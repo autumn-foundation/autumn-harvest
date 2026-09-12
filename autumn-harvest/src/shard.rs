@@ -964,6 +964,14 @@ fn group_by_pool_identity(pools: &BTreeMap<ShardId, DbPool>) -> BTreeMap<ShardId
 /// query parameter is dropped: none of them changes which relation a
 /// query resolves against.
 ///
+/// A Unix-socket DSN has no host in its authority. libpq then reads the
+/// real endpoint from a `host` or `hostaddr` query parameter instead
+/// (`postgresql:///harvest?host=%2Frun%2Fpg`). The key falls back to
+/// either one when the authority host is empty. It falls back to
+/// `hostaddr` whenever that is given at all, since `hostaddr` wins over
+/// `host` in libpq's own precedence. A `port` query parameter is
+/// honored the same way.
+///
 /// Two gaps are accepted rather than chased further. Closing either
 /// needs a live connection. Building a pool must stay a pure, local
 /// operation with no network access:
@@ -984,15 +992,26 @@ fn canonical_dsn_key(dsn: &str) -> String {
     let Ok(url) = url::Url::parse(dsn) else {
         return dsn.to_string();
     };
-    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    let port = url.port().unwrap_or(5432);
+    let mut host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let mut port = url.port().unwrap_or(5432);
     let path = url.path();
-    let options = url
-        .query_pairs()
-        .filter(|(k, _)| k == "options")
-        .map(|(_, v)| v.into_owned())
-        .collect::<Vec<String>>()
-        .join("\u{0}");
+    let mut options = String::new();
+    for (key, value) in url.query_pairs() {
+        match &*key {
+            "options" => {
+                options.push_str(&value);
+                options.push('\u{0}');
+            }
+            // A Unix-socket DSN carries no authority host, so libpq
+            // reads the real endpoint from `host` or `hostaddr` here
+            // instead. `hostaddr` wins when both are given, matching
+            // libpq's own precedence.
+            "host" if host.is_empty() => host = value.to_ascii_lowercase(),
+            "hostaddr" => host = value.to_ascii_lowercase(),
+            "port" => port = value.parse().unwrap_or(port),
+            _ => {}
+        }
+    }
     format!("{host}:{port}{path}?options={options}")
 }
 
@@ -2072,6 +2091,67 @@ mod tests {
             1,
             "application_name and sslmode never affect relation \
              resolution, so these must collapse to one group"
+        );
+    }
+
+    // A Unix-socket DSN carries the real endpoint in a `host` query
+    // parameter, not the URI authority. Two such DSNs for different
+    // sockets must never collapse (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_distinct_unix_socket_hosts_separate() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgresql:///harvest?host=%2Frun%2Fpg-a".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgresql:///harvest?host=%2Frun%2Fpg-b".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "different `host` query parameters name different sockets, \
+             so these must never collapse into one group"
+        );
+    }
+
+    // Two Unix-socket DSNs for the *same* socket, named through `host`,
+    // must still collapse to one group (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_shards_sharing_one_unix_socket_host() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgresql:///harvest?host=%2Frun%2Fpg-a".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgresql:///harvest?host=%2Frun%2Fpg-a".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "the same `host` query parameter names the same socket, so \
+             these must collapse into one group"
         );
     }
 }

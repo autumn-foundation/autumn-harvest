@@ -311,7 +311,12 @@ shard records:
   picks which schema a query resolves against — two DSNs differing only
   there must stay in separate groups. Every other query parameter
   (`application_name`, `sslmode`, and so on) is dropped, since none of
-  them changes which relation a query resolves against.
+  them changes which relation a query resolves against — except `host`,
+  `hostaddr`, and `port`: a Unix-socket DSN carries its real endpoint
+  there rather than in the URI authority
+  (`postgresql:///harvest?host=%2Frun%2Fpg`), so the key falls back to
+  them when the authority host is empty, or to `hostaddr` whenever it is
+  given at all, matching libpq's own precedence.
 
   Two gaps are accepted rather than chased further, since closing either
   needs a live connection: a host alias (two hostnames resolving to one

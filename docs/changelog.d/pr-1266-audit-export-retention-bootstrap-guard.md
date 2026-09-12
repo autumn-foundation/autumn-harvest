@@ -120,6 +120,16 @@ database under different usernames. Between an accepted, narrow,
 documented gap and reopening a P1-severity bug this PR exists to close,
 the gap stays.
 
+A ninth review round (P2) found a case the `options`-only key still
+missed: a Unix-socket DSN carries no host in its URI authority at all.
+libpq instead reads the real endpoint from a `host` or `hostaddr` query
+parameter (`postgresql:///harvest?host=%2Frun%2Fpg`), which the key had
+never inspected, so two DSNs naming different sockets could still
+collapse into one group. `canonical_dsn_key` now falls back to a `host`
+or `hostaddr` query parameter when the authority host is empty, or to
+`hostaddr` whenever it is given at all, matching libpq's own precedence
+between the two. A `port` query parameter is honored the same way.
+
 New tests:
 - `retention_protects_unexported_audit_when_configured_with_no_cursor_and_no_local_sink`
   reproduces the exact bootstrap window (no cursor row anywhere, no sink in
@@ -157,6 +167,10 @@ New tests:
 - `from_dsns_ignores_connection_only_parameters` pins the eighth round's
   P1 fix: two DSNs differing only in `application_name` and `sslmode`,
   and in credentials, still collapse into one group.
+- `from_dsns_keeps_distinct_unix_socket_hosts_separate` and
+  `from_dsns_groups_shards_sharing_one_unix_socket_host` pin the ninth
+  round's fix: two Unix-socket DSNs naming different sockets through
+  `host` never collapse, and two naming the same socket still do.
 
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call
