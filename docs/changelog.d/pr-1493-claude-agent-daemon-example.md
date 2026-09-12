@@ -54,10 +54,12 @@ migration, no change to any published crate — the example is a workspace
 member with `publish = false` and uses only the existing public surface of
 `autumn-harvest` (`default-features = false`) and `autumn-harvest-sqlite`.
 
-**Test evidence:** `cargo test -p claude-agent-daemon` — five offline tests:
-the happy path, a denied tool call, the restart proof (asserted by counting
-model calls in each process, so a replayed turn provably never reaches the
-model), the workspace sandbox, and one end-to-end run through the daemon
+**Test evidence:** `cargo test -p claude-agent-daemon` — an offline suite that
+needs no key and no network. It covers the happy path, a denied tool call, and
+the restart proof (asserted by counting model calls in each process, so a
+replayed turn provably never reaches the model). It also covers the workspace
+sandbox, the session listing and history read back from the event log, the
+request and response size caps, and one end-to-end run through the daemon
 socket. CI gains a clippy step and a Linux-only test step (issue #962: a new
 workspace member gets no coverage without its own steps; the control surface
 is a Unix domain socket, hence the OS gate).

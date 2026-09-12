@@ -357,6 +357,11 @@ Honest limits, so nothing here reads as a promise:
   parse, and would fail the turn after the same spend. The **durable** limit
   is checked on the reply itself, once it is built, and names `--max-tokens`
   when it refuses. With the default `--max-tokens` no real reply comes close.
+- **A control request is one line, and a megabyte at most.** The daemon reads
+  one byte past that cap, so a request that ended inside it is told apart from
+  one that continued. A request that passed the cap is refused, never
+  truncated. Trailing whitespace makes a truncated line parse. A prefix could
+  otherwise start a session, or release an approval nobody sent in full.
 - **Polling, not push.** `SQLite` has no `LISTEN`/`NOTIFY`, so progress comes
   from the `--tick-ms` poll. The poll reads no database at all: the daemon is
   the only writer, so it holds the live sessions in memory, seeded once at

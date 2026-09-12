@@ -55,7 +55,24 @@ const MAX_CONNECTIONS: usize = COMMAND_BACKLOG;
 /// A request is one line of JSON. A goal can be long, and a megabyte is far
 /// past anything an operator types. The cap stops one caller from growing the
 /// daemon's memory without end.
-const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
+///
+/// A request that passes this cap is REFUSED, not truncated. The daemon reads
+/// one byte more than the cap. A request that ended inside the cap is then
+/// distinguishable from one that continued past it. See
+/// [`REQUEST_READ_BYTES`].
+pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// How many bytes the daemon reads before it stops.
+///
+/// One past [`MAX_REQUEST_BYTES`], so reaching the cap is not the same as
+/// passing it. A reader stopped AT the cap reports the same end of input as a
+/// caller that closed the connection. The daemon cannot then tell a complete
+/// request from the start of a longer one.
+///
+/// A prefix that parses is the hazard. Valid JSON followed by whitespace
+/// parses on its own. A truncated request can then start a session, or
+/// release an approval nobody sent in full.
+const REQUEST_READ_BYTES: u64 = MAX_REQUEST_BYTES as u64 + 1;
 
 /// How long one caller may take to send its request.
 ///
@@ -560,14 +577,30 @@ async fn serve_connection(stream: UnixStream, tx: mpsc::Sender<Job>) {
     // no connection for the operator.
     let read = tokio::time::timeout(
         REQUEST_DEADLINE,
-        BufReader::new(read_half.take(MAX_REQUEST_BYTES)).read_line(&mut line),
+        BufReader::new(read_half.take(REQUEST_READ_BYTES)).read_line(&mut line),
     )
     .await;
     let request = match read {
+        // A request longer than the cap did not end inside it. The extra byte
+        // is the proof, so the prefix is refused instead of parsed. Trailing
+        // whitespace makes a truncated line parse. See [`REQUEST_READ_BYTES`].
+        Ok(Ok(_)) if line.len() > MAX_REQUEST_BYTES => {
+            answer(
+                &mut write_half,
+                &Response::Error {
+                    message: format!(
+                        "the request is longer than the {MAX_REQUEST_BYTES} bytes this \
+                         daemon reads. Shorten the goal or the note."
+                    ),
+                },
+            )
+            .await;
+            return;
+        }
         Ok(Ok(_)) => line,
         // A caller that stopped mid-request gets a reason, not a closed
-        // connection. The cap makes a truncated line malformed JSON, which is
-        // reported the same way.
+        // connection. A line that is not JSON is reported as malformed below.
+        // A line that passed the cap is refused above.
         Ok(Err(_)) => return,
         Err(_) => {
             answer(

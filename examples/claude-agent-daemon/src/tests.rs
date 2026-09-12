@@ -7859,3 +7859,151 @@ fn an_approval_signal_names_one_wait_and_only_that_wait() {
     assert_eq!(session::approval_call_id("something_else:1:0:x"), None);
     assert_eq!(session::approval_call_id("tool_approval"), None);
 }
+
+/// Options for a daemon that answers over `socket` and runs the stub model.
+fn socket_options(dir: &Path, socket: &Path) -> daemon::Options {
+    daemon::Options {
+        db: dir.join("agentd.db"),
+        socket: socket.to_path_buf(),
+        workspace: dir.join("workspace"),
+        model: claude::OFFLINE_MODEL.to_string(),
+        max_tokens: claude::DEFAULT_MAX_TOKENS,
+        tick: Duration::from_millis(50),
+        api_key: None,
+    }
+}
+
+/// Send raw bytes over the control socket and read the answer.
+///
+/// The answer is absent when the read fails. A caller that sent bytes the
+/// daemon never read loses the answer to a connection reset.
+async fn send_raw(socket: &Path, wire: &[u8]) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::UnixStream::connect(socket)
+        .await
+        .expect("the caller connects");
+    stream.write_all(wire).await.expect("the caller writes");
+    stream.flush().await.expect("the caller flushes");
+    let mut answer = String::new();
+    let read = tokio::time::timeout(Duration::from_secs(30), stream.read_to_string(&mut answer))
+        .await
+        .expect("the caller is answered or closed inside the deadline");
+    read.ok().map(|_| answer)
+}
+
+/// A request padded with whitespace to `len` bytes, which still parses.
+fn padded_request(request: &Request, len: usize) -> String {
+    let mut padded = serde_json::to_string(request).expect("the request encodes");
+    assert!(
+        padded.len() <= len,
+        "the request is longer than the padding"
+    );
+    while padded.len() < len {
+        padded.push(' ');
+    }
+    assert!(
+        serde_json::from_str::<Request>(padded.trim()).is_ok(),
+        "the test proves nothing unless the padded request parses on its own"
+    );
+    padded
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_longer_than_the_cap_is_refused() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let socket = dir.path().join("agentd.sock");
+    std::fs::create_dir_all(dir.path().join("workspace")).expect("the workspace is created");
+    let daemon = tokio::spawn(daemon::serve(socket_options(dir.path(), &socket)));
+    await_daemon(&socket).await;
+
+    // The hazard: a request padded with whitespace to exactly the cap parses
+    // on its own, because `trim` removes the padding. The caller then sends
+    // more bytes, so the padded prefix is not a whole request.
+    //
+    // The bytes that follow are whitespace. Any prefix the daemon reads
+    // therefore still parses, so only the length can refuse this request.
+    let cap = daemon::MAX_REQUEST_BYTES;
+    let submit = Request::Submit {
+        goal: "past the cap".to_string(),
+        max_turns: 1,
+        approval_timeout_secs: 300,
+    };
+    let mut wire = padded_request(&submit, cap).into_bytes();
+    wire.extend_from_slice(b"        \n");
+    send_raw(&socket, &wire).await;
+
+    // A started session is the damage, and the prefix asked for one. The
+    // answer is not asserted here: the bytes past the cap stay unread, so the
+    // close resets the connection and the caller loses the answer.
+    let listed = protocol::call(&socket, &Request::List { before: None })
+        .await
+        .expect("the list is answered");
+    let Response::Sessions { sessions, .. } = listed else {
+        panic!("unexpected answer: {listed:?}");
+    };
+    assert!(
+        sessions.is_empty(),
+        "a request that continued past the cap started a session: {sessions:?}"
+    );
+
+    daemon.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_whose_newline_arrives_past_the_cap_is_refused() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let socket = dir.path().join("agentd.sock");
+    std::fs::create_dir_all(dir.path().join("workspace")).expect("the workspace is created");
+    let daemon = tokio::spawn(daemon::serve(socket_options(dir.path(), &socket)));
+    await_daemon(&socket).await;
+
+    // A whole line, one byte past the cap. The newline does arrive, so a
+    // daemon that only required a newline would accept this. The length is
+    // what refuses it.
+    let cap = daemon::MAX_REQUEST_BYTES;
+    let mut line = padded_request(&Request::List { before: None }, cap);
+    line.push('\n');
+    assert_eq!(line.len(), cap + 1);
+
+    // The daemon reads every byte this caller sent, so nothing is left to
+    // reset the connection. This caller does read its answer.
+    let answer = send_raw(&socket, line.as_bytes())
+        .await
+        .expect("a caller whose bytes are all read is answered");
+    let refusal: Response = serde_json::from_str(answer.trim()).expect("the answer parses");
+    let Response::Error { message } = refusal else {
+        panic!("a request past the cap must be refused: {refusal:?}");
+    };
+    assert!(
+        message.contains(&cap.to_string()) && message.contains("Shorten the goal or the note"),
+        "the refusal must name the cap and what to do: {message}"
+    );
+
+    daemon.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_that_ends_at_the_cap_is_answered() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let socket = dir.path().join("agentd.sock");
+    std::fs::create_dir_all(dir.path().join("workspace")).expect("the workspace is created");
+    let daemon = tokio::spawn(daemon::serve(socket_options(dir.path(), &socket)));
+    await_daemon(&socket).await;
+
+    // The boundary the extra byte draws. This request ends inside the cap, so
+    // refusing it would refuse a caller that sent a whole line.
+    let cap = daemon::MAX_REQUEST_BYTES;
+    let mut line = padded_request(&Request::List { before: None }, cap - 1);
+    line.push('\n');
+    assert_eq!(line.len(), cap);
+    let answer = send_raw(&socket, line.as_bytes())
+        .await
+        .expect("a request that ends at the cap is answered");
+    let answered: Response = serde_json::from_str(answer.trim()).expect("the answer parses");
+    assert!(
+        matches!(answered, Response::Sessions { .. }),
+        "a request that ends at the cap must be served: {answered:?}"
+    );
+
+    daemon.abort();
+}
