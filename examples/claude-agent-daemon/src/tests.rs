@@ -1579,16 +1579,30 @@ fn a_write_lands_on_a_name_at_the_component_limit() {
     // The scratch name fits whatever the target does, and a short target keeps
     // its whole stem so a leftover file stays identifiable.
     for name in [long.as_str(), wide.as_str(), "notes.md"] {
-        let scratch = tools::scratch_name(name, 4_294_967_295, 15);
+        let scratch = tools::scratch_name(name, 4_294_967_295, u64::MAX, 15);
         assert!(
-            scratch.len() <= name.len().max(64),
+            scratch.len() <= name.len().max(96),
             "`{scratch}` is longer than the name it replaces"
         );
         assert!(scratch.len() <= 255, "`{scratch}` is over the limit");
     }
     assert!(
-        tools::scratch_name("notes.md", 123, 0).contains("notes.md"),
+        tools::scratch_name("notes.md", 123, 1, 0).contains("notes.md"),
         "a short target must keep its stem"
+    );
+
+    // The name carries a value that does not repeat across restarts. A daemon
+    // that always starts as pid 1 would otherwise retry the same sixteen names
+    // after a crash between the create and the rename.
+    assert_ne!(
+        tools::scratch_nonce(),
+        tools::scratch_nonce(),
+        "the scratch nonce must not repeat"
+    );
+    assert_ne!(
+        tools::scratch_name("notes.md", 1, 1, 0),
+        tools::scratch_name("notes.md", 1, 2, 0),
+        "a different nonce must give a different name"
     );
 }
 

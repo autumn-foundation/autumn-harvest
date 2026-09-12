@@ -48,7 +48,7 @@ const SCRATCH_CAP: usize = 255;
 /// once that name is longer than this floor. The target name is itself proof
 /// that the length is allowed. An ordinary short name keeps its whole stem in
 /// the scratch name, which is what makes a leftover file identifiable.
-const SCRATCH_FLOOR: usize = 64;
+const SCRATCH_FLOOR: usize = 96;
 
 /// The mode a file this toolbox CREATES is given.
 ///
@@ -449,9 +449,10 @@ fn create_scratch(path: &Path) -> Result<(PathBuf, std::fs::File), String> {
         .into_owned();
 
     let pid = std::process::id();
+    let nonce = scratch_nonce();
     let mut last = None;
     for attempt in 0..SCRATCH_ATTEMPTS {
-        let candidate = parent.join(scratch_name(&name, pid, attempt));
+        let candidate = parent.join(scratch_name(&name, pid, nonce, attempt));
         // `O_NOFOLLOW` refuses a link, as everywhere else in this module. The
         // mode is deliberately conservative here; the target's mode is applied
         // to the descriptor below, where no umask can filter it.
@@ -473,14 +474,37 @@ fn create_scratch(path: &Path) -> Result<(PathBuf, std::fs::File), String> {
     ))
 }
 
+/// A value that does not repeat across restarts.
+///
+/// The process id is not enough on its own. A container can start the daemon
+/// as pid 1 every time. A crash between the create and the rename leaves that
+/// scratch name behind, and nothing removes a file this module did not make.
+/// The next start would try the same names, and sixteen such crashes would
+/// leave an approved write with no name to use.
+///
+/// The hasher is seeded by the operating system, once per process, so two
+/// daemons that start in the same nanosecond still differ.
+pub fn scratch_nonce() -> u64 {
+    use std::hash::{BuildHasher, Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    hasher.finish()
+}
+
 /// The scratch basename for one attempt.
 ///
 /// The name carries the target's stem, so a leftover file says what it was
 /// for. The stem is cut when the whole name would not fit (see [`SCRATCH_CAP`]
 /// and [`SCRATCH_FLOOR`]). The cut lands on a character boundary, so a name
 /// of multi-byte characters is never split through one.
-pub fn scratch_name(name: &str, pid: u32, attempt: u32) -> String {
-    let suffix = format!(".agentd-{pid}-{attempt}.tmp");
+pub fn scratch_name(name: &str, pid: u32, nonce: u64, attempt: u32) -> String {
+    let suffix = format!(".agentd-{pid}-{nonce:x}-{attempt}.tmp");
     let cap = name.len().clamp(SCRATCH_FLOOR, SCRATCH_CAP);
     // One byte for the leading dot.
     let room = cap.saturating_sub(suffix.len() + 1);
