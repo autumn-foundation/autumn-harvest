@@ -1737,6 +1737,79 @@ async fn a_shard_whose_database_is_unreachable_is_marked_unobserved() {
     );
 }
 
+// Codex review on PR #1505: the two tests above cover a failure INSIDE
+// `fire_due_audit_exports`'s own per-shard loop. But `enforce_timeouts_once`
+// -- and therefore `fire_due_audit_exports` -- is only reached after the
+// timeout checker's OWN, earlier connection acquisition succeeds. If a
+// shard's database is unreachable even for that first checkout, the inner
+// mechanism never runs at all this tick.
+// `spawn_timeout_checker_for_shard` must mark the shard unobserved itself.
+#[tokio::test]
+async fn a_checkers_own_connection_failure_marks_its_shard_unobserved() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _installed = install(Arc::new(RecordingSink::new(200)), 100);
+
+    let (_conn, container) = make_conn().await;
+    let pool = single_connection_pool(&container).await;
+    container
+        .stop_with_timeout(Some(0))
+        .await
+        .expect("stop container");
+
+    let metrics = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(autumn_harvest::telemetry::TelemetryConfig {
+        metrics: metrics.clone(),
+        ..Default::default()
+    });
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    let handle = autumn_harvest::timeout::spawn_timeout_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(50),
+        telemetry,
+        std::time::Duration::from_secs(5),
+        None,
+        vec![autumn_harvest::types::ShardId::new(0)],
+        Arc::new(autumn_harvest::circuit_breaker::CircuitBreakerRegistry::default()),
+        None,
+        60,
+        Some(autumn_harvest::types::ShardId::new(0)),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
+    );
+
+    // Poll (bounded) rather than sleeping a fixed span: fast when the fix
+    // works, a clear timeout rather than a flake when it does not.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if metrics
+            .observed
+            .lock()
+            .expect("observed")
+            .contains(&(0_u16, false))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the checker must mark its own shard unobserved when it cannot even \
+             acquire its own connection; got {:?}",
+            metrics.observed.lock().expect("observed")
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        metrics.lag.lock().expect("lag").is_empty(),
+        "the lag gauge must not be given a fabricated reading for a shard \
+         whose checker could never even acquire a connection"
+    );
+
+    cancel.cancel();
+    let _ = handle.await;
+    uninstall();
+}
+
 // A mismatched (conn, shard_assignments) pair must never stamp rows in the
 // connection's own database under the assigned shard's key.
 //

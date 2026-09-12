@@ -4584,11 +4584,21 @@ pub fn spawn_timeout_checker_for_shard(
                 },
                 Ok(Err(e)) => {
                     tracing::error!(error = %e, "failed to acquire DB connection for timeout check");
+                    mark_audit_export_unobserved_for_checker_shard(
+                        &*telemetry.metrics,
+                        shard,
+                        sharded_pool.as_ref(),
+                    );
                 }
                 Err(_elapsed) => {
                     tracing::error!(
                         ?interval,
                         "pool acquisition exceeded the tick interval; skipping this tick"
+                    );
+                    mark_audit_export_unobserved_for_checker_shard(
+                        &*telemetry.metrics,
+                        shard,
+                        sharded_pool.as_ref(),
                     );
                 }
             }
@@ -4615,6 +4625,36 @@ pub fn spawn_timeout_checker_for_shard(
             crate::scanner_health::deregister_scanner(owner);
         }
     })
+}
+
+/// Mark this checker's own shard unobserved for audit export (issue #1268,
+/// Codex review).
+///
+/// `enforce_timeouts_once` — and therefore `fire_due_audit_exports` — never
+/// runs on a tick where this loop cannot get its own connection. Without
+/// this call, a shard whose database is fully unreachable leaves
+/// `harvest.audit.export_observed` frozen at its last reading, which can be
+/// a stale `1` from before the outage.
+///
+/// A no-op when audit export is not configured (AC8): this checker loop
+/// runs for every worker, and most never touch audit export.
+fn mark_audit_export_unobserved_for_checker_shard(
+    metrics: &(dyn MetricsRecorder + Send + Sync),
+    shard: Option<crate::types::ShardId>,
+    sharded_pool: Option<&crate::shard::ShardedDbPool>,
+) {
+    if !crate::audit_export::is_configured() {
+        return;
+    }
+    // Mirrors the shard `fire_due_audit_exports` itself would have used this
+    // tick: the checker's own assignment when sharded, or the pool's default
+    // shard otherwise -- never a bare `0` that could mislabel a non-zero
+    // default shard.
+    let shard_id = shard.map_or_else(
+        || sharded_pool.map_or(0, |pool| pool.default_shard().as_i32()),
+        crate::types::ShardId::as_i32,
+    );
+    metrics.record_audit_export_observed(u16::try_from(shard_id).unwrap_or(u16::MAX), false);
 }
 
 /// Terminate RUNNING workflow executions whose durable event count has reached
