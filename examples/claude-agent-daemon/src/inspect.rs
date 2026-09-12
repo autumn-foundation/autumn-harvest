@@ -10,6 +10,18 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 
+/// How many recorded events one pending-call lookup reads.
+///
+/// The awaited call is in the LAST model reply, so the scan runs backwards and
+/// stops. Reading the whole history instead would be unbounded twice over: the
+/// event count grows with every turn, and each model activity carries the
+/// whole transcript. A status call is not worth that, and the runtime is
+/// serialised, so one status would block every session drive.
+///
+/// The cap is generous. One turn records the model reply and one event for
+/// each tool call it asked for, so the newest reply is a few events back.
+pub const MAX_SCANNED_EVENTS: u32 = 64;
+
 /// How many sessions one listing carries.
 ///
 /// `list` reads the whole row of every session it names. A session's goal and
@@ -102,6 +114,40 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
 
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("cannot read the running sessions: {e}"))
+}
+
+/// Read the newest recorded events of one session, newest first.
+///
+/// The engine owns this table. The rows are read here, never written: the
+/// event log is append-only, and a reader of it must stay a reader.
+///
+/// # Errors
+///
+/// Returns an error if the query cannot run, or if a row is not readable.
+pub fn recent_events(
+    conn: &Connection,
+    exec_id: &str,
+    limit: u32,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT event_json FROM harvest_events WHERE exec_id = ?1 \
+             ORDER BY seq DESC LIMIT ?2",
+        )
+        .map_err(|e| format!("cannot prepare the event query: {e}"))?;
+    let rows = statement
+        .query_map(rusqlite::params![exec_id, limit], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|e| format!("cannot read the events: {e}"))?;
+
+    rows.map(|row| {
+        row.map_err(|e| format!("cannot read the events: {e}"))
+            .and_then(|json| {
+                serde_json::from_str(&json).map_err(|e| format!("cannot decode an event: {e}"))
+            })
+    })
+    .collect()
 }
 
 /// One session, by id.

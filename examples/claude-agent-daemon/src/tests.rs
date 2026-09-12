@@ -1047,7 +1047,7 @@ fn a_blank_model_name_is_refused() {
         let (_, signal) = crate::shutdown::channel();
         let refusal = claude::ModelConfig::new(
             Some("sk-ant-example".to_string()),
-            blank.to_string(),
+            blank,
             claude::DEFAULT_MAX_TOKENS,
             signal,
         );
@@ -1060,18 +1060,28 @@ fn a_blank_model_name_is_refused() {
         );
     }
 
-    // A real name still opens.
-    let (_, signal) = crate::shutdown::channel();
-    assert!(
-        claude::ModelConfig::new(
+    // A real name still opens, and a padded one is stored trimmed. A check
+    // that read the trimmed value while the verbatim one was sent would pass
+    // this. It would then send a name with spaces to the API.
+    for given in [
+        claude::DEFAULT_MODEL,
+        " claude-opus-5 ",
+        "\tclaude-opus-5\n",
+    ] {
+        let (_, signal) = crate::shutdown::channel();
+        let config = claude::ModelConfig::new(
             Some("sk-ant-example".to_string()),
-            claude::DEFAULT_MODEL.to_string(),
+            given,
             claude::DEFAULT_MAX_TOKENS,
             signal,
         )
-        .is_ok(),
-        "a real model name must be accepted"
-    );
+        .expect("a real model name must be accepted");
+        assert_eq!(
+            config.identity(),
+            given.trim(),
+            "the stored name must carry no padding: {given:?}"
+        );
+    }
 }
 
 #[test]
@@ -1116,6 +1126,56 @@ fn a_long_history_does_not_make_one_unbounded_listing() {
         last.exec_id,
         format!("exec-{:04}", rows - 1),
         "the newest session must be in the listing"
+    );
+}
+
+#[tokio::test]
+async fn a_status_reads_a_bounded_slice_of_the_history() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("agentd.db");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut rt = runtime(&db, &workspace, &calls);
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
+        .expect("the session starts");
+    let signal = drive_to_approval(&mut rt, exec).await;
+    drop(rt);
+
+    let reader = inspect::open(&db).expect("the reader opens");
+    let exec_id = exec.to_string();
+
+    // The status must find the awaited call in the newest events. Every model
+    // activity carries the whole transcript, so reading the history entire is
+    // unbounded twice over, and one status would block every session drive.
+    let call = daemon::pending_call(&reader, &exec_id, &signal, false)
+        .expect("the awaited call is in the newest events");
+    assert_eq!(call.token, signal, "the call must be the awaited one");
+
+    // The cap is what bounds the read. A session this short has fewer events
+    // than `MAX_SCANNED_EVENTS`, so asserting against that cap would pass
+    // whether or not the query carries a limit. The assertion uses a small
+    // limit instead, which only holds if the limit reaches the query.
+    let whole = inspect::recent_events(&reader, &exec_id, u32::MAX).expect("the events read");
+    assert!(
+        whole.len() > 3,
+        "the fixture must hold more events than the limit below, and holds {}",
+        whole.len()
+    );
+    let capped = inspect::recent_events(&reader, &exec_id, 3).expect("the events read");
+    assert_eq!(
+        capped.len(),
+        3,
+        "the read must stop at the limit it is given"
+    );
+
+    // Newest first, so the scan reaches the last model reply immediately.
+    assert_eq!(
+        capped.first(),
+        whole.first(),
+        "the bounded read must start at the newest event"
     );
 }
 
@@ -1190,7 +1250,13 @@ async fn the_full_view_shows_a_write_that_the_status_trims() {
         .expect("the session starts");
     let signal = drive_to_approval(&mut rt, exec).await;
 
-    let trimmed = daemon::pending_call(&rt, exec, &signal, false).expect("the status shows a call");
+    // The status reads the event log through the read-only connection, and it
+    // reads a bounded number of the newest events rather than the whole
+    // history. See `inspect::MAX_SCANNED_EVENTS`.
+    let reader = inspect::open(&dir.path().join("agentd.db")).expect("the reader opens");
+    let exec_id = exec.to_string();
+    let trimmed =
+        daemon::pending_call(&reader, &exec_id, &signal, false).expect("the status shows a call");
     assert!(
         trimmed.input.contains("truncated"),
         "the status must say when it has trimmed the payload"
@@ -1200,7 +1266,8 @@ async fn the_full_view_shows_a_write_that_the_status_trims() {
         "the trimmed view cannot hold the whole payload"
     );
 
-    let whole = daemon::pending_call(&rt, exec, &signal, true).expect("the full view shows a call");
+    let whole =
+        daemon::pending_call(&reader, &exec_id, &signal, true).expect("the full view shows a call");
     assert!(
         whole.input.contains(tail),
         "the full view must show every byte an approval authorises"
@@ -1252,7 +1319,7 @@ async fn a_session_refuses_to_continue_on_another_model() {
     // offline session onto billed calls.
     let model = claude::ModelConfig::new(
         Some("sk-ant-not-a-real-key".to_string()),
-        claude::DEFAULT_MODEL.to_string(),
+        claude::DEFAULT_MODEL,
         claude::DEFAULT_MAX_TOKENS,
         crate::shutdown::channel().1,
     )
@@ -2423,7 +2490,7 @@ fn a_live_daemon_refuses_the_offline_identity() {
     // API key, so it does not implement `Debug`.
     let Err(refusal) = claude::ModelConfig::new(
         Some("sk-not-a-real-key".to_string()),
-        claude::OFFLINE_MODEL.to_string(),
+        claude::OFFLINE_MODEL,
         claude::DEFAULT_MAX_TOKENS,
         crate::shutdown::channel().1,
     ) else {
@@ -2438,7 +2505,7 @@ fn a_live_daemon_refuses_the_offline_identity() {
     // error. A real model with a key is the ordinary case.
     let offline = claude::ModelConfig::new(
         None,
-        claude::OFFLINE_MODEL.to_string(),
+        claude::OFFLINE_MODEL,
         claude::DEFAULT_MAX_TOKENS,
         crate::shutdown::channel().1,
     )
@@ -2447,7 +2514,7 @@ fn a_live_daemon_refuses_the_offline_identity() {
 
     let live = claude::ModelConfig::new(
         Some("sk-not-a-real-key".to_string()),
-        claude::DEFAULT_MODEL.to_string(),
+        claude::DEFAULT_MODEL,
         claude::DEFAULT_MAX_TOKENS,
         crate::shutdown::channel().1,
     )

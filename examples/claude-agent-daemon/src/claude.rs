@@ -58,7 +58,7 @@ impl ModelConfig {
     /// Returns an error if the HTTP client cannot be built.
     pub fn new(
         api_key: Option<String>,
-        model: String,
+        model: &str,
         max_tokens: u32,
         shutdown: Signal,
     ) -> Result<Self, String> {
@@ -70,7 +70,11 @@ impl ModelConfig {
         // would refuse each one, and the refusal of an accepted request is
         // terminal here. The daemon would advertise readiness and fail every
         // session it was given.
-        if model.trim().is_empty() {
+        // Trimmed once, here, and the trimmed name is what is stored. A check
+        // that reads the trimmed value while the verbatim one is sent would
+        // pass ` claude-opus-5 ` and then send it to the API.
+        let model = model.trim().to_string();
+        if model.is_empty() {
             return Err(
                 "the model name is blank. Name a real model with `--model`, or \
                  unset `ANTHROPIC_API_KEY` to use the offline stub."

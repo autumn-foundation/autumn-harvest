@@ -164,7 +164,7 @@ pub async fn serve(options: Options) -> Result<(), String> {
 
     let model = ModelConfig::new(
         options.api_key,
-        options.model,
+        &options.model,
         options.max_tokens,
         signal.clone(),
     )?;
@@ -535,7 +535,7 @@ fn handle(
         Request::Status { execution_id, full } => {
             match inspect::execution(reader, WORKFLOW_NAME, &execution_id) {
                 Ok(Some(row)) => Response::Session {
-                    session: Box::new(view(runtime, &row, blocked, full)),
+                    session: Box::new(view(reader, &row, blocked, full)),
                 },
                 Ok(None) => Response::Error {
                     message: format!("no session {execution_id}"),
@@ -543,7 +543,7 @@ fn handle(
                 Err(message) => Response::Error { message },
             }
         }
-        Request::List => match sessions(runtime, reader, blocked, false) {
+        Request::List => match sessions(reader, blocked, false) {
             Ok((sessions, more)) => Response::Sessions { sessions, more },
             Err(message) => Response::Error { message },
         },
@@ -797,7 +797,6 @@ fn describe(event: &autumn_harvest::WorkflowEvent) -> String {
 
 /// Project every execution row into an operator view.
 fn sessions(
-    runtime: &SqliteRuntime,
     reader: &Connection,
     blocked: &Parked,
     full: bool,
@@ -811,14 +810,14 @@ fn sessions(
     }
     Ok((
         rows.iter()
-            .map(|row| view(runtime, row, blocked, full))
+            .map(|row| view(reader, row, blocked, full))
             .collect(),
         more,
     ))
 }
 
 /// Build one operator view.
-fn view(runtime: &SqliteRuntime, row: &ExecutionRow, blocked: &Parked, full: bool) -> SessionView {
+fn view(reader: &Connection, row: &ExecutionRow, blocked: &Parked, full: bool) -> SessionView {
     let goal = serde_json::from_str::<SessionTask>(&row.input_json)
         .map_or_else(|_| "<unreadable task>".to_string(), |task| task.goal);
     let answer = row
@@ -833,10 +832,9 @@ fn view(runtime: &SqliteRuntime, row: &ExecutionRow, blocked: &Parked, full: boo
         });
     let exec = row.exec_id.parse::<ExecutionId>().ok();
     let state = exec.and_then(|exec| blocked.get(&exec));
-    let pending = match (exec, state.and_then(|state| state.signal.as_deref())) {
-        (Some(exec), Some(signal)) => pending_call(runtime, exec, signal, full),
-        _ => None,
-    };
+    let pending = state
+        .and_then(|state| state.signal.as_deref())
+        .and_then(|signal| pending_call(reader, &row.exec_id, signal, full));
 
     SessionView {
         execution_id: row.exec_id.clone(),
@@ -855,17 +853,20 @@ fn view(runtime: &SqliteRuntime, row: &ExecutionRow, blocked: &Parked, full: boo
 /// model activity, so the history is the source of truth here. That is true of
 /// the run itself as well. The most recent model reply holds the awaited call,
 /// so the scan runs backwards.
+///
+/// The read is BOUNDED. Every status of a parked session comes here, and the
+/// whole history grows with every turn while each model activity carries the
+/// whole transcript. See [`inspect::MAX_SCANNED_EVENTS`].
 pub fn pending_call(
-    runtime: &SqliteRuntime,
-    exec: ExecutionId,
+    reader: &Connection,
+    exec_id: &str,
     signal: &str,
     full: bool,
 ) -> Option<PendingCall> {
     let call_id = session::approval_call_id(signal)?;
-    let history = runtime.load_history(exec).ok()?;
+    let recent = inspect::recent_events(reader, exec_id, inspect::MAX_SCANNED_EVENTS).ok()?;
 
-    for event in history.iter().rev() {
-        let value = serde_json::to_value(event).ok()?;
+    for value in recent {
         if value.get("type").and_then(Value::as_str) != Some("ActivityCompleted") {
             continue;
         }
