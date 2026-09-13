@@ -27,6 +27,61 @@ use autumn_harvest_plugin::dev::{
     DevRuntimeConfig, EphemeralPostgres, PostgresBinaries, running_as_root,
 };
 
+/// Serializes every `DevRuntime::start` call in this file against env-var
+/// mutation (Codex review, issue #1291).
+///
+/// `DevRuntime::start`'s harvest-mode gate reads `AUTUMN_HARVEST__MODE` and
+/// friends from the real process environment. A developer environment with
+/// `AUTUMN_HARVEST__MODE=split` or `external` set ambiently would otherwise
+/// make these tests see that gate's refusal instead of the one each actually
+/// asserts, or fail to start at all.
+static DEV_RUNTIME_START_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Unsets one env var for the life of this guard, restoring exactly what was
+/// there before — present or absent — even if the test panics.
+///
+/// Every `DevRuntime::start` call in this file holds
+/// `DEV_RUNTIME_START_SERIAL` for as long as a guard like this is alive.
+/// This struct does no locking of its own. It assumes that lock is already
+/// held.
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn unset(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: the caller holds `DEV_RUNTIME_START_SERIAL` for this
+        // guard's whole life, so no concurrent test observes `key` mid-change.
+        unsafe { std::env::remove_var(key) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `unset`.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+/// Every env var `resolve_harvest_mode_source` reads, forced absent so a
+/// `DevRuntime::start` call in this file sees the embedded default
+/// regardless of what this process inherited.
+fn harvest_mode_env_cleared() -> [EnvVarGuard; 3] {
+    [
+        EnvVarGuard::unset("AUTUMN_HARVEST__MODE"),
+        EnvVarGuard::unset("AUTUMN_HARVEST_DATABASE__URL"),
+        EnvVarGuard::unset("AUTUMN_MANIFEST_DIR"),
+    ]
+}
+
 /// The binaries to provision with, or `None` with a printed reason.
 ///
 /// Two environmental reasons to skip rather than fail: no Postgres server
@@ -199,6 +254,7 @@ async fn the_reaper_reclaims_an_abandoned_session_directory() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_busy_http_port_is_refused_before_any_cluster_is_created() {
     let Some(_binaries) = binaries() else { return };
@@ -212,6 +268,10 @@ async fn a_busy_http_port_is_refused_before_any_cluster_is_created() {
     let base = std::env::temp_dir().join(format!("harvest-dev-portclash-{}", std::process::id()));
     std::fs::create_dir_all(&base).expect("base");
 
+    let _serial = DEV_RUNTIME_START_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = harvest_mode_env_cleared();
     let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         http_port: port,
         session_root: Some(base.clone()),
@@ -248,6 +308,7 @@ async fn a_busy_http_port_is_refused_before_any_cluster_is_created() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_port_taken_during_provisioning_is_refused_and_takes_the_cluster_with_it() {
     // Codex round 3 (P2). The reservation above cannot be *held* across
@@ -282,6 +343,10 @@ async fn a_port_taken_during_provisioning_is_refused_and_takes_the_cluster_with_
         None
     });
 
+    let _serial = DEV_RUNTIME_START_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = harvest_mode_env_cleared();
     let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         http_port: port,
         session_root: Some(base.clone()),
@@ -359,19 +424,30 @@ async fn two_concurrent_dev_runtimes_do_not_collide() {
     second.shutdown().await.expect("second shutdown");
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_durable_workflow_executes_and_is_observable() {
     // The runtime provisions its own cluster; this only establishes that it
     // *can*, so the test skips rather than fails where nothing is installed.
     let Some(_binaries) = binaries() else { return };
 
-    let runtime = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
-        // Port 0: let the kernel pick, so the test never fights a real dev run.
-        http_port: 0,
-        ..DevRuntimeConfig::default()
-    })
-    .await
-    .expect("dev runtime should start");
+    // Scoped to release `DEV_RUNTIME_START_SERIAL` as soon as `start` returns:
+    // the workflow exercise below needs no env guard and would otherwise
+    // serialize against the other `DevRuntime::start` tests in this file for
+    // no reason.
+    let runtime = {
+        let _serial = DEV_RUNTIME_START_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = harvest_mode_env_cleared();
+        autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
+            // Port 0: let the kernel pick, so the test never fights a real dev run.
+            http_port: 0,
+            ..DevRuntimeConfig::default()
+        })
+        .await
+        .expect("dev runtime should start")
+    };
 
     let base = runtime.api_url().to_owned();
     let client = reqwest::Client::new();
