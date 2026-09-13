@@ -176,6 +176,13 @@ const LEGACY_RENAME_SUFFIX: &str = "__pre958";
 /// ROW` trigger that changes a partitioned row's destination.
 const EXEC_FK_TRIGGER: &str = "harvest_events_exec_fk_trg";
 
+/// Name of the transient function [`bounded_rename_fn_sql`] defines.
+///
+/// Schema-scoped, so it must not collide with an operator's own function of
+/// the same name. The `_958` tag matches every other transient identifier
+/// this module mints, for exactly that reason.
+const BOUNDED_RENAME_FN: &str = "harvest_bounded_rename_958";
+
 // ── Sweep "blocked" reasons ────────────────────────────────────────────────
 //
 // Constants, not inline literals, because `docs/partitioned-events.md` explains
@@ -402,12 +409,13 @@ pub struct SweepOptions {
     ///
     /// `max_drops` bounds successful drops, not the work of finding them. A
     /// blocked partition still costs a full gate evaluation — up to a tier-3
-    /// scan under `exact_scan_timeout` — and does not count against
+    /// scan under `exact_scan_timeout`. It does not count against
     /// `max_drops`. A shard with one long-lived execution pinning many old
     /// cohorts can then spend an entire tick evaluating every closed
-    /// partition, dropping none, at up to `partitions × exact_scan_timeout`.
-    /// This bounds that cost directly. [`SweepOutcome::truncated`] reports
-    /// when the budget was reached before every partition was considered.
+    /// partition. It drops none, at up to `partitions × exact_scan_timeout`.
+    /// This field bounds that cost directly. [`SweepOutcome::truncated`]
+    /// reports when the budget was reached before every partition was
+    /// considered.
     pub max_attempts: usize,
     /// How long to wait for that lock before giving up on a partition.
     ///
@@ -468,9 +476,10 @@ pub struct SweepOutcome {
     /// [`SweepOptions::max_attempts`].
     ///
     /// Not itself a problem — bounded passes that converge over successive
-    /// ticks are the design — but an operator reading a pass that dropped and
-    /// blocked nothing needs to know whether that is "the shard is clean" or
-    /// "the pass ran out of budget before it looked at the rest".
+    /// ticks are the design. An operator reading a pass that dropped and
+    /// blocked nothing needs to know which state that is. Either "the shard
+    /// is clean", or "the pass ran out of budget before it looked at the
+    /// rest".
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
     /// Partitions considered but left in place, each with the reason — a live
@@ -917,12 +926,12 @@ async fn cohort_partition_is_attached(
 /// runtime calls it every tick and at startup.
 ///
 /// Returns `(created, blocked)`. `blocked` names each cohort in the window
-/// that could not be carved out this pass — a generated name colliding with an
-/// unrelated relation, or a bounded lock attempt that ran out of time — even
-/// when the rest of the window was created successfully. A caller that only
-/// looks at `created` cannot tell "the window is fully covered" from "part of
-/// it is not", which is exactly the distinction an uncovered write range needs
-/// reported.
+/// that could not be carved out this pass. Causes include a generated name
+/// colliding with an unrelated relation, or a bounded lock attempt that ran
+/// out of time. This can happen even when the rest of the window was
+/// created successfully. A caller that only looks at `created` cannot tell
+/// "the window is fully covered" from "part of it is not". That is exactly
+/// the distinction an uncovered write range needs reported.
 ///
 /// # Errors
 ///
@@ -1242,10 +1251,11 @@ pub async fn enable_partitioning(
     let (partitions_created, lookahead_blocked) =
         ensure_partitions(conn, now, opts.lookahead_cohorts, opts.lock_timeout).await?;
     if !lookahead_blocked.is_empty() {
-        // Not an error: the conversion itself already committed and `created`
-        // is non-empty (the all-blocked case errors inside `ensure_partitions`
-        // above), so this is a partial catch-up gap, not a failed enable. Left
-        // for the next maintenance tick to close, same as any other tick.
+        // Not an error: the conversion itself already committed, and
+        // `created` is non-empty (the all-blocked case errors inside
+        // `ensure_partitions` above). So this is a partial catch-up gap, not
+        // a failed enable. Left for the next maintenance tick to close, same
+        // as any other tick.
         tracing::warn!(
             blocked = %lookahead_blocked.join(", "),
             "harvest partition enable: the lookahead window is not fully covered; \
@@ -1295,6 +1305,7 @@ pub fn enable_sql(opts: &EnableOptions) -> String {
     // empty the legacy table is dropped before this block ends, so the ACLs
     // have to be read while it still exists.
     let copy_acl = copy_acl_body(LEGACY_PARTITION, "harvest_events");
+    let bounded_rename_fn = bounded_rename_fn_sql();
     format!(
         r#"-- Issue #958: convert harvest_events to the partitioned layout.
 -- Generated by autumn_harvest::partition::enable_sql(); safe to re-run.
@@ -1372,19 +1383,33 @@ BEGIN
 
     -- Renaming a table renames neither its indexes nor its constraints, so
     -- without this the new parent could not reclaim their schema-scoped names.
+    --
+    -- The rename target is never a bare `obj.n || suffix`. At the 63-byte
+    -- identifier limit that renames a name to itself. It never frees it.
+    -- See `bounded_rename_fn_sql` for why, and how the safe name is
+    -- computed.
+    --
+    -- `CREATE FUNCTION` is DDL, so it must run through EXECUTE like every
+    -- other statement in this block; wrapped in its OWN dollar-quote tag,
+    -- distinct from the one the function body uses internally.
+    EXECUTE $harvest_br_958_wrap${bounded_rename_fn}$harvest_br_958_wrap$;
     FOR obj IN SELECT conname AS n FROM pg_constraint
                 WHERE conrelid = '{LEGACY_PARTITION}'::regclass
                   AND right(conname, {suffix_len}) <> '{LEGACY_RENAME_SUFFIX}'
     LOOP
         EXECUTE format('ALTER TABLE {LEGACY_PARTITION} RENAME CONSTRAINT %I TO %I',
-                       obj.n, obj.n || '{LEGACY_RENAME_SUFFIX}');
+                       obj.n,
+                       {BOUNDED_RENAME_FN}('constraint', '{LEGACY_PARTITION}'::regclass, obj.n,
+                                           '{LEGACY_RENAME_SUFFIX}'));
     END LOOP;
     FOR obj IN SELECT indexname AS n FROM pg_indexes
                 WHERE schemaname = current_schema() AND tablename = '{LEGACY_PARTITION}'
                   AND right(indexname, {suffix_len}) <> '{LEGACY_RENAME_SUFFIX}'
     LOOP
-        EXECUTE format('ALTER INDEX %I RENAME TO %I', obj.n, obj.n || '{LEGACY_RENAME_SUFFIX}');
+        EXECUTE format('ALTER INDEX %I RENAME TO %I', obj.n,
+                       {BOUNDED_RENAME_FN}('index', NULL, obj.n, '{LEGACY_RENAME_SUFFIX}'));
     END LOOP;
+    EXECUTE 'DROP FUNCTION {BOUNDED_RENAME_FN}(text, oid, text, text)';
 
     -- `LIKE ... INCLUDING DEFAULTS` copies the columns, their NOT NULLs and the
     -- `nextval(...)` id default -- and keeps working when a later migration
@@ -1533,6 +1558,82 @@ $harvest_enable_958$;
 /// engine grants at column granularity, and a table-level `GRANT` is what the
 /// preflight probes.
 ///
+/// SQL defining [`BOUNDED_RENAME_FN`], a transient helper both rename loops
+/// (in [`enable_sql`] and [`migration_plan_steps`]) call to compute a
+/// collision-safe temporary name.
+///
+/// # The bug this closes
+///
+/// Postgres silently truncates an identifier over 63 bytes. The rename loops
+/// append a fixed suffix (`__pre958`, `__old`) to reclaim an original name
+/// for the replacement relation. But appending a suffix to a name
+/// **already** at the 63-byte limit renames it to itself. The
+/// schema-scoped name is never freed. Replaying the captured
+/// `pg_get_indexdef` / `ADD CONSTRAINT` for the real name onto the
+/// replacement then fails with `duplicate_relation` / `duplicate_object`.
+/// The conversion is transactional, so this fails safely and loudly. But
+/// not at a line that names the cause.
+///
+/// # The fix
+///
+/// Truncate the base *before* appending the suffix, so the result always
+/// fits. A truncated base can (rarely) collide with another renamed sibling
+/// that happens to share the same 63-byte prefix. So the result is
+/// verified against the catalog. It is disambiguated with a numeric
+/// counter if needed:
+/// "generate, then verify the result is actually free", not "generate and
+/// hope".
+///
+/// Scoped correctly per kind. A constraint name only has to be unique among
+/// the constraints of `p_relid` (`pg_constraint.conrelid`). An index, or any
+/// other relation, name has to be unique across the whole schema
+/// (`pg_class`). That is why the function takes a `p_relid`, used only for
+/// the `'constraint'` case.
+///
+/// Created immediately before the rename loops that use it and dropped right
+/// after — schema debris a re-run should not leave behind.
+#[must_use]
+fn bounded_rename_fn_sql() -> String {
+    format!(
+        "CREATE FUNCTION {BOUNDED_RENAME_FN}(p_kind text, p_relid oid, p_base text, p_suffix text)
+RETURNS text LANGUAGE plpgsql AS $harvest_bounded_rename_958_fn$
+DECLARE
+    max_base  int := 63 - length(p_suffix);
+    candidate text;
+    disambig  int := 0;
+    taken     boolean;
+BEGIN
+    LOOP
+        IF disambig = 0 THEN
+            candidate := left(p_base, max_base) || p_suffix;
+        ELSE
+            candidate := left(p_base, greatest(max_base - length(disambig::text) - 1, 1))
+                         || '_' || disambig || p_suffix;
+        END IF;
+        IF p_kind = 'constraint' THEN
+            SELECT EXISTS (
+                SELECT 1 FROM pg_constraint WHERE conrelid = p_relid AND conname = candidate
+            ) INTO taken;
+        ELSE
+            SELECT EXISTS (
+                SELECT 1 FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = current_schema() AND c.relname = candidate
+            ) INTO taken;
+        END IF;
+        EXIT WHEN NOT taken;
+        disambig := disambig + 1;
+        IF disambig > 1000 THEN
+            RAISE EXCEPTION 'harvest #1270: could not find a free % name for % after 1000 \
+attempts', p_kind, p_base;
+        END IF;
+    END LOOP;
+    RETURN candidate;
+END;
+$harvest_bounded_rename_958_fn$;"
+    )
+}
+
 /// [`copy_acl_body`] is the same thing as bare plpgsql statements, for the
 /// conversion paths that already run inside a `DO` block; it needs
 /// [`COPY_ACL_DECLARE`] in that block's `DECLARE` section.
@@ -1648,6 +1749,93 @@ fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+/// Truncate `s` to at most `max_bytes` bytes, on a `char` boundary.
+///
+/// Postgres identifiers are conventionally ASCII. But truncating blindly at
+/// a byte offset could still split a multi-byte `char` in a quoted
+/// identifier and produce invalid UTF-8. Used only by
+/// [`bounded_rename_name`]'s Rust-side truncation. The PL/pgSQL path's
+/// `left()` is Postgres's own encoding-aware truncation and needs no
+/// equivalent.
+#[cfg(any(feature = "db", test))]
+fn truncate_ident(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Rust-side equivalent of [`bounded_rename_fn_sql`] for
+/// [`disable_partitioning`], which renames via individual `exec()` calls
+/// rather than embedded PL/pgSQL.
+///
+/// `table` is `None` for an index/relation name. That case checks
+/// schema-scoped uniqueness against `pg_class`. `table` is
+/// `Some(table_name)` for a constraint name, checked against
+/// `pg_constraint.conrelid` and scoped to that one table. See
+/// [`bounded_rename_fn_sql`] for why a bare `base || suffix` is unsafe at
+/// Postgres's 63-byte identifier limit.
+#[cfg(feature = "db")]
+async fn bounded_rename_name(
+    conn: &mut AsyncPgConnection,
+    table: Option<&str>,
+    base: &str,
+    suffix: &str,
+) -> HarvestResult<String> {
+    let max_base = 63usize.saturating_sub(suffix.len());
+    let mut disambig: u32 = 0;
+    loop {
+        let candidate = if disambig == 0 {
+            format!("{}{suffix}", truncate_ident(base, max_base))
+        } else {
+            let tag = disambig.to_string();
+            let room = max_base.saturating_sub(tag.len() + 1).max(1);
+            format!("{}_{tag}{suffix}", truncate_ident(base, room))
+        };
+        let taken = match table {
+            Some(table) => {
+                diesel::sql_query(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM pg_constraint
+                          WHERE conrelid = ($1::text)::regclass AND conname = $2
+                     ) AS v",
+                )
+                .bind::<Text, _>(table)
+                .bind::<Text, _>(&candidate)
+                .get_result::<BoolRow>(conn)
+                .await
+            }
+            None => {
+                diesel::sql_query(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM pg_class c
+                           JOIN pg_namespace n ON n.oid = c.relnamespace
+                          WHERE n.nspname = current_schema() AND c.relname = $1
+                     ) AS v",
+                )
+                .bind::<Text, _>(&candidate)
+                .get_result::<BoolRow>(conn)
+                .await
+            }
+        }
+        .map_err(database_error)?
+        .v;
+        if !taken {
+            return Ok(candidate);
+        }
+        disambig += 1;
+        if disambig > 1000 {
+            return Err(HarvestError::Database(format!(
+                "could not find a free name for {base} after 1000 attempts"
+            )));
+        }
+    }
+}
+
 #[cfg(feature = "db")]
 async fn exec(conn: &mut AsyncPgConnection, sql: &str) -> HarvestResult<()> {
     diesel::sql_query(sql)
@@ -1752,17 +1940,23 @@ pub async fn disable_partitioning(
             .await?;
             // Rename the parent's constraints/indexes so the flat table can reclaim
             // their names, exactly as the enable path does in reverse.
-            for (list_sql, rename_tmpl) in [
+            //
+            // The target is never a bare `{r.v}__old`: see
+            // `bounded_rename_fn_sql` for why that silently fails to free a
+            // name already at Postgres's 63-byte identifier limit.
+            for (list_sql, rename_tmpl, table_scope) in [
                 (
                     "SELECT conname AS v FROM pg_constraint \
                  WHERE conrelid = 'harvest_events_partitioned'::regclass",
                     "ALTER TABLE harvest_events_partitioned RENAME CONSTRAINT {q} TO {t}",
+                    Some("harvest_events_partitioned"),
                 ),
                 (
                     "SELECT indexname AS v FROM pg_indexes \
                  WHERE schemaname = current_schema() \
                    AND tablename = 'harvest_events_partitioned'",
                     "ALTER INDEX {q} RENAME TO {t}",
+                    None,
                 ),
             ] {
                 let rows = diesel::sql_query(list_sql)
@@ -1770,6 +1964,7 @@ pub async fn disable_partitioning(
                     .await
                     .map_err(database_error)?;
                 for r in rows {
+                    let target = bounded_rename_name(conn, table_scope, &r.v, "__old").await?;
                     exec(
                         conn,
                         // Both sides quoted: a mixed-case or special-character
@@ -1777,7 +1972,7 @@ pub async fn disable_partitioning(
                         // otherwise be case-folded or produce invalid syntax.
                         &rename_tmpl
                             .replace("{q}", &quote_ident(&r.v))
-                            .replace("{t}", &quote_ident(&format!("{}__old", r.v))),
+                            .replace("{t}", &quote_ident(&target)),
                     )
                     .await?;
                 }
@@ -1987,10 +2182,10 @@ async fn sweep_inner(
             continue;
         }
 
-        // Counted here, not at the top of the loop: this is the gate
-        // evaluation the budget exists to bound — up to a tier-3 scan under
-        // `exact_scan_timeout` — which a blocked partition costs exactly as
-        // much as a dropped one. The cheap skips above (DEFAULT, still open,
+        // Counted here, not at the top of the loop. This is the gate
+        // evaluation the budget exists to bound, up to a tier-3 scan under
+        // `exact_scan_timeout`. A blocked partition costs exactly as much as
+        // a dropped one. The cheap skips above (DEFAULT, still open,
         // unbounded) reach no such scan and do not spend the budget.
         attempts += 1;
         if let Some(reason) =
@@ -2456,11 +2651,11 @@ async fn drop_partition(
 /// Each batch runs under `statement_timeout`, exactly like the exact
 /// ownership scan this fallback runs alongside — see [`cohort_occupancy`].
 /// Without it, a batch on a partition where orphans are SPARSE re-scans the
-/// leading owned rows every iteration before finding one to delete, which is
-/// quadratic in the partition size and otherwise runs for as long as that
+/// leading owned rows every iteration before finding one to delete. That is
+/// quadratic in the partition size, and otherwise runs for as long as that
 /// scan takes, inside the retention tick. A timeout is "did what it could
-/// this tick, retry next" — not an error — matching every other budget in
-/// this module: what was deleted before the timeout stays deleted.
+/// this tick, retry next" — not an error. That matches every other budget
+/// in this module: what was deleted before the timeout stays deleted.
 #[cfg(feature = "db")]
 async fn delete_orphan_rows(
     conn: &mut AsyncPgConnection,
@@ -2470,7 +2665,9 @@ async fn delete_orphan_rows(
     timeout: Duration,
 ) -> HarvestResult<usize> {
     let batch = i64::try_from(batch).unwrap_or(i64::MAX).max(1);
-    let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX).max(1);
+    let ms = u64::try_from(timeout.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
     // Total work per partition per tick is capped, not just per statement. The
     // inner SELECT restarts from the top of the range each iteration, so on a
     // partition where orphans are SPARSE — the common shape for one pinned by a
@@ -2527,10 +2724,10 @@ async fn delete_orphan_rows(
         .await;
         let deleted = match result {
             Ok(n) => n,
-            // Fail safe toward "stop here": the rows this pass already deleted
-            // in earlier batches stay deleted, and the rest of this partition
-            // is retried next tick — the same direction every other budget in
-            // this module fails in.
+            // Fail safe toward "stop here". The rows this pass already
+            // deleted in earlier batches stay deleted. The rest of this
+            // partition is retried next tick — the same direction every
+            // other budget in this module fails in.
             Err(HarvestError::Database(msg)) if is_statement_timeout(&msg) => break,
             Err(e) => return Err(e),
         };
@@ -2885,11 +3082,11 @@ pub async fn maintain(
         ensure_partitions(conn, now, lookahead_cohorts, sweep_opts.lock_timeout).await?;
     let sweep = sweep(conn, now, sweep_opts).await?;
     // A partial catch-up must not report as a healthy, empty-`last_error`
-    // pass: `ensure_partitions` keeps creating the rest of the window when one
-    // cohort is blocked (deliberately — see its doc), so `created` can be
-    // non-empty even though the write window is still not fully covered. Never
-    // overwrites `drain_error`; both are real, independent failures this tick
-    // and neither may hide the other.
+    // pass. `ensure_partitions` keeps creating the rest of the window when
+    // one cohort is blocked (deliberately — see its doc). So `created` can
+    // be non-empty even though the write window is still not fully covered.
+    // This never overwrites `drain_error`. Both are real, independent
+    // failures this tick, and neither may hide the other.
     let last_error = if lookahead_blocked.is_empty() {
         drain_error
     } else {
@@ -2926,15 +3123,15 @@ pub struct MaintenanceOutcome {
     pub at: Option<DateTime<Utc>>,
     /// Cohort partitions created to extend the lookahead window.
     pub created: Vec<String>,
-    /// Cohorts in the lookahead window that could NOT be created this pass —
-    /// a generated name colliding with an unrelated relation, or a bounded
-    /// lock attempt that ran out of time.
+    /// Cohorts in the lookahead window that could NOT be created this pass.
+    /// Causes include a generated name colliding with an unrelated relation,
+    /// or a bounded lock attempt that ran out of time.
     ///
-    /// Non-empty here means the write window is not fully covered even though
-    /// `created` may also be non-empty: `ensure_partitions` keeps creating the
-    /// rest of the window when one cohort is blocked, so a partial catch-up
-    /// must not be mistaken for a healthy pass. Retried automatically next
-    /// tick.
+    /// Non-empty here means the write window is not fully covered, even
+    /// though `created` may also be non-empty. `ensure_partitions` keeps
+    /// creating the rest of the window when one cohort is blocked. A partial
+    /// catch-up must not be mistaken for a healthy pass. Retried
+    /// automatically next tick.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lookahead_blocked: Vec<String>,
     /// Rows moved out of the `DEFAULT` partition.
@@ -3274,6 +3471,15 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // Renaming a table renames neither its indexes nor its constraints, so
         // without this the new parent cannot reclaim their schema-scoped names
         // — and `ADD CONSTRAINT harvest_events_pkey` below aborts.
+        //
+        // The rename target is never a bare `obj.n || suffix`. See
+        // `bounded_rename_fn_sql` for why that silently fails to free a name
+        // already at Postgres's 63-byte identifier limit. It also explains
+        // how the safe name is computed instead. `CREATE FUNCTION` is valid
+        // as its own top-level statement here, unlike in `enable_sql`'s
+        // single `DO` block. So it is its own step here, dropped again once
+        // the rename loop is done.
+        step(4, bounded_rename_fn_sql()),
         step(
             4,
             format!(
@@ -3283,16 +3489,21 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
                  AND right(conname, {suffix_len}) <> '{LEGACY_RENAME_SUFFIX}'\n    \
                  LOOP\n        \
                  EXECUTE format('ALTER TABLE {LEGACY_PARTITION} RENAME CONSTRAINT %I TO %I',\n                       \
-                 obj.n, obj.n || '{LEGACY_RENAME_SUFFIX}');\n    \
+                 obj.n, {BOUNDED_RENAME_FN}('constraint', '{LEGACY_PARTITION}'::regclass,\n                            \
+                 obj.n, '{LEGACY_RENAME_SUFFIX}'));\n    \
                  END LOOP;\n    \
                  FOR obj IN SELECT indexname AS n FROM pg_indexes\n                \
                  WHERE schemaname = current_schema() AND tablename = '{LEGACY_PARTITION}'\n                  \
                  AND right(indexname, {suffix_len}) <> '{LEGACY_RENAME_SUFFIX}'\n    \
                  LOOP\n        \
                  EXECUTE format('ALTER INDEX %I RENAME TO %I', obj.n,\n                       \
-                 obj.n || '{LEGACY_RENAME_SUFFIX}');\n    \
+                 {BOUNDED_RENAME_FN}('index', NULL, obj.n, '{LEGACY_RENAME_SUFFIX}'));\n    \
                  END LOOP;\nEND\n$harvest_rename_958$"
             ),
+        ),
+        step(
+            4,
+            format!("DROP FUNCTION {BOUNDED_RENAME_FN}(text, oid, text, text)"),
         ),
         // The FK's ON DELETE CASCADE is the delete storm being eliminated; its
         // insert-time half lives on in the trigger below. The old PK and unique
@@ -3399,13 +3610,14 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
     ];
 
     // Issue #1270 item 7: `enable_partitioning` honours
-    // `allow_incompatible_publications` for the same guard; this scripted path
-    // must too, or an operator who has done the supported thing — brought the
-    // subscriber onto the partitioned layout with
-    // `publish_via_partition_root = true` — can use the override on a small
-    // table (`enable`) and not on a large one (`plan`), which is the only path
-    // large deployments are told to use. The tag is unique to this one `DO`
-    // block, so filtering on it cannot drop any other step.
+    // `allow_incompatible_publications` for the same guard. This scripted
+    // path must too. Otherwise an operator could use the override on a
+    // small table (`enable`) but not on a large one (`plan`). That operator
+    // has done the supported thing: brought the subscriber onto the
+    // partitioned layout with `publish_via_partition_root = true`. `plan`
+    // is the only path large deployments are told to use. The tag is
+    // unique to this one `DO` block, so filtering on it cannot drop any
+    // other step.
     if opts.allow_incompatible_publications {
         steps.retain(|s| !s.sql.contains("$harvest_pub_958$"));
     }
@@ -3730,10 +3942,11 @@ mod tests {
     #[test]
     fn allow_incompatible_publications_omits_the_phase_1_publication_guard() {
         // Issue #1270 item 7: `enable_partitioning` already honours the
-        // override for this guard; the scripted large-table plan must too, or
-        // an operator who has done the supported thing — run the partitioned
-        // layout on the subscriber too — can use the override on `enable` and
-        // not on `plan`, the only path large deployments are told to use.
+        // override for this guard. The scripted large-table plan must too.
+        // Otherwise an operator could use the override on `enable` but not
+        // on `plan`, the only path large deployments are told to use. That
+        // operator has done the supported thing: run the partitioned
+        // layout on the subscriber too.
         let now = Utc::now();
         let default_steps = migration_plan_steps(&EnableOptions::default(), now);
         assert!(
@@ -3866,6 +4079,29 @@ mod tests {
     fn quote_ident_escapes_embedded_quotes() {
         assert_eq!(quote_ident("harvest_events"), "\"harvest_events\"");
         assert_eq!(quote_ident("odd\"name"), "\"odd\"\"name\"");
+    }
+
+    #[test]
+    fn truncate_ident_is_a_no_op_under_the_limit() {
+        assert_eq!(truncate_ident("harvest_events", 63), "harvest_events");
+        assert_eq!(truncate_ident("short", 5), "short");
+    }
+
+    #[test]
+    fn truncate_ident_shortens_at_a_char_boundary() {
+        // Issue #1270 item 9: a name already at or near the 63-byte
+        // identifier limit must be truncated. Otherwise Postgres silently
+        // truncates it again (to the same value) once a suffix is appended.
+        let long = "a".repeat(70);
+        let truncated = truncate_ident(&long, 63);
+        assert_eq!(truncated.len(), 63);
+
+        // A multi-byte character must never be split — the result would not
+        // be valid UTF-8, and quoting it would produce broken SQL.
+        let multibyte = format!("{}{}", "a".repeat(62), 'é');
+        let truncated = truncate_ident(&multibyte, 63);
+        assert!(truncated.len() <= 63);
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
     }
 
     #[test]

@@ -452,6 +452,148 @@ fn the_migration_plan_documents_a_non_blocking_window_for_large_live_tables() {
     }
 }
 
+#[tokio::test]
+async fn a_user_index_at_the_identifier_length_limit_survives_conversion() {
+    // Issue #1270 item 9: Postgres silently truncates an identifier over 63
+    // bytes. Appending a suffix to a name already at that limit renames it
+    // TO ITSELF. The schema-scoped name is never freed. Replaying the
+    // captured index definition onto the new parent then fails with
+    // `duplicate_relation`. A user-defined index at exactly the limit must
+    // not make `enable` unusable.
+    //
+    // The proof is the ATTACH-LEGACY path completing at all. `enable_sql`
+    // renames the legacy table's indexes to free their names BEFORE
+    // replaying the captured definitions, which still name the ORIGINAL
+    // identifiers, onto the new parent. A self-colliding rename leaves the
+    // legacy copy holding the name. So the replay's `CREATE INDEX
+    // <original name>` collides with it, and the whole transaction — one
+    // `enable_sql` script — rolls back with `duplicate_relation`. There is
+    // no partial-success state to inspect afterward. Either it all
+    // committed, or none of it did.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // A row, so the table takes the ATTACH-LEGACY path rather than the
+    // fresh-table path. Only the former exercises the legacy rename loop
+    // this item's fix is in.
+    let exec = insert_execution(&mut conn, "longidx_wf", "li-1", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed");
+
+    // Exactly 63 bytes — Postgres's identifier limit.
+    let long_name = format!("idx_{}", "x".repeat(59));
+    assert_eq!(long_name.len(), 63, "precondition: exactly at the limit");
+    // `IF EXISTS` first. This suite may re-run against a persistent
+    // database, rather than a fresh one per run. A stray relation left by
+    // an interrupted earlier run must not fail this test for an unrelated
+    // reason.
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {long_name}"))
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query(format!(
+        "CREATE INDEX {long_name} ON harvest_events (event_type)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed a user index at the identifier limit");
+
+    let report = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect(
+            "enable must not fail on a user index whose name is already at \
+             Postgres's 63-byte identifier limit — a self-colliding rename \
+             would abort the whole conversion with duplicate_relation",
+        );
+    assert!(
+        matches!(report.mode, EnableMode::AttachLegacy { .. }),
+        "precondition: must exercise the legacy rename loop, got {:?}",
+        report.mode
+    );
+
+    assert_eq!(events_relkind(&mut conn).await, "p");
+
+    // The original name is now claimed by the REPLAYED index on the new
+    // parent. This is the strongest available proof the rename actually
+    // freed it. A self-colliding rename would have failed the transaction
+    // above, rather than leave anything to check here.
+    let on_new_parent = scalar_bool(
+        &mut conn,
+        &format!(
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() \
+             AND tablename = 'harvest_events' AND indexname = '{long_name}') AS v"
+        ),
+    )
+    .await;
+    assert!(
+        on_new_parent,
+        "the user's index must be replayed onto the new parent under its \
+         ORIGINAL name — that is the whole point of freeing it"
+    );
+}
+
+#[tokio::test]
+async fn a_user_index_at_the_identifier_length_limit_survives_disable() {
+    // The reverse direction of the item 9 fix. `disable_partitioning`
+    // renames every index on the partitioned parent with `__old`. It is
+    // exactly as vulnerable to the same silent-self-rename bug. Same proof
+    // shape as above: the whole revert is one transaction, so a
+    // self-colliding rename aborts it with duplicate_relation rather than
+    // leaving a partial state.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    let long_name = format!("idx_{}", "y".repeat(59));
+    assert_eq!(long_name.len(), 63, "precondition: exactly at the limit");
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {long_name}"))
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query(format!(
+        "CREATE INDEX {long_name} ON harvest_events (event_type)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed a user index at the identifier limit on the partitioned parent");
+
+    partition::disable_partitioning(&mut conn)
+        .await
+        .expect(
+            "disable must not fail on a user index whose name is already at \
+             Postgres's 63-byte identifier limit",
+        )
+        .expect("the shard was partitioned, so disable must report a revert");
+
+    assert_eq!(events_relkind(&mut conn).await, "r");
+
+    // The reclaimed flat table carries the index back under its ORIGINAL
+    // name.
+    let on_flat_table = scalar_bool(
+        &mut conn,
+        &format!(
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() \
+             AND tablename = 'harvest_events' AND indexname = '{long_name}') AS v"
+        ),
+    )
+    .await;
+    assert!(
+        on_flat_table,
+        "the user's index must be replayed onto the reclaimed flat table \
+         under its ORIGINAL name"
+    );
+}
+
 // ══ AC2: byte-identical per-execution event semantics ══════════════════════
 
 #[tokio::test]
@@ -1251,12 +1393,12 @@ async fn the_retention_tick_pre_creates_future_partitions_with_no_operator_cron(
 
 #[tokio::test]
 async fn partition_maintenance_runs_at_startup_not_after_a_full_tick_interval() {
-    // Issue #1270 item 5: the maintenance block used to live only after the
-    // loop's `sleep(tick_interval)`, so a shard that restarted after being
-    // offline longer than its lookahead window had no covering partition for
-    // up to a full tick interval — an hour, by default — during which every
-    // append lands in the DEFAULT partition. `spawn` must trigger the first
-    // pass immediately.
+    // Issue #1270 item 5: the maintenance block used to live only after
+    // the loop's `sleep(tick_interval)`. A shard that restarted after being
+    // offline longer than its lookahead window had no covering partition.
+    // That lasted up to a full tick interval — an hour, by default —
+    // during which every append lands in the DEFAULT partition. `spawn`
+    // must trigger the first pass immediately.
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
@@ -1280,9 +1422,9 @@ async fn partition_maintenance_runs_at_startup_not_after_a_full_tick_interval() 
     let started = Utc::now();
     let runtime = RetentionRuntime::spawn(pools, config, Arc::new(NoopMetrics), None, None)
         .expect("retention runtime should spawn when enabled");
-    // Deliberately NOT calling `runtime.run_now()` — that is the crutch every
-    // other test in this file uses, and the whole point here is that `spawn`
-    // alone must be enough.
+    // Deliberately NOT calling `runtime.run_now()` — that is the crutch
+    // every other test in this file uses. The whole point here is that
+    // `spawn` alone must be enough.
 
     let mut saw_maintenance = false;
     for _ in 0..100 {
@@ -1309,11 +1451,11 @@ async fn partition_maintenance_runs_at_startup_not_after_a_full_tick_interval() 
 #[tokio::test]
 async fn partition_maintenance_stays_none_on_a_shard_that_never_converted() {
     // Issue #1270 item 6: the maintenance block is gated on
-    // `config.partitions.enabled`, not on the detected layout, and `maintain`
-    // returns a stamped-but-empty outcome for an unpartitioned shard — so a
+    // `config.partitions.enabled`, not on the detected layout. `maintain`
+    // returns a stamped-but-empty outcome for an unpartitioned shard. So a
     // deployment that turned the config flag on without ever running
-    // `harvest partition enable` reported `Some(...)` after every tick,
-    // claiming maintenance was active on a shard that never opted in.
+    // `harvest partition enable` reported `Some(...)` after every tick.
+    // That claimed maintenance was active on a shard that never opted in.
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
@@ -1344,8 +1486,8 @@ async fn partition_maintenance_stays_none_on_a_shard_that_never_converted() {
         }
     }
     assert!(ran, "the retention tick did not complete in time");
-    // A little more room: on this shard `partition_maintenance` should never
-    // be set, so there is no stamp to wait for — only time to let a
+    // A little more room: on this shard `partition_maintenance` should
+    // never be set. There is no stamp to wait for, only time to let a
     // maintenance pass run, if it were going to.
     tokio::time::sleep(Duration::from_millis(200)).await;
     let snap = runtime.monitor().snapshot();
@@ -1499,9 +1641,10 @@ async fn the_sweep_is_bounded_and_reports_what_it_dropped_and_blocked() {
 #[tokio::test]
 async fn a_sweep_bounds_blocked_evaluations_too_not_only_drops() {
     // Issue #1270 item 1: `max_drops` bounds successful drops, not the work of
-    // finding them. A partition that ends up blocked still costs a full gate
-    // evaluation, so five closed cohorts that are ALL blocked must not let the
-    // pass examine every one of them regardless of `max_attempts`.
+    // finding them. A partition that ends up blocked still costs a full
+    // gate evaluation. Five closed cohorts that are ALL blocked must not
+    // let the pass examine every one of them, regardless of
+    // `max_attempts`.
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
@@ -1554,12 +1697,12 @@ async fn a_sweep_bounds_blocked_evaluations_too_not_only_drops() {
 
 #[tokio::test]
 async fn the_straggler_delete_bounds_its_own_statement_timeout() {
-    // Issue #1270 item 2: `delete_orphan_rows` ran with no `statement_timeout`
-    // of its own, so on a partition where a straggler execution has pinned a
-    // cohort, a `DELETE` blocked behind a lock could run — or wait — for as
-    // long as the blocker lives, inside the retention tick. It must fail safe
-    // like every other budget in this module: timed out, not errored, and
-    // retried next tick.
+    // Issue #1270 item 2: `delete_orphan_rows` ran with no
+    // `statement_timeout` of its own. A straggler execution can pin a
+    // cohort. On that partition, a `DELETE` blocked behind a lock could
+    // run, or wait, for as long as the blocker lives, inside the retention
+    // tick. It must fail safe like every other budget in this module: timed
+    // out, not errored, and retried next tick.
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
@@ -1568,8 +1711,8 @@ async fn the_straggler_delete_bounds_its_own_statement_timeout() {
         .expect("enable");
 
     // A cohort pinned by a still-existing execution, so the gate reports
-    // OWNED_REASON (not droppable) and — with straggler_grace configured —
-    // the sweep attempts the targeted orphan DELETE rather than skipping it.
+    // OWNED_REASON (not droppable). With straggler_grace configured, the
+    // sweep attempts the targeted orphan DELETE rather than skipping it.
     let old = Utc::now() - chrono::Duration::days(10);
     let pinning = insert_execution(&mut conn, "pin_wf", "pin-1", old, None).await;
     autumn_harvest::store::append_events(
@@ -1581,15 +1724,17 @@ async fn the_straggler_delete_bounds_its_own_statement_timeout() {
     .await
     .expect("seed");
     backdate_events(&mut conn, pinning, old).await;
-    let cohort_partition =
-        partition::partition_name(partition::cohort_start(old, partition::DEFAULT_COHORT_WIDTH_SECS));
+    let cohort_partition = partition::partition_name(partition::cohort_start(
+        old,
+        partition::DEFAULT_COHORT_WIDTH_SECS,
+    ));
 
-    // A concurrent SHARE lock on that one partition: it conflicts with the
-    // ROW EXCLUSIVE the straggler DELETE needs (the same conflict the
-    // sweeper's own drop re-check relies on), so the DELETE blocks waiting
-    // for it — and `statement_timeout` bounds a statement's total time
-    // including a lock wait, so this forces the timeout deterministically
-    // with no need for a large or slow dataset.
+    // A concurrent SHARE lock on that one partition. It conflicts with the
+    // ROW EXCLUSIVE the straggler DELETE needs — the same conflict the
+    // sweeper's own drop re-check relies on. So the DELETE blocks waiting
+    // for it. `statement_timeout` bounds a statement's total time including
+    // a lock wait, so this forces the timeout deterministically. No need
+    // for a large or slow dataset.
     let mut locker = connect(&url).await;
     diesel::sql_query("BEGIN")
         .execute(&mut locker)
@@ -2247,6 +2392,70 @@ async fn the_large_table_migration_plan_actually_runs() {
         .await
         .is_err(),
         "the uniqueness trigger must be installed by the script too"
+    );
+}
+
+#[tokio::test]
+async fn the_large_table_plans_rename_loop_survives_an_index_at_the_identifier_length_limit() {
+    // Issue #1270 item 9, the online path. `migration_plan_steps`'
+    // phase-4 rename loop is exactly as vulnerable as `enable_sql`'s. Both
+    // fail at a name already at Postgres's 63-byte identifier limit. It is
+    // a distinct code path (separate top-level statements, not one `DO`
+    // block). That path could have a different bug, even though the
+    // underlying flaw is the same.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    let exec = insert_execution(&mut conn, "plan_longidx_wf", "pli-1", day(2026, 2, 3), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    let long_name = format!("idx_{}", "z".repeat(59));
+    assert_eq!(long_name.len(), 63, "precondition: exactly at the limit");
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {long_name}"))
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query(format!(
+        "CREATE INDEX {long_name} ON harvest_events (event_type)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed a user index at the identifier limit");
+
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now()) {
+        diesel::sql_query(&step.sql)
+            .execute(&mut conn)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "plan step (phase {}) failed on an index name at the \
+                     identifier limit — a self-colliding rename would abort \
+                     here with duplicate_relation:\n{}\nerror: {e}",
+                    step.phase, step.sql
+                )
+            });
+    }
+
+    assert_eq!(events_relkind(&mut conn).await, "p");
+    let on_new_parent = scalar_bool(
+        &mut conn,
+        &format!(
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() \
+             AND tablename = 'harvest_events' AND indexname = '{long_name}') AS v"
+        ),
+    )
+    .await;
+    assert!(
+        on_new_parent,
+        "the user's index must be replayed onto the new parent under its \
+         ORIGINAL name"
     );
 }
 
@@ -3468,10 +3677,10 @@ async fn extending_the_write_window_never_queues_appends_indefinitely() {
 #[tokio::test]
 async fn a_partly_blocked_lookahead_catch_up_is_not_reported_as_a_healthy_pass() {
     // Issue #1270 item 4: `ensure_partitions` keeps creating the REST of the
-    // window when one cohort cannot be carved out — deliberate, so a
-    // maintenance gap does not become self-perpetuating. But `maintain` must
-    // not then report a healthy, empty-`last_error` pass just because
-    // `created` is non-empty: an operator needs to see that part of the
+    // window when one cohort cannot be carved out. That is deliberate, so a
+    // maintenance gap does not become self-perpetuating. But `maintain`
+    // must not then report a healthy, empty-`last_error` pass just because
+    // `created` is non-empty. An operator needs to see that part of the
     // write window is still uncovered.
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
@@ -3481,18 +3690,19 @@ async fn a_partly_blocked_lookahead_catch_up_is_not_reported_as_a_healthy_pass()
         .expect("enable");
 
     // `enable_partitioning` with default options already pre-created steps
-    // 0..=3 (today through +3 days) — `EnableOptions::default()`'s lookahead.
-    // Force step 5 of a wider 0..=6 window to be blocked instead: a generated
-    // partition name colliding with an unrelated, already-existing relation —
-    // one of the two ways `ensure_cohort_with_width` reports a cohort blocked
-    // (the other is a lock timeout, exercised above).
+    // 0..=3 (today through +3 days) — `EnableOptions::default()`'s
+    // lookahead. Force step 5 of a wider 0..=6 window to be blocked
+    // instead. Use a generated partition name colliding with an unrelated,
+    // already-existing relation. That is one of the two ways
+    // `ensure_cohort_with_width` reports a cohort blocked (the other is a
+    // lock timeout, exercised above).
     let collide_at = Utc::now() + chrono::Duration::days(5);
     let collide_cohort = partition::cohort_start(collide_at, partition::DEFAULT_COHORT_WIDTH_SECS);
     let collide_name = partition::partition_name(collide_cohort);
-    // `IF EXISTS` first: on a suite re-run against a persistent (rather than
-    // fresh-per-run) database, a stray relation left by an interrupted earlier
-    // run must not make this test fail for a reason unrelated to what it
-    // checks.
+    // `IF EXISTS` first. This suite may re-run against a persistent
+    // database, rather than a fresh one per run. A stray relation left by
+    // an interrupted earlier run must not make this test fail for a
+    // reason unrelated to what it checks.
     diesel::sql_query(format!("DROP TABLE IF EXISTS {collide_name}"))
         .execute(&mut conn)
         .await
