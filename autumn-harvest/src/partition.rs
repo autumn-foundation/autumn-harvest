@@ -1558,12 +1558,10 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
 /// empty path the trigger is destroyed with the table it was on.
 ///
 /// [`EXEC_FK_TRIGGER`] is excluded by its FUNCTION
-/// (`harvest_events_require_execution`), not by its name. That function is
-/// harvest's own, part of the base migration. A trigger invoking it is
-/// never operator-installed. Excluding by name alone has a gap: an
-/// operator's own trigger could happen to share the reserved name. On an
-/// unpartitioned shard, `EXEC_FK_TRIGGER` cannot yet be harvest's, since
-/// only a conversion creates it.
+/// (`harvest_events_require_execution`), not by name alone. That function
+/// is harvest's own, part of the base migration. On an unpartitioned
+/// shard, `EXEC_FK_TRIGGER` cannot yet be harvest's, since only a
+/// conversion creates it.
 ///
 /// Review finding: on a partitioned shard, `harvest_events` names only the
 /// parent. Postgres lets an operator install a trigger directly on a LEAF
@@ -1571,12 +1569,19 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
 /// `disable_partitioning`'s `DROP ... CASCADE` destroyed it along with the
 /// leaf. Matching the parent's direct children too closes that gap.
 ///
+/// Review finding: the function check alone has a gap in the OTHER
+/// direction from the name-only check it replaced. An operator's own
+/// trigger, under its own name, could call the same function -- reusing
+/// harvest's validation for a purpose of its own. The exemption now also
+/// requires the reserved trigger's own name, so only harvest's actual
+/// trigger, matching both, is ever exempted.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] if the catalog query fails.
 #[cfg(feature = "db")]
 pub async fn operator_triggers(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
-    let rows = diesel::sql_query(
+    let rows = diesel::sql_query(format!(
         "SELECT tg.tgname AS v
            FROM pg_trigger tg
            JOIN pg_class c ON c.oid = tg.tgrelid
@@ -1594,10 +1599,11 @@ pub async fn operator_triggers(conn: &mut AsyncPgConnection) -> HarvestResult<Ve
                 )
             )
             AND NOT tg.tgisinternal
-            AND NOT (p.proname = 'harvest_events_require_execution'
+            AND NOT (tg.tgname = '{EXEC_FK_TRIGGER}'
+                     AND p.proname = 'harvest_events_require_execution'
                      AND p.pronamespace = c.relnamespace)
-          ORDER BY 1",
-    )
+          ORDER BY 1"
+    ))
     .load::<TextRow>(conn)
     .await
     .map_err(database_error)?;
@@ -1942,7 +1948,8 @@ the preflight check ran but before this transaction''s ACCESS EXCLUSIVE lock. Dr
       JOIN pg_proc p ON p.oid = tg.tgfoid
      WHERE c.relname = '{LEGACY_PARTITION}' AND n.nspname = current_schema()
        AND NOT tg.tgisinternal
-       AND NOT (p.proname = 'harvest_events_require_execution'
+       AND NOT (tg.tgname = '{EXEC_FK_TRIGGER}'
+                AND p.proname = 'harvest_events_require_execution'
                 AND p.pronamespace = c.relnamespace);
     IF bad_trg IS NOT NULL THEN
         RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not carried by CREATE \
@@ -4398,6 +4405,12 @@ fn dependent_views_guard_sql(tag: &str) -> String {
 /// Review finding: phase 1's copy of this check has the identical gap
 /// [`dependent_views_guard_sql`] closes. Phase 4 recheck it too, right
 /// alongside the view recheck, under the same lock.
+///
+/// Review finding: the exemption for harvest's own trigger checked its
+/// FUNCTION alone. An operator trigger invoking that same function under
+/// its own name would then also be exempted and stay unnoticed. The
+/// check now also requires the reserved trigger's own name, matching
+/// [`operator_triggers`]'s fix for the identical gap.
 #[must_use]
 fn operator_triggers_guard_sql(tag: &str) -> String {
     format!(
@@ -4409,7 +4422,8 @@ fn operator_triggers_guard_sql(tag: &str) -> String {
          JOIN pg_proc p ON p.oid = tg.tgfoid\n     \
          WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
          AND NOT tg.tgisinternal\n       \
-         AND NOT (p.proname = 'harvest_events_require_execution'\n                      \
+         AND NOT (tg.tgname = '{EXEC_FK_TRIGGER}'\n                      \
+         AND p.proname = 'harvest_events_require_execution'\n                      \
          AND p.pronamespace = c.relnamespace);\n    \
          IF bad IS NOT NULL THEN\n        \
          RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not carried by \

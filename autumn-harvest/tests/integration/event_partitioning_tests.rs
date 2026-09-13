@@ -2039,6 +2039,55 @@ async fn an_operator_trigger_sharing_the_reserved_fk_trigger_name_still_refuses(
 }
 
 #[tokio::test]
+async fn an_operators_own_trigger_calling_the_reserved_function_still_refuses() {
+    // Review finding: the guard exempted `EXEC_FK_TRIGGER` by FUNCTION
+    // alone, closing the name-collision gap above but opening the
+    // mirror-image one. An operator's own trigger, under its own name,
+    // can call `harvest_events_require_execution` too. That function is
+    // part of the base migration. It is present whether or not the
+    // shard ever converts. The guard now exempts a trigger only when
+    // both its name and its function match harvest's own.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP TRIGGER IF EXISTS operator_reuses_harvest_fn_trg ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray trigger from a previous run");
+    diesel::sql_query(
+        "CREATE TRIGGER operator_reuses_harvest_fn_trg BEFORE INSERT ON harvest_events \
+         FOR EACH ROW EXECUTE FUNCTION harvest_events_require_execution()",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator trigger reusing harvest's own reserved function");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "a trigger merely calling the reserved function, under an operator's own \
+             name, must not be exempted from the guard",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("operator_reuses_harvest_fn_trg"),
+        "the refusal must name the offending trigger; got {msg}"
+    );
+
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP TRIGGER operator_reuses_harvest_fn_trg ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending trigger");
+}
+
+#[tokio::test]
 async fn an_operator_trigger_whose_function_lives_in_another_schema_still_refuses() {
     // Review finding: the fix for the reserved-name gap added
     // `p.pronamespace = c.relnamespace` to the join. An INNER JOIN with
