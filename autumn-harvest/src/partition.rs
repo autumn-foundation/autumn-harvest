@@ -1232,30 +1232,35 @@ async fn refuse_if_row_security(conn: &mut AsyncPgConnection, verb: &str) -> Har
     )))
 }
 
-/// User-defined unique indexes on `harvest_events` that do not include
-/// `cohort`.
+/// User-defined unique indexes on `harvest_events` that cannot survive
+/// conversion unchanged: either missing `cohort`, or backed by a
+/// constraint the replay step cannot carry forward.
 ///
 /// Excludes only the two constraint-backed indexes the enable script itself
 /// owns and replaces: `harvest_events_pkey` and
 /// `harvest_events_workflow_exec_id_event_id_key`, both of which add
 /// `cohort` explicitly.
 ///
-/// Review finding: the exclusion used to match ANY constraint-backed index,
-/// not just harvest's own two. `capture_index_defs` separately skips every
-/// constraint-backed index, assuming the two above are the only ones. An
-/// operator's own `UNIQUE` constraint fell through both checks unnoticed —
-/// this preflight never flagged it, and the replay step never carried it
-/// forward. The constraint then survived only on the legacy partition,
-/// silently weaker than it was before conversion. Naming harvest's own two
-/// constraints explicitly closes that gap: anything else constraint-backed
-/// is now checked exactly like an ordinary unique index.
+/// Review finding: naming harvest's own two constraints explicitly (rather
+/// than exempting every constraint-backed index) closed one gap, but left
+/// another. `capture_index_defs` skips every constraint-backed index
+/// unconditionally. It does this regardless of whether the index carries
+/// `cohort`. An operator's own compatible constraint, say `UNIQUE
+/// (external_id, cohort)`, now passes THIS check, since cohort is
+/// present. It is still silently dropped by that replay step. No code
+/// path recreates any constraint but harvest's own two. Flagging every
+/// non-harvest constraint-backed index here, regardless of `cohort`,
+/// closes that gap. There is no support for replaying an arbitrary
+/// constraint, so any operator constraint refuses the conversion rather
+/// than being silently lost.
 ///
-/// **Why this blocks the conversion.** Postgres requires the partition key
-/// in every unique index on a partitioned table. `capture_index_defs`
-/// replays every non-constraint index verbatim onto the new parent. A
-/// unique index that predates partitioning and does not carry `cohort` is
-/// a perfectly ordinary index on the flat layout. It makes `CREATE UNIQUE
-/// INDEX` fail once the parent is partitioned.
+/// **Why an ordinary index without `cohort` blocks the conversion.**
+/// Postgres requires the partition key in every unique index on a
+/// partitioned table. `capture_index_defs` replays every non-constraint
+/// index verbatim onto the new parent. A unique index that predates
+/// partitioning and does not carry `cohort` is a perfectly ordinary index
+/// on the flat layout. It makes `CREATE UNIQUE INDEX` fail once the parent
+/// is partitioned.
 ///
 /// Checked against only the first `indnkeyatts` entries of `indkey` — the
 /// true key columns. An `INCLUDE`d column does not participate in
@@ -1283,9 +1288,12 @@ pub async fn unique_indexes_missing_cohort(
                   AND con.conname IN ('harvest_events_pkey',
                                       'harvest_events_workflow_exec_id_event_id_key')
             )
-            AND NOT EXISTS (
-                SELECT 1 FROM generate_series(0, i.indnkeyatts - 1) k
-                 WHERE i.indkey[k] = cohort_attr.attnum
+            AND (
+                EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)
+                OR NOT EXISTS (
+                    SELECT 1 FROM generate_series(0, i.indnkeyatts - 1) k
+                     WHERE i.indkey[k] = cohort_attr.attnum
+                )
             )
           ORDER BY 1",
     )
@@ -1311,15 +1319,19 @@ async fn refuse_if_unique_index_without_cohort(
         return Ok(());
     }
     Err(HarvestError::Config(format!(
-        "refusing to {verb} harvest_events: {} that does not include `cohort` ({}). \
-         Postgres requires the partition key in every unique index on a partitioned \
-         table, so replaying it onto the partitioned parent would fail. Adding `cohort` \
-         to it is not offered automatically: `cohort` is the row's append instant, so a \
-         unique index that spans it is weaker than the index is today — exactly the \
-         reason the engine's own (workflow_exec_id, event_id) uniqueness moved into the \
-         insert trigger rather than a wider constraint. Drop the index if it is obsolete, \
-         or recreate it including `cohort` yourself if that weaker guarantee is \
-         acceptable for your use of it.",
+        "refusing to {verb} harvest_events: {} that cannot survive conversion unchanged \
+         ({}). Either it does not include `cohort` — Postgres requires the partition key \
+         in every unique index on a partitioned table, so replaying it onto the \
+         partitioned parent would fail — or it is backed by a table constraint other \
+         than harvest's own PRIMARY KEY and (workflow_exec_id, event_id) UNIQUE \
+         constraint, which the conversion has no way to replay and would otherwise drop \
+         silently. Adding `cohort` to a plain index is not offered automatically: \
+         `cohort` is the row's append instant, so a unique index that spans it is weaker \
+         than the index is today — exactly the reason the engine's own (workflow_exec_id, \
+         event_id) uniqueness moved into the insert trigger rather than a wider \
+         constraint. Drop the index or constraint if it is obsolete, or recreate it \
+         including `cohort` yourself if that weaker guarantee is acceptable for your use \
+         of it.",
         if bad.len() == 1 {
             "it carries a unique index"
         } else {
@@ -2305,6 +2317,46 @@ pub async fn disable_partitioning(
     refuse_if_operator_triggers(conn, "revert").await?;
     let report = Box::pin(
         conn.transaction::<DisableReport, HarvestError, _>(async |conn| {
+            // Review finding: the dependent-view and operator-trigger checks
+            // above ran in a separate round-trip, before this transaction
+            // even opened. That is well before anything here takes a lock
+            // stronger than ACCESS SHARE. A view or trigger created in that
+            // gap could commit before the rename further down. So could
+            // one created during the row deletes below, which lock only
+            // the rows they touch. Either way it would then be destroyed
+            // when the reclaimed parent is dropped. `LOCK TABLE` on a
+            // partitioned parent recurses onto every partition by
+            // default, so this also covers a view or trigger attached
+            // directly to a leaf. Recheck both now, under the lock this
+            // revert holds for the rest of the transaction.
+            exec(conn, "LOCK TABLE harvest_events IN ACCESS EXCLUSIVE MODE").await?;
+            let views = dependent_views(conn).await?;
+            if !views.is_empty() {
+                return Err(HarvestError::Config(format!(
+                    "refusing to revert harvest_events: {} depend on it ({}), created \
+                     after the preflight check ran but before this transaction's ACCESS \
+                     EXCLUSIVE lock. Drop the view (and recreate it against \
+                     harvest_events afterward), then re-run.",
+                    if views.len() == 1 { "a view" } else { "views" },
+                    views.join(", ")
+                )));
+            }
+            let triggers = operator_triggers(conn).await?;
+            if !triggers.is_empty() {
+                return Err(HarvestError::Config(format!(
+                    "refusing to revert harvest_events: {} not carried by CREATE TABLE \
+                     ... (LIKE ...) ({}), installed after the preflight check ran but \
+                     before this transaction's ACCESS EXCLUSIVE lock. Drop the trigger \
+                     (and recreate it against harvest_events afterward), then re-run.",
+                    if triggers.len() == 1 {
+                        "a trigger is"
+                    } else {
+                        "triggers are"
+                    },
+                    triggers.join(", ")
+                )));
+            }
+
             let index_defs = capture_index_defs(conn).await?;
 
             // The flat layout restores `UNIQUE (workflow_exec_id, event_id)` and
@@ -3685,6 +3737,36 @@ fn dependent_views_guard_sql(tag: &str) -> String {
     )
 }
 
+/// A `DO` block refusing when an operator trigger sits on `harvest_events`.
+/// Tagged with `tag`, so it can appear more than once in the same
+/// generated script.
+///
+/// Review finding: phase 1's copy of this check has the identical gap
+/// [`dependent_views_guard_sql`] closes. Phase 4 recheck it too, right
+/// alongside the view recheck, under the same lock.
+#[must_use]
+fn operator_triggers_guard_sql(tag: &str) -> String {
+    format!(
+        "DO ${tag}$\nDECLARE bad text;\nBEGIN\n    \
+         SELECT string_agg(tg.tgname, ', ' ORDER BY 1) INTO bad\n      \
+         FROM pg_trigger tg\n      \
+         JOIN pg_class c ON c.oid = tg.tgrelid\n      \
+         JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
+         JOIN pg_proc p ON p.oid = tg.tgfoid\n     \
+         WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
+         AND NOT tg.tgisinternal\n       \
+         AND NOT (p.proname = 'harvest_events_require_execution'\n                      \
+         AND p.pronamespace = c.relnamespace);\n    \
+         IF bad IS NOT NULL THEN\n        \
+         RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not carried by \
+         CREATE TABLE ... (LIKE ...) (%). An operator trigger would stay on the \
+         renamed legacy table after phase 4, where it stops firing for every new row \
+         from cutover onward while still existing. Drop the trigger (and recreate it \
+         against harvest_events afterward) before running this plan.', bad;\n    \
+         END IF;\nEND\n${tag}$;"
+    )
+}
+
 /// One statement of the large-live-table conversion plan.
 ///
 /// The plan exists in exactly one form — this list — and
@@ -3853,16 +3935,22 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
              AND con.conname IN ('harvest_events_pkey',\n                                 \
              'harvest_events_workflow_exec_id_event_id_key')\n       \
              )\n       \
-             AND NOT EXISTS (\n           \
-             SELECT 1 FROM generate_series(0, i.indnkeyatts - 1) k\n            \
-             WHERE i.indkey[k] = ca.attnum\n       \
+             AND (\n           \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)\n           \
+             OR NOT EXISTS (\n               \
+             SELECT 1 FROM generate_series(0, i.indnkeyatts - 1) k\n                \
+             WHERE i.indkey[k] = ca.attnum\n           \
+             )\n       \
              );\n    \
              IF bad IS NOT NULL THEN\n        \
-             RAISE EXCEPTION 'harvest #958: harvest_events carries a unique index that does \
-             not include `cohort` (%). Postgres requires the partition key in every unique \
-             index on a partitioned table, so phase 4 replaying this index onto the \
-             partitioned parent would fail. Drop the index if it is obsolete, or recreate \
-             it including `cohort` yourself, before running this plan.', bad;\n    \
+             RAISE EXCEPTION 'harvest #958: harvest_events carries a unique index that \
+             cannot survive conversion unchanged (%). Either it does not include \
+             `cohort` -- Postgres requires the partition key in every unique index on a \
+             partitioned table, so phase 4 replaying it would fail -- or it is backed by \
+             a table constraint other than harvest''s own two, which phase 4 has no way \
+             to replay and would otherwise drop silently. Drop the index or constraint if \
+             it is obsolete, or recreate it including `cohort` yourself, before running \
+             this plan.', bad;\n    \
              END IF;\nEND\n$harvest_uniq_958$;"
                 .to_string(),
         ),
@@ -3883,27 +3971,7 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // `CREATE TABLE ... (LIKE ...)` does not carry triggers. An operator
         // trigger would stay on the renamed legacy table after phase 4. It
         // would then stop firing for every new row from cutover onward.
-        step(
-            1,
-            "DO $harvest_trg_958$\nDECLARE bad text;\nBEGIN\n    \
-             SELECT string_agg(tg.tgname, ', ' ORDER BY 1) INTO bad\n      \
-             FROM pg_trigger tg\n      \
-             JOIN pg_class c ON c.oid = tg.tgrelid\n      \
-             JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
-             JOIN pg_proc p ON p.oid = tg.tgfoid\n     \
-             WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
-             AND NOT tg.tgisinternal\n       \
-             AND NOT (p.proname = 'harvest_events_require_execution'\n                      \
-             AND p.pronamespace = c.relnamespace);\n    \
-             IF bad IS NOT NULL THEN\n        \
-             RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not carried by \
-             CREATE TABLE ... (LIKE ...) (%). An operator trigger would stay on the \
-             renamed legacy table after phase 4, where it stops firing for every new row \
-             from cutover onward while still existing. Drop the trigger (and recreate it \
-             against harvest_events afterward) before running this plan.', bad;\n    \
-             END IF;\nEND\n$harvest_trg_958$;"
-                .to_string(),
-        ),
+        step(1, operator_triggers_guard_sql("harvest_trg_958")),
         // ── 1: bake the chosen width into the cohort function ─────────────
         step(1, cohort_function_sql(width)),
         // ── 2: the partition-key indexes, built without blocking ──────────
@@ -4032,6 +4100,22 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // ── 4: THE WINDOW — one transaction, metadata only ────────────────
         step(4, "BEGIN".to_string()),
         step(4, format!("SET LOCAL lock_timeout = '{lock_ms}ms'")),
+        // Review finding: the recheck below is only as good as the lock it
+        // runs under. `BEGIN` and `SET LOCAL` take no lock on
+        // `harvest_events` at all. Every statement up to this point is a
+        // plain catalog read, ACCESS SHARE at most. Without this explicit
+        // `LOCK TABLE`, a concurrent `CREATE VIEW` could still commit
+        // after the recheck. It could still commit before the actual
+        // rename several steps below. That is exactly the race being
+        // closed. Taking ACCESS EXCLUSIVE here, once, makes every
+        // catalog read for the rest of this transaction see a state
+        // that cannot change before the rename commits. That covers the
+        // recheck, the phase-2 completeness assertion, and the
+        // index-definition capture alike.
+        step(
+            4,
+            "LOCK TABLE harvest_events IN ACCESS EXCLUSIVE MODE".to_string(),
+        ),
         // Review finding: phase 1's dependent-view check ran hours before
         // this window, under this plan's online path. A view created (or
         // repointed) at `harvest_events` in that gap would pass phase 1
@@ -4040,7 +4124,11 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // actually converts under, so the state being checked is the
         // state being converted.
         step(4, dependent_views_guard_sql("harvest_view_cutover_958")),
-        // The first thing inside the window, so a plan resumed over a lost
+        // Review finding: phase 1's trigger check has the identical gap
+        // the view recheck above just closed. Recheck it too, under the
+        // same lock.
+        step(4, operator_triggers_guard_sql("harvest_trg_cutover_958")),
+        // Still before anything renames, so a plan resumed over a lost
         // phase-2 build aborts before it has renamed anything. Without it,
         // `ATTACH PARTITION` below discovers the missing index only once the
         // exclusive lock is held, and builds it there.

@@ -734,6 +734,104 @@ async fn the_large_table_plans_phase_1_also_refuses_a_constraint_backed_unique_i
 }
 
 #[tokio::test]
+async fn a_compatible_constraint_backed_unique_index_still_refuses() {
+    // Review finding: a constraint-backed unique index that DOES include
+    // `cohort` passed the missing-cohort check. `capture_index_defs`
+    // still excludes every constraint-backed index unconditionally,
+    // though, and only harvest's own two are ever recreated. The
+    // operator's own otherwise-compatible constraint was silently
+    // dropped during conversion. There is no support for replaying an
+    // arbitrary constraint, so refuse instead of silently losing it.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS uq_compatible_event_type_958",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray constraint from a previous run");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT uq_compatible_event_type_958 \
+         UNIQUE (id, cohort)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator's own constraint-backed unique index that includes cohort");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "a compatible constraint-backed unique index must still refuse the \
+             conversion -- there is no support for replaying it, so succeeding \
+             would silently drop it",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("uq_compatible_event_type_958"),
+        "the refusal must name the offending index; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT uq_compatible_event_type_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending constraint");
+}
+
+#[tokio::test]
+async fn the_large_table_plans_phase_1_also_refuses_a_compatible_constraint_backed_index() {
+    // Same guard, the scripted path.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS uq_plan_compatible_event_type_958",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray constraint from a previous run");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT uq_plan_compatible_event_type_958 \
+         UNIQUE (id, cohort)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator's own constraint-backed unique index that includes cohort");
+
+    let mut refusal: Option<String> = None;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 1)
+    {
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            refusal = Some(e.to_string());
+        }
+    }
+    let msg = refusal.expect(
+        "phase 1 of the plan must refuse a compatible constraint-backed unique index \
+         too, not exempt it for including cohort",
+    );
+    assert!(
+        msg.contains("uq_plan_compatible_event_type_958"),
+        "the refusal must name the offending index; got {msg}"
+    );
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT uq_plan_compatible_event_type_958",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("drop the offending constraint");
+}
+
+#[tokio::test]
 async fn a_dependent_view_refuses_the_conversion_instead_of_silently_going_stale() {
     // Issue #1270 item 14: Postgres tracks a view's dependency by relation
     // OID, not by name. Both conversion paths rename `harvest_events` out
@@ -2777,6 +2875,105 @@ async fn partition_maintenance_runs_at_startup_not_after_a_full_tick_interval() 
 }
 
 #[tokio::test]
+async fn the_startup_pass_runs_partition_maintenance_only_not_the_whole_tick() {
+    // Review finding: the immediate startup pass exists for one stated
+    // reason (issue #1270 item 5) — an uncovered write window after a
+    // restart. It used to be implemented by pre-loading the shared
+    // trigger channel. That made the very first tick win the race
+    // against `sleep`. It then ran the WHOLE janitor tick: history
+    // retention plus the audit, schedule, summary and rate-limit purges,
+    // across every shard. A fleet whose processes restart together turns
+    // that into a coordinated scan/delete stampede.
+    //
+    // Prove the startup pass does ONLY partition maintenance. Seed an
+    // expired execution under a history-retention age. Spawn with a long
+    // `tick_interval`, and confirm the execution SURVIVES the startup
+    // pass even though partition maintenance has already run. Then call
+    // `run_now()` and confirm a real full tick still collects it.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    let old = Utc::now() - chrono::Duration::days(30);
+    seed_expired(&mut conn, "startup_wf", "startup-1", old).await;
+
+    let pool = build_pool(&url);
+    let pools = ShardedDbPool::single(pool);
+    let config = RetentionConfig {
+        // Long enough that only the startup pass could touch the shard
+        // before the assertion below. Not this test's own patience, and
+        // not `run_now()` — it is not called yet.
+        tick_interval_secs: 3600,
+        ..RetentionConfig::with_max_age(Duration::from_secs(86_400))
+    };
+
+    let started = Utc::now();
+    let runtime = RetentionRuntime::spawn(pools, config, Arc::new(NoopMetrics), None, None)
+        .expect("retention runtime should spawn when enabled");
+
+    let mut saw_maintenance = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snap = runtime.monitor().snapshot();
+        if let Some(r) = snap.per_shard.iter().find(|r| r.shard == 0)
+            && r.partition_maintenance
+                .as_ref()
+                .and_then(|m| m.at)
+                .is_some_and(|at| at >= started)
+        {
+            saw_maintenance = true;
+            break;
+        }
+    }
+    assert!(
+        saw_maintenance,
+        "partition maintenance must still run at startup"
+    );
+
+    // A little more room: on this shard, workflow-history retention
+    // should never have run yet. There is no stamp to wait for; only
+    // time to let it happen, if the startup pass wrongly ran it too.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        scalar_i64(
+            &mut conn,
+            "SELECT COUNT(*)::bigint AS n FROM harvest_workflow_executions \
+             WHERE workflow_id = 'startup-1'"
+        )
+        .await,
+        1,
+        "the startup pass must not have run workflow-history retention — the \
+         expired execution must still be here"
+    );
+
+    // Now prove `run_now()` still gets a real, full tick.
+    runtime.run_now();
+    let mut deleted = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if scalar_i64(
+            &mut conn,
+            "SELECT COUNT(*)::bigint AS n FROM harvest_workflow_executions \
+             WHERE workflow_id = 'startup-1'",
+        )
+        .await
+            == 0
+        {
+            deleted = true;
+            break;
+        }
+    }
+    runtime.shutdown();
+    assert!(
+        deleted,
+        "run_now() must still trigger a full tick, collecting the expired execution"
+    );
+}
+
+#[tokio::test]
 async fn partition_maintenance_stays_none_on_a_shard_that_never_converted() {
     // Issue #1270 item 6: the maintenance block is gated on
     // `config.partitions.enabled`, not on the detected layout. `maintain`
@@ -4736,6 +4933,188 @@ async fn phase_4_rechecks_dependent_views_created_after_phase_1() {
         .execute(&mut conn)
         .await
         .expect("drop the offending view");
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {}", plan_pk_index()))
+        .execute(&mut conn)
+        .await
+        .expect("drop the index phase 2 legitimately built");
+    diesel::sql_query(format!(
+        "DROP INDEX IF EXISTS {}_exec_event_idx",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the other index phase 2 legitimately built");
+    diesel::sql_query(format!(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS {}_cohort_ck",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the constraint phase 3 legitimately built");
+}
+
+#[tokio::test]
+async fn phase_4_holds_access_exclusive_before_the_dependent_view_recheck() {
+    // Review finding: the recheck above is only as good as the lock it
+    // runs under. `BEGIN` and `SET LOCAL lock_timeout` take no lock on
+    // `harvest_events` at all. Without an explicit `LOCK TABLE`, a
+    // concurrent `CREATE VIEW` could still commit after the recheck ran.
+    // It could still commit before the actual rename several steps
+    // later. That is the exact race the recheck exists to close. Prove
+    // the lock is real: hold phase 4 open right after its `LOCK TABLE`
+    // step. Then show a concurrent `CREATE VIEW` blocks, rather than
+    // commits, while it is held.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    run_plan_phases(&mut conn, 1..=3).await;
+
+    let steps: Vec<_> = partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 4)
+        .collect();
+    let lock_pos = steps
+        .iter()
+        .position(|s| {
+            s.sql
+                .contains("LOCK TABLE harvest_events IN ACCESS EXCLUSIVE MODE")
+        })
+        .expect("phase 4 must have an explicit LOCK TABLE step before the recheck");
+
+    for step in &steps[..=lock_pos] {
+        diesel::sql_query(&step.sql)
+            .execute(&mut conn)
+            .await
+            .unwrap_or_else(|e| panic!("phase 4 step up to the lock: {e}"));
+    }
+
+    // A second session's `CREATE VIEW` takes only ACCESS SHARE on
+    // `harvest_events`, which conflicts with the ACCESS EXCLUSIVE the
+    // first session is holding. A short `statement_timeout` turns
+    // "blocks" into an observable failure instead of an indefinite hang.
+    let mut racer = connect(&url).await;
+    diesel::sql_query("SET statement_timeout = '500ms'")
+        .execute(&mut racer)
+        .await
+        .expect("set a short timeout on the racer");
+    let err = diesel::sql_query(
+        "CREATE VIEW harvest_events_lock_race_958 AS SELECT event_type FROM harvest_events",
+    )
+    .execute(&mut racer)
+    .await
+    .expect_err(
+        "a concurrent CREATE VIEW must block on the held ACCESS EXCLUSIVE lock, \
+         not commit while phase 4 is mid-flight",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("statement timeout") || msg.contains("canceling statement"),
+        "must fail because it was blocked waiting on the lock, not some other reason; \
+         got {msg}"
+    );
+
+    // Roll back the still-open phase-4 transaction so it does not leave
+    // the shard mid-conversion for a later test.
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut conn)
+        .await
+        .expect("roll back the held-open phase-4 transaction");
+
+    // Phases 1-3 each commit on their own (unlike phase 4). Clean up
+    // their artifacts exactly like the sibling recheck test above.
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {}", plan_pk_index()))
+        .execute(&mut conn)
+        .await
+        .expect("drop the index phase 2 legitimately built");
+    diesel::sql_query(format!(
+        "DROP INDEX IF EXISTS {}_exec_event_idx",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the other index phase 2 legitimately built");
+    diesel::sql_query(format!(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS {}_cohort_ck",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the constraint phase 3 legitimately built");
+}
+
+#[tokio::test]
+async fn phase_4_rechecks_an_operator_trigger_installed_after_phase_1() {
+    // Review finding: phase 4 got a dependent-view recheck but no
+    // equivalent operator-trigger recheck. Phase 1's trigger guard has
+    // the identical hours-long gap to phase 4's rename, though. An
+    // operator trigger installed in that gap would pass phase 1 clean,
+    // then silently stop firing for every new row after cutover.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    run_plan_phases(&mut conn, 1..=3).await;
+
+    // Simulate a trigger installed in the gap between phase 1 and phase 4.
+    diesel::sql_query("DROP TRIGGER IF EXISTS harvest_events_late_trg_958 ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray trigger from a previous run");
+    diesel::sql_query("DROP FUNCTION IF EXISTS harvest_events_late_trg_958_fn()")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray trigger function from a previous run");
+    diesel::sql_query(
+        "CREATE FUNCTION harvest_events_late_trg_958_fn() RETURNS trigger AS $$ \
+         BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a trigger function");
+    diesel::sql_query(
+        "CREATE TRIGGER harvest_events_late_trg_958 BEFORE INSERT ON harvest_events \
+         FOR EACH ROW EXECUTE FUNCTION harvest_events_late_trg_958_fn()",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a trigger installed after phase 1's check already passed");
+
+    let mut refusal: Option<String> = None;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 4)
+    {
+        // Phase 4's steps share one transaction. Only the FIRST error is
+        // the signal; the loop still runs to the trailing `COMMIT`, which
+        // Postgres always accepts even mid-abort.
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await
+            && refusal.is_none()
+        {
+            refusal = Some(e.to_string());
+        }
+    }
+    let msg = refusal
+        .expect("phase 4 must refuse a trigger installed after phase 1's check already passed");
+    assert!(
+        msg.contains("harvest_events_late_trg_958"),
+        "the refusal must name the offending trigger; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused window must leave the shard exactly as it was"
+    );
+
+    // Phases 1-3 each commit on their own (unlike phase 4). Clean up
+    // their artifacts exactly like the sibling recheck test above.
+    diesel::sql_query("DROP TRIGGER harvest_events_late_trg_958 ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending trigger");
+    diesel::sql_query("DROP FUNCTION harvest_events_late_trg_958_fn()")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending trigger function");
     diesel::sql_query(format!("DROP INDEX IF EXISTS {}", plan_pk_index()))
         .execute(&mut conn)
         .await
