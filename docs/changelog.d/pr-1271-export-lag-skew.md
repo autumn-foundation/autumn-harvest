@@ -30,9 +30,12 @@ sink outage the gauge exists to catch.
 
 `harvest_audit_log_export_seq_idx` gains `occurred_at` as a second key
 column (same leading column, same partial predicate), so the bounded scan
-is index-only. Every existing use of the index — the claim scan's `ORDER
-BY export_seq LIMIT n`, the redrive lookup's `MIN(export_seq)` — is
-unaffected.
+skips the heap fetch on a page the visibility map already covers. Every
+existing use of the index — the claim scan's `ORDER BY export_seq LIMIT
+n`, the redrive lookup's `MIN(export_seq)` — is unaffected. The migration
+checks the index's key-column count before rebuilding it, so an operator's
+out-of-band `CONCURRENTLY` pre-build (documented in the migration) makes
+this migration's own statement a no-op instead of undoing it.
 
 ### Tests (TDD red → green → refactor)
 
@@ -41,4 +44,11 @@ unaffected.
   reproduces the skew directly (a backdated row stamped with a *higher*
   `export_seq` than a recent row with a *lower* one) and asserts the
   reported lag tracks the older row. Confirmed failing pre-fix (~5s
-  reported instead of ~200s).
+  reported instead of ~200s). Also asserts the bounded gauge agrees with
+  the exact admin-view query (`pending_and_lag`) on this input.
+* `lag_window_still_catches_skew_at_its_last_covered_position` and
+  `lag_window_does_not_reach_skew_just_beyond_it` pin the
+  `EXPORT_LAG_LOOKBACK_ROWS` boundary itself: a skewed row at the window's
+  last position is found, and one immediately past it is not — proving the
+  bound is wired to the documented constant, not off by one in either
+  direction.

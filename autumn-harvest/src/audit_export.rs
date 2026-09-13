@@ -1431,12 +1431,15 @@ struct OldestInWindow {
 /// - Not-yet-sequenced rows: `MIN(occurred_at) WHERE export_seq IS NULL`.
 ///   An index-min on `harvest_audit_log_unexported_idx` serves this.
 /// - Sequenced-but-unacknowledged rows: `MIN(occurred_at)` over the lowest
-///   [`EXPORT_LAG_LOOKBACK_ROWS`] pending sequences (issue #1271). An
-///   index-only scan on `harvest_audit_log_export_seq_idx` serves this.
-///   Sequences are assigned in `(occurred_at, id)` order within one
-///   exporter tick. So skew between sequence and `occurred_at` comes only
-///   from a row a later tick sequenced, while an earlier tick's row stayed
-///   invisible. See [`EXPORT_LAG_LOOKBACK_ROWS`] for the accepted bound.
+///   [`EXPORT_LAG_LOOKBACK_ROWS`] pending sequences (issue #1271). The
+///   covering index `harvest_audit_log_export_seq_idx` on
+///   `(export_seq, occurred_at)` serves this without a heap fetch, on a
+///   page whose visibility map bit is already set. An unvacuumed page
+///   still costs one fetch. Sequences are assigned in `(occurred_at, id)` order
+///   within one exporter tick. So skew between sequence and `occurred_at`
+///   comes only from a row a later tick sequenced, while an earlier tick's
+///   row stayed invisible. See [`EXPORT_LAG_LOOKBACK_ROWS`] for the
+///   accepted bound.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
