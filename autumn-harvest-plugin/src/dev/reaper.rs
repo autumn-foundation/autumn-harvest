@@ -697,8 +697,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_directory_under_localappdata_is_trusted_on_windows() {
-        let base =
-            std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA must be set on Windows");
+        let base = std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA must be set on Windows");
         let dir = std::path::PathBuf::from(base).join("harvest-dev-test-1287-trusted");
         std::fs::create_dir_all(&dir).expect("create dir");
         let metadata = std::fs::symlink_metadata(&dir).expect("metadata");
