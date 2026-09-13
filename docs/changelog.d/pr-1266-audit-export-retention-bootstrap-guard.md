@@ -775,6 +775,31 @@ never lowercased. `from_dsns_keeps_distinctly_cased_socket_paths_separate`
 already pinned the intended behavior; it simply could not previously
 fail on the Linux runner this repository was developed against.
 
+CI's `Test DB (linux)` job caught a third issue on `6a51a35`, this time
+in a test rather than in engine code: the integration suite needs a
+live `PostgreSQL` via testcontainers, which this sandbox's Docker
+daemon cannot start, so this test's assertion had never actually run
+before landing on a runner that could run it.
+`retention_still_waits_on_a_decommissioned_shards_ack_while_the_flag_protects_the_group`
+failed with one row purged where none was expected. The pending check
+in `purge_old_audit_records` compares every colocated cursor's
+`last_acked_seq` against a row's raw `export_seq`, deliberately not
+scoped to the row's own shard -- the four other tests in this file
+that exercise `colocated_shard_ids` all rely on exactly that coarse,
+whole-group comparison, so narrowing it to a per-shard join was
+rejected as a regression against already-established, deliberate
+behavior. The test had stamped shard 1's frozen cursor to
+`last_acked_seq = 1`, which happens to equal shard 0's first row's own
+`export_seq`; since the comparison is strictly-greater, that one row
+was not "greater than" either cursor and purged on its own accord --
+correctly, since shard 0 had already fully acknowledged it -- while
+the other four, all comparing greater than shard 1's frozen value,
+stayed blocked. Left at its fresh-`INSERT` default of
+`last_acked_seq = 0` instead of a stamped value, every positive
+`export_seq` compares strictly greater than the frozen cursor, closing
+the off-by-one gap the stamped value opened without changing what the
+test is actually verifying.
+
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call
 site's behavior when the new flag is left at its default (disabled).

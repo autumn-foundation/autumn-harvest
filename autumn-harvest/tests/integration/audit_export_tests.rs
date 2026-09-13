@@ -2521,15 +2521,15 @@ async fn retention_still_waits_on_a_decommissioned_shards_ack_while_the_flag_pro
     assert_eq!(cursor_acked(&mut conn, 0).await, 5);
     uninstall();
 
+    // Left at its fresh-INSERT default of `last_acked_seq = 0` (never
+    // ticked), rather than stamped to some specific stale value. The
+    // pending check below compares every colocated cursor's
+    // `last_acked_seq` against a row's raw `export_seq`. It is not
+    // scoped to the row's own shard. A stamped value sharing a row's
+    // exact `export_seq` would let that one row alone slip through, an
+    // off-by-one artifact of that comparison. Zero has no such edge:
+    // every positive `export_seq` compares strictly greater than it.
     ensure_cursor_row(&mut conn, 1).await.expect("cursor row");
-    {
-        use autumn_harvest::schema::harvest_audit_export_cursor::dsl as cur;
-        diesel::update(cur::harvest_audit_export_cursor.find(1))
-            .set(cur::last_acked_seq.eq(1))
-            .execute(&mut conn)
-            .await
-            .expect("stamp stale ack");
-    }
     assert!(
         autumn_harvest::audit_export::decommission_cursor(&mut conn, 1)
             .await
@@ -2549,8 +2549,9 @@ async fn retention_still_waits_on_a_decommissioned_shards_ack_while_the_flag_pro
     assert_eq!(
         deleted, 0,
         "an operator explicitly protecting this pool group must still \
-         see shard 1's retired, stale cursor block purging, since shard \
-         1 may be mid-re-enablement and has not yet ticked to un-retire it"
+         see shard 1's retired, never-ticked cursor block purging, since \
+         shard 1 may be mid-re-enablement and has not yet ticked to \
+         un-retire it"
     );
 }
 
