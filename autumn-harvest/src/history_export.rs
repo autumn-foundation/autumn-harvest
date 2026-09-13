@@ -490,14 +490,16 @@ const fn decimal_digit_width(n: usize) -> usize {
     if n == 0 { 1 } else { n.ilog10() as usize + 1 }
 }
 
-/// `size_limit.actual_bytes` is itself a field inside `document`, so the
-/// document's own serialized length depends on how many decimal digits that
-/// one field renders as -- a self-referential fixed point. Every other byte
-/// of the document is invariant across guesses at that field's value, so
-/// the fixed point is solved with exactly one real serialization (which
-/// also reveals `constant`, the length of everything else) plus O(1)
-/// arithmetic on the digit width, instead of re-serializing the whole
-/// document again for every guess.
+/// `size_limit.actual_bytes` is itself a field inside `document`. So the
+/// document's own serialized length depends on how many decimal digits
+/// that one field renders as. That is a self-referential fixed point.
+///
+/// Every other byte of the document is invariant across guesses at that
+/// field's value. So the fixed point is solved with exactly one real
+/// serialization. That one serialization also reveals `constant`, the
+/// length of everything else. The rest of the fixed point is then solved
+/// with O(1) arithmetic on the digit width. This replaces re-serializing
+/// the whole document again for every guess.
 fn measure_export_bytes(document: &mut HistoryExportDocument) -> Result<usize, HistoryExportError> {
     let mut previous = document.size_limit.actual_bytes;
     let mut actual = serde_json::to_vec(document)?.len();
