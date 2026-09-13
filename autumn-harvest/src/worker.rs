@@ -26509,21 +26509,46 @@ impl Worker {
             .collect();
         // One dedicated audit-export task per assigned shard (issue #1269).
         // `enforce_timeouts_once` used to drive `fire_due_audit_exports`
-        // inline on this same cadence. Splitting it out means a slow sink
-        // delays nothing but its own next tick. It also no longer competes
-        // with the timeout checker for a second connection on a
-        // one-connection shard pool.
+        // inline on this same cadence. Splitting it out ends the permanent
+        // self-deadlock a one-connection shard pool used to hit. The checker
+        // no longer holds a connection while the export call asks the same
+        // pool for a second one. A slow delivery can still make the two
+        // tasks take turns for as long as it runs. It self-heals once the
+        // delivery attempt ends, which the old bug never did.
         let audit_export_checkers: Vec<_> = shard_pools_for_monitors
             .iter()
-            .map(|(shard_pool, shard)| {
-                crate::audit_export::spawn_audit_export_checker_for_shard(
-                    shard_pool.clone(),
+            .filter_map(|(shard_pool, shard)| {
+                // Unlike the other per-shard monitors above, this resolves
+                // each shard's EXACT pool rather than trust `shard_pool` (a
+                // soft, default-shard-falling-back lookup via
+                // `ShardedDbPool::pool_for`). `fire_due_audit_exports`'s own
+                // sharded arm made the same choice, for the same reason. A
+                // wrong pool here would silently stamp one shard's audit
+                // rows under another shard's `(shard, seq)` key. That is
+                // worse than a loud, recoverable skip.
+                let resolved =
+                    if let (Some(s), Some(sp)) = (*shard, self.config.sharded_pool.as_ref()) {
+                        let Some(exact) = sp.exact_pool_for(s) else {
+                            tracing::error!(
+                                shard = s.as_i32(),
+                                "assigned shard has no exact pool entry in the sharded \
+                             pool; skipping its dedicated audit-export task rather \
+                             than risk stamping records under another shard's key"
+                            );
+                            return None;
+                        };
+                        exact.clone()
+                    } else {
+                        shard_pool.clone()
+                    };
+                Some(crate::audit_export::spawn_audit_export_checker_for_shard(
+                    resolved,
                     self.shutdown.clone(),
                     self.config.poll_interval,
                     self.registry.telemetry().clone(),
                     *shard,
                     self.config.sharded_pool.as_ref(),
-                )
+                ))
             })
             .collect();
         let history_oversized_sampler = spawn_history_oversized_sampler(

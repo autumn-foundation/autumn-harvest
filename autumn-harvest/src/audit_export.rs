@@ -2215,10 +2215,19 @@ pub async fn export_due_audit_batch(
 /// succeed.
 ///
 /// This task owns its connection lifecycle end to end. It never runs nested
-/// inside another resident's checkout. A slow sink now delays nothing but
-/// this task's own next tick. A `max_size(1)` shard pool works too: this
+/// inside another resident's checkout. That nesting is what made the old
+/// failure permanent: the checker always held the pool's only connection
+/// when it tried to claim a second one. Every single tick failed the same
+/// way, forever.
+///
+/// A `max_size(1)` shard pool now works, in the sense that matters: this
 /// task and the timeout checker take the one connection in turn. Neither
-/// one ever needs a second connection while still holding the first.
+/// one needs a second connection while holding the first, so export is no
+/// longer permanently wedged. A slow delivery still holds this task's own
+/// connection for up to the claim lease. On a `max_size(1)` pool the
+/// checker's own tick can be skipped for that same window, but only for
+/// that window. It self-heals the moment the delivery attempt ends. The
+/// old bug never did.
 ///
 /// Registers under [`crate::scanner_health::Scanner::AuditExport`], so a
 /// wedged export task is visible to `scanner_liveness`, exactly like the

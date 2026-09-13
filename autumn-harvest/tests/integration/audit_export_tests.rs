@@ -2654,13 +2654,70 @@ async fn spawn_audit_export_checker_for_shard_exports_independently() {
     uninstall();
 }
 
-/// The held-connection regression this issue exists to fix (Codex review
-/// rounds 15/18 on PR #1261). A shard pool sized for one connection, shared
-/// by the timeout checker AND the export task. Under the old inline design
-/// this shard could never export. The checker's own connection occupied
-/// the pool's only slot before the export call tried to acquire a second
-/// one. The two are independent tasks now. They take turns on the one
-/// connection instead of one needing a second while holding the first.
+/// AC8 on the dedicated task: with no sink configured, the task must never
+/// even attempt a connection checkout, not merely fail gracefully if it
+/// did. Proven here by pointing the task at an unreachable database: if it
+/// ever called `pool.get()`, that call would fail and mark the shard
+/// unobserved. Across several tick intervals with no sink installed,
+/// nothing is ever marked unobserved. That is only possible if the
+/// connection checkout was skipped every single tick.
+#[tokio::test]
+async fn an_unconfigured_dedicated_task_never_attempts_a_connection_checkout() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+
+    let (_conn, container) = make_conn().await;
+    let pool = single_connection_pool(&container).await;
+    container
+        .stop_with_timeout(Some(0))
+        .await
+        .expect("stop container");
+
+    let metrics = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(autumn_harvest::telemetry::TelemetryConfig {
+        metrics: metrics.clone(),
+        ..Default::default()
+    });
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(20),
+        telemetry,
+        Some(autumn_harvest::types::ShardId::new(0)),
+        None,
+    );
+
+    // Several tick intervals' worth of real time, not just one: a single
+    // lucky tick proves nothing about every subsequent one.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    assert!(
+        metrics.observed.lock().expect("observed").is_empty(),
+        "an unconfigured task must never mark a shard unobserved -- that can \
+         only happen after a connection checkout was attempted, which AC8 \
+         forbids; got {:?}",
+        metrics.observed.lock().expect("observed")
+    );
+
+    cancel.cancel();
+    let _ = handle.await;
+}
+
+/// The property this issue's fix rests on. Codex review rounds 15/18 on PR
+/// #1261 named the specific old hazard. The multi-shard fan-out arm of
+/// `fire_due_audit_exports` ran inline while the timeout checker's own
+/// connection from the same pool was still held. It tried to acquire a
+/// SECOND connection from a `max_size(1)` pool and could never succeed.
+///
+/// This test does not re-drive that exact inline call site -- it is gone,
+/// and `enforce_timeouts_once_no_longer_exports_audit_records` above pins
+/// that directly. It instead checks the fix's replacement property. A
+/// shard pool sized for one connection, shared by the timeout checker AND
+/// the export task as two independent tasks, still exports. Neither task
+/// ever holds the connection while asking for a second one. They simply
+/// take turns.
 #[tokio::test]
 async fn a_dedicated_export_task_still_exports_on_a_size_one_pool_shared_with_the_timeout_checker()
 {

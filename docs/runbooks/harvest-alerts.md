@@ -3095,19 +3095,27 @@ because the exporter cannot currently reach this shard to advance it.
 ### Triage steps
 
 1. `curl -s "$HARVEST/admin/audit-export" | jq '.shards[] | select(.shard == <id>)'`.
-2. Read `last_error` on that shard. A connection-acquisition failure logs
-   `[audit_export] failed to get connection to shard ...` or `timed out
-   acquiring a connection for this shard` at `tracing::error!` level; search
-   the worker logs for the shard id around the alert's firing window.
+2. Read `last_error` on that shard. A connection-acquisition failure logs at
+   `tracing::error!` level; search the worker logs for the shard id around
+   the alert's firing window. The dedicated export task (issue #1269, the
+   default shipped path) logs `[audit_export] failed to acquire a
+   connection for the export tick` or `timed out acquiring a connection for
+   the export tick`. An embedder driving `fire_due_audit_exports` by hand
+   instead logs `[audit_export] failed to get connection to shard ...` or
+   `timed out acquiring a connection for this shard`.
 3. Confirm the shard's own database is reachable from the worker: the audit
    exporter (issue #1269: its own dedicated task, one per assigned shard)
    uses the same `ShardedDbPool` as every other per-shard scanner, so a
    shard unreachable here is usually unreachable for claim/timeout
    processing too.
 4. Check the shard's connection pool size. The export task and the timeout
-   checker each take a connection in turn, so a `max_size` of `1` works, but
-   heavy contention on an undersized pool can still exceed
-   `SHARD_ACQUIRE_BOUND` (in `audit_export.rs`) and skip a tick.
+   checker each take a connection in turn, so a `max_size` of `1` no longer
+   deadlocks permanently. A slow sink still holds the export task's
+   connection for up to the claim lease, though, so on a `max_size` of `1`
+   the checker's own ticks can be delayed for that same window; this
+   self-heals once the delivery attempt ends. Either task can still exceed
+   `SHARD_ACQUIRE_BOUND` (in `audit_export.rs`) and skip a tick if
+   contention is sustained.
 
 ### Likely causes
 

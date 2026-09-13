@@ -1413,7 +1413,7 @@
       },
       "management_checks": [
         "GET /admin/audit-export (per-shard cursor, lag, delivery_state, last_error)",
-        "Worker logs for '[audit_export] failed to get connection to shard' or 'timed out acquiring a connection for this shard'"
+        "Worker logs for '[audit_export] failed to acquire a connection for the export tick' or 'timed out acquiring a connection for the export tick' (the dedicated export task, issue #1269), or '[audit_export] failed to get connection to shard' / 'timed out acquiring a connection for this shard' (an embedder driving fire_due_audit_exports by hand)"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_audit_export_unobservable"
     }

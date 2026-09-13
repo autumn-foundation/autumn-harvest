@@ -227,10 +227,14 @@ mid-flight cannot be silently undone.
 
 The exporter runs on its own dedicated task, one per assigned shard
 (`spawn_audit_export_checker_for_shard`, issue #1269). It previously rode
-`enforce_timeouts_once`'s cadence and connection; splitting it out means a
-slow or unresponsive sink delays nothing but its own next tick, and no
-longer competes with the timeout checker for a second connection on a
-one-connection shard pool.
+`enforce_timeouts_once`'s cadence and connection, so a slow sink delayed
+every other resident of that loop, and a one-connection shard pool could
+never export at all: the export call needed a second connection from the
+pool while the checker already held the first. Splitting it out ends that
+permanent deadlock — the two tasks take turns on the pool instead. A slow
+sink can still make the timeout checker wait its turn on a one-connection
+pool for as long as the delivery attempt runs, but that resolves itself the
+moment the attempt ends, which the old failure never did.
 
 ### Retention interaction
 
