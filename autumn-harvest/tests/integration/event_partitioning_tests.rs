@@ -4070,6 +4070,65 @@ async fn disabling_removes_the_index_enabling_created() {
 }
 
 #[tokio::test]
+async fn disable_does_not_drop_an_operator_index_of_the_same_name_but_a_different_shape() {
+    // Review finding: `enable`'s `CREATE INDEX IF NOT EXISTS` leaves an
+    // operator's own pre-existing index of this exact name untouched, so
+    // it never becomes harvest's to remove. The old unconditional `DROP
+    // INDEX IF EXISTS idx_harvest_we_created_at` in `disable` deleted it
+    // anyway -- the same name-collision hazard item 13 fixed in
+    // `down.sql`, still present here.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP INDEX IF EXISTS idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    // A UNIQUE index: a shape `enable` never creates for this name, so it
+    // cannot be mistaken for the one `enable` builds.
+    diesel::sql_query(
+        "CREATE UNIQUE INDEX idx_harvest_we_created_at ON harvest_workflow_executions (id)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator index under the same name");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT to_regclass('idx_harvest_we_created_at') IS NOT NULL AS v"
+        )
+        .await,
+        "precondition: enable's CREATE INDEX IF NOT EXISTS must leave the \
+         operator's index in place, not replace it"
+    );
+
+    partition::disable_partitioning(&mut conn)
+        .await
+        .expect("disable")
+        .expect("the shard was partitioned, so disable must report a revert");
+
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT to_regclass('idx_harvest_we_created_at') IS NOT NULL AS v"
+        )
+        .await,
+        "disable must not drop an operator's own index just because it \
+         shares enable's index name"
+    );
+
+    diesel::sql_query("DROP INDEX idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .expect("drop the operator's index");
+}
+
+#[tokio::test]
 async fn enabling_creates_the_drop_gate_index_the_migration_no_longer_ships() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;

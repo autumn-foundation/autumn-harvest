@@ -176,6 +176,34 @@ const LEGACY_RENAME_SUFFIX: &str = "__pre958";
 /// ROW` trigger that changes a partitioned row's destination.
 const EXEC_FK_TRIGGER: &str = "harvest_events_exec_fk_trg";
 
+/// A boolean SQL expression, evaluating to exactly one row.
+///
+/// Checks that `idx_harvest_we_created_at` exists and has the shape
+/// `enable` creates: a plain (non-unique) single-column btree on
+/// `harvest_workflow_executions (created_at)`, with default opclass and no
+/// predicate or expression. `false` (not an error) when the index does not
+/// exist at all.
+///
+/// [`disable_partitioning`] uses this. It drops the index only when the
+/// shape matches what `enable` built, not an operator's own pre-existing
+/// index that happens to share the name.
+const WE_CREATED_AT_IDX_SHAPE_CHECK_SQL: &str = "SELECT COALESCE((
+       SELECT i.indrelid = 'harvest_workflow_executions'::regclass
+              AND NOT i.indisunique AND i.indpred IS NULL AND i.indexprs IS NULL
+              AND i.indnkeyatts = 1 AND i.indnatts = 1
+              AND i.indkey[0] = (SELECT a.attnum FROM pg_attribute a
+                                  WHERE a.attrelid = 'harvest_workflow_executions'::regclass
+                                    AND a.attname = 'created_at')
+              AND NOT EXISTS (
+                  SELECT 1 FROM unnest(i.indclass) AS oc(opclass)
+                  JOIN pg_opclass op ON op.oid = oc.opclass
+                 WHERE NOT op.opcdefault)
+         FROM pg_class c
+         JOIN pg_index i ON i.indexrelid = c.oid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relname = 'idx_harvest_we_created_at' AND n.nspname = current_schema()
+     ), false) AS v";
+
 /// Name of the transient function [`bounded_rename_fn_sql`] defines.
 ///
 /// Schema-scoped, so it must not collide with an operator's own function of
@@ -2278,7 +2306,15 @@ pub async fn disable_partitioning(
             // `enable`, so it is the path that removes it again,
             // symmetrically. The FK restored above makes the partitioned
             // drop gate's index moot on the flat layout anyway.
-            exec(conn, "DROP INDEX IF EXISTS idx_harvest_we_created_at").await?;
+            //
+            // Review finding: `enable`'s `CREATE INDEX IF NOT EXISTS` leaves
+            // an operator's own pre-existing index of this exact name
+            // untouched, so it never becomes harvest's to remove. Dropping
+            // by name alone would delete that unrelated index. Drop it only
+            // when its shape matches the one `enable` creates.
+            if scalar_bool(conn, WE_CREATED_AT_IDX_SHAPE_CHECK_SQL).await? {
+                exec(conn, "DROP INDEX idx_harvest_we_created_at").await?;
+            }
             Ok(DisableReport {
                 orphans_removed: orphans,
                 duplicates_removed: duplicates,
