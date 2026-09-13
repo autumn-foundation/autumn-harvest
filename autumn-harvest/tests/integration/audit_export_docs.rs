@@ -362,6 +362,14 @@ fn db_gated_test_header_does_not_restate_the_false_claim() {
          caveat (issue #1272)",
         path.display()
     );
+    assert!(
+        !contains_collapsed(&text, "byte-identical behavior when no sink is registered")
+            && !contains_collapsed(&text, "no sink configured means no work at all"),
+        "{}: AC8's read-path guarantee (column, cursor table, scanner \
+         return value) must not be stated as if it covered insert-path \
+         index cost too — scope it to the read path (issue #1272)",
+        path.display()
+    );
 }
 
 /// The whole step stanza containing `needle` in a workflow job block. Spans

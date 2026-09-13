@@ -12,9 +12,10 @@
 //! Verifies the claim/deliver/acknowledge pipeline against a real Postgres
 //! container. The invariants under test are the compliance ones:
 //!
-//! - `unconfigured_export_never_touches_anything` — AC8's "byte-identical
-//!   behavior when no sink is registered", asserted on the column, the cursor
-//!   table, and the scanner's return value.
+//! - `unconfigured_export_never_touches_anything` — AC8's read-path
+//!   guarantee: byte-identical column, cursor table, and scanner return
+//!   value when no sink is registered. The insert-path index cost is
+//!   separate (issue #1272).
 //! - `every_record_is_exported_with_a_dense_monotonic_sequence` — AC4.
 //! - `a_failing_sink_never_advances_the_cursor` and
 //!   `the_same_batch_is_retried_after_a_failure` — AC2's "never advances past
@@ -315,7 +316,10 @@ async fn unconfigured_export_never_touches_anything() {
     let processed = fire_due_audit_exports(&mut conn, &None, &[], &metrics)
         .await
         .expect("scanner runs");
-    assert_eq!(processed, 0, "no sink configured means no work at all");
+    assert_eq!(
+        processed, 0,
+        "no sink configured means the scanner does no work"
+    );
 
     assert!(
         export_seqs(&mut conn).await.iter().all(Option::is_none),
