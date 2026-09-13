@@ -687,6 +687,18 @@ jobs:
       - name: Run plugin connector tests (issue #944)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p autumn-harvest-plugin --features connectors --lib connector
+      # Issue #1287 review: the manifest's `dev_runtime_tests` row (features
+      # `dev-runtime`) and `dev_runtime_managed` row (`compileonly`, so
+      # `--no-run` only) never exercise this crate's `--lib` target, so the
+      # inline `#[cfg(test)]` unit tests inside `src/dev/reaper.rs` and
+      # `src/dev/acquire.rs` — including the Windows-specific
+      # `directory_is_ours` regression tests this issue added — were never
+      # actually built or run on any OS. `dev-runtime-managed` (a superset of
+      # `dev-runtime`) covers both files' tests in one step, on every OS this
+      # job's matrix runs, `windows-latest` included.
+      - name: Run plugin lib tests (dev-runtime-managed feature, issue #1287)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p autumn-harvest-plugin --features dev-runtime-managed --lib
       # Issue #1312. The `redis` feature changes two config paths: it accepts
       # `[harvest.redis] url` instead of rejecting it, and it compiles the
       # channel install. `--lib` without the feature covers neither, so the
@@ -932,6 +944,39 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
+      # The prune above guarantees every shard pulls its testcontainer images
+      # from a cold cache. `testcontainers` itself retries nothing on a pull,
+      # so a transient registry blip (a real one: "bytes remaining on stream"
+      # failed this exact job on issue #1287's PR) fails whichever live-DB
+      # test happened to trigger the pull -- not a real test bug. Retrying
+      # the pull here, in its own step with its own budget, turns that into a
+      # retried infrastructure step instead of a flaky test.
+      #
+      # Every tag this job's suites actually request, not just the
+      # testcontainers-modules default (Codex review: the default alone left
+      # the suites that override it just as exposed as before):
+      # `postgres:11-alpine` (the unoverridden default -- `autumn-web`'s own
+      # `TestDb`, used by e.g. the webhook suites), `postgres:16` (the tag
+      # ~220 of this repo's own DB suites request via `.with_tag("16")`),
+      # `postgres:16-alpine` (one outlier suite's override), and `redis:5.0`
+      # (Redis's default, un-overridden anywhere; needed by the issue #1312
+      # dispatch suites this job also forces via HARVEST_TEST_REQUIRE_REDIS
+      # below).
+      - name: Pre-pull Docker test images (retry transient pull failures)
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          for image in postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0; do
+            for attempt in 1 2 3 4 5; do
+              if docker pull "$image"; then
+                continue 2
+              fi
+              echo "pull of $image failed (attempt $attempt/5)"
+              sleep $((attempt * 5))
+            done
+            echo "::error::failed to pull $image after 5 attempts"
+            exit 1
+          done
       - name: Run Linux Docker-backed manifest suites (shard)
         if: needs.changes.outputs.code == 'true'
         shell: bash
