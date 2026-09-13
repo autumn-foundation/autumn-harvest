@@ -195,20 +195,28 @@ fn upgrade_guide_does_not_restate_the_false_claim() {
     );
 }
 
-/// Issue #1272's own fix added a "bounded by the retention window" claim.
-/// That is itself conditional: `audit_retention_days = 0` disables the purge
-/// (`retention.rs`'s `audit_retention_days > 0` gate), so the table and the
-/// index grow without bound. Both sources that make the claim must qualify
-/// it, not repeat the same class of overclaim this issue exists to retract.
+/// Issue #1272's own fix added a "cost is bounded" claim. That claim has two
+/// independent failure modes in `retention.rs`'s purge gate
+/// (`audit_retention_days > 0 && !config.dry_run`): a zero horizon, and
+/// `dry_run` left on with a positive horizon. An earlier revision of this
+/// fix named only the first. Both sources that make the claim must name
+/// both conditions.
 #[test]
 fn boundedness_claim_is_qualified_by_retention_setting() {
     for rel in ["autumn-harvest/src/audit_export.rs", "docs/audit-export.md"] {
         let path = repo_root().join(rel);
         let text = read_normalized(&path);
         assert!(
-            markers_near(&text, "bounded by the", "audit_retention_days"),
-            "{}: a 'bounded by the retention window' claim must name \
-             `audit_retention_days = 0` as the case where it does not hold",
+            markers_near(&text, "cost is bounded", "audit_retention_days"),
+            "{}: a 'cost is bounded' claim must name `audit_retention_days \
+             > 0` as one condition for the bound to hold",
+            path.display()
+        );
+        assert!(
+            markers_near(&text, "cost is bounded", "dry_run"),
+            "{}: a 'cost is bounded' claim must also name `dry_run` — the \
+             purge is skipped when it is true even with a positive \
+             retention horizon",
             path.display()
         );
     }

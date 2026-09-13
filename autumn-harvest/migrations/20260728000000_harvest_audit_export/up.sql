@@ -13,11 +13,11 @@
 -- below is predicated on `export_seq IS NULL`, which for an unconfigured
 -- deployment matches EVERY row. Such a deployment therefore pays a full index
 -- build at migration time and index maintenance on every subsequent audit
--- insert, for a feature it never turns on. Bounded by the audit retention
--- window only while retention stays enabled: `audit_retention_days = 0`
--- disables the purge and removes that bound too. Tracked as
--- autumn-foundation/autumn-harvest#1272, which weighs creating the index
--- lazily on first opt-in against leaving it here.
+-- insert, for a feature it never turns on. Bounded only while the audit
+-- purge actually runs, which needs both `audit_retention_days > 0` and
+-- `dry_run` set to false. Either condition failing removes that bound too.
+-- Tracked as autumn-foundation/autumn-harvest#1272, which weighs creating
+-- the index lazily on first opt-in against leaving it here.
 
 -- ── The per-shard monotonic sequence (AC4) ────────────────────────────────
 --
