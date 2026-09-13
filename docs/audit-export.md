@@ -327,6 +327,21 @@ shard records:
   decommissioning, and that stale row must not go on shielding rows a
   still-relevant, colocated shard has already fully acknowledged.
 
+  That exclusion cuts both ways, though (a Codex review finding on this
+  fix, issue #1266). `excluding_shard_from_protect_unexported_audit`'s own
+  guidance is to call it "for a shard being decommissioned", but the
+  config change and the actual `decommission_cursor` call are two
+  separate steps that need not land atomically. The moment the exemption
+  is configured, the shard drops out of `colocated_shard_ids` — before
+  `decommission_cursor` has necessarily run. A sweep landing in that
+  window must still see the exempted shard's own cursor, if it is still
+  live, protecting rows that shard has not yet acknowledged.
+  `purge_old_audit_records` takes a fourth argument,
+  `exempted_shard_ids`, naming exactly those shards, and keeps
+  consulting each one's cursor for this purpose until
+  `decommission_cursor` actually retires it — the moment the exemption
+  is meant to take effect.
+
   A shard still named in `colocated_shard_ids` — the default policy
   never excludes anyone — can also be decommissioned, and its retired
   cursor's stale ack is ignored the same way, but only while neither
@@ -383,11 +398,21 @@ shard records:
   unconditionally before the value ever reaches `SplitIdentifierString`,
   so `public\,public` reaches the server the same as `public,public`.
   Keeping the value from being truncated at an escaped space or tab
-  falls out of this same general rule. The extracted value is then
+  falls out of this same general rule. Splitting itself tests for
+  whitespace the way `pg_split_opts` does: `isspace()`, byte-at-a-time
+  in the `"C"` locale, which recognizes only six ASCII characters (a
+  Codex review finding, issue #1266). Rust's own `char::is_whitespace`
+  follows Unicode's broader `White_Space` property instead, matching a
+  no-break space and several other codepoints Postgres does not treat
+  as a separator here — using it would split an unquoted schema name
+  containing one of those into two tokens, silently truncating the
+  extracted value to everything before it. The extracted value is then
   parsed as a
   Postgres identifier list, the same grammar `SplitIdentifierString`
   uses for `search_path` server-side: comma-separated, with
-  insignificant whitespace around each name, an unquoted name folded to
+  insignificant whitespace around each name (the identical six-character
+  ASCII set, matching `SplitIdentifierString`'s own `scanner_isspace`,
+  not Unicode whitespace either), an unquoted name folded to
   lowercase, and a double-quoted name kept verbatim — case, embedded
   commas, embedded spaces, and all, with `""` inside one read as a
   literal quote. `tenant,public` and `tenant, public` compare equal, and

@@ -1689,11 +1689,18 @@ impl Drop for RetentionLeaseGuard {
 /// longer matters. Naming it anyway would make the missing-cursor check
 /// permanently true. That blocks purges of rows a still-protected shard
 /// has genuinely already acknowledged, defeating the exemption's purpose.
+///
+/// A fourth element carries the exempted shards back out too (issue
+/// #1266). `purge_old_audit_records`'s pending check still needs to hear
+/// from an exempted shard's cursor while that cursor stays live. The
+/// exemption is meant to take effect once `decommission_cursor` actually
+/// retires the row, not from the moment the config change lands. See its
+/// own doc comment.
 #[cfg(feature = "db")]
 fn group_shards_by_pool<'a>(
     pools: &'a ShardedDbPool,
     config: &RetentionConfig,
-) -> Vec<(&'a crate::worker::DbPool, bool, Vec<ShardId>)> {
+) -> Vec<(&'a crate::worker::DbPool, bool, Vec<ShardId>, Vec<ShardId>)> {
     pools
         .pool_groups()
         .into_iter()
@@ -1701,31 +1708,33 @@ fn group_shards_by_pool<'a>(
             let protect = shards
                 .iter()
                 .any(|shard| config.protects_unexported_audit(*shard));
-            let expects_cursor: Vec<ShardId> = shards
-                .into_iter()
-                .filter(|shard| {
+            let (expects_cursor, exempted): (Vec<ShardId>, Vec<ShardId>) =
+                shards.into_iter().partition(|shard| {
                     !config
                         .protect_unexported_audit
                         .as_ref()
                         .is_some_and(|exempt| exempt.contains(shard))
-                })
-                .collect();
-            (pool, protect, expects_cursor)
+                });
+            (pool, protect, expects_cursor, exempted)
         })
         .collect()
 }
 
 #[cfg(feature = "db")]
 async fn purge_audit_records_across_shards(pools: &ShardedDbPool, config: &RetentionConfig) {
-    for (pool, protect_unexported_audit, colocated_shards) in group_shards_by_pool(pools, config) {
+    for (pool, protect_unexported_audit, colocated_shards, exempted_shards) in
+        group_shards_by_pool(pools, config)
+    {
         if let Ok(mut conn) = pool.get().await {
             let colocated_shard_ids: Vec<i32> =
                 colocated_shards.iter().map(|s| s.as_i32()).collect();
+            let exempted_shard_ids: Vec<i32> = exempted_shards.iter().map(|s| s.as_i32()).collect();
             if let Err(err) = crate::audit::purge_old_audit_records(
                 &mut conn,
                 config.audit_retention_days,
                 protect_unexported_audit,
                 &colocated_shard_ids,
+                &exempted_shard_ids,
             )
             .await
             {
@@ -3424,12 +3433,12 @@ mod tests {
             2,
             "two distinct pools must never collapse into one group"
         );
-        let protections: Vec<bool> = groups.iter().map(|(_, protect, _)| *protect).collect();
+        let protections: Vec<bool> = groups.iter().map(|(_, protect, _, _)| *protect).collect();
         assert!(
             protections.contains(&false) && protections.contains(&true),
             "shard 0's exemption must not leak into shard 1's own, separate pool"
         );
-        for (_, protect, shards) in &groups {
+        for (_, protect, shards, _) in &groups {
             if *protect {
                 assert_eq!(
                     *shards,
@@ -3506,6 +3515,36 @@ mod tests {
             "an unconfigured flag exempts no one, so both colocated \
              shards must still be expected to have a cursor row, exactly \
              as they were before this flag existed"
+        );
+    }
+
+    // A Codex review finding on this fix (issue #1266). The exempted shard
+    // must travel back out as its own list, not merely be dropped from the
+    // expected-cursor one. `purge_old_audit_records` needs it to keep
+    // protecting an exempted shard's own unacknowledged rows while its
+    // cursor stays live. `decommission_cursor`, not this config change, is
+    // what is meant to release them.
+    #[cfg(feature = "db")]
+    #[test]
+    fn group_shards_by_pool_returns_the_exempted_shard_as_its_own_list() {
+        let pool = test_pool("postgres://unused/db");
+        let mut aliased = BTreeMap::new();
+        aliased.insert(ShardId::new(0), pool.clone());
+        aliased.insert(ShardId::new(1), pool);
+        let sharded = ShardedDbPool::from_map(aliased, ShardId::new(0));
+
+        let config = RetentionConfig::default()
+            .with_protect_unexported_audit(true)
+            .excluding_shard_from_protect_unexported_audit(ShardId::new(0));
+
+        let groups = group_shards_by_pool(&sharded, &config);
+        assert_eq!(
+            groups[0].3,
+            vec![ShardId::new(0)],
+            "shard 0 is exempted from the expected-cursor list, but it \
+             must still come back out as an exempted shard so the caller \
+             can keep consulting its cursor while decommission_cursor has \
+             not yet retired it"
         );
     }
 

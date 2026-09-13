@@ -1211,6 +1211,23 @@ fn strip_search_path_name_long_form(token: &str) -> Option<&str> {
         .then_some(value)
 }
 
+/// Whether `PostgreSQL` itself treats `c` as whitespace when splitting a
+/// raw string into tokens (issue #1266). Two call sites rely on this.
+/// `pg_split_opts` tests with `isspace()`, byte-at-a-time in the `"C"`
+/// locale. `SplitIdentifierString` tests with `scanner_isspace()`,
+/// hardcoded to sidestep exactly this pitfall for multibyte input. Both
+/// resolve to the same six-character ASCII set, not Rust's
+/// `char::is_whitespace`. Rust's
+/// version follows Unicode's `White_Space` property, so it also matches
+/// U+00A0 (no-break space) and several other codepoints these `PostgreSQL`
+/// functions do not. An unquoted schema name containing one of those
+/// codepoints would then split here but stay one token server-side,
+/// silently truncating the extracted name.
+#[cfg(feature = "db")]
+const fn is_postgres_whitespace(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r')
+}
+
 /// Splits a libpq `options` string into arguments, honoring its
 /// documented escaping (issue #1266). A backslash before any
 /// whitespace character embeds that character literally in the
@@ -1236,7 +1253,7 @@ fn split_options_preserving_escapes(options: &str) -> Vec<String> {
         if c == '\\' && chars.peek().is_some() {
             current.push(chars.next().expect("peeked Some above"));
             has_token = true;
-        } else if c.is_whitespace() {
+        } else if is_postgres_whitespace(c) {
             if has_token {
                 tokens.push(std::mem::take(&mut current));
                 has_token = false;
@@ -1351,7 +1368,10 @@ fn truncate_postgres_identifier(name: &str) -> &str {
 
 /// Parses a comma-separated identifier list the way `PostgreSQL`'s own
 /// `SplitIdentifierString` does (issue #1266), used for `search_path`
-/// and similar GUCs. Whitespace around an item is not significant. An
+/// and similar GUCs. Whitespace around an item is not significant, using
+/// `is_postgres_whitespace`'s six-character ASCII set rather than
+/// Rust's Unicode-aware `char::is_whitespace`, matching
+/// `SplitIdentifierString`'s own `scanner_isspace`. An
 /// unquoted item is folded to lowercase, matching `PostgreSQL`'s own
 /// folding of an unquoted identifier. A double-quoted item keeps its
 /// case verbatim, including any comma or whitespace it encloses; `""`
@@ -1366,7 +1386,7 @@ fn parse_identifier_list(value: &str) -> Option<Vec<String>> {
     let mut items = Vec::new();
     let mut chars = value.chars().peekable();
     loop {
-        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        while chars.next_if(|c| is_postgres_whitespace(*c)).is_some() {}
         match chars.peek() {
             None => break,
             Some('"') => {
@@ -1388,7 +1408,7 @@ fn parse_identifier_list(value: &str) -> Option<Vec<String>> {
             Some(_) => {
                 let mut ident = String::new();
                 while let Some(&c) = chars.peek() {
-                    if c == ',' || c.is_whitespace() {
+                    if c == ',' || is_postgres_whitespace(c) {
                         break;
                     }
                     ident.push(c);
@@ -1398,7 +1418,7 @@ fn parse_identifier_list(value: &str) -> Option<Vec<String>> {
                 items.push(truncate_postgres_identifier(&folded).to_string());
             }
         }
-        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        while chars.next_if(|c| is_postgres_whitespace(*c)).is_some() {}
         match chars.next() {
             None => break,
             Some(',') => {}
@@ -2933,6 +2953,57 @@ mod tests {
             "an escaped space in one alias's search_path value must not \
              stop it from collapsing with the other: PostgreSQL treats \
              `tenant,public` and `tenant, public` as the same schema list"
+        );
+    }
+
+    // A Codex review finding on this fix: `pg_split_opts` tests
+    // whitespace with `isspace()`, a byte-at-a-time ASCII test, not
+    // Unicode's `White_Space` property. A no-break space (U+00A0) is
+    // whitespace to Rust's `char::is_whitespace` but not to `PostgreSQL`,
+    // so it must not split an options token here either.
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_a_search_path_containing_a_non_ascii_space_distinct() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dtenant".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dtenant%C2%A0x"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "a no-break space is not ASCII whitespace to PostgreSQL's own \
+             options splitter, so `tenant\u{a0}x` must stay one unquoted \
+             token distinct from `tenant`, not split into `tenant` and a \
+             stray `x` that collides with the other DSN's search_path"
+        );
+    }
+
+    // The same ASCII-only whitespace rule applies inside
+    // `parse_identifier_list` itself, matching `SplitIdentifierString`'s
+    // `scanner_isspace` (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn parse_identifier_list_keeps_a_non_ascii_space_inside_an_unquoted_name() {
+        assert_eq!(
+            parse_identifier_list("tenant\u{a0}x,public"),
+            Some(vec!["tenant\u{a0}x".to_string(), "public".to_string()]),
+            "a no-break space is not whitespace to PostgreSQL's \
+             scanner_isspace, so it belongs inside the unquoted \
+             identifier rather than ending it early"
         );
     }
 

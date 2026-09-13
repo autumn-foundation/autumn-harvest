@@ -821,6 +821,38 @@ Fixed by reusing `$2` (`export_may_be_live`) in place of the separate
 mirrors the existing flag-only re-enablement test with the signal
 swapped, pinning the fix.
 
+The same review round found a P1 on the other side of the exemption
+feature. `excluding_shard_from_protect_unexported_audit`'s own doc
+comment says to call it "for a shard being decommissioned", but the
+config change and the actual `decommission_cursor` call need not land
+atomically. Exempting a shard removes it from `colocated_shard_ids`
+immediately, so a sweep landing in that window saw no cursor at all
+for that shard and nothing blocked deleting rows its own cursor --
+still live, still short of `last_acked_seq` -- had not actually
+acknowledged. `group_shards_by_pool` now also returns the exempted
+shards as their own list; `purge_old_audit_records` takes it as a
+fourth argument, `exempted_shard_ids`, and its pending check keeps
+consulting each one's cursor while it stays live, stopping only once
+`decommission_cursor` retires it. `group_shards_by_pool_returns_the_exempted_shard_as_its_own_list`
+pins the new list at the config layer;
+`retention_still_protects_an_exempted_shards_own_unacknowledged_rows_before_decommission`
+pins the SQL-level fix.
+
+A P2 in the same round: `pg_split_opts` tests whitespace with
+`isspace()`, a byte-at-a-time ASCII test in the `"C"` locale, not
+Unicode's `White_Space` property. `split_options_preserving_escapes`
+used Rust's `char::is_whitespace`, which also matches a no-break space
+and other codepoints Postgres does not treat as a separator here --
+splitting an unquoted schema name containing one into two tokens and
+silently truncating the extracted `search_path` value. The identical
+mismatch existed in `parse_identifier_list`, matching
+`SplitIdentifierString`'s own `scanner_isspace` rather than Unicode
+whitespace, though the finding named only the first occurrence.
+`is_postgres_whitespace`, a shared six-character ASCII predicate, now
+backs both. `from_dsns_keeps_a_search_path_containing_a_non_ascii_space_distinct`
+and `parse_identifier_list_keeps_a_non_ascii_space_inside_an_unquoted_name`
+pin each site.
+
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call
 site's behavior when the new flag is left at its default (disabled).

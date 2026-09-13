@@ -1656,6 +1656,7 @@ pub async fn purge_old_audit_records(
     retention_days: i64,
     protect_unexported_audit: bool,
     colocated_shard_ids: &[i32],
+    exempted_shard_ids: &[i32],
 ) -> HarvestResult<usize> {
     use diesel_async::RunQueryDsl as _;
 
@@ -1709,6 +1710,21 @@ pub async fn purge_old_audit_records(
     // decommission-then-resume transition still needs a re-enabling
     // shard's retired, not-yet-un-retired cursor treated as pending.
     // That stays true exactly as before this change.
+    //
+    // `exempted_shard_ids` covers a second, independent gap (issue #1266).
+    // `excluding_shard_from_protect_unexported_audit`'s own doc comment says
+    // to call it "for a shard being decommissioned". The config change and
+    // the `decommission_cursor` call need not land atomically, though.
+    // Exempting a shard removes it from `colocated_shard_ids` immediately.
+    // Without this fourth argument, a sweep landing in that window sees no
+    // cursor at all for the exempted shard in `$3`. Nothing then blocks
+    // deleting rows that shard's own cursor -- still live, still short of
+    // `last_acked_seq` -- has not actually acknowledged yet.
+    // `exempted_shard_ids` names exactly those shards, and the new final
+    // disjunct arm below still counts an
+    // exempted shard's cursor as pending while it stays live. It stops
+    // counting only once `decommission_cursor` actually retires that row,
+    // which is the moment the exemption is meant to take effect.
     diesel::sql_query(
         "DELETE FROM harvest_audit_log a \
          WHERE a.occurred_at < $1 \
@@ -1731,9 +1747,17 @@ pub async fn purge_old_audit_records(
                    ) \
                    OR EXISTS ( \
                         SELECT 1 FROM harvest_audit_export_cursor c \
-                        WHERE c.shard_id = ANY($3::int4[]) \
-                          AND a.export_seq > c.last_acked_seq \
-                          AND ($2::BOOLEAN OR c.retired_at IS NULL) \
+                        WHERE a.export_seq > c.last_acked_seq \
+                          AND ( \
+                                ( \
+                                  c.shard_id = ANY($3::int4[]) \
+                                  AND ($2::BOOLEAN OR c.retired_at IS NULL) \
+                                ) \
+                                OR ( \
+                                  c.shard_id = ANY($4::int4[]) \
+                                  AND c.retired_at IS NULL \
+                                ) \
+                              ) \
                    ) \
                  ) \
            )",
@@ -1741,6 +1765,7 @@ pub async fn purge_old_audit_records(
     .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
     .bind::<diesel::sql_types::Bool, _>(export_may_be_live)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(colocated_shard_ids.to_vec())
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(exempted_shard_ids.to_vec())
     .execute(conn)
     .await
     .map_err(database_error)
