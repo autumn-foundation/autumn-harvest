@@ -105,6 +105,8 @@
 //! byte-identical") therefore holds *by construction* rather than by testing
 //! luck.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -3410,6 +3412,47 @@ pub const DRAIN_MAX_COHORTS: usize = 32;
 #[cfg(feature = "db")]
 const DRAIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How long [`await_with_heartbeat`] keeps granting liveness credit to a
+/// step it has no other way to measure progress on.
+///
+/// Review finding: an unconditional timer-driven tick has no notion of
+/// progress at all. A step that hangs -- stuck on something the absent
+/// `statement_timeout` cannot catch, for instance -- would then tick
+/// forever, and the scanner could never age into `Stale` or `Wedged`.
+/// Ten minutes is generous enough for a legitimately huge cohort or
+/// backlog. Past it, [`await_with_heartbeat`] stops ticking and simply
+/// waits: a step still running normally finishes on its own, and a step
+/// truly stuck starts aging normally again, exactly as it did before
+/// this whole heartbeat existed.
+#[cfg(feature = "db")]
+const DRAIN_HEARTBEAT_GRACE: Duration = Duration::from_secs(600);
+
+/// Awaits `query`, ticking `progress` on [`DRAIN_HEARTBEAT_INTERVAL`]
+/// while it runs, for up to [`DRAIN_HEARTBEAT_GRACE`] total.
+///
+/// Never touches the connection the query itself is using -- it only
+/// races a timer against the caller's own future -- so the statement
+/// this awaits stays exactly one round trip.
+#[cfg(feature = "db")]
+async fn await_with_heartbeat<F: Future>(
+    mut query: Pin<&mut F>,
+    progress: &mut Option<&mut (dyn FnMut() + Send)>,
+) -> F::Output {
+    let deadline = tokio::time::Instant::now() + DRAIN_HEARTBEAT_GRACE;
+    loop {
+        tokio::select! {
+            result = &mut query => return result,
+            () = tokio::time::sleep(DRAIN_HEARTBEAT_INTERVAL) => {
+                if tokio::time::Instant::now() <= deadline
+                    && let Some(cb) = progress
+                {
+                    cb();
+                }
+            }
+        }
+    }
+}
+
 // A `statement_timeout` inside the drain's window is DELIBERATELY absent, and
 // this is the second thing to know about the pass after the budgets.
 //
@@ -3794,16 +3837,9 @@ async fn drain_default_bounded_inner(
         ))
         .load::<CohortCountRow>(&mut *conn);
         tokio::pin!(query);
-        loop {
-            tokio::select! {
-                result = &mut query => break result.map_err(database_error)?,
-                () = tokio::time::sleep(DRAIN_HEARTBEAT_INTERVAL) => {
-                    if let Some(cb) = &mut progress {
-                        cb();
-                    }
-                }
-            }
-        }
+        await_with_heartbeat(query, &mut progress)
+            .await
+            .map_err(database_error)?
     };
 
     // Take whole cohorts, oldest first, up to BOTH budgets — and always at
@@ -3941,16 +3977,9 @@ async fn drain_default_bounded_inner(
             ))
             .execute(conn);
             tokio::pin!(query);
-            loop {
-                tokio::select! {
-                    result = &mut query => break result.map_err(database_error)?,
-                    () = tokio::time::sleep(DRAIN_HEARTBEAT_INTERVAL) => {
-                        if let Some(cb) = &mut progress {
-                            cb();
-                        }
-                    }
-                }
-            }
+            await_with_heartbeat(query, &mut progress)
+                .await
+                .map_err(database_error)?
         };
 
         for t in &targets {
@@ -5691,5 +5720,44 @@ mod tests {
         parts.sort_by(compare_partitions);
         assert_eq!(parts[0].name, "harvest_events_p_20260901000000");
         assert!(parts[2].is_default, "DEFAULT sorts last");
+    }
+
+    // Review finding: an unconditional timer tick has no notion of
+    // progress. A step that never returns would then tick forever, and
+    // the scanner could never age into `Stale`/`Wedged`. `start_paused`
+    // makes the tick count deterministic: under paused time, tokio
+    // fast-forwards through each sleep in turn rather than this test
+    // waiting out ten real minutes.
+    #[cfg(feature = "db")]
+    #[tokio::test(start_paused = true)]
+    async fn await_with_heartbeat_stops_ticking_past_the_grace_period() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let ticks = AtomicU32::new(0);
+        let mut tick = || {
+            ticks.fetch_add(1, Ordering::Relaxed);
+        };
+        let mut progress: Option<&mut (dyn FnMut() + Send)> = Some(&mut tick);
+
+        // Resolves well past the grace period, so every tick observed is
+        // the heartbeat's own doing, not the query's.
+        let query = async {
+            tokio::time::sleep(DRAIN_HEARTBEAT_GRACE + DRAIN_HEARTBEAT_INTERVAL * 3).await;
+            42
+        };
+        tokio::pin!(query);
+        let result = await_with_heartbeat(query, &mut progress).await;
+
+        assert_eq!(result, 42, "the underlying future's own result must still be returned");
+        let expected_ticks = DRAIN_HEARTBEAT_GRACE.as_secs() / DRAIN_HEARTBEAT_INTERVAL.as_secs();
+        // `AtomicU32::load`, never `ticks.load(..)`: diesel's blanket
+        // `RunQueryDsl` impl (see `.iter().find(...)`, above) shadows it in
+        // this diesel-importing scope too.
+        assert_eq!(
+            u64::from(AtomicU32::load(&ticks, Ordering::Relaxed)),
+            expected_ticks,
+            "ticking must stop at the grace deadline, not continue for the \
+             three-interval overrun"
+        );
     }
 }
