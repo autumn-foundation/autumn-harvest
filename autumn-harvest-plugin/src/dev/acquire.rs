@@ -251,10 +251,9 @@ mod tests {
     #[test]
     fn a_directory_under_localappdata_is_private_on_windows() {
         let base = std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA must be set on Windows");
-        let dir = std::path::PathBuf::from(base).join("harvest-dev-test-1287-cache");
-        std::fs::create_dir_all(&dir).expect("create dir");
-        let result = directory_is_private(&dir);
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(result);
+        // A unique temp dir, not a fixed name: a fixed name could already
+        // exist with real contents, which dropping a `TempDir` would delete.
+        let dir = tempfile::tempdir_in(base).expect("temp dir under LOCALAPPDATA");
+        assert!(directory_is_private(dir.path()));
     }
 }

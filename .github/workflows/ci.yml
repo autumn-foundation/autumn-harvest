@@ -672,6 +672,18 @@ jobs:
       - name: Run plugin connector tests (issue #944)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p autumn-harvest-plugin --features connectors --lib connector
+      # Issue #1287 review: the manifest's `dev_runtime_tests` row (features
+      # `dev-runtime`) and `dev_runtime_managed` row (`compileonly`, so
+      # `--no-run` only) never exercise this crate's `--lib` target, so the
+      # inline `#[cfg(test)]` unit tests inside `src/dev/reaper.rs` and
+      # `src/dev/acquire.rs` — including the Windows-specific
+      # `directory_is_ours` regression tests this issue added — were never
+      # actually built or run on any OS. `dev-runtime-managed` (a superset of
+      # `dev-runtime`) covers both files' tests in one step, on every OS this
+      # job's matrix runs, `windows-latest` included.
+      - name: Run plugin lib tests (dev-runtime-managed feature, issue #1287)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p autumn-harvest-plugin --features dev-runtime-managed --lib
       # Issue #1312. The `redis` feature changes two config paths: it accepts
       # `[harvest.redis] url` instead of rejecting it, and it compiles the
       # channel install. `--lib` without the feature covers neither, so the

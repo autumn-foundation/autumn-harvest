@@ -40,7 +40,24 @@ directory is still trusted; a group-writable one is still rejected).
 `#[cfg(windows)]` tests — which run for real on this repo's `windows-latest`
 CI leg — pin the new Windows behaviour: a directory under `%LOCALAPPDATA%`
 is trusted, and `C:\Windows\Temp` (the shared, machine-wide location the
-issue names as the realistic exposure) is refused. The full workspace,
-including this crate's `dev-runtime-managed` feature, was cross-compile
-checked against `x86_64-pc-windows-gnu` to catch anything that would not
-even build on that target.
+issue names as the realistic exposure) is refused. Each Windows test uses a
+unique `tempfile::tempdir_in` under `%LOCALAPPDATA%`, not a fixed name, so
+it cannot collide with (and delete) a pre-existing directory of the same
+name. The full workspace, including this crate's `dev-runtime-managed`
+feature, was cross-compile checked against `x86_64-pc-windows-gnu` to catch
+anything that would not even build on that target.
+
+**Review round:** Codex's automated PR review found two real gaps, both
+fixed. (1) `windows_path_is_per_user` fell back to comparing the
+unresolved, lexical path when `canonicalize` failed on either side; a
+directory behind a broken junction could pass that comparison even though
+its eventual resolved target is shared. Both `canonicalize` calls now fail
+closed instead. (2) None of the manifest-driven `dev_runtime_tests`
+(`dev-runtime`, actually run) or `dev_runtime_managed` (`compileonly`,
+`--no-run` only) CI rows exercise this crate's `--lib` target, so the new
+inline unit tests — including every `#[cfg(windows)]` one — were never
+actually built or run by CI, on any OS. Fixed by adding a dedicated
+`cargo test -p autumn-harvest-plugin --features dev-runtime-managed --lib`
+step to the `test-nodb` job's matrix (`ci.yml`), the same pattern already
+used for the `webhooks`, `redis` and `connectors` features — it now runs on
+`windows-latest` alongside `ubuntu-latest` and `macos-latest`.
