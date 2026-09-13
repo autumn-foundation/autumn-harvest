@@ -1159,12 +1159,19 @@ async fn run_partition_maintenance_pass(
         // untouched by anything that replaces the monitor's reported
         // snapshot.
         let resume_after = resume_cursors.get(&shard).copied().flatten();
-        match crate::partition::maintain(
+        // Review finding: a tick recorded once before this whole shard's
+        // maintenance pass is not bounded progress either. A single shard
+        // can spend `max_attempts` partitions at `exact_scan_timeout` each,
+        // long enough on its own to cross the staleness threshold. Ticking
+        // once per partition the sweep attempts closes that gap.
+        let mut tick_partition = || crate::scanner_health::record_scanner_tick(metrics, owner);
+        match crate::partition::maintain_with_progress(
             &mut conn,
             now,
             config.partitions.lookahead_cohorts,
             &sweep_opts,
             resume_after,
+            &mut tick_partition,
         )
         .await
         {

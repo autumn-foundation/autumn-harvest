@@ -1789,6 +1789,10 @@ DECLARE
     bad_rls     text;
     rls_flag    boolean;
     bad_pub     text;
+    renamed_fkey text;
+    renamed_pkey text;
+    renamed_uniq text;
+    renamed      text;
 {COPY_ACL_DECLARE}
 BEGIN
     -- Idempotent: already partitioned, nothing to do.
@@ -1803,6 +1807,16 @@ BEGIN
     -- not leave every append waiting behind it.
     EXECUTE 'SET LOCAL lock_timeout = ' || quote_literal('{lock_ms}ms');
 
+    -- Review finding: `idx_defs` below used to be captured by a plain read
+    -- with no lock at all, which does not conflict with a concurrent
+    -- `CREATE UNIQUE INDEX ... (cohort, ...)`. Such an index could commit
+    -- in the gap between that read and the rename further down, and would
+    -- then be absent from every new partition regardless. An explicit lock
+    -- here, mirroring the large-table plan's own `LOCK TABLE` step, closes
+    -- the gap without moving the capture past the rename: see the comment
+    -- on `idx_defs` below for why the capture must stay on this side of it.
+    EXECUTE 'LOCK TABLE harvest_events IN ACCESS EXCLUSIVE MODE';
+
     -- Deliberately INSIDE the idempotency guard above. Replacing the cohort
     -- function is what changes the partition grid, so running it before the
     -- guard would let `enable --cohort-width-secs X` on an ALREADY-partitioned
@@ -1812,18 +1826,6 @@ BEGIN
     -- swallowed as a benign race, so nothing created and nothing reported.
     EXECUTE $harvest_cohort_def${cohort_fn}$harvest_cohort_def$;
 
-    -- Captured BEFORE the rename, so each definition still names
-    -- `harvest_events` and replays verbatim onto the new parent, where Postgres
-    -- propagates it to every partition. Constraint-backed indexes are excluded:
-    -- their replacements must include the partition key and are added below.
-    SELECT coalesce(array_agg(pg_get_indexdef(i.indexrelid)), ARRAY[]::text[])
-      INTO idx_defs
-      FROM pg_index i
-      JOIN pg_class c ON c.oid = i.indrelid
-      JOIN pg_namespace n ON n.oid = c.relnamespace
-     WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
-       AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid);
-
     -- The legacy partition covers everything below the current cohort. Every
     -- pre-conversion row carries the migration's `-infinity` sentinel, so all
     -- of them fall inside it with no row touched; every row appended from here
@@ -1832,6 +1834,28 @@ BEGIN
     -- only advances, no later append can route back into legacy. The legacy
     -- partition is sealed from the moment it is attached.
     cutover := harvest_event_cohort(now());
+
+    -- Captured here, already holding ACCESS EXCLUSIVE via the explicit
+    -- `LOCK TABLE` above, so no concurrent `CREATE UNIQUE INDEX ...
+    -- (cohort, ...)` can commit in the gap between this read and the
+    -- rename below. Deliberately still captured BEFORE the rename,
+    -- though, and not from `{LEGACY_PARTITION}` after it: every
+    -- definition `pg_get_indexdef` returns here names `harvest_events`
+    -- verbatim, and it is exactly that name -- freed by the rename below,
+    -- then reclaimed by the new parent -- that makes the FOREACH replay
+    -- further down land on the new table. Querying by the post-rename
+    -- name would bake `{LEGACY_PARTITION}` into every captured
+    -- definition instead, and replaying those verbatim recreates each
+    -- index on the LEGACY table, not the new parent. Constraint-backed
+    -- indexes are excluded: their replacements must include the
+    -- partition key and are added explicitly further down.
+    SELECT coalesce(array_agg(pg_get_indexdef(i.indexrelid)), ARRAY[]::text[])
+      INTO idx_defs
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
+       AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid);
 
     -- Detached so the sequence survives a DROP of an empty legacy table and can
     -- be re-owned by the new parent. The BIGSERIAL cursor must stay continuous
@@ -1903,14 +1927,14 @@ reproduce it on the converted layout by hand, then re-run.',
             COALESCE(bad_rls, 'none, but row security is enabled');
     END IF;
 {publication_recheck}
-    -- Review finding: `idx_defs` above is captured before the rename takes
-    -- ACCESS EXCLUSIVE, from a plain read that does not conflict with a
-    -- concurrent `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE`. Such a
-    -- constraint could commit in that gap; its backing index is excluded
-    -- from `idx_defs` unconditionally, and `capture_index_defs` never
-    -- replays it, so it would silently vanish from every new partition.
-    -- Recheck now, holding the lock, the same way the view and trigger
-    -- checks just did.
+    -- Review finding: a constraint-backed unique index -- one an operator
+    -- adds with `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE` -- is excluded
+    -- from `idx_defs` unconditionally, and nothing replays it. Added
+    -- between the Rust-side preflight (a separate round-trip before this
+    -- script starts) and the explicit lock this script itself took above,
+    -- it would silently vanish from every new partition. Recheck now,
+    -- holding that same lock, the same way the view and trigger checks
+    -- just did.
     SELECT string_agg(i.indexrelid::regclass::text, ', ' ORDER BY 1) INTO bad_idx
       FROM pg_index i
       JOIN pg_class c ON c.oid = i.indrelid
@@ -1934,13 +1958,14 @@ transaction''s ACCESS EXCLUSIVE lock. Drop the index or constraint if it is obso
 recreate it including `cohort` yourself, then re-run.', bad_idx;
     END IF;
 
-    -- Probed only AFTER the rename, which is the first statement to take
-    -- ACCESS EXCLUSIVE. A `SELECT EXISTS` before it takes only ACCESS SHARE,
-    -- which does not conflict with a concurrent INSERT: a workflow that started
-    -- and wrote its first events in the gap would commit before the rename,
-    -- `had_rows` would still be false, and the ELSE branch below would DROP the
-    -- table containing them. Enabling on a live-but-currently-empty shard is
-    -- exactly the recommended rollout, so that window is the common case.
+    -- Safe only because the explicit `LOCK TABLE` above already holds
+    -- ACCESS EXCLUSIVE by this point. Without it, a plain `SELECT EXISTS`
+    -- takes only ACCESS SHARE, which does not conflict with a concurrent
+    -- INSERT: a workflow that started and wrote its first events in that
+    -- gap could commit unseen, `had_rows` would read false, and the ELSE
+    -- branch below would DROP the table containing them. Enabling on a
+    -- live-but-currently-empty shard is exactly the recommended rollout,
+    -- so that window is the common case.
     EXECUTE 'SELECT EXISTS (SELECT 1 FROM {LEGACY_PARTITION})' INTO had_rows;
 
     -- Renaming a table renames neither its indexes nor its constraints, so
@@ -1959,10 +1984,28 @@ recreate it including `cohort` yourself, then re-run.', bad_idx;
                 WHERE conrelid = '{LEGACY_PARTITION}'::regclass
                   AND right(conname, {suffix_len}) <> '{LEGACY_RENAME_SUFFIX}'
     LOOP
+        renamed := {BOUNDED_RENAME_FN}('constraint', '{LEGACY_PARTITION}'::regclass, obj.n,
+                                       '{LEGACY_RENAME_SUFFIX}');
+        -- Review finding: the three DROPs below used to assume this
+        -- always returns `obj.n || '{LEGACY_RENAME_SUFFIX}'`. It does
+        -- not when that name is already taken -- an operator's own
+        -- constraint could happen to be named
+        -- `harvest_events_pkey{LEGACY_RENAME_SUFFIX}`, for one -- in
+        -- which case the function disambiguates to a different name.
+        -- A hard-coded DROP would then remove that unrelated operator
+        -- constraint and leave the actual renamed original in place,
+        -- so `ATTACH PARTITION` later fails on more than one primary
+        -- key. Capturing the real returned name here, per built-in
+        -- constraint, is what the later DROPs actually target.
+        IF obj.n = 'harvest_events_workflow_exec_id_fkey' THEN
+            renamed_fkey := renamed;
+        ELSIF obj.n = 'harvest_events_pkey' THEN
+            renamed_pkey := renamed;
+        ELSIF obj.n = 'harvest_events_workflow_exec_id_event_id_key' THEN
+            renamed_uniq := renamed;
+        END IF;
         EXECUTE format('ALTER TABLE {LEGACY_PARTITION} RENAME CONSTRAINT %I TO %I',
-                       obj.n,
-                       {BOUNDED_RENAME_FN}('constraint', '{LEGACY_PARTITION}'::regclass, obj.n,
-                                           '{LEGACY_RENAME_SUFFIX}'));
+                       obj.n, renamed);
     END LOOP;
     FOR obj IN SELECT indexname AS n FROM pg_indexes
                 WHERE schemaname = current_schema() AND tablename = '{LEGACY_PARTITION}'
@@ -2081,12 +2124,21 @@ recreate it including `cohort` yourself, then re-run.', bad_idx;
         -- alone can no longer be a key anyway: uniqueness on a partitioned
         -- table has to include the partition column. Global `id` uniqueness is
         -- not lost -- one sequence still feeds every partition.
-        EXECUTE 'ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT IF EXISTS '
-             || 'harvest_events_workflow_exec_id_fkey{LEGACY_RENAME_SUFFIX}';
-        EXECUTE 'ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT IF EXISTS '
-             || 'harvest_events_pkey{LEGACY_RENAME_SUFFIX}';
-        EXECUTE 'ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT IF EXISTS '
-             || 'harvest_events_workflow_exec_id_event_id_key{LEGACY_RENAME_SUFFIX}';
+        --
+        -- Dropped by the captured `renamed_*` name, not a hard-coded
+        -- `name || suffix`: see the review finding on the rename loop
+        -- above for why that guess can target the wrong object. `NULL`
+        -- means the original never existed (an operator's own schema
+        -- already lacked it), so there is nothing to drop.
+        IF renamed_fkey IS NOT NULL THEN
+            EXECUTE format('ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT %I', renamed_fkey);
+        END IF;
+        IF renamed_pkey IS NOT NULL THEN
+            EXECUTE format('ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT %I', renamed_pkey);
+        END IF;
+        IF renamed_uniq IS NOT NULL THEN
+            EXECUTE format('ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT %I', renamed_uniq);
+        END IF;
         EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS {LEGACY_PARTITION}_pk_idx '
              || 'ON {LEGACY_PARTITION} (id, cohort)';
         EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS {LEGACY_PARTITION}_exec_event_idx '
@@ -2796,7 +2848,7 @@ pub async fn evaluate(
     opts: &SweepOptions,
     resume_after: Option<DateTime<Utc>>,
 ) -> HarvestResult<SweepOutcome> {
-    sweep_inner(conn, now, opts, false, resume_after).await
+    sweep_inner(conn, now, opts, false, resume_after, None).await
 }
 
 /// Drop every fully-reclaimable cohort partition, oldest first.
@@ -2840,7 +2892,7 @@ pub async fn sweep(
     opts: &SweepOptions,
     resume_after: Option<DateTime<Utc>>,
 ) -> HarvestResult<SweepOutcome> {
-    sweep_inner(conn, now, opts, true, resume_after).await
+    sweep_inner(conn, now, opts, true, resume_after, None).await
 }
 
 /// The shared body of [`sweep`] and [`evaluate`].
@@ -2859,6 +2911,7 @@ async fn sweep_inner(
     opts: &SweepOptions,
     apply: bool,
     resume_after: Option<DateTime<Utc>>,
+    mut progress: Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<SweepOutcome> {
     let mut outcome = SweepOutcome::default();
     if !detect_layout(conn).await?.is_partitioned() {
@@ -2922,6 +2975,15 @@ async fn sweep_inner(
         // a dropped one. The cheap skips above (DEFAULT, still open,
         // unbounded) reach no such scan and do not spend the budget.
         attempts += 1;
+        // Review finding: a per-shard tick before this whole pass starts
+        // is not bounded progress. Up to `max_attempts` partitions at
+        // `exact_scan_timeout` each can still run past the liveness
+        // scanner's staleness threshold before the pass returns. Ticking
+        // once per attempted partition here bounds the gap between proofs
+        // of life to one gate evaluation, not one whole pass.
+        if let Some(cb) = &mut progress {
+            cb();
+        }
         // Review finding: a fixed oldest-first restart every pass cannot
         // converge past a permanently blocked oldest run — see
         // `SweepOutcome::next_resume`. Recorded before the outcome of
@@ -3790,6 +3852,53 @@ pub async fn maintain(
     sweep_opts: &SweepOptions,
     resume_after: Option<DateTime<Utc>>,
 ) -> HarvestResult<MaintenanceOutcome> {
+    maintain_inner(conn, now, lookahead_cohorts, sweep_opts, resume_after, None).await
+}
+
+/// Same as [`maintain`], but calls `progress` once per partition the sweep
+/// step attempts.
+///
+/// Review finding: a tick recorded once before a shard's whole maintenance
+/// pass is not bounded progress. A single shard can spend
+/// `max_attempts × exact_scan_timeout` evaluating blocked partitions, long
+/// enough to cross the liveness scanner's own staleness threshold before
+/// this call returns anything. The retention runtime uses this entry point
+/// instead of [`maintain`] for that reason. A caller that reports liveness
+/// can then space its proofs of life by one partition attempt, not one
+/// whole pass.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] on a catalog or DDL failure.
+#[cfg(feature = "db")]
+pub async fn maintain_with_progress(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+    lookahead_cohorts: u32,
+    sweep_opts: &SweepOptions,
+    resume_after: Option<DateTime<Utc>>,
+    progress: &mut (dyn FnMut() + Send),
+) -> HarvestResult<MaintenanceOutcome> {
+    maintain_inner(
+        conn,
+        now,
+        lookahead_cohorts,
+        sweep_opts,
+        resume_after,
+        Some(progress),
+    )
+    .await
+}
+
+#[cfg(feature = "db")]
+async fn maintain_inner(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+    lookahead_cohorts: u32,
+    sweep_opts: &SweepOptions,
+    resume_after: Option<DateTime<Utc>>,
+    progress: Option<&mut (dyn FnMut() + Send)>,
+) -> HarvestResult<MaintenanceOutcome> {
     if !detect_layout(conn).await?.is_partitioned() {
         // Still stamped: a caller polling for "maintenance has run" must not
         // hang forever on an unpartitioned shard, where there is nothing to do.
@@ -3832,7 +3941,7 @@ pub async fn maintain(
     };
     let (created, lookahead_blocked) =
         ensure_partitions(conn, now, lookahead_cohorts, sweep_opts.lock_timeout).await?;
-    let sweep = sweep(conn, now, sweep_opts, resume_after).await?;
+    let sweep = sweep_inner(conn, now, sweep_opts, true, resume_after, progress).await?;
     // A partial catch-up must not report as a healthy, empty-`last_error`
     // pass. `ensure_partitions` keeps creating the rest of the window when
     // one cohort is blocked (deliberately — see its doc). So `created` can
@@ -3948,7 +4057,7 @@ impl MaintenanceOutcome {
 ///
 /// Review finding: checked through `pg_get_indexdef`, not
 /// `pg_index.indnullsnotdistinct` directly. That column does not exist
-/// before PostgreSQL 15. `docs/partitioned-events.md` still supports 14,
+/// before `PostgreSQL` 15. `docs/partitioned-events.md` still supports 14,
 /// and a literal reference to it fails every phase-4 run there with
 /// "column does not exist", potentially hours into phases 1–3.
 /// `pg_get_indexdef` exists on every supported version. It renders
@@ -4566,14 +4675,40 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         step(
             4,
             format!(
-                "DO $harvest_rename_958$\nDECLARE obj record;\nBEGIN\n    \
+                "DO $harvest_rename_958$\nDECLARE\n    \
+                 obj record;\n    \
+                 renamed text;\n    \
+                 renamed_fkey text;\n    \
+                 renamed_pkey text;\n    \
+                 renamed_uniq text;\n\
+                 BEGIN\n    \
                  FOR obj IN SELECT conname AS n FROM pg_constraint\n                \
                  WHERE conrelid = '{LEGACY_PARTITION}'::regclass\n                  \
                  AND right(conname, {suffix_len}) <> '{LEGACY_RENAME_SUFFIX}'\n    \
                  LOOP\n        \
+                 renamed := {BOUNDED_RENAME_FN}('constraint', '{LEGACY_PARTITION}'::regclass,\n                            \
+                 obj.n, '{LEGACY_RENAME_SUFFIX}');\n        \
+                 -- Review finding: the DROPs below used to assume this\n        \
+                 -- always returns `obj.n || '{LEGACY_RENAME_SUFFIX}'`. It does\n        \
+                 -- not when that name is already taken -- an operator's own\n        \
+                 -- constraint could happen to be named\n        \
+                 -- `harvest_events_pkey{LEGACY_RENAME_SUFFIX}`, for one -- in\n        \
+                 -- which case the function disambiguates to a different\n        \
+                 -- name. A hard-coded DROP would then remove that unrelated\n        \
+                 -- operator constraint and leave the actual renamed original\n        \
+                 -- in place, so ATTACH PARTITION later fails on more than one\n        \
+                 -- primary key. Capturing the real returned name here, per\n        \
+                 -- built-in constraint, is what the DROPs below actually\n        \
+                 -- target.\n        \
+                 IF obj.n = 'harvest_events_workflow_exec_id_fkey' THEN\n            \
+                 renamed_fkey := renamed;\n        \
+                 ELSIF obj.n = 'harvest_events_pkey' THEN\n            \
+                 renamed_pkey := renamed;\n        \
+                 ELSIF obj.n = 'harvest_events_workflow_exec_id_event_id_key' THEN\n            \
+                 renamed_uniq := renamed;\n        \
+                 END IF;\n        \
                  EXECUTE format('ALTER TABLE {LEGACY_PARTITION} RENAME CONSTRAINT %I TO %I',\n                       \
-                 obj.n, {BOUNDED_RENAME_FN}('constraint', '{LEGACY_PARTITION}'::regclass,\n                            \
-                 obj.n, '{LEGACY_RENAME_SUFFIX}'));\n    \
+                 obj.n, renamed);\n    \
                  END LOOP;\n    \
                  FOR obj IN SELECT indexname AS n FROM pg_indexes\n                \
                  WHERE schemaname = current_schema() AND tablename = '{LEGACY_PARTITION}'\n                  \
@@ -4581,27 +4716,32 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
                  LOOP\n        \
                  EXECUTE format('ALTER INDEX %I RENAME TO %I', obj.n,\n                       \
                  {BOUNDED_RENAME_FN}('index', NULL, obj.n, '{LEGACY_RENAME_SUFFIX}'));\n    \
-                 END LOOP;\nEND\n$harvest_rename_958$"
+                 END LOOP;\n    \
+                 -- The FK's ON DELETE CASCADE is the delete storm being\n    \
+                 -- eliminated; its insert-time half lives on in the trigger\n    \
+                 -- below. The old PK and unique constraint must go too:\n    \
+                 -- ATTACH propagates the parent's, and a table may have only\n    \
+                 -- one primary key. Dropped by the captured name, not a\n    \
+                 -- hard-coded guess -- see the review finding above. `NULL`\n    \
+                 -- means the original never existed, so there is nothing to\n    \
+                 -- drop.\n    \
+                 IF renamed_fkey IS NOT NULL THEN\n        \
+                 EXECUTE format('ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT %I',\n                       \
+                 renamed_fkey);\n    \
+                 END IF;\n    \
+                 IF renamed_pkey IS NOT NULL THEN\n        \
+                 EXECUTE format('ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT %I',\n                       \
+                 renamed_pkey);\n    \
+                 END IF;\n    \
+                 IF renamed_uniq IS NOT NULL THEN\n        \
+                 EXECUTE format('ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT %I',\n                       \
+                 renamed_uniq);\n    \
+                 END IF;\nEND\n$harvest_rename_958$"
             ),
         ),
         step(
             4,
             format!("DROP FUNCTION {BOUNDED_RENAME_FN}(text, oid, text, text)"),
-        ),
-        // The FK's ON DELETE CASCADE is the delete storm being eliminated; its
-        // insert-time half lives on in the trigger below. The old PK and unique
-        // constraint must go too: ATTACH propagates the parent's, and a table
-        // may have only one primary key.
-        step(
-            4,
-            format!(
-                "ALTER TABLE {LEGACY_PARTITION}\n    \
-                 DROP CONSTRAINT IF EXISTS \
-                 harvest_events_workflow_exec_id_fkey{LEGACY_RENAME_SUFFIX},\n    \
-                 DROP CONSTRAINT IF EXISTS harvest_events_pkey{LEGACY_RENAME_SUFFIX},\n    \
-                 DROP CONSTRAINT IF EXISTS \
-                 harvest_events_workflow_exec_id_event_id_key{LEGACY_RENAME_SUFFIX}"
-            ),
         ),
         step(
             4,

@@ -959,6 +959,114 @@ async fn a_deferrable_impostor_of_harvests_own_constraint_still_refuses() {
 }
 
 #[tokio::test]
+async fn enable_survives_a_rename_target_collision_on_the_built_in_pkey() {
+    // Review finding: the bounded-rename loop discards the actual name
+    // `bounded_rename_fn` returns and a later step drops a hard-coded
+    // `harvest_events_pkey__pre958` instead. That guess is right only
+    // when the disambiguation candidate was free. An operator's own
+    // constraint already bearing that exact conventional name forces
+    // `bounded_rename_fn` to disambiguate the real renamed pkey to
+    // `harvest_events_pkey_1__pre958` instead. The hard-coded DROP then
+    // removes the OPERATOR's constraint, leaving the real old primary
+    // key in place. `ATTACH PARTITION` later fails with more than one
+    // primary key on the leaf.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(
+        &mut conn,
+        "pkey_collide_wf",
+        "pkey-collide-1",
+        day(2026, 2, 3),
+        None,
+    )
+    .await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    // The decoy: an operator's own constraint occupying the exact name
+    // `bounded_rename_fn` would otherwise pick for the real pkey. Its name
+    // already ends in the rename suffix. The rename loop's own
+    // `right(conname, ...) <> suffix` filter therefore leaves it
+    // untouched, exactly like a genuine leftover from an unrelated prior
+    // run would.
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT \
+         IF EXISTS harvest_events_pkey__pre958",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray decoy from a previous run");
+    // A CHECK constraint, deliberately. A UNIQUE decoy without `cohort`
+    // would be refused by the unique-index preflight before conversion
+    // ever reaches the rename step. That would test that guard instead
+    // of this one.
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_pkey__pre958 \
+         CHECK (event_type <> '')",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed the decoy occupying the rename target");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect(
+            "enable must survive a rename-target collision on the built-in pkey, \
+             not attach a leaf still carrying two primary keys",
+        );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "p",
+        "the conversion must succeed despite the collision"
+    );
+
+    let pkey = partition::LEGACY_PARTITION;
+    assert!(
+        scalar_bool(
+            &mut conn,
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM pg_constraint \
+                 WHERE conrelid = '{pkey}'::regclass \
+                 AND conname = 'harvest_events_pkey__pre958' AND contype = 'c') AS v"
+            ),
+        )
+        .await,
+        "the operator's own decoy constraint must survive untouched -- it is not \
+         harvest's to drop"
+    );
+    // Postgres itself gives the leaf its OWN primary key mirroring the
+    // parent's (id, cohort) shape the moment `ATTACH PARTITION` succeeds.
+    // It auto-names that `{pkey}_pkey` by its own convention, not by
+    // anything this engine names explicitly. A leftover primary key is
+    // not what the bug left behind; the disambiguated rename target the
+    // old hard-coded DROP never looked for is. Prove THAT is gone, under
+    // whatever name `bounded_rename_fn` actually returned for it.
+    assert!(
+        !scalar_bool(
+            &mut conn,
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM pg_constraint \
+                 WHERE conrelid = '{pkey}'::regclass \
+                 AND conname LIKE 'harvest_events_pkey%__pre958' \
+                 AND conname <> 'harvest_events_pkey__pre958') AS v"
+            ),
+        )
+        .await,
+        "the disambiguated rename target for the real primary key must have been \
+         dropped, not left behind under a name the old hard-coded guess never \
+         looked for"
+    );
+}
+
+#[tokio::test]
 async fn a_dependent_view_refuses_the_conversion_instead_of_silently_going_stale() {
     // Issue #1270 item 14: Postgres tracks a view's dependency by relation
     // OID, not by name. Both conversion paths rename `harvest_events` out
@@ -1373,6 +1481,59 @@ async fn enable_sql_rechecks_a_unique_index_added_after_the_preflight() {
         .execute(&mut conn)
         .await
         .expect("drop the offending constraint");
+}
+
+#[tokio::test]
+async fn a_plain_compatible_unique_index_survives_the_direct_enable_path() {
+    // Review finding: `idx_defs` is the set of index definitions replayed
+    // onto the new parent. It used to be captured by a plain read with no
+    // lock at all. That does not conflict with a concurrent `CREATE
+    // UNIQUE INDEX ... (cohort, ...)`. Such an index is neither
+    // constraint-backed nor missing the partition key. No refusal guard
+    // catches it either, so a capture taken too early could simply race
+    // it and miss it. The fix takes an explicit `LOCK TABLE` before
+    // capturing, closing the race. It does not move the capture past the
+    // rename. The capture must still name `harvest_events`, not
+    // `{LEGACY_PARTITION}`, so the replay lands on the right table. This
+    // proves a plain compatible index present at call time still
+    // survives onto the new parent.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(&mut conn, "plain_idx_wf", "plain-idx-1", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    diesel::sql_query("DROP INDEX IF EXISTS uq_plain_compat_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query("CREATE UNIQUE INDEX uq_plain_compat_958 ON harvest_events (id, cohort)")
+        .execute(&mut conn)
+        .await
+        .expect("seed a plain unique index that already includes cohort");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("a plain compatible unique index must not block conversion");
+
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() \
+             AND tablename = 'harvest_events' AND indexname = 'uq_plain_compat_958') AS v",
+        )
+        .await,
+        "the plain compatible index must be replayed onto the new parent, not \
+         silently dropped because it was captured from the wrong relation"
+    );
 }
 
 #[tokio::test]
@@ -4943,6 +5104,98 @@ async fn run_plan_phases(conn: &mut AsyncPgConnection, phases: std::ops::RangeIn
 }
 
 #[tokio::test]
+async fn the_plan_survives_a_rename_target_collision_on_the_built_in_pkey() {
+    // Review finding: the scripted plan's phase-4 rename loop had the
+    // identical gap enable_sql's did. See
+    // `enable_survives_a_rename_target_collision_on_the_built_in_pkey`.
+    // A later step dropped a hard-coded `harvest_events_pkey__pre958`
+    // rather than the name `bounded_rename_fn` actually returned. An
+    // operator's own constraint occupying that exact name then made the
+    // hard-coded DROP remove the wrong object, leaving the real old
+    // primary key behind.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(
+        &mut conn,
+        "plan_pkey_collide_wf",
+        "plan-pkey-collide-1",
+        day(2026, 2, 3),
+        None,
+    )
+    .await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT \
+         IF EXISTS harvest_events_pkey__pre958",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray decoy from a previous run");
+    // A CHECK constraint, deliberately. A UNIQUE decoy without `cohort`
+    // would be refused by the unique-index preflight before conversion
+    // ever reaches the rename step. That would test that guard instead
+    // of this one.
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_pkey__pre958 \
+         CHECK (event_type <> '')",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed the decoy occupying the rename target");
+
+    run_plan_phases(&mut conn, 1..=4).await;
+
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "p",
+        "the conversion must succeed despite the collision"
+    );
+    let pkey = partition::LEGACY_PARTITION;
+    assert!(
+        scalar_bool(
+            &mut conn,
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM pg_constraint \
+                 WHERE conrelid = '{pkey}'::regclass \
+                 AND conname = 'harvest_events_pkey__pre958' AND contype = 'c') AS v"
+            ),
+        )
+        .await,
+        "the operator's own decoy constraint must survive untouched"
+    );
+    // See the sibling `enable_sql` test's comment. `ATTACH PARTITION`
+    // itself gives the leaf its own primary key mirroring the parent's
+    // shape, so asserting none exists is the wrong invariant. The bug
+    // this proves fixed is the disambiguated rename target going
+    // undropped.
+    assert!(
+        !scalar_bool(
+            &mut conn,
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM pg_constraint \
+                 WHERE conrelid = '{pkey}'::regclass \
+                 AND conname LIKE 'harvest_events_pkey%__pre958' \
+                 AND conname <> 'harvest_events_pkey__pre958') AS v"
+            ),
+        )
+        .await,
+        "the disambiguated rename target for the real primary key must have been \
+         dropped, not left behind under a name the old hard-coded guess never \
+         looked for"
+    );
+}
+
+#[tokio::test]
 async fn re_running_the_plan_rebuilds_an_index_a_cancelled_build_left_invalid() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
@@ -6870,6 +7123,63 @@ async fn a_partly_blocked_lookahead_catch_up_is_not_reported_as_a_healthy_pass()
         .execute(&mut conn)
         .await
         .expect("drop the colliding relation");
+}
+
+#[tokio::test]
+async fn maintain_with_progress_ticks_once_per_partition_the_sweep_attempts() {
+    // Review finding: a liveness tick recorded once before a shard's whole
+    // maintenance pass is not bounded progress. A single shard can spend
+    // `max_attempts` partitions at `exact_scan_timeout` each, long enough
+    // on its own to cross the scanner's staleness threshold.
+    // `maintain_with_progress` exists so a caller can tick once per
+    // partition the sweep step attempts instead. Four closed cohorts,
+    // each pinned by its own still-existing execution, are all blocked.
+    // The sweep step still evaluates every one of them, so the callback
+    // must fire four times.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    for days in [20_i64, 21, 22, 23] {
+        let ts = Utc::now() - chrono::Duration::days(days);
+        let exec = insert_execution(&mut conn, "pinned_wf", &format!("pr-{days}"), ts, None).await;
+        autumn_harvest::store::append_events(
+            &mut conn,
+            ExecutionId::from_uuid(exec),
+            &sample_events(),
+            0,
+        )
+        .await
+        .expect("seed");
+        backdate_events(&mut conn, exec, ts).await;
+    }
+
+    let mut ticks = 0usize;
+    let outcome = partition::maintain_with_progress(
+        &mut conn,
+        Utc::now(),
+        0,
+        &SweepOptions::default(),
+        None,
+        &mut || ticks += 1,
+    )
+    .await
+    .expect("maintain_with_progress");
+
+    assert_eq!(
+        outcome.sweep.blocked.len(),
+        4,
+        "all four pinned cohorts must be evaluated and reported blocked; \
+         got {outcome:?}"
+    );
+    assert_eq!(
+        ticks, 4,
+        "the progress callback must fire once per partition the sweep step \
+         attempts, not once for the whole shard; got {ticks} ticks for {outcome:?}"
+    );
 }
 
 #[tokio::test]
