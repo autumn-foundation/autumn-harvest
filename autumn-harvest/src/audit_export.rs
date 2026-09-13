@@ -691,7 +691,7 @@ impl AuditExportBuilderConfig {
 }
 
 // ---------------------------------------------------------------------
-// M4: process-global runtime config (opt-in; `None` == fully inert)
+// M4: process-global runtime config (opt-in; `None` == scanner fully inert)
 // ---------------------------------------------------------------------
 
 /// Bound on acquiring a shard's connection inside the scanner (issue #953,
@@ -729,10 +729,12 @@ pub const DEFAULT_EXPORT_LEASE: std::time::Duration = std::time::Duration::from_
 
 /// Everything the exporter needs at runtime, installed once at startup.
 ///
-/// `None` (the default, before any builder wiring runs) means the feature is
-/// fully inert: [`fire_due_audit_exports`] returns `Ok(0)` before issuing a
-/// single query, so an embedder who never configures an audit sink sees zero
-/// behavior change and zero scanner work (AC8).
+/// `None` (the default, before any builder wiring runs) means the scanner is
+/// fully inert. [`fire_due_audit_exports`] returns `Ok(0)` before issuing a
+/// query, so an embedder who never configures a sink sees zero query
+/// behavior change and zero scanner work (AC8). The partial index is not
+/// part of that guarantee — see the module-level caveat above (issue
+/// #1272).
 #[derive(Clone)]
 pub struct AuditExportRuntimeConfig {
     /// Embedder-supplied (or plugin-default) transport.

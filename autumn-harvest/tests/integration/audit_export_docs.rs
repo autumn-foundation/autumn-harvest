@@ -98,13 +98,20 @@ fn module_doc_names_the_index_cost() {
 fn builder_config_doc_scopes_inert_to_the_scanner() {
     let path = repo_root().join("autumn-harvest/src/audit_export.rs");
     let text = read_normalized(&path);
-    assert!(
-        !contains_collapsed(&text, "the feature is entirely inert"),
-        "{}: 'entirely inert' must be scoped (e.g. to the scanner), not \
-         asserted of the whole feature — the partial index still costs \
-         insert-time maintenance when unconfigured (issue #1272)",
-        path.display()
-    );
+    for banned in [
+        "the feature is entirely inert",
+        "the feature is fully inert",
+        "`None` == fully inert",
+    ] {
+        assert!(
+            !contains_collapsed(&text, banned),
+            "{}: 'inert' claims must be scoped (e.g. to the scanner), not \
+             asserted of the whole feature — the partial index still costs \
+             insert-time maintenance when unconfigured (issue #1272); found \
+             {banned:?}",
+            path.display()
+        );
+    }
 }
 
 #[test]
@@ -131,6 +138,19 @@ fn changelog_fragment_names_the_index_cost() {
     assert!(
         names_index_cost_near(&text, "1272"),
         "{}: the opt-in bullet must reference issue #1272",
+        path.display()
+    );
+    assert!(
+        !contains_collapsed(&text, "When no sink is configured the guard finds nothing"),
+        "{}: the retention bullet must not claim the guard finds nothing \
+         whenever no sink is configured — a durable, non-retired cursor \
+         from a previously configured sink keeps applying it",
+        path.display()
+    );
+    assert!(
+        contains_collapsed(&text, "Retention interaction"),
+        "{}: the retention bullet should point at \"Retention interaction\" \
+         rather than re-deriving when the guard applies",
         path.display()
     );
 }
