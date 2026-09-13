@@ -377,6 +377,10 @@ specific command/feature:
 - **Worker sessions** (`create_session`) and **cancellable durable timers**
   (`start_timer` / `TimerHandle::…` — use the fire-once `ctx.timer(...)`).
 
+A rejected execution stays `RUNNING` and keeps erroring on every later drive.
+It does not block unrelated executions, though. `poll_once`/`run_until_idle`
+still drive the rest of the fleet in the same pass (issue #1530).
+
 Backend-level non-goals: distributed / multi-writer workers, `LISTEN`/`NOTIFY`
 push wake-ups, multi-server crash recovery, schedules, the management API,
 retention, worker sessions, sharding, DAGs, and the `WorkflowIdReusePolicy`
