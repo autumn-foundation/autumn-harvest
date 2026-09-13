@@ -294,6 +294,16 @@ fn boundedness_claim_points_at_retention_interaction() {
              the bound never fully closes",
             path.display()
         );
+        assert!(
+            !contains_collapsed(
+                &text,
+                "one decommission record and one reactivation record per shard"
+            ),
+            "{}: both handlers audit every call, no-op or repeated, so the \
+             permanent population is not capped at one pair per shard — say \
+             \"every ... request ... adds one more record\" instead",
+            path.display()
+        );
     }
 
     let doc = read_normalized(&repo_root().join("docs/audit-export.md"));

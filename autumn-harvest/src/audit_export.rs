@@ -39,8 +39,9 @@
 //! retention actually reclaims unexported rows. See `docs/audit-export.md`'s
 //! "Retention interaction" section for the exact conditions: they are more
 //! than one config flag. Tracked as issue #1272. Even then the bound is not
-//! total: one decommission record and one reactivation record per shard
-//! stay in the index forever by design.
+//! total. Every decommission or reactivation request, no-op or repeated,
+//! adds one more record per shard. That record stays in the index forever
+//! by design.
 //!
 //! # Where the monotonic sequence comes from (and why not `BIGSERIAL`)
 //!
