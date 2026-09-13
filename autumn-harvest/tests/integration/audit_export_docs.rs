@@ -274,8 +274,16 @@ fn boundedness_claim_points_at_retention_interaction() {
         contains_collapsed(&doc, "cursor row exists for the shard")
             && contains_collapsed(&doc, "sink is configured in the sweeping process"),
         "docs/audit-export.md's Retention interaction section must still \
-         document both halves of the purge guard; the boundedness claims \
-         elsewhere point here instead of restating them"
+         document both halves of the per-record purge guard; the \
+         boundedness claims elsewhere point here instead of restating them"
+    );
+    assert!(
+        markers_near(&doc, "### Retention interaction", "audit_retention_days")
+            && markers_near(&doc, "### Retention interaction", "dry_run"),
+        "docs/audit-export.md's Retention interaction section must also \
+         name the top-level `audit_retention_days`/`dry_run` purge gate, \
+         not just the per-record cursor/sink guard — a claim pointing here \
+         for \"the exact conditions\" needs all of them present"
     );
 }
 

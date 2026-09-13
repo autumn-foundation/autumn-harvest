@@ -241,8 +241,13 @@ shipped, even one past the retention window. A sweep that removed an unexported
 row would be a silent compliance gap — gone from the database *and* absent from
 the SIEM, with nothing anywhere to show it was lost.
 
-The guard applies when **either** signal says an exporter still owes this
-shard records:
+That guard only matters once the purge actually runs at all. It needs
+`audit_retention_days > 0` and `dry_run` set to false; either one unmet
+means no sweep touches `harvest_audit_log`, unexported row or not (issue
+#1272).
+
+Given the purge runs, the guard below applies when **either** signal says
+an exporter still owes this shard records:
 
 - **A cursor row exists for the shard.** Durable, shared state, so it works when
   retention and export run in **different processes** — a split web/worker
