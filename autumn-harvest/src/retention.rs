@@ -1299,8 +1299,19 @@ impl RetentionRuntime {
             // shard -- minutes, at the defaults. `shutdown()` calling
             // `cancel()` before this pass finishes must still make
             // `join()` return promptly, not wait out the whole pass.
+            //
+            // Review finding: this early return must still deregister,
+            // same as the graceful-stop path at the loop's own exit
+            // below. Skipping it here would leave this owner in the
+            // process-global liveness registry forever, aging into
+            // `Wedged`. A replacement runtime could then start up
+            // healthy while this registry entry keeps `/admin/preflight`
+            // unhappy anyway.
             tokio::select! {
-                () = shutdown_task.cancelled() => return,
+                () = shutdown_task.cancelled() => {
+                    crate::scanner_health::deregister_scanner(owner);
+                    return;
+                },
                 () = run_partition_maintenance_pass(
                     &pools,
                     &config,

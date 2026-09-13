@@ -5133,6 +5133,97 @@ async fn phase_4_refuses_a_valid_index_with_the_right_name_and_the_wrong_shape()
 }
 
 #[tokio::test]
+async fn phase_4_refuses_a_nulls_not_distinct_impostor_of_the_pk_index() {
+    // Review finding: the shape check verified uniqueness and the exact
+    // key columns, but not `indnullsnotdistinct`. Harvest's own phase-2
+    // indexes are ordinary ones -- `NULLS DISTINCT`, the default. An
+    // operator's own `UNIQUE NULLS NOT DISTINCT` index under the
+    // reserved pk-index name, with the exact right columns otherwise,
+    // still passed every other check. `ATTACH PARTITION` requires that
+    // property to match the parent's index. Phase 4 would then find
+    // this impostor unattachable. It would build a replacement under
+    // `ACCESS EXCLUSIVE` instead -- exactly the unplanned rebuild this
+    // assertion exists to catch in advance.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(&mut conn, "nnd_wf", "nnd-1", day(2026, 2, 3), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    let pk = plan_pk_index();
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {pk}"))
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query(format!(
+        "CREATE UNIQUE INDEX {pk} ON harvest_events (id, cohort) NULLS NOT DISTINCT"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect(
+        "seed an impostor index with the pk-index name, shape and columns, but NULLS NOT DISTINCT",
+    );
+    assert!(
+        index_is_valid(&mut conn, &pk).await,
+        "precondition: the impostor is VALID, not merely present"
+    );
+
+    run_plan_phases(&mut conn, 1..=3).await;
+
+    let mut failure: Option<String> = None;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 4)
+    {
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await
+            && failure.is_none()
+        {
+            failure = Some(e.to_string());
+        }
+    }
+    let msg = failure.expect(
+        "phase 4 must refuse when a valid, correctly-shaped index of the right \
+         name is NULLS NOT DISTINCT, not count it as the real one",
+    );
+    assert!(
+        msg.contains("phase 2 left 1 of 2 valid, correctly-shaped"),
+        "the refusal must report exactly one correctly-shaped index found; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused window must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {pk}"))
+        .execute(&mut conn)
+        .await
+        .expect("drop the impostor index");
+    diesel::sql_query(format!(
+        "DROP INDEX IF EXISTS {}_exec_event_idx",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the index phase 2 legitimately built");
+    diesel::sql_query(format!(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS {}_cohort_ck",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the constraint phase 3 legitimately built");
+}
+
+#[tokio::test]
 async fn phase_4_rechecks_dependent_views_created_after_phase_1() {
     // Review finding: phase 1's dependent-view check runs hours before
     // phase 4's rename, under this plan's online path. A view created (or

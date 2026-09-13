@@ -3834,6 +3834,16 @@ impl MaintenanceOutcome {
 /// type's default
 /// operator class. `indkey` is an `int2vector`, whose Postgres-defined
 /// array lower bound is `0`, so `indkey[0]` is the first key column.
+///
+/// Review finding: also checks `indnullsnotdistinct`. Harvest's own
+/// phase-2 indexes are ordinary ones — `NULLS DISTINCT`, the default.
+/// An operator's own `UNIQUE NULLS NOT DISTINCT` index under one of
+/// these reserved names, with otherwise matching columns, still passed
+/// every check above. `ATTACH PARTITION` requires that property to
+/// match the parent's index. Phase 4 would then find this impostor
+/// unattachable. It would build a replacement over the legacy table
+/// instead, under `ACCESS EXCLUSIVE` — exactly the unplanned rebuild
+/// this assertion exists to catch in advance.
 #[must_use]
 fn index_shape_check_sql(index_name: &str, columns: &[&str]) -> String {
     let col_checks: String = columns
@@ -3849,7 +3859,8 @@ fn index_shape_check_sql(index_name: &str, columns: &[&str]) -> String {
         .join(" AND ");
     let n = columns.len();
     format!(
-        "(c.relname = '{index_name}' AND i.indisunique AND i.indpred IS NULL \
+        "(c.relname = '{index_name}' AND i.indisunique AND NOT i.indnullsnotdistinct \
+         AND i.indpred IS NULL \
          AND i.indexprs IS NULL AND i.indnkeyatts = {n} AND i.indnatts = {n} \
          AND {col_checks} \
          AND NOT EXISTS (\
