@@ -1275,14 +1275,19 @@ mod tests {
     /// fixed, pre-existing per-suspension cost unrelated to this issue — the
     /// whole retry loop for one `ScheduleActivity` command resolves inside a
     /// *single* suspension, so that fixed cost is paid exactly once
-    /// regardless of `max_attempts`. This test asserts an absolute ceiling.
-    /// A policy with a 10-second initial backoff must finish in under 1
-    /// second, for both 2 and 50 attempts. No real backoff can meet that
-    /// ceiling, so a pass proves no attempt slept for its configured delay.
-    /// An earlier version asserted a 100ms delta between two runs instead.
-    /// On a loaded CI runner, scheduling noise alone could exceed 100ms
-    /// and fail the test (issue #1290).
-    #[tokio::test]
+    /// regardless of `max_attempts`. `start_paused` drives a virtual clock.
+    /// This test measures elapsed time with `tokio::time::Instant`, which
+    /// follows that virtual clock, instead of `std::time::Instant`. The one
+    /// suspension advances the virtual clock by exactly `SUSPENSION_TIMEOUT`
+    /// (100ms). A real backoff sleep would advance it far more, since the
+    /// configured backoff is 10 seconds. Elapsed time stays far below that
+    /// scale for any attempt count, independent of host speed. Two earlier
+    /// versions measured real time instead: one compared a 100ms delta
+    /// between two runs, the other asserted a 1-second absolute ceiling.
+    /// Both could still fail on a heavily loaded CI runner, since real
+    /// elapsed time includes time the process spends descheduled
+    /// (issue #1290).
+    #[tokio::test(start_paused = true)]
     async fn test_simulator_retries_are_logical_only_no_real_sleep() {
         async fn run_with_max_attempts(max_attempts: u32) -> std::time::Duration {
             let sim = WorkflowSimulator::new(single_activity_workflow)
@@ -1292,24 +1297,30 @@ mod tests {
                 )
                 .mock_activity("flaky", |_input| Err("always fails".to_string()));
 
-            let started = std::time::Instant::now();
+            let started = tokio::time::Instant::now();
             let res = sim.run(serde_json::json!("input")).await;
             assert!(res.final_output.is_err());
             started.elapsed()
         }
 
-        let no_real_sleep_ceiling = std::time::Duration::from_secs(1);
+        // One suspension advances the virtual clock by exactly
+        // `SUSPENSION_TIMEOUT` (100ms, `executor.rs`). This ceiling gives
+        // 3x headroom over that fixed, deterministic cost while staying
+        // far below the 10-second configured backoff.
+        let no_real_sleep_ceiling = std::time::Duration::from_millis(300);
 
         let few_attempts = run_with_max_attempts(2).await;
         assert!(
             few_attempts < no_real_sleep_ceiling,
-            "2 attempts took {few_attempts:?}; retries must be logical-only, not real-time sleeps"
+            "2 attempts advanced the virtual clock by {few_attempts:?}; retries must be \
+             logical-only, not real sleeps"
         );
 
         let many_attempts = run_with_max_attempts(50).await;
         assert!(
             many_attempts < no_real_sleep_ceiling,
-            "50 attempts took {many_attempts:?}; retries must be logical-only, not real-time sleeps"
+            "50 attempts advanced the virtual clock by {many_attempts:?}; retries must be \
+             logical-only, not real sleeps"
         );
     }
 
