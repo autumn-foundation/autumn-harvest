@@ -2561,11 +2561,30 @@ async fn export_once_via_pool(
     else {
         return Ok(0);
     };
-    ensure_cursor_row(&mut conn, shard_id).await?;
-    let now = Utc::now();
-    let Some(claim) =
-        claim_shard(&mut conn, shard_id, config.batch_size, config.lease, now).await?
-    else {
+    // Raced against `cancel` (Codex review on PR #1520, follow-up P2, fifth
+    // round). `claim_shard`'s locked read can wait indefinitely behind
+    // another session holding the cursor row. A bare await here would then
+    // block graceful shutdown for as long as that lock is held. That is
+    // exactly the failure mode the delivery wait below is raced against.
+    // Nothing has been claimed yet at this point. Abandoning the wait
+    // leaves no state to clean up: the next tick's `claim_shard` retries
+    // the same locked row from scratch.
+    let claim = tokio::select! {
+        result = async {
+            ensure_cursor_row(&mut conn, shard_id).await?;
+            let now = Utc::now();
+            claim_shard(&mut conn, shard_id, config.batch_size, config.lease, now).await
+        } => result?,
+        () = cancel.cancelled() => {
+            tracing::warn!(
+                shard = shard_id,
+                "[audit_export] shutdown requested while claiming a batch; abandoning \
+                 the wait for the next attempt to retry"
+            );
+            return Ok(0);
+        }
+    };
+    let Some(claim) = claim else {
         // Nothing claimed, but the lag gauge must still be emitted (issue
         // #1268). An operator's "is export keeping up?" signal has to stay
         // live exactly when deliveries are NOT happening.
