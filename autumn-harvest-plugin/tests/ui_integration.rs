@@ -4551,6 +4551,81 @@ async fn invalid_started_before_redisplays_form_instead_of_aborting_page() {
     );
 }
 
+/// Wayfinder error-path fix: `page`/`limit` were the two `WorkflowListParams`
+/// fields #1333 left behind. Both were still typed `Option<i64>` directly on
+/// the `Query<..>` extractor, unlike every other filter on this struct. A
+/// non-numeric value on either aborted the whole `/workflows` response with
+/// a bare, unstyled 400. That 400 landed before the filter form, or any
+/// already-typed filter, ever rendered.
+///
+/// RED baseline (pre-fix, reproduced by checking out the parent commit and
+/// running this test): `GET /workflows?limit=not-a-number&workflow_name=billing`
+/// returned `400 Bad Request`. The body did not contain the filters form, so
+/// it discarded `workflow_name=billing` along with the page.
+///
+/// GREEN (this commit): the request still renders the list page (`200`) and
+/// preserves the other filter. It falls back to `DEFAULT_PAGE_SIZE` and
+/// surfaces a `role="alert"` message naming the bad value next to the
+/// "Per page" field.
+#[tokio::test]
+async fn invalid_limit_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) =
+        fetch_html(&app, "/workflows?limit=not-a-number&workflow_name=billing").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid limit must not abort the whole list page: {html}"
+    );
+    assert!(
+        html.contains("value=\"billing\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+}
+
+/// Same fix, the `page` field. No form field backs it; it drives the
+/// Previous/Next links instead, a distinct code path. Covered independently
+/// here rather than assumed symmetric with `limit`.
+#[tokio::test]
+async fn invalid_page_redisplays_list_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) =
+        fetch_html(&app, "/workflows?page=not-a-number&workflow_name=billing").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid page must not abort the whole list page: {html}"
+    );
+    assert!(
+        html.contains("value=\"billing\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the pagination controls: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+    assert!(
+        html.contains("Page 1"),
+        "falls back to page 1 (zero-based page 0) instead of guessing: {html}"
+    );
+}
+
 /// Detail page event timestamps are displayed (not "—" for every row).
 #[tokio::test]
 async fn detail_page_event_timestamps_display() {

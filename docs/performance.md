@@ -1852,3 +1852,7 @@ standalone note rather than part of the claim-path attribution table above:
   `completion_trigger::enforce_completion_triggers_outbox`'s cross-shard
   relay scan, batched into one `workflow_name = ANY($1)` call via
   `resolve_target_queues_batch` (`lookup_calls` n → 1 at every swept size).
+* [`docs/performance-critical-path.md`](performance-critical-path.md) — a
+  redundant second edge-set traversal in
+  `critical_path::CriticalPathAnalyzer::analyze`'s sink detection, folded
+  into the existing per-level DP loop (instructions -15.45%, PR #1500).
