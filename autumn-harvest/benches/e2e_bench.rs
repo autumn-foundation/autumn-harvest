@@ -68,11 +68,12 @@ mod claim_bench_support;
 mod e2e_bench_support;
 
 use e2e_bench_support::{
-    BenchScenario, CHECK_ENV_VAR, Metric, PUBLISHED_BASELINES, REPLAY_CONTROL_DRIFT_PCT,
-    REPRO_TOLERANCE_PCT, ReproVerdict, SCENARIO_FILTER_ENV_VAR, SHARD_COUNTS, SHARD_FILTER_ENV_VAR,
-    ScenarioReport, baseline_for, relative_error_pct, render_matrix, render_value,
-    replay_control_drift_pct, repro_verdict, selected_scenarios, selected_shard_counts,
-    unknown_scenario_ids, unknown_shard_counts,
+    BenchScenario, CHECK_ENV_VAR, CellOutcome, Metric, PUBLISHED_BASELINES,
+    REPLAY_CONTROL_DRIFT_PCT, REPRO_TOLERANCE_PCT, ReproVerdict, SCENARIO_BUDGET_SECS,
+    SCENARIO_FILTER_ENV_VAR, SHARD_COUNTS, SHARD_FILTER_ENV_VAR, ScenarioReport, await_cell,
+    baseline_for, relative_error_pct, render_matrix, render_value, replay_control_drift_pct,
+    repro_verdict, selected_scenarios, selected_shard_counts, unknown_scenario_ids,
+    unknown_shard_counts,
 };
 
 fn main() {
@@ -125,21 +126,39 @@ async fn run() {
             // single unlucky database error aborts the whole sweep, discards
             // every cell already measured, and skips teardown for the databases
             // the remaining cells would have created.
-            let outcome = tokio::spawn(run_scenario(scenario, shards)).await;
+            //
+            // `await_cell` adds a hard wall-clock ceiling on top: a wedged
+            // database can otherwise park this await forever, since
+            // `SCENARIO_BUDGET_SECS` is only a *cooperative* deadline the
+            // scenario checks between its own awaits (issue #1288). A timed-out
+            // cell's databases are not dropped here; the next run's
+            // stale-database sweep reclaims them.
+            let handle = tokio::spawn(run_scenario(scenario, shards));
+            let outcome =
+                await_cell(handle, std::time::Duration::from_secs(SCENARIO_BUDGET_SECS)).await;
             match outcome {
-                Ok(Ok(report)) => reports.push(report),
-                Ok(Err(reason)) => {
+                CellOutcome::Report(report) => reports.push(report),
+                CellOutcome::Skipped(reason) => {
                     println!(
                         "\n> **Skipped** `{}` at {shards} shard(s): {}\n",
                         scenario.as_str(),
                         reason
                     );
                 }
-                Err(join) => {
+                CellOutcome::Panicked(join) => {
                     println!(
                         "\n> **Failed** `{}` at {shards} shard(s): the scenario panicked \
                          ({join}). Later cells still ran; databases this cell created may \
                          need dropping by hand.\n",
+                        scenario.as_str(),
+                    );
+                }
+                CellOutcome::TimedOut => {
+                    println!(
+                        "\n> **Timed out** `{}` at {shards} shard(s): the {SCENARIO_BUDGET_SECS}s \
+                         scenario budget was exhausted and the task was aborted. Later cells \
+                         still ran; databases this cell created were not dropped and will be \
+                         reclaimed by a later run's stale-database sweep.\n",
                         scenario.as_str(),
                     );
                 }

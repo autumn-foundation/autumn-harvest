@@ -90,6 +90,9 @@ mod delayed_start_tests;
 mod det_check_tests;
 mod determinism_static_analysis_docs;
 mod dispatch_tests;
+mod e2e_bench_cell_timeout_tests;
+#[cfg(feature = "db")]
+mod e2e_bench_stale_database_sweep_tests;
 mod e2e_bench_support;
 mod event_batch_tests;
 mod event_partitioning_tests;

@@ -157,6 +157,56 @@ pub const BENCH_ACTIVITIES: [&str; 3] = [
     "harvest_e2e_bench_step_3",
 ];
 
+/// Prefix of every shard database this harness creates against an admin URL.
+///
+/// See [`sweep_step`], which owns the rest of the name shape.
+pub const E2E_DB_PREFIX: &str = "harvest_e2e_";
+
+/// What the stale-database sweep should do with one candidate (issue #1288).
+///
+/// A shard database is named `{E2E_DB_PREFIX}{token}_{seq}_s{shard}`:
+///
+/// * `token` — 16 lowercase hex digits, from the claim harness's `db::run_token`.
+///   The e2e harness shares that token function with the claim harness, so a
+///   single process mints one token for the life of its run regardless of
+///   which harness asks.
+/// * `seq` — decimal digits in `u64` range, from an `AtomicU64` counter.
+/// * `shard` — decimal digits in `u32` range. `ShardId::as_i32` is signed, but
+///   every shard this harness ever mints is `idx as i32` for `idx in
+///   0..shard_count`, so it is never negative; checking `u32` here (rather
+///   than `i32`) is what keeps a decoy such as `..._s-1` from round-tripping
+///   as canonical and being handed to the sweep.
+///
+/// Same asymmetry as the claim harness's own `sweep_step`, which this mirrors
+/// for a different name shape rather than extending: refusing to reclaim one
+/// of ours leaks a database; reclaiming one of theirs destroys data. Every
+/// ambiguous case resolves to `SweepStep::Skip`.
+#[must_use]
+pub fn sweep_step(datname: &str) -> super::claim_bench_support::SweepStep {
+    use super::claim_bench_support::{SweepStep, is_canonical_decimal, is_run_token};
+
+    let Some(rest) = datname.strip_prefix(E2E_DB_PREFIX) else {
+        return SweepStep::Skip;
+    };
+    // Exactly three components. The trailing `None` rejects a longer name.
+    let mut parts = rest.split('_');
+    let (Some(token), Some(seq), Some(shard), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return SweepStep::Skip;
+    };
+    if !is_run_token(token) || !is_canonical_decimal::<u64>(seq) {
+        return SweepStep::Skip;
+    }
+    let Some(shard_digits) = shard.strip_prefix('s') else {
+        return SweepStep::Skip;
+    };
+    if !is_canonical_decimal::<u32>(shard_digits) {
+        return SweepStep::Skip;
+    }
+    SweepStep::AskServer
+}
+
 /// Task dispatches per completed `bench_workflow` run.
 ///
 /// A dispatch is a claim: a worker picks up a `harvest_task_queue` row and
@@ -1437,6 +1487,52 @@ pub async fn run_replay_throughput(shards: u32) -> ScenarioReport {
 }
 
 // ---------------------------------------------------------------------------
+// Cell timeout (issue #1288). Generic over the scenario's own result types, so
+// this carries no dependency on the `db` feature or a live database.
+// ---------------------------------------------------------------------------
+
+/// Outcome of one benchmark cell after its hard wall-clock ceiling.
+#[derive(Debug)]
+pub enum CellOutcome<T, E> {
+    /// The scenario finished within budget.
+    Report(T),
+    /// The scenario could not run here. Never a failure.
+    Skipped(E),
+    /// The scenario's task panicked.
+    Panicked(String),
+    /// The task did not finish within budget and was aborted.
+    TimedOut,
+}
+
+/// Await one cell's spawned task under a hard wall-clock ceiling.
+///
+/// The scenario budget is a *cooperative* deadline: every scenario runner
+/// checks it between awaits, but nothing bounds a single await. A wedged
+/// database can therefore park a cell forever, with nothing above it to
+/// notice (issue #1288). This is the outer stop. Past `budget`, the task is
+/// aborted and the cell reports [`CellOutcome::TimedOut`] instead of hanging
+/// the whole sweep.
+///
+/// Aborting does not run the task's remaining code, so a timed-out cell's
+/// `ShardCluster::teardown` never runs and its databases are not dropped
+/// here. The next run's stale-database sweep reclaims them instead.
+pub async fn await_cell<T, E>(
+    handle: tokio::task::JoinHandle<Result<T, E>>,
+    budget: Duration,
+) -> CellOutcome<T, E> {
+    let abort_handle = handle.abort_handle();
+    match tokio::time::timeout(budget, handle).await {
+        Ok(Ok(Ok(report))) => CellOutcome::Report(report),
+        Ok(Ok(Err(reason))) => CellOutcome::Skipped(reason),
+        Ok(Err(join_err)) => CellOutcome::Panicked(join_err.to_string()),
+        Err(_elapsed) => {
+            abort_handle.abort();
+            CellOutcome::TimedOut
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pure unit tests. No `#[tokio::test]`, no `block_on`: `ci_run_coverage`
 // classifies this file as a harness rather than a suite, and that classification
 // must keep holding.
@@ -2194,6 +2290,34 @@ mod tests {
             );
         }
     }
+
+    // ── Stale-database sweep name shape (issue #1288) ──────────────────────
+
+    use super::super::claim_bench_support::SweepStep;
+
+    #[test]
+    fn e2e_sweep_step_accepts_a_freshly_minted_name() {
+        let minted = format!("{E2E_DB_PREFIX}0123456789abcdef_7_s2");
+        assert_eq!(sweep_step(&minted), SweepStep::AskServer, "{minted}");
+    }
+
+    #[test]
+    fn e2e_sweep_step_leaves_names_we_did_not_mint_alone() {
+        for name in [
+            "harvest_claim_bench_1_0123456789abcdef_0",
+            "harvest_e2e_0123456789ABCDEF_7_s2",
+            "harvest_e2e_0123456789abcdef_7",
+            "harvest_e2e_0123456789abcdef_7_2",
+            "harvest_e2e_0123456789abcdef_7_s2_extra",
+            "harvest_e2e_0123456789abcdef_-1_s2",
+            "harvest_e2e_0123456789abcdef_7_s-1",
+            "harvest_e2e_short_7_s2",
+            "postgres",
+            "",
+        ] {
+            assert_eq!(sweep_step(name), SweepStep::Skip, "{name}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2243,8 +2367,8 @@ pub mod db {
         SIGNAL_WORKFLOWS_PER_SHARD, ScenarioReport, WORKERS_PER_SHARD, clock_offset_soundness,
         dispatch_population_soundness, latency_soundness, mean_inflight, measured_samples,
         pacing_verdict, per_shard_inflight_soundness, per_shard_pacing_verdict, steady_state_slice,
-        steady_state_throughput, steady_state_window, throughput_soundness, warmup_batch_for,
-        warmup_soundness,
+        steady_state_throughput, steady_state_window, sweep_step, throughput_soundness,
+        warmup_batch_for, warmup_soundness,
     };
 
     // ── Skip / provisioning ───────────────────────────────────────────────
@@ -2356,6 +2480,93 @@ pub mod db {
         failures
     }
 
+    /// Drop e2e shard databases left behind by an earlier run.
+    ///
+    /// `ShardCluster::teardown` drops what a run created on every ordinary and
+    /// error return, but a **panic** or a Ctrl-C skips it: dropping a database
+    /// is async, so `ShardCluster` cannot have a useful `Drop` (issue #1288).
+    /// Sweeping at provisioning time, not at teardown, is what reclaims those:
+    /// a run that panicked mid-sweep never reaches its own teardown, but the
+    /// next run's setup still passes through here.
+    ///
+    /// Mirrors `claim_bench_support::db::drop_stale_bench_databases` for the
+    /// e2e name shape. A database belonging to a **live** run is skipped, so
+    /// concurrent runs cannot delete each other's working set. Every failure
+    /// here is ignored: a leaked database is untidy, but failing to reclaim
+    /// one must never fail a benchmark.
+    async fn drop_stale_e2e_databases(admin: &mut AsyncPgConnection) {
+        #[derive(QueryableByName)]
+        struct NameRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            datname: String,
+        }
+
+        let Ok(rows) =
+            diesel::sql_query("SELECT datname FROM pg_database WHERE datname LIKE 'harvest_e2e_%'")
+                .load::<NameRow>(admin)
+                .await
+        else {
+            return;
+        };
+
+        for row in rows {
+            // The `LIKE` above is only a loose prefilter; every candidate is
+            // re-checked here against the full minted shape before anything
+            // destructive runs.
+            if sweep_step(&row.datname) == super::super::claim_bench_support::SweepStep::Skip {
+                continue;
+            }
+            // The server is the one party that sees every client regardless
+            // of host or PID namespace; a live run holds a lease connection
+            // for its database's whole lifetime (see `ShardCluster::leases`),
+            // so any backend at all means "in use".
+            if super::super::claim_bench_support::db::database_has_connections(
+                admin,
+                &row.datname,
+            )
+            .await
+            {
+                continue;
+            }
+            super::super::claim_bench_support::db::drop_database_version_neutral(
+                admin,
+                &row.datname,
+            )
+            .await;
+        }
+    }
+
+    /// Sweep stale e2e databases on `admin_url`'s server, then run `provision`
+    /// while still holding the stale-database sweep lock.
+    ///
+    /// The lock must span provisioning, not just the sweep: a fresh database
+    /// has no lease connection until [`create_shard_database`] finishes
+    /// connecting to it, and a foreign sweep between `CREATE DATABASE` and
+    /// that connect would see zero backends and correctly conclude the
+    /// database is abandoned. Same race, same fix, as
+    /// `claim_bench_support::db::setup_bench_db`.
+    ///
+    /// Skipped entirely against a testcontainer: nothing outside this process
+    /// can reach that server, so there is nothing to sweep and no peer to
+    /// serialize against.
+    async fn with_stale_sweep<T>(
+        admin_url: &str,
+        provision: impl std::future::Future<Output = Result<T, SkipReason>>,
+    ) -> Result<T, SkipReason> {
+        let lock = super::super::claim_bench_support::db::take_sweep_lock(admin_url)
+            .await
+            .map_err(|e| SkipReason(e.0))?;
+        let admin_db_url = super::super::claim_bench_support::db::admin_connection_url(admin_url)
+            .map_err(|e| SkipReason(e.0))?;
+        let mut admin = <AsyncPgConnection as AsyncConnection>::establish(&admin_db_url)
+            .await
+            .map_err(|e| SkipReason(format!("connect for the stale-database sweep: {e}")))?;
+        drop_stale_e2e_databases(&mut admin).await;
+        let result = provision.await;
+        super::super::claim_bench_support::db::release_sweep_lock(lock).await;
+        result
+    }
+
     async fn create_shard_database(
         admin_url: &str,
         shard: ShardId,
@@ -2369,7 +2580,15 @@ pub mod db {
                 ))
             })?;
         let seq = DB_SEQ.fetch_add(1, Ordering::Relaxed);
-        let name = format!("harvest_e2e_{}_{seq}_s{}", run_token(), shard.as_i32());
+        // Shape: `{super::E2E_DB_PREFIX}{token}_{seq}_s{shard}`. See
+        // `super::sweep_step`, which owns the rest of this shape and is the
+        // authority a stale-database sweep checks a name against.
+        let name = format!(
+            "{}{}_{seq}_s{}",
+            super::E2E_DB_PREFIX,
+            run_token(),
+            shard.as_i32()
+        );
         diesel::sql_query(format!("CREATE DATABASE {name}"))
             .execute(&mut admin)
             .await
@@ -2429,7 +2648,9 @@ pub mod db {
             let mut created = Vec::new();
             for (idx, admin) in admin_urls.iter().take(count).enumerate() {
                 let shard = ShardId::new(i32::try_from(idx).unwrap_or(0));
-                match create_shard_database(admin, shard).await {
+                // Each admin URL is potentially a different server, so the
+                // stale-database sweep and its lock are per-shard here.
+                match with_stale_sweep(admin, create_shard_database(admin, shard)).await {
                     Ok((url, name, lease)) => {
                         urls.insert(shard, url);
                         created.push(((*admin).to_owned(), name));
@@ -2484,20 +2705,33 @@ pub mod db {
         let mut urls = BTreeMap::new();
         let mut leases = Vec::new();
         let mut created = Vec::new();
-        for idx in 0..count {
-            let shard = ShardId::new(i32::try_from(idx).unwrap_or(0));
-            match create_shard_database(&admin_url, shard).await {
-                Ok((url, name, lease)) => {
-                    urls.insert(shard, url);
-                    created.push((admin_url.clone(), name));
-                    leases.push(lease);
-                }
-                Err(e) => {
-                    drop(leases);
-                    drop_created(&created).await;
-                    return Err(e);
+        let provision = async {
+            for idx in 0..count {
+                let shard = ShardId::new(i32::try_from(idx).unwrap_or(0));
+                match create_shard_database(&admin_url, shard).await {
+                    Ok((url, name, lease)) => {
+                        urls.insert(shard, url);
+                        created.push((admin_url.clone(), name));
+                        leases.push(lease);
+                    }
+                    Err(e) => return Err(e),
                 }
             }
+            Ok(())
+        };
+        // One sweep and one lock hold for the whole shard loop here: every
+        // shard shares this one server. Skipped on the testcontainer path —
+        // nothing outside this process can reach that server, so there is
+        // nothing to sweep and no peer to serialize against.
+        let provisioned = if container.is_none() {
+            with_stale_sweep(&admin_url, provision).await
+        } else {
+            provision.await
+        };
+        if let Err(e) = provisioned {
+            drop(leases);
+            drop_created(&created).await;
+            return Err(e);
         }
         Ok(ShardCluster {
             urls,
