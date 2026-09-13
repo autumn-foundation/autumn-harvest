@@ -735,6 +735,46 @@ is a storage-level limit independent of quoting.
 `from_dsns_groups_unquoted_names_differing_only_past_the_identifier_length_limit`
 pins the fix.
 
+A twenty-eighth review round (P2) proposed narrowing the previous
+round's truncation fix to the unquoted branch only, on the claim that
+`SplitIdentifierString` truncates only unquoted `search_path` entries
+and leaves quoted ones verbatim. Checked against the `PostgreSQL`
+documentation rather than assumed either way, since it directly
+contradicted the prior round's own reasoning: section 4.1.1 states,
+specifically for quoted identifiers, that "the length limitation
+still applies" -- quoting exempts a name from case-folding, not from
+the sixty-three-byte limit. `SplitIdentifierString` itself matches
+this: `truncate_identifier` runs once, after the quoted-or-unquoted
+branch has produced the name, with no branch-specific skip. Not
+narrowed; replied with the citation, leaving `parse_identifier_list`
+truncating both branches as the twenty-seventh round left it.
+
+Merging `origin/trunk-dev` to pick up unrelated fixes surfaced two
+issues on the merged tree, neither in code this PR touches. `trunk-dev`
+itself carried a duplicate Grafana panel id -- two independently landed
+PRs each minted id 956 in `docs/dashboards/starter-pack-v0.1.0.json` --
+already caught and fixed, unmerged, by PR #1519; that exact one-line
+renumbering was ported into this branch rather than re-derived.
+
+The merge also exposed a real, if narrow, cross-platform bug in
+`canonical_dsn_key` itself, caught by the Windows CI job:
+`from_dsns_keeps_distinctly_cased_socket_paths_separate` failed only on
+`windows-latest`. `tokio_postgres` represents a `/`-prefixed `host`
+value through its own `Unix` variant only on a `cfg(unix)` build --
+that variant, and the `/`-prefix rule that produces it, are both
+`#[cfg(unix)]`-gated upstream. On every other target, including
+Windows, the identical string surfaces through the plain `Tcp` variant
+instead, which this function was lowercasing like a real hostname. Two
+DSNs differing only in the case of a Unix-socket-style path therefore
+collapsed into one group on a Windows-built binary, while a Unix-built
+binary correctly kept them apart -- the same dangerous under-merging
+risk this key exists to close, now conditioned on build platform rather
+than DSN content. The `Tcp` arm now special-cases a `/`-prefixed name
+the same way the `Unix` arm below it already does: kept case-sensitive,
+never lowercased. `from_dsns_keeps_distinctly_cased_socket_paths_separate`
+already pinned the intended behavior; it simply could not previously
+fail on the Linux runner this repository was developed against.
+
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call
 site's behavior when the new flag is left at its default (disabled).

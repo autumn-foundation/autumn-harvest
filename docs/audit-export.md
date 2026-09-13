@@ -427,7 +427,14 @@ shard records:
   resolved host is lowercased only when it does not start
   with `/`: a DNS name is case-insensitive, but a Unix-socket path is a
   case-sensitive filesystem path (`/run/PG-A` and `/run/pg-a` name
-  different sockets). A DSN with no path is not treated as naming no
+  different sockets). `tokio_postgres` reports a `/`-prefixed `host`
+  value through its own `Unix` variant only on a `cfg(unix)` build; on
+  every other target it reports the identical string through the plain
+  `Tcp` variant instead, since upstream gates the `Unix` variant the same
+  way. The case-sensitive rule is applied in both arms for exactly this
+  reason. Skipping the `Tcp` arm would let a Windows-built binary
+  lowercase and collapse two DSNs that a Unix-built binary, given the
+  same input, keeps distinct. A DSN with no path is not treated as naming no
   database, since libpq defaults an omitted `dbname` to the connecting
   username — the key uses the username only in that case, never when a
   path is present.

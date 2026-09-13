@@ -1059,6 +1059,15 @@ fn canonical_dsn_key(dsn: &str) -> String {
             tokio_postgres::config::Host::Tcp(name) => {
                 if let Ok(addr) = std::net::IpAddr::from_str(name) {
                     hostaddrs.push(addr.to_string());
+                } else if name.starts_with('/') {
+                    // `Config::host`'s `/`-prefix rule is `#[cfg(unix)]`-gated
+                    // upstream. A non-Unix build parses a `/`-prefixed `host`
+                    // value into this `Tcp` arm, never the `Unix` arm below.
+                    // Keep it case-sensitive like the `Unix` arm does.
+                    // Do not lowercase it like a real hostname. The key this
+                    // function returns for one DSN must not depend on which
+                    // platform built the binary that computed it.
+                    hosts.push(name.clone());
                 } else {
                     hosts.push(name.to_ascii_lowercase());
                 }
