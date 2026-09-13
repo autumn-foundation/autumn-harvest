@@ -1275,13 +1275,13 @@ mod tests {
     /// fixed, pre-existing per-suspension cost unrelated to this issue — the
     /// whole retry loop for one `ScheduleActivity` command resolves inside a
     /// *single* suspension, so that fixed cost is paid exactly once
-    /// regardless of `max_attempts`. This test asserts an absolute ceiling:
-    /// a policy with a 10-second initial backoff must finish in under 1
+    /// regardless of `max_attempts`. This test asserts an absolute ceiling.
+    /// A policy with a 10-second initial backoff must finish in under 1
     /// second, for both 2 and 50 attempts. No real backoff can meet that
     /// ceiling, so a pass proves no attempt slept for its configured delay.
-    /// An earlier version compared elapsed time between two runs instead.
-    /// On a loaded CI runner, scheduling noise alone could exceed that
-    /// delta budget and fail the test (issue #1290).
+    /// An earlier version asserted a 100ms delta between two runs instead.
+    /// On a loaded CI runner, scheduling noise alone could exceed 100ms
+    /// and fail the test (issue #1290).
     #[tokio::test]
     async fn test_simulator_retries_are_logical_only_no_real_sleep() {
         async fn run_with_max_attempts(max_attempts: u32) -> std::time::Duration {
