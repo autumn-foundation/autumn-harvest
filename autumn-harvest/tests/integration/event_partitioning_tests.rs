@@ -2072,6 +2072,81 @@ async fn partition_maintenance_stays_none_on_a_shard_that_never_converted() {
 }
 
 #[tokio::test]
+async fn partition_maintenance_clears_to_none_after_a_shard_reverts_to_unpartitioned() {
+    // Review finding on item 6: `update_partitions` only ever sets
+    // `partition_maintenance`. A shard that ran maintenance and later
+    // reverted via `harvest partition disable` kept reporting its last
+    // outcome forever, since nothing ever cleared the field back to
+    // `None`.
+    //
+    // `RetentionConfig::default()`, not `with_max_age`, is deliberate. With
+    // a history-retention age configured, the tick's OTHER update path
+    // (`RetentionMonitor::update`, for the history-retention counters)
+    // replaces the whole per-shard result every tick. It would incidentally
+    // reset this field too, masking a regression here. No max_age skips
+    // that phase, so only the fix under test can clear the field.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    let pool = build_pool(&url);
+    let pools = ShardedDbPool::single(pool);
+    let config = RetentionConfig::default();
+    assert!(
+        config.max_age_secs.is_none(),
+        "precondition: the history-retention phase must be off, or its own \
+         update() would mask a regression in the fix under test"
+    );
+
+    let runtime = RetentionRuntime::spawn(pools, config, Arc::new(NoopMetrics), None, None)
+        .expect("retention runtime should spawn when enabled");
+    runtime.run_now();
+
+    let mut got_outcome = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snap = runtime.monitor().snapshot();
+        if let Some(r) = snap.per_shard.iter().find(|r| r.shard == 0)
+            && r.partition_maintenance.is_some()
+        {
+            got_outcome = true;
+            break;
+        }
+    }
+    assert!(
+        got_outcome,
+        "precondition: a partitioned shard must report a maintenance outcome"
+    );
+
+    partition::disable_partitioning(&mut conn)
+        .await
+        .expect("disable")
+        .expect("shard was partitioned, so disable must report a DisableReport");
+
+    runtime.run_now();
+    let mut cleared = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snap = runtime.monitor().snapshot();
+        if let Some(r) = snap.per_shard.iter().find(|r| r.shard == 0)
+            && r.partition_maintenance.is_none()
+        {
+            cleared = true;
+            break;
+        }
+    }
+    runtime.shutdown();
+    assert!(
+        cleared,
+        "partition_maintenance must clear back to None once the shard \
+         reverts to unpartitioned, not keep reporting its last outcome"
+    );
+}
+
+#[tokio::test]
 async fn an_append_for_an_uncovered_cohort_survives_via_the_default_partition() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;

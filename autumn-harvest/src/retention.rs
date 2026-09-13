@@ -974,6 +974,26 @@ impl RetentionMonitor {
         }
     }
 
+    /// Clear this shard's partition-maintenance outcome (review finding on
+    /// issue #1270 item 6).
+    ///
+    /// `update_partitions` only ever sets the field. A shard that reports a
+    /// real outcome and later reverts to unpartitioned (`harvest partition
+    /// disable`) would then keep showing its last outcome forever. Call
+    /// this when the layout probe finds a shard unpartitioned, so the field
+    /// returns to `None` instead of going stale.
+    #[cfg(feature = "db")]
+    fn clear_partitions(&self, shard: ShardId) {
+        let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
+        if let Some(existing) = guard
+            .per_shard
+            .iter_mut()
+            .find(|x| x.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
+        {
+            existing.partition_maintenance = None;
+        }
+    }
+
     /// Record this shard's rate-limit bucket GC count (issue #1127) without
     /// disturbing the history-retention counters already reported this tick.
     ///
@@ -1267,7 +1287,13 @@ impl RetentionRuntime {
                         // would say maintenance is active where it never
                         // converted.
                         match crate::partition::detect_layout(&mut conn).await {
-                            Ok(crate::partition::EventLayout::Unpartitioned) => continue,
+                            Ok(crate::partition::EventLayout::Unpartitioned) => {
+                                // A shard that reverted via `harvest partition
+                                // disable` must not keep showing its last
+                                // outcome from before the revert.
+                                monitor_task.clear_partitions(shard);
+                                continue;
+                            }
                             Ok(crate::partition::EventLayout::Partitioned { .. }) => {}
                             Err(error) => {
                                 tracing::warn!(
