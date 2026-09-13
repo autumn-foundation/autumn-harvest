@@ -1244,7 +1244,11 @@ fn parse_page_query_field(raw: Option<&str>) -> (i64, String, Option<String>) {
                 )),
             )
         },
-        |parsed| (parsed.max(0), trimmed.to_string(), None),
+        // A well-formed but negative page number is clamped, not rejected.
+        // The raw text is left empty so a caller displays the clamped
+        // value, not the pre-clamp text. This matches the pre-fix
+        // `.unwrap_or(0).max(0)` display.
+        |parsed| (parsed.max(0), String::new(), None),
     )
 }
 
@@ -1266,7 +1270,11 @@ fn parse_limit_query_field(raw: Option<&str>) -> (i64, String, Option<String>) {
                 )),
             )
         },
-        |parsed| (parsed.clamp(1, MAX_PAGE_SIZE), trimmed.to_string(), None),
+        // Same as `parse_page_query_field`: a well-formed but out-of-range
+        // limit is clamped silently, the pre-fix behavior. The raw text is
+        // left empty rather than displayed alongside a different effective
+        // value.
+        |parsed| (parsed.clamp(1, MAX_PAGE_SIZE), String::new(), None),
     )
 }
 
@@ -4713,7 +4721,7 @@ fn render_workflow_list(
             }
         }
 
-        (render_pagination(page, limit, has_next, state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_before_raw, exec_id_search, page_error))
+        (render_pagination(page, limit, limit_raw, has_next, state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_before_raw, exec_id_search, page_error))
     };
 
     layout("Workflows · Vantage", &body, "")
@@ -4794,7 +4802,13 @@ fn render_filters(
             }
             label {
                 "Per page"
-                input type="number" name="limit" min="1" max=(MAX_PAGE_SIZE) value=(limit_value);
+                // `type="text"`, not `type="number"`. A number input
+                // sanitizes an invalid value (e.g. "not-a-number") to
+                // blank at render time. The operator could then never see
+                // or correct their own bad input. This matches the Workers
+                // page's `shard` filter, the other redisplayable numeric
+                // field in this file.
+                input type="text" inputmode="numeric" pattern="[0-9]*" name="limit" value=(limit_value);
                 @if let Some(error) = limit_error {
                     span.field-error role="alert" { (error) }
                 }
@@ -4809,6 +4823,7 @@ fn render_filters(
 fn render_pagination(
     page: i64,
     limit: i64,
+    limit_raw: &str,
     has_next: bool,
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
@@ -4820,6 +4835,7 @@ fn render_pagination(
 ) -> Markup {
     let base_query = build_query_string(
         limit,
+        limit_raw,
         state_filter,
         workflow_name_filter,
         search_attr_filter,
@@ -4857,6 +4873,7 @@ fn render_pagination(
 #[allow(clippy::too_many_arguments)]
 fn build_query_string(
     limit: i64,
+    limit_raw: &str,
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
     search_attr_filter: Option<&(String, String)>,
@@ -4865,7 +4882,14 @@ fn build_query_string(
     exec_id_search: Option<&str>,
 ) -> String {
     let mut out = String::new();
-    if limit != DEFAULT_PAGE_SIZE {
+    // `limit_raw` is non-empty only on a genuine parse failure (see
+    // `parse_limit_query_field`), never for a valid-but-clamped value. An
+    // invalid limit the operator has not yet corrected must not silently
+    // vanish from a Next/Previous link, the same carry-through as
+    // `started_after`/`started_before` below.
+    if !limit_raw.is_empty() {
+        let _ = write!(out, "&limit={}", url_encode(limit_raw));
+    } else if limit != DEFAULT_PAGE_SIZE {
         let _ = write!(out, "&limit={limit}");
     }
     if let Some(state) = state_filter {
@@ -11479,26 +11503,28 @@ mod tests {
         );
     }
 
+    /// Codex review finding on this PR: on a successful parse, `raw` must be
+    /// empty, not an echo of the input. `render_filters`/`build_query_string`
+    /// treat a non-empty raw as "still invalid, keep displaying the bad
+    /// text". Echoing valid text there is harmless when it already matches
+    /// the resolved value. See the clamping test below for where it is not.
     #[test]
     fn parse_page_query_field_accepts_valid_values() {
-        assert_eq!(
-            parse_page_query_field(Some("3")),
-            (3, "3".to_string(), None)
-        );
+        assert_eq!(parse_page_query_field(Some("3")), (3, String::new(), None));
         assert_eq!(
             parse_page_query_field(Some("  7  ")),
-            (7, "7".to_string(), None)
+            (7, String::new(), None)
         );
     }
 
+    /// Codex review finding on this PR: a negative page number parses. It is
+    /// a well-formed whole number, and is clamped, matching the pre-fix
+    /// `.unwrap_or(0).max(0)` behavior. `raw` must stay empty, though, so a
+    /// caller displays the clamped `0`, not the pre-clamp `"-5"` alongside
+    /// it.
     #[test]
     fn parse_page_query_field_clamps_negative_values_to_zero() {
-        // A negative page number parses (it is a well-formed whole number)
-        // but is clamped, matching the pre-fix `.unwrap_or(0).max(0)` behavior.
-        assert_eq!(
-            parse_page_query_field(Some("-5")),
-            (0, "-5".to_string(), None)
-        );
+        assert_eq!(parse_page_query_field(Some("-5")), (0, String::new(), None));
     }
 
     /// GREEN -- the fix under test: a non-numeric `page` no longer aborts
@@ -11529,21 +11555,23 @@ mod tests {
     fn parse_limit_query_field_accepts_valid_values() {
         assert_eq!(
             parse_limit_query_field(Some("50")),
-            (50, "50".to_string(), None)
+            (50, String::new(), None)
         );
     }
 
+    /// Codex review finding on this PR: a well-formed but out-of-range limit
+    /// (`0`, `100000`) is clamped, matching the pre-fix `.clamp(1,
+    /// MAX_PAGE_SIZE)` behavior. `raw` must stay empty here. Before this
+    /// fix, `render_filters` preferred a non-empty `raw` over the resolved
+    /// `limit`. The "Per page" field then displayed the pre-clamp text
+    /// (`"100000"`). Pagination actually used the clamped value (`200`) —
+    /// a silent mismatch with no error explaining it.
     #[test]
     fn parse_limit_query_field_clamps_out_of_range_values() {
-        // Matches the pre-fix `.clamp(1, MAX_PAGE_SIZE)` behavior for a
-        // well-formed number outside the allowed range.
-        assert_eq!(
-            parse_limit_query_field(Some("0")),
-            (1, "0".to_string(), None)
-        );
+        assert_eq!(parse_limit_query_field(Some("0")), (1, String::new(), None));
         assert_eq!(
             parse_limit_query_field(Some("100000")),
-            (MAX_PAGE_SIZE, "100000".to_string(), None)
+            (MAX_PAGE_SIZE, String::new(), None)
         );
     }
 
@@ -11562,6 +11590,40 @@ mod tests {
         assert!(
             message.contains("a-lot") && message.contains("limit"),
             "the error names the bad value and the field: {message}"
+        );
+    }
+
+    /// Codex review finding on this PR: a `type="number"` input sanitizes an
+    /// invalid value to blank at render time in a real browser. The
+    /// operator could then never see or edit the exact text they typed.
+    /// That holds even though the HTML source already carried it — and
+    /// thus this test, if it only checked `contains("not-a-number")`. The
+    /// "Per page" field must be a text control, matching the Workers page's
+    /// `shard` filter.
+    #[test]
+    fn per_page_input_is_a_text_control_that_can_hold_invalid_text() {
+        let markup = render_filters(
+            None,
+            None,
+            None,
+            "",
+            None,
+            "",
+            None,
+            None,
+            DEFAULT_PAGE_SIZE,
+            "not-a-number",
+            Some("invalid limit 'not-a-number'"),
+        )
+        .into_string();
+        assert!(
+            markup
+                .contains(r#"input type="text" inputmode="numeric" pattern="[0-9]*" name="limit""#),
+            "the Per page field must be a text control, not type=\"number\": {markup}"
+        );
+        assert!(
+            markup.contains("value=\"not-a-number\""),
+            "the operator's invalid input must be preserved: {markup}"
         );
     }
 
@@ -12035,19 +12097,28 @@ mod tests {
     #[test]
     fn build_query_string_omits_default_limit() {
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, None, None, None, "", "", None),
+            build_query_string(DEFAULT_PAGE_SIZE, "", None, None, None, "", "", None),
             ""
         );
         assert_eq!(
-            build_query_string(10, None, None, None, "", "", None),
+            build_query_string(10, "", None, None, None, "", "", None),
             "&limit=10"
         );
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, Some("FAILED"), None, None, "", "", None),
+            build_query_string(
+                DEFAULT_PAGE_SIZE,
+                "",
+                Some("FAILED"),
+                None,
+                None,
+                "",
+                "",
+                None
+            ),
             "&state=FAILED"
         );
         assert_eq!(
-            build_query_string(50, Some("with space"), None, None, "", "", None),
+            build_query_string(50, "", Some("with space"), None, None, "", "", None),
             "&limit=50&state=with%20space"
         );
     }
@@ -12057,6 +12128,7 @@ mod tests {
         assert_eq!(
             build_query_string(
                 DEFAULT_PAGE_SIZE,
+                "",
                 None,
                 Some("onboarding"),
                 None,
@@ -12068,7 +12140,7 @@ mod tests {
         );
         let pair = ("tenant".to_string(), "acme".to_string());
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, None, None, Some(&pair), "", "", None),
+            build_query_string(DEFAULT_PAGE_SIZE, "", None, None, Some(&pair), "", "", None),
             "&search_attr_key=tenant&search_attr_value=acme"
         );
     }
@@ -12081,12 +12153,51 @@ mod tests {
     #[test]
     fn build_query_string_preserves_invalid_date_text_for_pagination() {
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, None, None, None, "yesterday", "", None),
+            build_query_string(
+                DEFAULT_PAGE_SIZE,
+                "",
+                None,
+                None,
+                None,
+                "yesterday",
+                "",
+                None
+            ),
             "&started_after=yesterday"
         );
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, None, None, None, "", "not-a-date", None),
+            build_query_string(
+                DEFAULT_PAGE_SIZE,
+                "",
+                None,
+                None,
+                None,
+                "",
+                "not-a-date",
+                None
+            ),
             "&started_before=not-a-date"
+        );
+    }
+
+    /// Same Codex finding, the `limit` field. `limit_raw` is non-empty only
+    /// on a genuine parse failure (`parse_limit_query_field`). It must
+    /// override the resolved `limit` in the link, rather than being
+    /// dropped alongside it.
+    #[test]
+    fn build_query_string_preserves_invalid_limit_text_for_pagination() {
+        assert_eq!(
+            build_query_string(
+                DEFAULT_PAGE_SIZE,
+                "not-a-number",
+                None,
+                None,
+                None,
+                "",
+                "",
+                None
+            ),
+            "&limit=not-a-number"
         );
     }
 
@@ -12099,6 +12210,7 @@ mod tests {
         assert_eq!(
             build_query_string(
                 DEFAULT_PAGE_SIZE,
+                "",
                 None,
                 None,
                 None,
