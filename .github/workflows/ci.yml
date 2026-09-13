@@ -935,16 +935,23 @@ jobs:
       # failed this exact job on issue #1287's PR) fails whichever live-DB
       # test happened to trigger the pull -- not a real test bug. Retrying
       # the pull here, in its own step with its own budget, turns that into a
-      # retried infrastructure step instead of a flaky test. Both images:
-      # `postgres:11-alpine` (testcontainers-modules' Postgres default, used
-      # by nearly every suite this job runs) and `redis:5.0` (its Redis
-      # default, needed by the issue #1312 dispatch suites this job also
-      # forces via HARVEST_TEST_REQUIRE_REDIS below).
+      # retried infrastructure step instead of a flaky test.
+      #
+      # Every tag this job's suites actually request, not just the
+      # testcontainers-modules default (Codex review: the default alone left
+      # the suites that override it just as exposed as before):
+      # `postgres:11-alpine` (the unoverridden default -- `autumn-web`'s own
+      # `TestDb`, used by e.g. the webhook suites), `postgres:16` (the tag
+      # ~220 of this repo's own DB suites request via `.with_tag("16")`),
+      # `postgres:16-alpine` (one outlier suite's override), and `redis:5.0`
+      # (Redis's default, un-overridden anywhere; needed by the issue #1312
+      # dispatch suites this job also forces via HARVEST_TEST_REQUIRE_REDIS
+      # below).
       - name: Pre-pull Docker test images (retry transient pull failures)
         if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
-          for image in postgres:11-alpine redis:5.0; do
+          for image in postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0; do
             for attempt in 1 2 3 4 5; do
               if docker pull "$image"; then
                 continue 2
