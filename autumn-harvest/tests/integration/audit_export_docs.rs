@@ -86,6 +86,12 @@ fn module_doc_names_the_index_cost() {
         path.display()
     );
     assert!(
+        !contains_collapsed(&text, "Opt-in and zero-cost when unconfigured"),
+        "{}: the retracted zero-cost heading must not return; \
+         issue #1272 scoped it to read behavior only",
+        path.display()
+    );
+    assert!(
         names_index_cost_near(&text, "harvest_audit_log_unexported_idx"),
         "{}: the opt-in section must name the partial index within reach of \
          issue #1272, next to its zero-cost claim",
