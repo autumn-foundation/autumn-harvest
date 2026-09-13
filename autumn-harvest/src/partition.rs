@@ -3418,10 +3418,10 @@ const DRAIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// Review finding: an unconditional timer-driven tick has no notion of
 /// progress at all. A step that hangs -- stuck on something the absent
 /// `statement_timeout` cannot catch, for instance -- would then tick
-/// forever, and the scanner could never age into `Stale` or `Wedged`.
-/// Ten minutes is generous enough for a legitimately huge cohort or
+/// forever. The scanner could never age into `Stale` or `Wedged`. Ten
+/// minutes is generous enough for a legitimately huge cohort or
 /// backlog. Past it, [`await_with_heartbeat`] stops ticking and simply
-/// waits: a step still running normally finishes on its own, and a step
+/// waits. A step still running normally finishes on its own. A step
 /// truly stuck starts aging normally again, exactly as it did before
 /// this whole heartbeat existed.
 #[cfg(feature = "db")]
@@ -3430,8 +3430,8 @@ const DRAIN_HEARTBEAT_GRACE: Duration = Duration::from_secs(600);
 /// Awaits `query`, ticking `progress` on [`DRAIN_HEARTBEAT_INTERVAL`]
 /// while it runs, for up to [`DRAIN_HEARTBEAT_GRACE`] total.
 ///
-/// Never touches the connection the query itself is using -- it only
-/// races a timer against the caller's own future -- so the statement
+/// Never touches the connection the query itself is using. It only
+/// races a timer against the caller's own future, so the statement
 /// this awaits stays exactly one round trip.
 #[cfg(feature = "db")]
 async fn await_with_heartbeat<F: Future>(
@@ -5748,7 +5748,10 @@ mod tests {
         tokio::pin!(query);
         let result = await_with_heartbeat(query, &mut progress).await;
 
-        assert_eq!(result, 42, "the underlying future's own result must still be returned");
+        assert_eq!(
+            result, 42,
+            "the underlying future's own result must still be returned"
+        );
         let expected_ticks = DRAIN_HEARTBEAT_GRACE.as_secs() / DRAIN_HEARTBEAT_INTERVAL.as_secs();
         // `AtomicU32::load`, never `ticks.load(..)`: diesel's blanket
         // `RunQueryDsl` impl (see `.iter().find(...)`, above) shadows it in
