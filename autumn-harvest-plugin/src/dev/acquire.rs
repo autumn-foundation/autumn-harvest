@@ -401,7 +401,12 @@ mod tests {
             let b = a.join("b");
             let cache = b.join("cache");
             fs::create_dir_all(&cache).expect("mkdir cache");
-            for dir in [root_path.as_path(), a.as_path(), b.as_path(), cache.as_path()] {
+            for dir in [
+                root_path.as_path(),
+                a.as_path(),
+                b.as_path(),
+                cache.as_path(),
+            ] {
                 fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod");
             }
             (root, cache)
