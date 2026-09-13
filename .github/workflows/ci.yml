@@ -929,6 +929,32 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
+      # The prune above guarantees every shard pulls its testcontainer images
+      # from a cold cache. `testcontainers` itself retries nothing on a pull,
+      # so a transient registry blip (a real one: "bytes remaining on stream"
+      # failed this exact job on issue #1287's PR) fails whichever live-DB
+      # test happened to trigger the pull -- not a real test bug. Retrying
+      # the pull here, in its own step with its own budget, turns that into a
+      # retried infrastructure step instead of a flaky test. Both images:
+      # `postgres:11-alpine` (testcontainers-modules' Postgres default, used
+      # by nearly every suite this job runs) and `redis:5.0` (its Redis
+      # default, needed by the issue #1312 dispatch suites this job also
+      # forces via HARVEST_TEST_REQUIRE_REDIS below).
+      - name: Pre-pull Docker test images (retry transient pull failures)
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          for image in postgres:11-alpine redis:5.0; do
+            for attempt in 1 2 3 4 5; do
+              if docker pull "$image"; then
+                continue 2
+              fi
+              echo "pull of $image failed (attempt $attempt/5)"
+              sleep $((attempt * 5))
+            done
+            echo "::error::failed to pull $image after 5 attempts"
+            exit 1
+          done
       - name: Run Linux Docker-backed manifest suites (shard)
         if: needs.changes.outputs.code == 'true'
         shell: bash
