@@ -803,7 +803,6 @@ fn read_global_audit_export_config() -> Option<std::sync::Arc<AuditExportRuntime
     }
 }
 
-
 /// Install [`GLOBAL_AUDIT_EXPORT_CONFIG`] for an embedder using the core
 /// `HarvestBuilder::build()` -> `into_worker_parts()` path directly.
 ///
