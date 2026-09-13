@@ -3528,10 +3528,15 @@ async fn audit_export_checker_re_registers_when_the_configured_lease_grows() {
     let long_lease = std::time::Duration::from_secs(120);
     let _installed = install_with_lease(Arc::new(RecordingSink::new(200)), 100, long_lease);
 
-    // The registered interval must grow to match, without restarting the task.
+    // The registered interval must grow to match, without restarting the
+    // task. It sums the poll interval, the checkout bound, and the lease,
+    // not their max (Codex review on PR #1520, follow-up P2, second
+    // round). See `audit_export_liveness_interval`.
+    let expected_interval =
+        poll_interval + autumn_harvest::audit_export::SHARD_ACQUIRE_BOUND + long_lease;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        if find_status().is_some_and(|s| s.poll_interval == long_lease) {
+        if find_status().is_some_and(|s| s.poll_interval == expected_interval) {
             break;
         }
         assert!(

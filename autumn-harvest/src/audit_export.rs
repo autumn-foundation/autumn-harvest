@@ -803,6 +803,7 @@ fn read_global_audit_export_config() -> Option<std::sync::Arc<AuditExportRuntime
     }
 }
 
+
 /// Install [`GLOBAL_AUDIT_EXPORT_CONFIG`] for an embedder using the core
 /// `HarvestBuilder::build()` -> `into_worker_parts()` path directly.
 ///
@@ -2709,6 +2710,22 @@ async fn export_once_via_pool(
     // follow-up P1). A sink swap landing during the reacquire wait just
     // above must still be caught before a stale `Advance` outcome can
     // commit. Fencing any earlier would miss exactly that swap.
+    //
+    // A swap landing during the acknowledgement write itself, after this
+    // comparison, is not caught (Codex review on PR #1520, follow-up P1,
+    // second round). Closing that too means holding this read across the
+    // `apply_outcome` await below, so no writer can land in between.
+    //
+    // `GLOBAL_AUDIT_EXPORT_CONFIG` is a `std::sync::RwLock`. Its read guard
+    // is not `Send`, confirmed by `cargo test`, not assumed. It cannot
+    // survive an await point inside a spawned, `Send`-bound task. Closing
+    // the gap for real needs an async-aware lock, across every reader and
+    // writer of the global -- a wider change than this fix.
+    //
+    // The residual window is bounded by `ack_bound`. It also requires a
+    // second runtime's `build()` to land inside that window. That only
+    // happens at process startup or an embedder's own rebuild, never on a
+    // request path.
     let attempt = fence_against_sink_swap(
         attempt,
         &config_arc,
@@ -2823,12 +2840,41 @@ async fn export_once_via_pool(
 /// publishing a longer lease is picked up without needing this task
 /// restarted.
 ///
+/// The three stages are summed, not maxed (Codex review on PR #1520,
+/// follow-up P2, second round). One tick sleeps for `interval`. It then
+/// may spend up to `SHARD_ACQUIRE_BOUND` acquiring its initial connection.
+/// Only then does the lease-bounded claim/delivery/acknowledge cycle
+/// start. These are three sequential stages, not alternatives, so their
+/// worst cases add. The prior formula registered only
+/// `interval.max(lease)`. That understated the true worst case by up to
+/// `SHARD_ACQUIRE_BOUND`, plus whichever of `interval` or `lease` was not
+/// the max. `scanner_liveness` grants `2 x` the registered interval before
+/// paging. That grace could then be shorter than one legitimately slow
+/// tick.
+///
 /// Pass `shard` to attribute this instance to one shard in the liveness
 /// snapshot, mirroring
 /// [`crate::timeout::spawn_timeout_checker_for_shard`]. `sharded_pool`
 /// resolves the shard actually stamped on exported records when `shard` is
 /// `None` (the unsharded fallback). This is the same rule
 /// [`fire_due_audit_exports`] applies in its own unsharded arm.
+/// The worst-case wall-clock span of one audit-export checker tick.
+///
+/// See [`spawn_audit_export_checker_for_shard`]'s doc comment for why the
+/// three stages sum rather than max. Saturating throughout: a
+/// pathological configuration degrades instead of overflowing.
+#[cfg(feature = "db")]
+fn audit_export_liveness_interval(
+    interval: std::time::Duration,
+    config: Option<&AuditExportRuntimeConfig>,
+) -> std::time::Duration {
+    config.map_or(interval, |config| {
+        interval
+            .saturating_add(SHARD_ACQUIRE_BOUND)
+            .saturating_add(config.lease)
+    })
+}
+
 #[must_use]
 #[cfg(feature = "db")]
 pub fn spawn_audit_export_checker_for_shard(
@@ -2842,7 +2888,7 @@ pub fn spawn_audit_export_checker_for_shard(
     // See this function's doc comment: the registered threshold must cover
     // the worst legitimate tick, not just the poll cadence.
     let mut registered_interval =
-        read_global_audit_export_config().map_or(interval, |config| interval.max(config.lease));
+        audit_export_liveness_interval(interval, read_global_audit_export_config().as_deref());
     // Issue #797: declare the loop before its first iteration so the
     // `scanner_liveness` check expects it and grants it boot grace.
     let mut owner = crate::scanner_health::register_scanner_for_shard(
@@ -2878,9 +2924,8 @@ pub fn spawn_audit_export_checker_for_shard(
             // A stale, too-tight threshold would misclassify a healthy
             // delivery under the new lease as `Stale` or `Wedged`. Cheap to
             // check every tick; only re-registers on an actual change.
-            let desired_interval = config_snapshot
-                .as_ref()
-                .map_or(interval, |config| interval.max(config.lease));
+            let desired_interval =
+                audit_export_liveness_interval(interval, config_snapshot.as_deref());
             if desired_interval != registered_interval {
                 crate::scanner_health::deregister_scanner(owner);
                 owner = crate::scanner_health::register_scanner_for_shard(
@@ -3403,6 +3448,46 @@ mod tests {
         assert_eq!(
             split_reserve(std::time::Duration::ZERO),
             (std::time::Duration::ZERO, std::time::Duration::ZERO)
+        );
+    }
+
+    // ── The liveness budget sums every stage of a tick, not just the max ────
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn liveness_interval_is_the_bare_poll_interval_when_unconfigured() {
+        let interval = Duration::from_secs(30);
+        assert_eq!(audit_export_liveness_interval(interval, None), interval);
+    }
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn liveness_interval_sums_sleep_checkout_and_lease() {
+        struct UnusedSink;
+        impl AuditSink for UnusedSink {
+            fn deliver<'a>(&'a self, _batch: &'a AuditBatch<'a>) -> SinkFuture<'a> {
+                unreachable!("this test never delivers a batch")
+            }
+        }
+
+        let interval = Duration::from_secs(60);
+        let lease = Duration::from_secs(60);
+        let config = AuditExportRuntimeConfig {
+            sink: std::sync::Arc::new(UnusedSink),
+            secret: CallbackSecret::new(Vec::new()),
+            batch_size: 100,
+            backoff: ExportBackoff::default(),
+            lease,
+        };
+
+        let budget = audit_export_liveness_interval(interval, Some(&config));
+
+        assert_eq!(
+            budget,
+            interval + SHARD_ACQUIRE_BOUND + lease,
+            "a poll interval close to the lease must not collapse to just their max: the \
+             sleep, the initial checkout, and the lease-bounded cycle are three sequential \
+             stages of one tick, so their worst cases add"
         );
     }
 
