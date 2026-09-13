@@ -31,13 +31,13 @@ use autumn_harvest_plugin::dev::{
 /// mutation (Codex review, issue #1291).
 ///
 /// `DevRuntime::start`'s harvest-mode gate reads `AUTUMN_HARVEST__MODE` and
-/// friends from the real process environment. A developer environment with
-/// `AUTUMN_HARVEST__MODE=split` or `external` set ambiently would otherwise
-/// make these tests see that gate's refusal instead of the one each actually
-/// asserts, or fail to start at all.
+/// friends from the real process environment. A developer environment might
+/// set `AUTUMN_HARVEST__MODE=split` or `external` ambiently. Without this
+/// guard, these tests would see that gate's refusal instead of the one each
+/// actually asserts, or fail to start at all.
 static DEV_RUNTIME_START_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Unsets one env var for the life of this guard, restoring exactly what was
+/// Unsets one env var for the life of this guard. Restores exactly what was
 /// there before — present or absent — even if the test panics.
 ///
 /// Every `DevRuntime::start` call in this file holds
@@ -329,11 +329,11 @@ async fn a_port_taken_during_provisioning_is_refused_and_takes_the_cluster_with_
     };
 
     // Acquired before the timed watcher below is spawned (Codex review, issue
-    // #1291): another `DevRuntime::start` test can hold this mutex for far
-    // longer than the watcher's 10-second polling window, and a watcher
-    // started first could time out and return `None` before this test ever
-    // begins provisioning, failing the `held.is_some()` assertion below for a
-    // reason that has nothing to do with what this test asserts.
+    // #1291). Another `DevRuntime::start` test can hold this mutex longer
+    // than the watcher's 10-second polling window. A watcher started first
+    // could then time out and return `None` before this test starts
+    // provisioning. That would fail the `held.is_some()` assertion below for
+    // an unrelated reason.
     let _serial = DEV_RUNTIME_START_SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -438,10 +438,10 @@ async fn a_durable_workflow_executes_and_is_observable() {
     // *can*, so the test skips rather than fails where nothing is installed.
     let Some(_binaries) = binaries() else { return };
 
-    // Scoped to release `DEV_RUNTIME_START_SERIAL` as soon as `start` returns:
-    // the workflow exercise below needs no env guard and would otherwise
-    // serialize against the other `DevRuntime::start` tests in this file for
-    // no reason.
+    // Scoped to release `DEV_RUNTIME_START_SERIAL` as soon as `start` returns.
+    // The workflow exercise below needs no env guard. Without this scope, it
+    // would serialize against the other `DevRuntime::start` tests here for no
+    // reason.
     let runtime = {
         let _serial = DEV_RUNTIME_START_SERIAL
             .lock()
