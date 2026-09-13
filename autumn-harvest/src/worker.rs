@@ -236,22 +236,29 @@ pub struct WorkerRuntimeConfig {
     /// Per-shard, per-tick batch size for the lazy payload-codec re-encryption
     /// sweep (issue #948). `0` disables it.
     pub codec_rotation_batch_size: i64,
-    /// Whether this worker enforces cross-region DR write-authority fencing
-    /// (issue #954). See [`crate::builder::WorkerConfig::dr_fencing`].
+    /// This worker's cross-region DR configuration (issue #954). See
+    /// [`crate::builder::WorkerConfig::dr_fencing`] and its sibling knobs.
     ///
-    /// **On the struct, not on the process-global beside the other two DR
-    /// knobs, and that asymmetry is deliberate.** A runtime config can be built
-    /// and *stored* long before `Worker::new` consumes it — the plugin's
-    /// `PreparedHarvestRuntime` does exactly that — so any unrelated
+    /// **On the struct, not only on the process-global [`DrConfig`] beside
+    /// it, and that asymmetry is deliberate.** A runtime config can be built
+    /// and *stored* long before `Worker::new` consumes it. The plugin's
+    /// `PreparedHarvestRuntime` does exactly that. So any unrelated
     /// `WorkerConfig::default()` conversion in between would overwrite a
-    /// last-writer-wins global and this worker would snapshot `false`: silently
-    /// unfenced, while `effective_config` still reported DR enabled. That is
-    /// the worst failure this feature has, so the flag travels with the
-    /// conversion that produced it.
+    /// last-writer-wins global, and this worker would snapshot the wrong
+    /// values. It would be silently unfenced while `effective_config`
+    /// still reported DR enabled. Or it would sample the wrong slot prefix
+    /// while `effective_config` still advertised the configured one.
     ///
-    /// The cadence and retention knobs stay on the global: racing them changes
-    /// only sampler timing, never whether the fence is enforced.
-    pub dr_fencing: bool,
+    /// So the whole [`DrConfig`], not only `fencing`, travels with the
+    /// conversion that produced it (finding 6). An earlier revision carried
+    /// only `fencing` on the struct, on the theory that racing the other
+    /// three fields "only changes sampler timing". Finding 6 disproved that
+    /// once `slot_prefix` joined them. The prefix decides which walsenders
+    /// count as this deployment's DR replication at all, so racing it can
+    /// silently change *what* is sampled, not merely *when*.
+    ///
+    /// [`DrConfig`]: crate::replication::DrConfig
+    pub dr: crate::replication::DrConfig,
 }
 
 impl WorkerRuntimeConfig {
@@ -389,16 +396,21 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
         // `start_idempotency::set_purge_window_secs` threads a duration knob
         // without a new field on every call site.
         crate::mutex::set_mutex_lease_ttl(cfg.mutex_lease_ttl);
-        // Same pattern, same reason (issue #954): publish the DR knobs to the
-        // process-global they govern rather than adding three required fields
-        // to a struct built literally at ~50 call sites. See
-        // `crate::replication::DrConfig`.
-        crate::replication::set_dr_config(crate::replication::DrConfig {
+        // Also published to the process-global `DrConfig` the persist-assert
+        // and admin-introspection paths read (issue #954). `Self.dr` below
+        // carries the SAME value directly, rather than a later
+        // `Worker::new` reading it back off this global (finding 6). A
+        // `WorkerRuntimeConfig` can be built and stored long before
+        // `Worker::new` consumes it. An unrelated conversion in between
+        // would otherwise overwrite the last-writer-wins global underneath
+        // it.
+        let dr = crate::replication::DrConfig {
             fencing: cfg.dr_fencing,
             sample_interval: cfg.replication_sample_interval,
             watermark_retain: cfg.replication_watermark_retain,
             slot_prefix: cfg.replication_slot_prefix.clone(),
-        });
+        };
+        crate::replication::set_dr_config(dr.clone());
         if let Some(first_queue) = cfg.queues.as_slice().first()
             && let Ok(mut lock) = crate::completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE.write()
             && lock.is_none()
@@ -440,7 +452,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             deployment_name: cfg.deployment_name,
             workflow_cache_size: cfg.workflow_cache_size,
             priority_aging_secs: cfg.priority_aging_secs,
-            dr_fencing: cfg.dr_fencing,
+            dr,
             unknown_target_grace_window: cfg.unknown_target_grace_window,
             poison_pill_threshold: cfg.poison_pill_threshold,
             capability_miss_max_redeliveries: cfg.capability_miss_max_redeliveries,
@@ -4031,6 +4043,34 @@ const fn effective_workflow_task_timeout(configured: Duration, local_cap: Durati
     } else {
         local_cap
     }
+}
+
+/// The poison-pill reclaimer's stuck-running backstop threshold (issue
+/// #1459), in seconds, derived from the effective workflow-task budget.
+///
+/// The engine hard-cancels a workflow-task dispatch once it exceeds
+/// `effective_workflow_task_timeout` (`run_under_workflow_body_budget`). So a
+/// `workflow` row still `RUNNING` past that budget already stopped
+/// processing. The only question is whether its reset call
+/// (`reset_timed_out_workflow_task`) landed. That reset retries a bounded
+/// ~2.7 seconds of pool-connection backoff before giving up.
+///
+/// Four times the budget plus a flat 30-second margin is generous headroom
+/// past both. It is wide enough that a merely slow, not stuck, decision
+/// cycle is never caught by it. The engine's own cancellation already
+/// bounds a cycle to one budget's length.
+///
+/// `None` when `workflow_task_timeout` is disabled (`Duration::ZERO`).
+/// There is then no per-cycle budget to compare against. The backstop stays
+/// off, and only the existing dead-worker reclaim path applies.
+fn stuck_running_threshold_secs(effective_workflow_task_timeout: Duration) -> Option<i64> {
+    if effective_workflow_task_timeout.is_zero() {
+        return None;
+    }
+    let margin = effective_workflow_task_timeout
+        .saturating_mul(4)
+        .saturating_add(Duration::from_secs(30));
+    Some(i64::try_from(margin.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// The deadline a **local** activity attempt reports via
@@ -10198,6 +10238,37 @@ async fn persist_all_started_child_workflows(
             )
             .await?;
         }
+        // Issue #1484 review: this transaction can spawn BOTH detached
+        // children (below, via `create_detached_child_executions`) and
+        // awaited children (further below, via the `local_new_children`
+        // loop). Locking each set in its own separately-sorted pass does not
+        // prevent an ABBA cycle across the two phases. A parent with
+        // detached key B and awaited key A can race a peer with detached
+        // key A and awaited key B. Each can then hold its phase-one key
+        // while it waits on the other's phase-two key. Issue #946 and issue
+        // #1228 Finding 2 each sorted one phase alone. This combines BOTH
+        // phases' keys into ONE `BTreeSet` instead. It locks the union
+        // before either insertion phase begins. No transaction can then
+        // ever hold a key here that another is waiting on.
+        let mut quota_lock_keys =
+            detached_child_quota_lock_keys(conn, registry, parent_execution, commands).await?;
+        // Local children only (issue #956): a cross-shard child's quota is
+        // enforced on ITS shard by the relay, under that shard's own advisory
+        // lock, so taking the lock here would serialise unrelated parents on a
+        // key this transaction never admits against.
+        for child in &local_new_children {
+            let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
+            if let Some(policy) = defaults.quota
+                && policy.has_any_cap()
+                && let Some(key) = crate::quota::resolve_quota_key(policy.key_expr, &child.input)
+            {
+                quota_lock_keys.insert((child.workflow_name.clone(), key));
+            }
+        }
+        for (workflow_name, key) in &quota_lock_keys {
+            crate::quota::lock_quota_key(conn, workflow_name, key).await?;
+        }
+
         create_detached_child_executions(
             conn,
             registry,
@@ -10220,48 +10291,6 @@ async fn persist_all_started_child_workflows(
             registry,
         )
         .await?;
-
-        // Issue #946, Codex round-5 review: pre-acquire every distinct quota
-        // advisory lock this fan-out will need, in one deterministic (sorted)
-        // order, BEFORE inserting any child row below. Without this, the
-        // per-child loop below acquires each `pg_advisory_xact_lock` one at a
-        // time as it iterates children in COMMAND order -- if two concurrent
-        // parents fan out to the same set of quota-governed keys in OPPOSITE
-        // command orders, each transaction can hold one key while waiting on
-        // the other (a classic ABBA wait-for cycle). Postgres resolves that
-        // by aborting one transaction with a raw `deadlock_detected` error,
-        // which is not `QuotaExceeded` and therefore not recovered by the
-        // loop below -- it propagates to `fail_execution_on_error` and
-        // terminally fails an otherwise-healthy parent over a transient
-        // serialization conflict, never a real quota breach. Sorting the
-        // lock-acquisition order makes a wait-for cycle impossible: every
-        // transaction that reaches this fan-out acquires the SAME keys in
-        // the SAME order, so no two transactions can ever hold a lock the
-        // other is waiting on. `lock_quota_key`'s `pg_advisory_xact_lock` is
-        // safely re-entrant within one session/transaction, so the per-child
-        // loop's own `enforce_quota_admission` -> `lock_quota_key` call below
-        // simply re-acquires what is already held here -- no other change
-        // needed. The set mirrors exactly what that loop would lock (a
-        // declared policy with `has_any_cap()` and a resolvable key), so no
-        // lock is taken here that the loop would not otherwise have taken.
-        let mut quota_lock_keys: std::collections::BTreeSet<(String, String)> =
-            std::collections::BTreeSet::new();
-        // Local children only (issue #956): a cross-shard child's quota is
-        // enforced on ITS shard by the relay, under that shard's own advisory
-        // lock, so taking the lock here would serialise unrelated parents on a
-        // key this transaction never admits against.
-        for child in &local_new_children {
-            let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
-            if let Some(policy) = defaults.quota
-                && policy.has_any_cap()
-                && let Some(key) = crate::quota::resolve_quota_key(policy.key_expr, &child.input)
-            {
-                quota_lock_keys.insert((child.workflow_name.clone(), key));
-            }
-        }
-        for (workflow_name, key) in &quota_lock_keys {
-            crate::quota::lock_quota_key(conn, workflow_name, key).await?;
-        }
 
         // Insert rows and enqueue tasks for new children.
         // Provenance ref for every child in this fan-out is the parent
@@ -10417,6 +10446,8 @@ async fn persist_all_started_child_workflows(
                 child_quota_key.as_deref(),
                 &child.workflow_name,
                 Some(registry.telemetry().metrics.as_ref()),
+                None, // no dry-run credit on a child spawn (children never declare cancel_running)
+                child.child_id,
             )
             .await?;
             store::append_events_offloaded_with_codecs(
@@ -10956,6 +10987,8 @@ async fn insert_awaited_child_execution(
         child_quota_key.as_deref(),
         &child.workflow_name,
         Some(registry.telemetry().metrics.as_ref()),
+        None, // no dry-run credit on a child spawn (children never declare cancel_running)
+        child.child_id,
     )
     .await?;
     store::append_events_offloaded_with_codecs(
@@ -11515,6 +11548,43 @@ async fn persist_mixed_suspension_batch(
             local
         };
 
+        // Issue #1484 review: this batch can carry BOTH `StartChildWorkflow`
+        // (awaited, below) and `SpawnDetachedChildWorkflow` (detached, resolved
+        // by `detached_spawns.persist` further below) commands together. Two
+        // separately-sorted lock passes, one per kind, do not prevent an ABBA
+        // cycle across the two. A parent with detached key B and awaited key
+        // A can race a peer with detached key A and awaited key B. Each
+        // transaction can then hold its own first-phase key while it waits
+        // on the other's second-phase key. Union both sets instead, and
+        // lock them in ONE sorted pass, before EITHER insertion phase runs.
+        // No transaction here can then ever hold a key another is waiting on.
+        // This mirrors how issue #946 and issue #1228 Finding 2 each closed
+        // the identical hazard within a single phase.
+        let mut quota_lock_keys =
+            detached_child_quota_lock_keys(conn, registry, parent_execution, commands).await?;
+        for child in &batch.children {
+            if existing_child_ids.contains(&child.child_id.as_uuid()) {
+                continue;
+            }
+            // A cross-shard child (issue #956) is admitted against its OWN
+            // shard's advisory lock by the relay, so locking its key here would
+            // serialise unrelated parents on a key this transaction never
+            // admits against.
+            if child_target_shard(child.child_id, shard_id) != shard_id {
+                continue;
+            }
+            let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
+            if let Some(policy) = defaults.quota
+                && policy.has_any_cap()
+                && let Some(key) = crate::quota::resolve_quota_key(policy.key_expr, &child.input)
+            {
+                quota_lock_keys.insert((child.workflow_name.clone(), key));
+            }
+        }
+        for (workflow_name, key) in &quota_lock_keys {
+            crate::quota::lock_quota_key(conn, workflow_name, key).await?;
+        }
+
         // ADR-0001 §2.8: a `harvest.child_workflow.start` PRODUCER span per
         // genuinely new child, parented to this executor cycle's execute span.
         // `EnteredSpan` is `!Send`, so each span is fully dropped (via
@@ -11607,42 +11677,11 @@ async fn persist_mixed_suspension_batch(
                 .map_err(crate::error::database_error)?;
         }
 
-        // Issue #946: pre-acquire every distinct quota advisory lock this batch
-        // needs, in one deterministic (sorted) order, BEFORE inserting any child
-        // row. Without this, two concurrent parents fanning out to the same
-        // quota-governed keys in OPPOSITE command orders can each hold one key
-        // while waiting on the other -- a wait-for cycle Postgres resolves by
-        // aborting one with a raw `deadlock_detected` error, which is NOT
-        // `QuotaExceeded` and would therefore terminally fail an otherwise-healthy
-        // parent over a transient serialization conflict. `lock_quota_key`'s
-        // `pg_advisory_xact_lock` is re-entrant within one transaction, so
-        // `enforce_quota_admission`'s own later call simply re-acquires what is
-        // already held. The set mirrors exactly what that path would lock.
-        let mut quota_lock_keys: std::collections::BTreeSet<(String, String)> =
-            std::collections::BTreeSet::new();
-        for child in &batch.children {
-            if existing_child_ids.contains(&child.child_id.as_uuid()) {
-                continue;
-            }
-            // A cross-shard child (issue #956) is admitted against its OWN
-            // shard's advisory lock by the relay, so locking its key here would
-            // serialise unrelated parents on a key this transaction never
-            // admits against.
-            if child_target_shard(child.child_id, shard_id) != shard_id {
-                continue;
-            }
-            let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
-            if let Some(policy) = defaults.quota
-                && policy.has_any_cap()
-                && let Some(key) = crate::quota::resolve_quota_key(policy.key_expr, &child.input)
-            {
-                quota_lock_keys.insert((child.workflow_name.clone(), key));
-            }
-        }
-        for (workflow_name, key) in &quota_lock_keys {
-            crate::quota::lock_quota_key(conn, workflow_name, key).await?;
-        }
-
+        // Issue #1484 review: already locked above. That combined pre-lock
+        // step ran jointly with the detached-child keys, before
+        // `detached_spawns.persist`. See its comment for why a separate pass
+        // here would not be safe.
+        //
         // Insert the row + enqueue the task for each genuinely new child, through
         // the same helper the #779 child-timeout race uses (which resolves the
         // child's OWN registered defaults and enforces its OWN declared quota).
@@ -12880,6 +12919,90 @@ pub async fn persist_child_workflow_failure(
     Ok((exec_id, None))
 }
 
+/// Compute the distinct `(workflow_name, quota_key)` pairs a batch of
+/// `SpawnDetachedChildWorkflow` commands needs locked, without acquiring any
+/// lock (issue #1228, Finding 2; issue #1484 review).
+///
+/// [`create_detached_child_executions`] calls this and locks the result
+/// itself for a caller that spawns ONLY detached children in a transaction.
+/// A caller that ALSO spawns awaited children in the same transaction needs
+/// more (issue #1484 review: `persist_all_started_child_workflows` and
+/// `persist_mixed_suspension_batch`). Such a caller unions this set with its
+/// own awaited-child key set instead. It locks the combined result in one
+/// sorted pass, before either insertion phase runs. Splitting the
+/// computation out of the lock loop is what makes that union possible. No
+/// caller needs to duplicate the resolve-key logic below.
+///
+/// Skips exactly what the insertion loop in `create_detached_child_executions`
+/// skips. A cross-shard child is skipped; the relay locks it on ITS OWN
+/// shard. An already-created child is skipped too (idempotent replay).
+/// `already_created` is one query taken BEFORE this batch's own inserts run.
+/// So it can miss an in-batch duplicate `child_id`. The insertion loop's own
+/// fresh per-child check still catches that case. Missing one here only
+/// means one harmless extra lock stays held for the rest of the transaction.
+async fn detached_child_quota_lock_keys(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    parent_execution: &WorkflowExecution,
+    commands: &[WorkflowCommand],
+) -> HarvestResult<std::collections::BTreeSet<(String, String)>> {
+    let requested_ids: Vec<uuid::Uuid> = commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::SpawnDetachedChildWorkflow { child_id, .. } => {
+                Some(child_id.as_uuid())
+            }
+            _ => None,
+        })
+        .collect();
+    // Skipped entirely when there are no detached-spawn commands (the common
+    // case) -- zero default overhead, mirroring `enforce_quota_admission`'s
+    // own AC9 contract.
+    let already_created: HashSet<uuid::Uuid> = if requested_ids.is_empty() {
+        HashSet::new()
+    } else {
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::id.eq_any(&requested_ids))
+            .select(harvest_workflow_executions::id)
+            .load::<uuid::Uuid>(conn)
+            .await
+            .map_err(crate::error::database_error)?
+            .into_iter()
+            .collect()
+    };
+    let mut quota_lock_keys: std::collections::BTreeSet<(String, String)> =
+        std::collections::BTreeSet::new();
+    for cmd in commands {
+        let WorkflowCommand::SpawnDetachedChildWorkflow {
+            child_id,
+            workflow_name,
+            input,
+            ..
+        } = cmd
+        else {
+            continue;
+        };
+        if child_target_shard(*child_id, parent_execution.shard_id) != parent_execution.shard_id
+            || already_created.contains(&child_id.as_uuid())
+        {
+            continue;
+        }
+        let Some(policy) = registry
+            .workflows
+            .get(workflow_name.as_str())
+            .and_then(|w| w.quota)
+        else {
+            continue;
+        };
+        if policy.has_any_cap()
+            && let Some(key) = crate::quota::resolve_quota_key(policy.key_expr, input)
+        {
+            quota_lock_keys.insert((workflow_name.clone(), key));
+        }
+    }
+    Ok(quota_lock_keys)
+}
+
 /// Perform the DB side-effects for all `SpawnDetachedChildWorkflow` commands in
 /// `commands`: insert a child execution row, start the child's event log with
 /// `WorkflowStarted`, and enqueue the child task.
@@ -12892,6 +13015,12 @@ pub async fn persist_child_workflow_failure(
 ///
 /// Non-detached-spawn commands in `commands` are silently skipped. Already-existing
 /// child rows (idempotent re-run after a crash) are also skipped.
+///
+/// Re-locks whatever [`detached_child_quota_lock_keys`] reports for this
+/// batch. `pg_advisory_xact_lock` is re-entrant per transaction (issue
+/// #1228, Finding 2). So a caller that already locked this exact set up
+/// front (issue #1484 review) pays only a harmless repeat acquisition. It
+/// never takes a second, distinct lock.
 #[allow(clippy::too_many_lines)]
 async fn create_detached_child_executions(
     conn: &mut AsyncPgConnection,
@@ -12917,6 +13046,35 @@ async fn create_detached_child_executions(
                 phase: CapabilityMissPhase::AfterHandler,
             });
         }
+    }
+
+    // Issue #1228, Finding 2: pre-acquire every distinct quota advisory lock
+    // this batch of detached children will need. Acquire them in one
+    // deterministic (sorted) order, BEFORE inserting any child row below.
+    // This mirrors the fix issue #946 already applied to the awaited-child
+    // fan-out (`persist_all_started_child_workflows`) for the identical
+    // hazard. The loop below used to lock each child's key one at a time,
+    // in raw command order. Two concurrent parents can spawn detached
+    // children under the same keys in OPPOSITE command order. Each could
+    // then hold one key while it waits on the other. That is a classic
+    // ABBA wait-for cycle. Postgres resolves it by aborting one transaction
+    // with a raw `deadlock_detected` error. That error is not
+    // `QuotaExceeded`, so it is never recovered. It terminally fails an
+    // otherwise-healthy parent over a transient conflict, not a real quota
+    // breach. Sorting the lock order removes the cycle. Every transaction
+    // reaching this fan-out locks the SAME keys in the SAME order.
+    //
+    // Issue #1484 review: the key computation itself lives in
+    // `detached_child_quota_lock_keys`. A caller that ALSO spawns awaited
+    // children in this same transaction can then union both sets. It locks
+    // them together, before either insertion phase. Locking here always
+    // covers this batch's own detached keys either way. When such a caller
+    // already locked this exact set up front, `pg_advisory_xact_lock`'s
+    // re-entrancy makes the repeat acquisition below a safe no-op.
+    let quota_lock_keys =
+        detached_child_quota_lock_keys(conn, registry, parent_execution, commands).await?;
+    for (workflow_name, key) in &quota_lock_keys {
+        crate::quota::lock_quota_key(conn, workflow_name, key).await?;
     }
 
     // Provenance ref for every detached child is the parent execution id (#740).
@@ -12974,7 +13132,10 @@ async fn create_detached_child_executions(
 
         // Idempotent: skip if already created (crash-restart replay). A
         // cross-shard detached child returns above, so this local check is
-        // complete for everything that reaches here.
+        // complete for everything that reaches here. A fresh query, not
+        // the `already_created` snapshot above. This loop's own earlier
+        // iterations insert rows too. A fresh read, unlike the snapshot,
+        // sees them. So an in-batch duplicate `child_id` is still caught.
         let already_exists: bool = harvest_workflow_executions::table
             .filter(harvest_workflow_executions::id.eq(child_id.as_uuid()))
             .count()
@@ -13102,6 +13263,8 @@ async fn create_detached_child_executions(
             child_quota_key.as_deref(),
             workflow_name.as_str(),
             Some(registry.telemetry().metrics.as_ref()),
+            None, // no dry-run credit on a detached child spawn (children never declare cancel_running)
+            *child_id,
         )
         .await?;
 
@@ -18293,21 +18456,18 @@ fn pending_update_result_event_count(commands: &[WorkflowCommand]) -> u64 {
 fn terminal_history_event_count(
     next_event_id: i32,
     pending_cmds: &[WorkflowCommand],
-    // Issue #952: `true` for a FAILING terminal, whose batch also appends the
-    // abandoned-dispatch records. The hard-cap preflight counts them, and this
-    // `harvest.workflow.history_size` gauge is meant to describe the same
-    // number, so it counts them too.
-    records_abandoned_dispatches: bool,
+    // Issue #952: nonzero for a FAILING terminal, whose batch also appends
+    // the abandoned-dispatch records. Issue #1265: pass the hard-cap
+    // preflight's resolved value here, from
+    // `abandoned_dispatch_event_count_resolved`. Do not recompute a
+    // pre-dedup count. A re-parked dispatch the dedup already zeroed must
+    // not inflate this gauge.
+    resolved_abandoned_dispatch_event_count: u64,
 ) -> u64 {
-    let abandoned = if records_abandoned_dispatches {
-        abandoned_dispatch_event_count(pending_cmds)
-    } else {
-        0
-    };
     u64::try_from(next_event_id)
         .unwrap_or(0)
         .saturating_add(pending_update_result_event_count(pending_cmds))
-        .saturating_add(abandoned)
+        .saturating_add(resolved_abandoned_dispatch_event_count)
         .saturating_add(1)
 }
 
@@ -20509,6 +20669,11 @@ async fn process_workflow_task(
     } else {
         0
     };
+    // Issue #1265: captured here so the `history_size` gauge below can reuse
+    // the SAME dedup-resolved count instead of recomputing a pre-dedup one.
+    // It stays 0 for every non-`Failed` outcome (mirrors
+    // `records_abandoned_dispatches`): none of those resolve this count.
+    let mut resolved_abandoned_dispatch_event_count: u64 = 0;
     let pending_durable_event_count = match &outcome {
         WorkflowOutcome::Suspended { commands } => {
             match suspended_command_event_count(conn, task.workflow_exec_id, commands).await {
@@ -20554,6 +20719,7 @@ async fn process_workflow_task(
                     .await;
                 }
             };
+            resolved_abandoned_dispatch_event_count = abandoned;
             pending_update_result_event_count(&pending_cmds)
                 .saturating_add(pre_suspension_event_count(&pending_cmds))
                 .saturating_add(terminal_parent_close_cascade_events)
@@ -20623,7 +20789,7 @@ async fn process_workflow_task(
             terminal_history_event_count(
                 next_event_id,
                 &pending_cmds,
-                records_abandoned_dispatches(&outcome),
+                resolved_abandoned_dispatch_event_count,
             )
             .saturating_add(terminal_parent_close_cascade_events),
         )
@@ -23559,11 +23725,24 @@ async fn sample_one_shard(
             // Emitted ONLY when known. Publishing 0.0 for "unknown"
             // would read as a perfect RPO for replication that is
             // dead — see METRIC_REPLICATION_LAG_SECONDS.
-            if let Some(seconds) = status.rpo_seconds() {
+            let rpo_seconds = status.rpo_seconds();
+            if let Some(seconds) = rpo_seconds {
                 telemetry
                     .metrics
                     .record_replication_lag_seconds(shard_u16, seconds);
             }
+            // Emitted every tick the views are readable, `known = false`
+            // included (issue #954, finding 2). A Prometheus gauge keeps
+            // exporting its last value. Merely skipping the lag gauge above
+            // when the RPO is unknown does not make the dashboard stale. It
+            // instead freezes the dashboard at the last healthy reading.
+            // This gauge is the signal that breaks that freeze for the
+            // "views readable, RPO unmeasurable" case.
+            // `record_replication_observable`'s `false` arm does not cover
+            // that case.
+            telemetry
+                .metrics
+                .record_replication_rpo_known(shard_u16, rpo_seconds.is_some());
         }
         Err(error) => {
             tracing::debug!(
@@ -23783,13 +23962,6 @@ pub struct Worker {
     pub registry: Arc<HandlerRegistry>,
     /// Set of activities that this worker cannot run because of unsatisfied requirements (issue #382).
     pub ineligible_activities: Vec<String>,
-    /// This worker's DR sampler cadence and watermark retention (issue #954).
-    ///
-    /// Snapshotted at construction from the process-global. Only the *timing*
-    /// knobs live there — whether fencing is enforced at all rides on
-    /// [`WorkerRuntimeConfig::dr_fencing`], because that one cannot tolerate a
-    /// last-writer-wins race. See that field.
-    dr: crate::replication::DrConfig,
     /// Bounds concurrent workflow task executions.
     workflow_semaphore: Arc<Semaphore>,
     /// Bounds concurrent activity task executions.
@@ -24967,7 +25139,6 @@ impl Worker {
             config,
             registry,
             ineligible_activities,
-            dr: crate::replication::dr_config(),
             workflow_semaphore: workflow_parts.semaphore,
             activity_semaphore: activity_parts.semaphore,
             workflow_permit_total: workflow_parts.permit_total,
@@ -25454,6 +25625,22 @@ impl Worker {
             );
         }
 
+        // Fence FIRST: pinning must precede fleet registration and the first
+        // poll, so a DR-enabled worker is never briefly unfenced (issue
+        // #954). This used to run AFTER the registration loop below,
+        // contradicting this exact comment and the single-shard path's
+        // ordering (finding 4). A worker in that window could not claim or
+        // persist — the claim/persist gates are structural and unaffected.
+        // But it could appear as a live worker in `harvest_workers`. It
+        // could also mutate rate-limit buckets on a shard whose generation
+        // it had not yet pinned. A subsequent `pin_dr_generations` failure
+        // then left those registrations behind, with no heartbeat started
+        // to clean them up.
+        if !self.pin_dr_generations(default_pool).await {
+            self.shutdown.cancel();
+            return;
+        }
+
         let startup_bound = shard_acquire_bound(true, self.config.poll_interval);
         let mut registration_pending_per_shard: Vec<Arc<AtomicBool>> =
             Vec::with_capacity(shard_targets.len());
@@ -25475,12 +25662,6 @@ impl Worker {
         // `default_pool`.
         let shard_pools_for_pressure: Vec<DbPool> =
             shard_targets.iter().map(|(_, p)| p.clone()).collect();
-        // Fence FIRST: pinning must precede fleet registration and the first
-        // poll, so a DR-enabled worker is never briefly unfenced (issue #954).
-        if !self.pin_dr_generations(default_pool).await {
-            self.shutdown.cancel();
-            return;
-        }
         let monitors = self.spawn_monitoring_tasks(default_pool, &shard_pools_for_pressure);
         let heartbeat_cancel = CancellationToken::new();
 
@@ -25948,7 +26129,7 @@ impl Worker {
     async fn pin_dr_generations(&self, fallback_pool: &DbPool) -> bool {
         use crate::replication::FenceRegistry;
 
-        if !self.config.dr_fencing {
+        if !self.config.dr.fencing {
             return true;
         }
 
@@ -26007,13 +26188,21 @@ impl Worker {
             }
         }
         if let Err(conflict) = FenceRegistry::publish(&pinned, default_shard) {
-            tracing::error!(
-                worker_id = %self.config.worker_id,
-                shard_id = conflict.shard_id,
-                already_pinned = conflict.pinned,
-                attempted = conflict.attempted,
-                "refusing to start: {conflict}"
-            );
+            match conflict {
+                crate::replication::PublishConflict::Generation(c) => tracing::error!(
+                    worker_id = %self.config.worker_id,
+                    shard_id = c.shard_id,
+                    already_pinned = c.pinned,
+                    attempted = c.attempted,
+                    "refusing to start: {conflict}"
+                ),
+                crate::replication::PublishConflict::DefaultShard(c) => tracing::error!(
+                    worker_id = %self.config.worker_id,
+                    already_pinned_default_shard = c.pinned,
+                    attempted_default_shard = c.attempted,
+                    "refusing to start: {conflict}"
+                ),
+            }
             return false;
         }
         true
@@ -26192,6 +26381,15 @@ impl Worker {
         // computation lives in one place.
         let worker_stale_secs = worker_stale_secs(self.config.worker_heartbeat_interval);
 
+        // Issue #1459: the poison-pill reclaimer's stuck-running backstop
+        // threshold, derived from this worker's own effective workflow-task
+        // budget (the same value `dispatch_task` enforces via
+        // `run_under_workflow_body_budget`).
+        let stuck_running_secs = stuck_running_threshold_secs(effective_workflow_task_timeout(
+            self.config.workflow_task_timeout,
+            self.config.max_local_activity_start_to_close,
+        ));
+
         // One timeout checker per assigned shard. `enforce_timeouts_once` scans
         // the connection's *own* database (find_timed_out_tasks, external-task
         // timeouts, workflow-execution deadlines, SLA breaches, history
@@ -26235,6 +26433,7 @@ impl Worker {
                     self.config.worker_heartbeat_interval,
                     self.config.poison_pill_threshold,
                     worker_stale_secs,
+                    stuck_running_secs,
                     self.registry.telemetry().clone(),
                     *shard,
                     self.registry.payload_codecs().clone(),
@@ -26459,7 +26658,7 @@ impl Worker {
         // authority. Neither may be silently switched off by a deployment that
         // simply has no metrics sink.
         #[cfg(feature = "db")]
-        let replication_sampler = if self.config.dr_fencing {
+        let replication_sampler = if self.config.dr.fencing {
             // Every deployment shape, not just sharded ones. Gating this on
             // `sharded_pool.is_some()` left the DOCUMENTED single-database
             // configuration — `.with_dr_fencing(true)` and nothing else — with
@@ -26473,9 +26672,9 @@ impl Worker {
                     targets,
                     self.shutdown.clone(),
                     self.registry.telemetry().clone(),
-                    self.dr.sample_interval,
-                    self.dr.watermark_retain,
-                    self.dr.slot_prefix.clone(),
+                    self.config.dr.sample_interval,
+                    self.config.dr.watermark_retain,
+                    self.config.dr.slot_prefix.clone(),
                 )
             })
         } else {
@@ -28622,6 +28821,24 @@ pub async fn quarantine_workflow_task_timeout(
     }
 }
 
+/// Backoff schedule for [`reset_timed_out_workflow_task`]'s pool-connection
+/// retries (issue #1459).
+///
+/// Ten attempts, sleeping 0ms then rising to an 8s cap, sum to about 32
+/// seconds of budget. The previous four-attempt, 2.7-second budget could
+/// exhaust under real contention. A 2026-09-09 CI-health investigation
+/// reproduced this. A controlled experiment pinned four concurrent copies
+/// to two CPUs. It hit the exhausted-budget signature in five of twelve
+/// runs. The orphan reclaimer only rescues a task owned by a dead worker.
+/// A row wedged here on a still-live worker had no other backstop.
+///
+/// The retry only delays reclaiming one already-timed-out row. The caller
+/// drops the dispatch concurrency permit before this call runs, so a
+/// longer retry window here never blocks another task from being
+/// dispatched.
+const RESET_POOL_RETRY_BACKOFF_MS: &[u64] =
+    &[0, 100, 250, 500, 1_000, 2_000, 4_000, 8_000, 8_000, 8_000];
+
 /// Reset a timed-out RUNNING workflow task back to PENDING so any worker can
 /// re-claim it on the next poll cycle without waiting for the orphan-reclaim
 /// staleness window (issue #494).
@@ -28637,7 +28854,7 @@ pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, w
     // live worker (the orphan reclaimer skips tasks owned by live workers).
     let mut conn = {
         let mut last_err = None;
-        let backoff_ms: &[u64] = &[0, 200, 500, 2_000];
+        let backoff_ms: &[u64] = RESET_POOL_RETRY_BACKOFF_MS;
         let mut result = None;
         for &delay_ms in backoff_ms {
             if delay_ms > 0 {
@@ -29824,7 +30041,7 @@ mod tests {
 
     fn default_runtime_config() -> WorkerRuntimeConfig {
         WorkerRuntimeConfig {
-            dr_fencing: false,
+            dr: crate::replication::DrConfig::default(),
             worker_id: "test-worker-1".to_string(),
             queues: vec!["default".to_string()],
             notification_database_url: None,
@@ -30270,6 +30487,42 @@ mod tests {
                 Duration::from_millis(500)
             ),
             Duration::from_millis(1500)
+        );
+    }
+
+    /// Issue #1459: the poison-pill stuck-running backstop threshold must
+    /// leave generous headroom past the engine's own hard cancellation of a
+    /// decision cycle. A merely slow, not stuck, cycle must never be caught.
+    #[test]
+    fn stuck_running_threshold_gives_headroom_past_the_task_budget() {
+        let budget = Duration::from_secs(60);
+        let threshold = stuck_running_threshold_secs(budget).expect("budget is nonzero");
+        let budget_secs = i64::try_from(budget.as_secs()).expect("test budget fits in i64");
+        assert!(
+            threshold > budget_secs,
+            "the threshold must exceed the budget a cycle can legitimately run for"
+        );
+        // Four times the budget plus the documented 30-second margin.
+        assert_eq!(threshold, 60 * 4 + 30);
+    }
+
+    #[test]
+    fn stuck_running_threshold_is_disabled_when_the_budget_is_zero() {
+        assert_eq!(
+            stuck_running_threshold_secs(Duration::ZERO),
+            None,
+            "no per-cycle budget to compare against means the backstop stays off"
+        );
+    }
+
+    #[test]
+    fn stuck_running_threshold_never_overflows_on_an_extreme_budget() {
+        let threshold = stuck_running_threshold_secs(Duration::from_secs(u64::MAX / 2))
+            .expect("nonzero budget");
+        assert_eq!(
+            threshold,
+            i64::MAX,
+            "saturating arithmetic clamps rather than panicking or wrapping"
         );
     }
 
@@ -30827,7 +31080,7 @@ mod tests {
     #[test]
     fn worker_rejects_invalid_config() {
         let cfg = WorkerRuntimeConfig {
-            dr_fencing: false,
+            dr: crate::replication::DrConfig::default(),
             queues: vec![],
             ..default_runtime_config()
         };
@@ -31392,7 +31645,7 @@ mod tests {
             .continue_as_new_threshold();
 
         let cfg = WorkerRuntimeConfig {
-            dr_fencing: false,
+            dr: crate::replication::DrConfig::default(),
             max_workflow_history_events: Some(threshold + 1),
             ..default_runtime_config()
         };
@@ -33524,7 +33777,7 @@ mod tests {
         labels.insert("gpu".to_string(), "true".to_string());
         labels.insert("region".to_string(), "eu-west-1".to_string());
         let cfg = WorkerRuntimeConfig {
-            dr_fencing: false,
+            dr: crate::replication::DrConfig::default(),
             labels,
             ..default_runtime_config()
         };
@@ -38929,6 +39182,29 @@ mod tests {
             u64::try_from(written).unwrap_or(u64::MAX),
             counted,
             "the preflight must count exactly the abandoned-dispatch events appended"
+        );
+    }
+
+    /// The `harvest.workflow.history_size` gauge must describe the same
+    /// durable count the hard-cap preflight resolves, not a pre-dedup upper
+    /// bound (issue #1265). A re-parked dispatch that the preflight already
+    /// resolved to zero events must not inflate the gauge by two events.
+    #[test]
+    fn terminal_history_event_count_uses_the_resolved_count_not_the_pre_dedup_bound() {
+        let already_started = ExecutionId::new();
+        let commands = vec![abandoned_child_cmd(
+            already_started,
+            "worker_child",
+            Value::Null,
+        )];
+        let plan = AbandonedDispatchPlan::with_started_children([already_started.as_uuid()]);
+        let resolved = abandoned_dispatch_event_count_for_plan(&commands, &plan);
+        assert_eq!(resolved, 0, "the re-park contributes no durable event");
+
+        let gauge = terminal_history_event_count(5, &commands, resolved);
+        assert_eq!(
+            gauge, 6,
+            "next_event_id (5) + resolved abandoned count (0) + terminal event (1)"
         );
     }
 

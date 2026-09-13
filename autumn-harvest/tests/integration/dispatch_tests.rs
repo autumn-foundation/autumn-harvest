@@ -288,7 +288,7 @@ fn shared_state_with(log: Arc<ActivityLog>) -> autumn_harvest::context::SharedSt
 fn worker_config(queue: &str, shards: Vec<ShardId>) -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
         codec_rotation_batch_size: 0,
-        dr_fencing: false,
+        dr: autumn_harvest::replication::DrConfig::default(),
         worker_id: uuid::Uuid::new_v4().to_string(),
         queues: vec![queue.to_string()],
         queue_weights: std::collections::HashMap::new(),
@@ -1001,8 +1001,8 @@ async fn the_by_id_claim_honours_the_dr_fence() {
 
     // A worker pinned to the current generation claims the named row.
     FenceRegistry::clear();
-    FenceRegistry::register(shard, generation);
-    FenceRegistry::set_default_shard(shard);
+    FenceRegistry::register(shard, generation).expect("no conflicting pin in this test");
+    FenceRegistry::set_default_shard(shard).expect("no conflicting default shard in this test");
     let claimed = autumn_harvest::queue::claim_task_by_id_on_shard(
         &mut conn,
         task_id,

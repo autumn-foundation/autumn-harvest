@@ -326,6 +326,14 @@ pre-failover epoch is fenced there too, the moment it tries to claim or persist.
 That is by design, and it is why re-seeding is not optional — a hand-repaired
 old database would carry the *old* epoch and quietly re-admit those workers.
 
+**The watermark trail travels with the data too, and needs no manual action.**
+Each row in `harvest_replication_heartbeat` carries the epoch in force when it
+was written. `measure_rpo` reads only the rows stamped with the CURRENT epoch,
+so a beat replicated in from before this fail-back (a different WAL stream,
+not comparable to the new one) is never read back as if it belonged to it. The
+RPO simply reports unknown until the re-seeded region writes its first beat
+under the new epoch, then reads normally.
+
 **2. Let it catch up, and watch the RPO.** Fail back when
 `harvest.replication.lag_seconds` on the new primary is small and stable and
 `harvest.replication.standbys` is `1`. There is no urgency: unlike the outage

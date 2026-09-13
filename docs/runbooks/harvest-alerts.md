@@ -2868,6 +2868,60 @@ incident channel rather than recorded as zero.
 
 ---
 
+## harvest_replication_rpo_unknown
+
+**What to do when a shard's RPO has no source.** The replication views are
+readable and a standby is connected, but no signal can produce an RPO number
+yet: no DR slot has confirmed a position, and the standby has not reported a
+`replay_lag` either. This differs from `harvest_replication_unobservable`: the
+views are not the problem here, the RPO itself has no source.
+
+`harvest.replication.lag_seconds` is withheld rather than published as a stale
+or fabricated number. A Prometheus gauge keeps exporting its last value, so
+withholding it alone does not make the panel stale — it freezes at the last
+healthy reading. `harvest.replication.rpo_known` is the signal that breaks
+that freeze: it is emitted every tick the views are readable, `0` included.
+
+### Triage steps
+
+1. `harvest dr status --shard <id>=<dsn> -o json`. Read the standby and slot
+   list for the affected shard.
+2. Confirm a DR slot exists and carries the configured prefix
+   (`replication_slot_prefix`, default `harvest_dr`). A standby attached
+   without one cannot report a watermark.
+3. Check how long ago the standby connected. A `replay_lag` of `NULL` is
+   normal until the first feedback round trip completes; give it one sampler
+   interval before treating it as stuck.
+
+### Likely causes
+
+- A physical standby attached to the primary without a `primary_slot_name`,
+  so no slot exists for the sampler to read a position from.
+- A freshly created DR slot with no watermark beat written yet (the sampler
+  writes at most one beat per shard per interval).
+- A standby that connected moments ago and has not completed a feedback round
+  trip.
+
+### False positives
+
+- The first sampler tick after a new standby connects. The `for: 10m` window
+  covers ordinary startup.
+
+### Safe actions
+
+- Create the missing replication slot and reattach the standby with
+  `primary_slot_name` set, per `docs/cross-region-dr.md`.
+- Wait one sampler interval past standby connection before escalating.
+
+### Escalation criteria
+
+Escalate if this fires for longer than the standby's expected catch-up time,
+or if a failover is being considered while this is firing — the RPO for this
+shard is unmeasured, and that must be said out loud in the incident channel
+rather than assumed to be small.
+
+---
+
 ## harvest_audit_export_lag_high
 
 `harvest.audit.export_lag` is the age of the **oldest** audit record the SIEM
@@ -2952,13 +3006,17 @@ invisible to detection is growing, and the audit table is growing with it.
   then sees neither a high value nor an absent series while that shard is going
   unexported.
 
-  There is **no metric-only detection for this case today**, and
-  `time() - timestamp(...)` does not provide one: Prometheus stamps each
-  *scraped sample* with the scrape time, and the endpoint keeps exposing the
-  stale value on every scrape, so such an expression stays near the scrape
-  interval forever. Do not rely on it. `changes(...) == 0` fails the same way
-  for the opposite reason — a healthy caught-up shard also holds a constant
-  `0`.
+  `time() - timestamp(...)` does not provide a fix, either: Prometheus stamps
+  each *scraped sample* with the scrape time, and the endpoint keeps exposing
+  the stale value on every scrape, so such an expression stays near the
+  scrape interval forever. Do not rely on it. `changes(...) == 0` fails the
+  same way for the opposite reason — a healthy caught-up shard also holds a
+  constant `0`.
+
+  `harvest_audit_export_unobservable` (below) is the metric-only fix for this
+  exact case (issue #1268): `harvest.audit.export_observed` is emitted every
+  tick that reaches a shard, success or failure, so it cannot go stale the
+  way the lag gauge can.
 
   What each alert actually covers:
 
@@ -2967,14 +3025,16 @@ invisible to detection is growing, and the audit table is growing with it.
   | Process down | `up == 0` |
   | Exporter never ran for a shard | `absent(harvest_audit_export_lag{shard="N"})` |
   | Sink failing or slow, exporter observing normally | the lag threshold — the cursor is held, so the oldest unacknowledged record ages and the gauge climbs |
-  | Exporter alive but **cannot observe the shard** | **nothing in metrics.** `last_error` and `unavailable_shards` on `GET /admin/audit-export` are authoritative; poll the route if you need this covered |
+  | Exporter alive but **cannot observe the shard** | `harvest_audit_export_unobservable` — see the runbook section below |
   | **One shard** never scanned while others report | **nothing in the shipped rules.** `absent()` is false as soon as any shard reports. Template one absence rule per configured shard from your own inventory: `absent(harvest_audit_export_lag{shard="N"})` |
 
-  The last row is a real gap, tracked as
-  autumn-foundation/autumn-harvest#1268 (an explicit availability signal
-  alongside the gauge). Note that the common outage — a sink that is down or
-  rejecting — falls in the *third* row and is covered: the exporter still reads
-  the cursor fine and the gauge climbs as designed.
+  The last row remains an open gap: it names a shard missing from a worker's
+  `shard_assignments` altogether, which no exporter tick ever touches, so no
+  series — lag or observed — exists for it either. That is a per-deployment
+  inventory question the starter pack cannot answer generically. Note that
+  the common outage — a sink that is down or rejecting — falls in the
+  *third* row and is covered: the exporter still reads the cursor fine and
+  the gauge climbs as designed.
 
 **Do not reach for the redrive.** `POST /admin/audit-export/redrive` rewinds
 the cursor so already-delivered records are re-exported; it is for **sink-side
@@ -3016,3 +3076,70 @@ Lag returns to ~0 and `harvest.audit.exported` resumes. On the receiver, check
 `(shard, seq)` contiguity across the outage window: sequences are dense per
 shard, so a hole is a real gap and a duplicate is the expected at-least-once
 behaviour.
+
+---
+
+## harvest_audit_export_unobservable
+
+**What to do when a shard's audit-export cursor cannot be read:** the
+exporter is running, but this tick could not read the shard's cursor row, or
+could not compute its lag, or could not even acquire a connection to the
+shard (issue #1268). `harvest.audit.export_lag` is not a reliable signal
+here — a Prometheus gauge keeps its last value, so the lag reading for this
+shard is frozen, commonly at `0`, and looks healthy.
+
+This is a ticket rather than a page: the sink may be working fine, and
+records already sequenced are not lost — the cursor is simply not advancing
+because the exporter cannot currently reach this shard to advance it.
+
+### Triage steps
+
+1. `curl -s "$HARVEST/admin/audit-export" | jq '.shards[] | select(.shard == <id>)'`.
+2. Read `last_error` on that shard. A connection-acquisition failure logs
+   `[audit_export] failed to get connection to shard ...` or `timed out
+   acquiring a connection for this shard` at `tracing::error!` level; search
+   the worker logs for the shard id around the alert's firing window.
+3. Confirm the shard's own database is reachable from the worker: the audit
+   exporter uses the same `ShardedDbPool` as every other per-shard resident
+   of `enforce_timeouts_once`, so a shard unreachable here is usually
+   unreachable for claim/timeout processing too.
+4. Check the shard's connection pool size. A pool with `max_size` of `1`
+   cannot yield a second connection while the scanner already holds the
+   first; see `SHARD_ACQUIRE_BOUND` in `audit_export.rs`.
+
+### Likely causes
+
+- The shard's database is down, unreachable over the network, or rejecting
+  new connections.
+- The shard's connection pool is undersized for the number of per-shard
+  scanner residents sharing it.
+- The shard is assigned to this worker but was never given a pool entry — a
+  configuration mismatch between `shard_assignments` and the
+  `ShardedDbPool`.
+- A transient cursor-row read failure or lag-query failure under database
+  load; this self-heals on the next tick without operator action.
+
+### False positives
+
+- A single tick during a brief connection blip. The `for: 10m` window
+  covers that; watch for the gauge returning to `1` on its own.
+- A deploy that briefly saturates a shard's pool while workers roll. It
+  clears within one or two poll intervals.
+
+### Safe actions
+
+- Fix the underlying connectivity or pool-sizing problem; recovery is
+  automatic once the shard is reachable again, and nothing was skipped —
+  the cursor resumes from where it stopped.
+- Widen the shard's connection pool if `SHARD_ACQUIRE_BOUND` timeouts recur
+  under normal load.
+- Nothing here calls for a redrive: no record was marked delivered that was
+  not, so there is nothing to rewind.
+
+### Escalation criteria
+
+Escalate when the shard stays unobservable past the compliance window your
+posture allows for privileged-action logs to sit unconfirmed, or when the
+underlying database outage is itself a page-worthy incident. Escalate to
+the team owning that shard's database first; this signal names an
+availability problem with the shard, not with the SIEM sink.

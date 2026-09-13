@@ -359,6 +359,27 @@ pub const METRIC_REPLICATION_LAG_BYTES: &str = "harvest.replication.lag_bytes";
 /// Labelled `{shard}`.
 pub const METRIC_REPLICATION_STANDBYS: &str = "harvest.replication.standbys";
 
+/// Gauge: `1` while a shard's measured RPO is known. `0` when the
+/// replication views are readable but the RPO itself is not (issue #954,
+/// finding 2).
+///
+/// [`METRIC_REPLICATION_OBSERVABLE`] covers the views-unreadable case. It
+/// does not cover a shard whose views read fine but whose RPO has no
+/// source yet. That happens for a physical standby attached with no DR
+/// slot, before it has reported its first `replay_lag`.
+///
+/// A Prometheus gauge keeps exporting its last value. So simply skipping
+/// [`METRIC_REPLICATION_LAG_SECONDS`] in that case does not make the
+/// series stale; it freezes the dashboard at the last healthy reading.
+/// This gauge is emitted on every sampler tick the views are readable, `0`
+/// included, so it cannot go stale the same way.
+///
+/// Alerting: ticket when this is `0` while
+/// [`METRIC_REPLICATION_OBSERVABLE`] is `1` (readable but unmeasurable) — see
+/// `harvest_replication_rpo_unknown` in the starter alert pack. Labelled
+/// `{shard}`.
+pub const METRIC_REPLICATION_RPO_KNOWN: &str = "harvest.replication.rpo_known";
+
 /// Gauge: the write-authority epoch a shard's database currently reports
 /// (issue #954).
 ///
@@ -388,6 +409,25 @@ pub const METRIC_SHARD_GENERATION: &str = "harvest.shard.generation";
 /// `actor`, `operation`, and `target_id` are deliberately never labels — they
 /// are unbounded, user-supplied, and tenant-identifying.
 pub const METRIC_AUDIT_EXPORT_LAG: &str = "harvest.audit.export_lag";
+
+/// Gauge: `1` when the exporter observed a shard's cursor and lag this tick,
+/// `0` when it could not (issue #1268).
+///
+/// A Prometheus gauge keeps its last value. Without this signal, a shard the
+/// exporter cannot observe freezes [`METRIC_AUDIT_EXPORT_LAG`] at its last
+/// reading, commonly `0`. The threshold alert then stays silent, and
+/// `absent()` never fires, because the series still exists.
+///
+/// Covers a connection the scanner cannot acquire, a failed cursor read, and
+/// a failed lag query. It does not cover a shard missing from
+/// `shard_assignments` altogether, since no code path ever runs for it.
+/// Template a per-shard `absent()` rule from your own inventory for that
+/// case.
+///
+/// Emitted on every exporter tick that reaches a shard, delivery outcome
+/// aside. Labelled `{shard}` only, for the same cardinality reason as
+/// [`METRIC_AUDIT_EXPORT_LAG`].
+pub const METRIC_AUDIT_EXPORT_OBSERVED: &str = "harvest.audit.export_observed";
 
 /// Counter: audit records acknowledged by the sink for a shard (issue #953).
 ///
@@ -863,6 +903,33 @@ pub const METRIC_CONCURRENCY_SUPERSEDED: &str = "harvest.concurrency.superseded"
 /// [`METRIC_CONCURRENCY_SUPERSEDED`]'s cardinality rule — the concurrency key
 /// is never a label (ADR-0001 §7). `execution.id` must never appear here.
 pub const METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT: &str = "harvest.concurrency.residual_over_limit";
+
+/// Counter: a `cancel_running` admission's quota credit assumed a run would
+/// be shed, and the real supersede pass skipped it instead (issue #1228
+/// review, P2).
+///
+/// `crate::concurrency::dry_run_supersede_credit` credits an admission for
+/// the exact runs it expects `supersede_inner` to cancel a moment later.
+/// `supersede_inner` can skip one of those runs on an unexpected error and
+/// leave it running instead. A candidate's own corrupted
+/// `parent_close_policy` is one cause. A `Config` error from its terminal
+/// chokepoint, that is not the benign already-terminal race, is another.
+/// Either way, one corrupt neighbor must never wedge every future
+/// admission for the key. The admission already committed on the
+/// assumption that run was gone. So the key is now genuinely over its
+/// declared cap, not merely transiently the way
+/// [`METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT`] describes. There is no way
+/// to retract that admission by the time this is detected. Its
+/// `WorkflowStarted` event is already durable. So this counter is the
+/// alertable signal, not a rejection.
+///
+/// Incremented once per admission whose real supersede pass left at least
+/// one credited run unshed, with the count of unshed runs as its value.
+///
+/// Labeled by `workflow` (workflow type name) only, matching
+/// [`METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT`]'s cardinality rule — neither
+/// the quota key nor `execution.id` is ever a label (ADR-0001 §7).
+pub const METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED: &str = "harvest.quota.supersede_credit_not_shed";
 
 /// Counter: incremented exactly once per real saga compensation sequence
 /// (issue #801).
@@ -2591,6 +2658,21 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow, gap);
     }
 
+    /// A `cancel_running` admission's quota credit assumed `gap` runs would
+    /// be shed, and the real supersede pass skipped them instead (issue
+    /// #1228 review, P2).
+    ///
+    /// Maps to the counter [`METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED`].
+    /// Unlike [`Self::record_concurrency_residual_over_limit`], the key
+    /// here is not merely transient. The admission that spent this credit
+    /// is already committed. So the key is genuinely over its declared cap
+    /// until an operator intervenes or the corrupt candidate is fixed.
+    /// Additive with a no-op default: implementing it is optional and no
+    /// existing implementor breaks.
+    fn record_quota_supersede_credit_not_shed(&self, workflow: &str, gap: u64) {
+        let _ = (workflow, gap);
+    }
+
     /// Record the current available tokens for a rate limit bucket key.
     ///
     /// Maps to the gauge `harvest.rate_limit.tokens_available{key}`.
@@ -2749,6 +2831,16 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (shard, count);
     }
 
+    /// Whether a shard's measured RPO is known (issue #954, finding 2).
+    ///
+    /// Emitted on every sampler tick the views are readable, `0` included —
+    /// like [`Self::record_replication_observable`], it must never go stale.
+    ///
+    /// Maps to the gauge [`METRIC_REPLICATION_RPO_KNOWN`].
+    fn record_replication_rpo_known(&self, shard: u16, known: bool) {
+        let _ = (shard, known);
+    }
+
     /// The write-authority epoch a shard's database currently reports
     /// (issue #954).
     ///
@@ -2766,6 +2858,20 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the gauge [`METRIC_AUDIT_EXPORT_LAG`].
     fn record_audit_export_lag(&self, shard: u16, seconds: f64) {
         let _ = (shard, seconds);
+    }
+
+    /// The exporter did, or did not, observe a shard's cursor and lag this
+    /// tick (issue #1268).
+    ///
+    /// Call this on **every** exporter tick that reaches a shard, whether or
+    /// not it delivers a batch. `true` when the cursor read and the lag query
+    /// both succeeded; `false` on a connection failure, a cursor read
+    /// failure, or a lag query failure. See [`METRIC_AUDIT_EXPORT_OBSERVED`]
+    /// for why this signal exists.
+    ///
+    /// Maps to the gauge [`METRIC_AUDIT_EXPORT_OBSERVED`].
+    fn record_audit_export_observed(&self, shard: u16, observed: bool) {
+        let _ = (shard, observed);
     }
 
     /// Audit records the sink acknowledged for a shard (issue #953).
@@ -3512,6 +3618,35 @@ pub fn emit_concurrency_residual_over_limit<M: MetricsRecorder + ?Sized>(
         return;
     }
     metrics.record_concurrency_residual_over_limit(workflow_name, gap);
+}
+
+/// Emit [`METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED`] for a skipped credited run.
+///
+/// A `cancel_running` admission's quota credit assumed `gap` runs would be
+/// shed. Its real supersede pass skipped them instead (issue #1228 review,
+/// P2).
+///
+/// Called INLINE from [`crate::execution::run_latest_wins_supersede`],
+/// right after the real supersede pass returns. Same convention as
+/// [`emit_concurrency_residual_over_limit`], and for the same reason: this
+/// is a brand-new counter with no pre-existing post-commit convention to
+/// violate. The condition it reports is itself already a rare edge case,
+/// like a corrupted `parent_close_policy` or an unexpected `Config` error
+/// on one candidate. An occasional phantom sample from a rolled-back
+/// transaction is an accepted, documented simplification, not the gap
+/// this counter exists to close.
+///
+/// Canary probe workflows (issue #796) are excluded, mirroring
+/// [`emit_workflow_terminal`].
+pub fn emit_quota_supersede_credit_not_shed<M: MetricsRecorder + ?Sized>(
+    metrics: &M,
+    workflow_name: &str,
+    gap: u64,
+) {
+    if crate::canary::is_canary_workflow(workflow_name) {
+        return;
+    }
+    metrics.record_quota_supersede_credit_not_shed(workflow_name, gap);
 }
 
 /// Default metrics recorder that discards every sample.
@@ -4391,6 +4526,7 @@ mod tests {
         rec.record_replication_observable(0, false);
         rec.record_replication_lag_bytes(0, 4_096);
         rec.record_replication_standbys(0, 1);
+        rec.record_replication_rpo_known(0, false);
         rec.record_shard_generation(0, 7);
         rec.record_shard_fenced(0);
         assert_eq!(
@@ -4402,6 +4538,10 @@ mod tests {
             "harvest.replication.lag_bytes"
         );
         assert_eq!(METRIC_REPLICATION_STANDBYS, "harvest.replication.standbys");
+        assert_eq!(
+            METRIC_REPLICATION_RPO_KNOWN,
+            "harvest.replication.rpo_known"
+        );
         assert_eq!(METRIC_SHARD_GENERATION, "harvest.shard.generation");
         assert_eq!(METRIC_SHARD_FENCED, "harvest.shard.fenced");
     }

@@ -314,6 +314,19 @@ the lag gauge only for "replication is slow".
 The beat also keeps WAL moving on an idle primary, so an idle deployment
 reports a live RPO instead of a lag that drifts upward on a healthy system.
 
+### Scoped to one WAL stream per generation
+
+The setup SQL above replicates `harvest_replication_heartbeat` along with
+every other table (`FOR ALL TABLES`), so a standby can carry beats the OLD
+primary wrote before a promotion. Those LSNs belong to a WAL stream a
+promoted primary does not share, so they are not comparable to its own
+positions. Each beat is stamped with the `harvest_shard_generation` epoch in
+force when it was written, and the RPO reads only beats from the CURRENT
+epoch — a beat from a superseded generation cannot be mistaken for one in the
+current WAL stream. See the fail-back section of
+`docs/runbooks/cross-region-failover.md` for what an operator sees during a
+promotion.
+
 | Metric | Meaning |
 | --- | --- |
 | `harvest.replication.lag_seconds{shard}` | The RPO in seconds. Absent when unknown. |
