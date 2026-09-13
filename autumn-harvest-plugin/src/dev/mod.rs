@@ -293,10 +293,10 @@ pub enum DevError {
     ///
     /// [`safety::classify_database_url`] only ever gates the **application**
     /// database. Under `split`/`external`, Harvest storage is a second,
-    /// independently resolved database that gate never sees — so an ambient
-    /// `harvest.mode` could point a worker at an unclassified, possibly remote
-    /// database. The dev runtime owns exactly one ephemeral cluster and has no
-    /// second database to offer, so it refuses here instead.
+    /// independently resolved database. That gate never sees it. An ambient
+    /// `harvest.mode` could point a worker at an unclassified, possibly
+    /// remote database. The dev runtime owns exactly one ephemeral cluster
+    /// and has no second database to offer. It refuses here instead.
     #[error(
         "refusing to start: {mode_source} sets harvest.mode = {mode:?}. The dev runtime supports \
          embedded storage only — it owns one ephemeral Postgres cluster and has no second \
@@ -963,7 +963,7 @@ impl autumn_web::config::ConfigLoader for DevConfigLoader {
 #[cfg(test)]
 mod harvest_mode_gate_tests {
     //! Issue #1291: the dev runtime owns one ephemeral cluster and cannot
-    //! honour a dedicated Harvest database, so ambient `split`/`external`
+    //! honour a dedicated Harvest database. Ambient `split`/`external`
     //! configuration must refuse startup rather than run unclassified.
 
     use autumn_web::config::MockEnv;

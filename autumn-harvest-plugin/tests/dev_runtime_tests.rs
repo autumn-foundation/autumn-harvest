@@ -1401,8 +1401,27 @@ fn banner_never_leaks_a_password() {
 // calls refuses nothing. These drive the real `DevRuntime::start`, which
 // rejects before it provisions anything — so they need no Postgres.
 
+/// Serializes every test in this binary that drives the real
+/// `DevRuntime::start`.
+///
+/// One of them, `starting_with_ambient_split_mode_configuration_is_refused`
+/// (issue #1291), mutates the process-wide `AUTUMN_HARVEST__MODE` and
+/// `AUTUMN_HARVEST_DATABASE__URL` env vars. `DevRuntime::start`'s new startup
+/// gate reads both from the real process environment. Left unguarded, that
+/// mutation would leak into every other `DevRuntime::start` test the harness
+/// happens to schedule at the same time. Each would then fail with
+/// `UnsupportedHarvestMode` instead of the refusal it actually asserts.
+static DEV_RUNTIME_START_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// Holds `DEV_RUNTIME_START_SERIAL` across the `.await` below on purpose. The
+// lock keeps ambient env state stable for the whole call, mirroring the
+// `TEST_SERIAL` pattern in `start_idempotency_integration.rs`.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn starting_against_a_remote_database_is_refused() {
+    let _guard = DEV_RUNTIME_START_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         database_url: Some("postgres://u:p@db.prod.example.com:5432/app".to_owned()),
         // Kernel-chosen. These tests are about DSN classification, but the port
@@ -1424,10 +1443,14 @@ async fn starting_against_a_remote_database_is_refused() {
     );
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_remote_database_is_refused_even_with_the_suspicious_name_opt_in() {
     // There is deliberately no override for a remote host, so the opt-in for a
     // production-shaped *name* must not double as one.
+    let _guard = DEV_RUNTIME_START_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         database_url: Some("postgres://u:p@db.prod.example.com:5432/app".to_owned()),
         allow_suspicious_database_name: true,
@@ -1445,8 +1468,12 @@ async fn a_remote_database_is_refused_even_with_the_suspicious_name_opt_in() {
     );
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_production_shaped_local_name_needs_the_explicit_opt_in() {
+    let _guard = DEV_RUNTIME_START_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         database_url: Some("postgres://u:p@127.0.0.1:5432/myapp_production".to_owned()),
         http_port: 0,
@@ -1466,24 +1493,17 @@ async fn a_production_shaped_local_name_needs_the_explicit_opt_in() {
 // ---------------------------------------------------------------------------
 // Issue #1291 — the gate above only ever classifies the APPLICATION
 // database. Under `harvest.mode = split`/`external`, Harvest storage is a
-// second, independently resolved database the gate never sees, so ambient
-// configuration could point the worker at a database the gate never
+// second, independently resolved database. The gate above never sees it.
+// Ambient configuration could point the worker at a database the gate never
 // classified. The dev runtime owns one ephemeral cluster and has no second
-// database to offer, so it refuses instead — see
+// database to offer. It refuses instead — see
 // `refuse_unsupported_harvest_mode` in `src/dev/mod.rs`, unit-tested there
 // (including the `autumn.toml` path) since `DevRuntime::start` calls it
 // verbatim as its first step.
 // ---------------------------------------------------------------------------
 
-/// Serializes tests in this binary that mutate process environment variables
-/// read by [`autumn_harvest_plugin::config::resolve_harvest_mode_source`].
-/// Nothing else in this file touches `AUTUMN_HARVEST__MODE` or
-/// `AUTUMN_HARVEST_DATABASE__URL`, but two such tests running concurrently
-/// would still race each other.
-static HARVEST_MODE_ENV_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-// Holds `HARVEST_MODE_ENV_SERIAL` across the `.await` below on purpose: the
-// lock exists to keep the env vars stable for the whole call, mirroring the
+// Holds `DEV_RUNTIME_START_SERIAL` across the `.await` below on purpose. The
+// lock keeps ambient env state stable for the whole call, mirroring the
 // `TEST_SERIAL` pattern in `start_idempotency_integration.rs`.
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
@@ -1491,11 +1511,11 @@ async fn starting_with_ambient_split_mode_configuration_is_refused() {
     // Issue #1291's exact reproduction: a developer environment set up for a
     // dedicated Harvest database refuses `cargo dev` rather than migrating
     // and running a worker against it.
-    let _guard = HARVEST_MODE_ENV_SERIAL
+    let _guard = DEV_RUNTIME_START_SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // SAFETY: serialized by `HARVEST_MODE_ENV_SERIAL` above; no other test in
-    // this binary reads these variables.
+    // SAFETY: serialized by `DEV_RUNTIME_START_SERIAL` above, which every
+    // `DevRuntime::start` test in this file also holds while it runs.
     unsafe {
         std::env::set_var("AUTUMN_HARVEST__MODE", "split");
         std::env::set_var(
@@ -1527,6 +1547,53 @@ async fn starting_with_ambient_split_mode_configuration_is_refused() {
     assert!(
         error.to_string().contains("AUTUMN_HARVEST__MODE"),
         "the refusal must name the responsible variable: {error}"
+    );
+}
+
+// Same lock-across-`.await` rationale as the test above.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn starting_with_split_mode_from_autumn_toml_is_refused() {
+    // The other path a repo checkout can carry (issue #1291): a checked-in
+    // `autumn.toml` with `[harvest] mode = "split"` needs no environment
+    // variable at all.
+    let _guard = DEV_RUNTIME_START_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        dir.path().join("autumn.toml"),
+        "[harvest]\nmode = \"split\"\n\n[harvest.database]\n\
+         url = \"postgres://user:pw@db.prod.example.com/harvest\"\n",
+    )
+    .expect("autumn.toml should be written");
+    // SAFETY: serialized by `DEV_RUNTIME_START_SERIAL` above.
+    unsafe {
+        std::env::set_var("AUTUMN_MANIFEST_DIR", dir.path());
+    }
+
+    let result = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
+        http_port: 0,
+        ..DevRuntimeConfig::default()
+    })
+    .await;
+
+    // SAFETY: still serialized by `_guard`.
+    unsafe {
+        std::env::remove_var("AUTUMN_MANIFEST_DIR");
+    }
+
+    let error = result.expect_err("split mode from autumn.toml must refuse the dev runtime");
+    assert!(
+        matches!(
+            error,
+            autumn_harvest_plugin::dev::DevError::UnsupportedHarvestMode { .. }
+        ),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("autumn.toml"),
+        "the refusal must name the responsible file: {error}"
     );
 }
 
@@ -1808,6 +1875,7 @@ fn root_is_refused_before_any_session_state_is_touched() {
 }
 
 #[cfg(unix)]
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn provisioning_as_root_creates_no_session_root() {
     // The behavioural half of the same finding, which only says anything on a
@@ -1816,6 +1884,9 @@ async fn provisioning_as_root_creates_no_session_root() {
     if !autumn_harvest_plugin::dev::running_as_root() {
         return;
     }
+    let _guard = DEV_RUNTIME_START_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let base = tempfile::tempdir().expect("temp dir");
     let config = DevRuntimeConfig {
         session_root: Some(base.path().to_path_buf()),
@@ -1912,12 +1983,16 @@ fn a_reused_owner_pid_does_not_strand_a_session_forever() {
     );
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_non_loopback_http_host_is_refused() {
     // Codex round 4 (P2). `http_host` is public and documented as
     // loopback-only, but a doc comment is not an enforcement — and the
     // management router is mounted with `.api(...)`, not `api_with_auth`,
     // precisely because it is supposed to be unreachable.
+    let _guard = DEV_RUNTIME_START_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for host in ["0.0.0.0", "::", "192.0.2.1"] {
         let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
             http_host: (*host).to_owned(),

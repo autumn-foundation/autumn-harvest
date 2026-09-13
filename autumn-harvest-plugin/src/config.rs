@@ -476,13 +476,12 @@ impl std::fmt::Display for HarvestModeSource {
 
 /// Resolve `harvest.mode` and say where the value came from.
 ///
-/// A narrow twin of [`HarvestRuntimeConfig::load_with_env`]: same config
-/// files, same profile, and the same precedence (root file, then
-/// profile-specific file, then environment), but tracked for one field only.
-/// A caller that needs to name the responsible variable or file — such as the
-/// dev runtime's startup gate (issue #1291) — reads the source here instead of
-/// re-deriving it from a fully loaded [`HarvestRuntimeConfig`], which drops
-/// that provenance.
+/// A narrow twin of [`HarvestRuntimeConfig::load_with_env`]. It reads the
+/// same config files under the same precedence — root file, then
+/// profile-specific file, then environment — but tracks one field only.
+/// A caller that must name the responsible variable or file reads the
+/// source here. The dev runtime's startup gate does this (issue #1291). A
+/// fully loaded [`HarvestRuntimeConfig`] drops that provenance.
 ///
 /// # Errors
 ///
