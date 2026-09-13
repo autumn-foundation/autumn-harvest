@@ -1089,24 +1089,33 @@ async fn run_partition_maintenance_pass(
         // life, spaced no farther apart than one shard's worth of work,
         // however long the whole pass takes.
         crate::scanner_health::record_scanner_tick(metrics, owner);
-        let mut conn = match pool.get().await {
-            Ok(conn) => conn,
-            Err(error) => {
-                // Never silent: a shard that cannot be reached gets no
-                // lookahead partitions and no reclamation, and the
-                // operator has to be able to tell that apart from
-                // "nothing to do".
-                tracing::warn!(
-                    shard = %shard,
-                    error = %error,
-                    "harvest event-partition maintenance could not acquire a connection"
-                );
-                monitor_task.update_partitions(
-                    shard,
-                    crate::partition::MaintenanceOutcome::failed(error.to_string()),
-                );
-                continue;
-            }
+        // Review finding: a saturated pool can leave this `.await`
+        // waiting far longer than the shard-boundary check above
+        // accounts for. Deadpool applies no acquisition timeout here.
+        // No transaction is open yet, so racing it against `shutdown`
+        // is exactly as safe as the shard-boundary check: returning
+        // here can never abandon one mid-flight.
+        let mut conn = tokio::select! {
+            () = shutdown.cancelled() => return,
+            result = pool.get() => match result {
+                Ok(conn) => conn,
+                Err(error) => {
+                    // Never silent: a shard that cannot be reached gets no
+                    // lookahead partitions and no reclamation, and the
+                    // operator has to be able to tell that apart from
+                    // "nothing to do".
+                    tracing::warn!(
+                        shard = %shard,
+                        error = %error,
+                        "harvest event-partition maintenance could not acquire a connection"
+                    );
+                    monitor_task.update_partitions(
+                        shard,
+                        crate::partition::MaintenanceOutcome::failed(error.to_string()),
+                    );
+                    continue;
+                }
+            },
         };
         // Probed before `maintain` runs it, so an unpartitioned shard can
         // be told apart from one that ran and did nothing (issue #1270

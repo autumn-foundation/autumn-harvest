@@ -105,7 +105,9 @@
 //! byte-identical") therefore holds *by construction* rather than by testing
 //! luck.
 
+#[cfg(feature = "db")]
 use std::future::Future;
+#[cfg(feature = "db")]
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -1558,6 +1560,144 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
     )))
 }
 
+/// Operator-installed `CHECK` and foreign-key constraints on `harvest_events`
+/// or on one of its leaf partitions.
+///
+/// Harvest itself creates exactly one foreign key on `harvest_events` --
+/// `harvest_events_workflow_exec_id_fkey`, `(workflow_exec_id)` referencing
+/// `harvest_workflow_executions(id)` `ON DELETE CASCADE` -- alongside the
+/// primary key and the `workflow_exec_id, event_id` unique constraint. All
+/// three are handled and replayed by name elsewhere in this module, and are
+/// excluded here by name, type and exact shape.
+///
+/// Harvest also creates exactly one `CHECK` constraint of its own:
+/// `{LEGACY_PARTITION}_cohort_ck` (`CHECK (cohort < cutover)`), added
+/// `NOT VALID` then validated so `ATTACH PARTITION` can skip its own
+/// full-table scan. It stays behind afterward, on whichever relation
+/// carries the pre-cutover rows at the time. That is `harvest_events`
+/// itself during the online path's phase 3, [`LEGACY_PARTITION`] from
+/// phase 4 onward.
+///
+/// A re-run of the plan over an already-converted shard renames every
+/// constraint the bounded-rename loop finds still occupying its
+/// original name. This one is included, and gains the suffix
+/// `{LEGACY_RENAME_SUFFIX}`. Unlike the primary key, unique and
+/// foreign-key constraints, it is never explicitly dropped afterward
+/// under that renamed name. It can persist that way indefinitely. Both
+/// the plain and the renamed form
+/// are excluded here, by name, type and column.
+///
+/// Every other constraint this query finds is an operator's own.
+///
+/// **Why this blocks the conversion.** `CREATE TABLE ... (LIKE ...)`
+/// carries neither a `CHECK` nor a foreign key, and both conversion
+/// directions build the replacement relation that way. A `CHECK` or
+/// foreign-key invariant an operator added would silently stop applying to
+/// every row appended after cutover, with nothing reporting the loss.
+/// Recreating it automatically is not offered: a foreign key's target
+/// table, and a `CHECK` expression's intended semantics, are not this
+/// module's to guess.
+///
+/// Unique and primary-key constraints are deliberately excluded here: every
+/// one is backed by an index, so [`refuse_if_unique_index_without_cohort`]
+/// already covers them.
+///
+/// Review finding: name alone does not identify harvest's own foreign key.
+/// An operator's own foreign key could reuse the reserved name
+/// `harvest_events_workflow_exec_id_fkey` on different columns, a different
+/// target, or a different `ON DELETE` action. Name-only matching would
+/// exempt it as harvest-owned, and it would then be silently dropped just
+/// like an unnamed one. The exemption below also verifies the local
+/// column (`workflow_exec_id`), the referenced table and column
+/// (`harvest_workflow_executions(id)`), `ON DELETE CASCADE`
+/// (`confdeltype = 'c'`), and that it is not `DEFERRABLE`. That is the
+/// same shape-over-name-alone rigor
+/// [`HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL`] already applies to the
+/// primary key and unique constraint.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] if the catalog query fails.
+#[cfg(feature = "db")]
+pub async fn unreplayable_constraints(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
+    let rows = diesel::sql_query(format!(
+        "SELECT DISTINCT con.conname AS v
+           FROM pg_constraint con
+           JOIN pg_class t ON t.oid = con.conrelid
+           JOIN pg_namespace n ON n.oid = t.relnamespace
+          WHERE n.nspname = current_schema()
+            AND (
+                t.relname = 'harvest_events'
+                OR t.oid IN (
+                    SELECT i.inhrelid
+                      FROM pg_inherits i
+                      JOIN pg_class parent ON parent.oid = i.inhparent
+                      JOIN pg_namespace pn ON pn.oid = parent.relnamespace
+                     WHERE parent.relname = 'harvest_events' AND pn.nspname = current_schema()
+                )
+            )
+            AND con.contype IN ('c', 'f')
+            AND NOT (
+                con.conname = 'harvest_events_workflow_exec_id_fkey'
+                AND con.contype = 'f'
+                AND NOT con.condeferrable
+                AND con.confdeltype = 'c'
+                AND con.confrelid = 'harvest_workflow_executions'::regclass
+                AND (SELECT array_agg(a.attname::text ORDER BY k)
+                       FROM generate_subscripts(con.conkey, 1) k
+                       JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]
+                    ) = ARRAY['workflow_exec_id']
+                AND (SELECT array_agg(a.attname::text ORDER BY k)
+                       FROM generate_subscripts(con.confkey, 1) k
+                       JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = con.confkey[k]
+                    ) = ARRAY['id']
+            )
+            AND NOT (
+                con.conname IN (
+                    '{LEGACY_PARTITION}_cohort_ck',
+                    '{LEGACY_PARTITION}_cohort_ck{LEGACY_RENAME_SUFFIX}'
+                )
+                AND con.contype = 'c'
+                AND NOT con.condeferrable
+                AND t.relname IN ('harvest_events', '{LEGACY_PARTITION}')
+                AND (SELECT array_agg(a.attname::text ORDER BY k)
+                       FROM generate_subscripts(con.conkey, 1) k
+                       JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]
+                    ) = ARRAY['cohort']
+            )
+          ORDER BY 1"
+    ))
+    .load::<TextRow>(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows.into_iter().map(|r| r.v).collect())
+}
+
+/// The refusal both conversion directions share.
+#[cfg(feature = "db")]
+async fn refuse_if_unreplayable_constraints(
+    conn: &mut AsyncPgConnection,
+    verb: &str,
+) -> HarvestResult<()> {
+    let constraints = unreplayable_constraints(conn).await?;
+    if constraints.is_empty() {
+        return Ok(());
+    }
+    Err(HarvestError::Config(format!(
+        "refusing to {verb} harvest_events: {} not carried by CREATE TABLE ... (LIKE ...) ({}). \
+         An operator CHECK or foreign-key constraint would stop applying to every row appended \
+         after cutover, while still existing on the relation this leaves behind. Drop the \
+         constraint (and recreate it against harvest_events afterward, if it is still needed) \
+         to proceed.",
+        if constraints.len() == 1 {
+            "a constraint is"
+        } else {
+            "constraints are"
+        },
+        constraints.join(", ")
+    )))
+}
+
 /// Operator-installed triggers on `harvest_events` or on one of its leaf
 /// partitions.
 ///
@@ -1596,6 +1736,13 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
 /// [`EXEC_FK_TRIGGER_TGTYPE`], no arguments, and no `WHEN` clause --
 /// harvest's trigger's exact, whole shape.
 ///
+/// Review finding: shape alone still omits `tgenabled`. Harvest's own
+/// trigger is always the plain enabled state (`O`). An operator's
+/// trigger matching every other check but marked `DISABLED`, `ENABLE
+/// REPLICA`, or `ENABLE ALWAYS` behaves differently after conversion
+/// silently changed its enable mode. The exemption now requires that
+/// too.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] if the catalog query fails.
@@ -1624,7 +1771,8 @@ pub async fn operator_triggers(conn: &mut AsyncPgConnection) -> HarvestResult<Ve
                      AND p.pronamespace = c.relnamespace
                      AND tg.tgtype = {EXEC_FK_TRIGGER_TGTYPE}
                      AND tg.tgnargs = 0
-                     AND tg.tgqual IS NULL)
+                     AND tg.tgqual IS NULL
+                     AND tg.tgenabled = 'O')
           ORDER BY 1"
     ))
     .load::<TextRow>(conn)
@@ -1725,6 +1873,7 @@ pub async fn enable_partitioning(
     refuse_if_unique_index_without_cohort(conn, "convert").await?;
     refuse_if_dependent_views(conn, "convert").await?;
     refuse_if_operator_triggers(conn, "convert").await?;
+    refuse_if_unreplayable_constraints(conn, "convert").await?;
 
     let width = opts.cohort_width_secs;
     let now = Utc::now();
@@ -1976,7 +2125,8 @@ the preflight check ran but before this transaction''s ACCESS EXCLUSIVE lock. Dr
                 AND p.pronamespace = c.relnamespace
                 AND tg.tgtype = {EXEC_FK_TRIGGER_TGTYPE}
                 AND tg.tgnargs = 0
-                AND tg.tgqual IS NULL);
+                AND tg.tgqual IS NULL
+                AND tg.tgenabled = 'O');
     IF bad_trg IS NOT NULL THEN
         RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not carried by CREATE \
 TABLE ... (LIKE ...) (%), installed after the preflight check ran but before this \
@@ -2651,6 +2801,11 @@ pub async fn disable_partitioning(
     // carry stays on the partitioned parent being reclaimed, not the flat
     // table `disable` builds in its place.
     refuse_if_operator_triggers(conn, "revert").await?;
+    // Same reason once more. A CHECK or foreign-key constraint `CREATE
+    // TABLE ... (LIKE ...)` did not carry stays on the partitioned parent
+    // being reclaimed. It does not follow to the flat table `disable`
+    // builds in its place.
+    refuse_if_unreplayable_constraints(conn, "revert").await?;
     let report = Box::pin(
         conn.transaction::<DisableReport, HarvestError, _>(async |conn| {
             // Review finding: the dependent-view and operator-trigger checks
@@ -4491,7 +4646,8 @@ fn dependent_views_guard_sql(tag: &str) -> String {
 /// Review finding: name and function still are not the whole identity --
 /// see [`operator_triggers`]'s identical follow-up fix. The check now
 /// also requires harvest's exact trigger shape: [`EXEC_FK_TRIGGER_TGTYPE`],
-/// no arguments, no `WHEN` clause.
+/// no arguments, no `WHEN` clause, and `tgenabled = 'O'` -- see
+/// [`operator_triggers`]'s identical enabled-state fix too.
 #[must_use]
 fn operator_triggers_guard_sql(tag: &str) -> String {
     format!(
@@ -4508,13 +4664,90 @@ fn operator_triggers_guard_sql(tag: &str) -> String {
          AND p.pronamespace = c.relnamespace\n                      \
          AND tg.tgtype = {EXEC_FK_TRIGGER_TGTYPE}\n                      \
          AND tg.tgnargs = 0\n                      \
-         AND tg.tgqual IS NULL);\n    \
+         AND tg.tgqual IS NULL\n                      \
+         AND tg.tgenabled = 'O');\n    \
          IF bad IS NOT NULL THEN\n        \
          RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not carried by \
          CREATE TABLE ... (LIKE ...) (%). An operator trigger would stay on the \
          renamed legacy table after phase 4, where it stops firing for every new row \
          from cutover onward while still existing. Drop the trigger (and recreate it \
          against harvest_events afterward) before running this plan.', bad;\n    \
+         END IF;\nEND\n${tag}$;"
+    )
+}
+
+/// A `DO` block refusing when a `CHECK` or foreign-key constraint sits on
+/// `harvest_events` or on one of its leaf partitions. Tagged with `tag`, so
+/// it can appear more than once in the same generated script.
+///
+/// Mirrors [`unreplayable_constraints`]'s query exactly. Primary-key and
+/// unique constraints are excluded, since every one is backed by an
+/// index. [`unique_index_guard_sql`] already covers them. Harvest's own
+/// foreign key (`harvest_events_workflow_exec_id_fkey`) and its own
+/// `{LEGACY_PARTITION}_cohort_ck` `CHECK` are excluded too. Both are
+/// matched by name, type and shape, the same way harvest's own primary
+/// key and unique constraint are.
+///
+/// Review finding: `enable_partitioning` makes this check in Rust. The
+/// scripted path needs its own because it never calls it, same as the
+/// view and trigger guards above. Phase 4 rechecks it again under the
+/// lock this phase converts under, for the identical hours-long-gap
+/// reason those guards do.
+#[must_use]
+fn unreplayable_constraints_guard_sql(tag: &str) -> String {
+    format!(
+        "DO ${tag}$\nDECLARE bad text;\nBEGIN\n    \
+         SELECT string_agg(DISTINCT con.conname, ', ' ORDER BY con.conname) INTO bad\n      \
+         FROM pg_constraint con\n      \
+         JOIN pg_class t ON t.oid = con.conrelid\n      \
+         JOIN pg_namespace n ON n.oid = t.relnamespace\n     \
+         WHERE n.nspname = current_schema()\n       \
+         AND (\n           \
+         t.relname = 'harvest_events'\n           \
+         OR t.oid IN (\n               \
+         SELECT i.inhrelid\n                 \
+         FROM pg_inherits i\n                 \
+         JOIN pg_class parent ON parent.oid = i.inhparent\n                 \
+         JOIN pg_namespace pn ON pn.oid = parent.relnamespace\n                \
+         WHERE parent.relname = 'harvest_events' AND pn.nspname = current_schema()\n           \
+         )\n       \
+         )\n       \
+         AND con.contype IN ('c', 'f')\n       \
+         AND NOT (\n           \
+         con.conname = 'harvest_events_workflow_exec_id_fkey'\n           \
+         AND con.contype = 'f'\n           \
+         AND NOT con.condeferrable\n           \
+         AND con.confdeltype = 'c'\n           \
+         AND con.confrelid = 'harvest_workflow_executions'::regclass\n           \
+         AND (SELECT array_agg(a.attname::text ORDER BY k)\n                  \
+         FROM generate_subscripts(con.conkey, 1) k\n                  \
+         JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]\n               \
+         ) = ARRAY['workflow_exec_id']\n           \
+         AND (SELECT array_agg(a.attname::text ORDER BY k)\n                  \
+         FROM generate_subscripts(con.confkey, 1) k\n                  \
+         JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = con.confkey[k]\n               \
+         ) = ARRAY['id']\n       \
+         )\n       \
+         AND NOT (\n           \
+         con.conname IN (\n               \
+         '{LEGACY_PARTITION}_cohort_ck',\n               \
+         '{LEGACY_PARTITION}_cohort_ck{LEGACY_RENAME_SUFFIX}'\n           \
+         )\n           \
+         AND con.contype = 'c'\n           \
+         AND NOT con.condeferrable\n           \
+         AND t.relname IN ('harvest_events', '{LEGACY_PARTITION}')\n           \
+         AND (SELECT array_agg(a.attname::text ORDER BY k)\n                  \
+         FROM generate_subscripts(con.conkey, 1) k\n                  \
+         JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]\n               \
+         ) = ARRAY['cohort']\n       \
+         );\n    \
+         IF bad IS NOT NULL THEN\n        \
+         RAISE EXCEPTION 'harvest #958: constraint(s) on harvest_events not carried by \
+         CREATE TABLE ... (LIKE ...) (%). An operator CHECK or foreign-key constraint \
+         would stop applying to every row appended after cutover, while still existing \
+         on the relation this leaves behind. Drop the constraint (and recreate it \
+         against harvest_events afterward, if it is still needed) before running this \
+         plan.', bad;\n    \
          END IF;\nEND\n${tag}$;"
     )
 }
@@ -4755,6 +4988,17 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // trigger would stay on the renamed legacy table after phase 4. It
         // would then stop firing for every new row from cutover onward.
         step(1, operator_triggers_guard_sql("harvest_trg_958")),
+        // ── 1: refuse early over a constraint not carried by CREATE TABLE
+        // ... (LIKE ...) ──────────────────────────────────────────────────
+        //
+        // Same reason and same phase as the guards above.
+        // `enable_partitioning` makes this check in Rust; the scripted path
+        // needs its own because it never calls it. See
+        // `unreplayable_constraints`. A `CHECK` or foreign-key constraint
+        // would stay enforced on the renamed legacy table after phase 4.
+        // It would then silently stop applying to any row appended from
+        // cutover onward.
+        step(1, unreplayable_constraints_guard_sql("harvest_constraint_958")),
         // ── 1: bake the chosen width into the cohort function ─────────────
         step(1, cohort_function_sql(width)),
         // ── 2: the partition-key indexes, built without blocking ──────────
@@ -4918,6 +5162,13 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // the view recheck above just closed. Recheck it too, under the
         // same lock.
         step(4, operator_triggers_guard_sql("harvest_trg_cutover_958")),
+        // Review finding: phase 1's constraint check has the identical gap
+        // the view and trigger rechecks above just closed. Recheck it too,
+        // under the same lock.
+        step(
+            4,
+            unreplayable_constraints_guard_sql("harvest_constraint_cutover_958"),
+        ),
         // Review finding: this in-lock block rechecked unique indexes,
         // views and triggers, but not row security or publications.
         // Those are phase 1's other two guards, with the identical

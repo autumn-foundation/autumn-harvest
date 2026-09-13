@@ -1004,13 +1004,17 @@ async fn enable_survives_a_rename_target_collision_on_the_built_in_pkey() {
     .execute(&mut conn)
     .await
     .expect("clear any stray decoy from a previous run");
-    // A CHECK constraint, deliberately. A UNIQUE decoy without `cohort`
-    // would be refused by the unique-index preflight before conversion
-    // ever reaches the rename step. That would test that guard instead
-    // of this one.
+    // An EXCLUDE constraint, deliberately. A UNIQUE decoy (with or
+    // without `cohort`) is refused by `refuse_if_unique_index_without_cohort`.
+    // A CHECK decoy is refused by `refuse_if_unreplayable_constraints`.
+    // Both would trip before conversion ever reaches the rename step,
+    // testing one of those guards instead of this one. A singleton-range
+    // exclusion on `id` is a real `pg_constraint` row neither guard
+    // inspects, and it never actually excludes anything since `id` is
+    // already unique.
     diesel::sql_query(
         "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_pkey__pre958 \
-         CHECK (event_type <> '')",
+         EXCLUDE USING gist (int8range(id, id, '[]') WITH &&)",
     )
     .execute(&mut conn)
     .await
@@ -1035,7 +1039,7 @@ async fn enable_survives_a_rename_target_collision_on_the_built_in_pkey() {
             &format!(
                 "SELECT EXISTS (SELECT 1 FROM pg_constraint \
                  WHERE conrelid = '{pkey}'::regclass \
-                 AND conname = 'harvest_events_pkey__pre958' AND contype = 'c') AS v"
+                 AND conname = 'harvest_events_pkey__pre958' AND contype = 'x') AS v"
             ),
         )
         .await,
@@ -2201,6 +2205,57 @@ async fn a_trigger_matching_the_reserved_name_and_function_but_not_the_shape_sti
 }
 
 #[tokio::test]
+async fn a_disabled_trigger_matching_every_other_check_still_refuses() {
+    // Review finding: shape alone still omits `tgenabled`. Harvest's own
+    // trigger is always the plain enabled state. An operator's trigger
+    // matching the reserved name, function, and shape, but installed
+    // `DISABLED`, must not be exempted -- conversion would otherwise
+    // silently re-enable it.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP TRIGGER IF EXISTS harvest_events_exec_fk_trg ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray trigger from a previous run");
+    diesel::sql_query(
+        "CREATE TRIGGER harvest_events_exec_fk_trg BEFORE INSERT ON harvest_events \
+         FOR EACH ROW EXECUTE FUNCTION harvest_events_require_execution()",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator trigger matching every check but the enabled state");
+    diesel::sql_query("ALTER TABLE harvest_events DISABLE TRIGGER harvest_events_exec_fk_trg")
+        .execute(&mut conn)
+        .await
+        .expect("disable the seeded trigger");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "a trigger matching every other check, but not harvest's enabled state, \
+             must not be exempted from the guard",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_exec_fk_trg"),
+        "the refusal must name the offending trigger; got {msg}"
+    );
+
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP TRIGGER harvest_events_exec_fk_trg ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending trigger");
+}
+
+#[tokio::test]
 async fn an_operator_trigger_whose_function_lives_in_another_schema_still_refuses() {
     // Review finding: the fix for the reserved-name gap added
     // `p.pronamespace = c.relnamespace` to the join. An INNER JOIN with
@@ -2359,6 +2414,286 @@ async fn a_trigger_installed_directly_on_a_leaf_partition_still_refuses_the_reve
         .execute(&mut conn)
         .await
         .expect("drop the offending trigger function");
+}
+
+#[tokio::test]
+async fn a_check_constraint_refuses_the_conversion_instead_of_silently_dropping() {
+    // Issue #1270 P2: `CREATE TABLE ... (LIKE ...)` carries neither a
+    // `CHECK` nor a foreign-key constraint. An operator's own `CHECK` on
+    // `harvest_events` would stay enforced on the renamed legacy table,
+    // silently no longer applying to any row appended from cutover
+    // onward.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS harvest_events_type_check_958",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray constraint from a previous run");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_type_check_958 \
+         CHECK (event_type <> '')",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator CHECK constraint");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "a CHECK constraint not carried by CREATE TABLE ... (LIKE ...) must refuse \
+             the conversion, not silently stop applying after it",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_type_check_958"),
+        "the refusal must name the offending constraint; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT harvest_events_type_check_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending constraint");
+}
+
+#[tokio::test]
+async fn a_foreign_key_constraint_refuses_the_conversion_too() {
+    // Same gap, the other constraint kind `unreplayable_constraints`
+    // covers. An operator foreign key is exactly as unreplayable as an
+    // operator CHECK, and just as silent about it.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP TABLE IF EXISTS harvest_events_fk_target_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray target table from a previous run");
+    diesel::sql_query("CREATE TABLE harvest_events_fk_target_958 (event_type TEXT PRIMARY KEY)")
+        .execute(&mut conn)
+        .await
+        .expect("seed a foreign-key target table");
+    diesel::sql_query(
+        "INSERT INTO harvest_events_fk_target_958 (event_type) VALUES ('operator_type_958')",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a matching target row so the constraint can be added");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_fk_958 \
+         FOREIGN KEY (event_type) REFERENCES harvest_events_fk_target_958(event_type)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator foreign key");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "a foreign key not carried by CREATE TABLE ... (LIKE ...) must refuse the \
+             conversion, not silently stop applying after it",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_fk_958"),
+        "the refusal must name the offending constraint; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT harvest_events_fk_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending constraint");
+    diesel::sql_query("DROP TABLE harvest_events_fk_target_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the target table");
+}
+
+#[tokio::test]
+async fn the_large_table_plans_phase_1_also_refuses_an_unreplayable_constraint() {
+    // Same guard, the scripted path. `migration_plan_steps` cannot call
+    // `enable_partitioning`'s Rust check, so it carries its own phase-1
+    // `DO` block making the identical refusal.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS harvest_events_plan_check_958",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray constraint from a previous run");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_plan_check_958 \
+         CHECK (event_type <> '')",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator CHECK constraint");
+
+    let mut refusal: Option<String> = None;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 1)
+    {
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            refusal = Some(e.to_string());
+        }
+    }
+    let msg =
+        refusal.expect("phase 1 of the plan must refuse a constraint that is not carried forward");
+    assert!(
+        msg.contains("harvest_events_plan_check_958"),
+        "the refusal must name the offending constraint; got {msg}"
+    );
+
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT harvest_events_plan_check_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending constraint");
+}
+
+#[tokio::test]
+async fn an_unreplayable_constraint_refuses_the_revert_too() {
+    // The reverse direction: `disable_partitioning` renames the
+    // partitioned parent out of the way exactly as `enable` renames the
+    // flat table, so it is exactly as vulnerable.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS harvest_events_disable_check_958",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray constraint from a previous run");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_disable_check_958 \
+         CHECK (event_type <> '')",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator CHECK constraint on the partitioned parent");
+
+    let err = partition::disable_partitioning(&mut conn).await.expect_err(
+        "a CHECK constraint must refuse the revert, not silently stop applying after it",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_disable_check_958"),
+        "the refusal must name the offending constraint; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "p",
+        "a refused revert must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT harvest_events_disable_check_958",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("drop the offending constraint");
+}
+
+#[tokio::test]
+async fn an_impostor_reusing_harvests_own_foreign_key_name_still_refuses() {
+    // Review finding: name alone must not identify harvest's own foreign
+    // key. An operator's own foreign key could reuse the exact reserved
+    // name `harvest_events_workflow_exec_id_fkey`, on different columns
+    // or a different target, and pass unnoticed. Name-only matching
+    // would treat it as harvest-owned and silently drop it. That is the
+    // same gap the shape check closes for the primary key and unique
+    // constraint above.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP TABLE IF EXISTS harvest_events_impostor_fk_target_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray target table from a previous run");
+    diesel::sql_query(
+        "CREATE TABLE harvest_events_impostor_fk_target_958 (event_type TEXT PRIMARY KEY)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a foreign-key target table");
+    diesel::sql_query(
+        "INSERT INTO harvest_events_impostor_fk_target_958 (event_type) VALUES ('impostor_958')",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a matching target row");
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT harvest_events_workflow_exec_id_fkey",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("drop the real foreign key to make room for the impostor");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_workflow_exec_id_fkey \
+         FOREIGN KEY (event_type) REFERENCES harvest_events_impostor_fk_target_958(event_type)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an impostor reusing harvest's own conventional foreign-key name");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "an impostor reusing harvest's own foreign-key name but a different shape \
+             must still refuse -- name alone must not exempt it",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_workflow_exec_id_fkey"),
+        "the refusal must name the offending constraint; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT harvest_events_workflow_exec_id_fkey",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("drop the impostor constraint");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_workflow_exec_id_fkey \
+         FOREIGN KEY (workflow_exec_id) REFERENCES harvest_workflow_executions(id) \
+         ON DELETE CASCADE",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("restore harvest's own real foreign key for later tests");
+    diesel::sql_query("DROP TABLE harvest_events_impostor_fk_target_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the target table");
 }
 
 #[tokio::test]
@@ -5505,13 +5840,12 @@ async fn the_plan_survives_a_rename_target_collision_on_the_built_in_pkey() {
     .execute(&mut conn)
     .await
     .expect("clear any stray decoy from a previous run");
-    // A CHECK constraint, deliberately. A UNIQUE decoy without `cohort`
-    // would be refused by the unique-index preflight before conversion
-    // ever reaches the rename step. That would test that guard instead
-    // of this one.
+    // An EXCLUDE constraint, deliberately. See the sibling `enable_sql`
+    // test's identical comment: a UNIQUE or CHECK decoy is refused by an
+    // earlier preflight before conversion ever reaches the rename step.
     diesel::sql_query(
         "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_pkey__pre958 \
-         CHECK (event_type <> '')",
+         EXCLUDE USING gist (int8range(id, id, '[]') WITH &&)",
     )
     .execute(&mut conn)
     .await
@@ -5531,7 +5865,7 @@ async fn the_plan_survives_a_rename_target_collision_on_the_built_in_pkey() {
             &format!(
                 "SELECT EXISTS (SELECT 1 FROM pg_constraint \
                  WHERE conrelid = '{pkey}'::regclass \
-                 AND conname = 'harvest_events_pkey__pre958' AND contype = 'c') AS v"
+                 AND conname = 'harvest_events_pkey__pre958' AND contype = 'x') AS v"
             ),
         )
         .await,
