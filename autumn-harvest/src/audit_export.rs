@@ -715,6 +715,26 @@ pub const SHARD_ACQUIRE_BOUND: std::time::Duration = std::time::Duration::from_s
 /// own margin above normal-case latency.
 pub const ACK_QUERY_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Splits a reserve between the post-delivery checkout and the
+/// acknowledgement query. The split keeps their uncapped proportion
+/// (Codex review on PR #1520, follow-up P1).
+///
+/// The caller never passes a `reserve` above `SHARD_ACQUIRE_BOUND` plus
+/// `ACK_QUERY_BOUND`, only at or below it. So this only ever shrinks the
+/// two bounds together, never widens either one. A short lease can cap
+/// `reserve` well below their sum.
+///
+/// Using the fixed, uncapped bounds for each step regardless would let the
+/// checkout alone consume a reserve meant to cover both steps. The
+/// acknowledgement would then get no margin at all.
+fn split_reserve(reserve: std::time::Duration) -> (std::time::Duration, std::time::Duration) {
+    let total = SHARD_ACQUIRE_BOUND + ACK_QUERY_BOUND;
+    let checkout_nanos = reserve.as_nanos() * SHARD_ACQUIRE_BOUND.as_nanos() / total.as_nanos();
+    let checkout =
+        std::time::Duration::from_nanos(u64::try_from(checkout_nanos).unwrap_or(u64::MAX));
+    (checkout, reserve.saturating_sub(checkout))
+}
+
 /// Default lease held on a shard's cursor while a batch is in flight.
 ///
 /// Long enough to cover a slow sink, short enough that a crashed exporter's
@@ -2198,6 +2218,10 @@ pub async fn fire_due_audit_exports(
 
 /// Acquire one shard's connection, bounded, for the dedicated export task.
 ///
+/// `bound` is normally [`SHARD_ACQUIRE_BOUND`], but the post-delivery
+/// reacquire passes a narrower, lease-derived bound instead (Codex review
+/// on PR #1520, follow-up P1) — see [`split_reserve`].
+///
 /// A connection-acquisition failure or timeout is logged and marks the
 /// shard unobserved, then returns `None`. It is not a database error, so
 /// the caller never turns it into an `Err`.
@@ -2207,6 +2231,7 @@ async fn acquire_shard_conn_for_export(
     shard_id: i32,
     shard_u16: u16,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    bound: std::time::Duration,
 ) -> Option<
     deadpool::managed::Object<
         diesel_async::pooled_connection::AsyncDieselConnectionManager<
@@ -2215,7 +2240,7 @@ async fn acquire_shard_conn_for_export(
     >,
 > {
     // Bounded, never a bare `pool.get()` — see `SHARD_ACQUIRE_BOUND`.
-    match tokio::time::timeout(SHARD_ACQUIRE_BOUND, pool.get()).await {
+    match tokio::time::timeout(bound, pool.get()).await {
         Ok(Ok(conn)) => Some(conn),
         Ok(Err(error)) => {
             tracing::error!(
@@ -2229,7 +2254,7 @@ async fn acquire_shard_conn_for_export(
         Err(_elapsed) => {
             tracing::error!(
                 shard = shard_id,
-                bound = ?SHARD_ACQUIRE_BOUND,
+                bound = ?bound,
                 "[audit_export] timed out acquiring a connection for the export tick; \
                  skipping it for one cycle"
             );
@@ -2264,12 +2289,17 @@ async fn acquire_shard_conn_for_export(
 /// P1 and follow-up P2).
 ///
 /// The reserve covers the second checkout and the acknowledgement query it
-/// runs.
-/// Both steps are bounded, but bounded is not free. A successful delivery
-/// finishing right at `lease_until` would otherwise leave no time for
-/// either step. A fresher claim could then reclaim the shard. The cap
+/// runs. Both steps are bounded, but bounded is not free. A successful
+/// delivery finishing right at `lease_until` would otherwise leave no time
+/// for either step. A fresher claim could then reclaim the shard. The cap
 /// also keeps a configured lease as short as one second from losing its
 /// entire delivery window to a fixed reserve.
+///
+/// [`split_reserve`] splits that same reserve between the two steps, so a
+/// capped reserve shrinks both bounds together (Codex review on PR #1520,
+/// follow-up P1). Reacquiring under the fixed, uncapped `SHARD_ACQUIRE_BOUND`
+/// regardless of the cap could let the checkout alone consume a reserve
+/// meant to cover both steps.
 ///
 /// `cancel` races the delivery wait, never the claim or the acknowledgement
 /// (Codex review on PR #1520, follow-up P1). A shutdown mid-delivery
@@ -2282,9 +2312,13 @@ async fn acquire_shard_conn_for_export(
 /// snapshot to decide the registered liveness interval. A second, separate
 /// read inside this function could observe a runtime swap the caller's
 /// read missed. That would register this tick's own tolerance against a
-/// lease it is not actually using. `fence_against_sink_swap` still reads
-/// the global fresh, deliberately -- it exists specifically to detect a
-/// swap that lands mid-delivery, after this snapshot was taken.
+/// lease it is not actually using.
+///
+/// `fence_against_sink_swap` reads the global fresh, deliberately, and runs
+/// immediately before the acknowledgement write, not right after delivery
+/// (Codex review on PR #1520, follow-up P1). A swap could otherwise land
+/// during the reacquire wait between the two, after an earlier fence check
+/// but before a stale `Advance` outcome commits.
 ///
 /// Returns `Ok(0)` before any query when no sink is configured (AC8).
 ///
@@ -2307,7 +2341,9 @@ async fn export_once_via_pool(
     let config = config_arc.as_ref();
     let shard_u16 = u16::try_from(shard_id).unwrap_or(u16::MAX);
 
-    let Some(mut conn) = acquire_shard_conn_for_export(pool, shard_id, shard_u16, metrics).await
+    let Some(mut conn) =
+        acquire_shard_conn_for_export(pool, shard_id, shard_u16, metrics, SHARD_ACQUIRE_BOUND)
+            .await
     else {
         return Ok(0);
     };
@@ -2347,8 +2383,14 @@ async fn export_once_via_pool(
                 &config.backoff,
                 now,
             );
-            let Some(mut conn) =
-                acquire_shard_conn_for_export(pool, shard_id, shard_u16, metrics).await
+            let Some(mut conn) = acquire_shard_conn_for_export(
+                pool,
+                shard_id,
+                shard_u16,
+                metrics,
+                SHARD_ACQUIRE_BOUND,
+            )
+            .await
             else {
                 return Ok(0);
             };
@@ -2401,6 +2443,15 @@ async fn export_once_via_pool(
     let delivery_deadline = claim.lease_until
         - chrono::Duration::from_std(reserve).unwrap_or_else(|_| chrono::Duration::zero());
 
+    // The reserve is split between the reacquire below and the
+    // acknowledgement query that follows it (Codex review on PR #1520,
+    // follow-up P1). The split keeps their uncapped proportion. A capped
+    // `reserve` can be smaller than the fixed `SHARD_ACQUIRE_BOUND`.
+    // Reacquiring under that fixed bound regardless could let the checkout
+    // alone consume the whole capped reserve, leaving the acknowledgement
+    // no margin at all. See [`split_reserve`].
+    let (checkout_bound, ack_bound) = split_reserve(reserve);
+
     // No connection held during this await. A timeout is classified exactly
     // like any other transport failure: the cursor is held and the batch is
     // retried. Never a loss.
@@ -2426,6 +2477,24 @@ async fn export_once_via_pool(
             return Ok(0);
         }
     };
+    // Reacquired under `checkout_bound`, the reserve's own share for this
+    // step (Codex review on PR #1520, follow-up P1). The fixed
+    // `SHARD_ACQUIRE_BOUND` above is for the claim checkout only.
+    let Some(mut conn) =
+        acquire_shard_conn_for_export(pool, shard_id, shard_u16, metrics, checkout_bound).await
+    else {
+        // The batch was delivered (or the attempt failed) but the outcome
+        // cannot be recorded this tick. At-least-once: the next tick that
+        // can reach this shard re-claims and re-attempts, so nothing is
+        // silently lost either way.
+        return Ok(0);
+    };
+
+    // Fenced and classified here, immediately before the acknowledgement
+    // write below, not right after delivery (Codex review on PR #1520,
+    // follow-up P1). A sink swap landing during the reacquire wait just
+    // above must still be caught before a stale `Advance` outcome can
+    // commit. Fencing any earlier would miss exactly that swap.
     let attempt = fence_against_sink_swap(
         attempt,
         &config_arc,
@@ -2439,16 +2508,27 @@ async fn export_once_via_pool(
         Utc::now(),
     );
 
-    let Some(mut conn) = acquire_shard_conn_for_export(pool, shard_id, shard_u16, metrics).await
-    else {
-        // The batch was delivered (or the attempt failed) but the outcome
-        // cannot be recorded this tick. At-least-once: the next tick that
-        // can reach this shard re-claims and re-attempts, so nothing is
-        // silently lost either way.
-        return Ok(0);
+    // Bounded by `ack_bound`, the reserve's own share for this query
+    // (Codex review on PR #1520, follow-up P1). A timeout here is treated
+    // exactly like the failed-reacquire case above: the outcome cannot be
+    // recorded this tick, but nothing is lost.
+    let applied = match tokio::time::timeout(
+        ack_bound,
+        apply_outcome(&mut conn, shard_id, claim.claim_epoch, &outcome, Utc::now()),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_elapsed) => {
+            tracing::error!(
+                shard = shard_id,
+                bound = ?ack_bound,
+                "[audit_export] timed out acknowledging an export batch; the next tick \
+                 will redeliver it"
+            );
+            return Ok(0);
+        }
     };
-    let applied =
-        apply_outcome(&mut conn, shard_id, claim.claim_epoch, &outcome, Utc::now()).await?;
 
     let delivered = match &outcome {
         ExportOutcome::Advance { .. } if applied => {
@@ -3067,6 +3147,45 @@ mod tests {
         assert_eq!(
             AuditExportBuilderConfig::default().effective_lease(),
             DEFAULT_EXPORT_LEASE
+        );
+    }
+
+    // ── `split_reserve` shrinks both post-delivery bounds together ───────────
+    //
+    // Codex review on PR #1520, follow-up P1: a capped reserve must not let
+    // the checkout alone consume it, leaving the acknowledgement no margin.
+
+    #[test]
+    fn split_reserve_returns_the_fixed_bounds_at_the_uncapped_reserve() {
+        let (checkout, ack) = split_reserve(SHARD_ACQUIRE_BOUND + ACK_QUERY_BOUND);
+        assert_eq!(checkout, SHARD_ACQUIRE_BOUND);
+        assert_eq!(ack, ACK_QUERY_BOUND);
+    }
+
+    #[test]
+    fn split_reserve_shrinks_both_bounds_proportionally() {
+        let reserve = std::time::Duration::from_secs(1);
+        let (checkout, ack) = split_reserve(reserve);
+
+        assert_eq!(
+            checkout + ack,
+            reserve,
+            "the split must account for every reserved nanosecond"
+        );
+        assert_eq!(checkout, std::time::Duration::from_nanos(714_285_714));
+        assert_eq!(ack, std::time::Duration::from_nanos(285_714_286));
+        assert!(
+            checkout > ack,
+            "the 5:2 ratio between SHARD_ACQUIRE_BOUND and ACK_QUERY_BOUND must survive the \
+             split, or a request storm during the reacquire could still starve the query"
+        );
+    }
+
+    #[test]
+    fn split_reserve_of_zero_is_zero() {
+        assert_eq!(
+            split_reserve(std::time::Duration::ZERO),
+            (std::time::Duration::ZERO, std::time::Duration::ZERO)
         );
     }
 

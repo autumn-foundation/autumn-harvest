@@ -3139,17 +3139,17 @@ async fn the_delivery_deadline_reserves_time_for_the_acknowledgement() {
 /// at or before the claim itself. Every batch would then time out
 /// immediately, regardless of how fast the sink actually is.
 ///
-/// A two-second lease is well under the seven-second reserve. Without the
+/// A four-second lease is well under the seven-second reserve. Without the
 /// cap, this instant sink would still be classified as a timeout. With the
-/// cap, the delivery window shrinks, but stays positive, and the batch is
-/// delivered and acknowledged.
+/// cap, the delivery, checkout, and acknowledgement windows all shrink,
+/// but stay positive, and the batch is delivered and acknowledged.
 #[tokio::test]
 async fn a_short_lease_still_keeps_a_positive_delivery_window() {
     let _guard = TEST_SERIAL.lock().await;
     let sink = install_with_lease(
         Arc::new(RecordingSink::new(200)),
         100,
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(4),
     );
     let (mut conn, container) = make_conn().await;
     insert_audit_rows(&mut conn, 1).await;

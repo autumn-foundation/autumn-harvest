@@ -78,6 +78,20 @@ pipeline itself, so the fix is architectural: give export its own task.
   on a short lease immediately and backing off forever. The cap instead
   shrinks the delivery window and the reserve together on a short lease,
   so a short lease always keeps some genuine delivery time.
+- **The capped reserve is split proportionally between the reacquire and
+  the acknowledgement query** (follow-up P1): a capped reserve can already
+  be smaller than the fixed `SHARD_ACQUIRE_BOUND`. Reacquiring under that
+  fixed bound regardless could let the checkout alone consume the whole
+  capped reserve, leaving the acknowledgement query no margin even after
+  the cap. `split_reserve` shrinks both bounds together, in their uncapped
+  5:2 proportion, and the acknowledgement query is now itself bounded by
+  its share instead of running unbounded.
+- **The sink-swap fence now runs immediately before the acknowledgement
+  write, not right after delivery** (follow-up P1): fencing right after
+  delivery could not see a swap landing during the post-delivery reacquire
+  wait, so a stale `Advance` outcome from a since-replaced sink could still
+  commit. Fencing and classifying right before the write closes that
+  window down to the acknowledgement query itself.
 - **The `audit_export` Prometheus expression carries the same startup gate
   as `retention`** (follow-up P2): the series starts at zero at
   registration, so a fresh worker's still-in-flight first delivery could
@@ -115,9 +129,12 @@ pipeline itself, so the fix is architectural: give export its own task.
   `the_delivery_deadline_reserves_time_for_the_acknowledgement` (a
   still-blocked sink proves the effective delivery bound is well short of
   the raw lease), and `a_short_lease_still_keeps_a_positive_delivery_window`
-  (an instant sink still succeeds on a two-second lease, proving the cap
-  keeps the delivery window positive rather than losing it entirely to the
-  fixed reserve). `alert_pack_docs.rs` adds
+  (an instant sink still succeeds on a four-second lease, proving the cap
+  keeps every window positive rather than losing them entirely to the
+  fixed reserve). `split_reserve_returns_the_fixed_bounds_at_the_uncapped_reserve`,
+  `split_reserve_shrinks_both_bounds_proportionally`, and
+  `split_reserve_of_zero_is_zero` pin the split's arithmetic directly.
+  `alert_pack_docs.rs` adds
   `scanner_stalled_audit_export_expression_carries_the_same_startup_gate`,
   pinning the `audit_export` expression's startup gate the same way the
   existing test pins the retention expression's.

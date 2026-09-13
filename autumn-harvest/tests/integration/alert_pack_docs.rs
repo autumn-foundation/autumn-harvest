@@ -572,8 +572,8 @@ fn scanner_stalled_retention_expression_cannot_fire_during_the_startup_hour() {
 
 /// Codex review on PR #1520, follow-up P2: `audit_export` shares the same
 /// startup hazard as `retention`. Its series also starts at zero at
-/// registration, and its own first tick can legitimately still be in
-/// flight when Prometheus evaluates a partial `[10m]` window. A bare
+/// registration. Its own first tick can legitimately still be in flight
+/// when Prometheus evaluates a partial `[10m]` window. A bare
 /// `rate(...) == 0` would page through every healthy startup, exactly like
 /// the un-gated retention expression this pack already fixed.
 ///
@@ -606,9 +606,9 @@ fn scanner_stalled_audit_export_expression_carries_the_same_startup_gate() {
          the registration-time zero cannot page through a healthy startup: {audit_export}"
     );
 
-    // Same label-set hazard as the retention gate: the `and` side must be a
-    // function result, not a bare selector, or the match drops __name__ on
-    // one side only and the alert silently never fires.
+    // Same label-set hazard as the retention gate. The `and` side must be a
+    // function result, not a bare selector. Otherwise the match drops
+    // __name__ on one side only, and the alert silently never fires.
     let (_, gate) = audit_export
         .split_once(" and ")
         .expect("the audit_export expression must carry an `and` gate");
