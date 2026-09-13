@@ -285,8 +285,8 @@ pub enum PartitionCommand {
         ///
         /// Set this only when the subscriber runs the partitioned layout too.
         /// Without it, an operator who has done exactly that could use this
-        /// override on `enable` but not on the large-table plan — the only
-        /// path large deployments are told to use.
+        /// override on `enable`. They could not use it on the large-table
+        /// plan — the only path large deployments are told to use.
         #[arg(long = "allow-incompatible-publications")]
         allow_incompatible_publications: bool,
     },
