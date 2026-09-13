@@ -177,10 +177,11 @@ failed session instead of a reported one. Every other stop reason still
 requires whole blocks, `end_turn` most of all, because its report carries the
 answer.
 
-Two stop reasons are the daemon's own rather than the model's. `max_turns`
-means the turn budget ran out, and `transcript_full` means the conversation no
-longer fits one request. Both end the session with the work of the turns that
-did run, and neither reads as a finished answer.
+Three stop reasons are the daemon's own rather than the model's. `max_turns`
+means the turn budget ran out, `transcript_full` means the conversation no
+longer fits one request, and `batch_full` means one turn asked for more tool
+calls than a turn may run. All three end the session with the work that did
+run, and none reads as a finished answer.
 
 **The database lives outside the workspace.** The agent can write any path
 inside the workspace, and a write replaces its target. A database the agent can
@@ -368,6 +369,14 @@ Honest limits, so nothing here reads as a promise:
   call. It does not fail: the engine would answer a non-retryable
   `PayloadTooLarge`, which would discard a turn already billed and whose
   approved writes had already run.
+
+  One turn's batch is bounded by COUNT as well as by size, and the two bound
+  different things. A cheap call returns a small result, so many of them stay
+  under the size cap: the same 2 MiB admits 31 calls returning 64 KiB, and
+  25890 reads of an empty file. Each of those still costs a filesystem
+  operation and a durable event. A turn may therefore run at most 200 calls,
+  which is one for each entry a directory listing may return, and a turn that
+  reaches it ends with the stop reason `batch_full`.
 - **A recorded turn can cost twice its response.** The durable reply keeps the
   assistant blocks verbatim — that is what makes the next request replay-exact
   — and also the text and tool calls copied out of them, so a reply of text

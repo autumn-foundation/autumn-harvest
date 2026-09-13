@@ -11658,3 +11658,100 @@ fn the_offline_stub_is_not_refused_a_name_it_never_uses() {
         "and it records the stub, as it did before"
     );
 }
+
+/// One turn's batch is bounded by COUNT, and not by size alone.
+///
+/// The size bound does not bound the work. A cheap call returns a small
+/// result, so many of them pass it while each one touches the filesystem and
+/// records its own durable events.
+///
+/// Measured against the 2 MiB payload cap: a read of an EMPTY file serialises
+/// to 81 bytes, so 25890 such calls fit under it. The same cap admits 31 calls
+/// returning 64 KiB, which is all the size bound's own test covers.
+///
+/// The report names `batch_full` and not `transcript_full`. The transcript is
+/// not full, and a report naming it would send an operator to look for
+/// something that is not there.
+#[tokio::test]
+async fn one_turn_runs_no_more_calls_than_a_turn_may_run() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+
+    // EMPTY files, so every result is tiny and the size bound is never near.
+    let files: usize = session::MAX_TURN_CALLS + 50;
+    for index in 0..files {
+        std::fs::write(workspace.join(format!("empty-{index}.txt")), "")
+            .expect("the fixture is written");
+    }
+
+    let model = move |input: Value| -> Result<Value, String> {
+        let request: TurnRequest =
+            serde_json::from_value(input).map_err(|e| format!("bad request: {e}"))?;
+        let _ = &request;
+        let reads: Vec<Value> = (0..files)
+            .map(|index| {
+                json!({
+                    "type": "tool_use",
+                    "id": format!("toolu_read_{index}"),
+                    "name": tools::TOOL_READ_FILE,
+                    "input": { "path": format!("empty-{index}.txt") },
+                })
+            })
+            .collect();
+        let mut content = vec![json!({ "type": "text", "text": "reading everything" })];
+        content.extend(reads);
+        serde_json::to_value(session::TurnReply {
+            content: Value::Array(content),
+            stop_reason: claude::STOP_TOOL_USE.to_string(),
+            text: "reading everything".to_string(),
+            tool_calls: (0..files)
+                .map(|index| session::ToolCall {
+                    id: format!("toolu_read_{index}"),
+                    name: tools::TOOL_READ_FILE.to_string(),
+                    input: json!({ "path": format!("empty-{index}.txt") }),
+                })
+                .collect(),
+        })
+        .map_err(|e| format!("bad reply: {e}"))
+    };
+
+    let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
+    rt.register_workflow(&session::agent_session_info());
+    rt.register_activity(&session::claude_turn_info(), model);
+    rt.register_activity(
+        &session::run_tool_info(),
+        tools::activity_body(workspace.clone()),
+    );
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
+        .expect("the session starts");
+    let state = rt.run_until_blocked(exec).await.expect("the run advances");
+
+    // COMPLETED, and not FAILED. The work that ran is kept.
+    let RunState::Completed(output) = state else {
+        panic!("the session must end rather than fail: {state:?}");
+    };
+    let report: session::SessionReport = serde_json::from_value(output).expect("the report reads");
+    assert_eq!(
+        report.stop,
+        session::STOP_BATCH_FULL,
+        "the report must name the bound that was reached: {report:?}"
+    );
+    // The bound that was NOT reached must not be named.
+    assert_ne!(
+        report.stop,
+        session::STOP_TRANSCRIPT_FULL,
+        "the transcript is not full, so the report must not say it is"
+    );
+    assert_eq!(
+        report.tool_calls as usize,
+        session::MAX_TURN_CALLS,
+        "and it must run exactly the calls a turn may run"
+    );
+    assert!(
+        (report.tool_calls as usize) < files,
+        "which is fewer than the reply asked for"
+    );
+    assert_eq!(report.turns, 1, "one turn ran");
+}

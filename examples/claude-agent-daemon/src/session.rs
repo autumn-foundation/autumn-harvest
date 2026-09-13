@@ -50,6 +50,29 @@ pub const STOP_MAX_TOKENS: &str = "max_tokens";
 /// This one is the DAEMON's, like `max_turns`, and not the model's.
 pub const STOP_TRANSCRIPT_FULL: &str = "transcript_full";
 
+/// The stop reason of a session whose turn asked for too many tool calls.
+///
+/// This one is the DAEMON's too. It is separate from
+/// [`STOP_TRANSCRIPT_FULL`], because the cause is separate: that bound is
+/// reached by SIZE, and this one by COUNT. A report naming the wrong one
+/// would send an operator to look for a transcript that is not full.
+pub const STOP_BATCH_FULL: &str = "batch_full";
+
+/// How many tool calls one turn may run.
+///
+/// The byte bound alone does not bound the WORK. A cheap call returns a small
+/// result, so many of them stay under a size cap. Each one still touches the
+/// filesystem and records its own durable events. Measured against the 2 MiB
+/// payload cap: a `read_file` on an empty file serialises to 81 bytes, so
+/// 25890 such calls fit under it. The same cap admits 31 calls returning
+/// 64 KiB.
+///
+/// The number is DERIVED and not chosen. The largest batch this daemon's own
+/// tools can invite is one call for each entry of a directory listing. A
+/// listing is capped at [`tools::MAX_ENTRIES`]. A turn that asks for more than
+/// one call per listed entry is asking for more than its tools offered.
+pub const MAX_TURN_CALLS: usize = tools::MAX_ENTRIES;
+
 /// Would this request be refused as too large to record?
 ///
 /// The transcript rides in the activity input, so it grows with every turn
@@ -324,7 +347,13 @@ pub async fn agent_session(
         // own durable events. A reply that is itself within the reply cap
         // could therefore spend far more than one request may carry.
         //
-        // The bound is the results ALONE against the cap a request may carry.
+        // TWO bounds, because one reply can be too much in two ways. The
+        // results can be too LARGE, and the calls can be too MANY. A cheap
+        // call passes the size bound and still costs a filesystem operation
+        // and a durable event. A size bound alone therefore leaves the work
+        // unbounded. See [`MAX_TURN_CALLS`].
+        //
+        // The size bound is the results ALONE against the cap a request may carry.
         // That is conservative. Results over the cap cannot fit a request
         // whatever the transcript holds beside them. No batch that would have
         // fit is therefore stopped here. A batch that fits is still measured whole
@@ -351,6 +380,11 @@ pub async fn agent_session(
             results.push(block);
             if spent > autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES {
                 return Ok(report(&last_text, turn, tool_calls, STOP_TRANSCRIPT_FULL));
+            }
+            // The COUNT is bounded beside the size, because the two bound
+            // different things. See [`MAX_TURN_CALLS`].
+            if position + 1 >= MAX_TURN_CALLS {
+                return Ok(report(&last_text, turn, tool_calls, STOP_BATCH_FULL));
             }
         }
         messages.push(Message::user(Value::Array(results)));
