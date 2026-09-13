@@ -800,6 +800,27 @@ stayed blocked. Left at its fresh-`INSERT` default of
 the off-by-one gap the stamped value opened without changing what the
 test is actually verifying.
 
+A Codex review round on `f912e76` found a genuine P1 in the retired-cursor
+override this test exercises. `purge_old_audit_records` binds
+`export_may_be_live` (`protect_unexported_audit` OR'd with
+`is_configured()`) as `$2` for the outer "export may be live" gate, but
+the per-row pending check's own retired-cursor override bound a
+separate `$4` parameter holding only the raw `protect_unexported_audit`
+flag. A decommissioned shard's frozen cursor therefore stayed pending
+while an operator's explicit flag was set, but not while only a local
+sink being configured said the same thing -- reopening this PR's own
+bootstrap-window bug for that one combination: a sweep landing after a
+sink is installed but before `ensure_cursor_row`'s next tick un-retires
+the cursor could purge that shard's stamped-but-unacknowledged rows.
+The function's own doc comment already claimed both signals "override
+a retired cursor the same way," so this was a real gap between stated
+intent and what the SQL actually bound, not a new design question.
+Fixed by reusing `$2` (`export_may_be_live`) in place of the separate
+`$4` bind, dropping the now-redundant fourth parameter entirely.
+`retention_protects_a_shard_being_re_enabled_after_decommission_via_a_configured_sink_alone`
+mirrors the existing flag-only re-enablement test with the signal
+swapped, pinning the fix.
+
 **Zero migration, zero engine impact beyond the new parameter.** No new
 `WorkflowEvent` variant, no schema change, no change to any existing call
 site's behavior when the new flag is left at its default (disabled).

@@ -329,18 +329,23 @@ shard records:
 
   A shard still named in `colocated_shard_ids` — the default policy
   never excludes anyone — can also be decommissioned, and its retired
-  cursor's stale ack is ignored the same way, but only while
-  `protect_unexported_audit` is not itself protecting this pool group.
+  cursor's stale ack is ignored the same way, but only while neither
+  signal is itself protecting this pool group.
   `decommission_cursor`'s own guarantee is that retiring a cursor "is
   precisely what lets retention purge" that shard's rows; without this,
   a decommissioned shard's frozen ack would block a still-active
   colocated shard's rows forever, since a retired cursor row is never
-  deleted. Gating this on `protect_unexported_audit` preserves the
-  flag's guarantee for a shard mid-re-enablement: an operator who keeps
-  the flag protecting this group through a decommission-then-resume
-  transition still sees the re-enabling shard's retired cursor treated
-  as pending, exactly as before this change, until its next tick
-  un-retires it.
+  deleted. Gating this on the combined `export_may_be_live` value —
+  `protect_unexported_audit` OR'd with `is_configured()`, not the flag
+  alone — preserves both signals' guarantee for a shard
+  mid-re-enablement: an operator who keeps the flag protecting this
+  group through a decommission-then-resume transition, or simply has a
+  local sink installed again before the worker's next tick, still sees
+  the re-enabling shard's retired cursor treated as pending, exactly as
+  before this change, until its next tick un-retires it. An earlier
+  revision bound the raw flag alone here, leaving this same bootstrap
+  window open whenever only `is_configured()` was live (a Codex review
+  finding on this fix).
 
   Detection covers both ways a fleet builds a `ShardedDbPool`.
   `ShardedDbPool::from_map` can receive one cloned `Pool` under two shard

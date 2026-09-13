@@ -1688,14 +1688,23 @@ pub async fn purge_old_audit_records(
     // matches the middle disjunct's own notion of "who still counts".
     //
     // A retired cursor's own stale ack is ignored too, but only while
-    // `protect_unexported_audit` is not itself protecting this pool
-    // group (issue #1266). `decommission_cursor`'s own doc comment says
-    // retiring a cursor "is precisely what lets retention purge" that
-    // shard's rows. `harvest_audit_export_cursor` rows are retired,
-    // never deleted. Without this, a permanently decommissioned
-    // shard's frozen ack would block a still-active colocated shard's
-    // rows forever. Gating on `$4` preserves the flag's own guarantee
-    // for a shard mid-re-enablement. An operator who explicitly keeps
+    // neither signal is itself protecting this pool group (issue
+    // #1266). `decommission_cursor`'s own doc comment says retiring a
+    // cursor "is precisely what lets retention purge" that shard's
+    // rows. `harvest_audit_export_cursor` rows are retired, never
+    // deleted. Without this, a permanently decommissioned shard's
+    // frozen ack would block a still-active colocated shard's rows
+    // forever. Gating on `$2` matters here. That is the same
+    // `export_may_be_live` value bound above, not `protect_unexported_audit`
+    // alone. It matters for a shard mid-re-enablement while only
+    // `is_configured()` is live. A sweep can land after a local sink is
+    // installed but before `ensure_cursor_row`'s next tick un-retires the
+    // cursor. That shard's stamped-but-unacknowledged rows must still count
+    // as pending then, exactly as an operator's explicit
+    // `protect_unexported_audit` already makes them. Binding the raw flag
+    // alone here left that window open for `is_configured()` on its own.
+    // That is the same class of bug this whole guard exists to close. An
+    // operator who explicitly keeps
     // `protect_unexported_audit` protecting this group through a
     // decommission-then-resume transition still needs a re-enabling
     // shard's retired, not-yet-un-retired cursor treated as pending.
@@ -1724,7 +1733,7 @@ pub async fn purge_old_audit_records(
                         SELECT 1 FROM harvest_audit_export_cursor c \
                         WHERE c.shard_id = ANY($3::int4[]) \
                           AND a.export_seq > c.last_acked_seq \
-                          AND ($4::BOOLEAN OR c.retired_at IS NULL) \
+                          AND ($2::BOOLEAN OR c.retired_at IS NULL) \
                    ) \
                  ) \
            )",
@@ -1732,7 +1741,6 @@ pub async fn purge_old_audit_records(
     .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
     .bind::<diesel::sql_types::Bool, _>(export_may_be_live)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(colocated_shard_ids.to_vec())
-    .bind::<diesel::sql_types::Bool, _>(protect_unexported_audit)
     .execute(conn)
     .await
     .map_err(database_error)

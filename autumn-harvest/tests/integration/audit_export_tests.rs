@@ -2216,6 +2216,69 @@ async fn retention_protects_a_shard_being_re_enabled_after_decommission() {
     );
 }
 
+// The same re-enablement window, protected by `is_configured()` alone
+// rather than an explicit `protect_unexported_audit` (a Codex review
+// finding on this fix; issue #1266). `export_may_be_live` already
+// covers this combination for the outer "export may be live" gate. The
+// per-row pending check's retired-cursor override must agree. Otherwise a
+// sweep can land after a local sink is installed, but before the worker's
+// next tick un-retires the cursor. It would then purge a decommissioned
+// shard's stamped-but-unacknowledged rows anyway.
+#[tokio::test]
+async fn retention_protects_a_shard_being_re_enabled_after_decommission_via_a_configured_sink_alone()
+ {
+    let _guard = TEST_SERIAL.lock().await;
+    let _sink = install(Arc::new(RecordingSink::new(200)), 2);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 2).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    assert!(
+        autumn_harvest::audit_export::decommission_cursor(&mut conn, 0)
+            .await
+            .expect("decommission")
+    );
+
+    // The operator re-enables export by reinstalling a sink in THIS
+    // process, but the worker has not ticked this shard since: the
+    // cursor is still retired. New audit activity keeps happening
+    // regardless. `protect_unexported_audit` stays `false` throughout;
+    // only `is_configured()` says export may be live.
+    insert_audit_rows(&mut conn, 3).await;
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
+
+    assert!(autumn_harvest::audit_export::is_configured());
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0])
+        .await
+        .expect("purge runs");
+    uninstall();
+    assert_eq!(
+        deleted, 2,
+        "the two rows the exporter already acknowledged before \
+         decommission may still go; only the three new, unclaimed rows \
+         are is_configured()'s concern here"
+    );
+
+    let remaining: i64 = harvest_audit_log::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(
+        remaining, 3,
+        "the three rows written during re-enablement must survive: a \
+         configured sink alone, with no explicit \
+         protect_unexported_audit, must protect them while the shard's \
+         cursor is still retired from before, or re-enabling export \
+         would silently reopen the bootstrap window for this signal too"
+    );
+}
+
 // Issue #1266. A stamped row must count as
 // pending when its shard has no cursor row at all. This holds even though
 // its `export_seq` is already assigned. `ensure_cursor_row` rebuilds a
