@@ -1503,6 +1503,92 @@ async fn refuse_if_unique_index_without_cohort(
     )))
 }
 
+/// Operator-added constraint-backed unique indexes on the still-partitioned
+/// `harvest_events` parent that `capture_index_defs` cannot replay onto the
+/// flat table [`disable_partitioning`] rebuilds.
+///
+/// Review finding: [`unique_indexes_missing_cohort`] runs only from
+/// [`enable_partitioning`]'s preflight, against the still-flat table.
+/// `disable_partitioning` had no equivalent check at all. Take an
+/// operator's own compatible constraint-backed unique index --
+/// `UNIQUE (external_id, cohort)`, say. It silently disappears the same
+/// way on the way back. `capture_index_defs` excludes every
+/// constraint-backed index unconditionally, and no replay step recreates
+/// any constraint but harvest's own two.
+///
+/// The "missing `cohort`" half of that sibling check does not apply here.
+/// Postgres itself already requires the partition key in every unique
+/// index on a partitioned table. Every candidate this query could find
+/// already carries it. What still needs excluding is harvest's own two
+/// constraints. Both are shaped one column wider here than on the flat
+/// layout. The partitioned parent's own primary key and unique
+/// constraint always carry `cohort` too.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] if the catalog query fails.
+#[cfg(feature = "db")]
+pub async fn constraint_backed_unique_indexes_on_partitioned_parent(
+    conn: &mut AsyncPgConnection,
+) -> HarvestResult<Vec<String>> {
+    let rows = diesel::sql_query(
+        "SELECT DISTINCT i.indexrelid::regclass::text AS v
+           FROM pg_index i
+           JOIN pg_class c ON c.oid = i.indrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
+            AND i.indisunique
+            AND EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)
+            AND NOT EXISTS (
+                SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid
+                  AND NOT con.condeferrable
+                  AND (
+                      (con.conname = 'harvest_events_pkey' AND con.contype = 'p'
+                       AND (SELECT array_agg(a.attname::text ORDER BY k)
+                              FROM generate_series(0, i.indnkeyatts - 1) k
+                              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
+                           ) = ARRAY['id', 'cohort'])
+                      OR
+                      (con.conname = 'harvest_events_workflow_exec_id_event_id_key' AND con.contype = 'u'
+                       AND (SELECT array_agg(a.attname::text ORDER BY k)
+                              FROM generate_series(0, i.indnkeyatts - 1) k
+                              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
+                           ) = ARRAY['workflow_exec_id', 'event_id', 'cohort'])
+                  )
+            )
+          ORDER BY 1",
+    )
+    .load::<TextRow>(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows.into_iter().map(|r| r.v).collect())
+}
+
+/// The refusal [`disable_partitioning`] makes, both before its transaction
+/// opens and again once it holds the revert lock.
+#[cfg(feature = "db")]
+async fn refuse_if_constraint_backed_unique_index_on_revert(
+    conn: &mut AsyncPgConnection,
+) -> HarvestResult<()> {
+    let bad = constraint_backed_unique_indexes_on_partitioned_parent(conn).await?;
+    if bad.is_empty() {
+        return Ok(());
+    }
+    Err(HarvestError::Config(format!(
+        "refusing to revert harvest_events: {} backed by a table constraint other than \
+         harvest's own PRIMARY KEY and (workflow_exec_id, event_id) UNIQUE constraint ({}). \
+         The conversion has no way to replay an arbitrary constraint, so it would otherwise \
+         be dropped silently. Drop the constraint (and recreate it on the flat table \
+         yourself afterward, if it is still needed) to proceed.",
+        if bad.len() == 1 {
+            "it carries a unique index"
+        } else {
+            "it carries unique indexes"
+        },
+        bad.join(", ")
+    )))
+}
+
 /// Views, including materialized views, that depend on `harvest_events` or
 /// on one of its leaf partitions.
 ///
@@ -1578,8 +1664,8 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
     )))
 }
 
-/// Operator-installed `CHECK` and foreign-key constraints on `harvest_events`
-/// or on one of its leaf partitions.
+/// Operator-installed `CHECK`, foreign-key and exclusion constraints on
+/// `harvest_events` or on one of its leaf partitions.
 ///
 /// Harvest itself creates exactly one foreign key on `harvest_events` --
 /// `harvest_events_workflow_exec_id_fkey`, `(workflow_exec_id)` referencing
@@ -1608,13 +1694,20 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
 /// Every other constraint this query finds is an operator's own.
 ///
 /// **Why this blocks the conversion.** `CREATE TABLE ... (LIKE ...)`
-/// carries neither a `CHECK` nor a foreign key, and both conversion
-/// directions build the replacement relation that way. A `CHECK` or
-/// foreign-key invariant an operator added would silently stop applying to
-/// every row appended after cutover, with nothing reporting the loss.
-/// Recreating it automatically is not offered: a foreign key's target
-/// table, and a `CHECK` expression's intended semantics, are not this
-/// module's to guess.
+/// carries none of the three, and both conversion directions build the
+/// replacement relation that way. A `CHECK`, foreign-key or exclusion
+/// invariant an operator added would silently stop applying to every row
+/// appended after cutover, with nothing reporting the loss. Recreating it
+/// automatically is not offered. A foreign key's target table, a `CHECK`
+/// expression's intended semantics, and an exclusion constraint's operator
+/// class and predicate are not this module's to guess.
+///
+/// Review finding: an exclusion constraint is index-backed like a unique
+/// or primary-key constraint, but `indisunique` is false for one, so
+/// [`refuse_if_unique_index_without_cohort`] never sees it. It is exactly
+/// as unreplayable as a `CHECK` or foreign key, though: `capture_index_defs`
+/// excludes every constraint-backed index unconditionally, this one
+/// included.
 ///
 /// Unique and primary-key constraints are deliberately excluded here: every
 /// one is backed by an index, so [`refuse_if_unique_index_without_cohort`]
@@ -1655,7 +1748,7 @@ pub async fn unreplayable_constraints(conn: &mut AsyncPgConnection) -> HarvestRe
                      WHERE parent.relname = 'harvest_events' AND pn.nspname = current_schema()
                 )
             )
-            AND con.contype IN ('c', 'f')
+            AND con.contype IN ('c', 'f', 'x')
             AND NOT (
                 con.conname = 'harvest_events_workflow_exec_id_fkey'
                 AND con.contype = 'f'
@@ -1706,10 +1799,10 @@ async fn refuse_if_unreplayable_constraints(
     }
     Err(HarvestError::Config(format!(
         "refusing to {verb} harvest_events: {} not carried by CREATE TABLE ... (LIKE ...) ({}). \
-         An operator CHECK or foreign-key constraint would stop applying to every row appended \
-         after cutover, while still existing on the relation this leaves behind. Drop the \
-         constraint (and recreate it against harvest_events afterward, if it is still needed) \
-         to proceed.",
+         An operator CHECK, foreign-key or exclusion constraint would stop applying to every \
+         row appended after cutover, while still existing on the relation this leaves behind. \
+         Drop the constraint (and recreate it against harvest_events afterward, if it is still \
+         needed) to proceed.",
         if constraints.len() == 1 {
             "a constraint is"
         } else {
@@ -2218,7 +2311,7 @@ recreate it including `cohort` yourself, then re-run.', bad_idx;
       JOIN pg_class c ON c.oid = con.conrelid
       JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE c.relname = '{LEGACY_PARTITION}' AND n.nspname = current_schema()
-       AND con.contype IN ('c', 'f')
+       AND con.contype IN ('c', 'f', 'x')
        AND NOT (
            con.conname = 'harvest_events_workflow_exec_id_fkey'
            AND con.contype = 'f'
@@ -2867,11 +2960,18 @@ pub async fn disable_partitioning(
     // carry stays on the partitioned parent being reclaimed, not the flat
     // table `disable` builds in its place.
     refuse_if_operator_triggers(conn, "revert").await?;
-    // Same reason once more. A CHECK or foreign-key constraint `CREATE
-    // TABLE ... (LIKE ...)` did not carry stays on the partitioned parent
-    // being reclaimed. It does not follow to the flat table `disable`
-    // builds in its place.
+    // Same reason once more. A CHECK, foreign-key or exclusion constraint
+    // `CREATE TABLE ... (LIKE ...)` did not carry stays on the partitioned
+    // parent being reclaimed. It does not follow to the flat table
+    // `disable` builds in its place.
     refuse_if_unreplayable_constraints(conn, "revert").await?;
+    // Same reason as `enable_partitioning`'s own check, the reverse
+    // direction. An operator's own constraint-backed unique index is
+    // shaped one column wider here than on the flat layout. The
+    // partitioned parent's own constraints always carry `cohort` too.
+    // It is excluded from `capture_index_defs` unconditionally all the
+    // same, and nothing else replays it.
+    refuse_if_constraint_backed_unique_index_on_revert(conn).await?;
     let report = Box::pin(
         conn.transaction::<DisableReport, HarvestError, _>(async |conn| {
             // Review finding: the dependent-view and operator-trigger checks
@@ -2938,9 +3038,10 @@ pub async fn disable_partitioning(
             }
             // Review finding: the view, trigger and row-security rechecks
             // above closed the identical preflight-to-lock gap for a
-            // CHECK or foreign-key constraint too. Same reason as
-            // `refuse_if_unreplayable_constraints` above, under the same
-            // lock this revert holds for the rest of the transaction.
+            // CHECK, foreign-key or exclusion constraint too. Same reason
+            // as `refuse_if_unreplayable_constraints` above, under the
+            // same lock this revert holds for the rest of the
+            // transaction.
             let constraints = unreplayable_constraints(conn).await?;
             if !constraints.is_empty() {
                 return Err(HarvestError::Config(format!(
@@ -2955,6 +3056,26 @@ pub async fn disable_partitioning(
                         "constraints are"
                     },
                     constraints.join(", ")
+                )));
+            }
+            // Same reason again: an operator's own constraint-backed
+            // unique index, added in that identical gap, is excluded from
+            // `capture_index_defs` below unconditionally either way.
+            let bad_unique = constraint_backed_unique_indexes_on_partitioned_parent(conn).await?;
+            if !bad_unique.is_empty() {
+                return Err(HarvestError::Config(format!(
+                    "refusing to revert harvest_events: {} backed by a table constraint \
+                     other than harvest's own PRIMARY KEY and (workflow_exec_id, event_id) \
+                     UNIQUE constraint ({}), added after the preflight check ran but before \
+                     this transaction's ACCESS EXCLUSIVE lock. Drop the constraint (and \
+                     recreate it on the flat table afterward, if it is still needed), then \
+                     re-run.",
+                    if bad_unique.len() == 1 {
+                        "it carries a unique index"
+                    } else {
+                        "it carries unique indexes"
+                    },
+                    bad_unique.join(", ")
                 )));
             }
 
@@ -4763,9 +4884,10 @@ fn operator_triggers_guard_sql(tag: &str) -> String {
     )
 }
 
-/// A `DO` block refusing when a `CHECK` or foreign-key constraint sits on
-/// `harvest_events` or on one of its leaf partitions. Tagged with `tag`, so
-/// it can appear more than once in the same generated script.
+/// A `DO` block refusing when a `CHECK`, foreign-key or exclusion
+/// constraint sits on `harvest_events` or on one of its leaf partitions.
+/// Tagged with `tag`, so it can appear more than once in the same
+/// generated script.
 ///
 /// Mirrors [`unreplayable_constraints`]'s query exactly. Primary-key and
 /// unique constraints are excluded, since every one is backed by an
@@ -4799,7 +4921,7 @@ fn unreplayable_constraints_guard_sql(tag: &str) -> String {
          WHERE parent.relname = 'harvest_events' AND pn.nspname = current_schema()\n           \
          )\n       \
          )\n       \
-         AND con.contype IN ('c', 'f')\n       \
+         AND con.contype IN ('c', 'f', 'x')\n       \
          AND NOT (\n           \
          con.conname = 'harvest_events_workflow_exec_id_fkey'\n           \
          AND con.contype = 'f'\n           \
@@ -4832,8 +4954,8 @@ fn unreplayable_constraints_guard_sql(tag: &str) -> String {
          );\n    \
          IF bad IS NOT NULL THEN\n        \
          RAISE EXCEPTION 'harvest #958: constraint(s) on harvest_events not carried by \
-         CREATE TABLE ... (LIKE ...) (%). An operator CHECK or foreign-key constraint \
-         would stop applying to every row appended after cutover, while still existing \
+         CREATE TABLE ... (LIKE ...) (%). An operator CHECK, foreign-key or exclusion \
+         constraint would stop applying to every row appended after cutover, while still existing \
          on the relation this leaves behind. Drop the constraint (and recreate it \
          against harvest_events afterward, if it is still needed) before running this \
          plan.', bad;\n    \

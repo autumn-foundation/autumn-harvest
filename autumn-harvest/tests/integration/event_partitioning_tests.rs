@@ -785,6 +785,59 @@ async fn a_compatible_constraint_backed_unique_index_still_refuses() {
 }
 
 #[tokio::test]
+async fn a_compatible_constraint_backed_unique_index_still_refuses_the_revert() {
+    // Review finding: `disable_partitioning` had no check at all for an
+    // operator's own constraint-backed unique index on the still-
+    // partitioned parent. `capture_index_defs` excludes every
+    // constraint-backed index unconditionally. That is true on the way
+    // back exactly as on the way in. Only harvest's own two are ever
+    // recreated on the flat table `disable` rebuilds. The operator's own
+    // otherwise-compatible constraint -- carrying `cohort`, as Postgres itself
+    // requires here -- was silently dropped.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS uq_revert_compatible_958",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray constraint from a previous run");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT uq_revert_compatible_958 \
+         UNIQUE (event_type, cohort)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator's own constraint-backed unique index on the partitioned parent");
+
+    let err = partition::disable_partitioning(&mut conn).await.expect_err(
+        "a compatible constraint-backed unique index must still refuse the revert \
+             -- there is no support for replaying it, so succeeding would silently \
+             drop it",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("uq_revert_compatible_958"),
+        "the refusal must name the offending index; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "p",
+        "a refused revert must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT uq_revert_compatible_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending constraint");
+}
+
+#[tokio::test]
 async fn the_large_table_plans_phase_1_also_refuses_a_compatible_constraint_backed_index() {
     // Same guard, the scripted path.
     let (url, _c) = setup_db().await;
@@ -959,44 +1012,23 @@ async fn a_deferrable_impostor_of_harvests_own_constraint_still_refuses() {
 }
 
 #[tokio::test]
-async fn enable_survives_a_rename_target_collision_on_the_built_in_pkey() {
-    // Review finding: the bounded-rename loop discards the actual name
-    // `bounded_rename_fn` returns and a later step drops a hard-coded
-    // `harvest_events_pkey__pre958` instead. That guess is right only
-    // when the disambiguation candidate was free. An operator's own
-    // constraint already bearing that exact conventional name forces
-    // `bounded_rename_fn` to disambiguate the real renamed pkey to
-    // `harvest_events_pkey_1__pre958` instead. The hard-coded DROP then
-    // removes the OPERATOR's constraint, leaving the real old primary
-    // key in place. `ATTACH PARTITION` later fails with more than one
-    // primary key on the leaf.
+async fn enable_refuses_over_an_exclusion_constraint_at_the_rename_target_name() {
+    // History: this test originally proved the bounded-rename loop's
+    // disambiguation. It used an EXCLUDE constraint at the exact rename
+    // target name as a decoy that survived every other guard. Adding
+    // exclusion constraints to `unreplayable_constraints` closed that
+    // last gap -- see "Reject exclusion constraints before replacing the
+    // table". Every `pg_constraint` type an operator could put at this
+    // name is now refused before the rename step runs at all. The
+    // disambiguation bug this test exercised can no longer be reached in
+    // practice. What is left to prove: an exclusion constraint must
+    // still refuse. That holds even for one that already carries the
+    // conventional rename suffix, rather than being silently treated as
+    // a leftover to ignore.
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
 
-    let exec = insert_execution(
-        &mut conn,
-        "pkey_collide_wf",
-        "pkey-collide-1",
-        day(2026, 2, 3),
-        None,
-    )
-    .await;
-    autumn_harvest::store::append_events(
-        &mut conn,
-        ExecutionId::from_uuid(exec),
-        &sample_events(),
-        0,
-    )
-    .await
-    .expect("seed a populated table");
-
-    // The decoy: an operator's own constraint occupying the exact name
-    // `bounded_rename_fn` would otherwise pick for the real pkey. Its name
-    // already ends in the rename suffix. The rename loop's own
-    // `right(conname, ...) <> suffix` filter therefore leaves it
-    // untouched, exactly like a genuine leftover from an unrelated prior
-    // run would.
     diesel::sql_query(
         "ALTER TABLE harvest_events DROP CONSTRAINT \
          IF EXISTS harvest_events_pkey__pre958",
@@ -1004,70 +1036,35 @@ async fn enable_survives_a_rename_target_collision_on_the_built_in_pkey() {
     .execute(&mut conn)
     .await
     .expect("clear any stray decoy from a previous run");
-    // An EXCLUDE constraint, deliberately. A UNIQUE decoy (with or
-    // without `cohort`) is refused by `refuse_if_unique_index_without_cohort`.
-    // A CHECK decoy is refused by `refuse_if_unreplayable_constraints`.
-    // Both would trip before conversion ever reaches the rename step,
-    // testing one of those guards instead of this one. A singleton-range
-    // exclusion on `id` is a real `pg_constraint` row neither guard
-    // inspects, and it never actually excludes anything since `id` is
-    // already unique.
     diesel::sql_query(
         "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_pkey__pre958 \
          EXCLUDE USING gist (int8range(id, id, '[]') WITH &&)",
     )
     .execute(&mut conn)
     .await
-    .expect("seed the decoy occupying the rename target");
+    .expect("seed an exclusion constraint at the reserved rename-target name");
 
-    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
         .await
-        .expect(
-            "enable must survive a rename-target collision on the built-in pkey, \
-             not attach a leaf still carrying two primary keys",
+        .expect_err(
+            "an exclusion constraint must refuse the conversion, not be silently \
+             carried past the rename step",
         );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_pkey__pre958"),
+        "the refusal must name the offending constraint; got {msg}"
+    );
     assert_eq!(
         events_relkind(&mut conn).await,
-        "p",
-        "the conversion must succeed despite the collision"
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
     );
 
-    let pkey = partition::LEGACY_PARTITION;
-    assert!(
-        scalar_bool(
-            &mut conn,
-            &format!(
-                "SELECT EXISTS (SELECT 1 FROM pg_constraint \
-                 WHERE conrelid = '{pkey}'::regclass \
-                 AND conname = 'harvest_events_pkey__pre958' AND contype = 'x') AS v"
-            ),
-        )
-        .await,
-        "the operator's own decoy constraint must survive untouched -- it is not \
-         harvest's to drop"
-    );
-    // Postgres itself gives the leaf its OWN primary key mirroring the
-    // parent's (id, cohort) shape the moment `ATTACH PARTITION` succeeds.
-    // It auto-names that `{pkey}_pkey` by its own convention, not by
-    // anything this engine names explicitly. A leftover primary key is
-    // not what the bug left behind; the disambiguated rename target the
-    // old hard-coded DROP never looked for is. Prove THAT is gone, under
-    // whatever name `bounded_rename_fn` actually returned for it.
-    assert!(
-        !scalar_bool(
-            &mut conn,
-            &format!(
-                "SELECT EXISTS (SELECT 1 FROM pg_constraint \
-                 WHERE conrelid = '{pkey}'::regclass \
-                 AND conname LIKE 'harvest_events_pkey%__pre958' \
-                 AND conname <> 'harvest_events_pkey__pre958') AS v"
-            ),
-        )
-        .await,
-        "the disambiguated rename target for the real primary key must have been \
-         dropped, not left behind under a name the old hard-coded guess never \
-         looked for"
-    );
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT harvest_events_pkey__pre958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending constraint");
 }
 
 #[tokio::test]
@@ -2584,6 +2581,54 @@ async fn a_foreign_key_constraint_refuses_the_conversion_too() {
         .execute(&mut conn)
         .await
         .expect("drop the target table");
+}
+
+#[tokio::test]
+async fn an_exclusion_constraint_refuses_the_conversion_too() {
+    // Same gap, the third constraint kind `unreplayable_constraints`
+    // covers. An exclusion constraint is index-backed like a unique or
+    // primary-key constraint, but `indisunique` is false for one, so
+    // `refuse_if_unique_index_without_cohort` never sees it.
+    // `capture_index_defs` excludes it from replay unconditionally all
+    // the same, exactly as it does a CHECK or foreign key's backing
+    // index.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS excl_event_type_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray constraint from a previous run");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT excl_event_type_958 \
+         EXCLUDE USING gist (int8range(id, id, '[]') WITH &&)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator exclusion constraint");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "an exclusion constraint not carried by CREATE TABLE ... (LIKE ...) must \
+             refuse the conversion, not silently stop applying after it",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("excl_event_type_958"),
+        "the refusal must name the offending constraint; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT excl_event_type_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending constraint");
 }
 
 #[tokio::test]
@@ -5981,35 +6026,18 @@ async fn run_plan_phases(conn: &mut AsyncPgConnection, phases: std::ops::RangeIn
 }
 
 #[tokio::test]
-async fn the_plan_survives_a_rename_target_collision_on_the_built_in_pkey() {
-    // Review finding: the scripted plan's phase-4 rename loop had the
-    // identical gap enable_sql's did. See
-    // `enable_survives_a_rename_target_collision_on_the_built_in_pkey`.
-    // A later step dropped a hard-coded `harvest_events_pkey__pre958`
-    // rather than the name `bounded_rename_fn` actually returned. An
-    // operator's own constraint occupying that exact name then made the
-    // hard-coded DROP remove the wrong object, leaving the real old
-    // primary key behind.
+async fn the_plan_refuses_over_an_exclusion_constraint_at_the_rename_target_name() {
+    // History: see the sibling `enable_sql` test's identical comment.
+    // Adding exclusion constraints to `unreplayable_constraints` closed
+    // the last gap that let any `pg_constraint` type survive to the
+    // rename step. The disambiguation bug this test originally exercised
+    // can no longer be reached in practice. What is left to prove: the
+    // scripted plan's own phase-1 constraint guard refuses an exclusion
+    // constraint even when it already carries the conventional rename
+    // suffix.
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
-
-    let exec = insert_execution(
-        &mut conn,
-        "plan_pkey_collide_wf",
-        "plan-pkey-collide-1",
-        day(2026, 2, 3),
-        None,
-    )
-    .await;
-    autumn_harvest::store::append_events(
-        &mut conn,
-        ExecutionId::from_uuid(exec),
-        &sample_events(),
-        0,
-    )
-    .await
-    .expect("seed a populated table");
 
     diesel::sql_query(
         "ALTER TABLE harvest_events DROP CONSTRAINT \
@@ -6018,57 +6046,36 @@ async fn the_plan_survives_a_rename_target_collision_on_the_built_in_pkey() {
     .execute(&mut conn)
     .await
     .expect("clear any stray decoy from a previous run");
-    // An EXCLUDE constraint, deliberately. See the sibling `enable_sql`
-    // test's identical comment: a UNIQUE or CHECK decoy is refused by an
-    // earlier preflight before conversion ever reaches the rename step.
     diesel::sql_query(
         "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_pkey__pre958 \
          EXCLUDE USING gist (int8range(id, id, '[]') WITH &&)",
     )
     .execute(&mut conn)
     .await
-    .expect("seed the decoy occupying the rename target");
+    .expect("seed an exclusion constraint at the reserved rename-target name");
 
-    run_plan_phases(&mut conn, 1..=4).await;
+    let mut refusal: Option<String> = None;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 1)
+    {
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            refusal = Some(e.to_string());
+        }
+    }
+    let msg = refusal.expect(
+        "phase 1 must refuse an exclusion constraint at the reserved rename-target \
+         name, not silently carry it past the rename step",
+    );
+    assert!(
+        msg.contains("harvest_events_pkey__pre958"),
+        "the refusal must name the offending constraint; got {msg}"
+    );
 
-    assert_eq!(
-        events_relkind(&mut conn).await,
-        "p",
-        "the conversion must succeed despite the collision"
-    );
-    let pkey = partition::LEGACY_PARTITION;
-    assert!(
-        scalar_bool(
-            &mut conn,
-            &format!(
-                "SELECT EXISTS (SELECT 1 FROM pg_constraint \
-                 WHERE conrelid = '{pkey}'::regclass \
-                 AND conname = 'harvest_events_pkey__pre958' AND contype = 'x') AS v"
-            ),
-        )
-        .await,
-        "the operator's own decoy constraint must survive untouched"
-    );
-    // See the sibling `enable_sql` test's comment. `ATTACH PARTITION`
-    // itself gives the leaf its own primary key mirroring the parent's
-    // shape, so asserting none exists is the wrong invariant. The bug
-    // this proves fixed is the disambiguated rename target going
-    // undropped.
-    assert!(
-        !scalar_bool(
-            &mut conn,
-            &format!(
-                "SELECT EXISTS (SELECT 1 FROM pg_constraint \
-                 WHERE conrelid = '{pkey}'::regclass \
-                 AND conname LIKE 'harvest_events_pkey%__pre958' \
-                 AND conname <> 'harvest_events_pkey__pre958') AS v"
-            ),
-        )
-        .await,
-        "the disambiguated rename target for the real primary key must have been \
-         dropped, not left behind under a name the old hard-coded guess never \
-         looked for"
-    );
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT harvest_events_pkey__pre958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending constraint");
 }
 
 #[tokio::test]
