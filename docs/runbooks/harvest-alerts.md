@@ -1873,13 +1873,17 @@ own work counters and its `tracing::error!`, not this heartbeat.
    the metric (step 2) to find which replica went quiet, then run the check
    there.
 2. With Prometheus, find the replica:
-   `rate(harvest_scanner_tick_total{scanner!="retention"}[5m])` — the wedged
-   loop reads `0` on the affected `instance` while its siblings and the other
-   replicas keep incrementing. Deliberately **not** `sum by (scanner)`: every
-   replica runs its own copy of all eight loops, so summing lets a healthy
-   replica mask a wedged one. Use a wider window for `retention`
-   (`increase(harvest_scanner_tick_total{scanner="retention"}[3h])`), which
-   polls hourly by default.
+   `rate(harvest_scanner_tick_total{scanner!="retention",scanner!="audit_export"}[5m])`
+   — the wedged loop reads `0` on the affected `instance` while its siblings
+   and the other replicas keep incrementing. Deliberately **not** `sum by
+   (scanner)`: every replica runs its own copy of all eight loops, so
+   summing lets a healthy replica mask a wedged one. Use a wider window for
+   `retention` (`increase(harvest_scanner_tick_total{scanner="retention"}[3h])`),
+   which polls hourly by default, and for `audit_export`
+   (`rate(harvest_scanner_tick_total{scanner="audit_export"}[10m])`), whose
+   per-tick duration follows the configured `audit_export_lease` rather
+   than the poll interval — a healthy delivery can legitimately flat-line
+   the 5m query without being wedged.
 3. Read the worker process logs around the time the series flat-lined. A
    panicked loop leaves a panic backtrace; a stalled one leaves nothing at all,
    which is itself diagnostic.

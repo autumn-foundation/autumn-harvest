@@ -2250,6 +2250,15 @@ async fn acquire_shard_conn_for_export(
 /// next attempt to redeliver. It never blocks the caller's shutdown for up
 /// to the full lease.
 ///
+/// `config_arc` is a snapshot the caller already read, not re-read here
+/// (Codex review on PR #1520, follow-up P2). The caller uses that same
+/// snapshot to decide the registered liveness interval. A second, separate
+/// read inside this function could observe a runtime swap the caller's
+/// read missed. That would register this tick's own tolerance against a
+/// lease it is not actually using. `fence_against_sink_swap` still reads
+/// the global fresh, deliberately -- it exists specifically to detect a
+/// swap that lands mid-delivery, after this snapshot was taken.
+///
 /// Returns `Ok(0)` before any query when no sink is configured (AC8).
 ///
 /// # Errors
@@ -2263,8 +2272,9 @@ async fn export_once_via_pool(
     shard_id: i32,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     cancel: &tokio_util::sync::CancellationToken,
+    config_arc: Option<std::sync::Arc<AuditExportRuntimeConfig>>,
 ) -> crate::error::HarvestResult<usize> {
-    let Some(config_arc) = read_global_audit_export_config() else {
+    let Some(config_arc) = config_arc else {
         return Ok(0);
     };
     let config = config_arc.as_ref();
@@ -2507,6 +2517,14 @@ pub fn spawn_audit_export_checker_for_shard(
                 () = tokio::time::sleep(interval) => {}
             }
 
+            // Read the config ONCE. Use this same snapshot for both the
+            // registration decision below and the tick itself (Codex review
+            // on PR #1520, follow-up P2). Two independent reads could
+            // observe different configs across a mid-tick runtime swap,
+            // registering this tick's tolerance against a lease it is not
+            // actually using.
+            let config_snapshot = read_global_audit_export_config();
+
             // The registered threshold must track the CURRENTLY configured
             // lease, not just the one in effect at spawn time (Codex review
             // on PR #1520 P2). A second runtime can publish a longer lease
@@ -2514,7 +2532,8 @@ pub fn spawn_audit_export_checker_for_shard(
             // A stale, too-tight threshold would misclassify a healthy
             // delivery under the new lease as `Stale` or `Wedged`. Cheap to
             // check every tick; only re-registers on an actual change.
-            let desired_interval = read_global_audit_export_config()
+            let desired_interval = config_snapshot
+                .as_ref()
                 .map_or(interval, |config| interval.max(config.lease));
             if desired_interval != registered_interval {
                 crate::scanner_health::deregister_scanner(owner);
@@ -2527,8 +2546,14 @@ pub fn spawn_audit_export_checker_for_shard(
                 registered_interval = desired_interval;
             }
 
-            if let Err(error) =
-                export_once_via_pool(&pool, shard_id, &*telemetry.metrics, &cancel).await
+            if let Err(error) = export_once_via_pool(
+                &pool,
+                shard_id,
+                &*telemetry.metrics,
+                &cancel,
+                config_snapshot,
+            )
+            .await
             {
                 tracing::error!(
                     shard = shard_id,
