@@ -75,16 +75,29 @@ if [ -z "$params" ]; then
   exit 1
 fi
 
-if ! grep -q ',' <<<"$params"; then
+# A leading `(` means the whole parameter list is one tuple-destructured
+# argument (e.g. `|(_ctx, order): (&MessageCtx, OrderPlaced)|`), which
+# implements `Fn((&MessageCtx, OrderPlaced))` -- a single tuple parameter --
+# not the required `Fn(&MessageCtx, OrderPlaced)`. Flagged in PR #1523
+# review: a bare comma count treats this as two arguments because a tuple
+# pattern's internal comma still counts, so it passed despite being the
+# same wrong arity as the untyped and typed single-argument cases above.
+trimmed_params="$(sed -E 's/^[[:space:]]+//' <<<"$params")"
+
+if [ -z "$trimmed_params" ] || ! grep -q ',' <<<"$trimmed_params" \
+  || [ "${trimmed_params:0:1}" = "(" ]; then
   echo "$doc: the cutover example's .map_json(...) closure takes a single" \
-    "argument (\"$params\") -- the typed body only, with no message-context" \
-    "parameter. SourceBinding::map_json requires Fn(&MessageCtx, T) ->" \
-    "Result<MappedMessage, E>, so this closure has the wrong arity and" \
-    "does not type-check." >&2
+    "argument (\"$params\") -- either the typed body alone, or both" \
+    "parameters destructured together as one tuple pattern. Either way it" \
+    "implements Fn(T) or Fn((&MessageCtx, T)), not the" \
+    "Fn(&MessageCtx, T) -> Result<MappedMessage, E> that SourceBinding::" \
+    "map_json requires, so this closure has the wrong arity and does not" \
+    "type-check." >&2
   echo >&2
-  echo "Fix: take the message context too, e.g. |_ctx, order: OrderPlaced|," \
-    "and return a MappedMessage (see the chapter's other .map_json" \
-    "examples, or MappedMessage::new)." >&2
+  echo "Fix: take the message context and the typed body as two separate" \
+    "closure parameters, e.g. |_ctx, order: OrderPlaced|, and return a" \
+    "MappedMessage (see the chapter's other .map_json examples, or" \
+    "MappedMessage::new)." >&2
   exit 1
 fi
 
