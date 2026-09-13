@@ -1050,6 +1050,28 @@ pub async fn ensure_partitions(
     lookahead_cohorts: u32,
     lock_timeout: Duration,
 ) -> HarvestResult<(Vec<String>, Vec<String>)> {
+    ensure_partitions_inner(conn, now, lookahead_cohorts, lock_timeout, None).await
+}
+
+/// Same as [`ensure_partitions`], but calls `progress` once per cohort this
+/// loop attempts.
+///
+/// Review finding: with `lookahead_cohorts` configured high and a long
+/// reader blocking every attempt, this loop can spend
+/// `lookahead_cohorts × lock_timeout` sequentially. That is long enough on
+/// its own to cross the liveness scanner's staleness threshold.
+/// `maintain_inner` uses this entry point, alongside the same pattern
+/// already used by [`drain_default_bounded_inner`] and [`sweep_inner`]. No
+/// phase of a maintenance pass then runs unbounded stretches with zero
+/// proof of life.
+#[cfg(feature = "db")]
+async fn ensure_partitions_inner(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+    lookahead_cohorts: u32,
+    lock_timeout: Duration,
+    mut progress: Option<&mut (dyn FnMut() + Send)>,
+) -> HarvestResult<(Vec<String>, Vec<String>)> {
     let width = match detect_layout(conn).await? {
         EventLayout::Unpartitioned => return Ok((Vec::new(), Vec::new())),
         EventLayout::Partitioned { cohort_width_secs } => cohort_width_secs,
@@ -1062,6 +1084,9 @@ pub async fn ensure_partitions(
             break;
         };
         attempted += 1;
+        if let Some(cb) = &mut progress {
+            cb();
+        }
         match ensure_cohort_with_width(conn, at, width, lock_timeout).await {
             Ok((name, true)) => created.push(name),
             Ok((_, false)) => {}
@@ -4017,8 +4042,14 @@ async fn maintain_inner(
         Ok(n) => (n, None),
         Err(e) => (0, Some(e.to_string())),
     };
-    let (created, lookahead_blocked) =
-        ensure_partitions(conn, now, lookahead_cohorts, sweep_opts.lock_timeout).await?;
+    let (created, lookahead_blocked) = ensure_partitions_inner(
+        conn,
+        now,
+        lookahead_cohorts,
+        sweep_opts.lock_timeout,
+        reborrow_progress(progress),
+    )
+    .await?;
     let sweep = sweep_inner(
         conn,
         now,

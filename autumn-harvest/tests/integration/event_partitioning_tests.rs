@@ -7134,8 +7134,14 @@ async fn maintain_with_progress_ticks_once_per_partition_the_sweep_attempts() {
     // `maintain_with_progress` exists so a caller can tick once per
     // partition the sweep step attempts instead. Four closed cohorts,
     // each pinned by its own still-existing execution, are all blocked.
-    // The sweep step still evaluates every one of them, so the callback
-    // must fire four times.
+    // The sweep step still evaluates every one of them, so it contributes
+    // four ticks.
+    //
+    // `lookahead_cohorts: 0` still makes `ensure_partitions` attempt one
+    // cohort (the current one). That loop now ticks too -- see the review
+    // finding on the lookahead window, alongside `sweep_inner` and
+    // `drain_default_bounded_inner`'s own ticks in `maintain_inner`. So the
+    // total here is five: one from ensure_partitions, four from the sweep.
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
@@ -7176,9 +7182,11 @@ async fn maintain_with_progress_ticks_once_per_partition_the_sweep_attempts() {
          got {outcome:?}"
     );
     assert_eq!(
-        ticks, 4,
+        ticks, 5,
         "the progress callback must fire once per partition the sweep step \
-         attempts, not once for the whole shard; got {ticks} ticks for {outcome:?}"
+         attempts (four, all blocked) plus once for ensure_partitions's own \
+         cohort attempt, not once for the whole shard; got {ticks} ticks for \
+         {outcome:?}"
     );
 }
 
@@ -7263,6 +7271,61 @@ async fn maintain_with_progress_ticks_during_the_default_partition_drain_too() {
         "the drain step must also tick -- not leave every tick to the sweep \
          step. Got {ticks} total ticks but only {sweep_ticks} partitions for \
          the sweep step to evaluate; outcome: {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn maintain_with_progress_ticks_while_extending_the_lookahead_window() {
+    // Review finding: `ensure_partitions`'s per-cohort loop received no
+    // progress callback at all. With `lookahead_cohorts` configured high
+    // and every attempt waiting out the lock timeout, that loop alone can
+    // spend `lookahead_cohorts * lock_timeout`. That is long enough to
+    // cross the scanner's staleness threshold with zero ticks in between,
+    // unlike the drain and sweep steps around it.
+    //
+    // The table starts empty and freshly enabled. There is nothing for the
+    // drain step to move and no closed cohort for the sweep step to
+    // evaluate, so both contribute zero ticks here. Every tick this pass
+    // records must therefore come from `ensure_partitions`, one per cohort
+    // it attempts: `lookahead_cohorts + 1` (the loop runs `0..=lookahead_
+    // cohorts` inclusive).
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    let lookahead_cohorts = 5;
+    let mut ticks = 0usize;
+    let outcome = partition::maintain_with_progress(
+        &mut conn,
+        Utc::now(),
+        lookahead_cohorts,
+        &SweepOptions::default(),
+        None,
+        &mut || ticks += 1,
+    )
+    .await
+    .expect("maintain_with_progress");
+
+    assert_eq!(
+        outcome.drained, 0,
+        "precondition: an empty DEFAULT partition has nothing to drain; \
+         got {outcome:?}"
+    );
+    assert_eq!(
+        outcome.sweep.blocked.len() + outcome.sweep.dropped.len(),
+        0,
+        "precondition: a freshly enabled table has no closed cohort for the \
+         sweep step to evaluate; got {outcome:?}"
+    );
+    assert_eq!(
+        ticks,
+        lookahead_cohorts as usize + 1,
+        "the progress callback must fire once per cohort ensure_partitions \
+         attempts, not once for the whole shard; got {ticks} ticks for \
+         {outcome:?}"
     );
 }
 
