@@ -796,7 +796,10 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("POST /admin/audit-export/redrive", RouteClass::Mutating),
     // Retires or reactivates a shard's audit-export cursor (issue #1273):
     // mutating, audited.
-    ("POST /admin/audit-export/decommission", RouteClass::Mutating),
+    (
+        "POST /admin/audit-export/decommission",
+        RouteClass::Mutating,
+    ),
     ("POST /admin/audit-export/reactivate", RouteClass::Mutating),
     // Calendar + completion-trigger CRUD. No dedicated audit op constant yet
     // (audit wiring is out of scope for #776); disposition is EXCLUDED_ROUTES.
@@ -1618,6 +1621,22 @@ pub async fn list_audit(
 /// shard it is scanning). Should two ever coexist, `EXISTS` errs toward
 /// retaining, never deleting.
 ///
+/// **A cursor row, once it exists, is authoritative over `is_configured()`**
+/// (issue #1273). The two signals above are not simply OR'd. `is_configured()`
+/// only stands in for a cursor row when NO row exists yet, the bootstrap
+/// window this function's doc already covers. Once a row exists, its own
+/// `retired_at` decides, full stop.
+///
+/// Earlier this made no practical difference:
+/// [`crate::audit_export::ensure_cursor_row`] used to un-retire a cursor on
+/// its very next scanner tick, so a retirement rarely outlived one tick.
+/// Issue #1273 made retirement durable, and that is exactly what surfaced
+/// this. With the old OR'd predicate, decommissioning a shard released
+/// nothing here as long as *any* shard in the process still had a sink
+/// configured. That is the ordinary fleet steady state. It silently broke the
+/// documented "retiring is what lets retention purge them" contract this
+/// module and `crate::audit_export::decommission_cursor_locked` both state.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] if the delete fails.
@@ -1635,10 +1654,13 @@ pub async fn purge_old_audit_records(
          WHERE a.occurred_at < $1 \
            AND NOT ( \
                  ( \
-                   $2::BOOLEAN \
-                   OR EXISTS ( \
+                   EXISTS ( \
                         SELECT 1 FROM harvest_audit_export_cursor \
                         WHERE retired_at IS NULL \
+                   ) \
+                   OR ( \
+                     $2::BOOLEAN \
+                     AND NOT EXISTS (SELECT 1 FROM harvest_audit_export_cursor) \
                    ) \
                  ) \
                  AND ( \

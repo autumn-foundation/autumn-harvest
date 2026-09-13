@@ -2051,6 +2051,55 @@ async fn retention_resumes_only_after_the_cursor_is_decommissioned() {
     );
 }
 
+// A decommissioned shard's own `retired_at` must be authoritative over the
+// process-wide `is_configured()` signal (issue #1273). The test above always
+// ran with the sink uninstalled, so it could not catch a guard that OR'd the
+// two signals together. A process commonly runs many shards' pools, so
+// export can stay configured there even after one shard retires. An OR'd
+// guard would keep protecting that shard's own unexported backlog forever.
+// That contradicts `decommission_cursor_locked`'s own documented promise
+// that retiring "is what lets retention purge them".
+#[tokio::test]
+async fn decommission_releases_its_shards_backlog_even_while_export_stays_configured_elsewhere() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _sink = install(Arc::new(RecordingSink::new(200)), 2);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 5).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    assert_eq!(cursor_acked(&mut conn, 0).await, 2);
+
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+        .await
+        .expect("decommission");
+
+    // Unlike `retention_resumes_only_after_the_cursor_is_decommissioned`, the
+    // sink stays installed: `is_configured()` reads `true` at purge time,
+    // standing in for a process still exporting other shards in the fleet.
+    assert!(
+        autumn_harvest::audit_export::is_configured(),
+        "this stands in for the rest of the fleet still exporting"
+    );
+
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
+
+    let deleted = purge_old_audit_records(&mut conn, 90)
+        .await
+        .expect("purge runs");
+    uninstall();
+    assert_eq!(
+        deleted, 5,
+        "the shard's own retirement must release its backlog regardless of \
+         whether a sink is configured for the rest of the fleet -- an \
+         operator who retired this shard is owed that purge"
+    );
+}
+
 #[tokio::test]
 async fn every_tick_refreshes_the_exporter_heartbeat() {
     let _guard = TEST_SERIAL.lock().await;
@@ -2605,6 +2654,100 @@ async fn a_reactivate_and_its_audit_record_land_together_on_the_target_shard() {
     assert_eq!(rows, 1, "a reactivate must leave exactly one audit row");
 }
 
+// A decommission (or reactivate) whose audit insert fails must leave the
+// cursor untouched. This mirrors `a_failed_audit_write_rolls_the_rewind_back`:
+// an applied-but-unaudited privileged mutation is exactly what the single
+// transaction exists to make unrepresentable.
+
+#[tokio::test]
+async fn a_failed_audit_write_rolls_the_decommission_back() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 1).await;
+    ensure_cursor_row(&mut conn, 0).await.expect("cursor");
+
+    use diesel_async::AsyncConnection as _;
+    let result = Box::pin(
+        conn.transaction::<(), autumn_harvest::error::HarvestError, _>(async |conn| {
+            autumn_harvest::audit_export::decommission_cursor_locked(conn, 0, chrono::Utc::now())
+                .await?;
+            // A NULL `operation` violates the table's NOT NULL, standing in
+            // for any reason the audit write could fail.
+            diesel::sql_query(
+                "INSERT INTO harvest_audit_log (actor, operation, target_type, \
+                 route_or_command, status, source) \
+                 VALUES ('alice', NULL, 'audit_export', 'POST /x', 'succeeded', 'api')",
+            )
+            .execute(conn)
+            .await
+            .map_err(autumn_harvest::error::database_error)?;
+            Ok(())
+        }),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "the audit insert must fail this transaction"
+    );
+    let status = export_status(&mut conn, 0, chrono::Utc::now())
+        .await
+        .expect("status")
+        .expect("row");
+    assert_ne!(
+        status.delivery_state, "RETIRED",
+        "the decommission must roll back with its audit write: a cursor \
+         retired with no trail is exactly what the single transaction \
+         prevents"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_audit_write_rolls_the_reactivate_back() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 1).await;
+    ensure_cursor_row(&mut conn, 0).await.expect("cursor");
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+        .await
+        .expect("decommission");
+
+    use diesel_async::AsyncConnection as _;
+    let result = Box::pin(
+        conn.transaction::<(), autumn_harvest::error::HarvestError, _>(async |conn| {
+            autumn_harvest::audit_export::reactivate_cursor_locked(conn, 0, chrono::Utc::now())
+                .await?;
+            diesel::sql_query(
+                "INSERT INTO harvest_audit_log (actor, operation, target_type, \
+                 route_or_command, status, source) \
+                 VALUES ('alice', NULL, 'audit_export', 'POST /x', 'succeeded', 'api')",
+            )
+            .execute(conn)
+            .await
+            .map_err(autumn_harvest::error::database_error)?;
+            Ok(())
+        }),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "the audit insert must fail this transaction"
+    );
+    let status = export_status(&mut conn, 0, chrono::Utc::now())
+        .await
+        .expect("status")
+        .expect("row");
+    assert_eq!(
+        status.delivery_state, "RETIRED",
+        "the reactivate must roll back with its audit write: a cursor \
+         reactivated with no trail is exactly what the single transaction \
+         prevents"
+    );
+}
+
 #[tokio::test]
 async fn decommissioning_a_shard_that_never_exported_reports_not_configured() {
     let _guard = TEST_SERIAL.lock().await;
@@ -2666,6 +2809,69 @@ async fn reactivating_a_shard_that_never_exported_reports_not_configured() {
             .await
             .expect("reactivate"),
         ReactivateOutcome::NotConfigured
+    );
+}
+
+// `reactivate_cursor_locked` bumps `claim_epoch`, same as decommission does.
+// No claim can be outstanding on a retired row today. So this is a defensive
+// bump for a future change, not a live hazard.
+//
+// But a delivery claimed BEFORE the decommission is exactly such an
+// outstanding claim. This test pins that its stale epoch is still fenced
+// out after a decommission-then-reactivate cycle, not just after the
+// decommission alone (which
+// `retiring_a_cursor_invalidates_a_delivery_already_in_flight` covers).
+#[tokio::test]
+async fn a_reactivate_does_not_reopen_a_claim_fenced_by_the_prior_decommission() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 3).await;
+    ensure_cursor_row(&mut conn, 0).await.expect("cursor");
+
+    // An exporter claims the shard and is mid-delivery.
+    let claim = claim_shard(
+        &mut conn,
+        0,
+        100,
+        std::time::Duration::from_secs(60),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("claim")
+    .expect("claimable");
+    assert_eq!(claim.records.len(), 3);
+
+    // The operator retires the cursor while that delivery is outstanding,
+    // then reactivates it -- both bump the epoch.
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+        .await
+        .expect("decommission");
+    autumn_harvest::audit_export::reactivate_cursor(&mut conn, 0, chrono::Utc::now())
+        .await
+        .expect("reactivate");
+
+    // The stale in-flight attempt now reports success against its epoch from
+    // before either transition.
+    apply_outcome(
+        &mut conn,
+        0,
+        claim.claim_epoch,
+        &ExportOutcome::Advance {
+            through_seq: 3,
+            status: 200,
+        },
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("apply is not an error, it simply matches nothing");
+
+    assert_eq!(
+        cursor_acked(&mut conn, 0).await,
+        0,
+        "a delivery claimed before the decommission must not move the \
+         cursor after a reactivate either: reactivating does not reopen a \
+         claim two lifecycle transitions have already fenced out"
     );
 }
 

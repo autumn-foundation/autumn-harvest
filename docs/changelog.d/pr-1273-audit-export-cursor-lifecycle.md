@@ -31,6 +31,31 @@ what gets recorded were never written down.
   the only way back from `RETIRED` to live, resuming from the preserved
   `last_assigned_seq` exactly as before, just as an explicit, audited
   operator action instead of an inferred one.
+- **Bonus fix, surfaced by finding 1's own fix: `purge_old_audit_records`'s
+  retention guard now treats a shard's own `retired_at` as authoritative.**
+  Its guard used to OR a shard's live-cursor check together with the
+  process-wide `is_configured()` flag, so decommissioning one shard released
+  nothing as long as *any* shard in the process still had a sink configured
+  — the ordinary fleet steady state. This made no practical difference
+  before finding 1's fix, since `ensure_cursor_row` un-retired a cursor on
+  the very next tick anyway; making retirement durable is what surfaced it.
+  `is_configured()` now only stands in for a cursor row when none exists
+  yet (the bootstrap window); once a row exists, its own `retired_at`
+  decides. See `decommission_releases_its_shards_backlog_even_while_export_stays_configured_elsewhere`.
+- **Second bonus fix, from automated review of this PR: the decommission
+  route no longer traps its own audit record in the stream it just
+  retired.** `POST /admin/audit-export/decommission`'s atomic audit row
+  lands on the target shard's own connection (needed for atomicity with the
+  mutation), but that shard's exporter is exactly what the call just
+  stopped — combined with the retention fix above, that record could
+  eventually be deleted from that shard's own database with no trace
+  anywhere, defeating finding 2's whole purpose. A genuine retirement now
+  also writes a second, best-effort audit record on the default shard,
+  which keeps exporting. Skipped when the target already IS the default
+  shard. Not yet covered by an automated test: this codebase has no
+  plugin-level HTTP integration test for the audit-export admin routes at
+  all (the pre-existing redrive route has the same gap), and a real test
+  needs a multi-shard harness this sandbox could not run against Docker.
 - **No migration.** `retired_at` and `claim_epoch` already existed on
   `harvest_audit_export_cursor`; the fix is a predicate on an existing
   `ON CONFLICT` statement plus two new locked-transaction functions
@@ -44,7 +69,11 @@ what gets recorded were never written down.
   `a_decommission_and_its_audit_record_land_together_on_the_target_shard`
   and its reactivate counterpart pin finding 2; idempotency
   (`AlreadyRetired`/`AlreadyActive`) and unconfigured-shard cases are
-  covered separately. Two existing tests that relied on the old implicit
-  reactivation (`a_recreated_cursor_continues_the_sequence_it_left_off_at`,
+  covered separately, along with atomicity (`a_failed_audit_write_rolls_the_decommission_back`
+  and its reactivate counterpart) and the epoch-fencing interaction across a
+  decommission-then-reactivate cycle
+  (`a_reactivate_does_not_reopen_a_claim_fenced_by_the_prior_decommission`).
+  Two existing tests that relied on the old implicit reactivation
+  (`a_recreated_cursor_continues_the_sequence_it_left_off_at`,
   `the_sequence_survives_a_decommission_that_purges_every_stamped_row`) were
   updated to call the new explicit `reactivate_cursor`.

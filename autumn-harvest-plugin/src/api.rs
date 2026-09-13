@@ -36,10 +36,10 @@ use autumn_harvest::audit::{
     self, AuditFilters, CLASSIFIED_ROUTES, HEADER_ACTOR, HEADER_IDEMPOTENCY_KEY, HEADER_REQUEST_ID,
     HEADER_SOURCE, OP_ACTIVITY_FAIL_NOW, OP_ACTIVITY_PAUSE, OP_ACTIVITY_RESUME,
     OP_ACTIVITY_RETRY_NOW, OP_AUDIT_EXPORT_DECOMMISSION, OP_AUDIT_EXPORT_REACTIVATE,
-    OP_AUDIT_EXPORT_REDRIVE, OP_BATCH_SUBMIT, OP_BUILD_COMPAT_DECLARE,
-    OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR, OP_BUILD_RAMP_SET,
-    OP_CALLBACK_REDRIVE, OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY,
-    OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
+    OP_AUDIT_EXPORT_REDRIVE, OP_BATCH_SUBMIT, OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE,
+    OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR, OP_BUILD_RAMP_SET, OP_CALLBACK_REDRIVE,
+    OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER,
+    OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
     OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
     OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ, OP_QUEUE_PAUSE,
     OP_QUEUE_RESUME, OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR, OP_RATE_LIMIT_PACING_OVERRIDE_SET,
@@ -37504,6 +37504,16 @@ struct AuditExportShardRequest {
 /// A shard already retired, or never configured, changes nothing but is
 /// still audited. An auditor needs the record of the request, not only of
 /// requests that had an effect.
+///
+/// **A genuine retirement also writes a second, best-effort audit record on
+/// the default shard** (Codex review, issue #1273 P1). The atomic record
+/// above lands on the shard whose own exporter this call just stopped. It
+/// can never reach the SIEM, and once the shard is retired its backlog is no
+/// longer purge-protected either. An unexportable record is not durable
+/// proof of anything. The default shard keeps exporting, so its copy is what
+/// actually closes the compliance gap this route exists to close. Skipped
+/// when the target already IS the default shard, where a second copy would
+/// land in the same retired stream as the first.
 #[allow(clippy::too_many_lines)] // one mutation + its bound audit write
 async fn audit_export_decommission_handler(
     headers: axum::http::HeaderMap,
@@ -37616,6 +37626,59 @@ async fn audit_export_decommission_handler(
             return AutumnError::service_unavailable_msg(error).into_response();
         }
     };
+
+    // A genuine retirement stops the TARGET shard's own exporter. Every other
+    // shard-local route (redrive, reactivate) can rely on the shard it wrote
+    // to still picking its own audit row up. This one cannot (Codex review,
+    // issue #1273 P1: "keep the decommission event outside the retired
+    // stream").
+    //
+    // Worse, once retired the shard's own backlog is no longer
+    // purge-protected either (see `crate::audit::purge_old_audit_records`).
+    // So the atomic record above is not just unexportable. It can eventually
+    // be deleted with no trace anywhere.
+    //
+    // A best-effort duplicate on the default shard, which keeps exporting,
+    // is what actually lets this event reach the SIEM. Skipped when the
+    // target IS the default shard: both copies would land in the same
+    // now-retired stream, so a second write buys nothing.
+    if outcome == ::autumn_harvest::audit_export::DecommissionOutcome::Retired
+        && ::autumn_harvest::types::ShardId::new(request.shard) != pool.default_shard()
+    {
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_AUDIT_EXPORT_DECOMMISSION,
+            target_type: TARGET_AUDIT_EXPORT,
+            target_id: Some(target_label.as_str()),
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status: STATUS_SUCCEEDED,
+            error_summary: Some("exportable copy: the target shard's own exporter is now retired"),
+            shard_id: Some(request.shard),
+            source: &source,
+        };
+        match acquire_conn(pool.default_pool()).await {
+            Ok(mut conn) => {
+                if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
+                    tracing::error!(
+                        error = %e,
+                        "failed to write the exportable copy of audit_export.decommission \
+                         on the default shard; the retirement is still recorded, \
+                         unexportably, on the target shard"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "could not reach the default shard to write the exportable copy of \
+                     audit_export.decommission; the retirement is still recorded, \
+                     unexportably, on the target shard"
+                );
+            }
+        }
+    }
 
     match outcome {
         ::autumn_harvest::audit_export::DecommissionOutcome::Retired => (

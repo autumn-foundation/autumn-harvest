@@ -235,16 +235,25 @@ shipped, even one past the retention window. A sweep that removed an unexported
 row would be a silent compliance gap — gone from the database *and* absent from
 the SIEM, with nothing anywhere to show it was lost.
 
-The guard applies when **either** signal says an exporter still owes this
-shard records:
+The guard applies when either signal says an exporter still owes this shard
+records — but the two are not simply OR'd. **A shard's own cursor row, once
+it exists, is authoritative**, retired or not:
 
-- **A cursor row exists for the shard.** Durable, shared state, so it works when
-  retention and export run in **different processes** — a split web/worker
-  deployment where only the worker configures the sink would otherwise have the
-  web app's retention sweep delete rows the worker still owes.
-- **A sink is configured in the sweeping process.** Covers the window before the
-  exporter's first tick on a shard has created the cursor row at all (freshly
-  enabled, newly added to the fleet, or a shard whose pool has been failing).
+- **A live (non-retired) cursor row exists for the shard.** Durable, shared
+  state, so it works when retention and export run in **different
+  processes** — a split web/worker deployment where only the worker
+  configures the sink would otherwise have the web app's retention sweep
+  delete rows the worker still owes.
+- **No cursor row exists yet, and a sink is configured in the sweeping
+  process.** Covers the window before the exporter's first tick on a shard
+  has created the cursor row at all (freshly enabled, newly added to the
+  fleet, or a shard whose pool has been failing).
+
+A **retired** cursor row falls into neither case, so it protects nothing —
+regardless of whether a sink happens to be configured for the rest of the
+fleet (issue #1273). That is what makes decommissioning a shard actually
+free its own backlog: the shard's own `retired_at` decides, not the
+process-wide "is any sink configured anywhere" signal.
 
 The guard is deliberately **not** time-based. An earlier revision expired it 24
 hours after the exporter's last heartbeat, so a long worker outage lifted it. A
@@ -280,6 +289,13 @@ applied-but-unaudited retirement is not representable. A shard already
 retired, or never configured, changes nothing but is still audited — the
 answer to "who asked to give up this compliance window" cannot depend on
 whether the request happened to be the first one.
+
+A genuine retirement additionally writes a second, best-effort audit record
+on the default shard. The primary record above lands on the shard whose own
+exporter this call just stopped — it can never reach the SIEM, and once that
+shard is retired its backlog is no longer purge-protected either, so an
+unexportable local record is not durable proof of anything. The default
+shard keeps exporting, so its copy is what actually gets this event off-box.
 
 Stopping the exporter alone does **not** restore purging — the guard keys on
 the cursor row, not on the sweeping process's sink configuration, which is what
