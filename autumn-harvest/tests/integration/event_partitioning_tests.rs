@@ -2395,6 +2395,58 @@ async fn a_sweep_bounds_blocked_evaluations_too_not_only_drops() {
 }
 
 #[tokio::test]
+async fn exhausting_the_budget_on_the_last_eligible_partition_is_not_truncated() {
+    // Review finding on item 1: the budget check ran at the TOP of the
+    // loop, before the cheap eligibility filters (DEFAULT, still open,
+    // unbounded). A pass that spent its last attempt on the final CLOSED
+    // partition would still mark `truncated` on its next iteration. That
+    // held even when every remaining partition in the list is DEFAULT or
+    // still open. Those are cheap skips that were never going to cost
+    // budget anyway. So this reports "ran out of budget" for a pass that
+    // in fact finished.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // One past, empty cohort partition: the single real candidate. Every
+    // OTHER partition in the list -- `enable`'s own lookahead cohorts and
+    // DEFAULT -- covers today or later. `upper > now` (or `is_default`)
+    // skips them for free. `max_attempts: 1` exactly exhausts the budget
+    // on the one real candidate.
+    let (past_partition, _) =
+        partition::ensure_cohort(&mut conn, Utc::now() - chrono::Duration::days(5))
+            .await
+            .expect("materialize a past, empty cohort partition");
+
+    let outcome = partition::sweep(
+        &mut conn,
+        Utc::now(),
+        &SweepOptions {
+            max_drops: 10,
+            max_attempts: 1,
+            ..SweepOptions::default()
+        },
+    )
+    .await
+    .expect("sweep");
+
+    assert!(
+        outcome.dropped.contains(&past_partition),
+        "the one real candidate, the empty past cohort, must still be \
+         dropped within budget; got {outcome:?}"
+    );
+    assert!(
+        !outcome.truncated,
+        "nothing else in the list was ever going to cost budget (DEFAULT \
+         and every still-open cohort are free skips), so this pass must \
+         not report truncated; got {outcome:?}"
+    );
+}
+
+#[tokio::test]
 async fn the_straggler_delete_bounds_its_own_statement_timeout() {
     // Issue #1270 item 2: `delete_orphan_rows` ran with no
     // `statement_timeout` of its own. A straggler execution can pin a

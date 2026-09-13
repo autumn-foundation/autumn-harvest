@@ -1194,9 +1194,11 @@ async fn refuse_if_row_security(conn: &mut AsyncPgConnection, verb: &str) -> Har
 }
 
 /// User-defined unique indexes on `harvest_events` that do not include
-/// `cohort`, and are not backed by a table constraint. Those are handled
-/// separately: the enable script's own `PRIMARY KEY` and
-/// `workflow_exec_id_event_id_key` constraints add `cohort` explicitly.
+/// `cohort`.
+///
+/// Excludes indexes backed by a table constraint: the enable script's own
+/// `PRIMARY KEY` and `workflow_exec_id_event_id_key` constraints add
+/// `cohort` explicitly, so those are handled separately.
 ///
 /// **Why this blocks the conversion.** Postgres requires the partition key
 /// in every unique index on a partitioned table. `capture_index_defs`
@@ -2416,10 +2418,6 @@ async fn sweep_inner(
 
     let mut attempts = 0usize;
     for part in list_partitions(conn).await? {
-        if outcome.dropped.len() >= opts.max_drops || attempts >= opts.max_attempts {
-            outcome.truncated = true;
-            break;
-        }
         // The DEFAULT partition is structural: dropping it would make an
         // append for an uncovered cohort fail outright. It is drained, never
         // dropped.
@@ -2437,6 +2435,16 @@ async fn sweep_inner(
         };
         if upper > now {
             continue;
+        }
+
+        // Checked here, after the cheap skips above, not at the top of the
+        // loop. A tick can exhaust its budget on exactly the last eligible
+        // partition. It must not then report `truncated` just because the
+        // remaining partitions in the list are DEFAULT or still open.
+        // Those cost nothing and were never going to be attempted anyway.
+        if outcome.dropped.len() >= opts.max_drops || attempts >= opts.max_attempts {
+            outcome.truncated = true;
+            break;
         }
 
         // Counted here, not at the top of the loop. This is the gate
