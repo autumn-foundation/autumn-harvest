@@ -15,15 +15,20 @@ collectively dominant" bookkeeping shape `docs/performance.md` and
 > hardware before designing against it — the harness is in the repo
 > precisely so you can.
 
-> **This page's first version was wrong, and this version explains why.**
-> The initial fix folded the worker-liveness check into a single
+> **This page's first version had two bugs, and this version explains
+> both.** The initial fix folded the worker-liveness check into a single
 > `UPDATE`/`SELECT ... FOR UPDATE` per row, and claimed a 3-statement-to-1
-> reduction. An automated review caught a real race: under lock
+> reduction. Automated review caught two real problems: (1) under lock
 > contention, that combined statement can read a stale, pre-wait snapshot
 > of `harvest_workers`, wrongly concluding a resurrected worker is still
-> dead. That was confirmed against a real Postgres, not just argued about
-> — see "The bug the first version had" below. The fix shipped here keeps
-> a separate row-lock statement and is a 3-to-2 reduction, not 3-to-1.
+> dead (confirmed against a real Postgres, not just argued about — see
+> "The bug the first version had" below); and (2) the combined statement
+> used SQL `NOW()` for `scheduled_at` and the liveness cutoff, which fixes
+> at the *transaction's* start rather than the statement's, silently
+> backdating both under the exact same wait window (see "The second bug"
+> below). The fix shipped here keeps a separate row-lock statement, binds
+> the current time from Rust, and is a 3-to-2 statement reduction, not
+> 3-to-1.
 
 ## 🎯 Workload
 
@@ -108,6 +113,30 @@ Splitting the row-lock acquisition into its own preceding statement (step
 6 below) and re-running the same scenario correctly leaves the row
 untouched: the second statement's fresh snapshot sees the resurrection.
 
+## The second bug the first version had
+
+Independently of the snapshot race, the first version's combined
+statement used SQL `NOW()` for `scheduled_at = NOW()` and for the
+liveness cutoff (`NOW() - ($5::bigint * INTERVAL '1 second')`). Postgres
+fixes `NOW()` (and `CURRENT_TIMESTAMP`) at the *transaction's* start, not
+the statement's -- `clock_timestamp()` is the one that reflects real
+wall-clock time at the moment it runs.
+
+The pre-fix code computed `Utc::now()` in Rust, at the point the liveness
+`SELECT` and the `UPDATE` actually executed -- after the row-lock
+`SELECT ... FOR UPDATE` had already resolved any wait. Replacing that
+with SQL `NOW()` silently reintroduced the same kind of staleness the
+snapshot bug did, along an independent axis: under the same lock-wait
+scenario, `scheduled_at` would be backdated by the wait's full duration
+(moving the requeued task ahead of same-priority tasks ordered by
+`scheduled_at`), and the liveness cutoff would be computed against the
+stale, pre-wait time rather than the actual moment of the check.
+
+The fix binds the current time as a parameter, read via `Utc::now()` in
+Rust at the same point the pre-fix code read it -- after the row lock,
+immediately before issuing the combined statement -- and uses that bound
+value for both `scheduled_at` and the cutoff, instead of SQL `NOW()`.
+
 ## 💡 Hypothesis (revised)
 
 A plain `SELECT ... FOR UPDATE` naming only `harvest_task_queue` absorbs
@@ -148,16 +177,16 @@ One new statement in `poison_pill.rs`, used only after the row lock is
 already held:
 
 ```sql
--- requeue_orphan_stmt
+-- requeue_orphan_stmt ($6 = current time, bound from Rust -- not SQL NOW())
 UPDATE harvest_task_queue
 SET state = 'PENDING', worker_id = NULL, started_at = NULL,
     sticky_worker_id = NULL, sticky_until = NULL, last_heartbeat_at = NULL,
-    error = NULL, crash_strikes = $4, scheduled_at = NOW()
+    error = NULL, crash_strikes = $4, scheduled_at = $6
 WHERE id = $1 AND state = 'RUNNING' AND worker_id = $2 AND crash_strikes = $3
   AND NOT EXISTS (
       SELECT 1 FROM harvest_workers w
       WHERE w.worker_id = $2
-        AND w.last_heartbeat_at > NOW() - ($5::bigint * INTERVAL '1 second')
+        AND w.last_heartbeat_at > $6 - ($5::bigint * INTERVAL '1 second')
   )
 RETURNING id
 ```
@@ -204,6 +233,19 @@ The admissible evidence here is the statement/`calls` count itself.
 
 Full artifacts:
 `docs/perf-artifacts/poison-pill-orphan-recheck/{before,after}-sweep.txt`.
+
+**A third finding, this time in the harness itself, not the database
+code:** the first version's `is_candidate_scan_statement` filter matched
+any statement touching `harvest_task_queue` with a `NOT EXISTS` clause --
+which, after the fix, also matched the new combined `UPDATE`. That
+inflated `candidate_scan_calls` to `n + 1` instead of the true, constant
+`1` (still visible in the first committed `after-sweep.txt`, since
+superseded). The bucket functions now also check statement kind (`SELECT`
+vs `UPDATE`), and `measure_one_pass` asserts `candidate_scan_calls == 1`
+on every call so this cannot silently regress again. The per-category
+counts above reflect the corrected buckets; the total-statement counts
+were never affected, since misclassification only moved calls between
+categories that both fed into the same reported total.
 
 ## ✅ Equivalence
 

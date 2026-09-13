@@ -177,7 +177,9 @@ pub const fn stuck_running_tasks_query() -> &'static str {
 ///
 /// `$1` = task id, `$2` = claiming worker id, `$3` = the crash-strike
 /// count the caller observed at scan time. `$4` = the new crash-strike
-/// count to record. `$5` = the worker-stale threshold in seconds.
+/// count to record. `$5` = the worker-stale threshold in seconds. `$6` =
+/// the current time, bound by the caller rather than read via SQL `NOW()`
+/// -- see [`requeue_orphan`]'s call site for why.
 ///
 /// Returns the row's id if it was actually transitioned. Returns no row
 /// otherwise: state/worker/strikes no longer match what the scan
@@ -193,7 +195,7 @@ pub const fn requeue_orphan_stmt() -> &'static str {
          last_heartbeat_at = NULL, \
          error = NULL, \
          crash_strikes = $4, \
-         scheduled_at = NOW() \
+         scheduled_at = $6 \
      WHERE id = $1 \
        AND state = 'RUNNING' \
        AND worker_id = $2 \
@@ -201,7 +203,7 @@ pub const fn requeue_orphan_stmt() -> &'static str {
        AND NOT EXISTS ( \
            SELECT 1 FROM harvest_workers w \
            WHERE w.worker_id = $2 \
-             AND w.last_heartbeat_at > NOW() - ($5::bigint * INTERVAL '1 second') \
+             AND w.last_heartbeat_at > $6 - ($5::bigint * INTERVAL '1 second') \
        ) \
      RETURNING id"
 }
@@ -323,12 +325,21 @@ mod scanner {
             // can never itself have to wait. Re-verifies the row is still
             // the same orphan, and re-checks the claiming worker is still
             // dead, together in the write's own WHERE clause.
+            //
+            // `now` is read here, in Rust, rather than via SQL `NOW()`.
+            // Postgres fixes `NOW()` at the transaction's start, not the
+            // statement's. A statement issued after the lock above had to
+            // wait would still see the pre-wait time. Reading it here
+            // matches the pre-fix code, which computed `Utc::now()` at
+            // this same point -- after the row lock, not before it.
+            let now = Utc::now();
             let updated: Option<IdRow> = diesel::sql_query(super::requeue_orphan_stmt())
                 .bind::<diesel::sql_types::Uuid, _>(task_id)
                 .bind::<diesel::sql_types::Text, _>(&worker_id)
                 .bind::<diesel::sql_types::Integer, _>(prior_strikes)
                 .bind::<diesel::sql_types::Integer, _>(new_strikes)
                 .bind::<diesel::sql_types::BigInt, _>(worker_stale_secs)
+                .bind::<diesel::sql_types::Timestamptz, _>(now)
                 .get_result(conn)
                 .await
                 .optional()

@@ -194,12 +194,38 @@ fn is_worker_recheck_statement(row: &StatRow) -> bool {
     q.contains("harvest_workers") && !q.contains("harvest_task_queue")
 }
 
+/// The one-time broad scan (`orphaned_running_tasks_query`): a `SELECT`
+/// against `harvest_task_queue` carrying a `NOT EXISTS` against
+/// `harvest_workers`. Distinguished from `requeue_orphan_stmt`'s combined
+/// `UPDATE` (below) by statement kind, not just the tables it touches.
+/// Both are `harvest_task_queue` plus `NOT EXISTS`, so a filter that
+/// ignored `SELECT` vs `UPDATE` would silently merge them. That was this
+/// harness's own bug on its first version. `requeue_orphan_stmt` also
+/// matched this predicate, so `candidate_scan_calls` read `n + 1` instead
+/// of the true, constant `1`. The printed *total* across all buckets was
+/// still correct by construction: every statement fell into exactly one
+/// of the buckets that existed then.
 fn is_candidate_scan_statement(row: &StatRow) -> bool {
     let q = row.query.to_ascii_lowercase();
-    q.contains("harvest_task_queue") && q.contains("not exists")
+    let q = q.trim_start();
+    q.starts_with("select") && q.contains("harvest_task_queue") && q.contains("not exists")
 }
 
-fn is_task_queue_row_statement(row: &StatRow) -> bool {
+/// `requeue_orphan_stmt`: the combined per-row `UPDATE` this
+/// investigation adds, folding the liveness re-check into the write.
+/// Matches the same two substrings [`is_candidate_scan_statement`] does,
+/// so distinguishing them by statement kind (`UPDATE` vs `SELECT`) is
+/// what keeps the two buckets disjoint.
+fn is_combined_update_statement(row: &StatRow) -> bool {
+    let q = row.query.to_ascii_lowercase();
+    let q = q.trim_start();
+    q.starts_with("update") && q.contains("harvest_task_queue") && q.contains("not exists")
+}
+
+/// The row-lock-only `SELECT ... FOR UPDATE` every `requeue_orphan` call
+/// still issues first. Touches `harvest_task_queue` alone, with no
+/// `NOT EXISTS`, so it cannot be confused with either statement above.
+fn is_row_lock_statement(row: &StatRow) -> bool {
     let q = row.query.to_ascii_lowercase();
     q.contains("harvest_task_queue") && !q.contains("not exists")
 }
@@ -209,8 +235,10 @@ struct SizePoint {
     worker_recheck_calls: i64,
     worker_recheck_buffers: i64,
     candidate_scan_calls: i64,
-    task_queue_row_calls: i64,
-    task_queue_row_buffers: i64,
+    combined_update_calls: i64,
+    combined_update_buffers: i64,
+    row_lock_calls: i64,
+    row_lock_buffers: i64,
 }
 
 async fn measure_one_pass(admin: &str, label: &str, n: i64, num_workers: i64) -> SizePoint {
@@ -273,21 +301,37 @@ async fn measure_one_pass(admin: &str, label: &str, n: i64, num_workers: i64) ->
         .filter(|r| is_candidate_scan_statement(r))
         .map(|r| r.calls)
         .sum();
-    let task_queue_row_calls: i64 = all_rows
+    let combined_update_calls: i64 = all_rows
         .iter()
-        .filter(|r| is_task_queue_row_statement(r))
+        .filter(|r| is_combined_update_statement(r))
         .map(|r| r.calls)
         .sum();
-    let task_queue_row_buffers: i64 = all_rows
+    let combined_update_buffers: i64 = all_rows
         .iter()
-        .filter(|r| is_task_queue_row_statement(r))
+        .filter(|r| is_combined_update_statement(r))
+        .map(|r| r.total_buffers)
+        .sum();
+    let row_lock_calls: i64 = all_rows
+        .iter()
+        .filter(|r| is_row_lock_statement(r))
+        .map(|r| r.calls)
+        .sum();
+    let row_lock_buffers: i64 = all_rows
+        .iter()
+        .filter(|r| is_row_lock_statement(r))
         .map(|r| r.total_buffers)
         .sum();
 
     assert!(
-        worker_recheck_calls > 0 || candidate_scan_calls > 0,
+        worker_recheck_calls > 0 || candidate_scan_calls > 0 || combined_update_calls > 0,
         "pg_stat_statements returned zero rows matching the expected shapes -- check \
          pg_stat_statements.track and shared_preload_libraries",
+    );
+    assert_eq!(
+        candidate_scan_calls, 1,
+        "the broad candidate scan runs exactly once per tick, regardless of n -- a count \
+         other than 1 here means is_candidate_scan_statement is (again) conflating it with \
+         the combined per-row UPDATE"
     );
 
     SizePoint {
@@ -295,8 +339,10 @@ async fn measure_one_pass(admin: &str, label: &str, n: i64, num_workers: i64) ->
         worker_recheck_calls,
         worker_recheck_buffers,
         candidate_scan_calls,
-        task_queue_row_calls,
-        task_queue_row_buffers,
+        combined_update_calls,
+        combined_update_buffers,
+        row_lock_calls,
+        row_lock_buffers,
     }
 }
 
@@ -332,28 +378,33 @@ async fn zz_capture_poison_pill_reclaim_perf_evidence() {
         "-- {label}: reclaim_orphaned_tasks, pg_stat_statements sweep \
          (num_distinct_dead_workers={NUM_DISTINCT_WORKERS}) --\n\
          n\tworker_recheck_calls\tworker_recheck_buffers\tcandidate_scan_calls\t\
-         task_queue_row_calls\ttask_queue_row_buffers"
+         combined_update_calls\tcombined_update_buffers\trow_lock_calls\trow_lock_buffers"
     )];
     for n in [60_i64, 300, 1_500] {
         let point = measure_one_pass(&admin, &label, n, NUM_DISTINCT_WORKERS).await;
         eprintln!(
             "label={label} n={} worker_recheck_calls={} worker_recheck_buffers={} \
-             candidate_scan_calls={} task_queue_row_calls={} task_queue_row_buffers={}",
+             candidate_scan_calls={} combined_update_calls={} combined_update_buffers={} \
+             row_lock_calls={} row_lock_buffers={}",
             point.n,
             point.worker_recheck_calls,
             point.worker_recheck_buffers,
             point.candidate_scan_calls,
-            point.task_queue_row_calls,
-            point.task_queue_row_buffers,
+            point.combined_update_calls,
+            point.combined_update_buffers,
+            point.row_lock_calls,
+            point.row_lock_buffers,
         );
         lines.push(format!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             point.n,
             point.worker_recheck_calls,
             point.worker_recheck_buffers,
             point.candidate_scan_calls,
-            point.task_queue_row_calls,
-            point.task_queue_row_buffers,
+            point.combined_update_calls,
+            point.combined_update_buffers,
+            point.row_lock_calls,
+            point.row_lock_buffers,
         ));
     }
     std::fs::write(
