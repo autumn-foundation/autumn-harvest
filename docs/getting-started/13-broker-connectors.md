@@ -523,7 +523,10 @@ identity. Rotate the namespace yourself as part of the cutover:
 
 ```rust
 SourceBinding::starts("orders", "orders", "order_flow")
-    .map_json(|order: OrderPlaced| Ok(WorkflowId::new(order.order_id)))
+    .map_json(|_ctx, order: OrderPlaced| {
+        let payload = serde_json::to_value(&order).map_err(|e| e.to_string())?;
+        Ok::<_, String>(MappedMessage::new(order.order_id, payload))
+    })
     // Bump on any cutover: new cluster, or a deleted-and-recreated topic.
     .key_incarnation("2026-08-cutover")
 ```
