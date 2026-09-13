@@ -75,37 +75,55 @@ if [ -z "$params" ]; then
   exit 1
 fi
 
-# Count top-level parameters exactly, splitting on commas only at bracket
-# depth 0 -- a plain comma count or "does it start with `(`" heuristic both
-# proved unsound in PR #1523 review: a tuple-destructured single argument
-# (`|(_ctx, order): (&MessageCtx, OrderPlaced)|`) has an internal comma that
-# a bare count mistakes for two arguments, a three-argument closure
-# (`|_ctx, order: OrderPlaced, extra|`) has two commas but is not the
-# required two-argument form, and a single argument with a tuple *type*
-# (`|order: (OrderPlaced, String)|`) has a comma with no leading `(` on the
-# parameter list itself. None of those are top-level commas once `()` /
-# `<>` / `[]` / `{}` nesting is tracked, which is what this counts instead.
-param_count="$(python3 -c '
+# Validate the closure header in one pass: exactly two top-level parameters
+# (splitting on commas only at bracket depth 0, tracking `()` / `<>` / `[]`
+# / `{}` -- a plain comma count or a "does it start with `(`" heuristic both
+# proved unsound in PR #1523 review, against a tuple-destructured single
+# argument, a three-argument closure, and a single argument with a tuple
+# *type*), and the second parameter must carry an explicit `OrderPlaced`
+# type annotation. Also flagged in review: `map_json<T, E, F>`'s `T` is
+# fixed by the closure's own declared parameter type, not inferred from the
+# trait bound or from the closure body -- an untyped `|_ctx, order|`
+# compiles the closure header but then fails with "type annotations
+# needed" (E0282) at `order.order_id`, since nothing else pins down what
+# `order` is.
+validation="$(python3 -c '
+import re
 import sys
 
 s = sys.argv[1]
 depth = 0
-count = 1
+parts = [""]
 opens = "([{<"
 closes = ")]}>"
 for ch in s:
     if ch in opens:
         depth += 1
+        parts[-1] += ch
     elif ch in closes:
         depth = max(0, depth - 1)
+        parts[-1] += ch
     elif ch == "," and depth == 0:
-        count += 1
-print(count if s.strip() else 0)
+        parts.append("")
+    else:
+        parts[-1] += ch
+
+parts = [p.strip() for p in parts] if s.strip() else []
+
+if len(parts) != 2:
+    print(f"ARITY\t{len(parts)}")
+elif not re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*:\s*OrderPlaced\b", parts[1]):
+    print(f"TYPE\t{parts[1]}")
+else:
+    print("OK\t")
 ' "$params")"
 
-if [ "$param_count" -ne 2 ]; then
+kind="${validation%%$'\t'*}"
+detail="${validation#*$'\t'}"
+
+if [ "$kind" = "ARITY" ]; then
   echo "$doc: the cutover example's .map_json(...) closure takes" \
-    "$param_count top-level parameter(s) (\"$params\"), not the two" \
+    "$detail top-level parameter(s) (\"$params\"), not the two" \
     "SourceBinding::map_json requires -- Fn(&MessageCtx, T) ->" \
     "Result<MappedMessage, E>. This does not type-check regardless of the" \
     "closure body." >&2
@@ -114,6 +132,20 @@ if [ "$param_count" -ne 2 ]; then
     "separate closure parameters, e.g. |_ctx, order: OrderPlaced|, and" \
     "return a MappedMessage (see the chapter's other .map_json examples," \
     "or MappedMessage::new)." >&2
+  exit 1
+fi
+
+if [ "$kind" = "TYPE" ]; then
+  echo "$doc: the cutover example's .map_json(...) closure's second" \
+    "parameter (\"$detail\") is not explicitly typed OrderPlaced." \
+    "map_json<T, E, F>'s T is fixed by the closure's own declared" \
+    "parameter type -- it is not inferred from the trait bound or from" \
+    "the closure body -- so an untyped or differently-typed parameter" \
+    "fails to compile with \"type annotations needed\" (E0282) at" \
+    "order.order_id." >&2
+  echo >&2
+  echo "Fix: annotate the second parameter explicitly, e.g." \
+    "order: OrderPlaced." >&2
   exit 1
 fi
 
