@@ -6241,6 +6241,9 @@ async fn run_partition_disable(shards: &[String], format: DrFormat) -> Result<()
 /// The nonzero exit is the point: `harvest partition enable --shard a --shard b`
 /// that converted `a` and failed on `b` has left a half-converted cluster, and a
 /// zero exit would let a deployment script move on as though it had not.
+// One text/JSON report, field by field. Splitting it would scatter one
+// operator-facing rendering across helpers that only print once each.
+#[allow(clippy::too_many_lines)]
 fn emit_partition_report(
     rows: &[PartitionShardReport],
     format: DrFormat,
