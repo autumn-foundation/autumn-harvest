@@ -4,9 +4,9 @@
 //!
 //! `store::running_executions` drives executions in ascending `ExecutionId`
 //! string order. Before the fix, `poll_once`'s loop propagated the first
-//! per-execution error with a bare `?`, so every execution ordered after the
-//! broken one in that pass was never driven — not once, forever, even across
-//! a restart. The fix keeps driving the rest of the fleet and still reports
+//! per-execution error with a bare `?`. Every execution ordered after the
+//! broken one in that pass was never driven. Not once, forever, even across
+//! a restart. The fix keeps driving the rest of the fleet. It still reports
 //! the first error, matching the existing single-error `poll_once` signature.
 
 // The `#[workflow]` macro references its input param through expansion.
@@ -34,9 +34,10 @@ async fn healthy_wf(_ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     Ok(n * 2)
 }
 
-/// Starts `healthy_wf` executions until one sorts (as an `ExecutionId` string)
-/// after `broken`, so it lands later in `running_executions`'s ascending scan
-/// — the ordering the issue's repro forces (~1-2 tries on average).
+/// Starts `healthy_wf` executions until one sorts, as an `ExecutionId`
+/// string, after `broken`. It then lands later in `running_executions`'s
+/// ascending scan — the ordering the issue's repro forces (~1-2 tries on
+/// average).
 fn start_healthy_after(rt: &mut SqliteRuntime, broken: ExecutionId) -> ExecutionId {
     for i in 0..50i64 {
         let id = rt.start_workflow("healthy_wf", json!(i)).unwrap();

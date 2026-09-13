@@ -969,18 +969,18 @@ impl SqliteRuntime {
     /// (re-read per driven cycle, issue #1069 P2). Returns `true` if any execution
     /// made durable progress this pass.
     ///
-    /// One execution's error (e.g. an unsupported command, issue #1530) does
-    /// NOT stop this pass from driving the rest of the fleet — every other
-    /// execution still gets its cycle. This is the fleet-wide analog of
-    /// [`run_until_blocked`](Self::run_until_blocked)'s per-execution
-    /// fail-fast: that call targets ONE execution the caller already knows
-    /// about, so it stays fail-fast; this one drives many UNRELATED
-    /// executions, so one of them failing must not silently starve the rest.
+    /// One execution's error (issue #1530) does NOT stop this pass. This pass
+    /// still drives every other execution.
+    ///
+    /// [`run_until_blocked`](Self::run_until_blocked) targets ONE execution
+    /// the caller already knows, so it stays fail-fast on error. This call
+    /// drives many UNRELATED executions, so one failure must not silently
+    /// starve the rest.
     ///
     /// # Errors
     ///
-    /// The FIRST execution to error in `ExecutionId` order, if any — every
-    /// other error in the same pass is logged (`tracing::warn!`) rather than
+    /// The FIRST execution to error, in `ExecutionId` order, if any. Every
+    /// other error in the same pass is logged (`tracing::warn!`), not
     /// dropped. See [`run_until_blocked`](Self::run_until_blocked) for the
     /// error variants a single execution can produce.
     pub async fn poll_once(&mut self) -> SqliteResult<bool> {
@@ -1041,10 +1041,10 @@ impl SqliteRuntime {
     /// [`MAX_ITERATIONS`] safety bound — surfaced honestly (mirroring
     /// [`run_until_blocked`](Self::run_until_blocked)'s [`SqliteError::Stuck`])
     /// rather than swallowed as a clean `Ok(())` a caller cannot distinguish from
-    /// genuine quiescence. Also propagates any per-execution error, but only
-    /// AFTER that pass's [`poll_once`](Self::poll_once) call has driven every
-    /// other execution (issue #1530) — a lone broken execution stops the NEXT
-    /// pass, not the rest of the fleet in the current one.
+    /// genuine quiescence. Also propagates any per-execution error. That
+    /// happens only AFTER the pass's [`poll_once`](Self::poll_once) call
+    /// drives every other execution (issue #1530). A lone broken execution
+    /// stops the NEXT pass, not the current one.
     pub async fn run_until_idle(&mut self) -> SqliteResult<()> {
         for _ in 0..MAX_ITERATIONS {
             if !self.poll_once().await? {
