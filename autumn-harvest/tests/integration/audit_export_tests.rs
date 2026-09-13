@@ -2649,6 +2649,55 @@ async fn retention_protects_a_bootstrapping_colocated_shard_despite_another_shar
     assert_eq!(remaining, 5);
 }
 
+// Codex review, PR #1504. A split deployment has two processes, each
+// with its own partial view of which shards share a physical database.
+// This call's own `colocated_shard_ids` can therefore omit a shard
+// whose cursor genuinely lives in this same database. The pending
+// check's acknowledgment disjunct must still see that shard's live
+// cursor, not only the shards this call happens to name.
+#[tokio::test]
+async fn retention_protects_a_row_a_live_unlisted_shards_cursor_has_not_acknowledged() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _sink = install(Arc::new(RecordingSink::new(200)), 5);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 5).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    assert_eq!(cursor_acked(&mut conn, 0).await, 5);
+    uninstall();
+
+    // Shard 1 shares this physical database but is unknown to this
+    // call: it never appears in `colocated_shard_ids` below. Its
+    // cursor is live and has acknowledged nothing.
+    ensure_cursor_row(&mut conn, 1).await.expect("cursor row");
+
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
+
+    // Only shard 0 is named. Shard 1's live cursor is invisible to
+    // this call's own colocated/exempted lists.
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0], &[])
+        .await
+        .expect("purge runs");
+    assert_eq!(
+        deleted, 0,
+        "shard 1's live cursor has acknowledged nothing, and must block \
+         the delete regardless of whether this call's own \
+         colocated_shard_ids happens to name it"
+    );
+
+    let remaining: i64 = harvest_audit_log::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(remaining, 5);
+}
+
 // Issue #1266. A stamped row must count as
 // pending when its shard has no cursor row at all. This holds even though
 // its `export_seq` is already assigned. `ensure_cursor_row` rebuilds a

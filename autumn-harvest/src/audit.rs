@@ -1653,12 +1653,14 @@ pub async fn list_audit(
 ///
 /// The pending check treats a row as pending, and so protected, in three
 /// cases. Its `export_seq` may be unassigned. Some shard in
-/// `colocated_shard_ids` may have no cursor row at all. Or a cursor row
-/// belonging to a shard in `colocated_shard_ids` may exist, not be
-/// retired, and simply not have acknowledged it yet. A retired
-/// cursor's own stale ack counts too, but only while
-/// `protect_unexported_audit` is itself protecting this pool group.
-/// See the note above the SQL for why.
+/// `colocated_shard_ids` may have no cursor row at all. Or any live
+/// (non-retired) cursor row anywhere in this database may simply not
+/// have acknowledged it yet. This holds whether or not its shard is
+/// named in `colocated_shard_ids` (Codex review, PR #1504). A retired
+/// cursor's own stale ack counts too, but only for a shard in
+/// `colocated_shard_ids`, and only while `protect_unexported_audit` is
+/// itself protecting this pool group. See the note above the SQL for
+/// why.
 ///
 /// The second case matters on its own (issue #1266). A stamped row can
 /// survive a cursor row's manual deletion. It can
@@ -1784,14 +1786,18 @@ pub async fn purge_old_audit_records(
     // shard-id list; the disjunct is true the moment any of them has no
     // matching row.
     //
-    // The last disjunct now also scopes to `colocated_shard_ids` (issue
-    // #1266). An excluded shard's cursor row can carry a stale
-    // `last_acked_seq` forever, since decommissioning retires a row
-    // rather than deleting it. Without this scope, that stale row alone
-    // could keep a row "pending" long after every shard that still
-    // matters had genuinely acknowledged it. `colocated_shard_ids` names
-    // only shards an operator has not explicitly exempted, so this
-    // matches the middle disjunct's own notion of "who still counts".
+    // The last disjunct's live-cursor arm is unconditional (Codex
+    // review, PR #1504). Any live cursor in this database blocks the
+    // delete, whether or not its shard is named in `$3`
+    // (`colocated_shard_ids`). An earlier revision scoped this arm to
+    // `$3` too. A split deployment has two processes, each with its own
+    // partial view of which shards share this physical database. It can
+    // leave a live cursor here that this call's own `colocated_shard_ids`
+    // never names. That scoped arm ignored the unlisted shard's own
+    // unacknowledged backlog entirely. It let such a row purge anyway,
+    // the moment every shard this call did know about had acknowledged
+    // it. Matching the outer gate's own unscoped
+    // `EXISTS (... WHERE retired_at IS NULL)` closes the same gap here.
     //
     // A retired cursor's own stale ack is ignored too, but only while
     // `protect_unexported_audit` is not itself protecting this pool
@@ -1811,20 +1817,15 @@ pub async fn purge_old_audit_records(
     // Re-enabling it via `is_configured()` alone was never a documented
     // signal this pending check trusted to override retirement.
     //
-    // `exempted_shard_ids` covers a second, independent gap (issue #1266).
-    // `excluding_shard_from_protect_unexported_audit`'s own doc comment says
-    // to call it "for a shard being decommissioned". The config change and
-    // the `decommission_cursor` call need not land atomically, though.
-    // Exempting a shard removes it from `colocated_shard_ids` immediately.
-    // Without this fourth argument, a sweep landing in that window sees no
-    // cursor at all for the exempted shard in `$3`. Nothing then blocks
-    // deleting rows that shard's own cursor -- still live, still short of
-    // `last_acked_seq` -- has not actually acknowledged yet.
-    // `exempted_shard_ids` names exactly those shards. The final
-    // disjunct arm below still counts an exempted shard's cursor as
-    // pending while it stays live, regardless of `$2`. It stops counting
-    // only once `decommission_cursor` actually retires that row, which is
-    // the moment the exemption is meant to take effect.
+    // `exempted_shard_ids` (`$4`) is no longer read by this predicate
+    // (Codex review, PR #1504). Its own exemption already takes effect
+    // only once `decommission_cursor` actually retires that shard's row,
+    // not from the moment the config change lands. While the cursor
+    // stays live, it already counts as pending regardless of `$2`. The
+    // unconditional live-cursor arm above now does exactly that for
+    // every live cursor, exempted or not. `$4` stays a parameter for
+    // interface stability, still bound below, though nothing in this
+    // query reads it.
     //
     // Also never one of the two audit-export lifecycle records exempted
     // above (issue #1273).
@@ -1863,13 +1864,10 @@ pub async fn purge_old_audit_records(
                         SELECT 1 FROM harvest_audit_export_cursor c \
                         WHERE a.export_seq > c.last_acked_seq \
                           AND ( \
-                                ( \
-                                  c.shard_id = ANY($3::int4[]) \
-                                  AND ($2::BOOLEAN OR c.retired_at IS NULL) \
-                                ) \
+                                c.retired_at IS NULL \
                                 OR ( \
-                                  c.shard_id = ANY($4::int4[]) \
-                                  AND c.retired_at IS NULL \
+                                  c.shard_id = ANY($3::int4[]) \
+                                  AND $2::BOOLEAN \
                                 ) \
                               ) \
                    ) \
