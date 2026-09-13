@@ -11,8 +11,14 @@ scope here. Wall-clock timing is not admissible evidence on this
 count (`valgrind --tool=callgrind`) or allocation count/bytes
 (`valgrind --tool=dhat`).
 
-dhat's counts are bit-for-bit reproducible on any machine: allocation count
-and byte totals don't depend on hash values. Callgrind's are not quite:
+dhat's counts do not depend on hash values, so hash randomness is not a
+source of variance for them the way it is for callgrind below. They are
+bit-for-bit reproducible across repeated runs of the same binary on the
+same target -- not a portable cross-machine guarantee: a different pointer
+width, allocator, or standard-library collection implementation across
+toolchains or architectures can change requested allocation sizes and
+counts. The figures below are this session's, on one build. Callgrind's are
+not quite reproducible even on the same binary:
 this harness's ids (`ExecutionId::new()`) are random UUIDs, and both this
 fixture's own bookkeeping and `LineageWalk`'s internal `HashMap`/`HashSet`
 hash them, so instruction counts vary slightly run to run from
