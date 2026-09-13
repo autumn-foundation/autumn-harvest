@@ -548,6 +548,151 @@ async fn the_large_table_plans_phase_1_also_refuses_a_unique_index_without_cohor
 }
 
 #[tokio::test]
+async fn a_dependent_view_refuses_the_conversion_instead_of_silently_going_stale() {
+    // Issue #1270 item 14: Postgres tracks a view's dependency by relation
+    // OID, not by name. Both conversion paths rename `harvest_events` out
+    // of the way, then create the replacement under the original name. A
+    // dependent view would keep pointing at the RENAMED relation. On the
+    // populated path, that relation is thereafter only the pre-cutover
+    // partition. The view keeps returning rows. It silently stops
+    // returning any row appended after the conversion.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(&mut conn, "view_wf", "view-1", day(2026, 2, 3), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    diesel::sql_query("DROP VIEW IF EXISTS harvest_events_by_type_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray view from a previous run");
+    diesel::sql_query(
+        "CREATE VIEW harvest_events_by_type_958 AS SELECT event_type FROM harvest_events",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a dependent view");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "a dependent view must refuse the conversion, not silently go \
+             stale after it",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_by_type_958"),
+        "the refusal must name the offending view; got {msg}"
+    );
+
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP VIEW harvest_events_by_type_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending view");
+}
+
+#[tokio::test]
+async fn the_large_table_plans_phase_1_also_refuses_a_dependent_view() {
+    // Same guard, the scripted path. `migration_plan_steps` cannot call
+    // `enable_partitioning`'s Rust check, so it carries its own phase-1
+    // `DO` block making the identical refusal.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP VIEW IF EXISTS harvest_events_plan_view_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray view from a previous run");
+    diesel::sql_query(
+        "CREATE VIEW harvest_events_plan_view_958 AS SELECT event_type FROM harvest_events",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a dependent view");
+
+    let mut refused = false;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 1)
+    {
+        if diesel::sql_query(&step.sql)
+            .execute(&mut conn)
+            .await
+            .is_err()
+        {
+            refused = true;
+        }
+    }
+    assert!(
+        refused,
+        "phase 1 of the plan must refuse a view that depends on harvest_events"
+    );
+
+    diesel::sql_query("DROP VIEW harvest_events_plan_view_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending view");
+}
+
+#[tokio::test]
+async fn a_dependent_view_refuses_the_revert_too() {
+    // The reverse direction: `disable_partitioning` renames the partitioned
+    // parent out of the way exactly as `enable` renames the flat table, so
+    // it is exactly as vulnerable.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    diesel::sql_query("DROP VIEW IF EXISTS harvest_events_disable_view_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray view from a previous run");
+    diesel::sql_query(
+        "CREATE VIEW harvest_events_disable_view_958 AS SELECT event_type FROM harvest_events",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a dependent view on the partitioned parent");
+
+    let err = partition::disable_partitioning(&mut conn)
+        .await
+        .expect_err("a dependent view must refuse the revert, not silently go stale after it");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_disable_view_958"),
+        "the refusal must name the offending view; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "p",
+        "a refused revert must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP VIEW harvest_events_disable_view_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending view");
+}
+
+#[tokio::test]
 async fn a_user_index_at_the_identifier_length_limit_survives_conversion() {
     // Issue #1270 item 9: Postgres silently truncates an identifier over 63
     // bytes. Appending a suffix to a name already at that limit renames it

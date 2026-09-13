@@ -1215,6 +1215,62 @@ async fn refuse_if_unique_index_without_cohort(conn: &mut AsyncPgConnection) -> 
     )))
 }
 
+/// Views that depend on `harvest_events`.
+///
+/// **Why this blocks the conversion.** Postgres records a view's dependency
+/// by relation OID, not by name. Both conversion directions rename
+/// `harvest_events` out of the way, then create the replacement under the
+/// original name. A dependent view keeps pointing at the RENAMED relation.
+/// On the populated path, that relation is thereafter only the pre-cutover
+/// partition. The view keeps returning rows. It silently stops returning
+/// any row appended after the conversion. On the empty-table path the
+/// rename target is dropped outright. The dependency makes that `DROP`
+/// fail instead — safer, but still not loud about the cause.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] if the catalog query fails.
+#[cfg(feature = "db")]
+pub async fn dependent_views(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
+    let rows = diesel::sql_query(
+        "SELECT DISTINCT (v_ns.nspname || '.' || v.relname) AS v
+           FROM pg_depend d
+           JOIN pg_rewrite r ON r.oid = d.objid
+           JOIN pg_class v ON v.oid = r.ev_class
+           JOIN pg_namespace v_ns ON v_ns.oid = v.relnamespace
+           JOIN pg_class t ON t.oid = d.refobjid
+           JOIN pg_namespace t_ns ON t_ns.oid = t.relnamespace
+          WHERE t.relname = 'harvest_events' AND t_ns.nspname = current_schema()
+            AND v.relkind = 'v'
+          ORDER BY 1",
+    )
+    .load::<TextRow>(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows.into_iter().map(|r| r.v).collect())
+}
+
+/// The refusal both conversion directions share.
+#[cfg(feature = "db")]
+async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> HarvestResult<()> {
+    let views = dependent_views(conn).await?;
+    if views.is_empty() {
+        return Ok(());
+    }
+    Err(HarvestError::Config(format!(
+        "refusing to {verb} harvest_events: {} depend on it ({}). Postgres tracks a view's \
+         dependency by relation OID, not by name, and the conversion renames harvest_events \
+         out of the way and creates the replacement under the original name — so a dependent \
+         view would keep pointing at the OLD relation, silently returning fewer rows than it \
+         should from the moment this commits, rather than failing loudly. Recreating the \
+         view automatically is not offered: `CREATE OR REPLACE VIEW` cannot change its \
+         column list, and this module cannot know whether that is safe for yours. Drop the \
+         view first (and recreate it against harvest_events afterward) to proceed.",
+        if views.len() == 1 { "a view" } else { "views" },
+        views.join(", ")
+    )))
+}
+
 /// Convert this shard's `harvest_events` to the partitioned layout.
 ///
 /// Idempotent: on an already-partitioned shard it reports
@@ -1280,6 +1336,7 @@ pub async fn enable_partitioning(
 
     refuse_if_row_security(conn, "convert").await?;
     refuse_if_unique_index_without_cohort(conn).await?;
+    refuse_if_dependent_views(conn, "convert").await?;
 
     let width = opts.cohort_width_secs;
     let now = Utc::now();
@@ -1949,6 +2006,10 @@ pub async fn disable_partitioning(
     // table with `LIKE` and replays the grants onto it, so a policy added after
     // the conversion would be dropped while access is restored.
     refuse_if_row_security(conn, "revert").await?;
+    // Same reason as `enable`'s check: a view depending on the partitioned
+    // parent would keep pointing at the renamed relation, not the reclaimed
+    // flat table.
+    refuse_if_dependent_views(conn, "revert").await?;
     let report = Box::pin(
         conn.transaction::<DisableReport, HarvestError, _>(async |conn| {
             let index_defs = capture_index_defs(conn).await?;
@@ -3454,6 +3515,35 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
              partitioned parent would fail. Drop the index if it is obsolete, or recreate \
              it including `cohort` yourself, before running this plan.', bad;\n    \
              END IF;\nEND\n$harvest_uniq_958$;"
+                .to_string(),
+        ),
+        // ── 1: refuse early over a view depending on harvest_events ───────
+        //
+        // Same reason and same phase as the guards above.
+        // `enable_partitioning` makes this check in Rust; the scripted path
+        // needs its own because it never calls it. See `dependent_views`.
+        // Postgres tracks a view's dependency by OID, not by name. A
+        // dependent view would keep pointing at the renamed relation after
+        // phase 4, silently returning fewer rows than it should.
+        step(
+            1,
+            "DO $harvest_view_958$\nDECLARE bad text;\nBEGIN\n    \
+             SELECT string_agg(DISTINCT (v_ns.nspname || '.' || v.relname), ', ') INTO bad\n      \
+             FROM pg_depend d\n      \
+             JOIN pg_rewrite r ON r.oid = d.objid\n      \
+             JOIN pg_class v ON v.oid = r.ev_class\n      \
+             JOIN pg_namespace v_ns ON v_ns.oid = v.relnamespace\n      \
+             JOIN pg_class t ON t.oid = d.refobjid\n      \
+             JOIN pg_namespace t_ns ON t_ns.oid = t.relnamespace\n     \
+             WHERE t.relname = 'harvest_events' AND t_ns.nspname = current_schema()\n       \
+             AND v.relkind = 'v';\n    \
+             IF bad IS NOT NULL THEN\n        \
+             RAISE EXCEPTION 'harvest #958: view(s) depend on harvest_events (%). Postgres \
+             tracks a view''s dependency by relation OID, not by name, and phase 4 renames \
+             harvest_events out of the way — so the view would keep pointing at the OLD \
+             relation, silently returning fewer rows than it should. Drop the view (and \
+             recreate it against harvest_events afterward) before running this plan.', bad;\n    \
+             END IF;\nEND\n$harvest_view_958$;"
                 .to_string(),
         ),
         // ── 1: bake the chosen width into the cohort function ─────────────
