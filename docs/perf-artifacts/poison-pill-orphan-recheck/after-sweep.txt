@@ -1,5 +1,5 @@
 -- after: reclaim_orphaned_tasks, pg_stat_statements sweep (num_distinct_dead_workers=3) --
 n	worker_recheck_calls	worker_recheck_buffers	candidate_scan_calls	task_queue_row_calls	task_queue_row_buffers
-60	0	0	61	0	0
-300	0	0	301	0	0
-1500	0	0	1501	0	0
+60	0	0	61	60	139
+300	0	0	301	300	1200
+1500	0	0	1501	1500	6000
