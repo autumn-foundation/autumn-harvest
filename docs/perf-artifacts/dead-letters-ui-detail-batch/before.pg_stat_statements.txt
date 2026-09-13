@@ -1,0 +1,5 @@
+-- pg_stat_statements after one GET /ui/dead-letters?limit=200, 200 dead letters --
+dlq_list: calls=1
+workflow_name_lookup: calls=198
+other: calls=1
+events_lookup: calls=198
