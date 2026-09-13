@@ -202,6 +202,15 @@ harness = false
 name = "diagnose_bench"
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling
+# harness for `lineage::LineageWalk` / `LineageTreeReport::finish` -- the
+# pure, in-memory half of `GET /workflows/{id}/lineage` (issue #621). No
+# feature requirement: `lineage` is an unconditional module. See
+# `benches/lineage_profile.rs`.
+[[bench]]
+name = "lineage_profile"
+harness = false
+
 [lints]
 workspace = true
 
