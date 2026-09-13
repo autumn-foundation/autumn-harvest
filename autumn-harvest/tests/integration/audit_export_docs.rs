@@ -138,9 +138,9 @@ fn changelog_fragment_names_the_index_cost() {
         path.display()
     );
     assert!(
-        markers_near(&text, "partial index", "1272"),
-        "{}: the opt-in bullet must name the partial index within reach of \
-         issue #1272, not just mention #1272 in isolation",
+        names_index_cost_near(&text, "partial index"),
+        "{}: the opt-in bullet must name the partial index, its maintenance \
+         cost, and issue #1272 all within reach of each other",
         path.display()
     );
     assert!(
