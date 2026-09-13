@@ -264,7 +264,7 @@ pub const MAX_LISTED_CHARS: u32 = 500;
 ///
 /// Four bytes is the longest UTF-8 character, so this budget always carries
 /// at least [`LISTED_READ_CHARS`] characters. The caller cuts the characters.
-const MAX_LISTED_BYTES: u32 = LISTED_READ_CHARS * 4;
+pub const MAX_LISTED_BYTES: u32 = LISTED_READ_CHARS * 4;
 
 /// How many characters of one listed field are READ.
 ///
@@ -457,7 +457,12 @@ pub const EVENTS_QUERY: &str = "SELECT seq, \
                                        1, ?4), zeroblob(0)) END, \
             CASE WHEN typeof(event_json) = 'text' AND json_valid(event_json) \
                  THEN coalesce(substr(cast(json_extract(event_json, '$.data') as blob), \
-                                       1, ?4), zeroblob(0)) END \
+                                       1, ?4), zeroblob(0)) END, \
+            CASE WHEN typeof(event_json) = 'text' AND json_valid(event_json) \
+                  AND json_type(event_json, '$.type') = 'text' \
+                 THEN length(cast(json_extract(event_json, '$.type') as blob)) END, \
+            CASE WHEN typeof(event_json) = 'text' AND json_valid(event_json) \
+                 THEN length(cast(json_extract(event_json, '$.data') as blob)) END \
      FROM harvest_events \
      WHERE exec_id = ?1 AND seq < ?2 \
      ORDER BY seq DESC LIMIT ?3";
@@ -680,10 +685,10 @@ pub fn event_lines(
                     seq: row.get(0)?,
                     // A type is a NAME, and an empty one names nothing. It
                     // is reported like a type that cannot be read.
-                    label: cut_text(row.get(1)?, detail_cap, MAX_EVENT_DETAIL_BYTES)
+                    label: cut_text(row.get(1)?, detail_cap, row.get(3)?)
                         .filter(|label| !label.is_empty())
                         .unwrap_or_else(|| "unknown".to_string()),
-                    detail: cut_text(row.get(2)?, detail_cap, MAX_EVENT_DETAIL_BYTES),
+                    detail: cut_text(row.get(2)?, detail_cap, row.get(4)?),
                 })
             },
         )
@@ -935,6 +940,13 @@ pub fn outstanding_signal(
     //
     // The restart calls this function once for each RUNNING session, so this
     // is the one place that sees them all.
+    // The QUEUE is read too, and not only the event log. A PENDING task the
+    // backend cannot claim is a session no drive can advance.
+    if let Some(reason) = unclaimable_task(conn, exec_id)? {
+        return Err(format!(
+            "session {exec_id} {reason}, so it cannot be driven again"
+        ));
+    }
     if let Some(reason) = ambiguous_history(conn, exec_id)? {
         return Err(format!(
             "session {exec_id} {reason}, so it cannot be driven again"
@@ -1116,6 +1128,67 @@ fn staged_decision(conn: &Connection, exec_id: &str, signal: &str) -> Result<Opt
     ))
 }
 
+/// Does a PENDING task of this session hold work the BACKEND cannot claim?
+///
+/// `claim_next_ready_task_tx` reads `input_json` as a `String` and parses it,
+/// and it does so BEFORE it marks the row `RUNNING`. A row it cannot read is
+/// therefore never consumed: the claim errors, the row stays `PENDING`, and
+/// the next drive meets the same row again. `drive_one` keeps the session
+/// after such an error, so the daemon reports readiness and retries a session
+/// that can never advance.
+///
+/// The event log says nothing about this. It is a THIRD table, beside the
+/// events and the staged decisions, and each is read with the semantics of
+/// the code that consumes it.
+///
+/// `retry_policy_json` is read the same way when it is present, and parsed as
+/// the engine's own `RetryPolicy`. Both use the real types, so neither can
+/// drift from what the backend accepts.
+fn unclaimable_task(conn: &Connection, exec_id: &str) -> Result<Option<String>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT input_json, retry_policy_json FROM harvest_tasks \
+             WHERE exec_id = ?1 AND state = 'PENDING'",
+        )
+        .map_err(|e| format!("cannot prepare the task query: {e}"))?;
+    let mut rows = statement
+        .query([exec_id])
+        .map_err(|e| format!("cannot read the tasks: {e}"))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("cannot read a task row: {e}"))?
+    {
+        // The backend reads this column as a `String`, so a non-text class
+        // fails HERE, exactly as it fails there.
+        let Ok(input) = row.get::<_, String>(0) else {
+            return Ok(Some(
+                "holds pending work the backend cannot read".to_string(),
+            ));
+        };
+        if serde_json::from_str::<serde_json::Value>(&input).is_err() {
+            return Ok(Some(
+                "holds pending work the backend cannot read".to_string(),
+            ));
+        }
+        match row.get::<_, Option<String>>(1) {
+            Ok(None) => {}
+            Ok(Some(policy)) => {
+                if serde_json::from_str::<autumn_harvest::RetryPolicy>(&policy).is_err() {
+                    return Ok(Some(
+                        "holds pending work whose retry policy the backend cannot read".to_string(),
+                    ));
+                }
+            }
+            Err(_) => {
+                return Ok(Some(
+                    "holds pending work whose retry policy the backend cannot read".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Does this history hold an event the ENGINE cannot read?
 ///
 /// Every row is deserialised with `WorkflowEvent`, which is the type
@@ -1287,8 +1360,12 @@ fn races_signal(timer_id: &str, signal: &str) -> bool {
 /// `budget` is the byte budget the query was given. It separates the two
 /// reasons the bytes can end inside a character: the database CUT them there,
 /// or nobody ever wrote a whole one.
-fn cut_text(bytes: Option<Vec<u8>>, chars: u32, budget: u32) -> Option<String> {
+fn cut_text(bytes: Option<Vec<u8>>, chars: u32, source_len: Option<i64>) -> Option<String> {
     let bytes = bytes?;
+    // The field's OWN length, which is the proof a cut happened. A field
+    // longer than the slice continued past it. One no longer than the slice
+    // was returned whole, so an unfinished character in it is damage.
+    let source_len = usize::try_from(source_len.unwrap_or_default()).unwrap_or(bytes.len());
     let whole = match std::str::from_utf8(&bytes) {
         Ok(text) => text,
         // `error_len` answers NOTHING only when the bytes END inside a
@@ -1298,9 +1375,13 @@ fn cut_text(bytes: Option<Vec<u8>>, chars: u32, budget: u32) -> Option<String> {
         // A stop reason of `"end_turn\ud800"` decodes to a valid `end_turn`,
         // and the listing would show a session that ended well.
         //
-        // The budget is what says a cut happened. Bytes SHORTER than it were
-        // returned whole, so an unfinished character in them is damage.
-        Err(split) if split.error_len().is_none() && bytes.len() >= budget as usize => {
+        // The LENGTH is what says a cut happened, and not the budget. A field
+        // exactly the budget long was returned whole, and inferring a cut
+        // from its size showed a plausible prefix for bytes nobody wrote.
+        // Measured on an error of 2003 letters and one `0xE2`. The listing
+        // showed 501 characters and called the row undamaged. The single
+        // status answered `incomplete utf-8 byte sequence from index 2003`.
+        Err(split) if split.error_len().is_none() && source_len > bytes.len() => {
             std::str::from_utf8(&bytes[..split.valid_up_to()]).unwrap_or_default()
         }
         Err(_) => return None,
@@ -1393,7 +1474,25 @@ pub const SESSIONS_QUERY: &str = "SELECT \
                                                        || ']*') = 0), 0) \
                                    ELSE 1 END \
                          ELSE 1 END, \
-                    rowid \
+                    rowid, \
+                    CASE WHEN typeof(exec_id) = 'text' \
+                         THEN length(cast(exec_id as blob)) END, \
+                    CASE WHEN typeof(state) = 'text' \
+                         THEN length(cast(state as blob)) END, \
+                    CASE WHEN typeof(input_json) = 'text' AND json_valid(input_json) \
+                          AND json_type(input_json, '$.goal') = 'text' \
+                         THEN length(cast(json_extract(input_json, '$.goal') \
+                                          as blob)) END, \
+                    CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
+                          AND json_type(output_json, '$.stop') = 'text' \
+                         THEN length(cast(json_extract(output_json, '$.stop') \
+                                          as blob)) END, \
+                    CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
+                          AND json_type(output_json, '$.answer') = 'text' \
+                         THEN length(cast(json_extract(output_json, '$.answer') \
+                                          as blob)) END, \
+                    CASE WHEN typeof(error) = 'text' \
+                         THEN length(cast(error as blob)) END \
              FROM harvest_executions \
              WHERE cast(workflow_name as blob) = cast(?1 as blob) \
              AND rowid < ?4 \
@@ -1480,16 +1579,24 @@ pub fn executions(
                 TIMEOUT_CEILING
             ],
             |row| {
+                // A TEXT column can still hold bytes no character has. The
+                // class test alone called such a row sound, while the single
+                // status refused the same field. The read itself is the
+                // evidence: the column held something and nothing came back.
+                let error_bytes: Option<Vec<u8>> = row.get(7)?;
+                let error = cut_text(error_bytes.clone(), LISTED_READ_CHARS, row.get(17)?);
+                let error_is_damaged: bool =
+                    row.get(8)? || (error_bytes.is_some() && error.is_none());
                 Ok(SessionSummary {
-                    exec_id: cut_text(row.get(0)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
-                    state: cut_text(row.get(1)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
-                    goal: cut_text(row.get(2)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
-                    stop: cut_text(row.get(3)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
+                    exec_id: cut_text(row.get(0)?, LISTED_READ_CHARS, row.get(12)?),
+                    state: cut_text(row.get(1)?, LISTED_READ_CHARS, row.get(13)?),
+                    goal: cut_text(row.get(2)?, LISTED_READ_CHARS, row.get(14)?),
+                    stop: cut_text(row.get(3)?, LISTED_READ_CHARS, row.get(15)?),
                     turns: row.get(4)?,
                     tool_calls: row.get(5)?,
-                    answer: cut_text(row.get(6)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
-                    error: cut_text(row.get(7)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
-                    error_is_damaged: row.get(8)?,
+                    answer: cut_text(row.get(6)?, LISTED_READ_CHARS, row.get(16)?),
+                    error,
+                    error_is_damaged,
                     report_is_damaged: row.get(9)?,
                     task_is_damaged: row.get(10)?,
                     row: row.get(11)?,

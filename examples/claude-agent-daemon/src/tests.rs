@@ -5870,7 +5870,13 @@ fn a_restored_wait_is_armed_and_unanswered() {
          PRIMARY KEY (exec_id, seq)); \
          CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
          exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
-         delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+         delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0); \
+         CREATE TABLE harvest_tasks (task_id TEXT PRIMARY KEY, exec_id TEXT NOT NULL, \
+         activity_id TEXT NOT NULL, name TEXT NOT NULL, input_json TEXT NOT NULL, \
+         queue TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL, \
+         run_at INTEGER NOT NULL, seq INTEGER NOT NULL, max_attempts INTEGER, \
+         retry_policy_json TEXT, start_to_close_ms INTEGER, \
+         scheduled_at INTEGER NOT NULL)",
     )
     .expect("the fixture tables are created");
 
@@ -11065,7 +11071,13 @@ fn a_restart_refuses_a_history_that_reads_two_ways() {
              PRIMARY KEY (exec_id, seq)); \
              CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
              exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
-             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0); \
+         CREATE TABLE harvest_tasks (task_id TEXT PRIMARY KEY, exec_id TEXT NOT NULL, \
+         activity_id TEXT NOT NULL, name TEXT NOT NULL, input_json TEXT NOT NULL, \
+         queue TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL, \
+         run_at INTEGER NOT NULL, seq INTEGER NOT NULL, max_attempts INTEGER, \
+         retry_policy_json TEXT, start_to_close_ms INTEGER, \
+         scheduled_at INTEGER NOT NULL)",
         )
         .expect("the fixture tables are created");
         conn.execute(
@@ -11178,7 +11190,13 @@ fn a_session_with_no_armed_wait_is_read_too() {
          PRIMARY KEY (exec_id, seq)); \
          CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
          exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
-         delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+         delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0); \
+         CREATE TABLE harvest_tasks (task_id TEXT PRIMARY KEY, exec_id TEXT NOT NULL, \
+         activity_id TEXT NOT NULL, name TEXT NOT NULL, input_json TEXT NOT NULL, \
+         queue TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL, \
+         run_at INTEGER NOT NULL, seq INTEGER NOT NULL, max_attempts INTEGER, \
+         retry_policy_json TEXT, start_to_close_ms INTEGER, \
+         scheduled_at INTEGER NOT NULL)",
     )
     .expect("the fixture tables are created");
     // No timer at all, which is the shape the old placement never reached.
@@ -11233,7 +11251,13 @@ fn a_staged_decision_the_engine_cannot_read_is_refused() {
              PRIMARY KEY (exec_id, seq)); \
              CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
              exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
-             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0); \
+         CREATE TABLE harvest_tasks (task_id TEXT PRIMARY KEY, exec_id TEXT NOT NULL, \
+         activity_id TEXT NOT NULL, name TEXT NOT NULL, input_json TEXT NOT NULL, \
+         queue TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL, \
+         run_at INTEGER NOT NULL, seq INTEGER NOT NULL, max_attempts INTEGER, \
+         retry_policy_json TEXT, start_to_close_ms INTEGER, \
+         scheduled_at INTEGER NOT NULL)",
         )
         .expect("the fixture tables are created");
         conn.execute(
@@ -11337,7 +11361,13 @@ fn a_history_is_read_with_the_engines_own_type() {
              PRIMARY KEY (exec_id, seq)); \
              CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
              exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
-             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0); \
+         CREATE TABLE harvest_tasks (task_id TEXT PRIMARY KEY, exec_id TEXT NOT NULL, \
+         activity_id TEXT NOT NULL, name TEXT NOT NULL, input_json TEXT NOT NULL, \
+         queue TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL, \
+         run_at INTEGER NOT NULL, seq INTEGER NOT NULL, max_attempts INTEGER, \
+         retry_policy_json TEXT, start_to_close_ms INTEGER, \
+         scheduled_at INTEGER NOT NULL)",
         )
         .expect("the fixture tables are created");
         let sql = if blob {
@@ -11420,7 +11450,13 @@ fn a_staged_decision_is_read_as_the_type_the_workflow_asks_for() {
              PRIMARY KEY (exec_id, seq)); \
              CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
              exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
-             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0); \
+         CREATE TABLE harvest_tasks (task_id TEXT PRIMARY KEY, exec_id TEXT NOT NULL, \
+         activity_id TEXT NOT NULL, name TEXT NOT NULL, input_json TEXT NOT NULL, \
+         queue TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL, \
+         run_at INTEGER NOT NULL, seq INTEGER NOT NULL, max_attempts INTEGER, \
+         retry_policy_json TEXT, start_to_close_ms INTEGER, \
+         scheduled_at INTEGER NOT NULL)",
         )
         .expect("the fixture tables are created");
         conn.execute(
@@ -11496,7 +11532,13 @@ fn a_delivered_decision_is_read_as_the_type_the_workflow_asks_for() {
              PRIMARY KEY (exec_id, seq)); \
              CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
              exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
-             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0); \
+         CREATE TABLE harvest_tasks (task_id TEXT PRIMARY KEY, exec_id TEXT NOT NULL, \
+         activity_id TEXT NOT NULL, name TEXT NOT NULL, input_json TEXT NOT NULL, \
+         queue TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL, \
+         run_at INTEGER NOT NULL, seq INTEGER NOT NULL, max_attempts INTEGER, \
+         retry_policy_json TEXT, start_to_close_ms INTEGER, \
+         scheduled_at INTEGER NOT NULL)",
         )
         .expect("the fixture tables are created");
         conn.execute(
@@ -11580,7 +11622,13 @@ fn a_delivery_for_another_signal_leaves_this_wait_outstanding() {
          PRIMARY KEY (exec_id, seq)); \
          CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
          exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
-         delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+         delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0); \
+         CREATE TABLE harvest_tasks (task_id TEXT PRIMARY KEY, exec_id TEXT NOT NULL, \
+         activity_id TEXT NOT NULL, name TEXT NOT NULL, input_json TEXT NOT NULL, \
+         queue TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL, \
+         run_at INTEGER NOT NULL, seq INTEGER NOT NULL, max_attempts INTEGER, \
+         retry_policy_json TEXT, start_to_close_ms INTEGER, \
+         scheduled_at INTEGER NOT NULL)",
     )
     .expect("the fixture tables are created");
     conn.execute(
@@ -11805,7 +11853,13 @@ fn a_recorded_result_is_read_as_the_type_its_activity_declares() {
              PRIMARY KEY (exec_id, seq)); \
              CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
              exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
-             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0); \
+         CREATE TABLE harvest_tasks (task_id TEXT PRIMARY KEY, exec_id TEXT NOT NULL, \
+         activity_id TEXT NOT NULL, name TEXT NOT NULL, input_json TEXT NOT NULL, \
+         queue TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL, \
+         run_at INTEGER NOT NULL, seq INTEGER NOT NULL, max_attempts INTEGER, \
+         retry_policy_json TEXT, start_to_close_ms INTEGER, \
+         scheduled_at INTEGER NOT NULL)",
         )
         .expect("the fixture tables are created");
         // The schedule names the activity. Without it the completion's type
@@ -12020,7 +12074,13 @@ fn a_recorded_reply_is_held_to_the_live_safety_checks() {
              PRIMARY KEY (exec_id, seq)); \
              CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
              exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
-             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0); \
+         CREATE TABLE harvest_tasks (task_id TEXT PRIMARY KEY, exec_id TEXT NOT NULL, \
+         activity_id TEXT NOT NULL, name TEXT NOT NULL, input_json TEXT NOT NULL, \
+         queue TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL, \
+         run_at INTEGER NOT NULL, seq INTEGER NOT NULL, max_attempts INTEGER, \
+         retry_policy_json TEXT, start_to_close_ms INTEGER, \
+         scheduled_at INTEGER NOT NULL)",
         )
         .expect("the fixture tables are created");
         conn.execute(
@@ -12119,7 +12179,13 @@ fn every_recorded_approval_is_read_and_not_only_the_awaited_one() {
              PRIMARY KEY (exec_id, seq)); \
              CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
              exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
-             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0); \
+         CREATE TABLE harvest_tasks (task_id TEXT PRIMARY KEY, exec_id TEXT NOT NULL, \
+         activity_id TEXT NOT NULL, name TEXT NOT NULL, input_json TEXT NOT NULL, \
+         queue TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL, \
+         run_at INTEGER NOT NULL, seq INTEGER NOT NULL, max_attempts INTEGER, \
+         retry_policy_json TEXT, start_to_close_ms INTEGER, \
+         scheduled_at INTEGER NOT NULL)",
         )
         .expect("the fixture tables are created");
         if armed {
@@ -12197,7 +12263,13 @@ fn one_recorded_reply(id: &str, reply: &session::TurnReply) -> rusqlite::Connect
          PRIMARY KEY (exec_id, seq)); \
          CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
          exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
-         delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+         delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0); \
+         CREATE TABLE harvest_tasks (task_id TEXT PRIMARY KEY, exec_id TEXT NOT NULL, \
+         activity_id TEXT NOT NULL, name TEXT NOT NULL, input_json TEXT NOT NULL, \
+         queue TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL, \
+         run_at INTEGER NOT NULL, seq INTEGER NOT NULL, max_attempts INTEGER, \
+         retry_policy_json TEXT, start_to_close_ms INTEGER, \
+         scheduled_at INTEGER NOT NULL)",
     )
     .expect("the fixture tables are created");
     conn.execute(
@@ -12561,5 +12633,175 @@ fn a_refusal_the_api_sends_is_accepted() {
             .expect("the wait query runs"),
         None,
         "and a recorded refusal is a history the restart accepts"
+    );
+}
+
+/// A cut is proven by the field's own LENGTH, not inferred from its size.
+///
+/// The listing asks the database for a byte budget. Bytes that end inside a
+/// character are the cut the database was asked to make, and the caller keeps
+/// the valid prefix. That reading was inferred from the SIZE of the slice. A
+/// field EXACTLY the budget long, ending in a broken sequence, was therefore
+/// read as a cut.
+///
+/// Measured before the fix, on an error of 2003 letters and one `0xE2`:
+///
+/// ```text
+/// listed error      = Some(501 chars)
+/// error_is_damaged  = false
+/// single status     = Err(incomplete utf-8 byte sequence from index 2003)
+/// ```
+///
+/// The listing showed a plausible prefix for bytes nobody wrote, and called
+/// the row sound, while the status refused the same field.
+#[test]
+fn a_cut_is_proven_by_the_length_and_not_by_the_size() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("cuts.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+
+    // EXACTLY the budget, ending inside a character. Nothing follows it, so
+    // no cut happened and the broken tail is damage.
+    let mut exact = "x"
+        .repeat(inspect::MAX_LISTED_BYTES as usize - 1)
+        .into_bytes();
+    exact.push(0xE2);
+    // LONGER than the budget, and every character whole. The database cuts
+    // it, and the cut lands inside the last character it returns.
+    let long = "é".repeat(inspect::MAX_LISTED_BYTES as usize).into_bytes();
+    for (exec, bytes) in [("exact", &exact), ("long", &long)] {
+        writer
+            .execute(
+                "INSERT INTO harvest_executions VALUES (?1, ?2, 'FAILED', ?3, NULL, \
+                 cast(?4 as text))",
+                rusqlite::params![exec, WORKFLOW_NAME, READABLE_TASK, bytes],
+            )
+            .expect("the session is recorded");
+    }
+    drop(writer);
+
+    let reader = inspect::open(&db).expect("the reader opens");
+    let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
+    let row = |exec: &str| {
+        listed
+            .iter()
+            .find(|r| r.exec_id.as_deref() == Some(exec))
+            .expect("the session is listed")
+    };
+
+    // The field ended inside a character and nothing followed it.
+    assert_eq!(
+        row("exact").error,
+        None,
+        "a field the database returned WHOLE is damaged, not cut"
+    );
+    assert!(
+        row("exact").error_is_damaged,
+        "and the row says so, as the single status does"
+    );
+    // The single status is the authority, and it refuses the same field.
+    assert!(
+        inspect::execution(&reader, WORKFLOW_NAME, "exact")
+            .map(|_| ())
+            .is_err(),
+        "the single status refuses the same field"
+    );
+
+    // The not-the-fault case: a field the database really did cut is still
+    // shown, with the character the cut split dropped.
+    let shown = row("long")
+        .error
+        .as_ref()
+        .expect("a cut field is still shown");
+    assert!(
+        !shown.is_empty() && shown.chars().all(|c| c == 'é'),
+        "a cut field keeps the characters that survived: {shown:?}"
+    );
+    assert!(!row("long").error_is_damaged, "and a cut is not damage");
+}
+
+/// A PENDING task the BACKEND cannot claim refuses the restart.
+///
+/// `claim_next_ready_task_tx` reads `input_json` as a `String` and parses it,
+/// BEFORE it marks the row `RUNNING`. A row it cannot read is therefore never
+/// consumed: the claim errors, the row stays `PENDING`, and the next drive
+/// meets it again. `drive_one` keeps the session after such an error, so the
+/// daemon reports readiness and retries a session that can never advance.
+///
+/// The event log says nothing about this. It is a THIRD table, beside the
+/// events and the staged decisions.
+#[test]
+fn a_pending_task_the_backend_cannot_claim_refuses_the_restart() {
+    let build = |blob: bool, input: &str, policy: Option<&str>| {
+        let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
+        conn.execute_batch(
+            "CREATE TABLE harvest_timers (timer_id TEXT, exec_id TEXT, fire_at INTEGER, \
+             fired INTEGER NOT NULL DEFAULT 0, arm_seq INTEGER, \
+             PRIMARY KEY (exec_id, timer_id)); \
+             CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+             PRIMARY KEY (exec_id, seq)); \
+             CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+             exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0); \
+             CREATE TABLE harvest_tasks (task_id TEXT PRIMARY KEY, exec_id TEXT NOT NULL, \
+             activity_id TEXT NOT NULL, name TEXT NOT NULL, input_json TEXT NOT NULL, \
+             queue TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL, \
+             run_at INTEGER NOT NULL, seq INTEGER NOT NULL, max_attempts INTEGER, \
+             retry_policy_json TEXT, start_to_close_ms INTEGER, \
+             scheduled_at INTEGER NOT NULL)",
+        )
+        .expect("the fixture tables are created");
+        let sql = if blob {
+            "INSERT INTO harvest_tasks VALUES ('t', 'e', 'a', 'claude_turn', \
+             cast(?1 as blob), 'default', 'PENDING', 0, 0, 0, NULL, ?2, NULL, 0)"
+        } else {
+            "INSERT INTO harvest_tasks VALUES ('t', 'e', 'a', 'claude_turn', ?1, \
+             'default', 'PENDING', 0, 0, 0, NULL, ?2, NULL, 0)"
+        };
+        conn.execute(sql, rusqlite::params![input, policy])
+            .expect("the pending task is recorded");
+        conn
+    };
+
+    for (label, blob, input, policy) in [
+        ("a class the backend cannot read", true, r#"{"a":1}"#, None),
+        ("text that is not JSON", false, "{not json", None),
+        (
+            "a retry policy the backend cannot read",
+            false,
+            r#"{"a":1}"#,
+            Some("{not json"),
+        ),
+    ] {
+        let conn = build(blob, input, policy);
+        let refused = inspect::outstanding_signal(&conn, "e", 1_000)
+            .expect_err("a task the backend cannot claim must refuse the restart");
+        assert!(
+            refused.contains("pending work"),
+            "[{label}] the refusal must say WHY it refuses: {refused}"
+        );
+        assert!(
+            refused.contains("cannot be driven again"),
+            "[{label}] and what it means for the session: {refused}"
+        );
+    }
+
+    // The not-the-fault cases. A claimable task leaves the session alone, and
+    // so does a task that is no longer PENDING.
+    assert_eq!(
+        inspect::outstanding_signal(&build(false, r#"{"a":1}"#, None), "e", 1_000)
+            .expect("the wait query runs"),
+        None,
+        "a task the backend can claim is not refused"
+    );
+    let running = build(true, r#"{"a":1}"#, None);
+    running
+        .execute("UPDATE harvest_tasks SET state = 'RUNNING'", [])
+        .expect("the task is claimed");
+    assert_eq!(
+        inspect::outstanding_signal(&running, "e", 1_000).expect("the wait query runs"),
+        None,
+        "a row the backend no longer claims is not this check's business"
     );
 }
