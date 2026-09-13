@@ -983,8 +983,11 @@ fn group_by_pool_identity(pools: &BTreeMap<ShardId, DbPool>) -> BTreeMap<ShardId
 /// which relation a query resolves against.
 ///
 /// A DNS hostname is lowercased, since it is case-insensitive. A
-/// Unix-socket path is kept as written instead, since a filesystem path
-/// is not: `/run/PG-A` and `/run/pg-a` name different sockets.
+/// Unix-socket path keeps its case instead, since a filesystem path is
+/// not: `/run/PG-A` and `/run/pg-a` name different sockets. It is
+/// otherwise normalized by [`normalize_unix_socket_path`], which strips
+/// harmless redundancy such as `.` components -- `/run/postgresql` and
+/// `/run/./postgresql` name the same socket.
 ///
 /// A DSN with no path names no database. That is not the same as
 /// naming none: libpq defaults an omitted `dbname` to the connecting
@@ -1067,14 +1070,14 @@ fn canonical_dsn_key(dsn: &str) -> String {
                     // Do not lowercase it like a real hostname. The key this
                     // function returns for one DSN must not depend on which
                     // platform built the binary that computed it.
-                    hosts.push(name.clone());
+                    hosts.push(normalize_unix_socket_path(name));
                 } else {
                     hosts.push(name.to_ascii_lowercase());
                 }
             }
             #[cfg(unix)]
             tokio_postgres::config::Host::Unix(path) => {
-                hosts.push(path.to_string_lossy().into_owned());
+                hosts.push(normalize_unix_socket_path(&path.to_string_lossy()));
             }
         }
     }
@@ -1104,6 +1107,30 @@ fn canonical_dsn_key(dsn: &str) -> String {
     let search_path = extract_search_path(config.get_options().unwrap_or_default());
 
     format!("{location:?}{ports:?}/{db:?}?search_path={search_path:?}")
+}
+
+/// Strips a Unix-socket path's harmless syntactic redundancy: a `.`
+/// component, and an empty component from a doubled or trailing `/`
+/// (Codex review, PR #1504). `/run/postgresql` and `/run/./postgresql`
+/// name the identical socket directory on every POSIX filesystem, with
+/// no lookup needed to know that.
+///
+/// A `..` component is deliberately left alone. Its target can depend
+/// on whether an earlier component is a symlink, which this function
+/// cannot know without asking the filesystem. That is the same reason
+/// [`canonical_dsn_key`]'s own doc leaves a host alias undetected:
+/// building a pool must stay a pure, local operation with no I/O.
+#[cfg(feature = "db")]
+fn normalize_unix_socket_path(path: &str) -> String {
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect();
+    if path.starts_with('/') {
+        format!("/{}", segments.join("/"))
+    } else {
+        segments.join("/")
+    }
 }
 
 /// Pulls only `search_path` settings out of a libpq `options` string,
@@ -2614,6 +2641,38 @@ mod tests {
             2,
             "a socket path's case is significant, so these must never \
              collapse into one group"
+        );
+    }
+
+    // A Unix-socket path's `.` component and doubled `/` are harmless
+    // syntactic redundancy the OS ignores. `/run/postgresql` and
+    // `/run/./postgresql` name the same socket (Codex review, PR #1504).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_shards_sharing_one_socket_path_written_differently() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgresql:///harvest?host=%2Frun%2Fpostgresql".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgresql:///harvest?host=%2Frun%2F.%2Fpostgresql%2F".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "a `.` component and a trailing `/` name the same directory \
+             the OS would resolve without them, so these must collapse \
+             into one group"
         );
     }
 
