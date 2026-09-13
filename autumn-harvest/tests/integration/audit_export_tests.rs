@@ -956,7 +956,7 @@ async fn redrive_recoverable_count_falls_short_when_a_purge_already_removed_part
         .execute(&mut conn)
         .await
         .expect("age rows 1-3");
-    let deleted = purge_old_audit_records(&mut conn, 90)
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0], &[])
         .await
         .expect("purge runs");
     assert_eq!(deleted, 3, "retention purges the aged, acknowledged rows");

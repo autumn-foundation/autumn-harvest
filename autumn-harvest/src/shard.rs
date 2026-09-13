@@ -1153,9 +1153,13 @@ fn canonical_dsn_key(dsn: &str) -> String {
 /// a literal quote character. `tenant,public` and `tenant, public` name
 /// the same search path and must compare equal. `"tenant, one"` (one
 /// quoted name) must never compare equal to `tenant,one` (two unquoted
-/// names). Full `PostgreSQL` locale-dependent case folding is not
-/// chased here; ASCII/Unicode lowercasing is the accepted
-/// approximation, alongside the other documented gaps below.
+/// names). Folding is ASCII-only (`A`-`Z` to `a`-`z`), matching
+/// `PostgreSQL` itself under a multibyte server encoding such as
+/// `UTF8`, where a non-ASCII byte is never downcased. A single-byte
+/// encoding's own further, locale-dependent folding is not chased
+/// here. That gap can only split two names `PostgreSQL` would treat
+/// as one, never merge two it keeps apart. It stands alongside the
+/// other documented gaps below.
 ///
 /// `options` can repeat `-c search_path=...` more than once. libpq
 /// applies each as a `SET` in order at session start, so only the last
@@ -1372,8 +1376,12 @@ fn truncate_postgres_identifier(name: &str) -> &str {
 /// `is_postgres_whitespace`'s six-character ASCII set rather than
 /// Rust's Unicode-aware `char::is_whitespace`, matching
 /// `SplitIdentifierString`'s own `scanner_isspace`. An
-/// unquoted item is folded to lowercase, matching `PostgreSQL`'s own
-/// folding of an unquoted identifier. A double-quoted item keeps its
+/// unquoted item is folded to lowercase using ASCII-only `A`-`Z`
+/// folding, not Rust's Unicode-aware `str::to_lowercase`. `PostgreSQL`
+/// itself never downcases a non-ASCII byte under a multibyte server
+/// encoding such as `UTF8`. Unicode folding would collapse two
+/// genuinely distinct identifiers into one canonical key that
+/// `PostgreSQL` keeps apart. A double-quoted item keeps its
 /// case verbatim, including any comma or whitespace it encloses; `""`
 /// inside one is a literal quote character. Either form is then
 /// truncated to `PostgreSQL`'s identifier length limit, matching what
@@ -1414,7 +1422,7 @@ fn parse_identifier_list(value: &str) -> Option<Vec<String>> {
                     ident.push(c);
                     chars.next();
                 }
-                let folded = ident.to_lowercase();
+                let folded = ident.to_ascii_lowercase();
                 items.push(truncate_postgres_identifier(&folded).to_string());
             }
         }
@@ -3009,6 +3017,19 @@ mod tests {
 
     #[cfg(feature = "db")]
     #[test]
+    fn parse_identifier_list_does_not_fold_a_non_ascii_uppercase_letter() {
+        assert_eq!(
+            parse_identifier_list("\u{c4}"),
+            Some(vec!["\u{c4}".to_string()]),
+            "PostgreSQL never downcases a non-ASCII byte under a \
+             multibyte server encoding such as UTF8, so Ä must stay Ä, \
+             not fold to ä the way Rust's Unicode-aware \
+             str::to_lowercase would"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
     fn from_dsns_groups_search_path_identifiers_that_differ_only_by_case() {
         let sharded = ShardedDbPool::from_dsns(
             [
@@ -3032,6 +3053,37 @@ mod tests {
             1,
             "PostgreSQL folds an unquoted identifier to lowercase, so \
              `PUBLIC` and `public` name the same schema and must collapse"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_search_path_identifiers_that_differ_only_by_non_ascii_case_distinct() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3D%C3%84".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3D%C3%A4".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "PostgreSQL never downcases a non-ASCII byte under a \
+             multibyte server encoding such as UTF8, so unquoted `Ä` \
+             and `ä` name two distinct schemas. Folding them together \
+             here would merge two apparent groups that are really \
+             separate databases, losing one pool's connection entirely"
         );
     }
 
