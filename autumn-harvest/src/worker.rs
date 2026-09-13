@@ -28390,7 +28390,7 @@ async fn acquire_conn_for_workflow_task_timeout_recovery(
 /// Look up the workflow name and queue name for timeout metric labels.
 ///
 /// Falls back to `("unknown", "default")` on any DB or pool failure, or on
-/// a checkout that exceeds [`WORKFLOW_TASK_TIMEOUT_ACQUIRE_BOUND`]. The
+/// a checkout that exceeds [`workflow_task_timeout_acquire_bound`]. The
 /// metric is always emitted, even when the execution row is gone or the
 /// pool is saturated.
 async fn workflow_task_timeout_metric_names(
@@ -28402,9 +28402,8 @@ async fn workflow_task_timeout_metric_names(
     let Some(exec_uuid) = exec_id else {
         return ("unknown".to_string(), "default".to_string());
     };
-    let Ok(Ok(mut conn)) =
-        tokio::time::timeout(WORKFLOW_TASK_TIMEOUT_ACQUIRE_BOUND, pool.get()).await
-    else {
+    let bound = workflow_task_timeout_acquire_bound(pool);
+    let Ok(Ok(mut conn)) = tokio::time::timeout(bound, pool.get()).await else {
         return ("unknown".to_string(), "default".to_string());
     };
     dsl::harvest_workflow_executions
