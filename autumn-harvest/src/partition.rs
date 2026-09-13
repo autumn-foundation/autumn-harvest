@@ -3228,6 +3228,52 @@ impl MaintenanceOutcome {
 
 // ── The large-live-table migration plan ────────────────────────────────────
 
+/// A boolean SQL expression checking that `c`/`i` name a **correctly
+/// shaped** unique index on exactly `columns`, in order. `c`/`i` are
+/// aliases for `pg_class` and `pg_index`, already joined and filtered to
+/// `indrelid = 'harvest_events'`.
+///
+/// Used by the phase-4 assertion below to close a narrow but real hole. An
+/// operator's own pre-existing, valid index can happen to hold one of the
+/// two fixed names (`{LEGACY_PARTITION}_pk_idx`,
+/// `{LEGACY_PARTITION}_exec_event_idx`). That makes phase 2's `CREATE ...
+/// IF NOT EXISTS` skip building the real one. Checking only the name and
+/// `indisvalid` — the assertion's original form — counts that impostor as
+/// ready. `ATTACH PARTITION` then builds the real index inside the window
+/// this plan advertises as metadata-only.
+///
+/// Checks uniqueness, and the exact key column list (position included —
+/// `(a, b)` is not `(b, a)`). Also checks that there is no partial-index
+/// predicate or expression column, and that every key column uses its
+/// type's default
+/// operator class. `indkey` is an `int2vector`, whose Postgres-defined
+/// array lower bound is `0`, so `indkey[0]` is the first key column.
+#[must_use]
+fn index_shape_check_sql(index_name: &str, columns: &[&str]) -> String {
+    let col_checks: String = columns
+        .iter()
+        .enumerate()
+        .map(|(pos, col)| {
+            format!(
+                "i.indkey[{pos}] = (SELECT a.attnum FROM pg_attribute a \
+                 WHERE a.attrelid = 'harvest_events'::regclass AND a.attname = '{col}')"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let n = columns.len();
+    format!(
+        "(c.relname = '{index_name}' AND i.indisunique AND i.indpred IS NULL \
+         AND i.indexprs IS NULL AND i.indnkeyatts = {n} AND i.indnatts = {n} \
+         AND {col_checks} \
+         AND NOT EXISTS (\
+             SELECT 1 FROM unnest(i.indclass) AS oc(opclass) \
+             JOIN pg_opclass op ON op.oid = oc.opclass \
+             WHERE NOT op.opcdefault\
+         ))"
+    )
+}
+
 /// One statement of the large-live-table conversion plan.
 ///
 /// The plan exists in exactly one form — this list — and
@@ -3274,6 +3320,12 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
     let lock_ms = opts.lock_timeout.as_millis().max(1);
     let suffix_len = LEGACY_RENAME_SUFFIX.len();
     let cutover_lit = ts_literal(cohort_start(now, width));
+    let pk_idx_check =
+        index_shape_check_sql(&format!("{LEGACY_PARTITION}_pk_idx"), &["id", "cohort"]);
+    let exec_event_idx_check = index_shape_check_sql(
+        &format!("{LEGACY_PARTITION}_exec_event_idx"),
+        &["workflow_exec_id", "event_id", "cohort"],
+    );
 
     let step = |phase: u8, sql: String| PlanStep {
         phase,
@@ -3517,6 +3569,12 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // phase-2 build aborts before it has renamed anything. Without it,
         // `ATTACH PARTITION` below discovers the missing index only once the
         // exclusive lock is held, and builds it there.
+        //
+        // Checks SHAPE, not just name and `indisvalid` (issue #1270 item
+        // 11). An operator's own pre-existing, valid index can happen to
+        // hold one of these two fixed names. That makes phase 2's
+        // `IF NOT EXISTS` skip building the real one. This assertion must
+        // not count that impostor as ready.
         step(
             4,
             format!(
@@ -3526,12 +3584,11 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
                  JOIN pg_namespace ns ON ns.oid = c.relnamespace\n     \
                  WHERE ns.nspname = current_schema() AND i.indisvalid\n       \
                  AND i.indrelid = 'harvest_events'::regclass\n       \
-                 AND c.relname IN ('{LEGACY_PARTITION}_pk_idx',\n                         \
-                 '{LEGACY_PARTITION}_exec_event_idx');\n    \
+                 AND ({pk_idx_check} OR {exec_event_idx_check});\n    \
                  IF n <> 2 THEN\n        \
-                 RAISE EXCEPTION 'harvest #958: phase 2 left % of 2 valid indexes on \
-                 harvest_events. ATTACH PARTITION would build the missing one while \
-                 holding ACCESS EXCLUSIVE. Re-run phase 2, then this window.', n;\n    \
+                 RAISE EXCEPTION 'harvest #958: phase 2 left % of 2 valid, correctly-shaped \
+                 indexes on harvest_events. ATTACH PARTITION would build the missing one \
+                 while holding ACCESS EXCLUSIVE. Re-run phase 2, then this window.', n;\n    \
                  END IF;\nEND\n$harvest_assert_958$;"
             ),
         ),

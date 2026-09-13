@@ -3145,6 +3145,97 @@ async fn the_lock_window_refuses_to_open_over_an_invalid_index() {
 }
 
 #[tokio::test]
+async fn phase_4_refuses_a_valid_index_with_the_right_name_and_the_wrong_shape() {
+    // Issue #1270 item 11: phase 4 asserted only the NAME and `indisvalid`
+    // of the two phase-2 indexes. An operator's own pre-existing, valid
+    // index can hold one of those two fixed names. That makes `CREATE ...
+    // IF NOT EXISTS` in phase 2 silently skip building the real one. `IF
+    // NOT EXISTS` checks only for a name collision, not definition
+    // compatibility. The old assertion counted that impostor as ready.
+    // `ATTACH PARTITION` would then build a real replacement inside the
+    // window this plan advertises as metadata-only.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(&mut conn, "shape_wf", "shape-1", day(2026, 2, 3), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    // The impostor: right name, valid, but the wrong columns and not even
+    // unique.
+    let pk = plan_pk_index();
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {pk}"))
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query(format!("CREATE INDEX {pk} ON harvest_events (event_type)"))
+        .execute(&mut conn)
+        .await
+        .expect("seed an impostor index with the pk-index name but the wrong shape");
+    assert!(
+        index_is_valid(&mut conn, &pk).await,
+        "precondition: the impostor is VALID, not merely present"
+    );
+
+    run_plan_phases(&mut conn, 1..=3).await;
+
+    let mut failed = false;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 4)
+    {
+        if diesel::sql_query(&step.sql)
+            .execute(&mut conn)
+            .await
+            .is_err()
+        {
+            failed = true;
+        }
+    }
+    assert!(
+        failed,
+        "phase 4 must refuse when a valid index of the right name has the \
+         wrong shape, not count it as the real one"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused window must leave the shard exactly as it was"
+    );
+
+    // Phases 1-3 each commit on their own (unlike phase 4). So the
+    // impostor, the real index phase 2 built alongside it, and phase 3's
+    // CHECK constraint all survive this refusal. Clean them up: a later
+    // test's `reset_to_unpartitioned` only reverses a PARTITIONED shard.
+    // Debris left on a still-flat table would otherwise leak into it.
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {pk}"))
+        .execute(&mut conn)
+        .await
+        .expect("drop the impostor index");
+    diesel::sql_query(format!(
+        "DROP INDEX IF EXISTS {}_exec_event_idx",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the index phase 2 legitimately built");
+    diesel::sql_query(format!(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS {}_cohort_ck",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the constraint phase 3 legitimately built");
+}
+
+#[tokio::test]
 async fn converting_refuses_while_any_publication_covers_harvest_events() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
