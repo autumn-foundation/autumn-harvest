@@ -9324,6 +9324,67 @@ fn an_id_too_long_to_decide_is_refused() {
     );
 }
 
+/// The longest allowed id still fits ONE argument of a shell command.
+///
+/// The status prints the approval token as one positional argument, and an
+/// operator copies that line into a shell. Linux caps a single argv entry at
+/// 32 pages and refuses the whole command past it, so `approve` and `deny`
+/// both fail before `agentd` starts. The session then parks until its
+/// deadline with no way to answer it.
+///
+/// The cap used to be measured against the control socket alone, which is
+/// eight times larger. A band of ids was therefore accepted, recorded, and
+/// printed inside a command that cannot run.
+///
+/// The exec halves run on Linux only. The limit is the kernel's, and macOS
+/// has a different one: no per-argument cap, and the vector and environment
+/// share 262144 bytes. The arithmetic half runs everywhere.
+#[test]
+fn the_longest_id_still_fits_one_shell_argument() {
+    let token = |id: &str| session::approval_signal(2, 0, id);
+    let longest = token(&"a".repeat(claude::MAX_CALL_ID_BYTES));
+    assert!(
+        longest.len() <= claude::MAX_ARGUMENT_BYTES,
+        "the widest token must fit one argument: {} against {}",
+        longest.len(),
+        claude::MAX_ARGUMENT_BYTES
+    );
+
+    #[cfg(target_os = "linux")]
+    {
+        // The hazard, stated first. This is the id the OLD cap allowed: it
+        // is under the control socket's limit and over the shell's.
+        let undecidable = token(&"a".repeat(1_048_064));
+        let refused = std::process::Command::new("/bin/true")
+            .arg(&undecidable)
+            .status()
+            .expect_err("a token of that length cannot be executed");
+        assert_eq!(
+            refused.raw_os_error(),
+            Some(7),
+            "and the shell refuses it with E2BIG: {refused}"
+        );
+
+        // The boundary. The widest token this daemon can offer runs.
+        std::process::Command::new("/bin/true")
+            .arg(&longest)
+            .status()
+            .expect("the widest token this daemon offers must execute");
+    }
+
+    // An ordinary id is untouched by any of this.
+    assert!(
+        claude::has_addressable_calls(&reply_with_call_id("toolu_01A2b3C4d5E6f7")),
+        "a real tool-use id must still be addressable"
+    );
+    assert!(
+        !claude::has_addressable_calls(&reply_with_call_id(
+            &"a".repeat(claude::MAX_CALL_ID_BYTES + 1)
+        )),
+        "and one byte past the cap is not"
+    );
+}
+
 /// The identity a daemon started with these two settings records.
 ///
 /// This is the value `check_resumable` compares a recorded session against.

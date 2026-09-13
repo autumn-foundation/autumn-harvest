@@ -769,20 +769,53 @@ fn is_replayable_block(block: &Value) -> bool {
 /// frame and proves the allowance is enough.
 const DECISION_FRAME_ALLOWANCE: usize = 512;
 
+/// The longest ONE argument a supported shell can execute.
+///
+/// Linux caps a single argv entry at 32 pages, and not the vector. Measured
+/// on the supported Linux environment: an argument of 131071 bytes executes,
+/// and one of 131072 fails with `E2BIG`. The whole vector is far larger,
+/// `ARG_MAX` 2097152, so the per-argument limit is the one that binds.
+///
+/// macOS has no per-argument limit. It caps the vector and the environment
+/// together at 262144. A command at this bound therefore fits there while the
+/// environment is under about 130000 bytes. An ordinary environment is two
+/// orders of magnitude under that.
+pub const MAX_ARGUMENT_BYTES: usize = 131_071;
+
 /// The longest tool-use id a reply may carry.
 ///
-/// The id becomes part of the approval token, and a decision crosses the
-/// control socket as ONE line under [`crate::daemon::MAX_REQUEST_BYTES`]. An
-/// id too long for that line is a call nobody can approve AND nobody can
+/// The id becomes part of the approval token, and the token must pass TWO
+/// limits. It crosses the control socket as one line under
+/// [`crate::daemon::MAX_REQUEST_BYTES`]. It is also printed as one argument
+/// of an `agentd approve` command line, which an operator copies into a
+/// shell. See [`MAX_ARGUMENT_BYTES`].
+///
+/// The cap is the SMALLER of the two, so a token that is offered is a token
+/// that can be sent. Measured, the argument limit is the smaller by a factor
+/// of eight.
+///
+/// An id too long for either is a call nobody can approve AND nobody can
 /// deny. The session then parks until its deadline, and the operator has no
-/// way to answer it.
+/// way to answer it. The shell answers `E2BIG` before `agentd` starts, so
+/// neither the approval nor the denial runs.
 ///
 /// The durable cap does not catch this. A reply costs about twice its ids,
 /// and the request cap is about half the recorded cap. A band of ids
 /// therefore records and cannot be decided. Measured: an id of 1048456 bytes
 /// records in 2097137 bytes, under the cap, and needs a 1048585-byte
 /// decision.
-pub const MAX_CALL_ID_BYTES: usize = crate::daemon::MAX_REQUEST_BYTES - DECISION_FRAME_ALLOWANCE;
+///
+/// One allowance covers both frames. The socket frame is the larger of the
+/// two, because the argv frame is the `tool_approval` prefix alone.
+pub const MAX_CALL_ID_BYTES: usize = {
+    let request = crate::daemon::MAX_REQUEST_BYTES - DECISION_FRAME_ALLOWANCE;
+    let argument = MAX_ARGUMENT_BYTES - DECISION_FRAME_ALLOWANCE;
+    if argument < request {
+        argument
+    } else {
+        request
+    }
+};
 
 /// Can every tool call in this reply be addressed on its own?
 ///
