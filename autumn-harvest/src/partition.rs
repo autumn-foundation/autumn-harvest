@@ -5121,15 +5121,23 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // instead of either silently destroying the unrelated object or
         // silently leaving it squatting on the name this plan needs to
         // (re)build under.
+        //
+        // Review finding: `NULLS NOT DISTINCT` is checked through
+        // `pg_get_indexdef`, not `pg_index.indnullsnotdistinct` directly.
+        // See `index_shape_check_sql`'s identical fix -- that column
+        // does not exist before `PostgreSQL` 15, and
+        // `docs/partitioned-events.md` still supports 14. A literal
+        // reference there would fail this `DO` block to parse on every
+        // supported-14 deployment, even one with no invalid index at all.
         step(2, "BEGIN".to_string()),
         step(2, format!("SET LOCAL lock_timeout = '{lock_ms}ms'")),
         step(
             2,
             format!(
                 "DO $harvest_reindex_958$\nDECLARE idx record; ok boolean;\nBEGIN\n    \
-                 FOR idx IN SELECT c.relname AS n, t.relname AS tbl, i.indrelid AS reloid,\n                            \
-                 i.indkey AS indkey, i.indnkeyatts AS nkeyatts, i.indnatts AS natts,\n                            \
-                 i.indisunique AS uniq, i.indnullsnotdistinct AS nulls_not_distinct,\n                            \
+                 FOR idx IN SELECT c.oid AS idxoid, c.relname AS n, t.relname AS tbl,\n                            \
+                 i.indrelid AS reloid, i.indkey AS indkey, i.indnkeyatts AS nkeyatts,\n                            \
+                 i.indnatts AS natts, i.indisunique AS uniq,\n                            \
                  i.indpred AS pred, i.indexprs AS exprs, i.indclass AS opclasses,\n                            \
                  i.indoption AS opts\n                       \
                  FROM pg_class c\n                \
@@ -5147,14 +5155,16 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
                  AND NOT EXISTS (SELECT 1 FROM unnest(idx.opts) AS o(bits) WHERE bits <> 0);\n        \
                  IF idx.n = '{LEGACY_PARTITION}_pk_idx' THEN\n            \
                  ok := ok AND idx.tbl = 'harvest_events' AND idx.uniq\n                  \
-                 AND NOT idx.nulls_not_distinct AND idx.nkeyatts = 2 AND idx.natts = 2\n                  \
+                 AND pg_get_indexdef(idx.idxoid) NOT ILIKE '%NULLS NOT DISTINCT%'\n                  \
+                 AND idx.nkeyatts = 2 AND idx.natts = 2\n                  \
                  AND (SELECT array_agg(a.attname::text ORDER BY k)\n                         \
                  FROM generate_series(0, 1) k\n                         \
                  JOIN pg_attribute a ON a.attrelid = idx.reloid AND a.attnum = idx.indkey[k]\n                      \
                  ) = ARRAY['id', 'cohort'];\n        \
                  ELSIF idx.n = '{LEGACY_PARTITION}_exec_event_idx' THEN\n            \
                  ok := ok AND idx.tbl = 'harvest_events' AND idx.uniq\n                  \
-                 AND NOT idx.nulls_not_distinct AND idx.nkeyatts = 3 AND idx.natts = 3\n                  \
+                 AND pg_get_indexdef(idx.idxoid) NOT ILIKE '%NULLS NOT DISTINCT%'\n                  \
+                 AND idx.nkeyatts = 3 AND idx.natts = 3\n                  \
                  AND (SELECT array_agg(a.attname::text ORDER BY k)\n                         \
                  FROM generate_series(0, 2) k\n                         \
                  JOIN pg_attribute a ON a.attrelid = idx.reloid AND a.attnum = idx.indkey[k]\n                      \

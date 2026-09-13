@@ -6241,6 +6241,72 @@ async fn phase_2_refuses_a_same_table_same_columns_index_with_different_semantic
 }
 
 #[tokio::test]
+async fn phase_2_refuses_an_invalid_nulls_not_distinct_impostor_of_the_pk_index() {
+    // Review finding: `NULLS NOT DISTINCT` is checked through
+    // `pg_get_indexdef`, not `pg_index.indnullsnotdistinct` directly --
+    // that column does not exist before PostgreSQL 15, and
+    // `docs/partitioned-events.md` still supports 14. This also proves
+    // the check works, not merely that it compiles. An invalid index
+    // could sit at the reserved pk-index name, on the right table with
+    // the right columns, but `NULLS NOT DISTINCT`. It must still refuse
+    // rather than being treated as this plan's own remnant.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {}", plan_pk_index()))
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query(format!(
+        "CREATE UNIQUE INDEX {} ON harvest_events (id, cohort) NULLS NOT DISTINCT",
+        plan_pk_index()
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed an impostor index with the pk-index shape and columns, but NULLS NOT DISTINCT");
+    invalidate_index(&mut conn, &plan_pk_index()).await;
+
+    run_plan_phases(&mut conn, 1..=1).await;
+
+    let mut refusal: Option<String> = None;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 2)
+    {
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            refusal = Some(e.to_string());
+        }
+    }
+    let msg = refusal.expect(
+        "phase 2 must refuse an invalid NULLS NOT DISTINCT impostor of the pk index, \
+         not treat it as this plan's own remnant",
+    );
+    assert!(
+        msg.contains(&plan_pk_index()),
+        "the refusal must name the offending index; got {msg}"
+    );
+    assert!(
+        scalar_bool(
+            &mut conn,
+            &format!(
+                "SELECT pg_get_indexdef(i.indexrelid) ILIKE '%NULLS NOT DISTINCT%' AS v \
+                 FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid \
+                 WHERE c.relname = '{}'",
+                plan_pk_index()
+            ),
+        )
+        .await,
+        "the operator's NULLS NOT DISTINCT impostor must survive untouched"
+    );
+
+    diesel::sql_query(format!("DROP INDEX {}", plan_pk_index()))
+        .execute(&mut conn)
+        .await
+        .expect("drop the impostor index");
+}
+
+#[tokio::test]
 async fn the_lock_window_refuses_to_open_over_an_invalid_index() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
