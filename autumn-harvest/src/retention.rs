@@ -384,10 +384,11 @@ pub struct PartitionMaintenanceConfig {
     /// Maximum partitions *evaluated* per tick, dropped or not.
     ///
     /// `max_drops_per_tick` bounds successful drops, not the cost of finding
-    /// them: a blocked partition can still cost a tier-3 scan up to
+    /// them. A blocked partition can still cost a tier-3 scan up to
     /// `exact_scan_timeout_secs`. Without its own budget, one long-lived
     /// execution pinning many old cohorts can make a tick evaluate every
-    /// closed partition, drop none, and spend the whole tick doing it.
+    /// closed partition. It would drop none, and spend the whole tick
+    /// doing it.
     pub max_attempts_per_tick: usize,
     /// Seconds to wait for that lock before deferring a partition to the next
     /// tick. Failing fast is what protects the concurrent-p99 budget.
@@ -1064,15 +1065,15 @@ impl RetentionRuntime {
         let (trigger_tx, mut trigger_rx) = mpsc::channel(1);
         // Issue #1270 item 5: run the first tick immediately rather than
         // waiting a full `tick_interval` (an hour, by default). Partition
-        // maintenance is the sharp edge — a shard that restarts after being
-        // offline longer than its lookahead window has no covering partition
-        // until the first pass runs, and every append meanwhile lands in the
-        // DEFAULT partition, whose later drain is the disruptive path this
-        // module exists to avoid. Buffered here, before the loop below ever
-        // runs: the channel has capacity 1, so this permit is waiting the
-        // moment the first `tokio::select!` polls it, and — since `sleep`
-        // cannot possibly have elapsed yet — the trigger branch always wins
-        // the first iteration.
+        // maintenance is the sharp edge. A shard that restarts after being
+        // offline longer than its lookahead window has no covering
+        // partition until the first pass runs. Every append meanwhile lands
+        // in the DEFAULT partition, whose later drain is the disruptive
+        // path this module exists to avoid. Buffered here, before the loop
+        // below ever runs: the channel has capacity 1, so this permit is
+        // waiting the moment the first `tokio::select!` polls it. Since
+        // `sleep` cannot possibly have elapsed yet, the trigger branch
+        // always wins the first iteration.
         let _ = trigger_tx.try_send(());
         // Issue #797: declare the loop before its first iteration so the
         // `scanner_liveness` check expects it and grants it boot grace.
@@ -1257,13 +1258,14 @@ impl RetentionRuntime {
                         // Probed before `maintain` runs it, so an unpartitioned
                         // shard can be told apart from one that ran and did
                         // nothing (issue #1270 item 6). `maintain` itself is
-                        // gated the same way and returns a stamped, empty
-                        // outcome for an unpartitioned shard — right for a
-                        // manual `harvest partition maintain`, wrong here:
-                        // `RetentionTickResult.partition_maintenance` is
-                        // documented as `None` on a shard that never opted in,
-                        // and recording `Some(...)` for it every tick would say
-                        // maintenance is active where it never converted.
+                        // gated the same way, and returns a stamped, empty
+                        // outcome for an unpartitioned shard. That is right
+                        // for a manual `harvest partition maintain`, but
+                        // wrong here: `RetentionTickResult.partition_maintenance`
+                        // is documented as `None` on a shard that never
+                        // opted in. Recording `Some(...)` for it every tick
+                        // would say maintenance is active where it never
+                        // converted.
                         match crate::partition::detect_layout(&mut conn).await {
                             Ok(crate::partition::EventLayout::Unpartitioned) => continue,
                             Ok(crate::partition::EventLayout::Partitioned { .. }) => {}
@@ -3253,9 +3255,9 @@ mod tests {
             "a zero lookahead must be rejected while partition maintenance is enabled"
         );
 
-        // Disabled maintenance never reads the field, so a stale zero left
-        // over from a config that later turned maintenance off must not block
-        // startup for reasons unrelated to what is actually running.
+        // Disabled maintenance never reads the field. A stale zero left
+        // over from a config that later turned maintenance off must not
+        // block startup for reasons unrelated to what is actually running.
         let config = RetentionConfig {
             partitions: PartitionMaintenanceConfig {
                 enabled: false,
