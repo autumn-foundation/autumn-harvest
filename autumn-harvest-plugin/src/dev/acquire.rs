@@ -163,6 +163,11 @@ fn cached_install(cache_root: &std::path::Path) -> Option<PostgresBinaries> {
 /// directory aside. That user can then put a symlink, or a directory of
 /// their own, in its place. Checking every ancestor removes the directory
 /// such a user would need to replace.
+///
+/// This still checks, then trusts the path for later use. It closes the
+/// race against another local user, but it does not remove the gap
+/// between the check and the run. Only opening a handle and executing
+/// from that handle would remove the gap.
 fn directory_is_private(dir: &std::path::Path) -> bool {
     leaf_is_private(dir) && dir.parent().is_none_or(ancestors_are_private)
 }
@@ -203,6 +208,13 @@ fn leaf_is_private(dir: &std::path::Path) -> bool {
 /// blocks the actual attack: another user renaming or deleting an entry
 /// they do not own. A plain shared temp directory does not need refusal
 /// to close that attack.
+///
+/// [`leaf_is_private`] fails open on ownership when the current uid
+/// cannot be determined. That is by design for one directory: a real
+/// permission problem still surfaces as `initdb`'s own error. This walk
+/// checks many directories. The same fail-open choice would widen, not
+/// narrow, what an unidentified process trusts. An ancestor with an
+/// indeterminate uid is refused here, unless the ancestor is root-owned.
 #[cfg(unix)]
 fn ancestors_are_private(dir: &std::path::Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
@@ -216,8 +228,8 @@ fn ancestors_are_private(dir: &std::path::Path) -> bool {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return false;
         }
-        let untrusted_owner = metadata.uid() != 0
-            && super::reaper::unix_uid().is_some_and(|uid| uid != metadata.uid());
+        let untrusted_owner =
+            metadata.uid() != 0 && super::reaper::unix_uid() != Some(metadata.uid());
         let mode = metadata.permissions().mode();
         let sticky = mode & 0o1000 != 0;
         let writable_by_others = mode & 0o022 != 0;
@@ -254,6 +266,19 @@ fn cache_root() -> Result<PathBuf, DevError> {
         .ok_or_else(|| DevError::Acquire {
             detail: "no cache directory is available (set HARVEST_DEV_CACHE_DIR)".to_owned(),
         })?;
+    // The ancestor walk in `directory_is_private` needs a real chain of
+    // directories to check. A relative path has no such chain above the
+    // current directory, and would fail that walk with a confusing error.
+    // Reject it here, with a message that names the actual problem.
+    if !base.is_absolute() {
+        return Err(DevError::Acquire {
+            detail: format!(
+                "the cache directory {} is not absolute. Set HARVEST_DEV_CACHE_DIR to an \
+                 absolute path",
+                base.display()
+            ),
+        });
+    }
     Ok(base
         .join("autumn-harvest")
         .join("postgresql")
@@ -269,11 +294,19 @@ mod tests {
 
     /// A cache root nested three levels under a fresh, owner-only temp
     /// directory: the shape a real per-user cache has.
+    ///
+    /// Every level gets an explicit `chmod`. `create_dir_all` alone would
+    /// leave each level's mode to the process umask, and a permissive
+    /// umask would then make this "accepted" fixture fail its own test.
     fn private_cache_root() -> (tempfile::TempDir, std::path::PathBuf) {
         let root = tempfile::tempdir().expect("temp dir");
-        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("chmod root");
-        let cache = root.path().join("a").join("b").join("cache");
+        let a = root.path().join("a");
+        let b = a.join("b");
+        let cache = b.join("cache");
         fs::create_dir_all(&cache).expect("mkdir cache");
+        for dir in [root.path(), a.as_path(), b.as_path(), cache.as_path()] {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
         (root, cache)
     }
 
@@ -326,5 +359,24 @@ mod tests {
         let ancestor = root.path().join("a");
         fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o1777)).expect("chmod");
         assert!(directory_is_private(&cache));
+    }
+
+    /// An ancestor owned by neither root nor the current user is refused,
+    /// even with a strict, no-write-bit mode. Mode alone is not the whole
+    /// rule: that owner still controls the directory's contents.
+    ///
+    /// Changing an ancestor's owner needs root, so this test runs only as
+    /// root — the same account this sandbox already runs test suites as.
+    #[test]
+    fn an_ancestor_owned_by_someone_else_is_refused() {
+        if super::super::reaper::unix_uid() != Some(0) {
+            eprintln!("SKIP: chowning an ancestor to another user needs root");
+            return;
+        }
+        let (root, cache) = private_cache_root();
+        let ancestor = root.path().join("a");
+        let other_uid = 65534; // "nobody" on most systems; the raw uid is enough.
+        std::os::unix::fs::chown(&ancestor, Some(other_uid), None).expect("chown");
+        assert!(!directory_is_private(&cache));
     }
 }
