@@ -436,12 +436,32 @@ pub const EVENTS_QUERY: &str = "SELECT seq, \
 /// such reply then hid the call an operator was waiting to decide, while the
 /// status still said the session was waiting. A call `input` can also hold
 /// text Rust cannot read, and bytes let the caller drop that ONE reply.
+///
+/// The last column asks whether the ROW is text. A `BLOB` holding the same
+/// bytes answers `json_valid` and every test above it, so this daemon reads
+/// the reply and its calls. The ENGINE cannot. `load_history` reads every
+/// `event_json` into a `String`, and a `BLOB` fails that read. A run holding
+/// one can never be driven again.
+///
+/// Measured on one reply row rewritten as a `BLOB`. `status` offered the
+/// awaited `write_file` call beside its live token. The next drive answered
+/// `InvalidColumnType(0, "event_json", Blob)`. An operator could
+/// approve a decision that nothing would ever consume.
+///
+/// The row is still SELECTED, and the caller reports it as unreadable. A
+/// query that dropped it would answer with an older reply instead, and a
+/// tool-use id is unique inside one reply only. See [`ReplyCalls`].
+///
+/// This is bounded to the rows this page reads. A `BLOB` row ANYWHERE in a
+/// history stops the same loader, and no bounded read here can see one that
+/// far back. The drive is what finds those.
 pub const REPLIES_QUERY: &str = "SELECT seq, \
             CASE WHEN json_valid(event_json) \
                   AND json_type(event_json, '$.data.output.tool_calls') = 'array' \
                  THEN cast(json_extract(event_json, '$.data.output.tool_calls') \
                            as blob) END, \
-            json_type(event_json, '$.data.output.tool_calls') \
+            json_type(event_json, '$.data.output.tool_calls'), \
+            typeof(event_json) <> 'text' \
      FROM harvest_events \
      WHERE exec_id = ?1 AND seq < ?2 \
      AND json_valid(event_json) \
@@ -656,6 +676,7 @@ pub fn reply_calls(
                     row.get::<_, i64>(0)?,
                     row.get::<_, Option<Vec<u8>>>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, bool>(3)?,
                 ))
             },
         )
@@ -663,7 +684,9 @@ pub fn reply_calls(
 
     rows.map(|row| {
         row.map_err(|e| format!("cannot read the replies: {e}"))
-            .map(|(seq, calls, kind)| (seq, ReplyCalls::read(calls, kind.as_deref())))
+            .map(|(seq, calls, kind, foreign)| {
+                (seq, ReplyCalls::read(calls, kind.as_deref(), foreign))
+            })
     })
     .collect()
 }
@@ -697,7 +720,18 @@ impl ReplyCalls {
     /// the field is there at all. `bytes` carries the array when it is one.
     ///
     /// An array is read WHOLE, and never cut: a cut array is not JSON.
-    fn read(bytes: Option<Vec<u8>>, kind: Option<&str>) -> Self {
+    ///
+    /// `foreign` says the ROW is not text. The engine loads a history by
+    /// reading every `event_json` into a `String`, which a `BLOB` refuses. A
+    /// run holding one can never be driven again. This daemon reads such a
+    /// row perfectly well. Offering the call inside it would offer a decision
+    /// no drive can consume. See [`REPLIES_QUERY`].
+    fn read(bytes: Option<Vec<u8>>, kind: Option<&str>, foreign: bool) -> Self {
+        // The row reads HERE and not in the engine. That is the first test,
+        // because the field inside it then decides nothing.
+        if foreign {
+            return Self::Unreadable;
+        }
         // No field at all. The reply asked for nothing.
         if kind.is_none() {
             return Self::NoCalls;

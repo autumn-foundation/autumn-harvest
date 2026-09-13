@@ -8781,6 +8781,100 @@ async fn a_live_parked_session_still_shows_its_awaited_call() {
     assert_eq!(found.token, signal, "beside its own token");
 }
 
+/// A reply the ENGINE cannot load offers no call to decide.
+///
+/// A `BLOB` holding the same bytes answers `json_valid`, so this daemon reads
+/// the reply and its calls. `load_history` reads every `event_json` into a
+/// `String`, which a `BLOB` refuses, so a run holding one can never be driven
+/// again.
+///
+/// Measured before the fix, on a REAL parked session with one reply row
+/// rewritten in place. `status` offered the awaited `write_file` call beside
+/// its live token. The next drive answered `InvalidColumnType(0,
+/// "event_json", Blob)`. An operator could approve a decision that nothing
+/// would ever consume.
+///
+/// The row stays in the page. A query that dropped it would answer with an
+/// older reply, and a tool-use id is unique inside one reply only.
+#[tokio::test]
+async fn a_reply_the_engine_cannot_load_offers_no_call() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    std::fs::write(workspace.join("README.md"), "hello").expect("the fixture is written");
+    let db = dir.path().join("foreign.db");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut rt = runtime(&db, &workspace, &calls);
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
+        .expect("the session starts");
+    let signal = drive_to_approval(&mut rt, exec).await;
+    drop(rt);
+    let exec_id = exec.to_string();
+
+    // The same session, before the row changes class. The call is offered.
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let page = inspect::reply_calls(&reader, &exec_id, None, 1).expect("the replies read");
+    let seq = page.first().expect("a reply is recorded").0;
+    assert!(
+        daemon::pending_call(&reader, &exec_id, &signal, false)
+            .expect("the replies read")
+            .is_some(),
+        "the fixture must offer the call before the row changes class"
+    );
+    drop(reader);
+
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    writer
+        .execute(
+            "UPDATE harvest_events SET event_json = cast(event_json as blob) \
+             WHERE exec_id = ?1 AND seq = ?2",
+            rusqlite::params![exec_id, seq],
+        )
+        .expect("the row is rewritten");
+    let class: String = writer
+        .query_row(
+            "SELECT typeof(event_json) FROM harvest_events WHERE exec_id = ?1 AND seq = ?2",
+            rusqlite::params![exec_id, seq],
+            |row| row.get(0),
+        )
+        .expect("the storage class reads");
+    assert_eq!(class, "blob", "the fixture must store the class it means");
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let page = inspect::reply_calls(&reader, &exec_id, None, 1).expect("the replies read");
+    let (found, reply) = page.first().expect("the row is still in the page");
+    assert_eq!(
+        *found, seq,
+        "the newest reply is still the newest, and not dropped for an older one"
+    );
+    assert!(
+        matches!(reply, inspect::ReplyCalls::Unreadable),
+        "a row the engine cannot load reads as unreadable: {reply:?}"
+    );
+
+    let refused = daemon::pending_call(&reader, &exec_id, &signal, false)
+        .expect_err("no call may be offered from a row the engine cannot load");
+    assert!(
+        !refused.contains("write_file") && !refused.contains("agent-notes.md"),
+        "and the refusal never names the call: {refused}"
+    );
+    drop(reader);
+
+    // The reason the refusal exists. The engine reads every row into a
+    // `String`, so this run can never be driven again.
+    let mut rt = runtime(&db, &workspace, &calls);
+    let refused = rt
+        .run_until_blocked(exec)
+        .await
+        .expect_err("the engine cannot load a history holding this row");
+    assert!(
+        format!("{refused:?}").contains("event_json"),
+        "the drive fails on the row itself: {refused:?}"
+    );
+}
+
 /// One reply carrying a tool call with this id.
 fn reply_with_call_id(id: &str) -> TurnReply {
     TurnReply {
