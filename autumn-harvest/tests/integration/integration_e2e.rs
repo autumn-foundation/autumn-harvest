@@ -1613,8 +1613,20 @@ fn slow_activity<'a>(
     _ctx: &'a ActivityContext,
     input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    // A fixed sleep raced the 100ms StartToClose timeout below. Under a
+    // loaded CI runner, a delayed scanner tick let the activity finish
+    // first. That changed the event history this test asserts on. It
+    // failed twice in a row on this PR (issue #1272).
+    //
+    // Sleep past the test's own 10-second bound instead. The activity
+    // then cannot complete before the wait loop gives up. The only way
+    // to reach FAILED is the StartToClose timeout.
+    //
+    // `worker.shutdown()`'s 1-second budget does not abort this task. It
+    // only stops waiting for it. The test's own runtime drops it at
+    // teardown.
     Box::pin(async move {
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
         Ok(input)
     })
 }
@@ -3472,7 +3484,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     name: "slow_activity",
                     module: "integration_e2e",
                     default_retry_policy: None,
-                    default_start_to_close: Some(Duration::from_millis(50)),
+                    default_start_to_close: Some(Duration::from_millis(100)),
                     default_heartbeat_timeout: None,
                     default_schedule_to_start: None,
                     default_schedule_to_close: None,
