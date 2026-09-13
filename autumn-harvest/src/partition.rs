@@ -1881,6 +1881,18 @@ harvest_events afterward), then re-run.', bad_trg;
     -- index -- never when IF NOT EXISTS finds an operator's own index
     -- already at that name. `disable_partitioning` reads the tag back to
     -- decide whether it may drop the index.
+    --
+    -- Review finding: the existence probe and the CREATE INDEX below are
+    -- two separate statements. Without a lock spanning both, a concurrent
+    -- session could commit an identically-shaped index between them. This
+    -- statement's own IF NOT EXISTS would then skip creation silently, but
+    -- `we_idx_existed` was already captured as false, so the index gets
+    -- tagged as harvest-owned anyway -- and a later `disable_partitioning`
+    -- would drop the OTHER session's index. SHARE UPDATE EXCLUSIVE
+    -- conflicts with itself, so it serializes this whole probe-create-tag
+    -- sequence against any other session doing the same thing, while still
+    -- allowing ordinary reads and writes on the table.
+    LOCK TABLE harvest_workflow_executions IN SHARE UPDATE EXCLUSIVE MODE;
     SELECT EXISTS (
         SELECT 1 FROM pg_class c
           JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -3704,6 +3716,54 @@ fn index_shape_check_sql(index_name: &str, columns: &[&str]) -> String {
     )
 }
 
+/// A `DO` block refusing over a unique index that cannot survive conversion
+/// unchanged. Tagged with `tag`, so it can appear more than once in the same
+/// generated script.
+///
+/// Review finding: phase 1's copy of this check runs hours before phase 4's
+/// rename, under `migration_plan`'s online path. An operator could add a
+/// compatible-looking constraint-backed unique index in that window and
+/// pass phase 1 clean. `capture_index_defs` would still drop it silently
+/// at phase 4, exactly like [`unique_indexes_missing_cohort`]'s own
+/// docstring explains. Recheck it under phase 4's lock too, alongside the
+/// view and trigger rechecks.
+#[must_use]
+fn unique_index_guard_sql(tag: &str) -> String {
+    format!(
+        "DO ${tag}$\nDECLARE bad text;\nBEGIN\n    \
+         SELECT string_agg(i.indexrelid::regclass::text, ', ' ORDER BY 1) INTO bad\n      \
+         FROM pg_index i\n      \
+         JOIN pg_class c ON c.oid = i.indrelid\n      \
+         JOIN pg_namespace n ON n.oid = c.relnamespace\n      \
+         JOIN pg_attribute ca\n        \
+         ON ca.attrelid = c.oid AND ca.attname = 'cohort'\n     \
+         WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
+         AND i.indisunique\n       \
+         AND NOT EXISTS (\n           \
+         SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid\n             \
+         AND con.conname IN ('harvest_events_pkey',\n                                 \
+         'harvest_events_workflow_exec_id_event_id_key')\n       \
+         )\n       \
+         AND (\n           \
+         EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)\n           \
+         OR NOT EXISTS (\n               \
+         SELECT 1 FROM generate_series(0, i.indnkeyatts - 1) k\n                \
+         WHERE i.indkey[k] = ca.attnum\n           \
+         )\n       \
+         );\n    \
+         IF bad IS NOT NULL THEN\n        \
+         RAISE EXCEPTION 'harvest #958: harvest_events carries a unique index that \
+         cannot survive conversion unchanged (%). Either it does not include \
+         `cohort` -- Postgres requires the partition key in every unique index on a \
+         partitioned table, so phase 4 replaying it would fail -- or it is backed by \
+         a table constraint other than harvest''s own two, which phase 4 has no way \
+         to replay and would otherwise drop silently. Drop the index or constraint if \
+         it is obsolete, or recreate it including `cohort` yourself, before running \
+         this plan.', bad;\n    \
+         END IF;\nEND\n${tag}$;"
+    )
+}
+
 /// A `DO` block refusing when a view depends on `harvest_events`, tagged
 /// with `tag` so it can appear more than once in the same generated script.
 ///
@@ -3919,41 +3979,7 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // `refuse_if_unique_index_without_cohort` — Postgres requires the
         // partition key in every unique index on a partitioned table, and
         // phase 4 replays every captured index verbatim.
-        step(
-            1,
-            "DO $harvest_uniq_958$\nDECLARE bad text;\nBEGIN\n    \
-             SELECT string_agg(i.indexrelid::regclass::text, ', ' ORDER BY 1) INTO bad\n      \
-             FROM pg_index i\n      \
-             JOIN pg_class c ON c.oid = i.indrelid\n      \
-             JOIN pg_namespace n ON n.oid = c.relnamespace\n      \
-             JOIN pg_attribute ca\n        \
-             ON ca.attrelid = c.oid AND ca.attname = 'cohort'\n     \
-             WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
-             AND i.indisunique\n       \
-             AND NOT EXISTS (\n           \
-             SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid\n             \
-             AND con.conname IN ('harvest_events_pkey',\n                                 \
-             'harvest_events_workflow_exec_id_event_id_key')\n       \
-             )\n       \
-             AND (\n           \
-             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)\n           \
-             OR NOT EXISTS (\n               \
-             SELECT 1 FROM generate_series(0, i.indnkeyatts - 1) k\n                \
-             WHERE i.indkey[k] = ca.attnum\n           \
-             )\n       \
-             );\n    \
-             IF bad IS NOT NULL THEN\n        \
-             RAISE EXCEPTION 'harvest #958: harvest_events carries a unique index that \
-             cannot survive conversion unchanged (%). Either it does not include \
-             `cohort` -- Postgres requires the partition key in every unique index on a \
-             partitioned table, so phase 4 replaying it would fail -- or it is backed by \
-             a table constraint other than harvest''s own two, which phase 4 has no way \
-             to replay and would otherwise drop silently. Drop the index or constraint if \
-             it is obsolete, or recreate it including `cohort` yourself, before running \
-             this plan.', bad;\n    \
-             END IF;\nEND\n$harvest_uniq_958$;"
-                .to_string(),
-        ),
+        step(1, unique_index_guard_sql("harvest_uniq_958")),
         // ── 1: refuse early over a view depending on harvest_events ───────
         //
         // Same reason and same phase as the guards above.
@@ -4116,6 +4142,13 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
             4,
             "LOCK TABLE harvest_events IN ACCESS EXCLUSIVE MODE".to_string(),
         ),
+        // Review finding: phase 1's unique-index check has the identical
+        // hours-long gap to phase 4's rename. An operator could add a
+        // compatible-looking constraint-backed unique index in that gap.
+        // It would pass phase 1 clean, and still have it silently dropped
+        // by `capture_index_defs` at phase 4. Recheck it too, under the
+        // same lock.
+        step(4, unique_index_guard_sql("harvest_uniq_cutover_958")),
         // Review finding: phase 1's dependent-view check ran hours before
         // this window, under this plan's online path. A view created (or
         // repointed) at `harvest_events` in that gap would pass phase 1

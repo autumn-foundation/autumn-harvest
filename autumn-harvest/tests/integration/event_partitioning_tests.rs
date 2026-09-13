@@ -5136,6 +5136,91 @@ async fn phase_4_rechecks_an_operator_trigger_installed_after_phase_1() {
 }
 
 #[tokio::test]
+async fn phase_4_rechecks_a_constraint_backed_unique_index_installed_after_phase_1() {
+    // Review finding (Codex, on the phase-4 view/trigger rechecks above):
+    // phase 1's unique-index guard has the identical hours-long gap. An
+    // operator could add a constraint-backed unique index — one that even
+    // includes `cohort` — in that gap. It would pass phase 1 clean, since
+    // phase 1 already ran. `capture_index_defs` still excludes every
+    // constraint-backed index unconditionally, though, so phase 4 would
+    // silently drop it instead of refusing.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    run_plan_phases(&mut conn, 1..=3).await;
+
+    // Simulate a constraint-backed unique index added in the gap between
+    // phase 1 and phase 4.
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS uq_late_event_type_958",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray constraint from a previous run");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT uq_late_event_type_958 \
+         UNIQUE (id, cohort)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a constraint-backed unique index added after phase 1's check already passed");
+
+    let mut refusal: Option<String> = None;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 4)
+    {
+        // Phase 4's steps share one transaction. Only the FIRST error is
+        // the signal; the loop still runs to the trailing `COMMIT`, which
+        // Postgres always accepts even mid-abort.
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await
+            && refusal.is_none()
+        {
+            refusal = Some(e.to_string());
+        }
+    }
+    let msg = refusal.expect(
+        "phase 4 must refuse a constraint-backed unique index added after phase 1's \
+         check already passed",
+    );
+    assert!(
+        msg.contains("uq_late_event_type_958"),
+        "the refusal must name the offending index; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused window must leave the shard exactly as it was"
+    );
+
+    // Phases 1-3 each commit on their own (unlike phase 4). Clean up
+    // their artifacts exactly like the sibling recheck tests above.
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT uq_late_event_type_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending constraint");
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {}", plan_pk_index()))
+        .execute(&mut conn)
+        .await
+        .expect("drop the index phase 2 legitimately built");
+    diesel::sql_query(format!(
+        "DROP INDEX IF EXISTS {}_exec_event_idx",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the other index phase 2 legitimately built");
+    diesel::sql_query(format!(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS {}_cohort_ck",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the constraint phase 3 legitimately built");
+}
+
+#[tokio::test]
 async fn converting_refuses_while_any_publication_covers_harvest_events() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
