@@ -1094,6 +1094,64 @@ async fn lag_covers_records_that_are_sequenced_but_not_yet_acknowledged() {
     );
 }
 
+// `occurred_at` is transaction START time. A long transaction can commit,
+// and so become visible to the exporter, AFTER a shorter one that started
+// later. The long transaction then gets a HIGHER `export_seq` while it
+// carries an OLDER `occurred_at` (issue #1271). A lookup keyed on the
+// single lowest pending sequence finds the short transaction and reports
+// its age instead of the true oldest pending record.
+#[tokio::test]
+async fn lag_is_not_fooled_by_a_late_committing_row_with_a_lower_sequence() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 2).await;
+
+    let old_row: uuid::Uuid = harvest_audit_log::table
+        .filter(harvest_audit_log::target_id.eq("exec-0"))
+        .select(harvest_audit_log::id)
+        .first(&mut conn)
+        .await
+        .expect("row 0");
+    let new_row: uuid::Uuid = harvest_audit_log::table
+        .filter(harvest_audit_log::target_id.eq("exec-1"))
+        .select(harvest_audit_log::id)
+        .first(&mut conn)
+        .await
+        .expect("row 1");
+
+    // The long transaction: old `occurred_at`, but the HIGHER sequence,
+    // because it became visible to the exporter later.
+    diesel::update(harvest_audit_log::table.filter(harvest_audit_log::id.eq(old_row)))
+        .set((
+            harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::seconds(200)),
+            harvest_audit_log::export_seq.eq(2),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("backdate and sequence the long transaction");
+
+    // The short transaction: recent `occurred_at`, LOWER sequence.
+    diesel::update(harvest_audit_log::table.filter(harvest_audit_log::id.eq(new_row)))
+        .set((
+            harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::seconds(5)),
+            harvest_audit_log::export_seq.eq(1),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("sequence the short transaction");
+
+    let lag = autumn_harvest::audit_export::export_lag_seconds(&mut conn, 0, chrono::Utc::now())
+        .await
+        .expect("lag query");
+    assert!(
+        lag > 150.0,
+        "the oldest pending record is ~200s old even though it holds the \
+         HIGHER sequence; a lookup keyed on the lowest sequence alone reports \
+         ~5s and hides the true lag. got {lag}"
+    );
+}
+
 // ── The lease is what stops two exporters delivering a shard concurrently ───
 
 #[tokio::test]

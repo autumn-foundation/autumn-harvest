@@ -330,6 +330,14 @@ and tenant-identifying (ADR-0001 §7).
 > to see. The oldest-record age is the one an SLO like "export lag < 30s p99"
 > can actually be measured against.
 
+> **A bounded precision limit (issue #1271).** `occurred_at` is transaction
+> start time. A long transaction can commit, and so become visible to the
+> exporter, after a shorter one that started later. The gauge finds the
+> true oldest pending record within the lowest `EXPORT_LAG_LOOKBACK_ROWS`
+> (1000) pending sequences. Skew beyond that many rows is not reflected.
+> `GET /admin/audit-export` runs the unbounded, exact query instead — use
+> it to confirm a reading this gauge cannot fully resolve.
+
 The gauge is emitted on **every** exporter tick, including ticks that deliver
 nothing — the signal must not go stale precisely when delivery has stopped.
 
