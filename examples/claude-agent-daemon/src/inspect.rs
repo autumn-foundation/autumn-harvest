@@ -291,8 +291,14 @@ pub fn open(db: &Path) -> Result<Connection, String> {
 ///
 /// Returns an error if the query fails.
 pub fn is_session(conn: &Connection, workflow_name: &str, exec_id: &str) -> Result<bool, String> {
+    // The name is matched by its BYTES. A `BLOB` holding the same letters
+    // never compares equal to a `TEXT` parameter. This answer is what
+    // `history` uses to tell a typo from a session, and such a row read as a
+    // typo. The lookup still seeks on `exec_id`, which is the primary key,
+    // so the cast costs nothing here.
     conn.query_row(
-        "SELECT 1 FROM harvest_executions WHERE workflow_name = ?1 AND exec_id = ?2",
+        "SELECT 1 FROM harvest_executions \
+         WHERE cast(workflow_name as blob) = cast(?1 as blob) AND exec_id = ?2",
         [workflow_name, exec_id],
         |_| Ok(true),
     )
@@ -757,6 +763,11 @@ impl ReplyCalls {
 /// and allocate the input and the output of every session that ever ran. The
 /// daemon serves its commands one at a time, so that cost blocks every one.
 ///
+/// The workflow name is matched by its BYTES. A `BLOB` holding the same
+/// letters never compares equal to a `TEXT` parameter, so `status` reported
+/// that such a session does not exist. The seek is still on `exec_id`, the
+/// primary key, so the cast costs this read nothing.
+///
 /// # Errors
 ///
 /// Returns an error if the query fails.
@@ -767,7 +778,7 @@ pub fn execution(
 ) -> Result<Option<ExecutionRow>, String> {
     conn.query_row(
         "SELECT exec_id, state, input_json, output_json, error FROM harvest_executions \
-         WHERE workflow_name = ?1 AND exec_id = ?2",
+         WHERE cast(workflow_name as blob) = cast(?1 as blob) AND exec_id = ?2",
         [workflow_name, exec_id],
         |row| {
             Ok(ExecutionRow {
@@ -1065,7 +1076,8 @@ pub const SESSIONS_QUERY: &str = "SELECT \
                                    ELSE 1 END \
                          ELSE 1 END, \
                     rowid \
-             FROM harvest_executions WHERE +workflow_name = ?1 \
+             FROM harvest_executions \
+             WHERE cast(workflow_name as blob) = cast(?1 as blob) \
              AND rowid < ?4 \
              ORDER BY rowid DESC LIMIT ?2";
 
@@ -1083,8 +1095,16 @@ pub fn executions(
     before: Option<i64>,
 ) -> Result<Vec<SessionSummary>, String> {
     // The rows are walked by ROWID, and the workflow name is tested against
-    // each one. The `+` is what asks for that: it takes the name out of the
-    // planner's index choice.
+    // each one. Matching the name by its BYTES is what asks for that now. A
+    // cast takes the name out of the planner's index choice, so the `+` that
+    // used to do it is no longer needed.
+    //
+    // The bytes are what the name must be matched by. A `BLOB` holding the
+    // same letters never compares equal to a `TEXT` parameter. A session
+    // recorded that way was missing from the listing, and `status` and
+    // `history` both reported that it does not exist. A terminal session
+    // simply disappeared. The startup read matches by bytes for the same
+    // reason. See [`RunningSession::name_is_damaged`].
     //
     // The index on the name cannot answer `ORDER BY rowid`, so a lookup
     // through it sorts every matching row in a temporary B-tree before the

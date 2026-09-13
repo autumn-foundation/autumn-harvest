@@ -3393,8 +3393,9 @@ fn a_directory_entry_holding_a_line_break_is_counted_and_not_named() {
 ///
 /// An index on the workflow name cannot answer `ORDER BY rowid`. A lookup
 /// through it therefore sorts every matching session in a temporary B-tree
-/// before the LIMIT applies. The `+` takes the name out of the planner's
-/// index choice, which leaves the rowid walk the listing already wants.
+/// before the LIMIT applies. Matching the name by its bytes takes it out of
+/// the planner's index choice, which leaves the rowid walk the listing
+/// already wants.
 ///
 /// The test reads the PRODUCTION query strings and asks the database how it
 /// would run them. The fixture carries the schema shapes and the index the
@@ -3584,6 +3585,114 @@ fn a_listed_report_is_shown_only_when_it_reads() {
         !shown("part").unwrap_or_default().contains("0 turns"),
         "no count is invented for a field nobody recorded"
     );
+}
+
+/// A session whose NAME is stored as bytes is still this workflow's.
+///
+/// A `BLOB` holding the same letters never compares equal to a `TEXT`
+/// parameter. Measured before the fix, on a terminal session recorded that
+/// way. `list` left it out. `status` and `history` both reported that it does
+/// not exist. A completed session simply disappeared.
+///
+/// The startup read was taught to match by bytes earlier. These three were
+/// not, which is the whole lesson: naming a class of fault is not sweeping
+/// for it.
+///
+/// The last two rows are the other end of the rule. Matching by bytes must
+/// not widen the filter: another workflow's rows stay out, in either class.
+#[test]
+fn a_session_named_in_bytes_is_still_this_workflows() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("names.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+    let report = r#"{"stop":"end_turn","turns":1,"tool_calls":0,"answer":"done"}"#;
+    for (exec, sql) in [
+        (
+            "text-name",
+            "INSERT INTO harvest_executions VALUES (?1, ?2, 'COMPLETED', ?3, ?4, NULL)",
+        ),
+        (
+            "blob-name",
+            "INSERT INTO harvest_executions \
+             VALUES (?1, cast(?2 as blob), 'COMPLETED', ?3, ?4, NULL)",
+        ),
+    ] {
+        writer
+            .execute(
+                sql,
+                rusqlite::params![exec, WORKFLOW_NAME, READABLE_TASK, report],
+            )
+            .expect("the session is recorded");
+    }
+    // Another workflow, in both classes. Neither may be listed as this one.
+    for (exec, sql) in [
+        (
+            "other-text",
+            "INSERT INTO harvest_executions VALUES (?1, ?2, 'COMPLETED', ?3, ?4, NULL)",
+        ),
+        (
+            "other-blob",
+            "INSERT INTO harvest_executions \
+             VALUES (?1, cast(?2 as blob), 'COMPLETED', ?3, ?4, NULL)",
+        ),
+    ] {
+        writer
+            .execute(
+                sql,
+                rusqlite::params![exec, "another_workflow", READABLE_TASK, report],
+            )
+            .expect("the session is recorded");
+    }
+    drop(writer);
+
+    let reader = inspect::open(&db).expect("the reader opens");
+    let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
+    let named: Vec<String> = listed
+        .iter()
+        .filter_map(|row| row.exec_id.clone())
+        .collect();
+    assert_eq!(
+        named,
+        ["text-name", "blob-name"],
+        "both classes of this workflow's name are listed, and no other workflow"
+    );
+
+    for exec in ["text-name", "blob-name"] {
+        assert!(
+            inspect::execution(&reader, WORKFLOW_NAME, exec)
+                .expect("the row reads")
+                .is_some(),
+            "[{exec}] status finds the session"
+        );
+        assert!(
+            inspect::is_session(&reader, WORKFLOW_NAME, exec).expect("the lookup answers"),
+            "[{exec}] history finds the session"
+        );
+        // The row is readable apart from its name, so the listing shows it.
+        let row = listed_row(&listed, exec);
+        assert_eq!(
+            row.goal.as_deref(),
+            Some("summarise it"),
+            "[{exec}] and the row reads as it stands"
+        );
+        assert!(
+            !row.task_is_damaged && !row.report_is_damaged,
+            "[{exec}] a name in the wrong class does not damage the documents"
+        );
+    }
+    for exec in ["other-text", "other-blob"] {
+        assert!(
+            inspect::execution(&reader, WORKFLOW_NAME, exec)
+                .expect("the row reads")
+                .is_none(),
+            "[{exec}] another workflow's session is not this one"
+        );
+        assert!(
+            !inspect::is_session(&reader, WORKFLOW_NAME, exec).expect("the lookup answers"),
+            "[{exec}] and history refuses it as a typo"
+        );
+    }
 }
 
 /// One damaged row does not hide every other session.
