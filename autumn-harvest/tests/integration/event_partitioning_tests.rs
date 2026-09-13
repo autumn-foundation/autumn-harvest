@@ -638,6 +638,102 @@ async fn the_large_table_plans_phase_1_also_refuses_an_include_only_cohort_colum
 }
 
 #[tokio::test]
+async fn an_operators_constraint_backed_unique_index_without_cohort_still_refuses() {
+    // Review finding: the guard exempted ANY constraint-backed index, not
+    // just the enable script's own two. `capture_index_defs` separately
+    // skips every constraint-backed index on the same assumption. An
+    // operator's own `UNIQUE` constraint fell through both checks
+    // unnoticed. It survived only on the legacy partition afterward,
+    // silently weaker than before.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS uq_operator_event_type_958",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray constraint from a previous run");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT uq_operator_event_type_958 \
+         UNIQUE (id, event_type)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator's own constraint-backed unique index missing cohort");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "a constraint-backed unique index must refuse the conversion just like an \
+             ordinary one, not be exempted for merely being constraint-backed",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("uq_operator_event_type_958"),
+        "the refusal must name the offending index; got {msg}"
+    );
+
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT uq_operator_event_type_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending constraint");
+}
+
+#[tokio::test]
+async fn the_large_table_plans_phase_1_also_refuses_a_constraint_backed_unique_index() {
+    // Same guard, the scripted path. Its phase-1 `DO` block had the
+    // identical any-constraint exemption.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS uq_plan_operator_event_type_958",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray constraint from a previous run");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT uq_plan_operator_event_type_958 \
+         UNIQUE (id, event_type)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator's own constraint-backed unique index missing cohort");
+
+    let mut refusal: Option<String> = None;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 1)
+    {
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            refusal = Some(e.to_string());
+        }
+    }
+    let msg = refusal.expect(
+        "phase 1 of the plan must refuse a constraint-backed unique index missing cohort, \
+         not exempt it for merely being constraint-backed",
+    );
+    assert!(
+        msg.contains("uq_plan_operator_event_type_958"),
+        "the refusal must name the offending index; got {msg}"
+    );
+
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT uq_plan_operator_event_type_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending constraint");
+}
+
+#[tokio::test]
 async fn a_dependent_view_refuses_the_conversion_instead_of_silently_going_stale() {
     // Issue #1270 item 14: Postgres tracks a view's dependency by relation
     // OID, not by name. Both conversion paths rename `harvest_events` out
@@ -778,6 +874,218 @@ async fn a_dependent_view_refuses_the_revert_too() {
         .execute(&mut conn)
         .await
         .expect("drop the offending view");
+}
+
+#[tokio::test]
+async fn a_view_depending_on_a_leaf_partition_directly_still_refuses_the_revert() {
+    // Review finding: the dependent-view check matched only the PARENT
+    // name `harvest_events`. Postgres lets a view depend directly on a
+    // LEAF partition instead, queried by name like any other table. Such
+    // a view used to pass this check unnoticed. `disable_partitioning`'s
+    // `DROP ... CASCADE` then took the leaf, and the view with it.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // A populated table takes the AttachLegacy path. That path renames
+    // the flat table to `LEGACY_PARTITION` rather than dropping it.
+    // The Fresh (empty-table) path never creates that name at all.
+    let exec = insert_execution(
+        &mut conn,
+        "leaf_view_wf",
+        "leaf-view-1",
+        day(2026, 2, 3),
+        None,
+    )
+    .await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    diesel::sql_query("DROP VIEW IF EXISTS harvest_events_leaf_view_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray view from a previous run");
+    diesel::sql_query(format!(
+        "CREATE VIEW harvest_events_leaf_view_958 AS SELECT event_type FROM {}",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed a view depending directly on a leaf partition");
+
+    let err = partition::disable_partitioning(&mut conn).await.expect_err(
+        "a view depending directly on a leaf partition must refuse the revert too, \
+         not only one depending on the parent",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_leaf_view_958"),
+        "the refusal must name the offending view; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "p",
+        "a refused revert must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP VIEW harvest_events_leaf_view_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending view");
+}
+
+#[tokio::test]
+async fn enable_sql_rechecks_a_dependent_view_created_after_the_preflight() {
+    // Review finding: `enable_partitioning`'s dependent-view check runs in
+    // Rust, a separate round-trip before `enable_sql`'s script even
+    // starts. That is well before the script takes ACCESS EXCLUSIVE at
+    // the rename. A session that created a view in that gap would have
+    // passed the Rust check clean. This test calls `enable_sql` directly,
+    // bypassing that Rust check entirely. It proves the script also
+    // refuses for itself once it holds the lock, rather than trusting
+    // only a check made before the window opened.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // A populated table takes the AttachLegacy path. That path keeps the
+    // legacy table as a partition rather than dropping it. On the empty
+    // (Fresh) path, Postgres's own `DROP TABLE` already refuses over a
+    // dependent view, for an unrelated reason. That would mask whether
+    // this recheck is what caught it. The populated path never runs
+    // that `DROP`, so this is the only guard standing between it and a
+    // silently stranded view.
+    let exec = insert_execution(&mut conn, "race_view_wf", "race-view-1", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    diesel::sql_query("DROP VIEW IF EXISTS harvest_events_race_view_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray view from a previous run");
+    diesel::sql_query(
+        "CREATE VIEW harvest_events_race_view_958 AS SELECT event_type FROM harvest_events",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a view as if created in the gap after the preflight check");
+
+    let err = diesel_async::SimpleAsyncConnection::batch_execute(
+        &mut conn,
+        &partition::enable_sql(&EnableOptions::default()),
+    )
+    .await
+    .expect_err(
+        "enable_sql must refuse under its own lock, not rely solely on a check made \
+         before the script started",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_race_view_958"),
+        "the refusal must name the offending view; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP VIEW harvest_events_race_view_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending view");
+}
+
+#[tokio::test]
+async fn enable_sql_rechecks_an_operator_trigger_installed_after_the_preflight() {
+    // Same race, the trigger guard's half. Both checks run in Rust before
+    // `enable_sql` starts, so both need the identical re-check once the
+    // script actually holds the lock.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // A populated table takes the AttachLegacy path. That path keeps
+    // the legacy table as a partition rather than dropping it. See the
+    // dependent-view test's sibling comment for why the empty path
+    // cannot isolate this recheck from Postgres's own protection.
+    let exec = insert_execution(&mut conn, "race_trg_wf", "race-trg-1", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    diesel::sql_query("DROP TRIGGER IF EXISTS harvest_events_race_trg_958 ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray trigger from a previous run");
+    diesel::sql_query("DROP FUNCTION IF EXISTS harvest_events_race_trg_958_fn()")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray trigger function from a previous run");
+    diesel::sql_query(
+        "CREATE FUNCTION harvest_events_race_trg_958_fn() RETURNS trigger AS $$ \
+         BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a trigger function");
+    diesel::sql_query(
+        "CREATE TRIGGER harvest_events_race_trg_958 BEFORE INSERT ON harvest_events \
+         FOR EACH ROW EXECUTE FUNCTION harvest_events_race_trg_958_fn()",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a trigger as if installed in the gap after the preflight check");
+
+    let err = diesel_async::SimpleAsyncConnection::batch_execute(
+        &mut conn,
+        &partition::enable_sql(&EnableOptions::default()),
+    )
+    .await
+    .expect_err(
+        "enable_sql must refuse under its own lock, not rely solely on a check made \
+         before the script started",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_race_trg_958"),
+        "the refusal must name the offending trigger; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP TRIGGER harvest_events_race_trg_958 ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending trigger");
+    diesel::sql_query("DROP FUNCTION harvest_events_race_trg_958_fn()")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending trigger function");
 }
 
 #[tokio::test]
@@ -1238,6 +1546,96 @@ async fn an_operator_trigger_whose_function_lives_in_another_schema_still_refuse
 }
 
 #[tokio::test]
+async fn a_trigger_installed_directly_on_a_leaf_partition_still_refuses_the_revert() {
+    // Review finding: the trigger guard matched only the PARENT name
+    // `harvest_events`. Postgres lets a trigger be installed directly on a
+    // LEAF partition instead of the parent. Such a trigger used to pass
+    // this check unnoticed. `disable_partitioning`'s `DROP ... CASCADE`
+    // then destroyed it along with the leaf, silently.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // A populated table takes the AttachLegacy path. That path renames
+    // the flat table to `LEGACY_PARTITION` rather than dropping it.
+    // The Fresh (empty-table) path never creates that name at all.
+    let exec = insert_execution(
+        &mut conn,
+        "leaf_trg_wf",
+        "leaf-trg-1",
+        day(2026, 2, 3),
+        None,
+    )
+    .await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    diesel::sql_query(format!(
+        "DROP TRIGGER IF EXISTS harvest_events_leaf_trg_958 ON {}",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray trigger from a previous run");
+    diesel::sql_query("DROP FUNCTION IF EXISTS harvest_events_leaf_trg_958_fn()")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray trigger function from a previous run");
+    diesel::sql_query(
+        "CREATE FUNCTION harvest_events_leaf_trg_958_fn() RETURNS trigger AS $$ \
+         BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a trigger function");
+    diesel::sql_query(format!(
+        "CREATE TRIGGER harvest_events_leaf_trg_958 BEFORE INSERT ON {} \
+         FOR EACH ROW EXECUTE FUNCTION harvest_events_leaf_trg_958_fn()",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed a trigger installed directly on a leaf partition");
+
+    let err = partition::disable_partitioning(&mut conn).await.expect_err(
+        "a trigger installed directly on a leaf partition must refuse the revert too, \
+         not only one on the parent",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_leaf_trg_958"),
+        "the refusal must name the offending trigger; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "p",
+        "a refused revert must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query(format!(
+        "DROP TRIGGER harvest_events_leaf_trg_958 ON {}",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the offending trigger");
+    diesel::sql_query("DROP FUNCTION harvest_events_leaf_trg_958_fn()")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending trigger function");
+}
+
+#[tokio::test]
 async fn a_user_index_at_the_identifier_length_limit_survives_conversion() {
     // Issue #1270 item 9: Postgres silently truncates an identifier over 63
     // bytes. Appending a suffix to a name already at that limit renames it
@@ -1454,6 +1852,74 @@ async fn a_multibyte_user_index_name_near_the_limit_survives_conversion() {
          parent under its original stored name; a byte-unsafe rename could \
          leave the name unfreed or garbled instead"
     );
+}
+
+#[tokio::test]
+async fn an_operators_own_function_of_the_same_name_does_not_block_conversion() {
+    // Review finding: the rename helper used a bare, fixed name in the
+    // application schema (`harvest_bounded_rename_958`). An operator's
+    // own schema could already hold a function of that exact name and
+    // signature. The plain `CREATE FUNCTION` would then abort the
+    // conversion. For the large-table plan, that abort lands inside
+    // phase 4, after phases 2 and 3's expensive online preparation had
+    // already run.
+    // The helper now lives in `pg_temp`, each session's private schema,
+    // where no persistent object can ever occupy the name ahead of time.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP FUNCTION IF EXISTS harvest_bounded_rename_958(text, oid, text, text)")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray function from a previous run");
+    diesel::sql_query(
+        "CREATE FUNCTION harvest_bounded_rename_958(p_kind text, p_relid oid, p_base text, \
+         p_suffix text) RETURNS text LANGUAGE sql AS $$ SELECT p_base $$",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator's own function sharing the helper's name and signature");
+
+    let exec = insert_execution(&mut conn, "fn_collide_wf", "fn-collide-1", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table, to exercise the rename loop that defines the helper");
+
+    let report = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect(
+            "an operator's own function sharing the transient helper's name and signature \
+             must not block conversion",
+        );
+    assert!(
+        matches!(report.mode, EnableMode::AttachLegacy { .. }),
+        "precondition: must exercise the legacy rename loop, got {:?}",
+        report.mode
+    );
+    assert_eq!(events_relkind(&mut conn).await, "p");
+
+    let operator_fn_survives = scalar_bool(
+        &mut conn,
+        "SELECT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE p.proname = 'harvest_bounded_rename_958' AND n.nspname = current_schema()) AS v",
+    )
+    .await;
+    assert!(
+        operator_fn_survives,
+        "the operator's own function must be left exactly as it was, never touched by the \
+         session-scoped helper"
+    );
+
+    diesel::sql_query("DROP FUNCTION harvest_bounded_rename_958(text, oid, text, text)")
+        .execute(&mut conn)
+        .await
+        .expect("drop the operator's function");
 }
 
 // ══ AC2: byte-identical per-execution event semantics ══════════════════════
@@ -4197,6 +4663,90 @@ async fn phase_4_refuses_a_valid_index_with_the_right_name_and_the_wrong_shape()
     .execute(&mut conn)
     .await
     .expect("drop the index phase 2 legitimately built");
+    diesel::sql_query(format!(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS {}_cohort_ck",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the constraint phase 3 legitimately built");
+}
+
+#[tokio::test]
+async fn phase_4_rechecks_dependent_views_created_after_phase_1() {
+    // Review finding: phase 1's dependent-view check runs hours before
+    // phase 4's rename, under this plan's online path. A view created (or
+    // repointed) at `harvest_events` in that gap would pass phase 1 clean,
+    // then silently go stale after the rename anyway. Phase 4 must repeat
+    // the identical check under the lock it actually converts within.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    run_plan_phases(&mut conn, 1..=3).await;
+
+    // Simulate a view showing up in the gap between phase 1 and phase 4.
+    diesel::sql_query("DROP VIEW IF EXISTS harvest_events_late_view_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray view from a previous run");
+    diesel::sql_query(
+        "CREATE VIEW harvest_events_late_view_958 AS SELECT event_type FROM harvest_events",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a view created after phase 1's check already passed");
+
+    let mut refusal: Option<String> = None;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 4)
+    {
+        // Phase 4's steps share one transaction (`BEGIN` ... `COMMIT`).
+        // Once the recheck raises, every later step also errors with
+        // Postgres's generic "current transaction is aborted". That is
+        // not the signal, so only the FIRST error is kept. The loop still
+        // runs to the trailing `COMMIT`. Postgres always accepts that,
+        // even mid-abort — it closes the block, as a rollback would.
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await
+            && refusal.is_none()
+        {
+            refusal = Some(e.to_string());
+        }
+    }
+    let msg = refusal.expect(
+        "phase 4 must refuse a view that started depending on harvest_events \
+         after phase 1's check already passed",
+    );
+    assert!(
+        msg.contains("harvest_events_late_view_958"),
+        "the refusal must name the offending view; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused window must leave the shard exactly as it was"
+    );
+
+    // Phases 1-3 each commit on their own (unlike phase 4). So the two
+    // phase-2 indexes and phase 3's CHECK constraint all survive this
+    // refusal. Clean them up: a later test's `reset_to_unpartitioned`
+    // only reverses a PARTITIONED shard, not debris on a still-flat one.
+    diesel::sql_query("DROP VIEW harvest_events_late_view_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending view");
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {}", plan_pk_index()))
+        .execute(&mut conn)
+        .await
+        .expect("drop the index phase 2 legitimately built");
+    diesel::sql_query(format!(
+        "DROP INDEX IF EXISTS {}_exec_event_idx",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the other index phase 2 legitimately built");
     diesel::sql_query(format!(
         "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS {}_cohort_ck",
         partition::LEGACY_PARTITION

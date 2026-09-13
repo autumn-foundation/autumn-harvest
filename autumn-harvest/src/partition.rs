@@ -229,12 +229,20 @@ fn we_created_at_idx_owned_check_sql() -> String {
     )
 }
 
-/// Name of the transient function [`bounded_rename_fn_sql`] defines.
+/// Name of the transient function [`bounded_rename_fn_sql`] defines,
+/// schema-qualified into `pg_temp`.
 ///
-/// Schema-scoped, so it must not collide with an operator's own function of
-/// the same name. The `_958` tag matches every other transient identifier
-/// this module mints, for exactly that reason.
-const BOUNDED_RENAME_FN: &str = "harvest_bounded_rename_958";
+/// Review finding: a bare, fixed name in the application schema is not
+/// guaranteed free. An operator's own schema could already hold a function
+/// of this exact name and signature. The plain `CREATE FUNCTION` below
+/// would then abort the conversion. For the large-table plan, that abort
+/// lands inside phase 4, after phases 2 and 3 already paid for the
+/// expensive online preparation. `pg_temp` is each session's private,
+/// connection-scoped schema. No persistent object can ever occupy a name
+/// there ahead of time, so this can never collide. Nothing is left behind
+/// either, even if the session ends before the trailing `DROP FUNCTION`
+/// runs.
+const BOUNDED_RENAME_FN: &str = "pg_temp.harvest_bounded_rename_958";
 
 // ── Sweep "blocked" reasons ────────────────────────────────────────────────
 //
@@ -1227,9 +1235,20 @@ async fn refuse_if_row_security(conn: &mut AsyncPgConnection, verb: &str) -> Har
 /// User-defined unique indexes on `harvest_events` that do not include
 /// `cohort`.
 ///
-/// Excludes indexes backed by a table constraint: the enable script's own
-/// `PRIMARY KEY` and `workflow_exec_id_event_id_key` constraints add
-/// `cohort` explicitly, so those are handled separately.
+/// Excludes only the two constraint-backed indexes the enable script itself
+/// owns and replaces: `harvest_events_pkey` and
+/// `harvest_events_workflow_exec_id_event_id_key`, both of which add
+/// `cohort` explicitly.
+///
+/// Review finding: the exclusion used to match ANY constraint-backed index,
+/// not just harvest's own two. `capture_index_defs` separately skips every
+/// constraint-backed index, assuming the two above are the only ones. An
+/// operator's own `UNIQUE` constraint fell through both checks unnoticed —
+/// this preflight never flagged it, and the replay step never carried it
+/// forward. The constraint then survived only on the legacy partition,
+/// silently weaker than it was before conversion. Naming harvest's own two
+/// constraints explicitly closes that gap: anything else constraint-backed
+/// is now checked exactly like an ordinary unique index.
 ///
 /// **Why this blocks the conversion.** Postgres requires the partition key
 /// in every unique index on a partitioned table. `capture_index_defs`
@@ -1259,7 +1278,11 @@ pub async fn unique_indexes_missing_cohort(
              ON cohort_attr.attrelid = c.oid AND cohort_attr.attname = 'cohort'
           WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
             AND i.indisunique
-            AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)
+            AND NOT EXISTS (
+                SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid
+                  AND con.conname IN ('harvest_events_pkey',
+                                      'harvest_events_workflow_exec_id_event_id_key')
+            )
             AND NOT EXISTS (
                 SELECT 1 FROM generate_series(0, i.indnkeyatts - 1) k
                  WHERE i.indkey[k] = cohort_attr.attnum
@@ -1306,7 +1329,8 @@ async fn refuse_if_unique_index_without_cohort(
     )))
 }
 
-/// Views, including materialized views, that depend on `harvest_events`.
+/// Views, including materialized views, that depend on `harvest_events` or
+/// on one of its leaf partitions.
 ///
 /// **Why this blocks the conversion.** Postgres records a view's dependency
 /// by relation OID, not by name — a materialized view the same way as an
@@ -1318,6 +1342,13 @@ async fn refuse_if_unique_index_without_cohort(
 /// after the conversion. On the empty-table path the rename target is
 /// dropped outright. The dependency makes that `DROP` fail instead —
 /// safer, but still not loud about the cause.
+///
+/// Review finding: on a partitioned shard, `harvest_events` names only the
+/// parent. A view can depend directly on a LEAF partition instead — Postgres
+/// allows querying one by name like any other table. That view used to pass
+/// this check unnoticed, then `disable_partitioning`'s `DROP ... CASCADE`
+/// took the leaf, and the view with it. Matching the parent's direct
+/// children too closes that gap.
 ///
 /// # Errors
 ///
@@ -1332,7 +1363,17 @@ pub async fn dependent_views(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<
            JOIN pg_namespace v_ns ON v_ns.oid = v.relnamespace
            JOIN pg_class t ON t.oid = d.refobjid
            JOIN pg_namespace t_ns ON t_ns.oid = t.relnamespace
-          WHERE t.relname = 'harvest_events' AND t_ns.nspname = current_schema()
+          WHERE t_ns.nspname = current_schema()
+            AND (
+                t.relname = 'harvest_events'
+                OR t.oid IN (
+                    SELECT i.inhrelid
+                      FROM pg_inherits i
+                      JOIN pg_class parent ON parent.oid = i.inhparent
+                      JOIN pg_namespace pn ON pn.oid = parent.relnamespace
+                     WHERE parent.relname = 'harvest_events' AND pn.nspname = current_schema()
+                )
+            )
             AND v.relkind IN ('v', 'm')
           ORDER BY 1",
     )
@@ -1363,7 +1404,8 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
     )))
 }
 
-/// Operator-installed triggers on `harvest_events`.
+/// Operator-installed triggers on `harvest_events` or on one of its leaf
+/// partitions.
 ///
 /// **Why this blocks the conversion.** `CREATE TABLE ... (LIKE ...)` does not
 /// carry triggers, and both conversion directions build the replacement
@@ -1381,6 +1423,12 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
 /// unpartitioned shard, `EXEC_FK_TRIGGER` cannot yet be harvest's, since
 /// only a conversion creates it.
 ///
+/// Review finding: on a partitioned shard, `harvest_events` names only the
+/// parent. Postgres lets an operator install a trigger directly on a LEAF
+/// partition instead. That trigger used to pass this check unnoticed, then
+/// `disable_partitioning`'s `DROP ... CASCADE` destroyed it along with the
+/// leaf. Matching the parent's direct children too closes that gap.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] if the catalog query fails.
@@ -1392,7 +1440,17 @@ pub async fn operator_triggers(conn: &mut AsyncPgConnection) -> HarvestResult<Ve
            JOIN pg_class c ON c.oid = tg.tgrelid
            JOIN pg_namespace n ON n.oid = c.relnamespace
            JOIN pg_proc p ON p.oid = tg.tgfoid
-          WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
+          WHERE n.nspname = current_schema()
+            AND (
+                c.relname = 'harvest_events'
+                OR c.oid IN (
+                    SELECT i.inhrelid
+                      FROM pg_inherits i
+                      JOIN pg_class parent ON parent.oid = i.inhparent
+                      JOIN pg_namespace pn ON pn.oid = parent.relnamespace
+                     WHERE parent.relname = 'harvest_events' AND pn.nspname = current_schema()
+                )
+            )
             AND NOT tg.tgisinternal
             AND NOT (p.proname = 'harvest_events_require_execution'
                      AND p.pronamespace = c.relnamespace)
@@ -1603,6 +1661,8 @@ DECLARE
     step        int;
     had_rows    boolean;
     we_idx_existed boolean;
+    bad_view    text;
+    bad_trg     text;
 {COPY_ACL_DECLARE}
 BEGIN
     -- Idempotent: already partitioned, nothing to do.
@@ -1653,6 +1713,48 @@ BEGIN
     -- partition would violate the parent's primary key.
     EXECUTE 'ALTER SEQUENCE harvest_events_id_seq OWNED BY NONE';
     EXECUTE 'ALTER TABLE harvest_events RENAME TO {LEGACY_PARTITION}';
+
+    -- Review finding: the dependent-view and operator-trigger checks run
+    -- in Rust, a separate round-trip before this script starts. A session
+    -- that created either kind of object in that gap could commit before
+    -- the rename above took its lock, and the object would then be
+    -- silently stranded on the table the rename just moved out from under
+    -- it. Repeat both checks now, holding the ACCESS EXCLUSIVE lock this
+    -- rename just acquired. Postgres tracks both dependencies by OID, so
+    -- the rename does not hide either one — querying by the new name,
+    -- {LEGACY_PARTITION}, still finds them.
+    SELECT string_agg(DISTINCT (v_ns.nspname || '.' || v.relname), ', '
+                      ORDER BY (v_ns.nspname || '.' || v.relname))
+      INTO bad_view
+      FROM pg_depend d
+      JOIN pg_rewrite r ON r.oid = d.objid
+      JOIN pg_class v ON v.oid = r.ev_class
+      JOIN pg_namespace v_ns ON v_ns.oid = v.relnamespace
+      JOIN pg_class t ON t.oid = d.refobjid
+      JOIN pg_namespace t_ns ON t_ns.oid = t.relnamespace
+     WHERE t.relname = '{LEGACY_PARTITION}' AND t_ns.nspname = current_schema()
+       AND v.relkind IN ('v', 'm');
+    IF bad_view IS NOT NULL THEN
+        RAISE EXCEPTION 'harvest #958: view(s) depend on harvest_events (%), created after \
+the preflight check ran but before this transaction''s ACCESS EXCLUSIVE lock. Drop the view \
+(and recreate it against harvest_events afterward), then re-run.', bad_view;
+    END IF;
+
+    SELECT string_agg(DISTINCT tg.tgname, ', ' ORDER BY tg.tgname) INTO bad_trg
+      FROM pg_trigger tg
+      JOIN pg_class c ON c.oid = tg.tgrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_proc p ON p.oid = tg.tgfoid
+     WHERE c.relname = '{LEGACY_PARTITION}' AND n.nspname = current_schema()
+       AND NOT tg.tgisinternal
+       AND NOT (p.proname = 'harvest_events_require_execution'
+                AND p.pronamespace = c.relnamespace);
+    IF bad_trg IS NOT NULL THEN
+        RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not carried by CREATE \
+TABLE ... (LIKE ...) (%), installed after the preflight check ran but before this \
+transaction''s ACCESS EXCLUSIVE lock. Drop the trigger (and recreate it against \
+harvest_events afterward), then re-run.', bad_trg;
+    END IF;
 
     -- Probed only AFTER the rename, which is the first statement to take
     -- ACCESS EXCLUSIVE. A `SELECT EXISTS` before it takes only ACCESS SHARE,
@@ -3550,6 +3652,39 @@ fn index_shape_check_sql(index_name: &str, columns: &[&str]) -> String {
     )
 }
 
+/// A `DO` block refusing when a view depends on `harvest_events`, tagged
+/// with `tag` so it can appear more than once in the same generated script.
+///
+/// Review finding: phase 1's copy of this check runs hours before phase 4's
+/// rename, under `migration_plan`'s online path. A view created (or
+/// repointed) at `harvest_events` in that window would pass phase 1 clean.
+/// It would then end up silently stale after phase 4 anyway.
+/// [`migration_plan_steps`] runs this same check again as the first thing
+/// inside phase 4's lock. The catalog state being validated is then the
+/// state actually being converted.
+#[must_use]
+fn dependent_views_guard_sql(tag: &str) -> String {
+    format!(
+        "DO ${tag}$\nDECLARE bad text;\nBEGIN\n    \
+         SELECT string_agg(DISTINCT (v_ns.nspname || '.' || v.relname), ', ') INTO bad\n      \
+         FROM pg_depend d\n      \
+         JOIN pg_rewrite r ON r.oid = d.objid\n      \
+         JOIN pg_class v ON v.oid = r.ev_class\n      \
+         JOIN pg_namespace v_ns ON v_ns.oid = v.relnamespace\n      \
+         JOIN pg_class t ON t.oid = d.refobjid\n      \
+         JOIN pg_namespace t_ns ON t_ns.oid = t.relnamespace\n     \
+         WHERE t.relname = 'harvest_events' AND t_ns.nspname = current_schema()\n       \
+         AND v.relkind IN ('v', 'm');\n    \
+         IF bad IS NOT NULL THEN\n        \
+         RAISE EXCEPTION 'harvest #958: view(s) depend on harvest_events (%). Postgres \
+         tracks a view''s dependency by relation OID, not by name, and phase 4 renames \
+         harvest_events out of the way — so the view would keep pointing at the OLD \
+         relation, silently returning fewer rows than it should. Drop the view (and \
+         recreate it against harvest_events afterward) before running this plan.', bad;\n    \
+         END IF;\nEND\n${tag}$;"
+    )
+}
+
 /// One statement of the large-live-table conversion plan.
 ///
 /// The plan exists in exactly one form — this list — and
@@ -3713,7 +3848,11 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
              ON ca.attrelid = c.oid AND ca.attname = 'cohort'\n     \
              WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
              AND i.indisunique\n       \
-             AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)\n       \
+             AND NOT EXISTS (\n           \
+             SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid\n             \
+             AND con.conname IN ('harvest_events_pkey',\n                                 \
+             'harvest_events_workflow_exec_id_event_id_key')\n       \
+             )\n       \
              AND NOT EXISTS (\n           \
              SELECT 1 FROM generate_series(0, i.indnkeyatts - 1) k\n            \
              WHERE i.indkey[k] = ca.attnum\n       \
@@ -3735,27 +3874,7 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // Postgres tracks a view's dependency by OID, not by name. A
         // dependent view would keep pointing at the renamed relation after
         // phase 4, silently returning fewer rows than it should.
-        step(
-            1,
-            "DO $harvest_view_958$\nDECLARE bad text;\nBEGIN\n    \
-             SELECT string_agg(DISTINCT (v_ns.nspname || '.' || v.relname), ', ') INTO bad\n      \
-             FROM pg_depend d\n      \
-             JOIN pg_rewrite r ON r.oid = d.objid\n      \
-             JOIN pg_class v ON v.oid = r.ev_class\n      \
-             JOIN pg_namespace v_ns ON v_ns.oid = v.relnamespace\n      \
-             JOIN pg_class t ON t.oid = d.refobjid\n      \
-             JOIN pg_namespace t_ns ON t_ns.oid = t.relnamespace\n     \
-             WHERE t.relname = 'harvest_events' AND t_ns.nspname = current_schema()\n       \
-             AND v.relkind IN ('v', 'm');\n    \
-             IF bad IS NOT NULL THEN\n        \
-             RAISE EXCEPTION 'harvest #958: view(s) depend on harvest_events (%). Postgres \
-             tracks a view''s dependency by relation OID, not by name, and phase 4 renames \
-             harvest_events out of the way — so the view would keep pointing at the OLD \
-             relation, silently returning fewer rows than it should. Drop the view (and \
-             recreate it against harvest_events afterward) before running this plan.', bad;\n    \
-             END IF;\nEND\n$harvest_view_958$;"
-                .to_string(),
-        ),
+        step(1, dependent_views_guard_sql("harvest_view_958")),
         // ── 1: refuse early over an operator trigger on harvest_events ────
         //
         // Same reason and same phase as the guards above.
@@ -3913,6 +4032,14 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // ── 4: THE WINDOW — one transaction, metadata only ────────────────
         step(4, "BEGIN".to_string()),
         step(4, format!("SET LOCAL lock_timeout = '{lock_ms}ms'")),
+        // Review finding: phase 1's dependent-view check ran hours before
+        // this window, under this plan's online path. A view created (or
+        // repointed) at `harvest_events` in that gap would pass phase 1
+        // clean, then silently go stale after the rename below anyway.
+        // Re-run the identical check now, holding the lock this phase
+        // actually converts under, so the state being checked is the
+        // state being converted.
+        step(4, dependent_views_guard_sql("harvest_view_cutover_958")),
         // The first thing inside the window, so a plan resumed over a lost
         // phase-2 build aborts before it has renamed anything. Without it,
         // `ATTACH PARTITION` below discovers the missing index only once the
