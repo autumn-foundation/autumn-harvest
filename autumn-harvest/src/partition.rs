@@ -3024,7 +3024,7 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         concurrent: true,
     };
 
-    vec![
+    let mut steps = vec![
         // ── 1: refuse outright if the table is already partitioned ────────
         //
         // Re-running the plan after a completed step 4 is not a no-op, it is
@@ -3396,7 +3396,20 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
             ),
         ),
         step(4, "COMMIT".to_string()),
-    ]
+    ];
+
+    // Issue #1270 item 7: `enable_partitioning` honours
+    // `allow_incompatible_publications` for the same guard; this scripted path
+    // must too, or an operator who has done the supported thing — brought the
+    // subscriber onto the partitioned layout with
+    // `publish_via_partition_root = true` — can use the override on a small
+    // table (`enable`) and not on a large one (`plan`), which is the only path
+    // large deployments are told to use. The tag is unique to this one `DO`
+    // block, so filtering on it cannot drop any other step.
+    if opts.allow_incompatible_publications {
+        steps.retain(|s| !s.sql.contains("$harvest_pub_958$"));
+    }
+    steps
 }
 
 /// Render the operator-run conversion script for a **large live**
@@ -3711,6 +3724,54 @@ mod tests {
             "a cutover computed when the plan was generated can be stale by the \
              time step 4 runs; a pre-conversion execution created after that \
              point would tear its history across two partitions"
+        );
+    }
+
+    #[test]
+    fn allow_incompatible_publications_omits_the_phase_1_publication_guard() {
+        // Issue #1270 item 7: `enable_partitioning` already honours the
+        // override for this guard; the scripted large-table plan must too, or
+        // an operator who has done the supported thing — run the partitioned
+        // layout on the subscriber too — can use the override on `enable` and
+        // not on `plan`, the only path large deployments are told to use.
+        let now = Utc::now();
+        let default_steps = migration_plan_steps(&EnableOptions::default(), now);
+        assert!(
+            default_steps
+                .iter()
+                .any(|s| s.sql.contains("$harvest_pub_958$")),
+            "the guard must be present by default"
+        );
+
+        let overridden_steps = migration_plan_steps(
+            &EnableOptions {
+                allow_incompatible_publications: true,
+                ..EnableOptions::default()
+            },
+            now,
+        );
+        assert!(
+            overridden_steps
+                .iter()
+                .all(|s| !s.sql.contains("$harvest_pub_958$")),
+            "the override must omit the guard entirely, not merely neuter it, \
+             so the printed script does not confuse an operator with a check \
+             that can never fire"
+        );
+
+        // Every other phase-1 guard (already-partitioned, row security) must
+        // survive — the override is specific to the publication check.
+        assert!(
+            overridden_steps
+                .iter()
+                .any(|s| s.sql.contains("$harvest_relkind_958$")),
+            "the already-partitioned guard is unrelated and must remain"
+        );
+        assert!(
+            overridden_steps
+                .iter()
+                .any(|s| s.sql.contains("$harvest_rls_958$")),
+            "the row-security guard is unrelated and must remain"
         );
     }
 

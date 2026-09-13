@@ -278,6 +278,17 @@ pub enum PartitionCommand {
         /// How many cohorts ahead of "now" the engine keeps pre-created.
         #[arg(long, value_name = "N", default_value_t = autumn_harvest::partition::DEFAULT_LOOKAHEAD_COHORTS)]
         lookahead_cohorts: u32,
+
+        /// Omit the phase-1 guard that refuses when a logical-replication
+        /// publication covers `harvest_events` without
+        /// `publish_via_partition_root`.
+        ///
+        /// Set this only when the subscriber runs the partitioned layout too.
+        /// Without it, an operator who has done exactly that could use this
+        /// override on `enable` but not on the large-table plan — the only
+        /// path large deployments are told to use.
+        #[arg(long = "allow-incompatible-publications")]
+        allow_incompatible_publications: bool,
     },
 
     /// **Convert this shard to the partitioned layout.**
@@ -5978,10 +5989,12 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
         PartitionCommand::Plan {
             cohort_width_secs,
             lookahead_cohorts,
+            allow_incompatible_publications,
         } => {
             let opts = autumn_harvest::partition::EnableOptions {
                 cohort_width_secs: *cohort_width_secs,
                 lookahead_cohorts: *lookahead_cohorts,
+                allow_incompatible_publications: *allow_incompatible_publications,
                 ..autumn_harvest::partition::EnableOptions::default()
             };
             opts.validate()
