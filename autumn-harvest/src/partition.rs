@@ -1623,13 +1623,14 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
 /// Review finding: name alone does not identify harvest's own foreign key.
 /// An operator's own foreign key could reuse the reserved name
 /// `harvest_events_workflow_exec_id_fkey` on different columns, a different
-/// target, or a different `ON DELETE` action. Name-only matching would
-/// exempt it as harvest-owned, and it would then be silently dropped just
-/// like an unnamed one. The exemption below also verifies the local
-/// column (`workflow_exec_id`), the referenced table and column
-/// (`harvest_workflow_executions(id)`), `ON DELETE CASCADE`
-/// (`confdeltype = 'c'`), and that it is not `DEFERRABLE`. That is the
-/// same shape-over-name-alone rigor
+/// target, or a different `ON DELETE`/`ON UPDATE` action. Name-only
+/// matching would exempt it as harvest-owned, and it would then be
+/// silently dropped just like an unnamed one. The exemption below also
+/// verifies the local column (`workflow_exec_id`) and the referenced
+/// table and column (`harvest_workflow_executions(id)`). It verifies
+/// `ON DELETE CASCADE` (`confdeltype = 'c'`), the built-in `ON UPDATE NO
+/// ACTION` (`confupdtype = 'a'`), and that it is not `DEFERRABLE`, too.
+/// That is the same shape-over-name-alone rigor
 /// [`HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL`] already applies to the
 /// primary key and unique constraint.
 ///
@@ -1660,6 +1661,7 @@ pub async fn unreplayable_constraints(conn: &mut AsyncPgConnection) -> HarvestRe
                 AND con.contype = 'f'
                 AND NOT con.condeferrable
                 AND con.confdeltype = 'c'
+                AND con.confupdtype = 'a'
                 AND con.confrelid = 'harvest_workflow_executions'::regclass
                 AND (SELECT array_agg(a.attname::text ORDER BY k)
                        FROM generate_subscripts(con.conkey, 1) k
@@ -2222,6 +2224,7 @@ recreate it including `cohort` yourself, then re-run.', bad_idx;
            AND con.contype = 'f'
            AND NOT con.condeferrable
            AND con.confdeltype = 'c'
+           AND con.confupdtype = 'a'
            AND con.confrelid = 'harvest_workflow_executions'::regclass
            AND (SELECT array_agg(a.attname::text ORDER BY k)
                   FROM generate_subscripts(con.conkey, 1) k
@@ -4802,6 +4805,7 @@ fn unreplayable_constraints_guard_sql(tag: &str) -> String {
          AND con.contype = 'f'\n           \
          AND NOT con.condeferrable\n           \
          AND con.confdeltype = 'c'\n           \
+         AND con.confupdtype = 'a'\n           \
          AND con.confrelid = 'harvest_workflow_executions'::regclass\n           \
          AND (SELECT array_agg(a.attname::text ORDER BY k)\n                  \
          FROM generate_subscripts(con.conkey, 1) k\n                  \

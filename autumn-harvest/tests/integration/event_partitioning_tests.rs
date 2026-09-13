@@ -2761,6 +2761,69 @@ async fn an_impostor_reusing_harvests_own_foreign_key_name_still_refuses() {
 }
 
 #[tokio::test]
+async fn an_impostor_foreign_key_with_on_update_cascade_still_refuses() {
+    // Review finding: the same columns, target and `ON DELETE CASCADE`
+    // are not the whole shape either. Harvest's own foreign key relies
+    // on the built-in `ON UPDATE NO ACTION` -- it never names an `ON
+    // UPDATE` clause. An operator's own foreign key, reusing the
+    // reserved name with the right columns, target and delete action,
+    // could still add `ON UPDATE CASCADE`. That used to pass this check
+    // unnoticed. Conversion would then drop it and replace it with only
+    // an insert-validation trigger, silently losing the operator's own
+    // cascading update.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT harvest_events_workflow_exec_id_fkey",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("drop the real foreign key to make room for the impostor");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_workflow_exec_id_fkey \
+         FOREIGN KEY (workflow_exec_id) REFERENCES harvest_workflow_executions(id) \
+         ON DELETE CASCADE ON UPDATE CASCADE",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an impostor with the right columns, target and delete action");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "an impostor foreign key with ON UPDATE CASCADE must still refuse -- the \
+             built-in ON UPDATE NO ACTION is part of the shape too",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_workflow_exec_id_fkey"),
+        "the refusal must name the offending constraint; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT harvest_events_workflow_exec_id_fkey",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("drop the impostor constraint");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_workflow_exec_id_fkey \
+         FOREIGN KEY (workflow_exec_id) REFERENCES harvest_workflow_executions(id) \
+         ON DELETE CASCADE",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("restore harvest's own real foreign key for later tests");
+}
+
+#[tokio::test]
 async fn an_impostor_reusing_harvests_reserved_cohort_check_name_still_refuses() {
     // Review finding: name, type, table and column alone must not identify
     // harvest's own generated `{LEGACY_PARTITION}_cohort_ck`. An operator's
