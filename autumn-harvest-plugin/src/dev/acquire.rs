@@ -55,7 +55,7 @@ pub async fn acquire_postgres_binaries() -> Result<PostgresBinaries, DevError> {
     if cache_root.exists() && !directory_is_private(&cache_root) {
         return Err(DevError::Acquire {
             detail: format!(
-                "the cache directory {} is not owner-only, and its contents would be executed. \
+                "the cache directory {} is not private, and its contents would be executed. \
                  Point HARVEST_DEV_CACHE_DIR somewhere private, or install PostgreSQL yourself",
                 cache_root.display()
             ),
@@ -139,7 +139,7 @@ fn cached_install(cache_root: &std::path::Path) -> Option<PostgresBinaries> {
         tracing::warn!(
             path = %cache_root.display(),
             "dev runtime: ignoring a cached PostgreSQL install in a directory that is not \
-             owner-only — it would be executed"
+             private — it would be executed"
         );
         return None;
     }
@@ -155,8 +155,9 @@ fn cached_install(cache_root: &std::path::Path) -> Option<PostgresBinaries> {
     complete.then(|| PostgresBinaries::at(bin_dir))
 }
 
-/// Whether `dir` exists, is a real directory (not a symlink), is owned by this
-/// user, and is not writable by group or other.
+/// Whether `dir` exists, is a real directory (not a symlink), is ours to
+/// trust (see [`super::reaper::directory_is_ours`]), and — on Unix — is not
+/// writable by group or other.
 fn directory_is_private(dir: &std::path::Path) -> bool {
     let Ok(metadata) = std::fs::symlink_metadata(dir) else {
         return false;
@@ -164,13 +165,12 @@ fn directory_is_private(dir: &std::path::Path) -> bool {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return false;
     }
+    if super::reaper::directory_is_ours(dir, &metadata).is_err() {
+        return false;
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::fs::PermissionsExt as _;
-        if super::reaper::unix_uid().is_some_and(|uid| uid != metadata.uid()) {
-            return false;
-        }
         if metadata.permissions().mode() & 0o022 != 0 {
             return false;
         }
@@ -200,4 +200,58 @@ fn cache_root() -> Result<PathBuf, DevError> {
         .join("autumn-harvest")
         .join("postgresql")
         .join(MANAGED_CACHE_KEY))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::directory_is_private;
+
+    /// Issue #1287 regression: the Unix answer must not change. A directory
+    /// we own, with default `tempfile` permissions, is still private.
+    #[cfg(unix)]
+    #[test]
+    fn an_owner_owned_directory_is_still_private_on_unix() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert!(directory_is_private(dir.path()));
+    }
+
+    /// Issue #1287 regression: group/other-writable is still rejected on
+    /// Unix, independent of the new `directory_is_ours` delegation above.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_writable_directory_is_still_rejected_on_unix() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o770))
+            .expect("chmod");
+        assert!(!directory_is_private(dir.path()));
+    }
+
+    /// Issue #1287's actual regression, for the cache-directory site: before
+    /// this fix, any non-symlink directory read as "private" on Windows.
+    /// `C:\Windows\Temp` is the machine-wide location the issue names as the
+    /// realistic exposure.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_outside_any_per_user_root_is_not_private_on_windows() {
+        let dir = std::path::PathBuf::from(r"C:\Windows\Temp");
+        assert!(
+            !directory_is_private(&dir),
+            "a shared directory must not be treated as a private cache"
+        );
+    }
+
+    /// The other half: a cache directory under `%LOCALAPPDATA%` is still
+    /// accepted.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_under_localappdata_is_private_on_windows() {
+        let base =
+            std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA must be set on Windows");
+        let dir = std::path::PathBuf::from(base).join("harvest-dev-test-1287-cache");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let result = directory_is_private(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result);
+    }
 }
