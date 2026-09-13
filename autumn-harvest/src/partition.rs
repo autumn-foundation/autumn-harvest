@@ -187,6 +187,7 @@ const EXEC_FK_TRIGGER: &str = "harvest_events_exec_fk_trg";
 /// [`disable_partitioning`] uses this. It drops the index only when the
 /// shape matches what `enable` built, not an operator's own pre-existing
 /// index that happens to share the name.
+#[cfg(feature = "db")]
 const WE_CREATED_AT_IDX_SHAPE_CHECK_SQL: &str = "SELECT COALESCE((
        SELECT i.indrelid = 'harvest_workflow_executions'::regclass
               AND NOT i.indisunique AND i.indpred IS NULL AND i.indexprs IS NULL
