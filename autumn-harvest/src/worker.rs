@@ -28286,27 +28286,53 @@ impl Worker {
 // Workflow-task timeout helpers (issue #494)
 // ---------------------------------------------------------------------------
 
-/// Bound on one pool checkout in the `BodyTimedOut` recovery path below.
+/// Tight bound on one pool checkout in the `BodyTimedOut` recovery path
+/// below. It exists to catch one hazard: every connection already
+/// checked out by other live work. Then `pool.get().await` is queueing
+/// behind a peer task's own decision cycle (issue #1459).
 ///
-/// Harvest configures no deadpool `Timeouts` (see `shard_acquire_bound`'s
-/// own doc comment), so a bare `pool.get().await` waits forever under real
-/// pool saturation instead of returning `Err`. Issue #1459's diagnosis,
-/// and later review on PR #1516/#1517, found that an unbounded checkout
-/// anywhere in this path defeats retrying. Control never reaches a later,
-/// bounded attempt otherwise. Every checkout the `BodyTimedOut` arm makes
-/// -- the metric-name lookup, the quarantine path, and the reset path's
-/// own retry loop -- shares this one bound.
+/// This bound must never apply to a `pool.get().await` that is instead
+/// creating a brand-new connection (DNS, TCP, TLS, Postgres auth).
+/// Review on PR #1516/#1517 caught that distinction. `deadpool` records
+/// a new connection only after `Manager::create()` resolves. So
+/// cancelling a slow-but-real handshake on every retry never converges,
+/// however many attempts remain. `external_target_location.rs`'s
+/// `peer_acquire_bound` documents the same hazard for the fan-out probe
+/// path and is the pattern [`workflow_task_timeout_acquire_bound`]
+/// mirrors below.
 const WORKFLOW_TASK_TIMEOUT_ACQUIRE_BOUND: Duration = Duration::from_secs(2);
 
+/// Bound for a checkout that is creating a new connection rather than
+/// queueing for one already open. Generous on purpose, matching
+/// `external_target_location.rs`'s `FANOUT_PEER_BOUND` reasoning. A real
+/// handshake under load can legitimately take several seconds. This path
+/// would rather wait than cancel a connection that was about to succeed.
+const WORKFLOW_TASK_TIMEOUT_CONNECT_BOUND: Duration = Duration::from_secs(10);
+
 /// Backoff schedule for [`acquire_conn_for_workflow_task_timeout_recovery`]:
-/// seven attempts, bounding the whole retry to roughly thirty seconds
-/// worst case. Long enough for the transient CI-runner contention burst
-/// issue #1459 recorded to clear, but not indefinite.
+/// seven attempts. Long enough for the transient CI-runner contention
+/// burst issue #1459 recorded to clear, but not indefinite.
 const WORKFLOW_TASK_TIMEOUT_BACKOFF_MS: &[u64] = &[0, 200, 500, 1_000, 2_000, 4_000, 8_000];
+
+/// Choose one attempt's checkout bound from the pool's own status.
+///
+/// [`WORKFLOW_TASK_TIMEOUT_ACQUIRE_BOUND`] applies only when the pool has
+/// no idle connection and no room to open one -- the genuine queueing
+/// hazard. Anything else gets
+/// [`WORKFLOW_TASK_TIMEOUT_CONNECT_BOUND`] instead, exactly mirroring
+/// `external_target_location.rs`'s `peer_acquire_bound`.
+fn workflow_task_timeout_acquire_bound(pool: &DbPool) -> Duration {
+    let status = pool.status();
+    if status.available > 0 || status.size < status.max_size {
+        WORKFLOW_TASK_TIMEOUT_CONNECT_BOUND
+    } else {
+        WORKFLOW_TASK_TIMEOUT_ACQUIRE_BOUND
+    }
+}
 
 /// Acquire a pool connection for `BodyTimedOut` recovery, retrying across
 /// [`WORKFLOW_TASK_TIMEOUT_BACKOFF_MS`] with each attempt bounded by
-/// [`WORKFLOW_TASK_TIMEOUT_ACQUIRE_BOUND`].
+/// [`workflow_task_timeout_acquire_bound`].
 ///
 /// Shared by [`reset_timed_out_workflow_task`] and
 /// [`quarantine_workflow_task_timeout`] (issue #1459). Review on PR
@@ -28335,7 +28361,8 @@ async fn acquire_conn_for_workflow_task_timeout_recovery(
         if delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
-        match tokio::time::timeout(WORKFLOW_TASK_TIMEOUT_ACQUIRE_BOUND, pool.get()).await {
+        let bound = workflow_task_timeout_acquire_bound(pool);
+        match tokio::time::timeout(bound, pool.get()).await {
             Ok(Ok(c)) => return Ok(c),
             Ok(Err(e)) => {
                 tracing::warn!(
@@ -28350,12 +28377,10 @@ async fn acquire_conn_for_workflow_task_timeout_recovery(
                 tracing::warn!(
                     task_id = %task_id,
                     op,
-                    bound = ?WORKFLOW_TASK_TIMEOUT_ACQUIRE_BOUND,
+                    bound = ?bound,
                     "workflow task timeout recovery: pool checkout exceeded its bound, retrying"
                 );
-                last_err = Some(format!(
-                    "pool acquisition exceeded {WORKFLOW_TASK_TIMEOUT_ACQUIRE_BOUND:?}"
-                ));
+                last_err = Some(format!("pool acquisition exceeded {bound:?}"));
             }
         }
     }
