@@ -59,6 +59,16 @@ cargo run -p claude-agent-daemon -- submit "find the TODOs and write them to TOD
 The request uses `claude-opus-5` with adaptive thinking and the three workspace
 tools below. Pick another model with `--model`.
 
+Adaptive thinking is asked for on `claude-opus-5` only. A model that does not
+take the parameter refuses the whole request, and that refusal is not
+retryable, so an unconditional ask would fail every turn of a session started
+on another model. This example holds no capability for a model it was not
+written for, only the name you typed, and a list of names would go stale as
+models are released. So another model runs here WITHOUT the thinking
+parameter: a weaker answer rather than a failed session. `--max-tokens` is the
+same shape of risk and is left to you, because a model with a lower output cap
+refuses the request and names the field.
+
 Server-side refusal fallbacks are deliberately **not** used. A fallback answers
 one turn on a different model, and this is a multi-turn loop: the next request
 would return to the configured model, which changes the conversation's model

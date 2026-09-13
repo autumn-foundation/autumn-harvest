@@ -1221,6 +1221,86 @@ fn a_blank_model_name_is_refused() {
     }
 }
 
+/// Only the model this example is written for is asked for thinking.
+///
+/// Adaptive thinking is a property of the MODEL. A model that does not take
+/// the parameter refuses the whole request, and that refusal is not
+/// retryable. Every turn then fails, and the session fails with them. The
+/// README invites another model with `--model`, so an unconditional
+/// `thinking` field made that invitation a way to lose a session.
+///
+/// This reads the keys one turn SENDS. An offline suite cannot see what the
+/// API accepts, so the assertion is the request and not the answer. The same
+/// limit caught a real defect once: a field added to a `tool_result` block
+/// passed every test and would have failed every live session.
+#[test]
+fn only_the_model_this_example_knows_is_asked_for_thinking() {
+    let request = session::TurnRequest {
+        model: "recorded".to_string(),
+        messages: vec![session::Message {
+            role: "user".to_string(),
+            content: json!("do it"),
+        }],
+    };
+    let body = |model: &str| {
+        let (_, signal) = crate::shutdown::channel();
+        let config = claude::ModelConfig::new(
+            Some("sk-ant-example".to_string()),
+            model,
+            claude::DEFAULT_MAX_TOKENS,
+            signal,
+        )
+        .expect("the model name is accepted");
+        claude::request_body(&config, &request)
+    };
+    let keys = |body: &Value| -> Vec<String> {
+        body.as_object()
+            .expect("the body is an object")
+            .keys()
+            .cloned()
+            .collect()
+    };
+
+    let known = body(claude::DEFAULT_MODEL);
+    assert_eq!(
+        known["thinking"],
+        json!({ "type": "adaptive" }),
+        "the model this example is written for is asked for adaptive thinking: {known}"
+    );
+    assert_eq!(
+        keys(&known),
+        [
+            "max_tokens",
+            "messages",
+            "model",
+            "system",
+            "thinking",
+            "tools"
+        ],
+        "and the turn sends these keys and no others: {known}"
+    );
+
+    // Any other name. The daemon holds no capability for it, only the name.
+    for other in ["claude-3-haiku-20240307", "claude-sonnet-4-20250514", "x"] {
+        let sent = body(other);
+        assert_eq!(
+            sent.get("thinking"),
+            None,
+            "[{other}] a model this example knows nothing of is asked for no \
+             thinking at all: {sent}"
+        );
+        assert_eq!(
+            keys(&sent),
+            ["max_tokens", "messages", "model", "system", "tools"],
+            "[{other}] and the rest of the turn is unchanged: {sent}"
+        );
+        assert_eq!(
+            sent["model"], other,
+            "[{other}] the turn still runs on the model that was asked for"
+        );
+    }
+}
+
 #[test]
 fn a_long_history_does_not_make_one_unbounded_listing() {
     // `list` reads the whole row of every session it names, and both the goal

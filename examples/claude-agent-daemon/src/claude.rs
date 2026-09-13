@@ -30,6 +30,9 @@ pub const STOP_TOOL_USE: &str = "tool_use";
 pub const STOP_END_TURN: &str = "end_turn";
 
 /// The default model. Adaptive thinking is on by default on this model.
+///
+/// It is also the ONE model this example asks thinking of. See
+/// [`thinking_for`].
 pub const DEFAULT_MODEL: &str = "claude-opus-5";
 /// The default output cap for a non-streaming request.
 pub const DEFAULT_MAX_TOKENS: u32 = 16_000;
@@ -388,6 +391,10 @@ pub fn activity_refusal_for_oversized_reply(reply: &TurnReply) -> Option<String>
 
 /// Build the request body.
 ///
+/// Public so a test can read the EXACT keys one turn sends. An offline suite
+/// cannot see what the API accepts. It can see what this daemon asks for, and
+/// a field the model does not take is refused before any turn runs.
+///
 /// There are deliberately NO server-side refusal fallbacks here. A fallback
 /// answers one turn on a DIFFERENT model, and this is a multi-turn loop. The
 /// next request would go back to the configured model, which switches the
@@ -398,16 +405,47 @@ pub fn activity_refusal_for_oversized_reply(reply: &TurnReply) -> Option<String>
 /// A refusal therefore ends the session under its own stop reason, where the
 /// operator can see it. It is not routed to a model the session is not
 /// recorded against.
-fn request_body(config: &ModelConfig, request: &TurnRequest) -> Value {
-    json!({
+pub fn request_body(config: &ModelConfig, request: &TurnRequest) -> Value {
+    let mut body = json!({
         "model": config.model,
         "max_tokens": config.max_tokens,
         "system": SYSTEM_PROMPT,
-        // Adaptive thinking lets the model decide how much to reason per turn.
-        "thinking": { "type": "adaptive" },
         "tools": tools::definitions(),
         "messages": request.messages,
-    })
+    });
+    if let Some(thinking) = thinking_for(&config.model) {
+        body["thinking"] = thinking;
+    }
+    body
+}
+
+/// The thinking this request asks for, if it asks for any.
+///
+/// Adaptive thinking is a property of the MODEL, and not of the API. A model
+/// that does not take the parameter refuses the whole request, and a refused
+/// request is not retryable. Every turn of the session then fails, and the
+/// session fails instead of running on the model it was asked to run on.
+///
+/// This example asks for adaptive thinking on the ONE model it is written
+/// for, and asks for none on any other. It cannot know what another model
+/// takes: there is no capability to read, only a name the operator typed. A
+/// list of names would rot as models are released, and a name it guessed
+/// wrong about would fail every turn again.
+///
+/// The cost is stated rather than hidden. A model that DOES take adaptive
+/// thinking runs here without it. That is a weaker answer, and not a failed
+/// session, so it is the side to be wrong on.
+///
+/// `max_tokens` is the same shape of risk and is left alone. A model with a
+/// lower output cap refuses a request above it, and the answer names the
+/// field. The operator has `--max-tokens` for that, and has no flag for this.
+///
+/// The answer is a function of the RECORDED model, so it is the same on every
+/// replay of one session. A build that changed this rule could send a
+/// transcript holding thinking blocks to a request that asks for none. The
+/// model is pinned in history against the same hazard.
+fn thinking_for(model: &str) -> Option<Value> {
+    (model == DEFAULT_MODEL).then(|| json!({ "type": "adaptive" }))
 }
 
 /// How much room the read cap leaves above the recorded payload cap.
@@ -692,9 +730,9 @@ fn is_replayable_block(block: &Value) -> bool {
             .and_then(Value::as_str)
             .is_some_and(|text| !text.is_empty()),
         // The thinking text may be EMPTY, and an empty one is still replayed.
-        // This request asks for adaptive thinking and asks for no display,
-        // and the default display returns every thinking block with an empty
-        // text. A check for text here would refuse ordinary replies.
+        // A request that asks for thinking asks for no display, and the
+        // default display returns every thinking block with an empty text. A
+        // check for text here would refuse ordinary replies.
         //
         // The SIGNATURE is the field that must be there. It carries the
         // encrypted reasoning whatever the display setting, and the API reads
