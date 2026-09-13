@@ -313,6 +313,23 @@ pub enum DevError {
         /// [`HarvestModeSource`] is not.
         mode_source: HarvestModeSource,
     },
+
+    /// The server thread panicked while building or running the app.
+    ///
+    /// [`ServerThread`] catches the panic so the caller learns the real
+    /// cause. Without it, only `ServerNotReady` is visible once the
+    /// readiness poll gives up.
+    ///
+    /// One known source: `register_plugin_migrations`'s own backstop
+    /// assertion (issue #1291). Ambient Harvest configuration can change to
+    /// `split` or `external` in the narrow window after
+    /// [`refuse_unsupported_harvest_mode`] last checked it, but before the
+    /// plugin finishes building.
+    #[error("the dev runtime's server thread panicked: {message}")]
+    ServerPanicked {
+        /// The panic payload, downcast to text where possible.
+        message: String,
+    },
 }
 
 /// How the dev runtime should come up.
@@ -560,6 +577,11 @@ impl DevRuntime {
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
+        // A panic is the real cause of the exit above. Report it instead of
+        // the generic timeout, which names no cause at all.
+        if let Some(message) = self.server.panic_message() {
+            return Err(DevError::ServerPanicked { message });
+        }
         Err(DevError::ServerNotReady {
             url,
             seconds: READY_TIMEOUT_SECS,
@@ -617,11 +639,23 @@ struct ServerThread {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     handle: Option<std::thread::JoinHandle<()>>,
     exited: Arc<std::sync::atomic::AtomicBool>,
+    /// The panic payload, if the thread's app body panicked. Read by
+    /// [`DevRuntime::wait_until_ready`] once `exited` is observed, so a
+    /// caller learns the real cause instead of only a readiness timeout.
+    panic_message: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl ServerThread {
     fn has_exited(&self) -> bool {
         self.exited.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The stored panic message, if the app body panicked.
+    fn panic_message(&self) -> Option<String> {
+        self.panic_message
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Ask the server to stop, then wait for its thread.
@@ -859,6 +893,8 @@ fn spawn_server(
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let exited_in_thread = Arc::clone(&exited);
+    let panic_message = Arc::new(std::sync::Mutex::new(None::<String>));
+    let panic_message_in_thread = Arc::clone(&panic_message);
 
     let handle = std::thread::Builder::new()
         .name("harvest-dev-server".to_owned())
@@ -877,12 +913,22 @@ fn spawn_server(
                     return;
                 }
             };
-            runtime.block_on(async move {
-                tokio::select! {
-                    () = run_app(loader, api_path, postgres) => {}
-                    _ = stop_rx => {}
-                }
-            });
+            // Caught, not left to unwind. A panic here (issue #1291's own
+            // backstop assertion, among others) would otherwise stay
+            // invisible. The readiness poll would only report a generic
+            // `ServerNotReady`, once it gives up on a thread that already
+            // died.
+            run_catching_panic(
+                || {
+                    runtime.block_on(async move {
+                        tokio::select! {
+                            () = run_app(loader, api_path, postgres) => {}
+                            _ = stop_rx => {}
+                        }
+                    });
+                },
+                &panic_message_in_thread,
+            );
             // Bounded, but generously: `pg_ctl stop --wait` is allowed 90
             // seconds, so a 5-second budget here could abandon a teardown
             // half-done and then report success.
@@ -894,7 +940,37 @@ fn spawn_server(
         stop: Some(stop_tx),
         handle: Some(handle),
         exited,
+        panic_message,
     })
+}
+
+/// Run `body`, catching a panic and recording it rather than propagating it.
+///
+/// Split out of `spawn_server` so this mechanism is unit-testable on its own,
+/// without a real Tokio runtime or `autumn-web` app behind it.
+fn run_catching_panic(body: impl FnOnce(), panic_message: &std::sync::Mutex<Option<String>>) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        let message = panic_payload_message(&*payload);
+        tracing::error!(%message, "dev runtime: the server thread panicked");
+        *panic_message
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message);
+    }
+}
+
+/// Render a panic payload as text.
+///
+/// `panic!`/`assert!` always carry `&str` or `String`. Anything else is a
+/// deliberate panic with a custom payload type, which this names rather than
+/// guesses at.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_owned();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "non-string panic payload".to_owned()
 }
 
 /// The app's own boot-and-serve body.
@@ -1046,5 +1122,61 @@ mod harvest_mode_gate_tests {
             message.contains(&config_path.display().to_string()),
             "the refusal must name the responsible file: {message}"
         );
+    }
+}
+
+#[cfg(test)]
+mod server_panic_tests {
+    //! A panicking server thread must surface its cause, not just
+    //! `ServerNotReady` (Codex review, issue #1291).
+    //!
+    //! `register_plugin_migrations`'s backstop assertion panics on this
+    //! thread. This happens if ambient Harvest configuration changes in the
+    //! narrow window this PR's other checks cannot close.
+
+    use super::{panic_payload_message, run_catching_panic};
+
+    #[test]
+    fn a_string_literal_panic_is_captured_verbatim() {
+        let panic_message = std::sync::Mutex::new(None);
+
+        run_catching_panic(|| panic!("boom"), &panic_message);
+
+        assert_eq!(panic_message.into_inner().unwrap().as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn a_formatted_panic_is_captured_verbatim() {
+        let panic_message = std::sync::Mutex::new(None);
+
+        run_catching_panic(|| panic!("mode was {:?}", "split"), &panic_message);
+
+        assert_eq!(
+            panic_message.into_inner().unwrap().as_deref(),
+            Some("mode was \"split\"")
+        );
+    }
+
+    #[test]
+    fn a_body_that_does_not_panic_leaves_no_message() {
+        let panic_message = std::sync::Mutex::new(None);
+
+        run_catching_panic(|| (), &panic_message);
+
+        assert_eq!(panic_message.into_inner().unwrap(), None);
+    }
+
+    #[test]
+    fn a_non_string_payload_gets_a_named_fallback() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42_i32);
+
+        assert_eq!(panic_payload_message(&*payload), "non-string panic payload");
+    }
+
+    #[test]
+    fn a_str_payload_downcasts_to_its_text() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+
+        assert_eq!(panic_payload_message(&*payload), "boom");
     }
 }
