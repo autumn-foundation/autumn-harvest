@@ -2578,9 +2578,19 @@ async fn export_once_via_pool(
         () = cancel.cancelled() => {
             tracing::warn!(
                 shard = shard_id,
-                "[audit_export] shutdown requested while claiming a batch; abandoning \
-                 the wait for the next attempt to retry"
+                "[audit_export] shutdown requested while claiming a batch; discarding \
+                 the connection and abandoning the wait for the next attempt to retry"
             );
+            // `claim_shard` runs inside its own Diesel transaction (Codex
+            // review on PR #1520, follow-up P2, sixth round -- P1).
+            // Dropping this future mid-flight sends no ROLLBACK. Silently
+            // returning `conn` to the pool could then hand the next
+            // checkout a connection still holding an open transaction and
+            // the cursor row's lock. `Object::take` detaches it from the
+            // pool instead of recycling it. Dropping the raw connection
+            // then closes the socket, and Postgres rolls back whatever
+            // that session still had open.
+            drop(deadpool::managed::Object::take(conn));
             return Ok(0);
         }
     };

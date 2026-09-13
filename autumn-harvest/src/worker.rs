@@ -26535,6 +26535,18 @@ impl Worker {
                              pool; skipping its dedicated audit-export task rather \
                              than risk stamping records under another shard's key"
                             );
+                            // A shard with no task never reaches the checker's own
+                            // `export_observed` emission (Codex review on PR #1520,
+                            // follow-up P2, sixth round). Set it here instead. A
+                            // healthy sibling shard's series could otherwise mask
+                            // this absence. It would then read as the "scanner
+                            // never runs here" case the alert notes call
+                            // legitimate, not the configuration failure it is.
+                            let shard_u16 = u16::try_from(s.as_i32()).unwrap_or(u16::MAX);
+                            self.registry
+                                .telemetry()
+                                .metrics
+                                .record_audit_export_observed(shard_u16, false);
                             return None;
                         };
                         exact.clone()
