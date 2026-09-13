@@ -2592,6 +2592,63 @@ async fn is_configured_alone_does_not_protect_a_re_enabling_shards_retired_curso
     );
 }
 
+// Codex review, PR #1504. The outer "export may be live" gate's
+// zero-cursor arm checked whether the whole `harvest_audit_export_cursor`
+// table was empty, not whether an *expected* shard lacked a row. A
+// retired shard's own leftover cursor row made that check false for
+// every other colocated shard sharing the physical database. This held
+// even for one that has never ticked. `is_configured()` could then
+// never stand in for that shard's missing cursor. Its rows lost
+// protection during exactly the bootstrap window this whole function
+// exists to close.
+#[tokio::test]
+async fn retention_protects_a_bootstrapping_colocated_shard_despite_another_shards_retired_cursor()
+{
+    let _guard = TEST_SERIAL.lock().await;
+    let _sink = install(Arc::new(RecordingSink::new(200)), 2);
+    let (mut conn, _c) = make_conn().await;
+
+    // Shard 0 has already ticked, acknowledged its rows, and been
+    // decommissioned: its cursor row exists and is retired.
+    insert_audit_rows(&mut conn, 2).await;
+    fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+        .await
+        .expect("decommission");
+
+    // Shard 1 is newly enabled and colocated in this same physical
+    // database. Its worker has never reached it, though: no cursor row
+    // for it exists at all.
+    insert_audit_rows(&mut conn, 3).await;
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
+
+    assert!(autumn_harvest::audit_export::is_configured());
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0, 1], &[])
+        .await
+        .expect("purge runs");
+    uninstall();
+    assert_eq!(
+        deleted, 0,
+        "shard 1 is still in its own bootstrap window -- no cursor row of \
+         its own exists yet -- regardless of shard 0's unrelated, already-\
+         retired cursor sharing this database; the three new rows must \
+         stay protected"
+    );
+
+    let remaining: i64 = harvest_audit_log::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(remaining, 5);
+}
+
 // Issue #1266. A stamped row must count as
 // pending when its shard has no cursor row at all. This holds even though
 // its `export_seq` is already assigned. `ensure_cursor_row` rebuilds a

@@ -1686,9 +1686,14 @@ pub async fn list_audit(
 ///
 /// **A cursor row, once it exists, is authoritative over `is_configured()`**
 /// (issue #1273). The two signals above are not simply OR'd. `is_configured()`
-/// only stands in for a cursor row when NO row exists yet, the bootstrap
-/// window this function's doc already covers. Once a row exists, its own
-/// `retired_at` decides, full stop.
+/// only stands in for an expected shard -- one named in
+/// `colocated_shard_ids` -- when that shard has no cursor row yet. That
+/// is the bootstrap window this function's doc already covers.
+///
+/// This is scoped per shard (Codex review, PR #1504). An unrelated
+/// colocated shard's own lingering row must never stand in for a
+/// different expected shard's still-missing one. Once an expected
+/// shard's own row exists, its `retired_at` decides, full stop.
 ///
 /// Earlier this made no practical difference:
 /// [`crate::audit_export::ensure_cursor_row`] used to un-retire a cursor on
@@ -1745,9 +1750,17 @@ pub async fn purge_old_audit_records(
     // own (issue #1266). An operator's explicit signal must keep closing
     // the bootstrap window, regardless of what any other colocated
     // shard's cursor looks like. `$7` (raw `is_configured()`) only
-    // stands in when no cursor row exists in this database yet at all.
-    // That is #1273's own rule, kept only for the narrow signal it was
-    // written for.
+    // stands in when some shard named in `$3` has no cursor row of its
+    // own yet (Codex review, PR #1504). That is #1273's own narrow
+    // signal, scoped the same way the pending check's own
+    // missing-cursor disjunct already is below.
+    //
+    // An earlier revision checked whether the whole cursor table was
+    // empty, not whether an expected shard's own row was missing. A
+    // retired, unrelated shard's lingering row then made that check
+    // false for every other colocated shard sharing this database.
+    // That reopened the exact bootstrap window this disjunct exists to
+    // close, even for a shard that had never ticked.
     //
     // `is_configured()` never overrides a specific shard's own retired
     // cursor outside that zero-cursor case, on purpose. This matches
@@ -1828,7 +1841,13 @@ pub async fn purge_old_audit_records(
                    OR $2::BOOLEAN \
                    OR ( \
                      $7::BOOLEAN \
-                     AND NOT EXISTS (SELECT 1 FROM harvest_audit_export_cursor) \
+                     AND EXISTS ( \
+                          SELECT 1 FROM unnest($3::int4[]) AS expected(shard_id) \
+                          WHERE NOT EXISTS ( \
+                               SELECT 1 FROM harvest_audit_export_cursor c \
+                               WHERE c.shard_id = expected.shard_id \
+                          ) \
+                     ) \
                    ) \
                  ) \
                  AND ( \
