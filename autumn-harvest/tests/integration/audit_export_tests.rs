@@ -3051,3 +3051,81 @@ async fn graceful_shutdown_does_not_wait_for_an_in_flight_delivery() {
     release.notify_one();
     uninstall();
 }
+
+/// The exact hazard a later review pass on PR #1520 raised. A successful
+/// delivery finishing right at `lease_until` must not be left with zero
+/// time to reacquire a connection and acknowledge it.
+///
+/// The delivery deadline reserves `SHARD_ACQUIRE_BOUND` off the lease. A
+/// still-blocked sink must therefore fail well before the raw lease
+/// elapses. A backoff is recorded then, not only once the raw lease
+/// itself runs out.
+#[tokio::test]
+async fn the_delivery_deadline_reserves_time_for_the_acknowledgement() {
+    let _guard = TEST_SERIAL.lock().await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let sink: Arc<dyn AuditSink> = Arc::new(SlowSink {
+        release: Arc::clone(&release),
+        status: 200,
+    });
+    // SHARD_ACQUIRE_BOUND is 5s. A 6s lease leaves only ~1s of delivery
+    // budget once that is reserved. That is comfortably inside this test's
+    // 3s deadline, and comfortably short of the raw 6s lease.
+    let lease = std::time::Duration::from_secs(6);
+    {
+        let mut lock = GLOBAL_AUDIT_EXPORT_CONFIG
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *lock = Some(Arc::new(AuditExportRuntimeConfig {
+            sink,
+            secret: CallbackSecret::new(b"test-secret".to_vec()),
+            batch_size: 100,
+            backoff: ExportBackoff::default(),
+            lease,
+        }));
+    }
+    let (mut conn, container) = make_conn().await;
+    insert_audit_rows(&mut conn, 1).await;
+
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(url);
+    let pool = autumn_harvest::worker::DbPool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("pool");
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(20),
+        Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        Some(autumn_harvest::types::ShardId::new(0)),
+        None,
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let status = export_status(&mut conn, 0, chrono::Utc::now())
+            .await
+            .expect("status query");
+        if status.is_some_and(|s| s.consecutive_failures >= 1) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a delivery blocked well past the reserved delivery deadline must \
+             be classified as a failure long before the raw {lease:?} lease \
+             elapses; the reserve was not applied"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    cancel.cancel();
+    release.notify_one();
+    let _ = handle.await;
+    uninstall();
+}

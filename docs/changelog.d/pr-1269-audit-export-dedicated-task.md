@@ -52,8 +52,26 @@ pipeline itself, so the fix is architectural: give export its own task.
   are unchanged — an embedder driving it by hand still works exactly as
   before — only the caller inside core's own scanner loop is gone.
 - **`Scanner::AuditExport`** added to the bounded `scanner` label set
-  (`scanner_health.rs`), bringing the total to eight labels / six spawned
+  (`scanner_health.rs`), bringing the total to eight labels / seven spawned
   loops.
+- **The per-tick liveness re-registration reads the same config snapshot
+  the tick itself delivers with** (follow-up P2): the checker previously
+  read the global export config twice per tick, once to size the
+  registered interval and once inside `export_once_via_pool`, so a swap
+  landing between the two reads could register one lease while delivering
+  against another. `export_once_via_pool` now takes the snapshot as a
+  parameter instead of reading it itself.
+- **The delivery deadline reserves `SHARD_ACQUIRE_BOUND` off the claim
+  lease** (follow-up P1): a delivery finishing right at `lease_until` left
+  zero time for the reacquire-and-acknowledge step that follows it. A
+  second exporter could then reclaim the shard before the first one's
+  acknowledgement lands, so a batch delivered under sustained near-lease
+  latency was never acknowledged. Reserving the acquire bound up front
+  guarantees a successful delivery always has that time left to
+  acknowledge.
+- **`docs/telemetry.md`** updated to list `audit_export.rs` among the
+  per-shard scanner loops, with the eight-label / seven-loop counts and
+  the `audit_export` label value.
 - Removed `timeout::mark_audit_export_unobserved_for_checker_shard` and its
   two call sites: the timeout checker's own connection failures no longer
   have anything to do with audit export's observability, since the two are
@@ -77,4 +95,7 @@ pipeline itself, so the fix is architectural: give export its own task.
   `an_in_flight_slow_delivery_never_blocks_the_timeout_checker_on_a_size_one_pool`
   (a blocking-until-released sink proves the connection-release property
   directly), `audit_export_checker_re_registers_when_the_configured_lease_grows`,
-  and `graceful_shutdown_does_not_wait_for_an_in_flight_delivery`.
+  `graceful_shutdown_does_not_wait_for_an_in_flight_delivery`, and
+  `the_delivery_deadline_reserves_time_for_the_acknowledgement` (a
+  still-blocked sink proves the effective delivery bound is
+  `lease - SHARD_ACQUIRE_BOUND`, not the raw lease).

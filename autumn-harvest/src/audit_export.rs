@@ -2244,6 +2244,12 @@ async fn acquire_shard_conn_for_export(
 /// same physical connection — for the acknowledgement transaction. No
 /// connection is held during delivery at all.
 ///
+/// The delivery deadline reserves `SHARD_ACQUIRE_BOUND` off the lease for
+/// that second checkout (Codex review on PR #1520, follow-up P1). The
+/// checkout itself is bounded, but bounded is not free. A successful
+/// delivery finishing right at `lease_until` would leave no time to
+/// reacquire before a fresher claim could reclaim the shard.
+///
 /// `cancel` races the delivery wait, never the claim or the acknowledgement
 /// (Codex review on PR #1520, follow-up P1). A shutdown mid-delivery
 /// abandons the wait and leaves the claim exactly where it was, for the
@@ -2349,12 +2355,32 @@ async fn export_once_via_pool(
         headers: &headers,
     };
 
+    // The delivery deadline reserves `SHARD_ACQUIRE_BOUND` off the end of
+    // the lease for the post-delivery reacquire-and-acknowledge step below
+    // (Codex review on PR #1520, follow-up P1). Without a reserve, a sink
+    // finishing near `lease_until` could leave the reacquire step to run
+    // PAST the lease.
+    //
+    // A second exporter would then see the lease already expired. It would
+    // reclaim the shard and bump `claim_epoch`. This attempt's
+    // `apply_outcome` below would be guarded out even though the batch was
+    // genuinely delivered. Under sustained near-lease latency that repeats
+    // forever: delivered, but never acknowledged.
+    //
+    // Reserving the time up front instead means a successful delivery
+    // always has a full `SHARD_ACQUIRE_BOUND` left to reacquire and
+    // acknowledge. That is before the lease a fresher claim could reclaim
+    // actually elapses.
+    let delivery_deadline = claim.lease_until
+        - chrono::Duration::from_std(SHARD_ACQUIRE_BOUND)
+            .unwrap_or_else(|_| chrono::Duration::zero());
+
     // No connection held during this await. A timeout is classified exactly
     // like any other transport failure: the cursor is held and the batch is
     // retried. Never a loss.
     //
     // Raced against `cancel` (Codex review on PR #1520 P1). A bare await
-    // here does not return until the sink finishes or the full lease
+    // here does not return until the sink finishes or the delivery deadline
     // elapses. Both worker shutdown paths join every export task's handle.
     // An in-flight delivery could otherwise hold up a graceful shutdown for
     // the whole lease. That is 60s by default, longer if configured -- well
@@ -2364,7 +2390,7 @@ async fn export_once_via_pool(
     // The claim's cursor and lease are untouched. The batch is safely
     // redelivered once this shard's lease expires or the process restarts.
     let attempt = tokio::select! {
-        attempt = deliver_within_lease(config, &batch, claim.lease_until) => attempt,
+        attempt = deliver_within_lease(config, &batch, delivery_deadline) => attempt,
         () = cancel.cancelled() => {
             tracing::warn!(
                 shard = shard_id,
