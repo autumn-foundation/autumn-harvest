@@ -5308,6 +5308,368 @@ async fn phase_4_rechecks_dependent_views_created_after_phase_1() {
 }
 
 #[tokio::test]
+async fn a_row_security_policy_on_a_leaf_partition_directly_still_refuses_the_revert() {
+    // Review finding: `row_security_config` matched only the PARENT name
+    // `harvest_events`. Postgres lets an operator enable row security or
+    // attach a policy directly on a LEAF partition instead. Such a
+    // configuration used to pass this check unnoticed.
+    // `disable_partitioning`'s copy-and-`DROP ... CASCADE` then silently
+    // dropped the protection along with the leaf it was attached to.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(
+        &mut conn,
+        "leaf_rls_wf",
+        "leaf-rls-1",
+        day(2026, 2, 3),
+        None,
+    )
+    .await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    diesel::sql_query(format!(
+        "ALTER TABLE {} ENABLE ROW LEVEL SECURITY",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("enable row security directly on a leaf partition");
+    diesel::sql_query(format!(
+        "DROP POLICY IF EXISTS harvest_events_leaf_rls_958 ON {}",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray policy from a previous run");
+    diesel::sql_query(format!(
+        "CREATE POLICY harvest_events_leaf_rls_958 ON {} USING (true)",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed a policy attached directly to a leaf partition");
+
+    let err = partition::disable_partitioning(&mut conn).await.expect_err(
+        "row security configured directly on a leaf partition must refuse the revert \
+         too, not only row security on the parent",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_leaf_rls_958"),
+        "the refusal must name the offending policy; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "p",
+        "a refused revert must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query(format!(
+        "DROP POLICY harvest_events_leaf_rls_958 ON {}",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the offending policy");
+    diesel::sql_query(format!(
+        "ALTER TABLE {} DISABLE ROW LEVEL SECURITY",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("disable row security on the leaf partition");
+}
+
+#[tokio::test]
+async fn enable_sql_rechecks_row_security_enabled_after_the_preflight() {
+    // Review finding: the phase-4 (and direct-path) in-lock recheck block
+    // rechecked unique indexes, views and triggers, but not row
+    // security. `CREATE TABLE ... (LIKE ...)` copies neither
+    // `relrowsecurity`/`relforcerowsecurity` nor any `pg_policy` row, the
+    // identical gap `refuse_if_row_security` exists to close before the
+    // lock. This test calls `enable_sql` directly, bypassing the Rust
+    // preflight entirely, to prove the script also refuses for itself
+    // once it holds the lock.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(&mut conn, "race_rls_wf", "race-rls-1", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    diesel::sql_query("ALTER TABLE harvest_events ENABLE ROW LEVEL SECURITY")
+        .execute(&mut conn)
+        .await
+        .expect("enable row security as if configured in the gap after the preflight check");
+    diesel::sql_query("DROP POLICY IF EXISTS harvest_events_race_rls_958 ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray policy from a previous run");
+    diesel::sql_query("CREATE POLICY harvest_events_race_rls_958 ON harvest_events USING (true)")
+        .execute(&mut conn)
+        .await
+        .expect("seed a policy as if added in the gap after the preflight check");
+
+    let err = diesel_async::SimpleAsyncConnection::batch_execute(
+        &mut conn,
+        &partition::enable_sql(&EnableOptions::default()),
+    )
+    .await
+    .expect_err(
+        "enable_sql must refuse under its own lock, not rely solely on a check made \
+         before the script started",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_race_rls_958"),
+        "the refusal must name the offending policy; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP POLICY harvest_events_race_rls_958 ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending policy");
+    diesel::sql_query("ALTER TABLE harvest_events DISABLE ROW LEVEL SECURITY")
+        .execute(&mut conn)
+        .await
+        .expect("disable row security");
+}
+
+#[tokio::test]
+async fn enable_sql_rechecks_a_publication_added_after_the_preflight() {
+    // Review finding: the in-lock recheck block had no publication check
+    // at all, unlike the Rust preflight `enable_partitioning` runs
+    // first. See `incompatible_publications` for why a leaf-publishing
+    // publication silently stops a logical-replication standby. This
+    // test calls `enable_sql` directly, bypassing that Rust preflight
+    // entirely, to prove the script also refuses for itself once it
+    // holds the lock.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(&mut conn, "race_pub_wf", "race-pub-1", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    diesel::sql_query("DROP PUBLICATION IF EXISTS harvest_events_race_pub_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray publication from a previous run");
+    diesel::sql_query("CREATE PUBLICATION harvest_events_race_pub_958 FOR TABLE harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("seed a publication as if added in the gap after the preflight check");
+
+    let err = diesel_async::SimpleAsyncConnection::batch_execute(
+        &mut conn,
+        &partition::enable_sql(&EnableOptions::default()),
+    )
+    .await
+    .expect_err(
+        "enable_sql must refuse under its own lock, not rely solely on a check made \
+         before the script started",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_race_pub_958"),
+        "the refusal must name the offending publication; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP PUBLICATION harvest_events_race_pub_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending publication");
+}
+
+#[tokio::test]
+async fn phase_4_rechecks_row_security_enabled_after_phase_1() {
+    // Review finding: phase 1's row-security check runs hours before
+    // phase 4's rename, under this plan's online path. Row security
+    // enabled (or a policy added) at `harvest_events` in that gap would
+    // pass phase 1 clean. It would then be silently dropped by phase
+    // 4's `CREATE TABLE ... (LIKE ...)` anyway. Phase 4 must repeat the
+    // identical check under the lock it actually converts within.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    run_plan_phases(&mut conn, 1..=3).await;
+
+    diesel::sql_query("ALTER TABLE harvest_events ENABLE ROW LEVEL SECURITY")
+        .execute(&mut conn)
+        .await
+        .expect("enable row security after phase 1's check already passed");
+    diesel::sql_query("DROP POLICY IF EXISTS harvest_events_late_rls_958 ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray policy from a previous run");
+    diesel::sql_query("CREATE POLICY harvest_events_late_rls_958 ON harvest_events USING (true)")
+        .execute(&mut conn)
+        .await
+        .expect("seed a policy created after phase 1's check already passed");
+
+    let mut refusal: Option<String> = None;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 4)
+    {
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await
+            && refusal.is_none()
+        {
+            refusal = Some(e.to_string());
+        }
+    }
+    let msg = refusal.expect(
+        "phase 4 must refuse row security enabled on harvest_events after phase 1's \
+         check already passed",
+    );
+    assert!(
+        msg.contains("harvest_events_late_rls_958"),
+        "the refusal must name the offending policy; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused window must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP POLICY harvest_events_late_rls_958 ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending policy");
+    diesel::sql_query("ALTER TABLE harvest_events DISABLE ROW LEVEL SECURITY")
+        .execute(&mut conn)
+        .await
+        .expect("disable row security");
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {}", plan_pk_index()))
+        .execute(&mut conn)
+        .await
+        .expect("drop the index phase 2 legitimately built");
+    diesel::sql_query(format!(
+        "DROP INDEX IF EXISTS {}_exec_event_idx",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the other index phase 2 legitimately built");
+    diesel::sql_query(format!(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS {}_cohort_ck",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the constraint phase 3 legitimately built");
+}
+
+#[tokio::test]
+async fn phase_4_rechecks_a_publication_added_after_phase_1() {
+    // Review finding: the phase-4 in-lock recheck block had no
+    // publication check at all, unlike phase 1's. A publication created
+    // (or repointed) in the hours-long gap before phase 4 would pass
+    // phase 1 clean. It would still break a logical-replication standby
+    // after this plan's cutover.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    run_plan_phases(&mut conn, 1..=3).await;
+
+    diesel::sql_query("DROP PUBLICATION IF EXISTS harvest_events_late_pub_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray publication from a previous run");
+    diesel::sql_query("CREATE PUBLICATION harvest_events_late_pub_958 FOR TABLE harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("seed a publication created after phase 1's check already passed");
+
+    let mut refusal: Option<String> = None;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 4)
+    {
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await
+            && refusal.is_none()
+        {
+            refusal = Some(e.to_string());
+        }
+    }
+    let msg = refusal.expect(
+        "phase 4 must refuse a publication covering harvest_events added after phase \
+         1's check already passed",
+    );
+    assert!(
+        msg.contains("harvest_events_late_pub_958"),
+        "the refusal must name the offending publication; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused window must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP PUBLICATION harvest_events_late_pub_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending publication");
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {}", plan_pk_index()))
+        .execute(&mut conn)
+        .await
+        .expect("drop the index phase 2 legitimately built");
+    diesel::sql_query(format!(
+        "DROP INDEX IF EXISTS {}_exec_event_idx",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the other index phase 2 legitimately built");
+    diesel::sql_query(format!(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS {}_cohort_ck",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the constraint phase 3 legitimately built");
+}
+
+#[tokio::test]
 async fn phase_4_holds_access_exclusive_before_the_dependent_view_recheck() {
     // Review finding: the recheck above is only as good as the lock it
     // runs under. `BEGIN` and `SET LOCAL lock_timeout` take no lock on
