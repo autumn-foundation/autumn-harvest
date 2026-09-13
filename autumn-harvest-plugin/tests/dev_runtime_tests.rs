@@ -1480,9 +1480,12 @@ impl Drop for EnvVarGuard {
 /// Pointing it at a real, empty file makes the lookup succeed there
 /// instead. That happens before the fallback ever runs.
 ///
-/// `AUTUMN_PROFILE` is forced unset too. Then no `autumn-<profile>.toml`
-/// lookup ever happens, closing the same fallback for a profile file.
-fn harvest_mode_env_cleared() -> [EnvVarGuard; 4] {
+/// `AUTUMN_PROFILE` is forced unset too, so no `autumn-<profile>.toml`
+/// lookup happens from that source. `resolve_profile` also falls back to
+/// `AUTUMN_IS_DEBUG` (Codex review, issue #1291), so this unsets that too.
+/// Otherwise an inherited `AUTUMN_IS_DEBUG=1`/`0` could still select a
+/// profile and reopen the same checkout-root fallback for its file.
+fn harvest_mode_env_cleared() -> [EnvVarGuard; 5] {
     let manifest_dir = std::env::temp_dir().join(format!(
         "autumn-harvest-plugin-embedded-manifest-{}",
         uuid::Uuid::new_v4()
@@ -1494,6 +1497,7 @@ fn harvest_mode_env_cleared() -> [EnvVarGuard; 4] {
         EnvVarGuard::unset("AUTUMN_HARVEST__MODE"),
         EnvVarGuard::unset("AUTUMN_HARVEST_DATABASE__URL"),
         EnvVarGuard::unset("AUTUMN_PROFILE"),
+        EnvVarGuard::unset("AUTUMN_IS_DEBUG"),
         EnvVarGuard::set("AUTUMN_MANIFEST_DIR", &manifest_dir),
     ]
 }
