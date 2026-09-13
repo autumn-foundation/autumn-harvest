@@ -746,6 +746,18 @@ impl RetentionConfig {
                 MAX_MAX_AGE.as_secs()
             ));
         }
+        // `EnableOptions::validate` (issue #958) rejects a zero lookahead at
+        // enable time for exactly this reason: it leaves every append landing
+        // in the DEFAULT partition. `PartitionMaintenanceConfig` must refuse
+        // the same value at runtime, or a deployment could enable with a sane
+        // lookahead and then configure maintenance to pre-create nothing.
+        if self.partitions.enabled && self.partitions.lookahead_cohorts == 0 {
+            return Err(
+                "partitions.lookahead_cohorts must be at least 1; with no lookahead every \
+                 append lands in the DEFAULT partition and reclamation stalls"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -3180,6 +3192,53 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_zero_lookahead_cohorts_is_rejected_when_partition_maintenance_is_enabled() {
+        // Issue #1270 item 3: `EnableOptions::validate` already rejects a zero
+        // lookahead at enable time, because it leaves every append landing in
+        // the DEFAULT partition. `PartitionMaintenanceConfig` must refuse the
+        // same value at runtime — the two paths must not disagree about what
+        // is a usable value.
+        let config = RetentionConfig {
+            partitions: PartitionMaintenanceConfig {
+                enabled: true,
+                lookahead_cohorts: 0,
+                ..PartitionMaintenanceConfig::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "a zero lookahead must be rejected while partition maintenance is enabled"
+        );
+
+        // Disabled maintenance never reads the field, so a stale zero left
+        // over from a config that later turned maintenance off must not block
+        // startup for reasons unrelated to what is actually running.
+        let config = RetentionConfig {
+            partitions: PartitionMaintenanceConfig {
+                enabled: false,
+                lookahead_cohorts: 0,
+                ..PartitionMaintenanceConfig::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "lookahead_cohorts is inert while partition maintenance is disabled"
+        );
+
+        let config = RetentionConfig {
+            partitions: PartitionMaintenanceConfig {
+                enabled: true,
+                lookahead_cohorts: 1,
+                ..PartitionMaintenanceConfig::default()
+            },
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
     }
 
     // --- Issue #737: per-workflow-type history retention overrides ---
