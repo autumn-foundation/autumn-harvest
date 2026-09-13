@@ -1103,6 +1103,70 @@ async fn an_operator_trigger_refuses_the_revert_too() {
 }
 
 #[tokio::test]
+async fn an_operator_trigger_sharing_the_reserved_fk_trigger_name_still_refuses() {
+    // Review finding: the guard used to exempt EXEC_FK_TRIGGER by NAME
+    // alone. On an unpartitioned shard that name cannot yet be harvest's.
+    // Only a conversion creates it. So an operator's own trigger sharing
+    // the reserved name was silently exempted, then dropped without
+    // warning by the LIKE-based rebuild. The guard now excludes a trigger
+    // only by its FUNCTION (`harvest_events_require_execution`), which an
+    // operator's trigger does not invoke even if its name collides.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP TRIGGER IF EXISTS harvest_events_exec_fk_trg ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray trigger from a previous run");
+    diesel::sql_query("DROP FUNCTION IF EXISTS harvest_events_reserved_name_958_fn()")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray trigger function from a previous run");
+    diesel::sql_query(
+        "CREATE FUNCTION harvest_events_reserved_name_958_fn() RETURNS trigger AS $$ \
+         BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a trigger function");
+    diesel::sql_query(
+        "CREATE TRIGGER harvest_events_exec_fk_trg BEFORE INSERT ON harvest_events \
+         FOR EACH ROW EXECUTE FUNCTION harvest_events_reserved_name_958_fn()",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator trigger reusing the reserved FK-trigger name");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "a name collision with EXEC_FK_TRIGGER must not exempt an \
+             operator's own trigger from the guard",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_exec_fk_trg"),
+        "the refusal must name the offending trigger; got {msg}"
+    );
+
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP TRIGGER harvest_events_exec_fk_trg ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending trigger");
+    diesel::sql_query("DROP FUNCTION harvest_events_reserved_name_958_fn()")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending trigger function");
+}
+
+#[tokio::test]
 async fn a_user_index_at_the_identifier_length_limit_survives_conversion() {
     // Issue #1270 item 9: Postgres silently truncates an identifier over 63
     // bytes. Appending a suffix to a name already at that limit renames it

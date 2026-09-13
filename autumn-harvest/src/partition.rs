@@ -1343,24 +1343,30 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
 /// every event, while it still exists — nothing reports the loss. On the
 /// empty path the trigger is destroyed with the table it was on.
 ///
-/// [`EXEC_FK_TRIGGER`] is excluded: the conversion creates it itself, as part
-/// of the design, not something an operator installed.
+/// [`EXEC_FK_TRIGGER`] is excluded by its FUNCTION
+/// (`harvest_events_require_execution`), not by its name. That function is
+/// harvest's own, part of the base migration. A trigger invoking it is
+/// never operator-installed. Excluding by name alone has a gap: an
+/// operator's own trigger could happen to share the reserved name. On an
+/// unpartitioned shard, `EXEC_FK_TRIGGER` cannot yet be harvest's, since
+/// only a conversion creates it.
 ///
 /// # Errors
 ///
 /// [`HarvestError::Database`] if the catalog query fails.
 #[cfg(feature = "db")]
 pub async fn operator_triggers(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
-    let rows = diesel::sql_query(format!(
+    let rows = diesel::sql_query(
         "SELECT tg.tgname AS v
            FROM pg_trigger tg
            JOIN pg_class c ON c.oid = tg.tgrelid
            JOIN pg_namespace n ON n.oid = c.relnamespace
+           JOIN pg_proc p ON p.oid = tg.tgfoid AND p.pronamespace = c.relnamespace
           WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
             AND NOT tg.tgisinternal
-            AND tg.tgname <> '{EXEC_FK_TRIGGER}'
-          ORDER BY 1"
-    ))
+            AND p.proname <> 'harvest_events_require_execution'
+          ORDER BY 1",
+    )
     .load::<TextRow>(conn)
     .await
     .map_err(database_error)?;
@@ -3712,23 +3718,23 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // would then stop firing for every new row from cutover onward.
         step(
             1,
-            format!(
-                "DO $harvest_trg_958$\nDECLARE bad text;\nBEGIN\n    \
-                 SELECT string_agg(tg.tgname, ', ' ORDER BY 1) INTO bad\n      \
-                 FROM pg_trigger tg\n      \
-                 JOIN pg_class c ON c.oid = tg.tgrelid\n      \
-                 JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
-                 WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
-                 AND NOT tg.tgisinternal\n       \
-                 AND tg.tgname <> '{EXEC_FK_TRIGGER}';\n    \
-                 IF bad IS NOT NULL THEN\n        \
-                 RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not carried by \
-                 CREATE TABLE ... (LIKE ...) (%). An operator trigger would stay on the \
-                 renamed legacy table after phase 4, where it stops firing for every new row \
-                 from cutover onward while still existing. Drop the trigger (and recreate it \
-                 against harvest_events afterward) before running this plan.', bad;\n    \
-                 END IF;\nEND\n$harvest_trg_958$;"
-            ),
+            "DO $harvest_trg_958$\nDECLARE bad text;\nBEGIN\n    \
+             SELECT string_agg(tg.tgname, ', ' ORDER BY 1) INTO bad\n      \
+             FROM pg_trigger tg\n      \
+             JOIN pg_class c ON c.oid = tg.tgrelid\n      \
+             JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
+             JOIN pg_proc p ON p.oid = tg.tgfoid AND p.pronamespace = c.relnamespace\n     \
+             WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
+             AND NOT tg.tgisinternal\n       \
+             AND p.proname <> 'harvest_events_require_execution';\n    \
+             IF bad IS NOT NULL THEN\n        \
+             RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not carried by \
+             CREATE TABLE ... (LIKE ...) (%). An operator trigger would stay on the \
+             renamed legacy table after phase 4, where it stops firing for every new row \
+             from cutover onward while still existing. Drop the trigger (and recreate it \
+             against harvest_events afterward) before running this plan.', bad;\n    \
+             END IF;\nEND\n$harvest_trg_958$;"
+                .to_string(),
         ),
         // ── 1: bake the chosen width into the cohort function ─────────────
         step(1, cohort_function_sql(width)),
