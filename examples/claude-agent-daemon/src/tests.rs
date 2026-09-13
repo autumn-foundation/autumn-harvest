@@ -5933,8 +5933,11 @@ fn a_restored_wait_is_armed_and_unanswered() {
     // A decision sent but not yet taken up lives only in the staged table.
     // The wait must not come back over it, or a second answer would be taken
     // for a call that is already decided.
+    // A REAL `ApprovalDecision`. An empty object is valid JSON that the type
+    // refuses, so it could not stand for a decision the engine takes up.
     conn.execute(
-        "INSERT INTO harvest_signals (exec_id, name, payload_json) VALUES ('e', ?1, '{}')",
+        "INSERT INTO harvest_signals (exec_id, name, payload_json) \
+         VALUES ('e', ?1, '{\"approved\":true}')",
         [armed],
     )
     .expect("the decision is staged");
@@ -11036,7 +11039,13 @@ fn a_restart_refuses_a_history_that_reads_two_ways() {
         format!(r#"{{"type":"SignalReceived","data":{{"signal_name":"{armed}"}},"type":"Other"}}"#);
     // The not-the-fault case: an ordinary readable delivery still closes the
     // wait, so the refusal is the damage and not the reading.
-    let waiting = r#"{"type":"Other","data":{}}"#.to_string();
+    //
+    // This event is a REAL variant, with every field it declares. A type that
+    // names no variant is refused by `WorkflowEvent`, so it could not stand
+    // for a readable history.
+    let waiting =
+        r#"{"type":"WorkflowStarted","data":{"input":{},"timestamp":"2026-09-13T00:00:00Z"}}"#
+            .to_string();
 
     let build = |blob: bool, event: &str| {
         let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
@@ -11167,7 +11176,7 @@ fn a_session_with_no_armed_wait_is_read_too() {
     // No timer at all, which is the shape the old placement never reached.
     conn.execute(
         "INSERT INTO harvest_events VALUES ('e', 0, cast(?1 as blob))",
-        [r#"{"type":"Other","data":{}}"#],
+        [r#"{"type":"WorkflowStarted","data":{"input":{},"timestamp":"2026-09-13T00:00:00Z"}}"#],
     )
     .expect("the unreadable event is appended");
 
@@ -11181,9 +11190,11 @@ fn a_session_with_no_armed_wait_is_read_too() {
     // The not-the-fault case: the same session with a readable event starts.
     conn.execute("DELETE FROM harvest_events WHERE exec_id = 'e'", [])
         .expect("the event is cleared");
+    // A REAL variant with every declared field, so it stands for a history
+    // the engine can load.
     conn.execute(
         "INSERT INTO harvest_events VALUES ('e', 0, ?1)",
-        [r#"{"type":"Other","data":{}}"#],
+        [r#"{"type":"WorkflowStarted","data":{"input":{},"timestamp":"2026-09-13T00:00:00Z"}}"#],
     )
     .expect("the readable event is appended");
     assert_eq!(
@@ -11270,8 +11281,21 @@ fn a_staged_decision_the_engine_cannot_read_is_refused() {
     // so does one holding an astral character, which `status` accepts.
     for (label, payload) in [
         ("a plain decision", r#"{"approved":true}"#),
-        ("a decision holding an astral character", r#"{"note":"😀"}"#),
-        ("a decision holding U+D7FF", "{\"note\":\"\u{d7ff}\"}"),
+        // Each of these carries `approved`, because the boundary being tested
+        // is the surrogate and not the shape.
+        (
+            "a decision holding an astral character",
+            r#"{"approved":true,"note":"😀"}"#,
+        ),
+        (
+            "a decision holding U+D7FF",
+            "{\"approved\":true,\"note\":\"\u{d7ff}\"}",
+        ),
+        // An UNKNOWN key is accepted, because the type accepts it.
+        (
+            "a decision holding an unknown key",
+            r#"{"approved":true,"extra":1}"#,
+        ),
     ] {
         let conn = build(false, payload);
         assert_eq!(
@@ -11280,4 +11304,162 @@ fn a_staged_decision_the_engine_cannot_read_is_refused() {
             "[{label}] a readable staged decision still ends the wait"
         );
     }
+}
+
+/// A history is read with the ENGINE's own type, not a restatement of it.
+///
+/// The check once tested the syntax and the class. Valid JSON naming no
+/// variant passed it, and `store::load_history` refuses exactly that. The
+/// restart reported readiness, and the drive kept the session and retried.
+///
+/// Four shapes are measured, and the loader refuses all four. The class is
+/// one the loader cannot read. The text is not JSON. The type names no
+/// variant. A declared field is absent from a variant that is named.
+#[test]
+fn a_history_is_read_with_the_engines_own_type() {
+    let readable =
+        r#"{"type":"WorkflowStarted","data":{"input":{},"timestamp":"2026-09-13T00:00:00Z"}}"#;
+    let build = |blob: bool, event: &str| {
+        let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
+        conn.execute_batch(
+            "CREATE TABLE harvest_timers (timer_id TEXT, exec_id TEXT, fire_at INTEGER, \
+             fired INTEGER NOT NULL DEFAULT 0, arm_seq INTEGER, \
+             PRIMARY KEY (exec_id, timer_id)); \
+             CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+             PRIMARY KEY (exec_id, seq)); \
+             CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+             exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+        )
+        .expect("the fixture tables are created");
+        let sql = if blob {
+            "INSERT INTO harvest_events VALUES ('e', 0, cast(?1 as blob))"
+        } else {
+            "INSERT INTO harvest_events VALUES ('e', 0, ?1)"
+        };
+        conn.execute(sql, [event]).expect("the event is appended");
+        conn
+    };
+
+    for (label, blob, event) in [
+        ("a class the loader cannot read", true, readable),
+        ("text that is not JSON", false, "{not json"),
+        // The shape this round adds. It is valid JSON, and it names no
+        // variant of `WorkflowEvent`.
+        (
+            "a type that names no variant",
+            false,
+            r#"{"type":"Other","data":{}}"#,
+        ),
+        // Valid JSON naming a REAL variant, missing a field it declares.
+        (
+            "a variant missing a declared field",
+            false,
+            r#"{"type":"SignalReceived","data":{"signal_name":"s"}}"#,
+        ),
+        // A repeated `type` is refused by the same read, with `duplicate
+        // field`, so `json_extract` never disagrees with the loader.
+        (
+            "a repeated declared key",
+            false,
+            r#"{"type":"TimerFired","type":"SignalReceived","data":{"signal_name":"s","payload":{}}}"#,
+        ),
+    ] {
+        let conn = build(blob, event);
+        let refused = inspect::outstanding_signal(&conn, "e", 1_000)
+            .expect_err("a history the engine cannot read must refuse the restart");
+        assert!(
+            refused.contains("cannot be told"),
+            "[{label}] the refusal must say WHY it refuses: {refused}"
+        );
+        // The engine is the authority, so assert the loader agrees.
+        assert!(
+            serde_json::from_str::<autumn_harvest::WorkflowEvent>(event).is_err() || blob,
+            "[{label}] the fixture must be one the loader itself refuses"
+        );
+    }
+
+    // The not-the-fault case: a real variant with every declared field.
+    let conn = build(false, readable);
+    assert_eq!(
+        inspect::outstanding_signal(&conn, "e", 1_000).expect("the wait query runs"),
+        None,
+        "a history the engine can load is not refused"
+    );
+    assert!(
+        serde_json::from_str::<autumn_harvest::WorkflowEvent>(readable).is_ok(),
+        "and the loader itself accepts it"
+    );
+}
+
+/// A staged decision is read as the TYPE the workflow asks for.
+///
+/// The check once tested the syntax. Valid JSON that `ApprovalDecision`
+/// refuses passed it, so the wait was suppressed. The next drive consumed the
+/// signal, `receive_signal_timeout` failed, `agent_session` propagated that,
+/// and the runtime sealed the session `FAILED`. A session a repair could have
+/// saved was made terminal.
+#[test]
+fn a_staged_decision_is_read_as_the_type_the_workflow_asks_for() {
+    let armed = "tool_approval:2:0:toolu_x";
+    let build = |payload: &str| {
+        let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
+        conn.execute_batch(
+            "CREATE TABLE harvest_timers (timer_id TEXT, exec_id TEXT, fire_at INTEGER, \
+             fired INTEGER NOT NULL DEFAULT 0, arm_seq INTEGER, \
+             PRIMARY KEY (exec_id, timer_id)); \
+             CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+             PRIMARY KEY (exec_id, seq)); \
+             CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+             exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+        )
+        .expect("the fixture tables are created");
+        conn.execute(
+            "INSERT INTO harvest_timers VALUES (?1, 'e', 9999, 0, 2)",
+            [format!("__signal_timeout:2:{armed}")],
+        )
+        .expect("the armed timer is recorded");
+        conn.execute(
+            "INSERT INTO harvest_signals (exec_id, name, payload_json) VALUES ('e', ?1, ?2)",
+            rusqlite::params![armed, payload],
+        )
+        .expect("the decision is staged");
+        conn
+    };
+
+    // Valid JSON that the type refuses. A syntax test passed both.
+    for (label, payload) in [
+        ("an object with no declared field", "{}"),
+        (
+            "a declared field of the wrong type",
+            r#"{"approved":"yes"}"#,
+        ),
+    ] {
+        let conn = build(payload);
+        let refused = inspect::outstanding_signal(&conn, "e", 1_000)
+            .expect_err("a decision the workflow cannot read must refuse the restart");
+        assert!(
+            refused.contains("never be taken up"),
+            "[{label}] the refusal must say WHY it refuses: {refused}"
+        );
+        // The workflow's own reader is the authority.
+        assert!(
+            serde_json::from_str::<session::ApprovalDecision>(payload).is_err(),
+            "[{label}] the fixture must be one the workflow itself refuses"
+        );
+    }
+
+    // The not-the-fault case. An unknown key is accepted, because the type
+    // accepts it, and refusing it would refuse a decision the drive takes up.
+    let extra = r#"{"approved":true,"extra":1}"#;
+    assert!(
+        serde_json::from_str::<session::ApprovalDecision>(extra).is_ok(),
+        "the workflow itself accepts an unknown key"
+    );
+    assert_eq!(
+        inspect::outstanding_signal(&build(extra), "e", 1_000).expect("the wait query runs"),
+        None,
+        "so the restart accepts it too"
+    );
 }

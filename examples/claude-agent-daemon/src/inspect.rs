@@ -8,9 +8,10 @@
 use std::path::Path;
 use std::time::Duration;
 
+use autumn_harvest::WorkflowEvent;
 use rusqlite::{Connection, OpenFlags};
 
-use crate::session::{self, SessionTask};
+use crate::session::{self, ApprovalDecision, SessionTask};
 
 /// How many events one `history` command prints.
 ///
@@ -1022,43 +1023,35 @@ fn answered(conn: &Connection, exec_id: &str, signal: &str) -> Result<bool, Stri
 /// take up. `Some(false)` is a row that suppresses the wait and that no drive
 /// can consume.
 ///
-/// The existence of the row is not enough. `peek_pending_signal` reads
-/// `payload_json` into a `String` and then deserialises it, so three shapes
-/// fail it while a bare existence test passes. Each one was measured.
+/// The row is read the way `peek_pending_signal` reads it, and then
+/// deserialised into the type the workflow asks for. Nothing here restates
+/// what that type accepts, so nothing here can drift from it.
 ///
-/// A `BLOB` payload fails the column read:
-/// `InvalidColumnType(0, "payload_json", Blob)`.
+/// Three shapes fail a bare existence test, and each one was measured. A
+/// `BLOB` fails the column read. Text that is not JSON fails the parse. Text
+/// holding no character fails it too, because `serde_json` refuses a lone
+/// surrogate escape that `json_valid` accepts.
 ///
-/// Text that is not JSON fails the parse: `key must be a string`.
+/// A fourth shape is the reason this reads the TYPE and not the syntax.
+/// `{}` and `{"approved":"yes"}` are valid JSON that `ApprovalDecision`
+/// refuses. A syntax test passed both. The drive then consumed the signal and
+/// `receive_signal_timeout` failed, which `agent_session` propagates, and the
+/// runtime sealed the session `FAILED`. A session that a repair could have
+/// saved was made terminal.
 ///
-/// Text holding no character fails it too. `json_valid` accepts a lone
-/// surrogate escape and `serde_json` refuses it, with `unexpected end of hex
-/// escape`. The test is a `GLOB` for a code point between `U+D800` and
-/// `U+DFFF` over the decoded value. It is EXACT: a well-formed pair decodes
-/// to one astral character and is not matched, and `U+D7FF` is not matched.
-/// Both were measured to deserialise.
-///
-/// The surrogate test walks the WHOLE document with `json_tree`. A payload is
-/// an arbitrary value rather than a declared shape, so a broken escape can
-/// sit at any depth. `json_each` reads the top level only. A nested one
-/// was measured: `json_each` passed it and `serde_json` refused it.
+/// An UNKNOWN key is accepted, because the type accepts it. Measured:
+/// `{"approved":true,"extra":1}` deserialises.
 ///
 /// The row is chosen with the backend's OWN order. `peek_pending_signal`
 /// takes the earliest-arrived undelivered row, so a bare `LIMIT 1` could
 /// report on a row the engine never reads.
 fn staged_decision(conn: &Connection, exec_id: &str, signal: &str) -> Result<Option<bool>, String> {
-    let sql = "SELECT CASE WHEN typeof(payload_json) <> 'text' THEN 0 \
-                            WHEN NOT json_valid(payload_json) THEN 0 \
-                            WHEN (SELECT count(*) FROM json_tree(payload_json) \
-                                  WHERE value GLOB '*[' || char(55296) \
-                                              || '-' || char(57343) \
-                                              || ']*') > 0 THEN 0 \
-                            ELSE 1 END \
-                 FROM harvest_signals \
-                WHERE exec_id = ?1 AND name = ?2 AND delivered = 0 \
-                ORDER BY received_at, signal_seq LIMIT 1";
     let mut statement = conn
-        .prepare(sql)
+        .prepare(
+            "SELECT payload_json FROM harvest_signals \
+             WHERE exec_id = ?1 AND name = ?2 AND delivered = 0 \
+             ORDER BY received_at, signal_seq LIMIT 1",
+        )
         .map_err(|e| format!("cannot prepare the staged decision query: {e}"))?;
     let mut rows = statement
         .query([exec_id, signal])
@@ -1069,56 +1062,65 @@ fn staged_decision(conn: &Connection, exec_id: &str, signal: &str) -> Result<Opt
     else {
         return Ok(None);
     };
-    let readable: i64 = row
-        .get(0)
-        .map_err(|e| format!("cannot read a staged decision: {e}"))?;
-    Ok(Some(readable == 1))
+    // The backend reads this column as a `String`, so a non-text class fails
+    // HERE, exactly as it fails there.
+    let Ok(payload) = row.get::<_, String>(0) else {
+        return Ok(Some(false));
+    };
+    Ok(Some(
+        serde_json::from_str::<ApprovalDecision>(&payload).is_ok(),
+    ))
 }
 
-/// Does this history hold an event that does not read ONE way?
+/// Does this history hold an event the ENGINE cannot read?
 ///
-/// Two faults are asked for together, because both make the answer above a
-/// guess rather than a reading.
+/// Every row is deserialised with `WorkflowEvent`, which is the type
+/// `store::load_history` deserialises. Nothing here restates what that type
+/// accepts. A variant added to the engine therefore needs no change here, and
+/// this check cannot drift away from the loader it stands in for.
 ///
-/// A row in a class the engine cannot load strands the run. `load_history`
-/// reads every `event_json` into a `String`, which a `BLOB` refuses. This
-/// daemon answers `json_valid` and every test above it on the same row. The
-/// restart therefore read the delivery and closed the wait. It then reported
-/// readiness with no pending call, and every drive failed. Measured on one delivery
-/// rewritten as a `BLOB`: the wait was suppressed, and the loader answered
-/// `InvalidColumnType(0, "event_json", Blob)`.
+/// A SQL test of the same question cannot hold that property. The enum
+/// carries fifty variants, each with its own fields, so any restatement of it
+/// is a copy that goes stale.
 ///
-/// A row that REPEATS a declared key reads two ways. `json_extract` reports
-/// the FIRST value and `serde_json` the LAST. Measured on a delivery holding
-/// `type` twice: this daemon read `SignalReceived` and the engine read
-/// `Other`. The wait was closed over a decision the engine never took.
+/// Four shapes were measured, and the loader refuses all four. A row in a
+/// class the loader cannot read fails the column read:
+/// `InvalidColumnType(0, "event_json", Blob)`. Text that is not JSON fails
+/// the parse. A type that names no variant fails with `unknown variant`. A
+/// variant missing a field it declares fails with `missing field`.
 ///
-/// The startup refuses rather than choosing one reading. Restoring the wait
-/// instead would print a token for a session no drive can advance, which is a
-/// decision nothing can consume. See [`REPLIES_QUERY`].
+/// A row that REPEATS `type` is refused by the same read, with `duplicate
+/// field`. The event query below reads `$.type` with `json_extract`, which
+/// reports the FIRST value where `serde_json` reports the LAST. That
+/// disagreement cannot reach the query, because this refuses the row first.
+///
+/// # Cost
+///
+/// One row is held at a time and dropped, so the peak is the largest single
+/// event and not the history. The first drive of each session reads the same
+/// rows through `load_history`, so this repeats that work rather than adding
+/// work of a new kind.
 fn ambiguous_history(conn: &Connection, exec_id: &str) -> Result<bool, String> {
-    // A CASE, and not a chain of `OR`. The class test must run BEFORE any
-    // test that reads the document, and only a CASE orders them.
-    let sql = "SELECT 1 FROM harvest_events WHERE exec_id = ?1 \
-         AND CASE WHEN typeof(event_json) <> 'text' THEN 1 \
-                  WHEN NOT json_valid(event_json) THEN 1 \
-                  WHEN (SELECT count(*) FROM json_each(event_json) \
-                        WHERE key = 'type') <> 1 THEN 1 \
-                  WHEN json_extract(event_json, '$.type') <> 'SignalReceived' THEN 0 \
-                  WHEN (SELECT count(*) FROM json_each(event_json) \
-                        WHERE key = 'data') <> 1 THEN 1 \
-                  WHEN (SELECT count(*) FROM json_each(event_json, '$.data') \
-                        WHERE key = 'signal_name') <> 1 THEN 1 \
-                  ELSE 0 END LIMIT 1";
     let mut statement = conn
-        .prepare(sql)
-        .map_err(|e| format!("cannot prepare the history class query: {e}"))?;
+        .prepare("SELECT event_json FROM harvest_events WHERE exec_id = ?1 ORDER BY seq")
+        .map_err(|e| format!("cannot prepare the history query: {e}"))?;
     let mut rows = statement
         .query([exec_id])
-        .map_err(|e| format!("cannot read the history classes: {e}"))?;
-    rows.next()
-        .map(|row| row.is_some())
-        .map_err(|e| format!("cannot read a history class: {e}"))
+        .map_err(|e| format!("cannot read the history: {e}"))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("cannot read a history row: {e}"))?
+    {
+        // `load_history` reads this column as a `String`, so a non-text class
+        // fails HERE, exactly as it fails there.
+        let Ok(event) = row.get::<_, String>(0) else {
+            return Ok(true);
+        };
+        if serde_json::from_str::<WorkflowEvent>(&event).is_err() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Does this query find a row?
