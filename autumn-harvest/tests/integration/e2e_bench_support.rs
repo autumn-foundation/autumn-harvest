@@ -1538,16 +1538,19 @@ pub enum CellOutcome<T, E> {
 /// `ShardCluster::teardown` never runs and its databases are not dropped
 /// here. The next run's stale-database sweep reclaims them instead.
 pub async fn await_cell<T, E>(
-    handle: tokio::task::JoinHandle<Result<T, E>>,
+    mut handle: tokio::task::JoinHandle<Result<T, E>>,
     budget: Duration,
 ) -> CellOutcome<T, E> {
-    let abort_handle = handle.abort_handle();
-    match tokio::time::timeout(budget, handle).await {
+    match tokio::time::timeout(budget, Pin::new(&mut handle)).await {
         Ok(Ok(Ok(report))) => CellOutcome::Report(report),
         Ok(Ok(Err(reason))) => CellOutcome::Skipped(reason),
         Ok(Err(join_err)) => CellOutcome::Panicked(join_err.to_string()),
         Err(_elapsed) => {
-            abort_handle.abort();
+            handle.abort();
+            // `abort()` only requests cancellation. Join the handle so this
+            // function does not return until the task's resources (shard
+            // leases, pools) are actually released, not merely asked to be.
+            let _ = handle.await;
             CellOutcome::TimedOut
         }
     }

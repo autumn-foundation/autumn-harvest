@@ -8,7 +8,7 @@
 //! neither a database nor the `db` feature.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::e2e_bench_support::{CellOutcome, await_cell};
@@ -16,6 +16,24 @@ use super::e2e_bench_support::{CellOutcome, await_cell};
 async fn hang_forever(ticks: Arc<AtomicUsize>) -> Result<(), String> {
     loop {
         ticks.fetch_add(1, Ordering::SeqCst);
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Sets its flag on drop. Stands in for a real cell's owned resources: a
+/// shard lease connection, a worker pool. Such resources must actually be
+/// released, not merely have their release requested.
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+async fn hang_holding(released: Arc<AtomicBool>) -> Result<(), String> {
+    let _guard = DropFlag(released);
+    loop {
         tokio::task::yield_now().await;
     }
 }
@@ -70,5 +88,29 @@ async fn a_timed_out_cell_is_actually_aborted_not_just_detached() {
         just_after_timeout, after_a_settling_wait,
         "the task kept ticking after its reported timeout: abort_handle.abort() did not \
          actually stop it, so a wedged cell would still run forever in the background"
+    );
+}
+
+/// `abort()` only requests cancellation; it does not by itself wait for the
+/// task to finish dropping. `await_cell` must join the aborted task before
+/// it returns, so the next cell never starts while this one's resources
+/// (shard leases, pools) are still open. Multi-thread runtime: the race this
+/// guards against is between this task's own drop and a task actually
+/// running on another worker thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_timed_out_cells_resources_are_released_before_await_cell_returns() {
+    let released = Arc::new(AtomicBool::new(false));
+    let handle = tokio::spawn(hang_holding(released.clone()));
+
+    let outcome = await_cell(handle, Duration::from_millis(20)).await;
+    assert!(
+        matches!(outcome, CellOutcome::TimedOut),
+        "expected TimedOut, got {outcome:?}"
+    );
+
+    assert!(
+        released.load(Ordering::SeqCst),
+        "await_cell returned before the timed-out task's resources were actually \
+         released; the next cell could start while a stale shard lease is still open"
     );
 }
