@@ -762,9 +762,23 @@ pub async fn list_partitions(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<
     // than reclaiming them. `SET LOCAL` inside an explicit transaction
     // scopes the override to this one query, so it never leaks onto a
     // pooled connection reused for something else afterward.
+    //
+    // Review finding: that scoping argument holds only when this call opens
+    // the outer transaction itself. Diesel implements a nested
+    // `.transaction()` as a `SAVEPOINT`, and `RELEASE SAVEPOINT` does not
+    // undo a `SET LOCAL` made inside it — only `ROLLBACK TO SAVEPOINT`
+    // does. A caller that already had `conn` inside a transaction would see
+    // `DateStyle` silently pinned to `ISO, MDY` for the rest of it. Capture
+    // the prior value first and restore it, inside this same savepoint,
+    // before returning.
     let rows = Box::pin(conn.transaction::<Vec<Row>, HarvestError, _>(async |conn| {
+        let prior = diesel::sql_query("SELECT current_setting('DateStyle') AS v")
+            .get_result::<TextRow>(conn)
+            .await
+            .map_err(database_error)?
+            .v;
         exec(conn, "SET LOCAL DateStyle = 'ISO, MDY'").await?;
-        diesel::sql_query(
+        let rows = diesel::sql_query(
             "SELECT child.relname AS name,
                     pg_get_expr(child.relpartbound, child.oid) AS bound
                FROM pg_inherits i
@@ -775,7 +789,13 @@ pub async fn list_partitions(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<
         )
         .load::<Row>(conn)
         .await
-        .map_err(database_error)
+        .map_err(database_error)?;
+        exec(
+            conn,
+            &format!("SET LOCAL DateStyle = '{}'", prior.replace('\'', "''")),
+        )
+        .await?;
+        Ok(rows)
     }))
     .await?;
 

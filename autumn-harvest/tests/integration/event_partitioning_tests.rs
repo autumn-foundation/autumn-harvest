@@ -1680,6 +1680,45 @@ async fn list_partitions_parses_bounds_under_a_non_iso_datestyle() {
 }
 
 #[tokio::test]
+async fn list_partitions_restores_date_style_inside_a_caller_transaction() {
+    // Review finding: `list_partitions`'s own `SET LOCAL DateStyle = 'ISO,
+    // MDY'` runs inside a `conn.transaction()`. A nested `.transaction()`
+    // -- one opened while `conn` is already inside a transaction -- is a
+    // `SAVEPOINT` under Diesel. `RELEASE SAVEPOINT` does not undo a `SET
+    // LOCAL` made inside it; only `ROLLBACK TO SAVEPOINT` does. A caller
+    // that already had `conn` inside its own transaction would otherwise
+    // see `DateStyle` silently pinned to `ISO, MDY` for the rest of it.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    conn.transaction::<(), autumn_harvest::HarvestError, _>(async |conn| {
+        diesel::sql_query("SET LOCAL DateStyle = 'SQL, DMY'")
+            .execute(conn)
+            .await?;
+
+        partition::list_partitions(conn).await?;
+
+        let style = diesel::sql_query("SELECT current_setting('DateStyle') AS v")
+            .get_result::<TextRow>(conn)
+            .await?
+            .v;
+        assert_eq!(
+            style, "SQL, DMY",
+            "list_partitions must restore the caller's DateStyle inside its own \
+             savepoint, not leave its 'ISO, MDY' override pinned for the rest of \
+             the caller's transaction"
+        );
+        Ok(())
+    })
+    .await
+    .expect("outer transaction");
+}
+
+#[tokio::test]
 async fn an_operator_trigger_refuses_the_conversion_instead_of_silently_going_dark() {
     // Issue #1270 item 16: `CREATE TABLE ... (LIKE ...)` does not carry
     // triggers. Both conversion paths build the replacement relation that
