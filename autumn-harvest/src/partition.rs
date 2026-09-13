@@ -3570,7 +3570,7 @@ async fn delete_orphan_rows(
 /// transaction, so a failure leaves every row where it was.
 #[cfg(feature = "db")]
 pub async fn drain_default(conn: &mut AsyncPgConnection) -> HarvestResult<usize> {
-    drain_default_bounded(conn, DRAIN_MAX_ROWS).await
+    drain_default_bounded_inner(conn, DRAIN_MAX_ROWS, None).await
 }
 
 /// [`drain_default`] with an explicit per-pass row budget.
@@ -3582,16 +3582,34 @@ pub async fn drain_default(conn: &mut AsyncPgConnection) -> HarvestResult<usize>
 ///
 /// [`HarvestError::Database`] if any step fails; the pass is one transaction,
 /// so a failure leaves every row where it was.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub async fn drain_default_bounded(
+    conn: &mut AsyncPgConnection,
+    max_rows: usize,
+) -> HarvestResult<usize> {
+    drain_default_bounded_inner(conn, max_rows, None).await
+}
+
+/// Same as [`drain_default_bounded`], but calls `progress` at each point
+/// this otherwise-unbounded pass can plausibly run long. That means
+/// before the census, once per cohort prepared, and before the final
+/// move. See [`maintain_with_progress`] for why a caller needs this.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] if any step fails; the pass is one transaction,
+/// so a failure leaves every row where it was.
 // A census, then one transaction whose steps must be read in order — detach,
 // create, move, re-enable, re-attach. Splitting it to satisfy a line budget
 // would scatter that sequence across helpers that only ever call each other
 // once, and the order is the whole correctness argument.
 #[allow(clippy::too_many_lines)]
 #[cfg(feature = "db")]
-#[doc(hidden)]
-pub async fn drain_default_bounded(
+async fn drain_default_bounded_inner(
     conn: &mut AsyncPgConnection,
     max_rows: usize,
+    mut progress: Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<usize> {
     let width = match detect_layout(conn).await? {
         EventLayout::Unpartitioned => return Ok(0),
@@ -3606,6 +3624,14 @@ pub async fn drain_default_bounded(
         return Ok(0);
     }
 
+    // Review finding: the census below is unbounded by any statement
+    // timeout. It is a full scan of the DEFAULT partition, exactly the
+    // expensive case this whole function exists for. Ticked immediately
+    // before it starts, so a caller reporting liveness has a proof of
+    // life as close as possible to entering it.
+    if let Some(cb) = &mut progress {
+        cb();
+    }
     // Census BEFORE the lock. This `GROUP BY` scans every row in the DEFAULT
     // partition, and `cohort` carries no index — on the large backlog a
     // maintenance gap leaves, exactly the case this budget exists for, it is
@@ -3656,6 +3682,9 @@ pub async fn drain_default_bounded(
         .await?;
 
         for cohort in &work {
+            if let Some(cb) = &mut progress {
+                cb();
+            }
             ensure_cohort_with_width(conn, *cohort, width, Duration::from_secs(2)).await?;
         }
         // The work list was read before the lock, so a row could have landed in
@@ -3730,6 +3759,14 @@ pub async fn drain_default_bounded(
             .ok();
         }
 
+        // Review finding: an oversized single cohort can still make this
+        // move itself run long. The row budget bounds the pass overall,
+        // but "always at least one" above means a cohort larger than
+        // `max_rows` is still taken whole. Ticked here, right before the
+        // one statement that does the actual moving.
+        if let Some(cb) = &mut progress {
+            cb();
+        }
         // One statement, so the rows leave `DEFAULT` exactly as they arrive in
         // their cohort partitions — there is no window in which a row exists in
         // both, and no `TRUNCATE` that could discard a row this pass did not
@@ -3852,7 +3889,16 @@ pub async fn maintain(
     sweep_opts: &SweepOptions,
     resume_after: Option<DateTime<Utc>>,
 ) -> HarvestResult<MaintenanceOutcome> {
-    maintain_inner(conn, now, lookahead_cohorts, sweep_opts, resume_after, None).await
+    let mut progress: Option<&mut (dyn FnMut() + Send)> = None;
+    maintain_inner(
+        conn,
+        now,
+        lookahead_cohorts,
+        sweep_opts,
+        resume_after,
+        &mut progress,
+    )
+    .await
 }
 
 /// Same as [`maintain`], but calls `progress` once per partition the sweep
@@ -3879,15 +3925,41 @@ pub async fn maintain_with_progress(
     resume_after: Option<DateTime<Utc>>,
     progress: &mut (dyn FnMut() + Send),
 ) -> HarvestResult<MaintenanceOutcome> {
+    let mut progress: Option<&mut (dyn FnMut() + Send)> = Some(progress);
     maintain_inner(
         conn,
         now,
         lookahead_cohorts,
         sweep_opts,
         resume_after,
-        Some(progress),
+        &mut progress,
     )
     .await
+}
+
+/// `progress` is `&mut Option<...>`, not `Option<&mut ...>`. Both
+/// [`drain_default_bounded_inner`] and [`sweep_inner`] below need their own
+/// reborrow of the same callback. Reborrowing an `&mut Option` twice in
+/// sequence is a short, independent borrow each time. Moving the `Option`
+/// itself into the first call would leave nothing for the second.
+///
+/// `&mut Option<&mut dyn Trait>` is invariant over the inner reference's
+/// lifetime, so `Option::as_deref_mut` cannot shorten it. Two sequential
+/// calls through it then conflict, even though neither outlives the
+/// other. A plain match reborrows explicitly instead, which does not hit
+/// that invariance.
+#[cfg(feature = "db")]
+// `Option::map`/`map_or` unify the outer and inner lifetimes, which brings
+// back the exact invariance conflict this function exists to avoid. The
+// plain match keeps them independent.
+#[allow(clippy::option_if_let_else)]
+fn reborrow_progress<'a>(
+    progress: &'a mut Option<&mut (dyn FnMut() + Send)>,
+) -> Option<&'a mut (dyn FnMut() + Send)> {
+    match progress {
+        Some(cb) => Some(&mut **cb),
+        None => None,
+    }
 }
 
 #[cfg(feature = "db")]
@@ -3897,7 +3969,7 @@ async fn maintain_inner(
     lookahead_cohorts: u32,
     sweep_opts: &SweepOptions,
     resume_after: Option<DateTime<Utc>>,
-    progress: Option<&mut (dyn FnMut() + Send)>,
+    progress: &mut Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<MaintenanceOutcome> {
     if !detect_layout(conn).await?.is_partitioned() {
         // Still stamped: a caller polling for "maintenance has run" must not
@@ -3935,13 +4007,27 @@ async fn maintain_inner(
     // it — and extending the write window is the one thing that must never
     // stop, because an uncovered cohort is what fills the DEFAULT partition in
     // the first place. A failed drain is recorded and retried next tick.
-    let (drained, drain_error) = match drain_default(conn).await {
+    let (drained, drain_error) = match drain_default_bounded_inner(
+        conn,
+        DRAIN_MAX_ROWS,
+        reborrow_progress(progress),
+    )
+    .await
+    {
         Ok(n) => (n, None),
         Err(e) => (0, Some(e.to_string())),
     };
     let (created, lookahead_blocked) =
         ensure_partitions(conn, now, lookahead_cohorts, sweep_opts.lock_timeout).await?;
-    let sweep = sweep_inner(conn, now, sweep_opts, true, resume_after, progress).await?;
+    let sweep = sweep_inner(
+        conn,
+        now,
+        sweep_opts,
+        true,
+        resume_after,
+        reborrow_progress(progress),
+    )
+    .await?;
     // A partial catch-up must not report as a healthy, empty-`last_error`
     // pass. `ensure_partitions` keeps creating the rest of the window when
     // one cohort is blocked (deliberately — see its doc). So `created` can

@@ -7183,6 +7183,90 @@ async fn maintain_with_progress_ticks_once_per_partition_the_sweep_attempts() {
 }
 
 #[tokio::test]
+async fn maintain_with_progress_ticks_during_the_default_partition_drain_too() {
+    // Review finding: the progress callback reached only `sweep_inner`.
+    // `drain_default`'s own census (an unbounded full scan of the DEFAULT
+    // partition) and its final move (which can process an oversized
+    // cohort) run first, in `maintain_inner`. Either can itself cross the
+    // scanner's staleness threshold with zero ticks in between.
+    //
+    // The table starts empty here, so `enable` takes the fresh-table path
+    // and there is no legacy partition to catch these cohorts. Every row
+    // below lands straight in DEFAULT. The drain then creates a real
+    // partition per cohort, which the sweep step -- running right after,
+    // in the same pass -- immediately evaluates too. So this cannot
+    // isolate the drain's ticks by giving the sweep step nothing to do.
+    // It proves the weaker, still sufficient claim instead. The total
+    // tick count exceeds what the sweep step's per-partition ticks alone
+    // could produce, so the drain step must be contributing some of its
+    // own.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    let exec = seed_expired(&mut conn, "drain_tick_wf", "drain-tick-1", day(2026, 3, 1)).await;
+    let _ = exec;
+    diesel::sql_query(
+        "INSERT INTO harvest_events
+             (workflow_exec_id, event_id, event_type, event_data, timestamp, cohort)
+         SELECT e.workflow_exec_id,
+                1000 + (g.i * 10) + e.event_id,
+                e.event_type,
+                e.event_data,
+                e.timestamp,
+                '2026-03-01'::timestamptz + (g.i || ' days')::interval
+           FROM harvest_events e
+           CROSS JOIN generate_series(1, 2) AS g(i)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a small multi-cohort backlog");
+
+    // Every row seeded above already landed in DEFAULT on insert -- there
+    // is no partition covering March 2026 yet. This just proves that
+    // precondition, rather than relying on it silently.
+    let parked = scalar_i64(
+        &mut conn,
+        &format!(
+            "SELECT COUNT(*)::bigint AS n FROM {}",
+            partition::DEFAULT_PARTITION
+        ),
+    )
+    .await;
+    assert!(
+        parked > 0,
+        "precondition: the seeded backlog must already sit in DEFAULT"
+    );
+
+    let mut ticks = 0usize;
+    let outcome = partition::maintain_with_progress(
+        &mut conn,
+        Utc::now(),
+        0,
+        &SweepOptions::default(),
+        None,
+        &mut || ticks += 1,
+    )
+    .await
+    .expect("maintain_with_progress");
+
+    assert!(
+        outcome.drained > 0,
+        "precondition: the backlog must actually drain; got {outcome:?}"
+    );
+    let sweep_ticks = outcome.sweep.blocked.len() + outcome.sweep.dropped.len();
+    assert!(
+        ticks > sweep_ticks,
+        "the drain step must also tick -- not leave every tick to the sweep \
+         step. Got {ticks} total ticks but only {sweep_ticks} partitions for \
+         the sweep step to evaluate; outcome: {outcome:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_large_default_backlog_drains_in_bounded_passes() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
