@@ -45,10 +45,10 @@ Harvest now streams them off-box.
   exactly when the guard applies: a durable cursor row keeps applying even
   after a sink is removed from the sweeping process.
 - **Opt-in, but one cost is not zero**: no sink configured means no sequence
-  assigned, no cursor row, and the scanner returns before issuing a query. The
-  partial index still matches every row and costs insert-time maintenance
-  regardless of configuration. Tracked as issue #1272. **No new
-  `WorkflowEvent` variant, zero replay-determinism impact.**
+  is assigned, no cursor row is created, and the scanner returns before
+  issuing a query. The partial index still matches every row and costs
+  insert-time maintenance regardless of configuration. Tracked as issue
+  #1272. **No new `WorkflowEvent` variant, zero replay-determinism impact.**
 
 New migration: `20260728000000_harvest_audit_export`. See
 `docs/audit-export.md`.
