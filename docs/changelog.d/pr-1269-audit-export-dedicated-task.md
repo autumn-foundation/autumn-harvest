@@ -33,7 +33,20 @@ pipeline itself, so the fix is architectural: give export its own task.
   run as long as the configured lease allows, which can far exceed the
   worker's poll interval, so `scanner_liveness` registers with
   `poll_interval.max(lease)` to avoid flagging a healthy, still-within-lease
-  delivery as `Stale` or `Wedged`.
+  delivery as `Stale` or `Wedged`. Re-checked every tick and re-registered on
+  a change, so a second runtime publishing a longer lease is picked up
+  without restarting the task (follow-up P2).
+- **The shipped `harvest_scanner_stalled` alert gives `audit_export` its own
+  10m Prometheus window** (follow-up P2), instead of sharing the other
+  sub-minute loops' 5m one: a healthy delivery running longer than 5
+  minutes under a longer configured `audit_export_lease` would otherwise
+  page despite being within its supported timeout.
+- **Shutdown cancels an in-flight delivery wait instead of joining it**
+  (follow-up P1): both worker shutdown paths await every export task's
+  handle, and a bare await on the sink call would have blocked graceful
+  shutdown for up to the full lease. The delivery await now races `cancel`;
+  a shutdown mid-delivery abandons the wait and leaves the claim exactly
+  where it was; the batch is safely redelivered later.
 - **`enforce_timeouts_once` no longer calls `fire_due_audit_exports`.** The
   function, its claim/deliver/ack pipeline, and its `pub` primitive shape
   are unchanged — an embedder driving it by hand still works exactly as
@@ -60,3 +73,8 @@ pipeline itself, so the fix is architectural: give export its own task.
   `scanner_tick_db_tests.rs` adds the same register/tick/deregister proof
   the other per-shard loops have. `scanner_liveness_tests.rs` extends the
   bounded label-set and spawn-site-ownership guards to the new variant.
+  Follow-up review rounds add
+  `an_in_flight_slow_delivery_never_blocks_the_timeout_checker_on_a_size_one_pool`
+  (a blocking-until-released sink proves the connection-release property
+  directly), `audit_export_checker_re_registers_when_the_configured_lease_grows`,
+  and `graceful_shutdown_does_not_wait_for_an_in_flight_delivery`.

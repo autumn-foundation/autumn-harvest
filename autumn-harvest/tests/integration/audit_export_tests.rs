@@ -2984,3 +2984,70 @@ async fn an_in_flight_slow_delivery_never_blocks_the_timeout_checker_on_a_size_o
     let _ = export_handle.await;
     uninstall();
 }
+
+/// Graceful shutdown must not wait for an in-flight delivery (Codex review
+/// on PR #1520, follow-up P1). Both worker shutdown paths join every
+/// export task's `JoinHandle`. Without a fix, a slow or blackholed sink
+/// would hold up shutdown for as long as the claim lease allows.
+#[tokio::test]
+async fn graceful_shutdown_does_not_wait_for_an_in_flight_delivery() {
+    let _guard = TEST_SERIAL.lock().await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let sink: Arc<dyn AuditSink> = Arc::new(SlowSink {
+        release: Arc::clone(&release),
+        status: 200,
+    });
+    {
+        // A long lease: without the fix, shutdown would block for this
+        // whole duration once a delivery is in flight.
+        let mut lock = GLOBAL_AUDIT_EXPORT_CONFIG
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *lock = Some(Arc::new(AuditExportRuntimeConfig {
+            sink,
+            secret: CallbackSecret::new(b"test-secret".to_vec()),
+            batch_size: 100,
+            backoff: ExportBackoff::default(),
+            lease: std::time::Duration::from_secs(300),
+        }));
+    }
+    let (mut conn, container) = make_conn().await;
+    insert_audit_rows(&mut conn, 1).await;
+
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(url);
+    let pool = autumn_harvest::worker::DbPool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("pool");
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(20),
+        Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        Some(autumn_harvest::types::ShardId::new(0)),
+        None,
+    );
+
+    // Give the task time to claim the row and enter the blocked delivery.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    cancel.cancel();
+    let shutdown_bound = std::time::Duration::from_secs(5);
+    let result = tokio::time::timeout(shutdown_bound, handle).await;
+    assert!(
+        result.is_ok(),
+        "graceful shutdown must not wait for an in-flight delivery; the \
+         task did not exit within {shutdown_bound:?} of a still-blocked sink \
+         with a 300s lease"
+    );
+
+    // Nothing is awaiting the sink anymore -- harmless, but tidy.
+    release.notify_one();
+    uninstall();
+}

@@ -2244,6 +2244,12 @@ async fn acquire_shard_conn_for_export(
 /// same physical connection — for the acknowledgement transaction. No
 /// connection is held during delivery at all.
 ///
+/// `cancel` races the delivery wait, never the claim or the acknowledgement
+/// (Codex review on PR #1520, follow-up P1). A shutdown mid-delivery
+/// abandons the wait and leaves the claim exactly where it was, for the
+/// next attempt to redeliver. It never blocks the caller's shutdown for up
+/// to the full lease.
+///
 /// Returns `Ok(0)` before any query when no sink is configured (AC8).
 ///
 /// # Errors
@@ -2256,6 +2262,7 @@ async fn export_once_via_pool(
     pool: &crate::worker::DbPool,
     shard_id: i32,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> crate::error::HarvestResult<usize> {
     let Some(config_arc) = read_global_audit_export_config() else {
         return Ok(0);
@@ -2335,7 +2342,28 @@ async fn export_once_via_pool(
     // No connection held during this await. A timeout is classified exactly
     // like any other transport failure: the cursor is held and the batch is
     // retried. Never a loss.
-    let attempt = deliver_within_lease(config, &batch, claim.lease_until).await;
+    //
+    // Raced against `cancel` (Codex review on PR #1520 P1). A bare await
+    // here does not return until the sink finishes or the full lease
+    // elapses. Both worker shutdown paths join every export task's handle.
+    // An in-flight delivery could otherwise hold up a graceful shutdown for
+    // the whole lease. That is 60s by default, longer if configured -- well
+    // past a typical deployment's termination grace period.
+    //
+    // Cancellation drops the delivery future without recording an outcome.
+    // The claim's cursor and lease are untouched. The batch is safely
+    // redelivered once this shard's lease expires or the process restarts.
+    let attempt = tokio::select! {
+        attempt = deliver_within_lease(config, &batch, claim.lease_until) => attempt,
+        () = cancel.cancelled() => {
+            tracing::warn!(
+                shard = shard_id,
+                "[audit_export] shutdown requested mid-delivery; abandoning the wait \
+                 and leaving the claim for the next attempt to redeliver"
+            );
+            return Ok(0);
+        }
+    };
     let attempt = fence_against_sink_swap(
         attempt,
         &config_arc,
@@ -2499,7 +2527,9 @@ pub fn spawn_audit_export_checker_for_shard(
                 registered_interval = desired_interval;
             }
 
-            if let Err(error) = export_once_via_pool(&pool, shard_id, &*telemetry.metrics).await {
+            if let Err(error) =
+                export_once_via_pool(&pool, shard_id, &*telemetry.metrics, &cancel).await
+            {
                 tracing::error!(
                     shard = shard_id,
                     error = %error,
