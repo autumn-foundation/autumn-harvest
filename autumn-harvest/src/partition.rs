@@ -176,6 +176,16 @@ const LEGACY_RENAME_SUFFIX: &str = "__pre958";
 /// ROW` trigger that changes a partitioned row's destination.
 const EXEC_FK_TRIGGER: &str = "harvest_events_exec_fk_trg";
 
+/// [`EXEC_FK_TRIGGER`]'s own `pg_trigger.tgtype` bitmask: `TRIGGER_TYPE_ROW`
+/// (1) | `TRIGGER_TYPE_BEFORE` (2) | `TRIGGER_TYPE_INSERT` (4), Postgres's
+/// encoding of `BEFORE INSERT FOR EACH ROW`.
+///
+/// Part of the operator-trigger exemption's identity check, alongside
+/// the reserved name and function. A trigger matching both of those,
+/// but installed as `BEFORE UPDATE`, is still an operator's own, not
+/// harvest's.
+const EXEC_FK_TRIGGER_TGTYPE: i16 = 7;
+
 /// The `COMMENT` `enable` stamps on `idx_harvest_we_created_at`.
 ///
 /// Stamped the moment `enable` actually creates that index. Never stamped
@@ -1576,6 +1586,14 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
 /// requires the reserved trigger's own name, so only harvest's actual
 /// trigger, matching both, is ever exempted.
 ///
+/// Review finding: name and function still are not the whole identity.
+/// An operator's trigger could carry both but a different definition.
+/// It could run `BEFORE UPDATE` in place of `BEFORE INSERT FOR EACH
+/// ROW`. It could carry a `WHEN` clause, or arguments harvest's own
+/// trigger never takes. The exemption now also requires
+/// [`EXEC_FK_TRIGGER_TGTYPE`], no arguments, and no `WHEN` clause --
+/// harvest's trigger's exact, whole shape.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] if the catalog query fails.
@@ -1601,7 +1619,10 @@ pub async fn operator_triggers(conn: &mut AsyncPgConnection) -> HarvestResult<Ve
             AND NOT tg.tgisinternal
             AND NOT (tg.tgname = '{EXEC_FK_TRIGGER}'
                      AND p.proname = 'harvest_events_require_execution'
-                     AND p.pronamespace = c.relnamespace)
+                     AND p.pronamespace = c.relnamespace
+                     AND tg.tgtype = {EXEC_FK_TRIGGER_TGTYPE}
+                     AND tg.tgnargs = 0
+                     AND tg.tgqual IS NULL)
           ORDER BY 1"
     ))
     .load::<TextRow>(conn)
@@ -1950,7 +1971,10 @@ the preflight check ran but before this transaction''s ACCESS EXCLUSIVE lock. Dr
        AND NOT tg.tgisinternal
        AND NOT (tg.tgname = '{EXEC_FK_TRIGGER}'
                 AND p.proname = 'harvest_events_require_execution'
-                AND p.pronamespace = c.relnamespace);
+                AND p.pronamespace = c.relnamespace
+                AND tg.tgtype = {EXEC_FK_TRIGGER_TGTYPE}
+                AND tg.tgnargs = 0
+                AND tg.tgqual IS NULL);
     IF bad_trg IS NOT NULL THEN
         RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not carried by CREATE \
 TABLE ... (LIKE ...) (%), installed after the preflight check ran but before this \
@@ -2500,6 +2524,14 @@ fn truncate_ident(s: &str, max_bytes: usize) -> &str {
 /// `pg_constraint.conrelid` and scoped to that one table. See
 /// [`bounded_rename_fn_sql`] for why a bare `base || suffix` is unsafe at
 /// Postgres's 63-byte identifier limit.
+///
+/// Review finding: a constraint candidate free in `pg_constraint` is not
+/// necessarily free to rename to. `ALTER TABLE ... RENAME CONSTRAINT`
+/// also renames the constraint's backing index, scoped schema-wide in
+/// `pg_class`, not per-table. An unrelated relation already holding that
+/// name would then make the rename fail on a collision this check never
+/// saw. Checked against both catalogs now, matching
+/// [`bounded_rename_fn_sql`]'s identical fix for the same gap.
 #[cfg(feature = "db")]
 async fn bounded_rename_name(
     conn: &mut AsyncPgConnection,
@@ -2523,6 +2555,10 @@ async fn bounded_rename_name(
                     "SELECT EXISTS (
                          SELECT 1 FROM pg_constraint
                           WHERE conrelid = ($1::text)::regclass AND conname = $2
+                     ) OR EXISTS (
+                         SELECT 1 FROM pg_class c
+                           JOIN pg_namespace n ON n.oid = c.relnamespace
+                          WHERE n.nspname = current_schema() AND c.relname = $2
                      ) AS v",
                 )
                 .bind::<Text, _>(table)
@@ -3363,15 +3399,16 @@ const DRAIN_MAX_ROWS: usize = 50_000;
 #[doc(hidden)]
 pub const DRAIN_MAX_COHORTS: usize = 32;
 
-/// How often the oversized-cohort move ticks liveness while it runs.
+/// How often the drain's single-statement steps tick liveness while they
+/// run: the oversized-cohort census and the oversized-cohort move.
 ///
-/// The move is one SQL statement, so nothing can tick between its rows.
+/// Each is one SQL statement, so nothing can tick between its rows.
 /// Racing it against a repeating timer, instead, ticks liveness on the
 /// clock without touching the statement itself. Well under
 /// [`crate::scanner_health::MIN_SCANNER_STALENESS_THRESHOLD`], so this
-/// alone cannot make an active move look stale.
+/// alone cannot make an active step look stale.
 #[cfg(feature = "db")]
-const DRAIN_MOVE_HEARTBEAT: Duration = Duration::from_secs(10);
+const DRAIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 // A `statement_timeout` inside the drain's window is DELIBERATELY absent, and
 // this is the second thing to know about the pass after the budgets.
@@ -3738,12 +3775,11 @@ async fn drain_default_bounded_inner(
 
     // Review finding: the census below is unbounded by any statement
     // timeout. It is a full scan of the DEFAULT partition, exactly the
-    // expensive case this whole function exists for. Ticked immediately
-    // before it starts, so a caller reporting liveness has a proof of
-    // life as close as possible to entering it.
-    if let Some(cb) = &mut progress {
-        cb();
-    }
+    // expensive case this whole function exists for. Nothing can tick
+    // between its rows, so a single tick before it starts is not enough
+    // on its own for a large backlog. Race it against a repeating timer,
+    // the same way the oversized-cohort move below does.
+    //
     // Census BEFORE the lock. This `GROUP BY` scans every row in the DEFAULT
     // partition, and `cohort` carries no index — on the large backlog a
     // maintenance gap leaves, exactly the case this budget exists for, it is
@@ -3751,13 +3787,24 @@ async fn drain_default_bounded_inner(
     // unbounded work under the parent's ACCESS EXCLUSIVE, so the row budget
     // bounded only what was MOVED while the shard stayed stopped for the whole
     // scan. Here it takes ACCESS SHARE and costs bystanders nothing.
-    let census = diesel::sql_query(format!(
-        "SELECT cohort AS v, count(*)::bigint AS n
-           FROM {DEFAULT_PARTITION} GROUP BY 1 ORDER BY 1"
-    ))
-    .load::<CohortCountRow>(&mut *conn)
-    .await
-    .map_err(database_error)?;
+    let census = {
+        let query = diesel::sql_query(format!(
+            "SELECT cohort AS v, count(*)::bigint AS n
+               FROM {DEFAULT_PARTITION} GROUP BY 1 ORDER BY 1"
+        ))
+        .load::<CohortCountRow>(&mut *conn);
+        tokio::pin!(query);
+        loop {
+            tokio::select! {
+                result = &mut query => break result.map_err(database_error)?,
+                () = tokio::time::sleep(DRAIN_HEARTBEAT_INTERVAL) => {
+                    if let Some(cb) = &mut progress {
+                        cb();
+                    }
+                }
+            }
+        }
+    };
 
     // Take whole cohorts, oldest first, up to BOTH budgets — and always at
     // least one, so a cohort larger than the row budget still makes progress
@@ -3897,7 +3944,7 @@ async fn drain_default_bounded_inner(
             loop {
                 tokio::select! {
                     result = &mut query => break result.map_err(database_error)?,
-                    () = tokio::time::sleep(DRAIN_MOVE_HEARTBEAT) => {
+                    () = tokio::time::sleep(DRAIN_HEARTBEAT_INTERVAL) => {
                         if let Some(cb) = &mut progress {
                             cb();
                         }
@@ -4411,6 +4458,11 @@ fn dependent_views_guard_sql(tag: &str) -> String {
 /// its own name would then also be exempted and stay unnoticed. The
 /// check now also requires the reserved trigger's own name, matching
 /// [`operator_triggers`]'s fix for the identical gap.
+///
+/// Review finding: name and function still are not the whole identity --
+/// see [`operator_triggers`]'s identical follow-up fix. The check now
+/// also requires harvest's exact trigger shape: [`EXEC_FK_TRIGGER_TGTYPE`],
+/// no arguments, no `WHEN` clause.
 #[must_use]
 fn operator_triggers_guard_sql(tag: &str) -> String {
     format!(
@@ -4424,7 +4476,10 @@ fn operator_triggers_guard_sql(tag: &str) -> String {
          AND NOT tg.tgisinternal\n       \
          AND NOT (tg.tgname = '{EXEC_FK_TRIGGER}'\n                      \
          AND p.proname = 'harvest_events_require_execution'\n                      \
-         AND p.pronamespace = c.relnamespace);\n    \
+         AND p.pronamespace = c.relnamespace\n                      \
+         AND tg.tgtype = {EXEC_FK_TRIGGER_TGTYPE}\n                      \
+         AND tg.tgnargs = 0\n                      \
+         AND tg.tgqual IS NULL);\n    \
          IF bad IS NOT NULL THEN\n        \
          RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not carried by \
          CREATE TABLE ... (LIKE ...) (%). An operator trigger would stay on the \

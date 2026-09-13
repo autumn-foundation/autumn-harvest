@@ -1144,6 +1144,67 @@ async fn enable_survives_a_rename_target_collision_on_an_unrelated_relation() {
 }
 
 #[tokio::test]
+async fn disable_survives_a_rename_target_collision_on_an_unrelated_relation() {
+    // Review finding: `bounded_rename_name`, the Rust helper
+    // `disable_partitioning` uses for its own constraint renames, had the
+    // identical `pg_constraint`-only gap `bounded_rename_fn` already
+    // closed for the enable path. Renaming the new parent's
+    // `harvest_events_pkey` constraint back onto the flat table also
+    // renames its backing index, resolved schema-wide against
+    // `pg_class`. An unrelated relation already at the conventional
+    // target (`harvest_events_pkey__old`) passed the old,
+    // `pg_constraint`-only free-name check. It then made the implicit
+    // index rename fail outright, aborting the whole revert.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // The decoy: an unrelated table occupying the exact name
+    // `bounded_rename_name` would otherwise pick for the renamed pkey
+    // constraint (and, implicitly, its backing index). No `pg_constraint`
+    // row uses this name, so the old, `pg_constraint`-only free-name
+    // check reported it available.
+    diesel::sql_query("DROP TABLE IF EXISTS harvest_events_pkey__old")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray decoy from a previous run");
+    diesel::sql_query("CREATE TABLE harvest_events_pkey__old (id int)")
+        .execute(&mut conn)
+        .await
+        .expect("seed the decoy occupying the rename target's relation name");
+
+    partition::disable_partitioning(&mut conn)
+        .await
+        .expect("revert must not error")
+        .expect("the shard was partitioned");
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "the revert must succeed despite the collision"
+    );
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT EXISTS (SELECT 1 FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = current_schema() \
+             AND c.relname = 'harvest_events_pkey__old' AND c.relkind = 'r') AS v",
+        )
+        .await,
+        "the operator's own decoy table must survive untouched -- it is not \
+         harvest's to drop"
+    );
+
+    diesel::sql_query("DROP TABLE IF EXISTS harvest_events_pkey__old")
+        .execute(&mut conn)
+        .await
+        .expect("clean up the decoy table");
+}
+
+#[tokio::test]
 async fn a_dependent_view_refuses_the_conversion_instead_of_silently_going_stale() {
     // Issue #1270 item 14: Postgres tracks a view's dependency by relation
     // OID, not by name. Both conversion paths rename `harvest_events` out
@@ -2082,6 +2143,58 @@ async fn an_operators_own_trigger_calling_the_reserved_function_still_refuses() 
     );
 
     diesel::sql_query("DROP TRIGGER operator_reuses_harvest_fn_trg ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending trigger");
+}
+
+#[tokio::test]
+async fn a_trigger_matching_the_reserved_name_and_function_but_not_the_shape_still_refuses() {
+    // Review finding: name and function are still not the whole identity.
+    // An operator's trigger could carry harvest's exact reserved name
+    // and call harvest's exact reserved function. It could still be
+    // installed as `BEFORE UPDATE`, rather than `BEFORE INSERT FOR EACH
+    // ROW` -- a shape neither earlier check distinguishes. The guard now
+    // also requires harvest's exact trigger type, no arguments, and no
+    // `WHEN` clause.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP TRIGGER IF EXISTS harvest_events_exec_fk_trg ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray trigger from a previous run");
+    diesel::sql_query(
+        "CREATE TRIGGER harvest_events_exec_fk_trg BEFORE UPDATE ON harvest_events \
+         FOR EACH ROW EXECUTE FUNCTION harvest_events_require_execution()",
+    )
+    .execute(&mut conn)
+    .await
+    .expect(
+        "seed an operator trigger matching the reserved name and function under a \
+         different definition",
+    );
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "a trigger matching the reserved name and function, but not harvest's \
+             exact shape, must not be exempted from the guard",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_exec_fk_trg"),
+        "the refusal must name the offending trigger; got {msg}"
+    );
+
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP TRIGGER harvest_events_exec_fk_trg ON harvest_events")
         .execute(&mut conn)
         .await
         .expect("drop the offending trigger");
