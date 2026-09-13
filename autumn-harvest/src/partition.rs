@@ -1151,6 +1151,70 @@ async fn refuse_if_row_security(conn: &mut AsyncPgConnection, verb: &str) -> Har
     )))
 }
 
+/// User-defined unique indexes on `harvest_events` that do not include
+/// `cohort`, and are not backed by a table constraint. Those are handled
+/// separately: the enable script's own `PRIMARY KEY` and
+/// `workflow_exec_id_event_id_key` constraints add `cohort` explicitly.
+///
+/// **Why this blocks the conversion.** Postgres requires the partition key
+/// in every unique index on a partitioned table. `capture_index_defs`
+/// replays every non-constraint index verbatim onto the new parent. A
+/// unique index that predates partitioning and does not carry `cohort` is
+/// a perfectly ordinary index on the flat layout. It makes `CREATE UNIQUE
+/// INDEX` fail once the parent is partitioned.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] if the catalog query fails.
+#[cfg(feature = "db")]
+pub async fn unique_indexes_missing_cohort(
+    conn: &mut AsyncPgConnection,
+) -> HarvestResult<Vec<String>> {
+    let rows = diesel::sql_query(
+        "SELECT i.indexrelid::regclass::text AS v
+           FROM pg_index i
+           JOIN pg_class c ON c.oid = i.indrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+           JOIN pg_attribute cohort_attr
+             ON cohort_attr.attrelid = c.oid AND cohort_attr.attname = 'cohort'
+          WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
+            AND i.indisunique
+            AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)
+            AND NOT (cohort_attr.attnum = ANY(i.indkey))
+          ORDER BY 1",
+    )
+    .load::<TextRow>(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows.into_iter().map(|r| r.v).collect())
+}
+
+/// The refusal [`enable_partitioning`] and the scripted plan share.
+///
+/// Detected before anything mutates, exactly like the row-security and
+/// publication guards. A mid-conversion `duplicate_object` /
+/// `insufficient columns in UNIQUE constraint definition` from Postgres
+/// names neither the index nor why it is unsupported.
+#[cfg(feature = "db")]
+async fn refuse_if_unique_index_without_cohort(conn: &mut AsyncPgConnection) -> HarvestResult<()> {
+    let bad = unique_indexes_missing_cohort(conn).await?;
+    if bad.is_empty() {
+        return Ok(());
+    }
+    Err(HarvestError::Config(format!(
+        "refusing to convert harvest_events: it carries a unique index that does not \
+         include `cohort` ({}). Postgres requires the partition key in every unique index \
+         on a partitioned table, so replaying this index onto the partitioned parent would \
+         fail. Adding `cohort` to it is not offered automatically: `cohort` is the row's \
+         append instant, so a unique index that spans it is weaker than the index is today \
+         — exactly the reason the engine's own (workflow_exec_id, event_id) uniqueness moved \
+         into the insert trigger rather than a wider constraint. Drop the index if it is \
+         obsolete, or recreate it including `cohort` yourself if that weaker guarantee is \
+         acceptable for your use of it.",
+        bad.join(", ")
+    )))
+}
+
 /// Convert this shard's `harvest_events` to the partitioned layout.
 ///
 /// Idempotent: on an already-partitioned shard it reports
@@ -1215,6 +1279,7 @@ pub async fn enable_partitioning(
     }
 
     refuse_if_row_security(conn, "convert").await?;
+    refuse_if_unique_index_without_cohort(conn).await?;
 
     let width = opts.cohort_width_secs;
     let now = Utc::now();
@@ -3299,6 +3364,36 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
              IF rls OR pols IS NOT NULL THEN\n        \
              RAISE EXCEPTION 'harvest #958: harvest_events has row level security              configured (policies: %). Phase 4 replaces it with a table built by CREATE              TABLE ... (LIKE ...), which copies neither the row-security flags nor any              policy, while the owner and grants ARE replayed onto the replacement — so the              same roles would reach a table with row security off and rows a policy had              been filtering would become readable. Drop the policies if obsolete, or              reproduce them on the converted layout by hand, before running this plan.',              COALESCE(pols, 'none, but row security is enabled');\n    \
              END IF;\nEND\n$harvest_rls_958$;"
+                .to_string(),
+        ),
+        // ── 1: refuse early over a unique index missing `cohort` ──────────
+        //
+        // Same reason and same phase as the guards above.
+        // `enable_partitioning` makes this check in Rust; the scripted path
+        // needs its own because it never calls it. See
+        // `refuse_if_unique_index_without_cohort` — Postgres requires the
+        // partition key in every unique index on a partitioned table, and
+        // phase 4 replays every captured index verbatim.
+        step(
+            1,
+            "DO $harvest_uniq_958$\nDECLARE bad text;\nBEGIN\n    \
+             SELECT string_agg(i.indexrelid::regclass::text, ', ' ORDER BY 1) INTO bad\n      \
+             FROM pg_index i\n      \
+             JOIN pg_class c ON c.oid = i.indrelid\n      \
+             JOIN pg_namespace n ON n.oid = c.relnamespace\n      \
+             JOIN pg_attribute ca\n        \
+             ON ca.attrelid = c.oid AND ca.attname = 'cohort'\n     \
+             WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
+             AND i.indisunique\n       \
+             AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)\n       \
+             AND NOT (ca.attnum = ANY(i.indkey));\n    \
+             IF bad IS NOT NULL THEN\n        \
+             RAISE EXCEPTION 'harvest #958: harvest_events carries a unique index that does \
+             not include `cohort` (%). Postgres requires the partition key in every unique \
+             index on a partitioned table, so phase 4 replaying this index onto the \
+             partitioned parent would fail. Drop the index if it is obsolete, or recreate \
+             it including `cohort` yourself, before running this plan.', bad;\n    \
+             END IF;\nEND\n$harvest_uniq_958$;"
                 .to_string(),
         ),
         // ── 1: bake the chosen width into the cohort function ─────────────

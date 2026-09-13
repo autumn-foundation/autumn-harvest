@@ -453,6 +453,101 @@ fn the_migration_plan_documents_a_non_blocking_window_for_large_live_tables() {
 }
 
 #[tokio::test]
+async fn a_unique_index_without_cohort_refuses_the_conversion_instead_of_aborting_mid_transaction()
+{
+    // Issue #1270 item 10: `capture_index_defs` replays every non-constraint
+    // index verbatim onto the new parent. Postgres requires the partition
+    // key in every unique index on a partitioned table. A unique index
+    // that predates partitioning and does not carry `cohort` is perfectly
+    // valid on the flat layout. It would make `enable_sql` fail with a raw
+    // Postgres error partway through the conversion. Detect it first and
+    // refuse with an explanation instead.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP INDEX IF EXISTS uq_event_type_no_cohort_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query(
+        "CREATE UNIQUE INDEX uq_event_type_no_cohort_958 ON harvest_events (id, event_type)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a unique index that does not include cohort");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "a unique index missing cohort must refuse the conversion, not \
+             abort partway through it",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("uq_event_type_no_cohort_958"),
+        "the refusal must name the offending index; got {msg}"
+    );
+    assert!(
+        msg.contains("cohort"),
+        "the refusal must explain the partition-key requirement; got {msg}"
+    );
+
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP INDEX uq_event_type_no_cohort_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending index");
+}
+
+#[tokio::test]
+async fn the_large_table_plans_phase_1_also_refuses_a_unique_index_without_cohort() {
+    // Same guard, the scripted path. `migration_plan_steps` cannot call
+    // `enable_partitioning`'s Rust check, so it carries its own phase-1 `DO`
+    // block making the identical refusal.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP INDEX IF EXISTS uq_plan_no_cohort_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query("CREATE UNIQUE INDEX uq_plan_no_cohort_958 ON harvest_events (id)")
+        .execute(&mut conn)
+        .await
+        .expect("seed a unique index that does not include cohort");
+
+    let mut refused = false;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 1)
+    {
+        if diesel::sql_query(&step.sql)
+            .execute(&mut conn)
+            .await
+            .is_err()
+        {
+            refused = true;
+        }
+    }
+    assert!(
+        refused,
+        "phase 1 of the plan must refuse a unique index missing cohort"
+    );
+
+    diesel::sql_query("DROP INDEX uq_plan_no_cohort_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending index");
+}
+
+#[tokio::test]
 async fn a_user_index_at_the_identifier_length_limit_survives_conversion() {
     // Issue #1270 item 9: Postgres silently truncates an identifier over 63
     // bytes. Appending a suffix to a name already at that limit renames it
