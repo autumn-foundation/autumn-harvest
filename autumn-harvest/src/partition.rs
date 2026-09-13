@@ -1208,6 +1208,11 @@ async fn refuse_if_row_security(conn: &mut AsyncPgConnection, verb: &str) -> Har
 /// a perfectly ordinary index on the flat layout. It makes `CREATE UNIQUE
 /// INDEX` fail once the parent is partitioned.
 ///
+/// Checked against only the first `indnkeyatts` entries of `indkey` — the
+/// true key columns. An `INCLUDE`d column does not participate in
+/// uniqueness. `cohort` sitting there does not satisfy the requirement,
+/// even though it is present in the wider `indkey` array.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] if the catalog query fails.
@@ -1225,7 +1230,10 @@ pub async fn unique_indexes_missing_cohort(
           WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
             AND i.indisunique
             AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)
-            AND NOT (cohort_attr.attnum = ANY(i.indkey))
+            AND NOT EXISTS (
+                SELECT 1 FROM generate_series(0, i.indnkeyatts - 1) k
+                 WHERE i.indkey[k] = cohort_attr.attnum
+            )
           ORDER BY 1",
     )
     .load::<TextRow>(conn)
@@ -3639,7 +3647,10 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
              WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
              AND i.indisunique\n       \
              AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)\n       \
-             AND NOT (ca.attnum = ANY(i.indkey));\n    \
+             AND NOT EXISTS (\n           \
+             SELECT 1 FROM generate_series(0, i.indnkeyatts - 1) k\n            \
+             WHERE i.indkey[k] = ca.attnum\n       \
+             );\n    \
              IF bad IS NOT NULL THEN\n        \
              RAISE EXCEPTION 'harvest #958: harvest_events carries a unique index that does \
              not include `cohort` (%). Postgres requires the partition key in every unique \

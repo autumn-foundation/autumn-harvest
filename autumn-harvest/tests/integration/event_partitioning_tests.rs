@@ -506,6 +506,52 @@ async fn a_unique_index_without_cohort_refuses_the_conversion_instead_of_abortin
 }
 
 #[tokio::test]
+async fn a_unique_index_with_cohort_only_as_an_include_column_still_refuses() {
+    // Review finding on item 10: `indkey` holds both key columns and
+    // INCLUDE columns. Checking membership across the whole array let an
+    // index with `cohort` only INCLUDEd -- not a key column -- pass the
+    // guard. An INCLUDE column does not participate in uniqueness, so
+    // Postgres still rejects the index once the parent is partitioned.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP INDEX IF EXISTS uq_include_cohort_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query(
+        "CREATE UNIQUE INDEX uq_include_cohort_958 ON harvest_events (id) INCLUDE (cohort)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a unique index with cohort only as an INCLUDE column");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "an INCLUDE-only cohort column must still refuse the conversion, \
+             not be mistaken for a real key column",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("uq_include_cohort_958"),
+        "the refusal must name the offending index; got {msg}"
+    );
+
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP INDEX uq_include_cohort_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending index");
+}
+
+#[tokio::test]
 async fn the_large_table_plans_phase_1_also_refuses_a_unique_index_without_cohort() {
     // Same guard, the scripted path. `migration_plan_steps` cannot call
     // `enable_partitioning`'s Rust check, so it carries its own phase-1 `DO`
@@ -542,6 +588,50 @@ async fn the_large_table_plans_phase_1_also_refuses_a_unique_index_without_cohor
     );
 
     diesel::sql_query("DROP INDEX uq_plan_no_cohort_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending index");
+}
+
+#[tokio::test]
+async fn the_large_table_plans_phase_1_also_refuses_an_include_only_cohort_column() {
+    // Same guard, the scripted path. Its phase-1 `DO` block had the
+    // identical `indkey`-membership gap: an INCLUDEd `cohort` is not a
+    // key column, so it does not satisfy the requirement.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP INDEX IF EXISTS uq_plan_include_cohort_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query(
+        "CREATE UNIQUE INDEX uq_plan_include_cohort_958 ON harvest_events (id) INCLUDE (cohort)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a unique index with cohort only as an INCLUDE column");
+
+    let mut refusal: Option<String> = None;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 1)
+    {
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            refusal = Some(e.to_string());
+        }
+    }
+    let msg = refusal.expect(
+        "phase 1 of the plan must refuse an INCLUDE-only cohort column, \
+         not mistake it for a real key column",
+    );
+    assert!(
+        msg.contains("uq_plan_include_cohort_958"),
+        "the refusal must name the offending index; got {msg}"
+    );
+
+    diesel::sql_query("DROP INDEX uq_plan_include_cohort_958")
         .execute(&mut conn)
         .await
         .expect("drop the offending index");
