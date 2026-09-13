@@ -26536,8 +26536,9 @@ impl Worker {
                              than risk stamping records under another shard's key"
                             );
                             // A shard with no task never reaches the checker's own
-                            // `export_observed` emission (Codex review on PR #1520,
-                            // follow-up P2, sixth round). Set it here instead. A
+                            // `export_observed` emission or its `scanner_liveness`
+                            // registration (Codex review on PR #1520, follow-up
+                            // P2, sixth round). Set the gauge here instead. A
                             // healthy sibling shard's series could otherwise mask
                             // this absence. It would then read as the "scanner
                             // never runs here" case the alert notes call
@@ -26547,6 +26548,16 @@ impl Worker {
                                 .telemetry()
                                 .metrics
                                 .record_audit_export_observed(shard_u16, false);
+                            // Registered, never deregistered, never ticked. It
+                            // ages straight into `Stale` then `Wedged` on the
+                            // ordinary schedule. `scanner_liveness` needs no
+                            // separate "missing pool" case to surface this.
+                            let _ = crate::scanner_health::register_scanner_for_shard(
+                                self.registry.telemetry().metrics.as_ref(),
+                                crate::scanner_health::Scanner::AuditExport,
+                                self.config.poll_interval,
+                                Some(s),
+                            );
                             return None;
                         };
                         exact.clone()
