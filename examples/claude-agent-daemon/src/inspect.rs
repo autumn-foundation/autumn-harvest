@@ -1006,15 +1006,75 @@ fn answered(conn: &Connection, exec_id: &str, signal: &str) -> Result<bool, Stri
         }
         None => {}
     }
-    one_row(
-        conn,
-        "SELECT 1 FROM harvest_events WHERE exec_id = ?1 \
-         AND json_valid(event_json) \
-         AND json_extract(event_json, '$.type') = 'SignalReceived' \
-         AND json_extract(event_json, '$.data.signal_name') = ?2 LIMIT 1",
-        exec_id,
-        signal,
-    )
+    match delivered_decision(conn, exec_id, signal)? {
+        Some(true) => Ok(true),
+        Some(false) => Err(format!(
+            "session {exec_id} recorded a decision for {signal} that the workflow \
+             cannot read, so the session fails on every drive"
+        )),
+        None => Ok(false),
+    }
+}
+
+/// Is a decision for this signal in the LOG, and can the workflow read it?
+///
+/// `None` means the log holds none. `Some(true)` is a decision the replay
+/// takes up. `Some(false)` is one that ends the session.
+///
+/// The event is read as `WorkflowEvent`, and then its payload as the type the
+/// workflow asks for. BOTH reads are needed, because the variant declares
+/// `payload` as an untyped `Value`. An event holding `{}` is a valid
+/// `WorkflowEvent` and an invalid `ApprovalDecision`. A read of the event
+/// alone therefore reports a decision the replay cannot take up.
+///
+/// Measured on three delivered events. Every one deserialised as an event.
+/// `{"approved":true}` read as a decision, and `{}` and
+/// `{"approved":"yes"}` did not. All three suppressed the wait.
+///
+/// The consequence is the one the staged row has. `receive_signal_timeout`
+/// refuses the payload on the next drive, `agent_session` propagates that,
+/// and the runtime seals the session `FAILED`.
+///
+/// Reading the event here also ends the last `json_extract` on this path.
+/// That function reports the FIRST value of a repeated key and `serde_json`
+/// reports the LAST. The two could disagree about the name a row carries.
+///
+/// # Cost
+///
+/// One row is held at a time and dropped. [`ambiguous_history`] has already
+/// proven every row deserialises, so this pass reads rows it knows are sound.
+fn delivered_decision(
+    conn: &Connection,
+    exec_id: &str,
+    signal: &str,
+) -> Result<Option<bool>, String> {
+    let mut statement = conn
+        .prepare("SELECT event_json FROM harvest_events WHERE exec_id = ?1 ORDER BY seq")
+        .map_err(|e| format!("cannot prepare the delivery query: {e}"))?;
+    let mut rows = statement
+        .query([exec_id])
+        .map_err(|e| format!("cannot read the deliveries: {e}"))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("cannot read a delivery: {e}"))?
+    {
+        let Ok(event) = row.get::<_, String>(0) else {
+            continue;
+        };
+        let Ok(WorkflowEvent::SignalReceived {
+            signal_name,
+            payload,
+        }) = serde_json::from_str::<WorkflowEvent>(&event)
+        else {
+            continue;
+        };
+        if signal_name == signal {
+            return Ok(Some(
+                serde_json::from_value::<ApprovalDecision>(payload).is_ok(),
+            ));
+        }
+    }
+    Ok(None)
 }
 
 /// Is a decision STAGED for this signal, and can the engine read it?
@@ -1121,19 +1181,6 @@ fn ambiguous_history(conn: &Connection, exec_id: &str) -> Result<bool, String> {
         }
     }
     Ok(false)
-}
-
-/// Does this query find a row?
-fn one_row(conn: &Connection, sql: &str, exec_id: &str, signal: &str) -> Result<bool, String> {
-    let mut statement = conn
-        .prepare(sql)
-        .map_err(|e| format!("cannot prepare the decision query: {e}"))?;
-    let mut rows = statement
-        .query([exec_id, signal])
-        .map_err(|e| format!("cannot read the decisions: {e}"))?;
-    rows.next()
-        .map(|row| row.is_some())
-        .map_err(|e| format!("cannot read a decision: {e}"))
 }
 
 /// Is this timer the deadline of that signal's wait?

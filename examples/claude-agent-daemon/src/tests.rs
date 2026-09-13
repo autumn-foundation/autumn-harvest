@@ -11463,3 +11463,121 @@ fn a_staged_decision_is_read_as_the_type_the_workflow_asks_for() {
         "so the restart accepts it too"
     );
 }
+
+/// A DELIVERED decision is read as the type the workflow asks for.
+///
+/// `WorkflowEvent::SignalReceived` declares `payload` as an untyped `Value`,
+/// so an event carrying `{}` is a valid event and an invalid
+/// `ApprovalDecision`. Reading the event alone therefore reports a decision
+/// the replay cannot take up.
+///
+/// Measured before the fix: all three payloads below deserialised as events
+/// and all three suppressed the wait, while two are decisions the workflow
+/// refuses. `receive_signal_timeout` then fails on the next drive and the
+/// runtime seals the session `FAILED`.
+#[test]
+fn a_delivered_decision_is_read_as_the_type_the_workflow_asks_for() {
+    let armed = "tool_approval:2:0:toolu_x";
+    let build = |payload: &str| {
+        let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
+        conn.execute_batch(
+            "CREATE TABLE harvest_timers (timer_id TEXT, exec_id TEXT, fire_at INTEGER, \
+             fired INTEGER NOT NULL DEFAULT 0, arm_seq INTEGER, \
+             PRIMARY KEY (exec_id, timer_id)); \
+             CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+             PRIMARY KEY (exec_id, seq)); \
+             CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+             exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+        )
+        .expect("the fixture tables are created");
+        conn.execute(
+            "INSERT INTO harvest_timers VALUES (?1, 'e', 9999, 0, 2)",
+            [format!("__signal_timeout:2:{armed}")],
+        )
+        .expect("the armed timer is recorded");
+        let event = format!(
+            r#"{{"type":"SignalReceived","data":{{"signal_name":"{armed}","payload":{payload}}}}}"#
+        );
+        conn.execute("INSERT INTO harvest_events VALUES ('e', 0, ?1)", [&event])
+            .expect("the delivery is appended");
+        (conn, event)
+    };
+
+    for (label, payload) in [
+        ("an object with no declared field", "{}"),
+        (
+            "a declared field of the wrong type",
+            r#"{"approved":"yes"}"#,
+        ),
+    ] {
+        let (conn, event) = build(payload);
+        // The event itself is SOUND. That is the whole point: the history
+        // check cannot see this, because `payload` is an untyped `Value`.
+        assert!(
+            serde_json::from_str::<autumn_harvest::WorkflowEvent>(&event).is_ok(),
+            "[{label}] the event must be one the engine loads"
+        );
+        assert!(
+            serde_json::from_str::<session::ApprovalDecision>(payload).is_err(),
+            "[{label}] and a payload the workflow refuses"
+        );
+        let refused = inspect::outstanding_signal(&conn, "e", 1_000)
+            .expect_err("a recorded decision the workflow cannot read must refuse the restart");
+        assert!(
+            refused.contains("fails on every drive"),
+            "[{label}] the refusal must say WHY it refuses: {refused}"
+        );
+    }
+
+    // The not-the-fault cases. A real decision still ends the wait, and an
+    // unknown key beside it is still a decision the replay takes up.
+    for (label, payload) in [
+        ("a plain decision", r#"{"approved":true}"#),
+        (
+            "a decision with a note",
+            r#"{"approved":false,"note":"denied"}"#,
+        ),
+        (
+            "a decision holding an unknown key",
+            r#"{"approved":true,"extra":1}"#,
+        ),
+    ] {
+        let (conn, _) = build(payload);
+        assert_eq!(
+            inspect::outstanding_signal(&conn, "e", 1_000).expect("the wait query runs"),
+            None,
+            "[{label}] a decision the workflow reads still ends the wait"
+        );
+    }
+
+    // A delivery for ANOTHER signal is not this signal's answer, so the wait
+    // it guards is still restored.
+    let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
+    conn.execute_batch(
+        "CREATE TABLE harvest_timers (timer_id TEXT, exec_id TEXT, fire_at INTEGER, \
+         fired INTEGER NOT NULL DEFAULT 0, arm_seq INTEGER, \
+         PRIMARY KEY (exec_id, timer_id)); \
+         CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+         PRIMARY KEY (exec_id, seq)); \
+         CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+         exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+         delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+    )
+    .expect("the fixture tables are created");
+    conn.execute(
+        "INSERT INTO harvest_timers VALUES (?1, 'e', 9999, 0, 2)",
+        [format!("__signal_timeout:2:{armed}")],
+    )
+    .expect("the armed timer is recorded");
+    conn.execute(
+        "INSERT INTO harvest_events VALUES ('e', 0, ?1)",
+        [r#"{"type":"SignalReceived","data":{"signal_name":"tool_approval:1:0:other","payload":{}}}"#],
+    )
+    .expect("the other delivery is appended");
+    assert_eq!(
+        inspect::outstanding_signal(&conn, "e", 1_000).expect("the wait query runs"),
+        Some(armed.to_string()),
+        "a delivery for another signal leaves this wait outstanding"
+    );
+}
