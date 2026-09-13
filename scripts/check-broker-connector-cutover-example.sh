@@ -58,10 +58,27 @@ if ! grep -qF 'key_incarnation("2026-08-cutover")' <<<"$window"; then
   exit 1
 fi
 
-if grep -qE '\.map_json\(\|[A-Za-z_][A-Za-z0-9_]*: ' <<<"$window"; then
+# Arity: pull the text between `.map_json(|` and the closure's closing `|`.
+# A Rust closure parameter list never contains a bare `|` (bitwise-or has no
+# place there), so the first `|` after the opening one is always the close.
+# Flagged in PR #1523 review: the prior check
+# (`grep -qE '\.map_json\(\|[A-Za-z_][A-Za-z0-9_]*: '`) only rejected a
+# single argument when it carried an explicit type annotation, so
+# `.map_json(|order| { ... })` -- untyped, still the wrong arity -- slipped
+# through.
+params="$(grep -oP '(?<=\.map_json\(\|)[^|]*' <<<"$window" | head -n1)"
+
+if [ -z "$params" ]; then
+  echo "$doc: could not find a .map_json(|...| closure header in the" \
+    "cutover example; has it moved to map_raw or changed shape? Update" \
+    "this guard to match." >&2
+  exit 1
+fi
+
+if ! grep -q ',' <<<"$params"; then
   echo "$doc: the cutover example's .map_json(...) closure takes a single" \
-    "argument -- the typed body only, with no message-context parameter." \
-    "SourceBinding::map_json requires Fn(&MessageCtx, T) ->" \
+    "argument (\"$params\") -- the typed body only, with no message-context" \
+    "parameter. SourceBinding::map_json requires Fn(&MessageCtx, T) ->" \
     "Result<MappedMessage, E>, so this closure has the wrong arity and" \
     "does not type-check." >&2
   echo >&2
@@ -78,9 +95,19 @@ if grep -qF 'Ok(WorkflowId::new(' <<<"$window"; then
   exit 1
 fi
 
-if ! grep -qF "MappedMessage::new" <<<"$window"; then
-  echo "$doc: the cutover example no longer builds a MappedMessage;" \
-    "update this guard to match the current example." >&2
+# Return type: the closure must yield Result<MappedMessage, E>, not a bare
+# MappedMessage. Also flagged in review: a prior check merely required the
+# substring `MappedMessage::new` to appear anywhere in the window, so
+# `.map_json(|_ctx, order| MappedMessage::new(...))` -- missing the `Ok(...)`
+# wrapper -- passed despite not type-checking against `map_json`'s bound.
+if ! grep -qE 'Ok(::<[^)]*>)?\(\s*MappedMessage::new\(' <<<"$window"; then
+  echo "$doc: the cutover example's .map_json(...) closure does not return" \
+    "Ok(MappedMessage::new(...)) -- map_json requires" \
+    "Result<MappedMessage, E>, so a bare MappedMessage (missing the Ok(...)" \
+    "wrapper) does not type-check." >&2
+  echo >&2
+  echo "Fix: wrap the constructed MappedMessage in Ok(...), e.g." \
+    "Ok::<_, String>(MappedMessage::new(...))." >&2
   exit 1
 fi
 
