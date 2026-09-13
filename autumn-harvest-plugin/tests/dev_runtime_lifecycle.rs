@@ -328,6 +328,17 @@ async fn a_port_taken_during_provisioning_is_refused_and_takes_the_cluster_with_
         probe.local_addr().expect("addr").port()
     };
 
+    // Acquired before the timed watcher below is spawned (Codex review, issue
+    // #1291): another `DevRuntime::start` test can hold this mutex for far
+    // longer than the watcher's 10-second polling window, and a watcher
+    // started first could time out and return `None` before this test ever
+    // begins provisioning, failing the `held.is_some()` assertion below for a
+    // reason that has nothing to do with what this test asserts.
+    let _serial = DEV_RUNTIME_START_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = harvest_mode_env_cleared();
+
     // Event-driven, not timed: the session directory is created at the very
     // start of provisioning and `initdb` runs for seconds afterwards, so
     // claiming the port the moment that directory appears lands reliably in
@@ -343,10 +354,6 @@ async fn a_port_taken_during_provisioning_is_refused_and_takes_the_cluster_with_
         None
     });
 
-    let _serial = DEV_RUNTIME_START_SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _env = harvest_mode_env_cleared();
     let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         http_port: port,
         session_root: Some(base.clone()),
