@@ -1,4 +1,4 @@
-# `lineage::LineageWalk`/`LineageTreeReport::finish`: pre-size the per-parent and per-node vecs
+# `lineage::LineageWalk`/`LineageTreeReport::finish`: pre-size the per-level and per-node vecs
 
 This note documents a profiling pass over
 `autumn_harvest_plugin::lineage::LineageWalk` and `LineageTreeReport::finish`
@@ -97,17 +97,16 @@ already applied to `project_awaitables`' history index:
 2. **`admit_level`'s `next: Vec<uuid::Uuid>`.** At most one id per input row
    is ever admitted into it, so `rows.len()` -- already known -- is an exact
    upper bound.
-3. **`finish`'s `by_parent: HashMap<uuid::Uuid, Vec<LineageChildRow>>`** (the
-   outer map) **and `attach_children`'s `node.children: Vec<LineageNode>`.**
-   `self.nodes.len()` bounds the outer map's distinct-key count (loosely: at
-   most one parent per row). `attach_children` already holds `rows` -- the
-   exact, already-known count of the node's own children -- before the loop
-   that fills `node.children`.
+3. **`attach_children`'s `node.children: Vec<LineageNode>`.**
+   `attach_children` already holds `rows` -- the exact, already-known count
+   of the node's own children -- before the loop that fills
+   `node.children`.
 
 None of these needs an extra pass over the data to size correctly (unlike
 `HistoryIndex`'s per-category counts, which needed one): each bound is
-either already in hand (`rows.len()`) or a cheap, already-computed superset
-(`self.nodes.len()`).
+already in hand as `rows.len()`. (`finish`'s `by_parent` map -- the fourth
+collection this call path grows from empty -- has no such cheap bound; see
+"Correction (post-review)" below for why it is deliberately left unsized.)
 
 ## Change
 
@@ -119,7 +118,6 @@ either already in hand (`rows.len()`) or a cheap, already-computed superset
   actually admitted, in lockstep, which can never exceed the live budget)
   -- all three right-sized to *this call's* batch, not to the walk's
   ceiling.
-* `finish` sizes the `by_parent` `HashMap` from `self.nodes.len()`.
 * `attach_children` calls `node.children.reserve_exact(rows.len())` once,
   right after removing `rows` from `by_parent` and before the loop that
   pushes into it.
@@ -142,11 +140,11 @@ declaration, differing only by the `lineage.rs` diff above, same
 | | Instructions (Ir) |
 |---|---|
 | Before | 311,176,188 |
-| After  | 296,002,192 |
-| **Reduction** | **15,173,996 (4.88%)** |
+| After  | 304,149,903 |
+| **Reduction** | **7,026,285 (2.26%)** |
 
-Just short of the >=5% floor on its own -- see "Correction (post-review)"
-below for why this number is smaller than this fix's first cut. The
+Short of the >=5% floor on its own -- see "Correction (post-review)" below
+for why this number is smaller than this fix's first two cuts. The
 allocation-bytes floor below still clears independently, and the floor
 rule is an *or*: at least one deterministic counter clearing is sufficient.
 
@@ -154,8 +152,8 @@ rule is an *or*: at least one deterministic counter clearing is sufficient.
 
 | dhat | Before | After | Reduction |
 |---|---|---|---|
-| Total bytes  | 107,581,951 | 87,912,951 | 19,669,000 (**18.29%**) |
-| Total blocks | 357,430 | 354,130 | 3,300 (0.92%) |
+| Total bytes  | 107,581,951 | 87,911,151 | 19,670,800 (**18.29%**) |
+| Total blocks | 357,430 | 354,530 | 2,900 (0.81%) |
 
 Bytes clear the >=10%-allocation floor by ~1.8x. Block count barely moves,
 for the same reason noted in the dag_graph/awaitables precedent:
@@ -197,6 +195,23 @@ what one call could ever admit. This session's single-shard-per-level
 harness never sends such an oversized batch, so this fix does not move the
 numbers above -- it closes a gap the harness does not exercise, not one it
 measures. Both `nodes` and `next` now share the `admittable` binding.
+
+A third Codex round (P2, `lineage.rs:610`) caught that `finish`'s
+`by_parent` `HashMap` -- sized from `self.nodes.len()` in this fix's first
+two cuts -- has no cheap tight bound the way `nodes`/`next`/`children` do.
+`self.nodes.len()` bounds the number of distinct parents (every row has at
+most one), but a broad, shallow tree -- many children directly under one
+parent, exactly the wide fan-out shape this endpoint exists for -- has
+`self.nodes.len()` rows and as few as one distinct parent. Reserving
+`self.nodes.len()` there traded a real growth-step cost this walk's
+dominant shape rarely pays for a worst-case over-allocation it always
+would. Computing a tight distinct-parent count first would need a second
+pass over `self.nodes` that itself hashes every row's parent id, undoing
+the saving. `by_parent` is now left growing from empty, unchanged from
+`HEAD` -- this fix touches only the three collections with a bound that is
+both cheap and tight. The numbers above are this final version's; they are
+smaller again than the second round's, since `by_parent`'s own (small, per
+the original profile's attribution) contribution is no longer claimed.
 
 ### Correctness
 

@@ -601,13 +601,20 @@ impl LineageWalk {
         // bounded by `max_depth` (≤ LINEAGE_MAX_DEPTH_CEILING), so this cannot
         // overflow the stack.
         //
-        // `self.nodes.len()` is a safe (if loose) upper bound on the number
-        // of distinct parents -- every row has at most one. Reserving it
-        // up front costs one over-sized allocation. The alternative is
-        // however many `hashbrown` rehashes it takes to reach the real
-        // count by growing from empty.
-        let mut by_parent: HashMap<uuid::Uuid, Vec<LineageChildRow>> =
-            HashMap::with_capacity(self.nodes.len());
+        // Left growing from empty, deliberately. `self.nodes.len()` bounds
+        // the number of distinct parents -- every row has at most one.
+        // That bound can be extremely loose, though. A broad, shallow tree
+        // has many children directly under one parent -- exactly the wide
+        // fan-out shape this endpoint exists for. Such a tree has
+        // `self.nodes.len()` rows and as few as one distinct parent. An
+        // earlier cut of this fix reserved `self.nodes.len()` here. That
+        // traded a real growth-step cost this walk's dominant shape rarely
+        // pays for a worst-case over-allocation it always would (Codex
+        // review). Unlike `nodes`, `next` and `node.children` below, there
+        // is no cheap tight bound on the real distinct-parent count without
+        // a second pass over `self.nodes`. That pass would itself hash
+        // every row's parent id, undoing the saving it exists to buy.
+        let mut by_parent: HashMap<uuid::Uuid, Vec<LineageChildRow>> = HashMap::new();
         for row in self.nodes {
             if let Some(parent) = row.parent_id {
                 by_parent.entry(parent.as_uuid()).or_default().push(row);
