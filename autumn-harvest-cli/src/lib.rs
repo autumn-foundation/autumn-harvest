@@ -6304,6 +6304,13 @@ fn emit_partition_report(
                         m.sweep.dropped.len(),
                         m.sweep.straggler_rows_deleted,
                     );
+                    if m.sweep.truncated {
+                        // Issue #1270 item 1's whole reason for existing. A
+                        // pass that dropped and blocked nothing must not
+                        // read as "shard is clean". It may really mean the
+                        // pass ran out of budget before it looked at the rest.
+                        println!("  sweep: truncated, ran out of budget before finishing");
+                    }
                     if let Some(e) = &m.last_error {
                         println!("  INCOMPLETE: {e}");
                     }
@@ -6326,6 +6333,9 @@ fn emit_partition_report(
                         sweep.dropped.len(),
                         sweep.blocked.len()
                     );
+                    if sweep.truncated {
+                        println!("  sweep: truncated, ran out of budget before finishing");
+                    }
                     for b in &sweep.blocked {
                         println!("  blocked: {b}");
                     }
