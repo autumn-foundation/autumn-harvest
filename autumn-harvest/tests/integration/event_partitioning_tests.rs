@@ -4412,6 +4412,65 @@ async fn disable_does_not_drop_an_operator_index_of_the_same_name_but_a_differen
 }
 
 #[tokio::test]
+async fn disable_does_not_drop_an_identically_shaped_operator_index_either() {
+    // Second review finding on the same fix. A shape check alone cannot
+    // tell harvest's index apart from an operator's own index of the
+    // IDENTICAL shape. A plain btree on
+    // harvest_workflow_executions (created_at) is an ordinary thing to
+    // build independently. `enable`'s CREATE INDEX IF NOT EXISTS leaves
+    // it untouched and does not tag it. Disable must not drop it either,
+    // even though the shape check alone would have said yes.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP INDEX IF EXISTS idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query(
+        "CREATE INDEX idx_harvest_we_created_at ON harvest_workflow_executions (created_at)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator index with the exact shape enable creates");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT to_regclass('idx_harvest_we_created_at') IS NOT NULL AS v"
+        )
+        .await,
+        "precondition: enable's CREATE INDEX IF NOT EXISTS must leave the \
+         operator's index in place, not replace it"
+    );
+
+    partition::disable_partitioning(&mut conn)
+        .await
+        .expect("disable")
+        .expect("the shard was partitioned, so disable must report a revert");
+
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT to_regclass('idx_harvest_we_created_at') IS NOT NULL AS v"
+        )
+        .await,
+        "disable must not drop an operator's own index just because its \
+         shape happens to match the one enable would have built -- only \
+         the ownership tag settles that"
+    );
+
+    diesel::sql_query("DROP INDEX idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .expect("drop the operator's index");
+}
+
+#[tokio::test]
 async fn enabling_creates_the_drop_gate_index_the_migration_no_longer_ships() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;

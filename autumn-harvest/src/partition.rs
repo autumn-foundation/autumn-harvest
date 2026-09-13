@@ -176,19 +176,39 @@ const LEGACY_RENAME_SUFFIX: &str = "__pre958";
 /// ROW` trigger that changes a partitioned row's destination.
 const EXEC_FK_TRIGGER: &str = "harvest_events_exec_fk_trg";
 
+/// The `COMMENT` `enable` stamps on `idx_harvest_we_created_at`.
+///
+/// Stamped the moment `enable` actually creates that index. Never stamped
+/// when `CREATE INDEX IF NOT EXISTS` finds an operator's own index already
+/// at that name.
+///
+/// A shape check alone cannot tell harvest's index apart from an
+/// operator's own index of the identical shape. Building an index on
+/// `harvest_workflow_executions (created_at)` independently is an
+/// ordinary thing to do. Recording ownership at creation time removes the
+/// ambiguity instead of guessing from the result.
+const WE_CREATED_AT_IDX_OWNERSHIP_TAG: &str =
+    "harvest #958: created by partition enable, safe to drop on disable";
+
 /// A boolean SQL expression, evaluating to exactly one row.
 ///
-/// Checks that `idx_harvest_we_created_at` exists and has the shape
+/// Checks that `idx_harvest_we_created_at` exists and carries
+/// [`WE_CREATED_AT_IDX_OWNERSHIP_TAG`]. Also checks it has the shape
 /// `enable` creates: a plain (non-unique) single-column btree on
 /// `harvest_workflow_executions (created_at)`, with default opclass and no
 /// predicate or expression. `false` (not an error) when the index does not
 /// exist at all.
 ///
-/// [`disable_partitioning`] uses this. It drops the index only when the
-/// shape matches what `enable` built, not an operator's own pre-existing
-/// index that happens to share the name.
+/// [`disable_partitioning`] uses this. It drops the index only when BOTH
+/// signals agree. The tag alone could in principle survive some
+/// hypothetical future `ALTER INDEX`. The shape alone cannot distinguish
+/// harvest's index from an operator's identically shaped one. Requiring
+/// both is the conservative choice: an index missing either signal is
+/// left alone.
 #[cfg(feature = "db")]
-const WE_CREATED_AT_IDX_SHAPE_CHECK_SQL: &str = "SELECT COALESCE((
+fn we_created_at_idx_owned_check_sql() -> String {
+    format!(
+        "SELECT COALESCE((
        SELECT i.indrelid = 'harvest_workflow_executions'::regclass
               AND NOT i.indisunique AND i.indpred IS NULL AND i.indexprs IS NULL
               AND i.indnkeyatts = 1 AND i.indnatts = 1
@@ -199,11 +219,15 @@ const WE_CREATED_AT_IDX_SHAPE_CHECK_SQL: &str = "SELECT COALESCE((
                   SELECT 1 FROM unnest(i.indclass) AS oc(opclass)
                   JOIN pg_opclass op ON op.oid = oc.opclass
                  WHERE NOT op.opcdefault)
+              AND obj_description(c.oid, 'pg_class') = \
+                  $harvest_we_idx_tag_958${WE_CREATED_AT_IDX_OWNERSHIP_TAG}$harvest_we_idx_tag_958$
          FROM pg_class c
          JOIN pg_index i ON i.indexrelid = c.oid
          JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE c.relname = 'idx_harvest_we_created_at' AND n.nspname = current_schema()
-     ), false) AS v";
+     ), false) AS v"
+    )
+}
 
 /// Name of the transient function [`bounded_rename_fn_sql`] defines.
 ///
@@ -1571,6 +1595,7 @@ DECLARE
     hi          timestamptz;
     step        int;
     had_rows    boolean;
+    we_idx_existed boolean;
 {COPY_ACL_DECLARE}
 BEGIN
     -- Idempotent: already partitioned, nothing to do.
@@ -1730,8 +1755,22 @@ BEGIN
     -- ACCESS EXCLUSIVE on harvest_events; `migration_plan` builds the same
     -- index CONCURRENTLY, outside any lock window, for the large tables where
     -- the difference is felt.
+    --
+    -- Tagged only when this statement is the one that actually creates the
+    -- index -- never when IF NOT EXISTS finds an operator's own index
+    -- already at that name. `disable_partitioning` reads the tag back to
+    -- decide whether it may drop the index.
+    SELECT EXISTS (
+        SELECT 1 FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relname = 'idx_harvest_we_created_at' AND n.nspname = current_schema()
+    ) INTO we_idx_existed;
     EXECUTE 'CREATE INDEX IF NOT EXISTS idx_harvest_we_created_at '
          || 'ON harvest_workflow_executions (created_at)';
+    IF NOT we_idx_existed THEN
+        EXECUTE 'COMMENT ON INDEX idx_harvest_we_created_at IS '
+             || quote_literal('{WE_CREATED_AT_IDX_OWNERSHIP_TAG}');
+    END IF;
 
     -- The catch-all, created before any cohort partition so there is never an
     -- instant in which an append could find no partition at all.
@@ -2340,9 +2379,11 @@ pub async fn disable_partitioning(
             // Review finding: `enable`'s `CREATE INDEX IF NOT EXISTS` leaves
             // an operator's own pre-existing index of this exact name
             // untouched, so it never becomes harvest's to remove. Dropping
-            // by name alone would delete that unrelated index. Drop it only
-            // when its shape matches the one `enable` creates.
-            if scalar_bool(conn, WE_CREATED_AT_IDX_SHAPE_CHECK_SQL).await? {
+            // by name alone would delete that unrelated index. A shape
+            // check alone is not enough either — an operator's own index
+            // can happen to have the identical shape. Drop it only when
+            // `enable` tagged it AND its shape still matches.
+            if scalar_bool(conn, &we_created_at_idx_owned_check_sql()).await? {
                 exec(conn, "DROP INDEX idx_harvest_we_created_at").await?;
             }
             Ok(DisableReport {
@@ -3791,6 +3832,17 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // the busiest table in the schema, so the concurrent form is not
         // optional here: a plain build holds SHARE for its duration and every
         // insert, state update and retention delete waits behind it.
+        //
+        // Unlike `enable_sql`, this step does not stamp
+        // `WE_CREATED_AT_IDX_OWNERSHIP_TAG`. `CREATE INDEX CONCURRENTLY`
+        // must run alone, outside any transaction. It cannot also check
+        // pre-existence and conditionally tag in one atomic step the way
+        // `enable_sql`'s single transaction does. An index this plan
+        // builds is therefore never dropped by `disable_partitioning`,
+        // which requires the tag. That is the safe default. Leaving the
+        // index behind costs an operator one manual `DROP INDEX`.
+        // Dropping an untagged index on a guess could destroy one of
+        // theirs instead.
         concurrent(
             2,
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvest_we_created_at\n    \
