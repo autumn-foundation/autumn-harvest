@@ -24101,6 +24101,13 @@ struct WorkerMonitoringHandles {
     /// Dedicated per-shard audit-export tasks (issue #1269). One per assigned
     /// shard, mirroring `timeout_checkers`.
     audit_export_checkers: Vec<tokio::task::JoinHandle<()>>,
+    /// `scanner_liveness` registrations for a shard skipped because
+    /// `ShardedDbPool` had no exact pool entry for it (Codex review on PR
+    /// #1520, follow-up P2, seventh round). No task owns these. There is
+    /// nothing to join, but each must still be deregistered at shutdown.
+    /// Otherwise it outlives this worker, reporting a configuration
+    /// failure that no longer exists.
+    orphaned_audit_export_scanners: Vec<crate::scanner_health::ScannerOwner>,
     /// Worker-session local-registry reconcilers (issue #606). Empty when
     /// `db` is disabled.
     session_slot_reconcilers: Vec<tokio::task::JoinHandle<()>>,
@@ -25900,6 +25907,9 @@ impl Worker {
                 tracing::warn!(error = %error, "audit-export checker failed during shutdown");
             }
         }
+        for owner in monitors.orphaned_audit_export_scanners {
+            crate::scanner_health::deregister_scanner(owner);
+        }
         if let Err(error) = monitors.queue_depth_sampler.await {
             tracing::warn!(error = %error, "queue depth sampler failed during shutdown");
         }
@@ -26515,6 +26525,8 @@ impl Worker {
         // delivery (`audit_export::export_once_via_pool`, PR #1520 review).
         // A slow sink no longer blocks the timeout checker for the
         // duration of a delivery either.
+        let mut orphaned_audit_export_scanners: Vec<crate::scanner_health::ScannerOwner> =
+            Vec::new();
         let audit_export_checkers: Vec<_> = shard_pools_for_monitors
             .iter()
             .filter_map(|(shard_pool, shard)| {
@@ -26548,15 +26560,23 @@ impl Worker {
                                 .telemetry()
                                 .metrics
                                 .record_audit_export_observed(shard_u16, false);
-                            // Registered, never deregistered, never ticked. It
-                            // ages straight into `Stale` then `Wedged` on the
-                            // ordinary schedule. `scanner_liveness` needs no
-                            // separate "missing pool" case to surface this.
-                            let _ = crate::scanner_health::register_scanner_for_shard(
-                                self.registry.telemetry().metrics.as_ref(),
-                                crate::scanner_health::Scanner::AuditExport,
-                                self.config.poll_interval,
-                                Some(s),
+                            // Never ticked, so it ages straight into `Stale`
+                            // then `Wedged` on the ordinary schedule --
+                            // `scanner_liveness` needs no separate "missing
+                            // pool" case to surface this. Kept, not dropped,
+                            // so this worker's shutdown can deregister it
+                            // (Codex review on PR #1520, follow-up P2,
+                            // seventh round). Dropped here instead, it would
+                            // outlive this worker. A later, correctly
+                            // configured worker in this process would then
+                            // inherit a phantom failure that is not its own.
+                            orphaned_audit_export_scanners.push(
+                                crate::scanner_health::register_scanner_for_shard(
+                                    self.registry.telemetry().metrics.as_ref(),
+                                    crate::scanner_health::Scanner::AuditExport,
+                                    self.config.poll_interval,
+                                    Some(s),
+                                ),
                             );
                             return None;
                         };
@@ -26818,6 +26838,7 @@ impl Worker {
             poison_pill_reclaimers,
             pause_auto_resumers,
             audit_export_checkers,
+            orphaned_audit_export_scanners,
             session_slot_reconcilers,
             quota_key_reconcilers,
             history_oversized_sampler,
@@ -27540,6 +27561,9 @@ impl Worker {
                     "audit-export checker task failed during shutdown"
                 );
             }
+        }
+        for owner in monitors.orphaned_audit_export_scanners {
+            crate::scanner_health::deregister_scanner(owner);
         }
         if let Err(error) = monitors.queue_depth_sampler.await {
             tracing::warn!(

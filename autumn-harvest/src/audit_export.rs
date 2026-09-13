@@ -2799,6 +2799,14 @@ async fn export_once_via_pool(
             // waiting. `false` is the only honest reading here, not
             // whatever the row happens to show right now.
             metrics.record_audit_export_observed(shard_u16, false);
+            // Discarded, not returned to the pool (Codex review on PR
+            // #1520, follow-up P2, seventh round -- P1). This mirrors the
+            // claim-cancellation fix above. Dropping this future does not
+            // cancel the already-dispatched `UPDATE`. A connection stuck
+            // behind a locked row would otherwise be recycled anyway. Every
+            // later user of a size-one shard pool would then queue behind
+            // that same blocked statement.
+            drop(deadpool::managed::Object::take(conn));
             return Ok(0);
         }
     };
