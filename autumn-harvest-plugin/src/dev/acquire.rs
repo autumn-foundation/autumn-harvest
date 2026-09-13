@@ -314,11 +314,19 @@ mod tests {
 
     /// Issue #1287 regression: the Unix answer must not change. A directory
     /// we own, with default `tempfile` permissions, is still private.
+    ///
+    /// Canonicalised first: the ancestor walk (issue #1292) refuses a
+    /// symlinked ancestor. On macOS `tempfile`'s own base directory
+    /// resolves through one (`/var` -> `/private/var`). That symlink is
+    /// root-owned. No attacker can replace it, so it is not the case
+    /// this test means to pin. Canonicalising resolves it away, leaving
+    /// only real directories in the chain.
     #[cfg(unix)]
     #[test]
     fn an_owner_owned_directory_is_still_private_on_unix() {
         let dir = tempfile::tempdir().expect("temp dir");
-        assert!(directory_is_private(dir.path()));
+        let real_dir = dir.path().canonicalize().expect("canonicalize temp dir");
+        assert!(directory_is_private(&real_dir));
     }
 
     /// Issue #1287 regression: group/other-writable is still rejected on
@@ -379,13 +387,21 @@ mod tests {
         /// Every level gets an explicit `chmod`. `create_dir_all` alone would
         /// leave each level's mode to the process umask, and a permissive
         /// umask would then make this "accepted" fixture fail its own test.
+        ///
+        /// The root is canonicalised before use. On macOS, `tempfile`'s own
+        /// base resolves through a root-owned symlink (`/var` ->
+        /// `/private/var`). No attacker can replace that symlink, but the
+        /// ancestor walk refuses any symlinked ancestor regardless of who
+        /// owns it. Canonicalising leaves only real directories for it to
+        /// walk, so this "accepted" fixture does not fail on that platform.
         fn private_cache_root() -> (tempfile::TempDir, std::path::PathBuf) {
             let root = tempfile::tempdir().expect("temp dir");
-            let a = root.path().join("a");
+            let root_path = root.path().canonicalize().expect("canonicalize temp dir");
+            let a = root_path.join("a");
             let b = a.join("b");
             let cache = b.join("cache");
             fs::create_dir_all(&cache).expect("mkdir cache");
-            for dir in [root.path(), a.as_path(), b.as_path(), cache.as_path()] {
+            for dir in [root_path.as_path(), a.as_path(), b.as_path(), cache.as_path()] {
                 fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod");
             }
             (root, cache)
