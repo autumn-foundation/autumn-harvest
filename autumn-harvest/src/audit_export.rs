@@ -1566,25 +1566,55 @@ pub struct AuditExportShardStatus {
     pub next_attempt_at: DateTime<Utc>,
 }
 
+/// How many of the lowest-sequence pending rows [`export_lag_seconds`] scans
+/// for the true oldest `occurred_at` (issue #1271).
+///
+/// `occurred_at` is transaction start time. A long transaction can commit
+/// after a shorter one that started later. The exporter then sees the long
+/// transaction later and assigns it a higher sequence. Its `occurred_at`
+/// stays older than the short transaction's.
+///
+/// A lookup over only the single lowest-sequence pending row misses this
+/// skew. It reports the short transaction's age instead of the true lag.
+///
+/// This bound trades exactness for a fixed cost. It scans the lowest
+/// [`EXPORT_LAG_LOOKBACK_ROWS`] pending rows and takes their minimum
+/// `occurred_at`. This finds the true oldest row whenever the skew resolves
+/// within that many rows, which covers every ordinary case. The scan cost
+/// never grows with the total backlog.
+pub const EXPORT_LAG_LOOKBACK_ROWS: i64 = 1000;
+
+/// The bounded pending-window scan's single output column.
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct OldestInWindow {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    oldest: Option<DateTime<Utc>>,
+}
+
 /// Age in seconds of the oldest audit record the sink has not acknowledged,
 /// or `0.0` when nothing is pending. This is `harvest.audit.export_lag`.
 ///
-/// Deliberately **two index-servable point lookups** rather than the single
-/// `MIN(occurred_at) WHERE export_seq IS NULL OR export_seq > $1` the admin
-/// view uses (issue #953 review): that disjunction spans both partial indexes
-/// and degenerates into visiting every pending heap tuple. This runs on
-/// **every** scanner tick, and the pending set is largest during exactly the
-/// sink outage when the database is already under stress — so the per-tick
-/// query must not scale with the backlog.
+/// Deliberately **two bounded lookups**, not the single query the admin
+/// view uses: `MIN(occurred_at) WHERE export_seq IS NULL OR export_seq > $1`
+/// (issue #953 review). That disjunction spans both partial indexes. It
+/// degenerates into visiting every pending heap tuple. This runs on every
+/// scanner tick. The pending set grows largest during a sink outage, when
+/// the database is already under stress. So the per-tick query must not
+/// scale with the backlog.
 ///
-/// - Not-yet-sequenced rows: `MIN(occurred_at) WHERE export_seq IS NULL`,
-///   served as an index-min by `harvest_audit_log_unexported_idx`.
-/// - Sequenced-but-unacknowledged rows: the `occurred_at` of the *next*
-///   record the exporter owes the sink, found by `ORDER BY export_seq LIMIT 1`
-///   on `harvest_audit_log_export_seq_idx`. Sequences are assigned in
-///   `(occurred_at, id)` order within a batch, so this is the oldest such
-///   record in every ordinary case, and it is the operationally meaningful
-///   one — "how old is the next thing we owe the sink?" — in any case.
+/// - Not-yet-sequenced rows: `MIN(occurred_at) WHERE export_seq IS NULL`.
+///   An index-min on `harvest_audit_log_unexported_idx` serves this.
+/// - Sequenced-but-unacknowledged rows: `MIN(occurred_at)` over the lowest
+///   [`EXPORT_LAG_LOOKBACK_ROWS`] pending sequences (issue #1271). The
+///   covering index `harvest_audit_log_export_seq_idx` on
+///   `(export_seq, occurred_at)` serves this without a heap fetch, on a
+///   page whose visibility map bit is already set. An unvacuumed page
+///   still costs one fetch. Sequences are assigned in `(occurred_at, id)` order
+///   within one exporter tick. So skew between sequence and `occurred_at`
+///   comes only from a row a later tick sequenced, while an earlier tick's
+///   row stayed invisible. See [`EXPORT_LAG_LOOKBACK_ROWS`] for the
+///   accepted bound.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
@@ -1607,16 +1637,24 @@ pub async fn export_lag_seconds(
         .await
         .map_err(crate::error::database_error)?;
 
-    let next_owed: Option<DateTime<Utc>> = log::harvest_audit_log
-        .filter(log::export_seq.gt(last_acked_seq))
-        .select(log::occurred_at)
-        .order(log::export_seq.asc())
-        .first::<DateTime<Utc>>(conn)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)?;
+    // The oldest `occurred_at` among the lowest `EXPORT_LAG_LOOKBACK_ROWS`
+    // pending sequences, not merely the single lowest one. See the module
+    // doc above and issue #1271.
+    let window: OldestInWindow = diesel::sql_query(
+        "SELECT MIN(occurred_at) AS oldest FROM ( \
+             SELECT occurred_at FROM harvest_audit_log \
+             WHERE export_seq > $1 \
+             ORDER BY export_seq ASC \
+             LIMIT $2 \
+         ) AS pending_window",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(last_acked_seq)
+    .bind::<diesel::sql_types::BigInt, _>(EXPORT_LAG_LOOKBACK_ROWS)
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
 
-    let oldest = match (unsequenced, next_owed) {
+    let oldest = match (unsequenced, window.oldest) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (Some(a), None) | (None, Some(a)) => Some(a),
         (None, None) => None,
