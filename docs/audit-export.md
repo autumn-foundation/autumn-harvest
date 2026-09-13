@@ -25,9 +25,9 @@ per-shard cursor that advances only on acknowledgement.
   maintenance cost. That cost is bounded only while retention actually
   reclaims unexported rows. See "Retention interaction" below for the exact
   conditions, which are more than one config flag. Tracked as issue #1272.
-  Even then the bound is not total. Every decommission or reactivation
-  request, no-op or repeated, adds one more record per shard. That record
-  stays in the index forever by design.
+  Even then the bound is not total. Retention can never purge a
+  decommission or reactivation record, exported or not. That holds no
+  matter how many requests a shard has seen.
 - **It never touches workflow history.** No new `WorkflowEvent` variant, no
   replay-determinism impact. Audit rows are operational metadata; the exporter
   only reads them.

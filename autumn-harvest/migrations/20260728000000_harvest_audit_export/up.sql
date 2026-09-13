@@ -19,9 +19,9 @@
 -- conditions, which are more than one config flag. Tracked as
 -- autumn-foundation/autumn-harvest#1272, which weighs creating the index
 -- lazily on first opt-in against leaving it here. Even then the bound is
--- not total. Every decommission or reactivation request, no-op or
--- repeated, adds one more record per shard. That record stays in the
--- index forever by design.
+-- not total. Retention can never purge a decommission or reactivation
+-- record, exported or not. That holds no matter how many requests a
+-- shard has seen.
 
 -- ── The per-shard monotonic sequence (AC4) ────────────────────────────────
 --

@@ -304,6 +304,22 @@ fn boundedness_claim_points_at_retention_interaction() {
              \"every ... request ... adds one more record\" instead",
             path.display()
         );
+        assert!(
+            !contains_collapsed(&text, "stays in the index forever"),
+            "{}: claim_shard does not exempt these operations — a shard \
+             whose exporter later runs can still claim and sequence a \
+             decommission/reactivate record, removing it from the \
+             unexported index. Claim only that retention can never purge \
+             it, exported or not",
+            path.display()
+        );
+        assert!(
+            contains_collapsed(&text, "exported or not"),
+            "{}: the decommission/reactivate exemption is from purge, not \
+             from ever being exported — say \"exported or not\" so the \
+             claim does not imply permanent index membership",
+            path.display()
+        );
     }
 
     let doc = read_normalized(&repo_root().join("docs/audit-export.md"));
