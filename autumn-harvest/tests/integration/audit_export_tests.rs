@@ -180,12 +180,13 @@ impl AuditSink for RecordingSink {
 }
 
 /// Records `harvest.audit.export_lag` / `harvest.audit.export_observed` /
-/// `harvest.audit.exported` samples.
+/// `harvest.audit.exported` samples, plus `harvest.scanner.tick` labels.
 #[derive(Default)]
 struct RecordingMetrics {
     lag: Mutex<Vec<(u16, f64)>>,
     observed: Mutex<Vec<(u16, bool)>>,
     exported: Mutex<Vec<(u16, u64)>>,
+    ticks: Mutex<Vec<String>>,
 }
 
 impl MetricsRecorder for RecordingMetrics {
@@ -203,6 +204,29 @@ impl MetricsRecorder for RecordingMetrics {
             .lock()
             .expect("exported lock")
             .push((shard, count));
+    }
+    fn record_scanner_tick(&self, scanner: &str, shard: &str) {
+        let _ = shard;
+        self.ticks
+            .lock()
+            .expect("ticks lock")
+            .push(scanner.to_owned());
+    }
+}
+
+/// A sink that blocks until released. A test can hold a delivery open for as
+/// long as it needs, to observe what happens while it is in flight.
+struct SlowSink {
+    release: Arc<tokio::sync::Notify>,
+    status: u16,
+}
+
+impl AuditSink for SlowSink {
+    fn deliver<'a>(&'a self, _batch: &'a AuditBatch<'a>) -> SinkFuture<'a> {
+        Box::pin(async move {
+            self.release.notified().await;
+            SinkAttempt::success(self.status)
+        })
     }
 }
 
@@ -2769,6 +2793,106 @@ async fn a_dedicated_export_task_still_exports_on_a_size_one_pool_shared_with_th
     }
     assert_eq!(sink.all_seqs(), vec![1, 2, 3]);
 
+    cancel.cancel();
+    let _ = checker_handle.await;
+    let _ = export_handle.await;
+    uninstall();
+}
+
+/// The exact hazard PR #1520's own review raised on this issue's fix. A
+/// slow, still-in-flight delivery must never occupy a `max_size(1)` shard
+/// pool's only connection. If it did, the timeout checker sharing that pool
+/// could not tick even once until the delivery finished.
+///
+/// Proven with a sink that blocks until released. While it is blocked, the
+/// export task must hold NO connection at all. The checker keeps ticking on
+/// the pool's one connection the whole time.
+#[tokio::test]
+async fn an_in_flight_slow_delivery_never_blocks_the_timeout_checker_on_a_size_one_pool() {
+    let _guard = TEST_SERIAL.lock().await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let sink: Arc<dyn AuditSink> = Arc::new(SlowSink {
+        release: Arc::clone(&release),
+        status: 200,
+    });
+    {
+        // A long lease: this test holds the delivery open on purpose, and
+        // the lease must not classify that as a timeout while we do.
+        let mut lock = GLOBAL_AUDIT_EXPORT_CONFIG
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *lock = Some(Arc::new(AuditExportRuntimeConfig {
+            sink,
+            secret: CallbackSecret::new(b"test-secret".to_vec()),
+            batch_size: 100,
+            backoff: ExportBackoff::default(),
+            lease: std::time::Duration::from_secs(300),
+        }));
+    }
+    let (mut conn, container) = make_conn().await;
+    insert_audit_rows(&mut conn, 1).await;
+
+    let pool = single_connection_pool(&container).await;
+    let metrics = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(autumn_harvest::telemetry::TelemetryConfig {
+        metrics: metrics.clone(),
+        ..Default::default()
+    });
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    let checker_handle = autumn_harvest::timeout::spawn_timeout_checker_for_shard(
+        pool.clone(),
+        cancel.clone(),
+        std::time::Duration::from_millis(15),
+        telemetry.clone(),
+        std::time::Duration::from_secs(5),
+        None,
+        vec![],
+        Arc::new(autumn_harvest::circuit_breaker::CircuitBreakerRegistry::default()),
+        None,
+        60,
+        Some(autumn_harvest::types::ShardId::new(0)),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
+    );
+    let export_handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(20),
+        telemetry,
+        Some(autumn_harvest::types::ShardId::new(0)),
+        None,
+    );
+
+    // Give the export task time to claim the row and enter its delivery
+    // call, which is now blocked on `release`.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // While the delivery is still blocked, the checker must keep ticking --
+    // proof it can still acquire the pool's one connection.
+    let before = metrics
+        .ticks
+        .lock()
+        .expect("ticks")
+        .iter()
+        .filter(|t| *t == "timeout")
+        .count();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let after = metrics
+        .ticks
+        .lock()
+        .expect("ticks")
+        .iter()
+        .filter(|t| *t == "timeout")
+        .count();
+    assert!(
+        after > before,
+        "the timeout checker must keep ticking while a slow delivery is in \
+         flight on a size-one pool, proving the export task released the \
+         connection before the network call; got before={before} after={after}"
+    );
+
+    release.notify_one();
     cancel.cancel();
     let _ = checker_handle.await;
     let _ = export_handle.await;

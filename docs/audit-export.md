@@ -230,11 +230,15 @@ The exporter runs on its own dedicated task, one per assigned shard
 `enforce_timeouts_once`'s cadence and connection, so a slow sink delayed
 every other resident of that loop, and a one-connection shard pool could
 never export at all: the export call needed a second connection from the
-pool while the checker already held the first. Splitting it out ends that
-permanent deadlock — the two tasks take turns on the pool instead. A slow
-sink can still make the timeout checker wait its turn on a one-connection
-pool for as long as the delivery attempt runs, but that resolves itself the
-moment the attempt ends, which the old failure never did.
+pool while the checker already held the first.
+
+Splitting it out ends that permanent deadlock, and the task's own
+connection handling (`export_once_via_pool`) closes the follow-on gap a
+later review round found: it checks a connection out for the claim, releases
+it, delivers with no connection held at all, then checks one out again for
+the acknowledgement. A slow or hung sink therefore never occupies a
+one-connection shard pool during delivery, so it cannot delay the timeout
+checker either.
 
 ### Retention interaction
 

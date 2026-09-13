@@ -2182,24 +2182,223 @@ pub async fn fire_due_audit_exports(
 // M8: a dedicated per-shard export task (issue #1269)
 // ---------------------------------------------------------------------
 
-/// Run one shard's audit-export tick.
+/// Acquire one shard's connection, bounded, for the dedicated export task.
 ///
-/// Reads the process-wide config. Returns `Ok(0)` before any query when no
-/// sink is configured (AC8). Otherwise claims and delivers one due batch.
+/// A connection-acquisition failure or timeout is logged and marks the
+/// shard unobserved, then returns `None`. It is not a database error, so
+/// the caller never turns it into an `Err`.
+#[cfg(feature = "db")]
+async fn acquire_shard_conn_for_export(
+    pool: &crate::worker::DbPool,
+    shard_id: i32,
+    shard_u16: u16,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+) -> Option<
+    deadpool::managed::Object<
+        diesel_async::pooled_connection::AsyncDieselConnectionManager<
+            diesel_async::AsyncPgConnection,
+        >,
+    >,
+> {
+    // Bounded, never a bare `pool.get()` — see `SHARD_ACQUIRE_BOUND`.
+    match tokio::time::timeout(SHARD_ACQUIRE_BOUND, pool.get()).await {
+        Ok(Ok(conn)) => Some(conn),
+        Ok(Err(error)) => {
+            tracing::error!(
+                shard = shard_id,
+                error = %error,
+                "[audit_export] failed to acquire a connection for the export tick"
+            );
+            metrics.record_audit_export_observed(shard_u16, false);
+            None
+        }
+        Err(_elapsed) => {
+            tracing::error!(
+                shard = shard_id,
+                bound = ?SHARD_ACQUIRE_BOUND,
+                "[audit_export] timed out acquiring a connection for the export tick; \
+                 skipping it for one cycle"
+            );
+            metrics.record_audit_export_observed(shard_u16, false);
+            None
+        }
+    }
+}
+
+/// Export one shard's due batch, acquiring connections from `pool` rather
+/// than holding one across the whole call.
+///
+/// [`export_once_on_conn`] holds its caller's connection from the claim
+/// through the acknowledgement, network delivery included. That is fine
+/// when the caller already owns the connection for other reasons — an
+/// embedder driving [`fire_due_audit_exports`] by hand.
+///
+/// It is wrong for [`spawn_audit_export_checker_for_shard`]'s own dedicated
+/// task (Codex review on PR #1520 P1). On a `max_size(1)` shard pool,
+/// holding the connection for the whole delivery would block every other
+/// user of that pool. The timeout checker is one of them, for up to the
+/// claim lease. That is exactly the coupling issue #1269 exists to remove.
+///
+/// This checks a connection out for the claim transaction, then releases it
+/// before the network call. It checks one out again — not necessarily the
+/// same physical connection — for the acknowledgement transaction. No
+/// connection is held during delivery at all.
+///
+/// Returns `Ok(0)` before any query when no sink is configured (AC8).
 ///
 /// # Errors
-/// Returns `HarvestError` on a database failure. A sink transport failure is
-/// never an `Err` here — see [`fire_due_audit_exports`].
+/// Returns `HarvestError` on a genuine database failure inside a claimed
+/// transaction. A sink transport failure, and a connection-acquisition
+/// failure, are never an `Err` here — see [`fire_due_audit_exports`].
 #[cfg(feature = "db")]
-pub async fn export_due_audit_batch(
-    conn: &mut diesel_async::AsyncPgConnection,
+#[allow(clippy::too_many_lines)] // claim + release + deliver + reacquire + apply is one unit
+async fn export_once_via_pool(
+    pool: &crate::worker::DbPool,
     shard_id: i32,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> crate::error::HarvestResult<usize> {
-    let Some(config) = read_global_audit_export_config() else {
+    let Some(config_arc) = read_global_audit_export_config() else {
         return Ok(0);
     };
-    export_once_on_conn(conn, &config, shard_id, metrics).await
+    let config = config_arc.as_ref();
+    let shard_u16 = u16::try_from(shard_id).unwrap_or(u16::MAX);
+
+    let Some(mut conn) = acquire_shard_conn_for_export(pool, shard_id, shard_u16, metrics).await
+    else {
+        return Ok(0);
+    };
+    ensure_cursor_row(&mut conn, shard_id).await?;
+    let now = Utc::now();
+    let Some(claim) =
+        claim_shard(&mut conn, shard_id, config.batch_size, config.lease, now).await?
+    else {
+        // Nothing claimed, but the lag gauge must still be emitted (issue
+        // #1268). An operator's "is export keeping up?" signal has to stay
+        // live exactly when deliveries are NOT happening.
+        emit_lag_and_observed(&mut conn, shard_id, metrics).await;
+        return Ok(0);
+    };
+    // Released before any network I/O -- the whole point of this function.
+    drop(conn);
+
+    let first_seq = claim.records.first().map_or(0, |r| r.seq);
+    let last_seq = claim.records.last().map_or(0, |r| r.seq);
+
+    let body = match serialize_batch(&claim.records) {
+        Ok(body) => body,
+        Err(error) => {
+            // Cannot serialize what we claimed. Hold the cursor AND write a
+            // real backoff, mirroring `export_once_on_conn`'s own handling
+            // of this case.
+            tracing::error!(
+                shard = shard_id,
+                error = %error,
+                "failed to serialize an audit export batch; holding the cursor"
+            );
+            let now = Utc::now();
+            let outcome = classify_export_outcome(
+                &SinkAttempt::transport_error(format!("batch serialization failed: {error}")),
+                last_seq,
+                claim.consecutive_failures,
+                &config.backoff,
+                now,
+            );
+            let Some(mut conn) =
+                acquire_shard_conn_for_export(pool, shard_id, shard_u16, metrics).await
+            else {
+                return Ok(0);
+            };
+            apply_outcome(&mut conn, shard_id, claim.claim_epoch, &outcome, now).await?;
+            emit_lag_and_observed(&mut conn, shard_id, metrics).await;
+            return Ok(0);
+        }
+    };
+
+    let delivered_at = Utc::now();
+    let headers = export_headers(
+        &config.secret,
+        &body,
+        shard_id,
+        first_seq,
+        last_seq,
+        delivered_at,
+    );
+    let batch = AuditBatch {
+        shard: shard_id,
+        first_seq,
+        last_seq,
+        records: &claim.records,
+        body: &body,
+        headers: &headers,
+    };
+
+    // No connection held during this await. A timeout is classified exactly
+    // like any other transport failure: the cursor is held and the batch is
+    // retried. Never a loss.
+    let attempt = deliver_within_lease(config, &batch, claim.lease_until).await;
+    let attempt = fence_against_sink_swap(
+        attempt,
+        &config_arc,
+        read_global_audit_export_config().as_ref(),
+    );
+    let outcome = classify_export_outcome(
+        &attempt,
+        last_seq,
+        claim.consecutive_failures,
+        &config.backoff,
+        Utc::now(),
+    );
+
+    let Some(mut conn) = acquire_shard_conn_for_export(pool, shard_id, shard_u16, metrics).await
+    else {
+        // The batch was delivered (or the attempt failed) but the outcome
+        // cannot be recorded this tick. At-least-once: the next tick that
+        // can reach this shard re-claims and re-attempts, so nothing is
+        // silently lost either way.
+        return Ok(0);
+    };
+    let applied =
+        apply_outcome(&mut conn, shard_id, claim.claim_epoch, &outcome, Utc::now()).await?;
+
+    let delivered = match &outcome {
+        ExportOutcome::Advance { .. } if applied => {
+            let count = claim.records.len();
+            metrics.record_audit_exported(shard_u16, count as u64);
+            count
+        }
+        ExportOutcome::Advance { .. } => {
+            // The guarded write did not apply: this attempt's lease expired
+            // and a fresher claim owns the shard, or a redrive bumped the
+            // epoch. The batch was delivered (the receiver dedupes on
+            // `(shard, seq)`) but this attempt must not move the cursor.
+            tracing::warn!(
+                shard = shard_id,
+                claim_epoch = claim.claim_epoch,
+                "audit export batch was acknowledged by the sink but its claim had \
+                 already been superseded; the cursor was not advanced and the batch \
+                 will be re-delivered (at-least-once)"
+            );
+            0
+        }
+        ExportOutcome::Backoff {
+            last_status,
+            last_error,
+            consecutive_failures,
+            ..
+        } => {
+            tracing::warn!(
+                shard = shard_id,
+                status = ?last_status,
+                error = ?last_error,
+                consecutive_failures,
+                "audit export delivery failed; cursor held at its current position"
+            );
+            0
+        }
+    };
+
+    emit_lag_and_observed(&mut conn, shard_id, metrics).await;
+    Ok(delivered)
 }
 
 /// Spawn a dedicated background task that exports one shard's due audit
@@ -2214,24 +2413,28 @@ pub async fn export_due_audit_batch(
 /// competed with the checker's already-held connection. It could never
 /// succeed.
 ///
-/// This task owns its connection lifecycle end to end. It never runs nested
-/// inside another resident's checkout. That nesting is what made the old
-/// failure permanent: the checker always held the pool's only connection
-/// when it tried to claim a second one. Every single tick failed the same
-/// way, forever.
+/// This task owns its connection lifecycle end to end, through
+/// [`export_once_via_pool`]. It never runs nested inside another resident's
+/// checkout. That nesting is what made the old failure permanent: the
+/// checker always held the pool's only connection when it tried to claim a
+/// second one. Every single tick failed the same way, forever.
 ///
-/// A `max_size(1)` shard pool now works, in the sense that matters: this
-/// task and the timeout checker take the one connection in turn. Neither
-/// one needs a second connection while holding the first, so export is no
-/// longer permanently wedged. A slow delivery still holds this task's own
-/// connection for up to the claim lease. On a `max_size(1)` pool the
-/// checker's own tick can be skipped for that same window, but only for
-/// that window. It self-heals the moment the delivery attempt ends. The
-/// old bug never did.
+/// A `max_size(1)` shard pool now works, in the sense that matters. This
+/// task never holds a connection across a network call. It never blocks
+/// the timeout checker, or anything else sharing the pool, for the
+/// duration of a delivery. Export is no longer permanently wedged, and a
+/// slow sink no longer starves its neighbors on a one-connection pool
+/// either.
 ///
 /// Registers under [`crate::scanner_health::Scanner::AuditExport`], so a
 /// wedged export task is visible to `scanner_liveness`, exactly like the
 /// timeout checker and the poison-pill reclaimer.
+///
+/// The registered interval accounts for the configured export lease, not
+/// just the poll interval (Codex review on PR #1520 P2). A single tick can
+/// legitimately run as long as the lease allows. A bare poll-interval
+/// threshold would flag a healthy, still-within-lease delivery as `Stale`
+/// or `Wedged`.
 ///
 /// Pass `shard` to attribute this instance to one shard in the liveness
 /// snapshot, mirroring
@@ -2249,12 +2452,16 @@ pub fn spawn_audit_export_checker_for_shard(
     shard: Option<crate::types::ShardId>,
     sharded_pool: Option<&crate::shard::ShardedDbPool>,
 ) -> tokio::task::JoinHandle<()> {
+    // See this function's doc comment: the registered threshold must cover
+    // the worst legitimate tick, not just the poll cadence.
+    let registered_interval =
+        read_global_audit_export_config().map_or(interval, |config| interval.max(config.lease));
     // Issue #797: declare the loop before its first iteration so the
     // `scanner_liveness` check expects it and grants it boot grace.
     let owner = crate::scanner_health::register_scanner_for_shard(
         &*telemetry.metrics,
         crate::scanner_health::Scanner::AuditExport,
-        interval,
+        registered_interval,
         shard,
     );
     let shard_id = shard.map_or_else(
@@ -2269,47 +2476,15 @@ pub fn spawn_audit_export_checker_for_shard(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            // A cheap config check before spending a connection checkout: an
-            // unconfigured deployment must still pay nothing per tick (AC8).
-            if is_configured() {
-                // Bounded, never a bare `pool.get()` — see `SHARD_ACQUIRE_BOUND`.
-                match tokio::time::timeout(SHARD_ACQUIRE_BOUND, pool.get()).await {
-                    Ok(Ok(mut conn)) => {
-                        if let Err(error) =
-                            export_due_audit_batch(&mut conn, shard_id, &*telemetry.metrics).await
-                        {
-                            tracing::error!(
-                                shard = shard_id,
-                                error = %error,
-                                "[audit_export] scheduled export tick failed"
-                            );
-                            telemetry
-                                .metrics
-                                .record_audit_export_observed(shard_u16, false);
-                        }
-                    }
-                    Ok(Err(error)) => {
-                        tracing::error!(
-                            shard = shard_id,
-                            error = %error,
-                            "[audit_export] failed to acquire a connection for the export tick"
-                        );
-                        telemetry
-                            .metrics
-                            .record_audit_export_observed(shard_u16, false);
-                    }
-                    Err(_elapsed) => {
-                        tracing::error!(
-                            shard = shard_id,
-                            bound = ?SHARD_ACQUIRE_BOUND,
-                            "[audit_export] timed out acquiring a connection for the export \
-                             tick; skipping it for one cycle"
-                        );
-                        telemetry
-                            .metrics
-                            .record_audit_export_observed(shard_u16, false);
-                    }
-                }
+            if let Err(error) = export_once_via_pool(&pool, shard_id, &*telemetry.metrics).await {
+                tracing::error!(
+                    shard = shard_id,
+                    error = %error,
+                    "[audit_export] scheduled export tick failed"
+                );
+                telemetry
+                    .metrics
+                    .record_audit_export_observed(shard_u16, false);
             }
 
             // Issue #797: unconditional end-of-iteration liveness tick, same

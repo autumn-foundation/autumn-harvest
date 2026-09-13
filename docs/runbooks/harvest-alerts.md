@@ -3109,13 +3109,12 @@ because the exporter cannot currently reach this shard to advance it.
    shard unreachable here is usually unreachable for claim/timeout
    processing too.
 4. Check the shard's connection pool size. The export task and the timeout
-   checker each take a connection in turn, so a `max_size` of `1` no longer
-   deadlocks permanently. A slow sink still holds the export task's
-   connection for up to the claim lease, though, so on a `max_size` of `1`
-   the checker's own ticks can be delayed for that same window; this
-   self-heals once the delivery attempt ends. Either task can still exceed
-   `SHARD_ACQUIRE_BOUND` (in `audit_export.rs`) and skip a tick if
-   contention is sustained.
+   checker each take a connection in turn, and the export task never holds
+   its connection across the sink call (`export_once_via_pool`), so a
+   `max_size` of `1` neither deadlocks permanently nor blocks the checker
+   for the duration of a slow delivery. Either task can still exceed
+   `SHARD_ACQUIRE_BOUND` (in `audit_export.rs`) and skip a tick under
+   sustained contention.
 
 ### Likely causes
 

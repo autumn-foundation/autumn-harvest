@@ -18,14 +18,22 @@ pipeline itself, so the fix is architectural: give export its own task.
   interval, registered under the new `Scanner::AuditExport` liveness label.
   It owns its connection lifecycle end to end — never nested inside
   another resident's checkout, which is what made the old failure
-  permanent (every tick failed the same way, forever). A one-connection
-  shard pool now works, in the sense that matters: the export task and the
-  timeout checker take turns on the pool instead of one needing a second
-  connection while holding the first, so export is no longer permanently
-  wedged. A slow delivery can still make the two tasks take turns for as
-  long as it runs, but that self-heals the moment the delivery attempt
-  ends. A cheap `is_configured()` check skips the connection checkout
-  entirely on an unconfigured deployment (AC8).
+  permanent (every tick failed the same way, forever). A cheap
+  `is_configured()` check skips the connection checkout entirely on an
+  unconfigured deployment (AC8).
+- **`export_once_via_pool`**: the task's own tick never holds a pooled
+  connection across the network delivery (Codex review on this PR, P1). It
+  checks a connection out for the claim transaction, releases it before the
+  sink call, then checks one out again for the acknowledgement. A slow or
+  hung sink therefore cannot occupy a `max_size(1)` shard pool during
+  delivery and block the timeout checker, which a naive "just split the
+  task" fix would still have allowed.
+- **Liveness registration accounts for the export lease, not just the poll
+  interval** (Codex review on this PR, P2): a single tick can legitimately
+  run as long as the configured lease allows, which can far exceed the
+  worker's poll interval, so `scanner_liveness` registers with
+  `poll_interval.max(lease)` to avoid flagging a healthy, still-within-lease
+  delivery as `Stale` or `Wedged`.
 - **`enforce_timeouts_once` no longer calls `fire_due_audit_exports`.** The
   function, its claim/deliver/ack pipeline, and its `pub` primitive shape
   are unchanged — an embedder driving it by hand still works exactly as

@@ -26510,11 +26510,11 @@ impl Worker {
         // One dedicated audit-export task per assigned shard (issue #1269).
         // `enforce_timeouts_once` used to drive `fire_due_audit_exports`
         // inline on this same cadence. Splitting it out ends the permanent
-        // self-deadlock a one-connection shard pool used to hit. The checker
-        // no longer holds a connection while the export call asks the same
-        // pool for a second one. A slow delivery can still make the two
-        // tasks take turns for as long as it runs. It self-heals once the
-        // delivery attempt ends, which the old bug never did.
+        // self-deadlock a one-connection shard pool used to hit. The task
+        // also never holds its pooled connection across the network
+        // delivery (`audit_export::export_once_via_pool`, PR #1520 review).
+        // A slow sink no longer blocks the timeout checker for the
+        // duration of a delivery either.
         let audit_export_checkers: Vec<_> = shard_pools_for_monitors
             .iter()
             .filter_map(|(shard_pool, shard)| {
