@@ -3393,6 +3393,65 @@ fn the_inert_migration_builds_no_index_on_the_executions_table() {
     );
 }
 
+#[test]
+fn the_down_migration_does_not_drop_an_index_it_never_created() {
+    // Issue #1270 item 13: `down.sql` used to run
+    // `DROP INDEX IF EXISTS idx_harvest_we_created_at` unconditionally.
+    // `up.sql` never creates that index. `harvest partition enable` (and
+    // `plan`) does, as part of opting in. Consider an operator who had
+    // created an index of that name themselves, before ever opting in.
+    // `harvest_workflow_executions (created_at)` is an ordinary index to
+    // want. Rolling back an otherwise inert migration would delete it.
+    let down = include_str!("../../migrations/20260901115500_harvest_event_partitioning/down.sql");
+    let statements: String = down
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !statements.contains("idx_harvest_we_created_at"),
+        "rollback of this migration must be as inert as its forward \
+         direction: it must not remove an index it never built"
+    );
+}
+
+#[tokio::test]
+async fn disabling_removes_the_index_enabling_created() {
+    // The other half of the item 13 fix. `harvest partition enable` (and
+    // `plan`) creates `idx_harvest_we_created_at` as part of opting in.
+    // `harvest partition disable` -- the reverse operation -- is the path
+    // that removes it again, symmetrically. `down.sql` deliberately no
+    // longer touches it (see the previous test).
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT to_regclass('idx_harvest_we_created_at') IS NOT NULL AS v"
+        )
+        .await,
+        "precondition: enable created the index"
+    );
+
+    partition::disable_partitioning(&mut conn)
+        .await
+        .expect("disable")
+        .expect("the shard was partitioned, so disable must report a revert");
+
+    assert!(
+        !scalar_bool(
+            &mut conn,
+            "SELECT to_regclass('idx_harvest_we_created_at') IS NOT NULL AS v"
+        )
+        .await,
+        "disable must remove the index enable created"
+    );
+}
+
 #[tokio::test]
 async fn enabling_creates_the_drop_gate_index_the_migration_no_longer_ships() {
     let (url, _c) = setup_db().await;

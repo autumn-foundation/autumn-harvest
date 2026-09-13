@@ -2123,6 +2123,14 @@ pub async fn disable_partitioning(
             )
             .await?;
             exec(conn, "DROP TABLE harvest_events_partitioned CASCADE").await?;
+            // Issue #1270 item 13: `harvest partition enable` (and `plan`)
+            // creates this index as part of opting in. The migration itself
+            // is inert and never builds it, precisely so a deployment that
+            // never opts in never pays for it. `disable` is the reverse of
+            // `enable`, so it is the path that removes it again,
+            // symmetrically. The FK restored above makes the partitioned
+            // drop gate's index moot on the flat layout anyway.
+            exec(conn, "DROP INDEX IF EXISTS idx_harvest_we_created_at").await?;
             Ok(DisableReport {
                 orphans_removed: orphans,
                 duplicates_removed: duplicates,
