@@ -781,19 +781,22 @@ mod tests {
 
     #[test]
     fn cutover_example_from_getting_started_ch13_type_checks() {
-        // PR #1523: five rounds of review found the shell guard's
-        // pattern-matched approximation of "does this closure type-check"
-        // (arity, parameter types, return type, tail-position) kept
-        // acquiring new gaps as fast as they were patched, because a
-        // markdown fence is not compiled anywhere else. The actual fix is
-        // to compile it. The block between the markers below must stay
-        // byte-identical (this function's indentation aside) to the
-        // "Cutting a binding over to a new cluster or a recreated topic"
-        // example in docs/getting-started/13-broker-connectors.md --
-        // checked for drift by
-        // scripts/check-broker-connector-cutover-example.sh -- so a real
-        // compile of this test (CI's `connector` lib-test job) is what
-        // enforces the doc's correctness, not a regex.
+        // PR #1523: five review rounds found gaps in the shell guard.
+        // The guard pattern-matched a closure's type signature: arity,
+        // parameter types, return type, tail position. A markdown fence
+        // compiles nowhere else, so each patch closed one gap and left
+        // another open. The fix is to compile the example instead.
+        //
+        // The block between the markers below must stay byte-identical to
+        // the cutover example in docs/getting-started/13-broker-connectors.md.
+        // That example lives in the "Cutting a binding over to a new
+        // cluster or a recreated topic" section. Ignore this function's
+        // own indentation when comparing the two.
+        //
+        // scripts/check-broker-connector-cutover-example.sh checks for
+        // drift between the doc and this test. A real compile of this
+        // test enforces the doc's correctness. CI's `connector` lib-test
+        // job runs it on every change. No regex offers the same guarantee.
         #[derive(serde::Deserialize, serde::Serialize)]
         struct OrderPlaced {
             order_id: String,
