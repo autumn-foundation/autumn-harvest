@@ -1229,17 +1229,18 @@ async fn refuse_if_unique_index_without_cohort(conn: &mut AsyncPgConnection) -> 
     )))
 }
 
-/// Views that depend on `harvest_events`.
+/// Views, including materialized views, that depend on `harvest_events`.
 ///
 /// **Why this blocks the conversion.** Postgres records a view's dependency
-/// by relation OID, not by name. Both conversion directions rename
-/// `harvest_events` out of the way, then create the replacement under the
-/// original name. A dependent view keeps pointing at the RENAMED relation.
-/// On the populated path, that relation is thereafter only the pre-cutover
-/// partition. The view keeps returning rows. It silently stops returning
-/// any row appended after the conversion. On the empty-table path the
-/// rename target is dropped outright. The dependency makes that `DROP`
-/// fail instead — safer, but still not loud about the cause.
+/// by relation OID, not by name — a materialized view the same way as an
+/// ordinary one. Both conversion directions rename `harvest_events` out of
+/// the way, then create the replacement under the original name. A
+/// dependent view keeps pointing at the RENAMED relation. On the populated
+/// path, that relation is thereafter only the pre-cutover partition. The
+/// view keeps returning rows. It silently stops returning any row appended
+/// after the conversion. On the empty-table path the rename target is
+/// dropped outright. The dependency makes that `DROP` fail instead —
+/// safer, but still not loud about the cause.
 ///
 /// # Errors
 ///
@@ -1255,7 +1256,7 @@ pub async fn dependent_views(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<
            JOIN pg_class t ON t.oid = d.refobjid
            JOIN pg_namespace t_ns ON t_ns.oid = t.relnamespace
           WHERE t.relname = 'harvest_events' AND t_ns.nspname = current_schema()
-            AND v.relkind = 'v'
+            AND v.relkind IN ('v', 'm')
           ORDER BY 1",
     )
     .load::<TextRow>(conn)
@@ -3614,7 +3615,7 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
              JOIN pg_class t ON t.oid = d.refobjid\n      \
              JOIN pg_namespace t_ns ON t_ns.oid = t.relnamespace\n     \
              WHERE t.relname = 'harvest_events' AND t_ns.nspname = current_schema()\n       \
-             AND v.relkind = 'v';\n    \
+             AND v.relkind IN ('v', 'm');\n    \
              IF bad IS NOT NULL THEN\n        \
              RAISE EXCEPTION 'harvest #958: view(s) depend on harvest_events (%). Postgres \
              tracks a view''s dependency by relation OID, not by name, and phase 4 renames \

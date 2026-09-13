@@ -693,6 +693,97 @@ async fn a_dependent_view_refuses_the_revert_too() {
 }
 
 #[tokio::test]
+async fn a_dependent_materialized_view_refuses_the_conversion_too() {
+    // Review finding on item 14: Postgres records a materialized view's
+    // dependency the same way as an ordinary view, by relation OID
+    // (`pg_depend`/`pg_rewrite`, `relkind = 'm'`). The guard checked only
+    // `relkind = 'v'`, so a materialized view was never caught and would
+    // silently stop reflecting new events after conversion.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP MATERIALIZED VIEW IF EXISTS harvest_events_matview_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray materialized view from a previous run");
+    diesel::sql_query(
+        "CREATE MATERIALIZED VIEW harvest_events_matview_958 AS \
+         SELECT event_type FROM harvest_events",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a dependent materialized view");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "a dependent materialized view must refuse the conversion, not \
+             silently go stale after it",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_matview_958"),
+        "the refusal must name the offending materialized view; got {msg}"
+    );
+
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP MATERIALIZED VIEW harvest_events_matview_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending materialized view");
+}
+
+#[tokio::test]
+async fn the_large_table_plans_phase_1_also_refuses_a_dependent_materialized_view() {
+    // Same guard, the scripted path. Its phase-1 `DO` block had the
+    // identical `relkind = 'v'` gap.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP MATERIALIZED VIEW IF EXISTS harvest_events_plan_matview_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray materialized view from a previous run");
+    diesel::sql_query(
+        "CREATE MATERIALIZED VIEW harvest_events_plan_matview_958 AS \
+         SELECT event_type FROM harvest_events",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a dependent materialized view");
+
+    let mut refused = false;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 1)
+    {
+        if diesel::sql_query(&step.sql)
+            .execute(&mut conn)
+            .await
+            .is_err()
+        {
+            refused = true;
+        }
+    }
+    assert!(
+        refused,
+        "phase 1 of the plan must refuse a materialized view that depends on harvest_events"
+    );
+
+    diesel::sql_query("DROP MATERIALIZED VIEW harvest_events_plan_matview_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending materialized view");
+}
+
+#[tokio::test]
 async fn list_partitions_parses_bounds_under_a_non_iso_datestyle() {
     // Issue #1270 item 15: `pg_get_expr(relpartbound, ...)` renders a
     // partition's timestamp bounds in the SESSION's `DateStyle`, not a
