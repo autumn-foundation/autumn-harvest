@@ -49,7 +49,7 @@ fn shard_db_name(cluster: &db::ShardCluster) -> String {
 /// Wait until the server has actually noticed a dropped connection is gone.
 ///
 /// Dropping a Rust-side `AsyncPgConnection` closes the client socket.
-/// PostgreSQL is not guaranteed to remove that backend from
+/// `PostgreSQL` is not guaranteed to remove that backend from
 /// `pg_stat_activity` in the same instant, especially on a busy server. A
 /// test that drops a lease and immediately re-triggers the sweep can
 /// therefore race the server's own cleanup. It could see a

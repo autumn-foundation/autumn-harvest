@@ -91,8 +91,6 @@ mod det_check_tests;
 mod determinism_static_analysis_docs;
 mod dispatch_tests;
 mod e2e_bench_cell_timeout_tests;
-#[cfg(feature = "db")]
-mod e2e_bench_stale_database_sweep_tests;
 mod e2e_bench_support;
 mod event_batch_tests;
 mod event_partitioning_tests;
@@ -205,6 +203,8 @@ mod scheduler_overdue_tests;
 #[cfg(feature = "db")]
 mod scheduler_registration_tests;
 mod security;
+#[cfg(feature = "db")]
+mod shard_database_sweep_tests;
 #[cfg(feature = "db")]
 mod shard_placement_by_id_tests;
 #[cfg(all(feature = "db", feature = "testing"))]
