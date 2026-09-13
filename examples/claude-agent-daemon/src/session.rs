@@ -74,6 +74,15 @@ pub const STOP_TRANSCRIPT_FULL: &str = "transcript_full";
 /// This runs inside the workflow, so it must answer the same way on replay.
 /// It reads no clock and no state outside its argument, and the cap is a
 /// constant of the build.
+/// The serialised size of one `tool_result` block.
+///
+/// A block that cannot be serialised is measured as nothing, which is how
+/// [`over_input_cap`] treats a request it cannot serialise. Neither refuses
+/// work over a size it failed to read.
+fn block_bytes(block: &Value) -> u64 {
+    serde_json::to_vec(block).map_or(0, |json| json.len() as u64)
+}
+
 fn over_input_cap(request: &TurnRequest) -> bool {
     serde_json::to_vec(request).is_ok_and(|json| {
         json.len() as u64 > autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES
@@ -307,6 +316,29 @@ pub async fn agent_session(
         // user message. A split teaches the model to stop calling tools in
         // parallel, so the results are collected first and pushed together.
         let mut results = Vec::with_capacity(reply.tool_calls.len());
+        // The batch is bounded WHILE it runs, and not at the next turn.
+        //
+        // One accepted reply may ask for many calls, and a `read_file` may
+        // return 64 KiB. The check above runs before a turn, so the whole
+        // batch ran first: every result was held, and every call recorded its
+        // own durable events. A reply that is itself within the reply cap
+        // could therefore spend far more than one request may carry.
+        //
+        // The bound is the results ALONE against the cap a request may carry.
+        // That is conservative. Results over the cap cannot fit a request
+        // whatever the transcript holds beside them. No batch that would have
+        // fit is therefore stopped here. A batch that fits is still measured whole
+        // at the next turn, by the check above.
+        //
+        // The outcome does not change, only the work. The session ends under
+        // the same stop reason, and on the same turn number, as it would have
+        // at the next turn. The tool-call count is lower, because the calls
+        // after the bound do not run.
+        //
+        // This runs inside the workflow, so it must answer the same way on
+        // replay. It reads a serialised length of results the activities
+        // recorded, and a cap that is a constant of the build.
+        let mut spent = 0_u64;
         for (position, call) in reply.tool_calls.into_iter().enumerate() {
             tool_calls += 1;
             let outcome = if tools::needs_approval(&call.name) {
@@ -314,7 +346,12 @@ pub async fn agent_session(
             } else {
                 run_tool_call(ctx, &task.workspace, &call).await?
             };
-            results.push(tool_result_block(&call.id, &outcome));
+            let block = tool_result_block(&call.id, &outcome);
+            spent = spent.saturating_add(block_bytes(&block));
+            results.push(block);
+            if spent > autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES {
+                return Ok(report(&last_text, turn, tool_calls, STOP_TRANSCRIPT_FULL));
+            }
         }
         messages.push(Message::user(Value::Array(results)));
     }

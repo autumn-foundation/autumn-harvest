@@ -283,11 +283,19 @@ async fn a_transcript_too_large_to_send_ends_the_session() {
         "and it must end under its own name: {report:?}"
     );
 
-    // The work of the turn that DID run is kept and counted.
+    // The work that DID run is kept and counted, and the batch stopped at the
+    // bound rather than running every call the reply asked for. The reply
+    // asked for 35 reads of 64 KiB each, and the cap is 2 MiB, so the bound
+    // falls inside the batch. Before the bound the loop ran all 35, held
+    // every result, and recorded the durable events of every call.
+    assert!(
+        u64::from(report.tool_calls) < files as u64,
+        "the batch must stop at the bound, and got {} of {files}",
+        report.tool_calls
+    );
     assert_eq!(
-        u64::from(report.tool_calls),
-        files as u64,
-        "every read of the turn that ran is counted"
+        report.tool_calls, 32,
+        "and it must stop at the FIRST call whose results pass the cap"
     );
     // And ONLY the turns that ran. The guard fires before the model call of
     // turn two, so one turn happened. A report of two would count a turn
@@ -11579,5 +11587,74 @@ fn a_delivered_decision_is_read_as_the_type_the_workflow_asks_for() {
         inspect::outstanding_signal(&conn, "e", 1_000).expect("the wait query runs"),
         Some(armed.to_string()),
         "a delivery for another signal leaves this wait outstanding"
+    );
+}
+
+/// The offline stub is not refused a name it never uses.
+///
+/// Both name refusals exist for reasons that hold only with a key. A request
+/// carries the name, and the resume command prints it. Without a key no
+/// request is sent, and `identity` records `offline-stub` rather than this
+/// name, so the resume command names the stub.
+///
+/// The blank name is a common configuration and not an exotic one. Clap
+/// applies a default only when the variable is ABSENT, so `AGENTD_MODEL=`
+/// arrives here blank. Measured before the fix: the daemon refused to start
+/// with no key set. The advice then told the operator to unset
+/// `ANTHROPIC_API_KEY`, which was never set.
+#[test]
+fn the_offline_stub_is_not_refused_a_name_it_never_uses() {
+    for (label, name) in [
+        ("an empty name", ""),
+        ("a name of whitespace", "   "),
+        ("a name holding a newline", "a\nb"),
+    ] {
+        let (_, signal) = crate::shutdown::channel();
+        let config = claude::ModelConfig::new(None, name, claude::DEFAULT_MAX_TOKENS, signal)
+            .unwrap_or_else(|e| panic!("[{label}] the offline stub must start: {e}"));
+        assert!(!config.is_live(), "[{label}] and it must not be live");
+        // The reason it is safe: the name reaches nothing. What a session
+        // records is the stub, so no command prints the name above.
+        assert_eq!(
+            config.identity(),
+            claude::OFFLINE_MODEL,
+            "[{label}] and it records the stub, not the name it was given"
+        );
+    }
+
+    // The not-the-fault cases. WITH a key every refusal stands, because with
+    // a key every reason holds.
+    for (label, name) in [
+        ("an empty name", ""),
+        ("a name of whitespace", "   "),
+        ("a name holding a newline", "a\nb"),
+    ] {
+        let (_, signal) = crate::shutdown::channel();
+        let refused = claude::ModelConfig::new(
+            Some("sk-ant-example".to_string()),
+            name,
+            claude::DEFAULT_MAX_TOKENS,
+            signal,
+        );
+        assert!(
+            refused.map(|_| ()).is_err(),
+            "[{label}] a live daemon must still refuse it"
+        );
+    }
+
+    // And a real name offline is still accepted, so the fix did not make the
+    // offline path refuse or rename anything it used to take.
+    let (_, signal) = crate::shutdown::channel();
+    let config = claude::ModelConfig::new(
+        None,
+        claude::DEFAULT_MODEL,
+        claude::DEFAULT_MAX_TOKENS,
+        signal,
+    )
+    .expect("a real name offline still starts");
+    assert_eq!(
+        config.identity(),
+        claude::OFFLINE_MODEL,
+        "and it records the stub, as it did before"
     );
 }

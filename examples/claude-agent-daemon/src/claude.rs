@@ -101,7 +101,21 @@ impl ModelConfig {
         // that reads the trimmed value while the verbatim one is sent would
         // pass ` claude-opus-5 ` and then send it to the API.
         let model = model.trim().to_string();
-        if model.is_empty() {
+        // Both refusals below are LIVE-only, because both reasons are.
+        //
+        // Without a key this name reaches nothing. No request is sent, and
+        // `identity` records `offline-stub` rather than this name, so the
+        // resume command names the stub too. Refusing here broke the no-key
+        // mode for a common configuration: an environment variable that is
+        // SET and empty. Clap applies a default only when the variable is
+        // absent, so `AGENTD_MODEL=` reaches this as a blank name. The advice
+        // then told the operator to unset a key that was never set.
+        //
+        // The default is NOT substituted instead. That would pick a model
+        // silently when a key IS set, which hides a misconfiguration on the
+        // billed path. The refusal stays exactly where its reason holds.
+        let live = api_key.is_some();
+        if live && model.is_empty() {
             return Err(
                 "the model name is blank. Name a real model with `--model`, or \
                  unset `ANTHROPIC_API_KEY` to use the offline stub."
@@ -114,7 +128,7 @@ impl ModelConfig {
         // guards the socket path and the workspace path.
         // The TRIM does not cover this. It removes the whitespace at the
         // ends, and an interior tab or newline stays.
-        if let Some(refused) = crate::unprintable(&model) {
+        if let Some(refused) = crate::unprintable(&model).filter(|_| live) {
             return Err(format!(
                 "the model name {} holds {}, which no command this daemon \
                  prints can carry. A session recorded against another model \
@@ -127,7 +141,7 @@ impl ModelConfig {
         if let Some(message) = header_refusal(api_key.as_deref()) {
             return Err(message);
         }
-        if api_key.is_some() && model == OFFLINE_MODEL {
+        if live && model == OFFLINE_MODEL {
             return Err(format!(
                 "`{OFFLINE_MODEL}` is the name this daemon records for its own stub, \
                  and not a model. A session recorded against the stub would resume \
