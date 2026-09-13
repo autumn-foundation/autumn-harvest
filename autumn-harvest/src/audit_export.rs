@@ -2761,22 +2761,15 @@ async fn export_once_via_pool(
             // `export_observed` keeps its last-good value. The cursor then
             // stalls silently behind repeated acknowledgement timeouts.
             //
-            // `conn`'s in-flight query was abandoned mid-timeout. It is not
-            // reused directly here. A fresh connection is acquired for this
-            // follow-up read instead, mirroring the serialization-failure
-            // branch above. Best-effort: a failed reacquire just skips the
-            // emission, same as everywhere else this helper is called.
-            if let Some(mut conn) = acquire_shard_conn_for_export(
-                pool,
-                shard_id,
-                shard_u16,
-                metrics,
-                SHARD_ACQUIRE_BOUND,
-            )
-            .await
-            {
-                emit_lag_and_observed(&mut conn, shard_id, metrics).await;
-            }
+            // Recorded directly, not via `emit_lag_and_observed` (Codex
+            // review on PR #1520, follow-up P2, fourth round). That
+            // helper's own success path reports `true` whenever it can
+            // read the cursor row, which it almost always can. This
+            // acknowledgement is genuinely indeterminate: the write may
+            // have landed on the database side after the client gave up
+            // waiting. `false` is the only honest reading here, not
+            // whatever the row happens to show right now.
+            metrics.record_audit_export_observed(shard_u16, false);
             return Ok(0);
         }
     };
