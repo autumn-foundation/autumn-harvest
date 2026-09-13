@@ -1986,17 +1986,28 @@ own work counters and its `tracing::error!`, not this heartbeat.
   normally:
 
   ```promql
-  (rate(harvest_scanner_tick_total{scanner!="retention"}[5m]) == 0)
+  (rate(harvest_scanner_tick_total{scanner!="retention",scanner!="audit_export"}[5m]) == 0)
+    and on(instance) (count by (instance) (harvest_worker_slots_available) > 0)
+  ```
+
+  `audit_export` is excluded here for the same reason it gets its own window
+  in the shipped alert: a healthy delivery can legitimately run longer than
+  this recipe's 5m under a configured `audit_export_lease`. Give it its own
+  arm with the wider window, same gate:
+
+  ```promql
+  (rate(harvest_scanner_tick_total{scanner="audit_export"}[10m]) == 0)
     and on(instance) (count by (instance) (harvest_worker_slots_available) > 0)
   ```
 
   Since the tick series is created at registration (see below), this also
   covers the narrow case of a process that registers its loops and drains
   before any of them completes a first iteration. Adapt `instance` to whatever
-  target label your scrape config uses. If your topology runs `retention` or
-  `schedule` on a process with no worker, gate those two on that process's own
-  identifying label instead — or rely on the `scanner_liveness` check, which
-  needs no gate because it knows what is registered.
+  target label your scrape config uses. If your topology runs `retention`,
+  `schedule`, or `audit_export` on a process with no worker, gate those on
+  that process's own identifying label instead — or rely on the
+  `scanner_liveness` check, which needs no gate because it knows what is
+  registered.
 - **Not a false positive: one wedged shard.** A multi-shard worker spawns a
   `timeout`, `poison_pill`, and `pause_auto_resume` loop **per assigned shard**,
   all under one `scanner` label. Both surfaces handle this, and both have to:
