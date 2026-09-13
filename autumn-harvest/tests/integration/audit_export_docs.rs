@@ -247,6 +247,17 @@ fn upgrade_guide_does_not_restate_the_false_claim() {
          audit sink is configured' instead",
         path.display()
     );
+    assert!(
+        !contains_collapsed(
+            &text,
+            "the assignment index matches every row, not none, when no sink is configured"
+        ),
+        "{}: 'when no sink is configured' also covers a shard that exported \
+         before and had its sink removed — there, already-stamped rows stay \
+         outside the index. Scope the every-row claim to a deployment that \
+         never configured a sink",
+        path.display()
+    );
 }
 
 /// Issue #1272's own fix added a "cost is bounded" claim. Two review rounds
