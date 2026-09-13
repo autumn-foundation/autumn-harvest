@@ -132,8 +132,8 @@ flagged to the PR author via comment.
 - **Item 1 — CI sample:** 8/13 (62%) of explicit-failure runs in the
   post-`#1510`-merge portion of the 24h window shared this exact signature,
   across 8 unrelated commits/branches.
-- `docs/audits/comment-hygiene.py --self-test && --base origin/trunk-dev` on
-  the fix →clean.
+- `python3 docs/audits/comment-hygiene.py --self-test && python3
+  docs/audits/comment-hygiene.py --base origin/trunk-dev` on the fix → clean.
 - Not a flake, so this role's rerun-protocol/revert-check hard gate does not
   apply to item 1's fix — the assertion is deterministic and was verified
   failing-then-passing directly.
