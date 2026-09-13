@@ -693,6 +693,59 @@ async fn a_dependent_view_refuses_the_revert_too() {
 }
 
 #[tokio::test]
+async fn list_partitions_parses_bounds_under_a_non_iso_datestyle() {
+    // Issue #1270 item 15: `pg_get_expr(relpartbound, ...)` renders a
+    // partition's timestamp bounds in the SESSION's `DateStyle`, not a
+    // fixed format. The bound parser only accepts ISO year-first forms. A
+    // connection (or a pooler that inherited a non-default setting) using a
+    // different style used to parse every finite bound as `None`. Existing
+    // cohorts would fail the exact-bound check. `ensure_partitions` would
+    // error on every tick, and the sweeper would treat bounded partitions
+    // as unbounded rather than reclaiming them.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // `DMY` alone would already misparse an ISO string's month/day; `SQL`
+    // also changes the rendered separator and field order.
+    diesel::sql_query("SET DateStyle = 'SQL, DMY'")
+        .execute(&mut conn)
+        .await
+        .expect("set a non-ISO DateStyle on this session");
+
+    let parts = partition::list_partitions(&mut conn)
+        .await
+        .expect("list_partitions must not error under a non-ISO DateStyle");
+    let non_default: Vec<_> = parts.iter().filter(|p| !p.is_default).collect();
+    assert!(
+        !non_default.is_empty(),
+        "precondition: enable must have created cohort partitions"
+    );
+    for p in &non_default {
+        assert!(
+            p.upper.is_some(),
+            "every cohort partition must have a parsed upper bound \
+             regardless of session DateStyle; got {p:?}"
+        );
+    }
+    // The legacy partition (if this shard took that path) is the one with a
+    // `None` lower bound (`MINVALUE`) — everything else must parse both
+    // ends.
+    for p in non_default
+        .iter()
+        .filter(|p| p.name != partition::LEGACY_PARTITION)
+    {
+        assert!(
+            p.lower.is_some(),
+            "a non-legacy cohort partition must have a parsed lower bound; got {p:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_user_index_at_the_identifier_length_limit_survives_conversion() {
     // Issue #1270 item 9: Postgres silently truncates an identifier over 63
     // bytes. Appending a suffix to a name already at that limit renames it

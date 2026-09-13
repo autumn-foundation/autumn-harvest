@@ -660,18 +660,32 @@ pub async fn list_partitions(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<
         bound: String,
     }
 
-    let rows = diesel::sql_query(
-        "SELECT child.relname AS name,
-                pg_get_expr(child.relpartbound, child.oid) AS bound
-           FROM pg_inherits i
-           JOIN pg_class parent ON parent.oid = i.inhparent
-           JOIN pg_class child  ON child.oid  = i.inhrelid
-           JOIN pg_namespace n  ON n.oid = parent.relnamespace
-          WHERE parent.relname = 'harvest_events' AND n.nspname = current_schema()",
-    )
-    .load::<Row>(conn)
-    .await
-    .map_err(database_error)?;
+    // `pg_get_expr` renders a bound's timestamp literals in the session's
+    // `DateStyle`, not a fixed format — issue #1270 item 15. The parser
+    // below accepts only ISO year-first forms. A connection (or a pooler
+    // that inherited a non-default setting) using, say, `SQL, DMY` would
+    // parse every finite bound as `None`. Existing cohorts would then fail
+    // the exact-bound check. `ensure_partitions` would error on every tick,
+    // and the sweeper would treat bounded partitions as unbounded rather
+    // than reclaiming them. `SET LOCAL` inside an explicit transaction
+    // scopes the override to this one query, so it never leaks onto a
+    // pooled connection reused for something else afterward.
+    let rows = Box::pin(conn.transaction::<Vec<Row>, HarvestError, _>(async |conn| {
+        exec(conn, "SET LOCAL DateStyle = 'ISO, MDY'").await?;
+        diesel::sql_query(
+            "SELECT child.relname AS name,
+                    pg_get_expr(child.relpartbound, child.oid) AS bound
+               FROM pg_inherits i
+               JOIN pg_class parent ON parent.oid = i.inhparent
+               JOIN pg_class child  ON child.oid  = i.inhrelid
+               JOIN pg_namespace n  ON n.oid = parent.relnamespace
+              WHERE parent.relname = 'harvest_events' AND n.nspname = current_schema()",
+        )
+        .load::<Row>(conn)
+        .await
+        .map_err(database_error)
+    }))
+    .await?;
 
     let mut out: Vec<PartitionInfo> = rows
         .into_iter()
