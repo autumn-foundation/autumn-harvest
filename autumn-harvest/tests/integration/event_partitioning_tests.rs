@@ -1381,6 +1381,62 @@ async fn the_sweep_is_bounded_and_reports_what_it_dropped_and_blocked() {
     );
 }
 
+#[tokio::test]
+async fn a_sweep_bounds_blocked_evaluations_too_not_only_drops() {
+    // Issue #1270 item 1: `max_drops` bounds successful drops, not the work of
+    // finding them. A partition that ends up blocked still costs a full gate
+    // evaluation, so five closed cohorts that are ALL blocked must not let the
+    // pass examine every one of them regardless of `max_attempts`.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Five closed cohorts, each pinned by its own still-existing execution —
+    // every one of them is blocked, none droppable.
+    for days in [20_i64, 21, 22, 23, 24] {
+        let ts = Utc::now() - chrono::Duration::days(days);
+        let exec = insert_execution(&mut conn, "pinned_wf", &format!("p-{days}"), ts, None).await;
+        autumn_harvest::store::append_events(
+            &mut conn,
+            ExecutionId::from_uuid(exec),
+            &sample_events(),
+            0,
+        )
+        .await
+        .expect("seed");
+        backdate_events(&mut conn, exec, ts).await;
+    }
+
+    let outcome = partition::sweep(
+        &mut conn,
+        Utc::now(),
+        &SweepOptions {
+            max_drops: 10,
+            max_attempts: 2,
+            ..SweepOptions::default()
+        },
+    )
+    .await
+    .expect("sweep");
+
+    assert!(outcome.dropped.is_empty(), "nothing here is droppable");
+    assert_eq!(
+        outcome.blocked.len(),
+        2,
+        "the pass must stop evaluating once it spends its attempts budget, \
+         not keep scanning every remaining blocked partition; got {outcome:?}"
+    );
+    assert!(
+        outcome.truncated,
+        "a pass that stopped before considering every partition must say so, \
+         or an operator reading zero dropped and two blocked cannot tell a \
+         clean shard from one that ran out of budget; got {outcome:?}"
+    );
+}
+
 // ══ Pure unit coverage for the cohort algebra ══════════════════════════════
 
 #[test]

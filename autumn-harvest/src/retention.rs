@@ -381,6 +381,14 @@ pub struct PartitionMaintenanceConfig {
     /// `ACCESS EXCLUSIVE` lock on the parent, so a bounded budget keeps a
     /// backlog from holding the append path off; successive ticks converge.
     pub max_drops_per_tick: usize,
+    /// Maximum partitions *evaluated* per tick, dropped or not.
+    ///
+    /// `max_drops_per_tick` bounds successful drops, not the cost of finding
+    /// them: a blocked partition can still cost a tier-3 scan up to
+    /// `exact_scan_timeout_secs`. Without its own budget, one long-lived
+    /// execution pinning many old cohorts can make a tick evaluate every
+    /// closed partition, drop none, and spend the whole tick doing it.
+    pub max_attempts_per_tick: usize,
     /// Seconds to wait for that lock before deferring a partition to the next
     /// tick. Failing fast is what protects the concurrent-p99 budget.
     pub drop_lock_timeout_secs: u64,
@@ -412,6 +420,7 @@ impl Default for PartitionMaintenanceConfig {
             enabled: true,
             lookahead_cohorts: crate::partition::DEFAULT_LOOKAHEAD_COHORTS,
             max_drops_per_tick: crate::partition::SweepOptions::default().max_drops,
+            max_attempts_per_tick: crate::partition::SweepOptions::default().max_attempts,
             drop_lock_timeout_secs: 2,
             exact_scan_timeout_secs: crate::partition::SweepOptions::default()
                 .exact_scan_timeout
@@ -429,6 +438,7 @@ impl PartitionMaintenanceConfig {
     pub fn sweep_options(&self) -> crate::partition::SweepOptions {
         crate::partition::SweepOptions {
             max_drops: self.max_drops_per_tick,
+            max_attempts: self.max_attempts_per_tick,
             lock_timeout: Duration::from_secs(self.drop_lock_timeout_secs.max(1)),
             exact_scan_timeout: Duration::from_secs(self.exact_scan_timeout_secs.max(1)),
             owner_probe_cap: self.owner_probe_cap,

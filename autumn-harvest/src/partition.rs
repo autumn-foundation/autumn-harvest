@@ -398,6 +398,17 @@ pub struct SweepOptions {
     /// unbounded pass could hold the append path off for as long as it takes to
     /// drop a backlog. Bounded passes converge over successive ticks instead.
     pub max_drops: usize,
+    /// Maximum partitions to *evaluate* in one pass, dropped or not.
+    ///
+    /// `max_drops` bounds successful drops, not the work of finding them. A
+    /// blocked partition still costs a full gate evaluation — up to a tier-3
+    /// scan under `exact_scan_timeout` — and does not count against
+    /// `max_drops`. A shard with one long-lived execution pinning many old
+    /// cohorts can then spend an entire tick evaluating every closed
+    /// partition, dropping none, at up to `partitions × exact_scan_timeout`.
+    /// This bounds that cost directly. [`SweepOutcome::truncated`] reports
+    /// when the budget was reached before every partition was considered.
+    pub max_attempts: usize,
     /// How long to wait for that lock before giving up on a partition.
     ///
     /// Failing fast and retrying next tick is what keeps the concurrent-p99
@@ -437,6 +448,7 @@ impl Default for SweepOptions {
     fn default() -> Self {
         Self {
             max_drops: 32,
+            max_attempts: 128,
             lock_timeout: Duration::from_secs(2),
             straggler_grace: None,
             straggler_batch: 1_000,
@@ -451,6 +463,16 @@ impl Default for SweepOptions {
 pub struct SweepOutcome {
     /// Partitions dropped, oldest first.
     pub dropped: Vec<String>,
+    /// Whether this pass stopped before every partition was considered,
+    /// because it hit [`SweepOptions::max_drops`] or
+    /// [`SweepOptions::max_attempts`].
+    ///
+    /// Not itself a problem — bounded passes that converge over successive
+    /// ticks are the design — but an operator reading a pass that dropped and
+    /// blocked nothing needs to know whether that is "the shard is clean" or
+    /// "the pass ran out of budget before it looked at the rest".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
     /// Partitions considered but left in place, each with the reason — a live
     /// execution still owns rows there, or the lock could not be taken in time.
     /// Reported rather than silently skipped so an operator can see *why*
@@ -1920,8 +1942,10 @@ async fn sweep_inner(
         return Ok(outcome);
     }
 
+    let mut attempts = 0usize;
     for part in list_partitions(conn).await? {
-        if outcome.dropped.len() >= opts.max_drops {
+        if outcome.dropped.len() >= opts.max_drops || attempts >= opts.max_attempts {
+            outcome.truncated = true;
             break;
         }
         // The DEFAULT partition is structural: dropping it would make an
@@ -1943,6 +1967,12 @@ async fn sweep_inner(
             continue;
         }
 
+        // Counted here, not at the top of the loop: this is the gate
+        // evaluation the budget exists to bound — up to a tier-3 scan under
+        // `exact_scan_timeout` — which a blocked partition costs exactly as
+        // much as a dropped one. The cheap skips above (DEFAULT, still open,
+        // unbounded) reach no such scan and do not spend the budget.
+        attempts += 1;
         if let Some(reason) =
             cohort_occupancy(conn, &EventScope::cohort(part.lower, upper), upper, opts).await?
         {
