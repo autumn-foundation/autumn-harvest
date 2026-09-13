@@ -1,30 +1,30 @@
 //! Deterministic (non-criterion) instruction/allocation-count profiling
-//! harness for `autumn_harvest::history_export::export_history` — the
-//! archival-export path `retention.rs`'s reclamation sweep calls once per
-//! retiring execution before deleting its row (issue #524/#698/#772/#798;
-//! the same function is also re-exported at the crate root as public API).
+//! harness for `autumn_harvest::history_export::export_history`. This is the
+//! archival-export path. `retention.rs`'s reclamation sweep calls it once per
+//! retiring execution, before deleting its row (issue #524/#698/#772/#798).
+//! The same function is also re-exported at the crate root as public API.
 //! Wall-clock timing is not admissible evidence on this (shared-vCPU)
-//! machine — every number this harness produces evidence for is a
+//! machine. Every number this harness produces evidence for is a
 //! deterministic instruction count (`valgrind --tool=callgrind`) or
-//! allocation count/bytes (`valgrind --tool=dhat`), both reproducible
+//! allocation count/bytes (`valgrind --tool=dhat`). Both are reproducible
 //! bit-for-bit on any machine.
 //!
 //! # Workload
 //!
 //! Reuses `replay_profile_support::build_history` byte-for-byte (via
-//! `#[path]`, same trick `replay_profile.rs` uses) so this harness measures
-//! the *same* documented issue #135 history shape — `n` sequential
-//! activities, each carrying a realistic ~230-byte JSON payload — rather
-//! than a bespoke shape invented to flatter a particular change. Default
+//! `#[path]`, same trick `replay_profile.rs` uses). This harness therefore
+//! measures the *same* documented issue #135 history shape — `n` sequential
+//! activities, each carrying a realistic ~230-byte JSON payload. That shape
+//! is not a bespoke one invented to flatter a particular change. Default
 //! `n=5_000` (5,000 activities = 10,001 events, matching the replay
-//! harness's default) is exported under `HistoryPayloadPolicy::Full`, the
-//! policy `retention.rs`'s archival path always uses.
+//! harness's default) is exported under `HistoryPayloadPolicy::Full`. That
+//! is the policy `retention.rs`'s archival path always uses.
 //!
 //! `HISTORY_EXPORT_PROFILE_N` (default `5_000`) sets the activity count.
 //! `HISTORY_EXPORT_PROFILE_REPS` (default `20`) repeats the `export_history`
-//! call against a fresh clone of the same request each rep (the history is
-//! built once, outside the measured loop, so its one-time construction cost
-//! is not attributed to `export_history` itself).
+//! call against a fresh clone of the same request each rep. The history is
+//! built once, outside the measured loop. Its one-time construction cost is
+//! therefore not attributed to `export_history` itself.
 //!
 //! # Running
 //!

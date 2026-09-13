@@ -484,17 +484,34 @@ fn redacted_summary(value: &Value, kind: &'static str) -> Result<Value, HistoryE
     }))
 }
 
+/// Decimal digit count of `n` as `serde_json` renders it: plain, unsigned,
+/// no leading zero. `1` for `0`, `n.ilog10() + 1` otherwise.
+const fn decimal_digit_width(n: usize) -> usize {
+    if n == 0 { 1 } else { n.ilog10() as usize + 1 }
+}
+
+/// `size_limit.actual_bytes` is itself a field inside `document`, so the
+/// document's own serialized length depends on how many decimal digits that
+/// one field renders as -- a self-referential fixed point. Every other byte
+/// of the document is invariant across guesses at that field's value, so
+/// the fixed point is solved with exactly one real serialization (which
+/// also reveals `constant`, the length of everything else) plus O(1)
+/// arithmetic on the digit width, instead of re-serializing the whole
+/// document again for every guess.
 fn measure_export_bytes(document: &mut HistoryExportDocument) -> Result<usize, HistoryExportError> {
-    let mut last = 0;
+    let mut previous = document.size_limit.actual_bytes;
+    let mut actual = serde_json::to_vec(document)?.len();
+    let constant = actual - decimal_digit_width(previous);
+
     for _ in 0..4 {
-        let actual = serde_json::to_vec(document)?.len();
-        if actual == last {
+        if actual == previous {
             return Ok(actual);
         }
         document.size_limit.actual_bytes = actual;
-        last = actual;
+        previous = actual;
+        actual = constant + decimal_digit_width(actual);
     }
-    Ok(last)
+    Ok(previous)
 }
 
 fn history_state_is_terminal(state: &str) -> bool {
