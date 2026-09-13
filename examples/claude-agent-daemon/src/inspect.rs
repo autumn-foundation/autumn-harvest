@@ -5,6 +5,7 @@
 //! opens the file in WAL mode with a busy timeout for exactly this case: one
 //! writer, plus the occasional reader. Never open a second WRITE handle.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -1149,6 +1150,11 @@ fn staged_decision(conn: &Connection, exec_id: &str, signal: &str) -> Result<Opt
 /// the parse. A type that names no variant fails with `unknown variant`. A
 /// variant missing a field it declares fails with `missing field`.
 ///
+/// A recorded activity RESULT is read as the type the activity declares, and
+/// not only as an event. `ActivityCompleted` declares `output` as an untyped
+/// `Value`, so the event read stops at that field. See
+/// [`unreadable_output`].
+///
 /// A row that REPEATS `type` is refused by the same read, with `duplicate
 /// field`. The event query below reads `$.type` with `json_extract`, which
 /// reports the FIRST value where `serde_json` reports the LAST. That
@@ -1167,6 +1173,10 @@ fn ambiguous_history(conn: &Connection, exec_id: &str) -> Result<bool, String> {
     let mut rows = statement
         .query([exec_id])
         .map_err(|e| format!("cannot read the history: {e}"))?;
+    // The activity each result BELONGS to, learned as the pass goes.
+    // `ActivityCompleted` names no activity, only its id, so the declared
+    // result type is known from the `ActivityScheduled` that precedes it.
+    let mut scheduled: HashMap<String, String> = HashMap::new();
     while let Some(row) = rows
         .next()
         .map_err(|e| format!("cannot read a history row: {e}"))?
@@ -1176,11 +1186,56 @@ fn ambiguous_history(conn: &Connection, exec_id: &str) -> Result<bool, String> {
         let Ok(event) = row.get::<_, String>(0) else {
             return Ok(true);
         };
-        if serde_json::from_str::<WorkflowEvent>(&event).is_err() {
+        let Ok(event) = serde_json::from_str::<WorkflowEvent>(&event) else {
             return Ok(true);
+        };
+        match event {
+            WorkflowEvent::ActivityScheduled {
+                activity_id, name, ..
+            } => {
+                scheduled.insert(activity_id.to_string(), name);
+            }
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output,
+            } => {
+                if unreadable_output(scheduled.get(&activity_id.to_string()), output) {
+                    return Ok(true);
+                }
+            }
+            _ => {}
         }
     }
     Ok(false)
+}
+
+/// Is this recorded result one the WORKFLOW cannot read?
+///
+/// `WorkflowEvent::ActivityCompleted` declares `output` as an untyped
+/// `Value`, so an event that deserialises says nothing about the result
+/// inside it. The replay asks for the type the activity declares, and it is
+/// that ask which fails. Measured on a completed `claude_turn` holding `{}`:
+/// the event read as `Ok` and the result as
+/// `Err(missing field `content`)`.
+///
+/// The consequence is the one a bad decision has. `execute_activity` refuses
+/// the value on the first replay, `agent_session` propagates that, and the
+/// runtime seals a repairable session `FAILED`.
+///
+/// A result this daemon declares NO type for is passed over. The activity may
+/// belong to another workflow in the same file, and the id may name a
+/// schedule this page never read. Neither is this daemon's to judge.
+fn unreadable_output(name: Option<&String>, output: serde_json::Value) -> bool {
+    let Some(name) = name else {
+        return false;
+    };
+    if name == session::claude_turn_info().name {
+        return serde_json::from_value::<session::TurnReply>(output).is_err();
+    }
+    if name == session::run_tool_info().name {
+        return serde_json::from_value::<session::ToolOutcome>(output).is_err();
+    }
+    false
 }
 
 /// Is this timer the deadline of that signal's wait?

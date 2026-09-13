@@ -11755,3 +11755,115 @@ async fn one_turn_runs_no_more_calls_than_a_turn_may_run() {
     );
     assert_eq!(report.turns, 1, "one turn ran");
 }
+
+/// A recorded activity RESULT is read as the type the activity declares.
+///
+/// `WorkflowEvent::ActivityCompleted` declares `output` as an untyped
+/// `Value`, so an event that deserialises says nothing about the result
+/// inside it. This is the same seam as a delivered decision, one field over.
+///
+/// Measured before the fix: a completed `claude_turn` holding `{}` read as an
+/// event and failed as a `TurnReply` with `missing field content`. The
+/// restart reported readiness, and on the first replay `execute_activity`
+/// refused the value, `agent_session` propagated it, and the runtime sealed a
+/// repairable session `FAILED`.
+///
+/// The result's type is known from the `ActivityScheduled` that names the
+/// activity, because the completion carries only an id.
+#[test]
+fn a_recorded_result_is_read_as_the_type_its_activity_declares() {
+    let id = "01234567-89ab-4cde-8f01-23456789abcd";
+    let good_reply = r#"{"content":[],"stop_reason":"end_turn","text":"","tool_calls":[]}"#;
+    let good_outcome = r#"{"output":"done","is_error":false}"#;
+    let build = |activity: &str, output: &str| {
+        let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
+        conn.execute_batch(
+            "CREATE TABLE harvest_timers (timer_id TEXT, exec_id TEXT, fire_at INTEGER, \
+             fired INTEGER NOT NULL DEFAULT 0, arm_seq INTEGER, \
+             PRIMARY KEY (exec_id, timer_id)); \
+             CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+             PRIMARY KEY (exec_id, seq)); \
+             CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+             exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+        )
+        .expect("the fixture tables are created");
+        // The schedule names the activity. Without it the completion's type
+        // is unknowable, which the last case below covers.
+        conn.execute(
+            "INSERT INTO harvest_events VALUES ('e', 0, ?1)",
+            [format!(
+                r#"{{"type":"ActivityScheduled","data":{{"activity_id":"{id}",\
+                   "name":"{activity}","input":{{}},"queue":"default"}}}}"#
+            )
+            .replace("\\\n                   ", "")],
+        )
+        .expect("the schedule is appended");
+        conn.execute(
+            "INSERT INTO harvest_events VALUES ('e', 1, ?1)",
+            [format!(
+                r#"{{"type":"ActivityCompleted","data":{{"activity_id":"{id}","output":{output}}}}}"#
+            )],
+        )
+        .expect("the completion is appended");
+        conn
+    };
+
+    for (label, activity, output) in [
+        ("a model reply with no declared field", "claude_turn", "{}"),
+        (
+            "a model reply with a field of the wrong type",
+            "claude_turn",
+            r#"{"content":[],"stop_reason":1,"text":"","tool_calls":[]}"#,
+        ),
+        ("a tool outcome with no declared field", "run_tool", "{}"),
+    ] {
+        let conn = build(activity, output);
+        let refused = inspect::outstanding_signal(&conn, "e", 1_000)
+            .expect_err("a result the workflow cannot read must refuse the restart");
+        assert!(
+            refused.contains("cannot be told"),
+            "[{label}] the refusal must say WHY it refuses: {refused}"
+        );
+        // The event is SOUND. That is the point: the history read cannot see
+        // this, because `output` is an untyped `Value`.
+        let event = format!(
+            r#"{{"type":"ActivityCompleted","data":{{"activity_id":"{id}","output":{output}}}}}"#
+        );
+        assert!(
+            serde_json::from_str::<autumn_harvest::WorkflowEvent>(&event).is_ok(),
+            "[{label}] the event must be one the engine loads"
+        );
+    }
+
+    // The not-the-fault cases. A result the workflow reads is not refused.
+    for (label, activity, output) in [
+        ("a whole model reply", "claude_turn", good_reply),
+        ("a whole tool outcome", "run_tool", good_outcome),
+        // An unknown key is accepted, because the type accepts it.
+        (
+            "a reply holding an unknown key",
+            "claude_turn",
+            r#"{"content":[],"stop_reason":"end_turn","text":"","tool_calls":[],"extra":1}"#,
+        ),
+        // A tool outcome recorded against the MODEL activity would be read as
+        // a reply and refused, so the pairing is what picks the type.
+        ("a tool outcome under run_tool", "run_tool", good_outcome),
+    ] {
+        let conn = build(activity, output);
+        assert_eq!(
+            inspect::outstanding_signal(&conn, "e", 1_000).expect("the wait query runs"),
+            None,
+            "[{label}] a result the workflow reads is not refused"
+        );
+    }
+
+    // A completion this daemon declares no type for is passed over. The
+    // activity may belong to another workflow in the same file.
+    let conn = build("some_other_activity", "{}");
+    assert_eq!(
+        inspect::outstanding_signal(&conn, "e", 1_000).expect("the wait query runs"),
+        None,
+        "a result of an activity this daemon does not declare is not judged"
+    );
+}
