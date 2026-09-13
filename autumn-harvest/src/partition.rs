@@ -5109,14 +5109,18 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // Review finding: matching by schema and name alone selected any
         // invalid index anywhere bearing one of these three reserved
         // names, on any table. An operator's own cancelled concurrent
-        // build could coincidentally share a name -- on an unrelated
-        // table, or on the right table with different columns. The loop
-        // below checks the expected table and exact column list per
-        // name, the same shape rigor `we_created_at_idx_owned_check_sql`
-        // already applies before `disable_partitioning` drops that index.
-        // A mismatch refuses instead of either silently destroying the
-        // unrelated object or silently leaving it squatting on the name
-        // this plan needs to (re)build under.
+        // build could coincidentally share a name. It could sit on an
+        // unrelated table. It could sit on the right table with
+        // different columns. It could even sit on the right table and
+        // columns with different semantics -- non-unique, partial,
+        // expression-based, a non-default opclass, descending order, or
+        // `NULLS NOT DISTINCT`. The loop below checks all of that per
+        // name, the same full shape rigor
+        // `we_created_at_idx_owned_check_sql` already applies before
+        // `disable_partitioning` drops that index. A mismatch refuses
+        // instead of either silently destroying the unrelated object or
+        // silently leaving it squatting on the name this plan needs to
+        // (re)build under.
         step(2, "BEGIN".to_string()),
         step(2, format!("SET LOCAL lock_timeout = '{lock_ms}ms'")),
         step(
@@ -5124,7 +5128,10 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
             format!(
                 "DO $harvest_reindex_958$\nDECLARE idx record; ok boolean;\nBEGIN\n    \
                  FOR idx IN SELECT c.relname AS n, t.relname AS tbl, i.indrelid AS reloid,\n                            \
-                 i.indkey AS indkey, i.indnkeyatts AS nkeyatts, i.indnatts AS natts\n                       \
+                 i.indkey AS indkey, i.indnkeyatts AS nkeyatts, i.indnatts AS natts,\n                            \
+                 i.indisunique AS uniq, i.indnullsnotdistinct AS nulls_not_distinct,\n                            \
+                 i.indpred AS pred, i.indexprs AS exprs, i.indclass AS opclasses,\n                            \
+                 i.indoption AS opts\n                       \
                  FROM pg_class c\n                \
                  JOIN pg_index i ON i.indexrelid = c.oid\n                \
                  JOIN pg_namespace n2 ON n2.oid = c.relnamespace\n               \
@@ -5134,24 +5141,32 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
                  '{LEGACY_PARTITION}_exec_event_idx',\n                                   \
                  'idx_harvest_we_created_at')\n    \
                  LOOP\n        \
-                 ok := false;\n        \
+                 ok := idx.pred IS NULL AND idx.exprs IS NULL\n              \
+                 AND NOT EXISTS (SELECT 1 FROM unnest(idx.opclasses) AS oc(opclass)\n                             \
+                 JOIN pg_opclass op ON op.oid = oc.opclass WHERE NOT op.opcdefault)\n              \
+                 AND NOT EXISTS (SELECT 1 FROM unnest(idx.opts) AS o(bits) WHERE bits <> 0);\n        \
                  IF idx.n = '{LEGACY_PARTITION}_pk_idx' THEN\n            \
-                 ok := idx.tbl = 'harvest_events' AND idx.nkeyatts = 2 AND idx.natts = 2\n                  \
+                 ok := ok AND idx.tbl = 'harvest_events' AND idx.uniq\n                  \
+                 AND NOT idx.nulls_not_distinct AND idx.nkeyatts = 2 AND idx.natts = 2\n                  \
                  AND (SELECT array_agg(a.attname::text ORDER BY k)\n                         \
                  FROM generate_series(0, 1) k\n                         \
                  JOIN pg_attribute a ON a.attrelid = idx.reloid AND a.attnum = idx.indkey[k]\n                      \
                  ) = ARRAY['id', 'cohort'];\n        \
                  ELSIF idx.n = '{LEGACY_PARTITION}_exec_event_idx' THEN\n            \
-                 ok := idx.tbl = 'harvest_events' AND idx.nkeyatts = 3 AND idx.natts = 3\n                  \
+                 ok := ok AND idx.tbl = 'harvest_events' AND idx.uniq\n                  \
+                 AND NOT idx.nulls_not_distinct AND idx.nkeyatts = 3 AND idx.natts = 3\n                  \
                  AND (SELECT array_agg(a.attname::text ORDER BY k)\n                         \
                  FROM generate_series(0, 2) k\n                         \
                  JOIN pg_attribute a ON a.attrelid = idx.reloid AND a.attnum = idx.indkey[k]\n                      \
                  ) = ARRAY['workflow_exec_id', 'event_id', 'cohort'];\n        \
                  ELSIF idx.n = 'idx_harvest_we_created_at' THEN\n            \
-                 ok := idx.tbl = 'harvest_workflow_executions' AND idx.nkeyatts = 1 AND idx.natts = 1\n                  \
+                 ok := ok AND idx.tbl = 'harvest_workflow_executions' AND NOT idx.uniq\n                  \
+                 AND idx.nkeyatts = 1 AND idx.natts = 1\n                  \
                  AND idx.indkey[0] = (SELECT a.attnum FROM pg_attribute a\n                                        \
                  WHERE a.attrelid = 'harvest_workflow_executions'::regclass\n                                          \
                  AND a.attname = 'created_at');\n        \
+                 ELSE\n            \
+                 ok := false;\n        \
                  END IF;\n        \
                  IF ok THEN\n            \
                  EXECUTE format('DROP INDEX %I', idx.n);\n        \

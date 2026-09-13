@@ -6177,6 +6177,70 @@ async fn phase_2_refuses_when_a_reserved_index_name_is_squatted_elsewhere() {
 }
 
 #[tokio::test]
+async fn phase_2_refuses_a_same_table_same_columns_index_with_different_semantics() {
+    // Review finding: the expected table and column list are not the
+    // whole shape either. An operator's own invalid index could sit at
+    // a reserved name, on the right table with the right columns. It
+    // could still carry different semantics -- non-unique, here, in
+    // place of harvest's own UNIQUE. It must not be treated as this
+    // plan's own remnant.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {}", plan_pk_index()))
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query(format!(
+        "CREATE INDEX {} ON harvest_events (id, cohort)",
+        plan_pk_index()
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed a non-unique index at the reserved name and columns");
+    invalidate_index(&mut conn, &plan_pk_index()).await;
+
+    run_plan_phases(&mut conn, 1..=1).await;
+
+    let mut refusal: Option<String> = None;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 2)
+    {
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            refusal = Some(e.to_string());
+        }
+    }
+    let msg = refusal.expect(
+        "phase 2 must refuse a same-table, same-column index with different semantics, \
+         not treat it as this plan's own remnant",
+    );
+    assert!(
+        msg.contains(&plan_pk_index()),
+        "the refusal must name the offending index; got {msg}"
+    );
+    assert!(
+        scalar_bool(
+            &mut conn,
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM pg_class c \
+                 JOIN pg_index i ON i.indexrelid = c.oid \
+                 WHERE c.relname = '{}' AND NOT i.indisunique) AS v",
+                plan_pk_index()
+            ),
+        )
+        .await,
+        "the operator's non-unique index must survive untouched"
+    );
+
+    diesel::sql_query(format!("DROP INDEX {}", plan_pk_index()))
+        .execute(&mut conn)
+        .await
+        .expect("drop the decoy index");
+}
+
+#[tokio::test]
 async fn the_lock_window_refuses_to_open_over_an_invalid_index() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
