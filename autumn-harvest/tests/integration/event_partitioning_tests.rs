@@ -746,6 +746,187 @@ async fn list_partitions_parses_bounds_under_a_non_iso_datestyle() {
 }
 
 #[tokio::test]
+async fn an_operator_trigger_refuses_the_conversion_instead_of_silently_going_dark() {
+    // Issue #1270 item 16: `CREATE TABLE ... (LIKE ...)` does not carry
+    // triggers. Both conversion paths build the replacement relation that
+    // way. An operator trigger (an audit trigger, say) would stay on the
+    // renamed legacy table. That table receives no new rows after cutover.
+    // The trigger then stops firing for every event, while still existing.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP TRIGGER IF EXISTS harvest_events_op_trg_958 ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray trigger from a previous run");
+    diesel::sql_query("DROP FUNCTION IF EXISTS harvest_events_op_trg_958_fn()")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray trigger function from a previous run");
+    diesel::sql_query(
+        "CREATE FUNCTION harvest_events_op_trg_958_fn() RETURNS trigger AS $$ \
+         BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a trigger function");
+    diesel::sql_query(
+        "CREATE TRIGGER harvest_events_op_trg_958 BEFORE INSERT ON harvest_events \
+         FOR EACH ROW EXECUTE FUNCTION harvest_events_op_trg_958_fn()",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator trigger");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "an operator trigger must refuse the conversion, not silently go \
+             dark after it",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_op_trg_958"),
+        "the refusal must name the offending trigger; got {msg}"
+    );
+
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP TRIGGER harvest_events_op_trg_958 ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending trigger");
+    diesel::sql_query("DROP FUNCTION harvest_events_op_trg_958_fn()")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending trigger function");
+}
+
+#[tokio::test]
+async fn the_large_table_plans_phase_1_also_refuses_an_operator_trigger() {
+    // Same guard, the scripted path. `migration_plan_steps` cannot call
+    // `enable_partitioning`'s Rust check, so it carries its own phase-1
+    // `DO` block making the identical refusal.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP TRIGGER IF EXISTS harvest_events_plan_trg_958 ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray trigger from a previous run");
+    diesel::sql_query("DROP FUNCTION IF EXISTS harvest_events_plan_trg_958_fn()")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray trigger function from a previous run");
+    diesel::sql_query(
+        "CREATE FUNCTION harvest_events_plan_trg_958_fn() RETURNS trigger AS $$ \
+         BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a trigger function");
+    diesel::sql_query(
+        "CREATE TRIGGER harvest_events_plan_trg_958 BEFORE INSERT ON harvest_events \
+         FOR EACH ROW EXECUTE FUNCTION harvest_events_plan_trg_958_fn()",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator trigger");
+
+    let mut refused = false;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 1)
+    {
+        if diesel::sql_query(&step.sql)
+            .execute(&mut conn)
+            .await
+            .is_err()
+        {
+            refused = true;
+        }
+    }
+    assert!(
+        refused,
+        "phase 1 of the plan must refuse an operator trigger on harvest_events"
+    );
+
+    diesel::sql_query("DROP TRIGGER harvest_events_plan_trg_958 ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending trigger");
+    diesel::sql_query("DROP FUNCTION harvest_events_plan_trg_958_fn()")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending trigger function");
+}
+
+#[tokio::test]
+async fn an_operator_trigger_refuses_the_revert_too() {
+    // The reverse direction: `disable_partitioning` rebuilds a flat table
+    // with `LIKE` exactly as `enable` rebuilds the partitioned parent, so
+    // it is exactly as vulnerable.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    diesel::sql_query("DROP TRIGGER IF EXISTS harvest_events_disable_trg_958 ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray trigger from a previous run");
+    diesel::sql_query("DROP FUNCTION IF EXISTS harvest_events_disable_trg_958_fn()")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray trigger function from a previous run");
+    diesel::sql_query(
+        "CREATE FUNCTION harvest_events_disable_trg_958_fn() RETURNS trigger AS $$ \
+         BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a trigger function");
+    diesel::sql_query(
+        "CREATE TRIGGER harvest_events_disable_trg_958 BEFORE INSERT ON harvest_events \
+         FOR EACH ROW EXECUTE FUNCTION harvest_events_disable_trg_958_fn()",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator trigger on the partitioned parent");
+
+    let err = partition::disable_partitioning(&mut conn)
+        .await
+        .expect_err("an operator trigger must refuse the revert, not silently go dark after it");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_disable_trg_958"),
+        "the refusal must name the offending trigger; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "p",
+        "a refused revert must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP TRIGGER harvest_events_disable_trg_958 ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending trigger");
+    diesel::sql_query("DROP FUNCTION harvest_events_disable_trg_958_fn()")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending trigger function");
+}
+
+#[tokio::test]
 async fn a_user_index_at_the_identifier_length_limit_survives_conversion() {
     // Issue #1270 item 9: Postgres silently truncates an identifier over 63
     // bytes. Appending a suffix to a name already at that limit renames it

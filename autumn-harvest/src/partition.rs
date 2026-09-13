@@ -1285,6 +1285,65 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
     )))
 }
 
+/// Operator-installed triggers on `harvest_events`.
+///
+/// **Why this blocks the conversion.** `CREATE TABLE ... (LIKE ...)` does not
+/// carry triggers, and both conversion directions build the replacement
+/// relation that way. On the populated path an operator trigger (an audit or
+/// validation trigger, say) stays on the renamed legacy table. That table
+/// receives no new rows after cutover. The trigger then stops firing for
+/// every event, while it still exists — nothing reports the loss. On the
+/// empty path the trigger is destroyed with the table it was on.
+///
+/// [`EXEC_FK_TRIGGER`] is excluded: the conversion creates it itself, as part
+/// of the design, not something an operator installed.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] if the catalog query fails.
+#[cfg(feature = "db")]
+pub async fn operator_triggers(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
+    let rows = diesel::sql_query(format!(
+        "SELECT tg.tgname AS v
+           FROM pg_trigger tg
+           JOIN pg_class c ON c.oid = tg.tgrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
+            AND NOT tg.tgisinternal
+            AND tg.tgname <> '{EXEC_FK_TRIGGER}'
+          ORDER BY 1"
+    ))
+    .load::<TextRow>(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows.into_iter().map(|r| r.v).collect())
+}
+
+/// The refusal both conversion directions share.
+#[cfg(feature = "db")]
+async fn refuse_if_operator_triggers(
+    conn: &mut AsyncPgConnection,
+    verb: &str,
+) -> HarvestResult<()> {
+    let triggers = operator_triggers(conn).await?;
+    if triggers.is_empty() {
+        return Ok(());
+    }
+    Err(HarvestError::Config(format!(
+        "refusing to {verb} harvest_events: {} not carried by CREATE TABLE ... (LIKE ...) \
+         ({}). An operator trigger stays on the renamed table, where it stops firing for \
+         every new row from cutover onward while still existing — silent for an audit or \
+         validation trigger, since nothing reports the loss. Drop the trigger first (and \
+         recreate it against harvest_events afterward) to proceed.",
+        if triggers.len() == 1 {
+            "a trigger is"
+        } else {
+            "triggers are"
+        },
+        triggers.join(", ")
+    )))
+}
+
 /// Convert this shard's `harvest_events` to the partitioned layout.
 ///
 /// Idempotent: on an already-partitioned shard it reports
@@ -1351,6 +1410,7 @@ pub async fn enable_partitioning(
     refuse_if_row_security(conn, "convert").await?;
     refuse_if_unique_index_without_cohort(conn).await?;
     refuse_if_dependent_views(conn, "convert").await?;
+    refuse_if_operator_triggers(conn, "convert").await?;
 
     let width = opts.cohort_width_secs;
     let now = Utc::now();
@@ -2024,6 +2084,10 @@ pub async fn disable_partitioning(
     // parent would keep pointing at the renamed relation, not the reclaimed
     // flat table.
     refuse_if_dependent_views(conn, "revert").await?;
+    // Same reason again: a trigger `CREATE TABLE ... (LIKE ...)` did not
+    // carry stays on the partitioned parent being reclaimed, not the flat
+    // table `disable` builds in its place.
+    refuse_if_operator_triggers(conn, "revert").await?;
     let report = Box::pin(
         conn.transaction::<DisableReport, HarvestError, _>(async |conn| {
             let index_defs = capture_index_defs(conn).await?;
@@ -3559,6 +3623,34 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
              recreate it against harvest_events afterward) before running this plan.', bad;\n    \
              END IF;\nEND\n$harvest_view_958$;"
                 .to_string(),
+        ),
+        // ── 1: refuse early over an operator trigger on harvest_events ────
+        //
+        // Same reason and same phase as the guards above.
+        // `enable_partitioning` makes this check in Rust; the scripted path
+        // needs its own because it never calls it. See `operator_triggers`.
+        // `CREATE TABLE ... (LIKE ...)` does not carry triggers. An operator
+        // trigger would stay on the renamed legacy table after phase 4. It
+        // would then stop firing for every new row from cutover onward.
+        step(
+            1,
+            format!(
+                "DO $harvest_trg_958$\nDECLARE bad text;\nBEGIN\n    \
+                 SELECT string_agg(tg.tgname, ', ' ORDER BY 1) INTO bad\n      \
+                 FROM pg_trigger tg\n      \
+                 JOIN pg_class c ON c.oid = tg.tgrelid\n      \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
+                 WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
+                 AND NOT tg.tgisinternal\n       \
+                 AND tg.tgname <> '{EXEC_FK_TRIGGER}';\n    \
+                 IF bad IS NOT NULL THEN\n        \
+                 RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not carried by \
+                 CREATE TABLE ... (LIKE ...) (%). An operator trigger would stay on the \
+                 renamed legacy table after phase 4, where it stops firing for every new row \
+                 from cutover onward while still existing. Drop the trigger (and recreate it \
+                 against harvest_events afterward) before running this plan.', bad;\n    \
+                 END IF;\nEND\n$harvest_trg_958$;"
+            ),
         ),
         // ── 1: bake the chosen width into the cohort function ─────────────
         step(1, cohort_function_sql(width)),
