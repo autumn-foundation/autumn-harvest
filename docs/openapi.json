@@ -674,7 +674,7 @@
                 }
               }
             },
-            "description": "`outcome` is `retired` on a genuine transition, or `already_retired` when the shard was already retired (a no-op that is still audited). Retiring bumps the shard's claim epoch and clears its lease, so a delivery already in flight cannot acknowledge over the retirement -- the same fencing the redrive route uses. A genuine `retired` transition also writes a second, best-effort audit record on the default shard: the primary record lands on the shard whose own exporter this call just stopped, so it can never reach the SIEM, and the default shard's copy is what actually does."
+            "description": "`outcome` is `retired` on a genuine transition, or `already_retired` when the shard was already retired (a no-op that is still audited). Retiring bumps the shard's claim epoch and clears its lease, so a delivery already in flight cannot acknowledge over the retirement -- the same fencing the redrive route uses. The primary audit record lands on the shard whose own exporter this call just stopped, so it can never reach the SIEM there; retention never purges an audit_export.decommission or .reactivate record on any shard, so that record is permanent regardless -- a durability guarantee, not an export one. A genuine `retired` transition also writes a second, best-effort audit record on the default shard (when it differs from the target) for an actual chance at reaching the SIEM."
           },
           "404": {
             "description": "The named shard has no audit-export cursor: audit export has never run there."

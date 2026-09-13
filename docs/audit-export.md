@@ -261,6 +261,12 @@ timeout cannot distinguish "export was intentionally removed" from "the worker
 has been down since Friday", and it resolves that ambiguity by deleting audit
 records during exactly the outage where they matter most.
 
+One pair of records is exempt from the guard entirely: `audit_export.decommission`
+and `audit_export.reactivate` rows are never purged, on any shard, live or
+retired (issue #1273). These describe the audit-export system's own lifecycle
+controls, and the shard a decommission targets can never export its own
+record about itself — see "Retiring and reactivating" below.
+
 ### Retiring and reactivating audit export on a shard
 
 Because the guard never expires on its own, turning export off is an explicit,
@@ -290,12 +296,17 @@ retired, or never configured, changes nothing but is still audited — the
 answer to "who asked to give up this compliance window" cannot depend on
 whether the request happened to be the first one.
 
-A genuine retirement additionally writes a second, best-effort audit record
-on the default shard. The primary record above lands on the shard whose own
-exporter this call just stopped — it can never reach the SIEM, and once that
-shard is retired its backlog is no longer purge-protected either, so an
-unexportable local record is not durable proof of anything. The default
-shard keeps exporting, so its copy is what actually gets this event off-box.
+The primary record above lands on the shard whose own exporter this call
+just stopped, so it can never reach the SIEM from there — and in a
+single-shard deployment that shard is the only one there is. What makes the
+guarantee hold anyway: `purge_old_audit_records` never purges an
+`audit_export.decommission` or `.reactivate` record, on any shard, live or
+retired. That record is permanent — a durability guarantee, not an export
+one. A genuine retirement additionally writes a second, best-effort audit
+record on a different, still-exporting default shard, for an actual chance
+at reaching the SIEM; a failure there is logged and does not fail the
+request, since the permanent record already satisfies the compliance
+contract on its own.
 
 Stopping the exporter alone does **not** restore purging — the guard keys on
 the cursor row, not on the sweeping process's sink configuration, which is what

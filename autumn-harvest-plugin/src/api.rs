@@ -37505,15 +37505,28 @@ struct AuditExportShardRequest {
 /// still audited. An auditor needs the record of the request, not only of
 /// requests that had an effect.
 ///
+/// **The atomic record above lands on the shard whose own exporter this
+/// call just stopped** (Codex review, issue #1273 P1). So it can never
+/// reach the SIEM. In a single-shard deployment that shard is also the only
+/// one there is, so there is no other exportable destination to fall back
+/// to.
+///
+/// What makes this route's guarantee true anyway is
+/// [`crate::audit::purge_old_audit_records`]: it never purges an
+/// `audit_export.decommission` or `.reactivate` row, on any shard, live or
+/// retired. So the atomic record survives forever and stays readable via
+/// `GET /audit` on the target shard, even though it may never leave that
+/// shard's own database.
+///
 /// **A genuine retirement also writes a second, best-effort audit record on
-/// the default shard** (Codex review, issue #1273 P1). The atomic record
-/// above lands on the shard whose own exporter this call just stopped. It
-/// can never reach the SIEM, and once the shard is retired its backlog is no
-/// longer purge-protected either. An unexportable record is not durable
-/// proof of anything. The default shard keeps exporting, so its copy is what
-/// actually closes the compliance gap this route exists to close. Skipped
-/// when the target already IS the default shard, where a second copy would
-/// land in the same retired stream as the first.
+/// the default shard**, when that differs from the target. The default
+/// shard keeps exporting, so its copy has a real chance of reaching the
+/// SIEM. This is an opportunistic improvement, not the correctness
+/// guarantee: a failure here is logged and does not fail the request. The
+/// atomic record's permanence, above, already makes this action's
+/// compliance trail durable on its own. Skipped when the target already IS
+/// the default shard, where a second copy would be redundant with the
+/// first.
 #[allow(clippy::too_many_lines)] // one mutation + its bound audit write
 async fn audit_export_decommission_handler(
     headers: axum::http::HeaderMap,
@@ -37627,21 +37640,19 @@ async fn audit_export_decommission_handler(
         }
     };
 
-    // A genuine retirement stops the TARGET shard's own exporter. Every other
-    // shard-local route (redrive, reactivate) can rely on the shard it wrote
-    // to still picking its own audit row up. This one cannot (Codex review,
-    // issue #1273 P1: "keep the decommission event outside the retired
-    // stream").
+    // A genuine retirement stops the TARGET shard's own exporter. So the
+    // atomic record above can never reach the SIEM from there (Codex
+    // review, issue #1273 P1). `purge_old_audit_records` never purges this
+    // operation, on any shard, so that record is permanent regardless. This
+    // is a durability guarantee, not an export one. In a single-shard
+    // deployment the target IS the only shard, so permanence is all this
+    // route can ever promise there.
     //
-    // Worse, once retired the shard's own backlog is no longer
-    // purge-protected either (see `crate::audit::purge_old_audit_records`).
-    // So the atomic record above is not just unexportable. It can eventually
-    // be deleted with no trace anywhere.
-    //
-    // A best-effort duplicate on the default shard, which keeps exporting,
-    // is what actually lets this event reach the SIEM. Skipped when the
-    // target IS the default shard: both copies would land in the same
-    // now-retired stream, so a second write buys nothing.
+    // Where a DIFFERENT shard still exports, attempt a second, best-effort
+    // copy there for an actual shot at reaching the SIEM. A failure here is
+    // logged, not fatal: the atomic record's permanence already satisfies
+    // this route's compliance contract on its own. Skipped when the target
+    // IS the default shard, where a second copy would be redundant.
     if outcome == ::autumn_harvest::audit_export::DecommissionOutcome::Retired
         && ::autumn_harvest::types::ShardId::new(request.shard) != pool.default_shard()
     {
@@ -37654,7 +37665,9 @@ async fn audit_export_decommission_handler(
             request_id: request_id.as_deref(),
             idempotency_key: None,
             status: STATUS_SUCCEEDED,
-            error_summary: Some("exportable copy: the target shard's own exporter is now retired"),
+            error_summary: Some(
+                "opportunistic copy: the target shard's own exporter is now retired",
+            ),
             shard_id: Some(request.shard),
             source: &source,
         };
@@ -37663,18 +37676,18 @@ async fn audit_export_decommission_handler(
                 if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
                     tracing::error!(
                         error = %e,
-                        "failed to write the exportable copy of audit_export.decommission \
-                         on the default shard; the retirement is still recorded, \
-                         unexportably, on the target shard"
+                        "failed to write the opportunistic copy of audit_export.decommission \
+                         on the default shard; the retirement is still permanently recorded \
+                         on the target shard, just not exported"
                     );
                 }
             }
             Err(e) => {
                 tracing::error!(
                     error = %e,
-                    "could not reach the default shard to write the exportable copy of \
-                     audit_export.decommission; the retirement is still recorded, \
-                     unexportably, on the target shard"
+                    "could not reach the default shard to write the opportunistic copy of \
+                     audit_export.decommission; the retirement is still permanently \
+                     recorded on the target shard, just not exported"
                 );
             }
         }

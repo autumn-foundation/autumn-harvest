@@ -1637,6 +1637,28 @@ pub async fn list_audit(
 /// documented "retiring is what lets retention purge them" contract this
 /// module and `crate::audit_export::decommission_cursor_locked` both state.
 ///
+/// **`audit_export.decommission` and `audit_export.reactivate` records are
+/// never purged, live or retired shard, exported or not** (issue #1273,
+/// Codex review P1). These two rows describe the audit-export system's own
+/// lifecycle controls. A decommission targeting the shard it runs on can
+/// never export its own record. Retiring a cursor is exactly what stops
+/// that shard's exporter from claiming anything, including this row. In a
+/// single-shard deployment that shard is also the only one there is.
+///
+/// A cross-shard best-effort copy (see `audit_export_decommission_handler`
+/// in the plugin) can get such a record to the SIEM when another shard is
+/// still exporting. It cannot when the target IS the only exportable shard,
+/// or when the copy's own write fails.
+///
+/// So the guarantee this route actually provides is narrower, and
+/// achievable: a permanent LOCAL record of who authorised the transition.
+/// It stays discoverable via `GET /audit` on that shard, forever. Not
+/// guaranteed delivery to an external SIEM for the one event whose entire
+/// subject is "this shard's exporter just stopped or resumed". The
+/// exclusion below spends unbounded local storage on two specific, rare,
+/// admin-triggered operations, to make that narrower guarantee
+/// unconditionally true.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] if the delete fails.
@@ -1649,9 +1671,12 @@ pub async fn purge_old_audit_records(
     let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days);
 
     // Delete an aged row UNLESS export is live AND that row is still pending.
+    // Also never one of the two audit-export lifecycle records exempted
+    // above.
     diesel::sql_query(
         "DELETE FROM harvest_audit_log a \
          WHERE a.occurred_at < $1 \
+           AND a.operation NOT IN ($3, $4) \
            AND NOT ( \
                  ( \
                    EXISTS ( \
@@ -1674,6 +1699,8 @@ pub async fn purge_old_audit_records(
     )
     .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
     .bind::<diesel::sql_types::Bool, _>(crate::audit_export::is_configured())
+    .bind::<diesel::sql_types::Text, _>(OP_AUDIT_EXPORT_DECOMMISSION)
+    .bind::<diesel::sql_types::Text, _>(OP_AUDIT_EXPORT_REACTIVATE)
     .execute(conn)
     .await
     .map_err(database_error)

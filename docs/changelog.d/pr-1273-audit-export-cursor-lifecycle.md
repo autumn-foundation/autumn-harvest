@@ -42,20 +42,34 @@ what gets recorded were never written down.
   `is_configured()` now only stands in for a cursor row when none exists
   yet (the bootstrap window); once a row exists, its own `retired_at`
   decides. See `decommission_releases_its_shards_backlog_even_while_export_stays_configured_elsewhere`.
-- **Second bonus fix, from automated review of this PR: the decommission
-  route no longer traps its own audit record in the stream it just
-  retired.** `POST /admin/audit-export/decommission`'s atomic audit row
-  lands on the target shard's own connection (needed for atomicity with the
-  mutation), but that shard's exporter is exactly what the call just
-  stopped — combined with the retention fix above, that record could
-  eventually be deleted from that shard's own database with no trace
-  anywhere, defeating finding 2's whole purpose. A genuine retirement now
-  also writes a second, best-effort audit record on the default shard,
-  which keeps exporting. Skipped when the target already IS the default
-  shard. Not yet covered by an automated test: this codebase has no
-  plugin-level HTTP integration test for the audit-export admin routes at
-  all (the pre-existing redrive route has the same gap), and a real test
-  needs a multi-shard harness this sandbox could not run against Docker.
+- **Second and third bonus fixes, from two rounds of automated review on
+  this PR: the decommission route's own audit record can no longer be
+  silently lost.** `POST /admin/audit-export/decommission`'s atomic audit
+  row lands on the target shard's own connection (needed for atomicity with
+  the mutation), but that shard's exporter is exactly what the call just
+  stopped — it can never reach the SIEM from there, and in a single-shard
+  deployment that shard is the only one there is, so a cross-shard
+  workaround alone cannot cover every case. Two changes together close
+  this:
+  - `purge_old_audit_records` now never purges an `audit_export.decommission`
+    or `.reactivate` record, on any shard, live or retired — a durability
+    guarantee (this specific record survives forever, locally), not an
+    export one. This is what makes the route's compliance contract true
+    unconditionally, including for a single-shard deployment or a
+    decommission of the default shard itself.
+  - A genuine retirement additionally writes a second, best-effort audit
+    record on the default shard when it differs from the target, for an
+    actual chance at reaching the SIEM. A failure here is logged, not
+    fatal, since the permanent record above already satisfies the
+    guarantee on its own.
+
+  Not yet covered by an automated test: this codebase has no plugin-level
+  HTTP integration test for the audit-export admin routes at all (the
+  pre-existing redrive route has the same gap), and a real end-to-end test
+  of the best-effort cross-shard copy needs a multi-shard harness this
+  sandbox could not run against Docker. The purge-exemption itself, which
+  carries the actual guarantee, is covered by
+  `a_decommission_audit_record_survives_purge_even_on_its_own_now_retired_shard`.
 - **No migration.** `retired_at` and `claim_epoch` already existed on
   `harvest_audit_export_cursor`; the fix is a predicate on an existing
   `ON CONFLICT` statement plus two new locked-transaction functions
@@ -70,9 +84,12 @@ what gets recorded were never written down.
   and its reactivate counterpart pin finding 2; idempotency
   (`AlreadyRetired`/`AlreadyActive`) and unconfigured-shard cases are
   covered separately, along with atomicity (`a_failed_audit_write_rolls_the_decommission_back`
-  and its reactivate counterpart) and the epoch-fencing interaction across a
+  and its reactivate counterpart), the epoch-fencing interaction across a
   decommission-then-reactivate cycle
-  (`a_reactivate_does_not_reopen_a_claim_fenced_by_the_prior_decommission`).
+  (`a_reactivate_does_not_reopen_a_claim_fenced_by_the_prior_decommission`),
+  and the retention-guard fixes
+  (`decommission_releases_its_shards_backlog_even_while_export_stays_configured_elsewhere`,
+  `a_decommission_audit_record_survives_purge_even_on_its_own_now_retired_shard`).
   Two existing tests that relied on the old implicit reactivation
   (`a_recreated_cursor_continues_the_sequence_it_left_off_at`,
   `the_sequence_survives_a_decommission_that_purges_every_stamped_row`) were

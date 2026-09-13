@@ -2100,6 +2100,83 @@ async fn decommission_releases_its_shards_backlog_even_while_export_stays_config
     );
 }
 
+// A `decommission_cursor` (or `reactivate_cursor`) audit row must never be
+// purged, on ANY shard, live or retired (issue #1273, Codex review P1). In
+// a single-shard deployment the shard an operator decommissions is the only
+// shard there is. Its own exporter is exactly what the call just stopped,
+// so its audit record can never reach the SIEM. Per the retention fix
+// above, nothing else protects it from this same purge sweep. Without this
+// exemption, the one record documenting who authorised the retirement would
+// itself be silently deleted. That is exactly the compliance gap issue
+// #1273 finding 2 exists to close.
+#[tokio::test]
+async fn a_decommission_audit_record_survives_purge_even_on_its_own_now_retired_shard() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 2).await;
+    ensure_cursor_row(&mut conn, 0).await.expect("cursor");
+
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+        .await
+        .expect("decommission");
+
+    // Stands in for the atomic write the admin route makes in the same
+    // transaction as the retirement. It lands on the shard being retired,
+    // since that is the only connection available to keep the two atomic.
+    let decommission_record = NewAuditRecord {
+        actor: "alice",
+        operation: autumn_harvest::audit::OP_AUDIT_EXPORT_DECOMMISSION,
+        target_type: autumn_harvest::audit::TARGET_AUDIT_EXPORT,
+        target_id: Some("shard=0"),
+        route_or_command: "POST /admin/audit-export/decommission",
+        request_id: None,
+        idempotency_key: None,
+        status: STATUS_SUCCEEDED,
+        error_summary: None,
+        shard_id: Some(0),
+        source: "api",
+    };
+    audit::insert_audit(&mut conn, &decommission_record)
+        .await
+        .expect("audit insert");
+
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
+
+    // The sink stays configured. This stands in equally for "another
+    // shard in the fleet still exports" and for the single-shard case
+    // with no other shard at all. The exemption must hold either way.
+    let deleted = purge_old_audit_records(&mut conn, 90)
+        .await
+        .expect("purge runs");
+    uninstall();
+
+    assert_eq!(
+        deleted, 2,
+        "the two ordinary records must still be purged normally: retiring \
+         this shard releases its backlog, exactly as the sibling test above \
+         asserts"
+    );
+    let survivors: i64 = harvest_audit_log::table
+        .filter(
+            harvest_audit_log::operation.eq(autumn_harvest::audit::OP_AUDIT_EXPORT_DECOMMISSION),
+        )
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(
+        survivors, 1,
+        "the decommission's own audit record must survive the same purge \
+         that just freed its shard's ordinary backlog -- it is the one \
+         durable proof of who authorised giving up that shard's export window"
+    );
+}
+
 #[tokio::test]
 async fn every_tick_refreshes_the_exporter_heartbeat() {
     let _guard = TEST_SERIAL.lock().await;
