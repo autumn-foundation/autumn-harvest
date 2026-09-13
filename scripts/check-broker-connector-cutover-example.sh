@@ -39,9 +39,16 @@ for f in "$doc" "$src"; do
 done
 
 # The doc's example: its SourceBinding::starts(...) call is unique in the
-# chapter, and .key_incarnation("2026-08-cutover") 6 lines below it closes
-# the block.
-doc_block="$(grep -A 6 -F 'SourceBinding::starts("orders", "orders", "order_flow")' "$doc")"
+# chapter. Read to the fence's own closing ``` rather than a fixed line
+# count -- flagged in review: a fixed `-A N` window silently stops
+# validating anything appended after that offset but still inside the
+# fence, so a later edit could grow the example, drift from the compiled
+# copy, and still print OK.
+doc_block="$(awk '
+  /SourceBinding::starts\("orders", "orders", "order_flow"\)/ { flag = 1 }
+  flag && /^```$/ { exit }
+  flag { print }
+' "$doc")"
 
 if [ -z "$doc_block" ]; then
   echo "$doc: could not find the cutover example's" \
@@ -53,9 +60,9 @@ fi
 
 if ! grep -qF 'key_incarnation("2026-08-cutover")' <<<"$doc_block"; then
   echo "$doc: found SourceBinding::starts(\"orders\", \"orders\"," \
-    "\"order_flow\") but not .key_incarnation(\"2026-08-cutover\") within" \
-    "6 lines of it; has the cutover example moved or grown? Update this" \
-    "guard (and the compiled copy in $src) to match." >&2
+    "\"order_flow\") but not .key_incarnation(\"2026-08-cutover\") before" \
+    "the fence closes; has the cutover example moved or changed shape?" \
+    "Update this guard (and the compiled copy in $src) to match." >&2
   exit 1
 fi
 
