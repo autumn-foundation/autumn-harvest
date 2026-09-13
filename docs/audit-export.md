@@ -225,8 +225,20 @@ call outlived its lease — and whose batch a later claim already re-delivered �
 cannot apply a stale outcome over a fresher one, and a redrive that lands
 mid-flight cannot be silently undone.
 
-The exporter rides the existing background-scanner cadence
-(`enforce_timeouts_once`); it spawns no task of its own.
+The exporter runs on its own dedicated task, one per assigned shard
+(`spawn_audit_export_checker_for_shard`, issue #1269). It previously rode
+`enforce_timeouts_once`'s cadence and connection, so a slow sink delayed
+every other resident of that loop, and a one-connection shard pool could
+never export at all: the export call needed a second connection from the
+pool while the checker already held the first.
+
+Splitting it out ends that permanent deadlock, and the task's own
+connection handling (`export_once_via_pool`) closes the follow-on gap a
+later review round found: it checks a connection out for the claim, releases
+it, delivers with no connection held at all, then checks one out again for
+the acknowledgement. A slow or hung sink therefore never occupies a
+one-connection shard pool during delivery, so it cannot delay the timeout
+checker either.
 
 ### Retention interaction
 
@@ -235,16 +247,25 @@ shipped, even one past the retention window. A sweep that removed an unexported
 row would be a silent compliance gap — gone from the database *and* absent from
 the SIEM, with nothing anywhere to show it was lost.
 
-The guard applies when **either** signal says an exporter still owes this
-shard records:
+The guard applies when either signal says an exporter still owes this shard
+records — but the two are not simply OR'd. **A shard's own cursor row, once
+it exists, is authoritative**, retired or not:
 
-- **A cursor row exists for the shard.** Durable, shared state, so it works when
-  retention and export run in **different processes** — a split web/worker
-  deployment where only the worker configures the sink would otherwise have the
-  web app's retention sweep delete rows the worker still owes.
-- **A sink is configured in the sweeping process.** Covers the window before the
-  exporter's first tick on a shard has created the cursor row at all (freshly
-  enabled, newly added to the fleet, or a shard whose pool has been failing).
+- **A live (non-retired) cursor row exists for the shard.** Durable, shared
+  state, so it works when retention and export run in **different
+  processes** — a split web/worker deployment where only the worker
+  configures the sink would otherwise have the web app's retention sweep
+  delete rows the worker still owes.
+- **No cursor row exists yet, and a sink is configured in the sweeping
+  process.** Covers the window before the exporter's first tick on a shard
+  has created the cursor row at all (freshly enabled, newly added to the
+  fleet, or a shard whose pool has been failing).
+
+A **retired** cursor row falls into neither case, so it protects nothing —
+regardless of whether a sink happens to be configured for the rest of the
+fleet (issue #1273). That is what makes decommissioning a shard actually
+free its own backlog: the shard's own `retired_at` decides, not the
+process-wide "is any sink configured anywhere" signal.
 
 The guard is deliberately **not** time-based. An earlier revision expired it 24
 hours after the exporter's last heartbeat, so a long worker outage lifted it. A
@@ -252,13 +273,21 @@ timeout cannot distinguish "export was intentionally removed" from "the worker
 has been down since Friday", and it resolves that ambiguity by deleting audit
 records during exactly the outage where they matter most.
 
-### Retiring audit export on a shard
+One pair of records is exempt from the guard entirely: `audit_export.decommission`
+and `audit_export.reactivate` rows are never purged, on any shard, live or
+retired (issue #1273). These describe the audit-export system's own lifecycle
+controls, and the shard a decommission targets can never export its own
+record about itself — see "Retiring and reactivating" below.
 
-Because the guard never expires on its own, turning export off is an explicit
-operator action:
+### Retiring and reactivating audit export on a shard
 
-```rust
-autumn_harvest::audit_export::decommission_cursor(&mut conn, shard_id).await?;
+Because the guard never expires on its own, turning export off is an explicit,
+audited operator action (issue #1273):
+
+```bash
+curl -X POST https://app.example.com/api/harvest/admin/audit-export/decommission \
+  -H 'Content-Type: application/json' \
+  -d '{"shard": 0}'
 ```
 
 This marks the cursor **retired**; the row itself is never deleted, because its
@@ -267,23 +296,58 @@ retention ignores it, a redrive against that shard is refused with `404` rather
 than reporting a rewind whose records nothing will ship, the status route
 reports `delivery_state: "RETIRED"` with a zero backlog, and any delivery still
 in flight is invalidated — retiring bumps the cursor's `claim_epoch`, so an
-attempt claimed beforehand can no longer apply its outcome afterwards. Retiring is what tells
-retention that nothing owes this shard records any more, so the next sweep
-purges its aged audit rows normally. Do this
-only once you accept that any records the shard had not yet shipped will never
-reach the SIEM.
+attempt claimed beforehand can no longer apply its outcome afterwards. Retiring
+is what tells retention that nothing owes this shard records any more, so the
+next sweep purges its aged audit rows normally. Do this only once you accept
+that any records the shard had not yet shipped will never reach the SIEM.
+
+**The decommission is itself audited** (`audit_export.decommission`), in the
+same one-transaction-one-connection shape as a redrive: an
+applied-but-unaudited retirement is not representable. A shard already
+retired, or never configured, changes nothing but is still audited — the
+answer to "who asked to give up this compliance window" cannot depend on
+whether the request happened to be the first one.
+
+The primary record above lands on the shard whose own exporter this call
+just stopped, so it can never reach the SIEM from there — and in a
+single-shard deployment that shard is the only one there is. What makes the
+guarantee hold anyway: `purge_old_audit_records` never purges an
+`audit_export.decommission` or `.reactivate` record, on any shard, live or
+retired. That record is permanent — a durability guarantee, not an export
+one. A genuine retirement additionally writes a second, best-effort audit
+record on a different, still-exporting default shard, for an actual chance
+at reaching the SIEM; a failure there is logged and does not fail the
+request, since the permanent record already satisfies the compliance
+contract on its own.
 
 Stopping the exporter alone does **not** restore purging — the guard keys on
 the cursor row, not on the sweeping process's sink configuration, which is what
 makes it safe across a split web/worker deployment. Both steps are required.
 
-Re-enabling export afterwards is safe: the next exporter tick un-retires the
-cursor and resumes from the preserved `last_assigned_seq`, so new records
-continue the sequence instead of re-issuing numbers that already name different
-records — which a receiver deduping on `(shard, seq)`, exactly as this document
-instructs it to, would silently discard. This holds even when retention purged
-every stamped row in the meantime, which is why the cursor is retired rather
-than deleted. Records purged while retired are gone and are not re-delivered.
+Resuming export is the sibling route:
+
+```bash
+curl -X POST https://app.example.com/api/harvest/admin/audit-export/reactivate \
+  -H 'Content-Type: application/json' \
+  -d '{"shard": 0}'
+```
+
+This is safe: it resumes from the preserved `last_assigned_seq`, so new
+records continue the sequence instead of re-issuing numbers that already name
+different records — which a receiver deduping on `(shard, seq)`, exactly as
+this document instructs it to, would silently discard. This holds even when
+retention purged every stamped row in the meantime, which is why the cursor is
+retired rather than deleted. Records purged while retired are gone and are not
+re-delivered.
+
+Reactivation used to be an implicit side effect of the exporter's next scanner
+tick, which had two problems (issue #1273): a scanner tick already under way
+when an operator decommissioned a shard could un-retire it moments later with
+no coordination, silently undoing the operator's decision; and resuming export
+had no audit trail of its own, same as decommissioning did not. Reactivation
+is now this dedicated, audited route, and `ensure_cursor_row` never clears
+`retired_at` under any circumstance — the only way from `RETIRED` back to live
+is this call.
 
 Until then, a sink left down indefinitely lets the audit table grow past its
 retention window. That is the deliberate trade — unbounded growth is loud
@@ -330,6 +394,14 @@ and tenant-identifying (ADR-0001 §7).
 > to see. The oldest-record age is the one an SLO like "export lag < 30s p99"
 > can actually be measured against.
 
+> **A bounded precision limit (issue #1271).** `occurred_at` is transaction
+> start time. A long transaction can commit, and so become visible to the
+> exporter, after a shorter one that started later. The gauge finds the
+> true oldest pending record within the lowest `EXPORT_LAG_LOOKBACK_ROWS`
+> (1000) pending sequences. Skew beyond that many rows is not reflected.
+> `GET /admin/audit-export` runs the unbounded, exact query instead — use
+> it to confirm a reading this gauge cannot fully resolve.
+
 The gauge is emitted on **every** exporter tick, including ticks that deliver
 nothing — the signal must not go stale precisely when delivery has stopped.
 
@@ -371,8 +443,8 @@ Read-only, admin-gated, cross-shard.
 ```
 
 `delivery_state` is `IDLE`, `DELIVERING`, `BACKOFF`, `RETRYING`, `RETIRED`, or
-`NOT_STARTED`. `RETIRED` means an operator ran `decommission_cursor`: no
-exporter owes this shard records and retention may purge them, so the row's
+`NOT_STARTED`. `RETIRED` means an operator ran `POST /admin/audit-export/decommission`:
+no exporter owes this shard records and retention may purge them, so the row's
 other fields are a frozen snapshot rather than live state.
 
 `sink_configured` reports whether **the process serving this request** has a
@@ -421,6 +493,12 @@ Three properties worth knowing:
   and timestamp order can disagree; anchoring this way means any skew makes the
   rewind reach *further back* (costing duplicate deliveries your receiver
   dedupes) rather than skipping records the operator asked for.
+  **Known gap (issue #1508):** that lowest sequence is found among *surviving*
+  rows. If retention already purged the earliest records at or after the
+  instant, `before` silently resolves as if they were never part of the
+  window — `already_purged_records` (below) cannot see a prefix the resolver
+  itself already dropped. `to_seq` does not have this gap: it names an exact
+  position, so `already_purged_records` is exact for it.
 - **The redrive is itself audited** (`audit_export.redrive`), so re-exporting is
   as auditable as the operations being exported. The rewind and its audit
   record are **one transaction on one connection** — the audit row is written
@@ -437,9 +515,19 @@ Three properties worth knowing:
   moved, and the trail must not say otherwise.
 - **It invalidates in-flight deliveries.** The rewind bumps the shard's claim
   epoch, so a batch already in flight cannot acknowledge over it.
+- **The response says what it can actually deliver, not just what you asked
+  for** (issue #1267). Retention does not take the cursor row's lock, so a
+  sweep can read the cursor before this redrive rewinds it and purge part of
+  the window the redrive is about to promise back. The `200` response carries
+  `recoverable_records` — records in `(to, from]` that still exist, counted
+  in the same transaction as the rewind — and `already_purged_records`, the
+  rest of that window, gone before this redrive could reach it.
+  `already_purged_records` is `0` on the common path, where nothing raced the
+  rewind.
 
 Only records still present in the audit table can be re-exported; a redrive
-past the retention window returns whatever survives.
+past the retention window returns whatever survives, and
+`already_purged_records` in the response says how much that was.
 
 ---
 

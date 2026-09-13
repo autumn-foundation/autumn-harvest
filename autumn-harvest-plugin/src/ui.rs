@@ -9,7 +9,7 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
@@ -199,7 +199,7 @@ code.sample{display:inline-block;margin:0 4px 2px 0;font-size:11px;color:#cbd5e1
 .kv .v{color:#e2e8f0;word-break:break-all}
 pre{background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:12px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;margin:0}
 .error-banner{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px}
-.filters .field-error{display:block;background:#7f1d1d;color:#fee2e2;padding:2px 8px;border-radius:4px;font-size:11px;margin-top:4px}
+.field-error{display:block;background:#7f1d1d;color:#fee2e2;padding:2px 8px;border-radius:4px;font-size:11px;margin-top:4px}
 .empty{color:#94a3b8;font-style:italic;padding:24px;text-align:center}
 .detail-row{display:flex;gap:16px;align-items:center;margin-bottom:16px;flex-wrap:wrap}
 .detail-row .back{color:#93c5fd;font-size:13px}
@@ -250,9 +250,9 @@ footer{padding:20px 24px;color:#94a3b8;font-size:12px;text-align:center;border-t
 #[derive(Debug, Deserialize)]
 pub(crate) struct WorkflowListParams {
     #[serde(default)]
-    page: Option<i64>,
+    page: Option<String>,
     #[serde(default)]
-    limit: Option<i64>,
+    limit: Option<String>,
     #[serde(default)]
     state: Option<String>,
     #[serde(default)]
@@ -1107,11 +1107,17 @@ async fn list_workflows_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Query(params): Query<WorkflowListParams>,
 ) -> Result<Markup, AutumnError> {
-    let limit = params
-        .limit
-        .unwrap_or(DEFAULT_PAGE_SIZE)
-        .clamp(1, MAX_PAGE_SIZE);
-    let page = params.page.unwrap_or(0).max(0);
+    // Issue: `page`/`limit` were still typed `Option<i64>` directly on this
+    // struct — the two fields left over after #1333 fixed every other
+    // filter here. A non-numeric value on either aborted the whole page
+    // with a bare, unstyled 400. That 400 landed before the filter form or
+    // any workflow row rendered. It discarded every filter the operator
+    // had entered. `parse_page_query_field`/`parse_limit_query_field`
+    // degrade to a default and report the bad value inline instead, the
+    // same "one field costs, not the page" contract as
+    // `parse_started_bound`.
+    let (limit, limit_raw, limit_error) = parse_limit_query_field(params.limit.as_deref());
+    let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
     let offset = page.saturating_mul(limit);
 
     let state_filter = params
@@ -1212,7 +1218,64 @@ async fn list_workflows_ui(
         exec_id_search.as_deref(),
         active_gate_count,
         &unavailable_shards,
+        &limit_raw,
+        limit_error.as_deref(),
+        page_error.as_deref(),
     ))
+}
+
+/// Parses the workflow list page's `page` query parameter (zero-based).
+///
+/// A non-numeric value falls back to page 0 and reports the bad value
+/// inline, instead of aborting the whole page render. Returns
+/// `(page, raw_display, error)`, the same contract as
+/// [`parse_shard_id_filter`].
+fn parse_page_query_field(raw: Option<&str>) -> (i64, String, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (0, String::new(), None);
+    };
+    trimmed.parse::<i64>().map_or_else(
+        |_| {
+            (
+                0,
+                trimmed.to_string(),
+                Some(format!(
+                    "Invalid page '{trimmed}'; expected a whole number. Showing page 1."
+                )),
+            )
+        },
+        // A well-formed but negative page number is clamped, not rejected.
+        // The raw text is left empty so a caller displays the clamped
+        // value, not the pre-clamp text. This matches the pre-fix
+        // `.unwrap_or(0).max(0)` display.
+        |parsed| (parsed.max(0), String::new(), None),
+    )
+}
+
+/// Parses the workflow list page's `limit` ("Per page") query parameter.
+///
+/// Same contract as [`parse_page_query_field`], falling back to
+/// `DEFAULT_PAGE_SIZE` instead of aborting the page.
+fn parse_limit_query_field(raw: Option<&str>) -> (i64, String, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (DEFAULT_PAGE_SIZE, String::new(), None);
+    };
+    trimmed.parse::<i64>().map_or_else(
+        |_| {
+            (
+                DEFAULT_PAGE_SIZE,
+                trimmed.to_string(),
+                Some(format!(
+                    "Invalid limit '{trimmed}'; expected a whole number. Showing {DEFAULT_PAGE_SIZE} per page."
+                )),
+            )
+        },
+        // Same as `parse_page_query_field`: a well-formed but out-of-range
+        // limit is clamped silently, the pre-fix behavior. The raw text is
+        // left empty rather than displayed alongside a different effective
+        // value.
+        |parsed| (parsed.clamp(1, MAX_PAGE_SIZE), String::new(), None),
+    )
 }
 
 /// Parses an optional RFC 3339 `started_after`/`started_before` filter bound
@@ -2542,19 +2605,33 @@ async fn load_dead_letters_from_shards_for_ui(
                 let rows = query_dead_letters_for_ui(&mut conn, filters, limit)
                     .await
                     .map_err(|e| e.to_string())?;
+                // Deduplicated. Two dead letters can share one execution.
+                // An `unnest($1::uuid[])` id appearing twice would run the
+                // per-id LATERAL event lookup twice for that id. The rendered
+                // event count would double instead of staying capped at 10.
+                let exec_ids: Vec<uuid::Uuid> = rows
+                    .iter()
+                    .filter_map(|d| d.workflow_exec_id)
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                let (names, events) = load_dead_letter_details_batch(&mut conn, &exec_ids)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let mut out = Vec::with_capacity(rows.len());
                 for dead_letter in rows {
-                    let workflow_name = load_dead_letter_workflow_name(&mut conn, &dead_letter)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let events = load_dead_letter_events(&mut conn, &dead_letter)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    let workflow_name = dead_letter
+                        .workflow_exec_id
+                        .and_then(|id| names.get(&id).cloned());
+                    let row_events = dead_letter
+                        .workflow_exec_id
+                        .and_then(|id| events.get(&id).cloned())
+                        .unwrap_or_default();
                     out.push(DeadLetterUiRow {
                         shard_id,
                         dead_letter,
                         workflow_name,
-                        events,
+                        events: row_events,
                     });
                 }
                 Ok(out)
@@ -2643,39 +2720,71 @@ async fn count_dead_letters_for_ui(
     query.count().get_result(conn).await.map_err(database_error)
 }
 
-async fn load_dead_letter_workflow_name(
+/// Batched replacement for two lookups this function used to run once per
+/// dead letter in a page (`load_dead_letter_workflow_name` and
+/// `load_dead_letter_events`). A page holds up to `MAX_PAGE_SIZE` (200) rows.
+/// The old shape issued up to 400 extra round trips per page load. Each
+/// round trip was cheap alone, an index lookup or less. The count stayed
+/// invisible in a buffer-ranked profile and dominant in a calls-ranked one.
+///
+/// Returns `(workflow_name_by_exec_id, last_10_events_by_exec_id)`. A dead
+/// letter absent from a map had no matching row. That matches the `None` or
+/// empty `Vec` the old per-row functions returned for the same case.
+async fn load_dead_letter_details_batch(
     conn: &mut AsyncPgConnection,
-    dead_letter: &DeadLetter,
-) -> HarvestResult<Option<String>> {
-    let Some(exec_id) = dead_letter.workflow_exec_id else {
-        return Ok(None);
-    };
-    harvest_workflow_executions::table
-        .find(exec_id)
-        .select(harvest_workflow_executions::workflow_name)
-        .first(conn)
-        .await
-        .optional()
-        .map_err(database_error)
-}
+    exec_ids: &[uuid::Uuid],
+) -> HarvestResult<(
+    HashMap<uuid::Uuid, String>,
+    HashMap<uuid::Uuid, Vec<HarvestEvent>>,
+)> {
+    if exec_ids.is_empty() {
+        return Ok((HashMap::new(), HashMap::new()));
+    }
 
-async fn load_dead_letter_events(
-    conn: &mut AsyncPgConnection,
-    dead_letter: &DeadLetter,
-) -> HarvestResult<Vec<HarvestEvent>> {
-    let Some(exec_id) = dead_letter.workflow_exec_id else {
-        return Ok(Vec::new());
-    };
-    let mut events = harvest_events::table
-        .filter(harvest_events::workflow_exec_id.eq(exec_id))
-        .order(harvest_events::event_id.desc())
-        .limit(10)
-        .select(HarvestEvent::as_select())
-        .load(conn)
+    let names: HashMap<uuid::Uuid, String> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::id.eq_any(exec_ids))
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::workflow_name,
+        ))
+        .load::<(uuid::Uuid, String)>(conn)
         .await
-        .map_err(database_error)?;
-    events.reverse();
-    Ok(events)
+        .map_err(database_error)?
+        .into_iter()
+        .collect();
+
+    // One `LATERAL`-per-id "last 10" query instead of N separate
+    // `ORDER BY ... LIMIT 10` queries. Each `LATERAL` subquery uses the
+    // same `idx_harvest_events_exec (workflow_exec_id, event_id)` index
+    // the old per-row query relied on. The outer `ORDER BY` groups each
+    // id's rows in ascending `event_id` order already, so no per-group
+    // reverse step is needed here. The old function fetched descending
+    // order and reversed each group in Rust instead.
+    let rows: Vec<HarvestEvent> = diesel::sql_query(
+        "SELECT e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e.timestamp \
+         FROM unnest($1::uuid[]) AS w(exec_id) \
+         CROSS JOIN LATERAL ( \
+             SELECT * FROM harvest_events \
+             WHERE workflow_exec_id = w.exec_id \
+             ORDER BY event_id DESC \
+             LIMIT 10 \
+         ) e \
+         ORDER BY e.workflow_exec_id, e.event_id",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(exec_ids)
+    .load(conn)
+    .await
+    .map_err(database_error)?;
+
+    let mut events: HashMap<uuid::Uuid, Vec<HarvestEvent>> = HashMap::new();
+    for event in rows {
+        events
+            .entry(event.workflow_exec_id)
+            .or_default()
+            .push(event);
+    }
+
+    Ok((names, events))
 }
 
 // ---------------------------------------------------------------------------
@@ -4539,6 +4648,9 @@ fn render_workflow_list(
     exec_id_search: Option<&str>,
     active_gate_count: usize,
     unavailable_shards: &[UnavailableShard],
+    limit_raw: &str,
+    limit_error: Option<&str>,
+    page_error: Option<&str>,
 ) -> Markup {
     // Issue #756: name the unreachable shard(s) so a partial list is not read
     // as the authoritative fleet state.
@@ -4575,7 +4687,7 @@ fn render_workflow_list(
             }
         }
 
-        (render_filters(state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_after_error, started_before_raw, started_before_error, exec_id_search, limit))
+        (render_filters(state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_after_error, started_before_raw, started_before_error, exec_id_search, limit, limit_raw, limit_error))
 
         @if workflows.is_empty() {
             div.card.empty { "No workflows match this filter." }
@@ -4609,7 +4721,7 @@ fn render_workflow_list(
             }
         }
 
-        (render_pagination(page, limit, has_next, state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_before_raw, exec_id_search))
+        (render_pagination(page, limit, limit_raw, has_next, state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_before_raw, exec_id_search, page_error))
     };
 
     layout("Workflows · Vantage", &body, "")
@@ -4626,11 +4738,21 @@ fn render_filters(
     started_before_error: Option<&str>,
     exec_id_search: Option<&str>,
     limit: i64,
+    limit_raw: &str,
+    limit_error: Option<&str>,
 ) -> Markup {
     let (attr_key, attr_value) =
         search_attr_filter.map_or(("", ""), |(k, v)| (k.as_str(), v.as_str()));
     let workflow_name_value = workflow_name_filter.unwrap_or("");
     let exec_id_search_value = exec_id_search.unwrap_or("");
+    // Echo exactly what the operator typed on a parse failure, matching
+    // `started_after`/`started_before`. Fall back to the resolved value
+    // when the field was absent or already valid.
+    let limit_value = if limit_raw.is_empty() {
+        limit.to_string()
+    } else {
+        limit_raw.to_string()
+    };
 
     html! {
         form.filters method="get" action="workflows" {
@@ -4680,7 +4802,16 @@ fn render_filters(
             }
             label {
                 "Per page"
-                input type="number" name="limit" min="1" max=(MAX_PAGE_SIZE) value=(limit);
+                // `type="text"`, not `type="number"`. A number input
+                // sanitizes an invalid value (e.g. "not-a-number") to
+                // blank at render time. The operator could then never see
+                // or correct their own bad input. This matches the Workers
+                // page's `shard` filter, the other redisplayable numeric
+                // field in this file.
+                input type="text" inputmode="numeric" pattern="[0-9]*" name="limit" value=(limit_value);
+                @if let Some(error) = limit_error {
+                    span.field-error role="alert" { (error) }
+                }
             }
             button type="submit" { "Apply" }
             a.reset href="workflows" { "Reset" }
@@ -4692,6 +4823,7 @@ fn render_filters(
 fn render_pagination(
     page: i64,
     limit: i64,
+    limit_raw: &str,
     has_next: bool,
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
@@ -4699,9 +4831,11 @@ fn render_pagination(
     started_after_raw: &str,
     started_before_raw: &str,
     exec_id_search: Option<&str>,
+    page_error: Option<&str>,
 ) -> Markup {
     let base_query = build_query_string(
         limit,
+        limit_raw,
         state_filter,
         workflow_name_filter,
         search_attr_filter,
@@ -4711,6 +4845,9 @@ fn render_pagination(
     );
 
     html! {
+        @if let Some(error) = page_error {
+            span.field-error role="alert" { (error) }
+        }
         div.pagination {
             @if page > 0 {
                 a href={ "workflows?page=" (page - 1) (PreEscaped(&base_query)) } {
@@ -4736,6 +4873,7 @@ fn render_pagination(
 #[allow(clippy::too_many_arguments)]
 fn build_query_string(
     limit: i64,
+    limit_raw: &str,
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
     search_attr_filter: Option<&(String, String)>,
@@ -4744,7 +4882,14 @@ fn build_query_string(
     exec_id_search: Option<&str>,
 ) -> String {
     let mut out = String::new();
-    if limit != DEFAULT_PAGE_SIZE {
+    // `limit_raw` is non-empty only on a genuine parse failure (see
+    // `parse_limit_query_field`), never for a valid-but-clamped value. An
+    // invalid limit the operator has not yet corrected must not silently
+    // vanish from a Next/Previous link, the same carry-through as
+    // `started_after`/`started_before` below.
+    if !limit_raw.is_empty() {
+        let _ = write!(out, "&limit={}", url_encode(limit_raw));
+    } else if limit != DEFAULT_PAGE_SIZE {
         let _ = write!(out, "&limit={limit}");
     }
     if let Some(state) = state_filter {
@@ -11358,6 +11503,142 @@ mod tests {
         );
     }
 
+    /// Codex review finding on this PR: on a successful parse, `raw` must be
+    /// empty, not an echo of the input. `render_filters`/`build_query_string`
+    /// treat a non-empty raw as "still invalid, keep displaying the bad
+    /// text". Echoing valid text there is harmless when it already matches
+    /// the resolved value. See the clamping test below for where it is not.
+    #[test]
+    fn parse_page_query_field_accepts_valid_values() {
+        assert_eq!(parse_page_query_field(Some("3")), (3, String::new(), None));
+        assert_eq!(
+            parse_page_query_field(Some("  7  ")),
+            (7, String::new(), None)
+        );
+    }
+
+    /// Codex review finding on this PR: a negative page number parses. It is
+    /// a well-formed whole number, and is clamped, matching the pre-fix
+    /// `.unwrap_or(0).max(0)` behavior. `raw` must stay empty, though, so a
+    /// caller displays the clamped `0`, not the pre-clamp `"-5"` alongside
+    /// it.
+    #[test]
+    fn parse_page_query_field_clamps_negative_values_to_zero() {
+        assert_eq!(parse_page_query_field(Some("-5")), (0, String::new(), None));
+    }
+
+    /// GREEN -- the fix under test: a non-numeric `page` no longer aborts
+    /// the whole `/workflows` response. It degrades to page 0 while naming
+    /// the bad value, so every other filter the operator entered survives.
+    #[test]
+    fn parse_page_query_field_rejects_non_numeric_text_without_erroring() {
+        let (page, raw, error) = parse_page_query_field(Some("not-a-number"));
+        assert_eq!(page, 0, "an invalid page falls back to page 0");
+        assert_eq!(raw, "not-a-number", "the raw text is echoed back");
+        let message = error.expect("an invalid page must carry a redisplayable error");
+        assert!(
+            message.contains("not-a-number") && message.contains("page"),
+            "the error names the bad value and the field: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_page_query_field_blank_or_missing_is_not_an_error() {
+        assert_eq!(parse_page_query_field(None), (0, String::new(), None));
+        assert_eq!(
+            parse_page_query_field(Some("   ")),
+            (0, String::new(), None)
+        );
+    }
+
+    #[test]
+    fn parse_limit_query_field_accepts_valid_values() {
+        assert_eq!(
+            parse_limit_query_field(Some("50")),
+            (50, String::new(), None)
+        );
+    }
+
+    /// Codex review finding on this PR: a well-formed but out-of-range limit
+    /// (`0`, `100000`) is clamped, matching the pre-fix `.clamp(1,
+    /// MAX_PAGE_SIZE)` behavior. `raw` must stay empty here. Before this
+    /// fix, `render_filters` preferred a non-empty `raw` over the resolved
+    /// `limit`. The "Per page" field then displayed the pre-clamp text
+    /// (`"100000"`). Pagination actually used the clamped value (`200`) —
+    /// a silent mismatch with no error explaining it.
+    #[test]
+    fn parse_limit_query_field_clamps_out_of_range_values() {
+        assert_eq!(parse_limit_query_field(Some("0")), (1, String::new(), None));
+        assert_eq!(
+            parse_limit_query_field(Some("100000")),
+            (MAX_PAGE_SIZE, String::new(), None)
+        );
+    }
+
+    /// GREEN -- the fix under test: a non-numeric `limit` no longer aborts
+    /// the whole `/workflows` response. It degrades to `DEFAULT_PAGE_SIZE`
+    /// while naming the bad value, matching `parse_page_query_field`.
+    #[test]
+    fn parse_limit_query_field_rejects_non_numeric_text_without_erroring() {
+        let (limit, raw, error) = parse_limit_query_field(Some("a-lot"));
+        assert_eq!(
+            limit, DEFAULT_PAGE_SIZE,
+            "an invalid limit falls back to the default page size"
+        );
+        assert_eq!(raw, "a-lot", "the raw text is echoed back");
+        let message = error.expect("an invalid limit must carry a redisplayable error");
+        assert!(
+            message.contains("a-lot") && message.contains("limit"),
+            "the error names the bad value and the field: {message}"
+        );
+    }
+
+    /// Codex review finding on this PR: a `type="number"` input sanitizes an
+    /// invalid value to blank at render time in a real browser. The
+    /// operator could then never see or edit the exact text they typed.
+    /// That holds even though the HTML source already carried it — and
+    /// thus this test, if it only checked `contains("not-a-number")`. The
+    /// "Per page" field must be a text control, matching the Workers page's
+    /// `shard` filter.
+    #[test]
+    fn per_page_input_is_a_text_control_that_can_hold_invalid_text() {
+        let markup = render_filters(
+            None,
+            None,
+            None,
+            "",
+            None,
+            "",
+            None,
+            None,
+            DEFAULT_PAGE_SIZE,
+            "not-a-number",
+            Some("invalid limit 'not-a-number'"),
+        )
+        .into_string();
+        assert!(
+            markup
+                .contains(r#"input type="text" inputmode="numeric" pattern="[0-9]*" name="limit""#),
+            "the Per page field must be a text control, not type=\"number\": {markup}"
+        );
+        assert!(
+            markup.contains("value=\"not-a-number\""),
+            "the operator's invalid input must be preserved: {markup}"
+        );
+    }
+
+    #[test]
+    fn parse_limit_query_field_blank_or_missing_is_not_an_error() {
+        assert_eq!(
+            parse_limit_query_field(None),
+            (DEFAULT_PAGE_SIZE, String::new(), None)
+        );
+        assert_eq!(
+            parse_limit_query_field(Some("   ")),
+            (DEFAULT_PAGE_SIZE, String::new(), None)
+        );
+    }
+
     /// Issue #619: with nothing paused **and** every shard readable, the banner
     /// must render nothing at all, so a healthy Workers page is byte-identical to
     /// before the feature.
@@ -11816,19 +12097,28 @@ mod tests {
     #[test]
     fn build_query_string_omits_default_limit() {
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, None, None, None, "", "", None),
+            build_query_string(DEFAULT_PAGE_SIZE, "", None, None, None, "", "", None),
             ""
         );
         assert_eq!(
-            build_query_string(10, None, None, None, "", "", None),
+            build_query_string(10, "", None, None, None, "", "", None),
             "&limit=10"
         );
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, Some("FAILED"), None, None, "", "", None),
+            build_query_string(
+                DEFAULT_PAGE_SIZE,
+                "",
+                Some("FAILED"),
+                None,
+                None,
+                "",
+                "",
+                None
+            ),
             "&state=FAILED"
         );
         assert_eq!(
-            build_query_string(50, Some("with space"), None, None, "", "", None),
+            build_query_string(50, "", Some("with space"), None, None, "", "", None),
             "&limit=50&state=with%20space"
         );
     }
@@ -11838,6 +12128,7 @@ mod tests {
         assert_eq!(
             build_query_string(
                 DEFAULT_PAGE_SIZE,
+                "",
                 None,
                 Some("onboarding"),
                 None,
@@ -11849,7 +12140,7 @@ mod tests {
         );
         let pair = ("tenant".to_string(), "acme".to_string());
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, None, None, Some(&pair), "", "", None),
+            build_query_string(DEFAULT_PAGE_SIZE, "", None, None, Some(&pair), "", "", None),
             "&search_attr_key=tenant&search_attr_value=acme"
         );
     }
@@ -11862,12 +12153,51 @@ mod tests {
     #[test]
     fn build_query_string_preserves_invalid_date_text_for_pagination() {
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, None, None, None, "yesterday", "", None),
+            build_query_string(
+                DEFAULT_PAGE_SIZE,
+                "",
+                None,
+                None,
+                None,
+                "yesterday",
+                "",
+                None
+            ),
             "&started_after=yesterday"
         );
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, None, None, None, "", "not-a-date", None),
+            build_query_string(
+                DEFAULT_PAGE_SIZE,
+                "",
+                None,
+                None,
+                None,
+                "",
+                "not-a-date",
+                None
+            ),
             "&started_before=not-a-date"
+        );
+    }
+
+    /// Same Codex finding, the `limit` field. `limit_raw` is non-empty only
+    /// on a genuine parse failure (`parse_limit_query_field`). It must
+    /// override the resolved `limit` in the link, rather than being
+    /// dropped alongside it.
+    #[test]
+    fn build_query_string_preserves_invalid_limit_text_for_pagination() {
+        assert_eq!(
+            build_query_string(
+                DEFAULT_PAGE_SIZE,
+                "not-a-number",
+                None,
+                None,
+                None,
+                "",
+                "",
+                None
+            ),
+            "&limit=not-a-number"
         );
     }
 
@@ -11880,6 +12210,7 @@ mod tests {
         assert_eq!(
             build_query_string(
                 DEFAULT_PAGE_SIZE,
+                "",
                 None,
                 None,
                 None,

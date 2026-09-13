@@ -245,6 +245,137 @@ pub const fn workflow_history_ceiling_query() -> &'static str {
      WHERE event_count >= $1"
 }
 
+/// The one query shape behind all three external-outbox scanners
+/// (issue #1486).
+///
+/// The three scanners differ only in the request type they claim, the two
+/// events that resolve it, and the payload key that correlates them. The
+/// shape must stay identical across the three, so it is written once here
+/// and substituted, rather than copied.
+///
+/// `$1` is the caller's shard assignment list. `$2` is the per-sweep list of
+/// event ids this sweep already gave up on.
+///
+/// # Why the executions join is a `LATERAL`, and the resolution check is not
+///
+/// The executions join is pinned to its correlated form on purpose. A `LIMIT
+/// 1` inside a `LATERAL` cannot be pulled up into the outer query, so the
+/// shape is structural. `harvest_workflow_executions.id` is the primary key,
+/// so the subquery returns at most one row with or without that `LIMIT`, and
+/// the pin changes no result. It is also free: the same query with this join
+/// written as an ordinary `INNER JOIN` measures 6,350 buffers against 6,358.
+/// The pin buys a plan that cannot change shape with the statistics, at no
+/// measured cost. That is the whole argument for it.
+///
+/// The resolution check stays a `NOT EXISTS`, and that is also measured. An
+/// earlier revision of this change pinned it the same way, as a `LEFT JOIN
+/// LATERAL ... WHERE res.resolved IS NULL`. The two forms select the same
+/// rows. The outer join costs twice as much.
+///
+/// The reason is join order, and it only shows once resolved requests
+/// accumulate. `harvest_events` is append-only, so a request row stays in
+/// `idx_harvest_events_external_outbox_pending` after it resolves. Every
+/// claim walks those rows and discards them. As an anti-join the planner
+/// runs the resolution probe first and lifts the executions probe above it,
+/// so the executions probe runs once. An outer join cannot be reordered, so
+/// both probes run for every row about to be discarded. Measured over a
+/// backlog of 8,000 resolved requests: 24,253 buffers against 48,253.
+///
+/// # Why the `ORDER BY`
+///
+/// `ORDER BY e.timestamp, e.id` pins the outer scan. Only
+/// `idx_harvest_events_external_outbox_pending` produces that order. Every
+/// competing plan needs a sort, and a sort under `LIMIT 1` must read every
+/// candidate first. The ordered index scan returns after one row. It wins
+/// whatever the row estimate says.
+///
+/// `ORDER BY e.id` alone does not pin it. `harvest_events_pkey` supplies
+/// that order too. Under an inflated estimate the planner walks the primary
+/// key, and filters every unrelated event out of a full ascending scan.
+/// Prefixing the order with `event_type` does not help either. The planner
+/// drops a column that the `WHERE` clause pins to a constant, because the
+/// remaining order is all it has to satisfy.
+///
+/// The order is also the drain order. `timestamp` is the request instant the
+/// grace-window check already reads, and `id` breaks ties. The oldest
+/// pending request goes first, so newer arrivals cannot starve a backlog.
+/// Note `timestamp` is caller-settable, so this is request order and not
+/// append order; `id` is append order and decides every tie.
+macro_rules! external_outbox_claim_query {
+    (requested = $requested:literal, resolved = ($first:literal, $second:literal), key = $key:literal) => {
+        concat!(
+            "SELECT e.* FROM harvest_events e \
+             JOIN LATERAL ( \
+                 SELECT 1 AS running_exec FROM harvest_workflow_executions x \
+                 WHERE x.id = e.workflow_exec_id \
+                   AND x.state = 'RUNNING' \
+                   AND x.shard_id = ANY($1) \
+                 LIMIT 1 \
+             ) running ON TRUE \
+             WHERE e.event_type = '",
+            $requested,
+            "' \
+               AND (e.event_data->'data'->>'",
+            $key,
+            "') IS NOT NULL \
+               AND NOT (e.id = ANY($2)) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM harvest_events res \
+                   WHERE res.workflow_exec_id = e.workflow_exec_id \
+                     AND res.event_type IN ('",
+            $first,
+            "', '",
+            $second,
+            "') \
+                     AND res.event_data->'data'->>'",
+            $key,
+            "' = e.event_data->'data'->>'",
+            $key,
+            "' \
+               ) \
+             ORDER BY e.timestamp, e.id \
+             LIMIT 1 \
+             FOR UPDATE OF e SKIP LOCKED"
+        )
+    };
+}
+
+/// SQL behind the external-signal outbox scanner
+/// ([`enforce_external_signals_outbox`], issue #1146). Shape and plan
+/// rationale: [`external_outbox_claim_query`].
+#[must_use]
+pub const fn external_signal_outbox_claim_query() -> &'static str {
+    external_outbox_claim_query!(
+        requested = "ExternalSignalRequested",
+        resolved = ("ExternalSignalDelivered", "ExternalSignalFailed"),
+        key = "signal_id"
+    )
+}
+
+/// SQL behind the external-cancel outbox scanner
+/// ([`enforce_external_cancels_outbox`], issue #1146). Shape and plan
+/// rationale: [`external_outbox_claim_query`].
+#[must_use]
+pub const fn external_cancel_outbox_claim_query() -> &'static str {
+    external_outbox_claim_query!(
+        requested = "ExternalCancelRequested",
+        resolved = ("ExternalCancelDelivered", "ExternalCancelFailed"),
+        key = "cancel_id"
+    )
+}
+
+/// SQL behind the external-await outbox scanner
+/// ([`enforce_external_awaits_outbox`], issue #1146). Shape and plan
+/// rationale: [`external_outbox_claim_query`].
+#[must_use]
+pub const fn external_await_outbox_claim_query() -> &'static str {
+    external_outbox_claim_query!(
+        requested = "ExternalAwaitRequested",
+        resolved = ("ExternalAwaitResolved", "ExternalAwaitFailed"),
+        key = "await_id"
+    )
+}
+
 /// SQL query to find RUNNING workflow executions that have exceeded either their
 /// per-run `execution_timeout` deadline (issue #243) OR their chain-scoped
 /// lifetime cap deadline (issue #617).
@@ -2836,21 +2967,7 @@ pub async fn enforce_external_signals_outbox(
                 let shards = shards_clone;
                 let codecs = codecs_clone;
                 let excluded = excluded_clone;
-                let sql = "SELECT e.* FROM harvest_events e \
-                           INNER JOIN harvest_workflow_executions execs ON e.workflow_exec_id = execs.id \
-                           WHERE e.event_type = 'ExternalSignalRequested' \
-                             AND execs.state = 'RUNNING' \
-                             AND execs.shard_id = ANY($1) \
-                             AND (e.event_data->'data'->>'signal_id') IS NOT NULL \
-                             AND NOT (e.id = ANY($2)) \
-                             AND NOT EXISTS ( \
-                                 SELECT 1 FROM harvest_events res \
-                                 WHERE res.workflow_exec_id = e.workflow_exec_id \
-                                   AND res.event_type IN ('ExternalSignalDelivered', 'ExternalSignalFailed') \
-                                   AND res.event_data->'data'->>'signal_id' = e.event_data->'data'->>'signal_id' \
-                             ) \
-                           LIMIT 1 \
-                           FOR UPDATE OF e SKIP LOCKED";
+                let sql = external_signal_outbox_claim_query();
 
                 let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
@@ -3320,21 +3437,7 @@ pub async fn enforce_external_cancels_outbox(
                 let shards = shards_clone;
                 let codecs = codecs_clone;
                 let excluded = excluded_clone;
-                let sql = "SELECT e.* FROM harvest_events e \
-                           INNER JOIN harvest_workflow_executions execs ON e.workflow_exec_id = execs.id \
-                           WHERE e.event_type = 'ExternalCancelRequested' \
-                             AND execs.state = 'RUNNING' \
-                             AND execs.shard_id = ANY($1) \
-                             AND (e.event_data->'data'->>'cancel_id') IS NOT NULL \
-                             AND NOT (e.id = ANY($2)) \
-                             AND NOT EXISTS ( \
-                                 SELECT 1 FROM harvest_events res \
-                                 WHERE res.workflow_exec_id = e.workflow_exec_id \
-                                   AND res.event_type IN ('ExternalCancelDelivered', 'ExternalCancelFailed') \
-                                   AND res.event_data->'data'->>'cancel_id' = e.event_data->'data'->>'cancel_id' \
-                             ) \
-                           LIMIT 1 \
-                           FOR UPDATE OF e SKIP LOCKED";
+                let sql = external_cancel_outbox_claim_query();
 
                 let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
@@ -3877,21 +3980,7 @@ pub async fn enforce_external_awaits_outbox(
                 let shards = shards_clone;
                 let codecs = codecs_clone;
                 let excluded = excluded_clone;
-                let sql = "SELECT e.* FROM harvest_events e \
-                           INNER JOIN harvest_workflow_executions execs ON e.workflow_exec_id = execs.id \
-                           WHERE e.event_type = 'ExternalAwaitRequested' \
-                             AND execs.state = 'RUNNING' \
-                             AND execs.shard_id = ANY($1) \
-                             AND (e.event_data->'data'->>'await_id') IS NOT NULL \
-                             AND NOT (e.id = ANY($2)) \
-                             AND NOT EXISTS ( \
-                                 SELECT 1 FROM harvest_events res \
-                                 WHERE res.workflow_exec_id = e.workflow_exec_id \
-                                   AND res.event_type IN ('ExternalAwaitResolved', 'ExternalAwaitFailed') \
-                                   AND res.event_data->'data'->>'await_id' = e.event_data->'data'->>'await_id' \
-                             ) \
-                           LIMIT 1 \
-                           FOR UPDATE OF e SKIP LOCKED";
+                let sql = external_await_outbox_claim_query();
 
                 let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
@@ -4150,47 +4239,13 @@ pub async fn enforce_timeouts_once(
     payload_codecs: &crate::payload_codec::PayloadCodecs,
     codec_rotation_batch_size: i64,
 ) -> HarvestResult<usize> {
-    // Off-box audit-record export (issue #953) runs FIRST, and its failures are
-    // logged rather than propagated. Both halves are deliberate, and both were
-    // wrong in an earlier revision that simply appended the call to the end of
-    // this function (Codex review round 26 P1).
-    //
-    // First, because a resident BEFORE it can `return Err` on every tick -- a
-    // task whose history will not decode, say, because its payload codec is
-    // unavailable -- and audit export would then never run on that shard again.
-    // Records would accumulate unexported, and because the lag gauge is written
-    // inside the export pass it would go stale rather than climb, so neither
-    // the threshold alert nor the absent-series alert could fire. A compliance
-    // gap that hides its own signal.
-    //
-    // Logged rather than propagated, because the mirror of that hazard is just
-    // as bad: an export failure must not stop timeout enforcement, SLA checks,
-    // session cleanup or codec rotation. This is the same "one failure must
-    // never stop the others" rule already applied per-shard inside
-    // `fire_due_audit_exports`, lifted to the residents of this loop.
+    // Off-box audit-record export (issue #953) used to run here, sharing
+    // this loop's connection and cadence. Issue #1269 moved it to its own
+    // task, `crate::audit_export::spawn_audit_export_checker_for_shard`. A
+    // slow sink no longer delays timeout enforcement, SLA checks, session
+    // cleanup, or codec rotation. A `max_size(1)` shard pool no longer
+    // needs a second connection while this loop still holds the first.
     let mut count = 0usize;
-    match crate::audit_export::fire_due_audit_exports(
-        conn,
-        sharded_pool,
-        shard_assignments,
-        metrics,
-    )
-    .await
-    {
-        // Deliberately NOT folded into `count`, for the same reason the codec
-        // re-encryption sweep below keeps its own total out of it: `count` is
-        // the timeout-enforcement total, and the caller logs
-        // `warn!("enforced timed-out tasks")` whenever it is non-zero. Folding
-        // exported records in makes every healthy export tick claim a timeout
-        // that never happened -- a 500-record batch would report
-        // `enforced_count=500`. Export reports itself through
-        // `harvest.audit.export_*` instead.
-        Ok(_exported) => {}
-        Err(error) => tracing::error!(
-            error = %error,
-            "[audit_export] export pass failed; continuing with the rest of the scanner"
-        ),
-    }
     // Refresh this process's active codec key from the durable, fleet-wide
     // `harvest_codec_key_state` table (issue #1244). Placed here, before the
     // first `?`-propagating resident, deliberately.
@@ -4204,8 +4259,7 @@ pub async fn enforce_timeouts_once(
     // staleness window as satisfied.
     //
     // Shard-local, on this connection, and never allowed to break the rest
-    // of the tick. Same posture as the audit-export call above and the
-    // re-encryption sweep below.
+    // of the tick. Same posture as the re-encryption sweep below.
     match crate::codec_rotation::refresh_active_codec_key(conn, payload_codecs).await {
         Ok(_flipped) => {}
         Err(e) => tracing::warn!(
@@ -4584,21 +4638,11 @@ pub fn spawn_timeout_checker_for_shard(
                 },
                 Ok(Err(e)) => {
                     tracing::error!(error = %e, "failed to acquire DB connection for timeout check");
-                    mark_audit_export_unobserved_for_checker_shard(
-                        &*telemetry.metrics,
-                        sharded_pool.as_ref(),
-                        &shard_assignments,
-                    );
                 }
                 Err(_elapsed) => {
                     tracing::error!(
                         ?interval,
                         "pool acquisition exceeded the tick interval; skipping this tick"
-                    );
-                    mark_audit_export_unobserved_for_checker_shard(
-                        &*telemetry.metrics,
-                        sharded_pool.as_ref(),
-                        &shard_assignments,
                     );
                 }
             }
@@ -4625,52 +4669,6 @@ pub fn spawn_timeout_checker_for_shard(
             crate::scanner_health::deregister_scanner(owner);
         }
     })
-}
-
-/// Mark unobserved, for audit export, every shard this checker's own tick
-/// would have driven `fire_due_audit_exports` over (issue #1268, Codex
-/// review).
-///
-/// `enforce_timeouts_once` — and therefore `fire_due_audit_exports` — never
-/// runs on a tick where this loop cannot get its own connection. Without
-/// this call, every such shard leaves `harvest.audit.export_observed`
-/// frozen at its last reading, which can be a stale `1` from before the
-/// outage.
-///
-/// Deliberately ignores this loop's own `shard` label. It matches on
-/// `sharded_pool`/`shard_assignments` alone, mirroring
-/// `fire_due_audit_exports`'s own sharded/unsharded split exactly. The
-/// public, legacy `spawn_timeout_checker` entry point passes `shard: None`
-/// for a process-wide loop. That loop can still cover a real, non-default
-/// `shard_assignments` list (e.g. `[7]`). Labelling only the pool's default
-/// shard there would mark the wrong shard unobserved, leaving the
-/// actually-affected one frozen.
-///
-/// A no-op when audit export is not configured (AC8): this checker loop
-/// runs for every worker, and most never touch audit export.
-fn mark_audit_export_unobserved_for_checker_shard(
-    metrics: &(dyn MetricsRecorder + Send + Sync),
-    sharded_pool: Option<&crate::shard::ShardedDbPool>,
-    shard_assignments: &[crate::types::ShardId],
-) {
-    if !crate::audit_export::is_configured() {
-        return;
-    }
-    match sharded_pool {
-        Some(_) if !shard_assignments.is_empty() => {
-            for shard in shard_assignments {
-                metrics.record_audit_export_observed(
-                    u16::try_from(shard.as_i32()).unwrap_or(u16::MAX),
-                    false,
-                );
-            }
-        }
-        _ => {
-            let shard_id = sharded_pool.map_or(0, |pool| pool.default_shard().as_i32());
-            metrics
-                .record_audit_export_observed(u16::try_from(shard_id).unwrap_or(u16::MAX), false);
-        }
-    }
 }
 
 /// Terminate RUNNING workflow executions whose durable event count has reached
@@ -5316,67 +5314,6 @@ mod tests {
         }
     }
 
-    /// Audit export must run before the first `?` in the pass, and its own
-    /// failure must never abort the pass (issue #953).
-    ///
-    /// Two directions, one hazard each:
-    ///
-    /// - **Export before the first `?`.** Every resident after the export call
-    ///   can return `Err` and end the tick. If export moved below one of them, a
-    ///   single permanently-failing resident — a task whose enforcement errors on
-    ///   every pass — would stop compliance delivery for the whole shard
-    ///   indefinitely, and the backlog would grow silently.
-    /// - **Export's own error swallowed.** Conversely, if the export call grew a
-    ///   `?`, a sink outage would abort timeout enforcement, SLA checks and
-    ///   session cleanup — letting a compliance feature take down the scanner.
-    ///
-    /// Source-level for the same reason as
-    /// `locked_deadline_reread_never_precedes_the_execution_lock` above: the
-    /// hazard is *statement order*, which no behavioural assertion can see.
-    ///
-    /// It is also the only form this guard can take. The natural dynamic test —
-    /// seed a due task whose enforcement fails, assert the export still happened
-    /// — cannot be written: `harvest_task_queue.workflow_exec_id` is a foreign
-    /// key, so a task naming a nonexistent execution cannot be inserted, and an
-    /// unregistered payload codec decodes to the `undecodable_marker` rather
-    /// than erroring (issue #608). There is no supported way to seed a
-    /// deterministically-failing resident.
-    #[test]
-    fn audit_export_runs_before_the_first_fallible_resident() {
-        let src = include_str!("timeout.rs");
-        let start = src
-            .find("pub async fn enforce_timeouts_once(")
-            .expect("enforce_timeouts_once must exist");
-        let body = &src[start..];
-        let end = body[1..]
-            .find("\npub async fn ")
-            .map_or(body.len(), |o| o + 1);
-        let body = &body[..end];
-
-        let export = body
-            .find("fire_due_audit_exports(")
-            .expect("the pass must fire due audit exports");
-        let first_fallible = body
-            .find("find_timed_out_tasks(conn).await?")
-            .expect("the timed-out-task scan must stay the first fallible resident");
-        assert!(
-            export < first_fallible,
-            "audit export must run BEFORE the first resident that can `?` out of              the pass; below it, one permanently-failing task stops compliance              delivery for the whole shard"
-        );
-
-        let handled = &body[export..first_fallible];
-        assert!(
-            handled.contains("Err(error) => tracing::error!"),
-            "the export call must log and continue on error, never `?`; a sink              outage must not abort timeout enforcement for the shard"
-        );
-        assert!(
-            !handled.contains(
-                "fire_due_audit_exports(conn, sharded_pool, shard_assignments, metrics).await?"
-            ),
-            "the export call must not propagate its error with `?`"
-        );
-    }
-
     /// The two deadline queries must differ only by `FOR UPDATE`, so the fast
     /// path can never disagree with the authoritative check about expiry.
     #[test]
@@ -5477,6 +5414,85 @@ mod tests {
         // carve-out — see the dedicated test below.)
         assert!(!heartbeat_timeout_query().contains("PAUSED"));
         assert!(!start_to_close_timeout_query().contains("PAUSED"));
+    }
+
+    /// Each outbox claim query names its own family, and only its own.
+    ///
+    /// The three come from one macro, so a transposed event type or
+    /// correlation key is the defect this catches. Every gate that runs the
+    /// SQL needs Postgres and the migration, so this runs in the default
+    /// lane instead.
+    #[test]
+    fn external_outbox_claim_queries_name_their_own_family() {
+        let families = [
+            (
+                external_signal_outbox_claim_query(),
+                "ExternalSignalRequested",
+                "ExternalSignalDelivered",
+                "ExternalSignalFailed",
+                "signal_id",
+            ),
+            (
+                external_cancel_outbox_claim_query(),
+                "ExternalCancelRequested",
+                "ExternalCancelDelivered",
+                "ExternalCancelFailed",
+                "cancel_id",
+            ),
+            // The await family resolves as `Resolved`, not `Delivered`.
+            (
+                external_await_outbox_claim_query(),
+                "ExternalAwaitRequested",
+                "ExternalAwaitResolved",
+                "ExternalAwaitFailed",
+                "await_id",
+            ),
+        ];
+
+        let all_keys = ["signal_id", "cancel_id", "await_id"];
+        for (sql, requested, first, second, key) in families {
+            assert!(
+                sql.contains(&format!("e.event_type = '{requested}'")),
+                "{sql}"
+            );
+            assert!(
+                sql.contains(&format!("IN ('{first}', '{second}')")),
+                "{sql}"
+            );
+            for other in all_keys {
+                let occurrences = sql.matches(&format!("'{other}'")).count();
+                if other == key {
+                    assert!(occurrences > 0, "{requested} must key on {key}: {sql}");
+                } else {
+                    assert_eq!(
+                        occurrences, 0,
+                        "{requested} must not mention {other}: {sql}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The claim queries keep the four clauses their plan and their
+    /// concurrency contract depend on.
+    #[test]
+    fn external_outbox_claim_queries_keep_their_plan_pins() {
+        for sql in [
+            external_signal_outbox_claim_query(),
+            external_cancel_outbox_claim_query(),
+            external_await_outbox_claim_query(),
+        ] {
+            // Pins the outer scan to idx_harvest_events_external_outbox_pending.
+            assert!(sql.contains("ORDER BY e.timestamp, e.id"), "{sql}");
+            // Pins the executions lookup to a correlated probe.
+            assert!(sql.contains("JOIN LATERAL"), "{sql}");
+            // Keeps the resolution check an anti-join, so a discarded
+            // candidate does not also pay the executions probe.
+            assert!(sql.contains("NOT EXISTS"), "{sql}");
+            assert!(!sql.contains("LEFT JOIN LATERAL"), "{sql}");
+            // The concurrency contract the drain loop relies on.
+            assert!(sql.contains("FOR UPDATE OF e SKIP LOCKED"), "{sql}");
+        }
     }
 
     #[test]

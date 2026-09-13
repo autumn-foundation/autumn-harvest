@@ -3895,7 +3895,7 @@
           "description": "A nested self-referential completion-trigger admission (cancelling an incumbent synchronously starts a new run under the same on_conflict = cancel_running key) left the key transiently over its declared limit \u2014 the outer admission is protected from being shed, so the nested pass has nothing left it may cancel. Self-healing on the next ordinary admission for the key (issue #1197)."
         },
         {
-          "id": 956,
+          "id": 959,
           "type": "timeseries",
           "title": "Quota supersede credit not shed",
           "datasource": {
@@ -5715,7 +5715,7 @@
               }
             }
           ],
-          "description": "Liveness heartbeat rate of each background control loop (issue #797). Every loop ticks on EVERY iteration, including no-work iterations, so a series that flat-lines to zero means that loop is wedged (panicked, deadlocked, or stalled on a never-returning query) -- not merely idle. Kept per-instance deliberately: every replica runs its own copy of all seven loops, so summing across instances would let a healthy replica mask a wedged one. Note `retention` polls hourly by default, so at short rate intervals its line sits indistinguishably near zero when healthy -- judge it on the 3h panel beside this one, whose window is longer than the janitor's cadence. Alert: harvest_scanner_stalled. Bounded `scanner` label (7 values); execution.id is never a label (ADR-0001 SS7)."
+          "description": "Liveness heartbeat rate of each background control loop (issue #797). Every loop ticks on EVERY iteration, including no-work iterations, so a series that flat-lines to zero means that loop is wedged (panicked, deadlocked, or stalled on a never-returning query) -- not merely idle. Kept per-instance deliberately: every replica runs its own copy of all eight loops, so summing across instances would let a healthy replica mask a wedged one. Note `retention` polls hourly by default, so at short rate intervals its line sits indistinguishably near zero when healthy -- judge it on the 3h panel beside this one, whose window is longer than the janitor's cadence. `audit_export` has the same caveat for a different reason: its per-tick duration is bounded by the operator-configurable audit_export_lease, not the poll interval, so a healthy in-flight delivery can legitimately flat-line this line for longer than $__rate_interval -- the harvest_scanner_stalled alert's own audit_export expression uses a wider 10m window for exactly this reason, so treat that alert (or the scanner_liveness preflight check, which accounts for the lease directly) as authoritative over this raw-rate panel for that series. Alert: harvest_scanner_stalled. Bounded `scanner` label (8 values); execution.id is never a label (ADR-0001 SS7)."
         },
         {
           "id": 927,
@@ -6239,7 +6239,7 @@
       "description": "Alert: harvest_audit_export_unobservable (docs/runbooks/harvest-alerts.md#harvest_audit_export_unobservable) Whether the exporter could read this shard's cursor and lag this tick \u2014 a connection it cannot acquire, a failed cursor read, or a failed lag query all report 0. Read this panel FIRST: a Prometheus gauge keeps exporting its last value, so while this is 0 the lag panel above is frozen at its last reading rather than reflecting reality."
     },
     {
-      "id": 957,
+      "id": 959,
       "type": "timeseries",
       "title": "RPO known (0 = readable but unmeasurable)",
       "datasource": {

@@ -24098,6 +24098,16 @@ struct WorkerMonitoringHandles {
     timeout_checkers: Vec<tokio::task::JoinHandle<()>>,
     poison_pill_reclaimers: Vec<tokio::task::JoinHandle<()>>,
     pause_auto_resumers: Vec<tokio::task::JoinHandle<()>>,
+    /// Dedicated per-shard audit-export tasks (issue #1269). One per assigned
+    /// shard, mirroring `timeout_checkers`.
+    audit_export_checkers: Vec<tokio::task::JoinHandle<()>>,
+    /// `scanner_liveness` registrations for a shard skipped because
+    /// `ShardedDbPool` had no exact pool entry for it (Codex review on PR
+    /// #1520, follow-up P2, seventh round). No task owns these. There is
+    /// nothing to join, but each must still be deregistered at shutdown.
+    /// Otherwise it outlives this worker, reporting a configuration
+    /// failure that no longer exists.
+    orphaned_audit_export_scanners: Vec<crate::scanner_health::ScannerOwner>,
     /// Worker-session local-registry reconcilers (issue #606). Empty when
     /// `db` is disabled.
     session_slot_reconcilers: Vec<tokio::task::JoinHandle<()>>,
@@ -25892,6 +25902,14 @@ impl Worker {
                 tracing::warn!(error = %error, "pause auto-resumer failed during shutdown");
             }
         }
+        for handle in monitors.audit_export_checkers {
+            if let Err(error) = handle.await {
+                tracing::warn!(error = %error, "audit-export checker failed during shutdown");
+            }
+        }
+        for owner in monitors.orphaned_audit_export_scanners {
+            crate::scanner_health::deregister_scanner(owner);
+        }
         if let Err(error) = monitors.queue_depth_sampler.await {
             tracing::warn!(error = %error, "queue depth sampler failed during shutdown");
         }
@@ -26499,6 +26517,83 @@ impl Worker {
                 )
             })
             .collect();
+        // One dedicated audit-export task per assigned shard (issue #1269).
+        // `enforce_timeouts_once` used to drive `fire_due_audit_exports`
+        // inline on this same cadence. Splitting it out ends the permanent
+        // self-deadlock a one-connection shard pool used to hit. The task
+        // also never holds its pooled connection across the network
+        // delivery (`audit_export::export_once_via_pool`, PR #1520 review).
+        // A slow sink no longer blocks the timeout checker for the
+        // duration of a delivery either.
+        let mut orphaned_audit_export_scanners: Vec<crate::scanner_health::ScannerOwner> =
+            Vec::new();
+        let audit_export_checkers: Vec<_> = shard_pools_for_monitors
+            .iter()
+            .filter_map(|(shard_pool, shard)| {
+                // Unlike the other per-shard monitors above, this resolves
+                // each shard's EXACT pool rather than trust `shard_pool` (a
+                // soft, default-shard-falling-back lookup via
+                // `ShardedDbPool::pool_for`). `fire_due_audit_exports`'s own
+                // sharded arm made the same choice, for the same reason. A
+                // wrong pool here would silently stamp one shard's audit
+                // rows under another shard's `(shard, seq)` key. That is
+                // worse than a loud, recoverable skip.
+                let resolved =
+                    if let (Some(s), Some(sp)) = (*shard, self.config.sharded_pool.as_ref()) {
+                        let Some(exact) = sp.exact_pool_for(s) else {
+                            tracing::error!(
+                                shard = s.as_i32(),
+                                "assigned shard has no exact pool entry in the sharded \
+                             pool; skipping its dedicated audit-export task rather \
+                             than risk stamping records under another shard's key"
+                            );
+                            // A shard with no task never reaches the checker's own
+                            // `export_observed` emission or its `scanner_liveness`
+                            // registration (Codex review on PR #1520, follow-up
+                            // P2, sixth round). Set the gauge here instead. A
+                            // healthy sibling shard's series could otherwise mask
+                            // this absence. It would then read as the "scanner
+                            // never runs here" case the alert notes call
+                            // legitimate, not the configuration failure it is.
+                            let shard_u16 = u16::try_from(s.as_i32()).unwrap_or(u16::MAX);
+                            self.registry
+                                .telemetry()
+                                .metrics
+                                .record_audit_export_observed(shard_u16, false);
+                            // Never ticked, so it ages straight into `Stale`
+                            // then `Wedged` on the ordinary schedule --
+                            // `scanner_liveness` needs no separate "missing
+                            // pool" case to surface this. Kept, not dropped,
+                            // so this worker's shutdown can deregister it
+                            // (Codex review on PR #1520, follow-up P2,
+                            // seventh round). Dropped here instead, it would
+                            // outlive this worker. A later, correctly
+                            // configured worker in this process would then
+                            // inherit a phantom failure that is not its own.
+                            orphaned_audit_export_scanners.push(
+                                crate::scanner_health::register_scanner_for_shard(
+                                    self.registry.telemetry().metrics.as_ref(),
+                                    crate::scanner_health::Scanner::AuditExport,
+                                    self.config.poll_interval,
+                                    Some(s),
+                                ),
+                            );
+                            return None;
+                        };
+                        exact.clone()
+                    } else {
+                        shard_pool.clone()
+                    };
+                Some(crate::audit_export::spawn_audit_export_checker_for_shard(
+                    resolved,
+                    self.shutdown.clone(),
+                    self.config.poll_interval,
+                    self.registry.telemetry().clone(),
+                    *shard,
+                    self.config.sharded_pool.as_ref(),
+                ))
+            })
+            .collect();
         let history_oversized_sampler = spawn_history_oversized_sampler(
             sampler_pools.clone(),
             self.shutdown.clone(),
@@ -26742,6 +26837,8 @@ impl Worker {
             timeout_checkers,
             poison_pill_reclaimers,
             pause_auto_resumers,
+            audit_export_checkers,
+            orphaned_audit_export_scanners,
             session_slot_reconcilers,
             quota_key_reconcilers,
             history_oversized_sampler,
@@ -27456,6 +27553,18 @@ impl Worker {
                 );
             }
         }
+        for handle in monitors.audit_export_checkers {
+            if let Err(error) = handle.await {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "audit-export checker task failed during shutdown"
+                );
+            }
+        }
+        for owner in monitors.orphaned_audit_export_scanners {
+            crate::scanner_health::deregister_scanner(owner);
+        }
         if let Err(error) = monitors.queue_depth_sampler.await {
             tracing::warn!(
                 worker_id = %self.config.worker_id,
@@ -28019,6 +28128,10 @@ impl Worker {
         let registry = Arc::clone(&self.registry);
         let task_id = task.id;
         let task_type = task.task_type.clone();
+        // The `crash_strikes` this dispatch claimed the row at. It is the claim
+        // epoch, so a release can apply to this claim and not merely to this
+        // worker. Only `poison_pill::requeue_orphan` changes it.
+        let claim_crash_strikes = task.crash_strikes;
         let worker_id = self.config.worker_id.clone();
         let build_id = self.config.build_id.clone();
         let cancellation_grace_period = self.config.cancellation_grace_period;
@@ -28202,6 +28315,42 @@ impl Worker {
                             error = %error,
                             "task execution failed"
                         );
+                        // Release the claim so the row stays retryable (issue
+                        // #1459). A workflow task that returns an error here
+                        // keeps its claim: `state` is `RUNNING` and `worker_id`
+                        // is this worker. Nothing recovers that row. The
+                        // in-process timeout above cannot fire, because
+                        // `process_task` already returned. The orphan reclaimer
+                        // skips a task that a live worker owns. So the execution
+                        // wedges until this worker stops.
+                        //
+                        // The dominant error here is a Postgres deadlock. The
+                        // parent's decision cycle and a child's terminal write
+                        // contend under load. Postgres aborts one side so the
+                        // other proceeds, and the aborted side must retry. An
+                        // aborted transaction wrote nothing, so a retry replays
+                        // the same cycle from the same history.
+                        //
+                        // Measured with issue #1459's recipe, four copies pinned
+                        // to two CPUs, rounds alternating between builds: 7
+                        // wedges in 16 runs before, 0 in 16 after.
+                        //
+                        // The reset is guarded on `state = 'RUNNING' AND
+                        // worker_id = <self>`, so it never disturbs a row that a
+                        // reclaim or a new owner already took. The slot is
+                        // dropped first, as the timeout arm does, so recovery
+                        // I/O holds no concurrency permit.
+                        #[cfg(feature = "db")]
+                        if task_type == "workflow" {
+                            drop(permit);
+                            reset_timed_out_workflow_task(
+                                &pool,
+                                task_id,
+                                &worker_id,
+                                claim_crash_strikes,
+                            )
+                            .await;
+                        }
                     }
                     Ok(TaskDispatchOutcome::BodyTimedOut) => {
                         // Release the concurrency slot immediately so other
@@ -28289,7 +28438,13 @@ impl Worker {
                                 // Reset the task to PENDING so any worker can
                                 // re-claim it on the next poll, without waiting
                                 // for the orphan-reclaim staleness window.
-                                reset_timed_out_workflow_task(&pool, task_id, &worker_id).await;
+                                reset_timed_out_workflow_task(
+                                    &pool,
+                                    task_id,
+                                    &worker_id,
+                                    claim_crash_strikes,
+                                )
+                                .await;
                             }
                         }
                         #[cfg(not(feature = "db"))]
@@ -28330,6 +28485,30 @@ impl Worker {
                         error = %error,
                         "task execution failed"
                     );
+                    // Release the claim here too (issue #1459, Codex P1 on PR
+                    // #1497). This arm runs when the task is not a workflow
+                    // task. It also runs when `with_workflow_task_timeout` is
+                    // `Duration::ZERO`. The builder documents that value as a
+                    // supported way to disable the wall-clock guard. A workflow
+                    // task on that path met the same abandoned claim, so the
+                    // recovery cannot live only in the timed arm.
+                    //
+                    // An activity task needs nothing here. Its `heartbeat_timeout`
+                    // and `start_to_close` columns give the server-side scan in
+                    // `timeout::find_timed_out_tasks` a deadline to find it by. A
+                    // workflow task has no such column, which is why only its
+                    // claim strands.
+                    #[cfg(feature = "db")]
+                    if task_type == "workflow" {
+                        drop(permit);
+                        reset_timed_out_workflow_task(
+                            &pool,
+                            task_id,
+                            &worker_id,
+                            claim_crash_strikes,
+                        )
+                        .await;
+                    }
                 }
             }
         };
@@ -28846,7 +29025,12 @@ const RESET_POOL_RETRY_BACKOFF_MS: &[u64] =
 /// Uses an optimistic `WHERE state = 'RUNNING' AND worker_id = …` guard so a
 /// concurrent reclaim or a different worker that somehow picked it up does not
 /// get its state overwritten.
-pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, worker_id: &str) {
+pub async fn reset_timed_out_workflow_task(
+    pool: &DbPool,
+    task_id: uuid::Uuid,
+    worker_id: &str,
+    claim_crash_strikes: i32,
+) {
     use crate::schema::harvest_task_queue::dsl;
 
     // Retry acquiring a pool connection: a transient pool saturation during
@@ -28893,7 +29077,15 @@ pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, w
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING"))
-            .filter(dsl::worker_id.eq(worker_id)),
+            .filter(dsl::worker_id.eq(worker_id))
+            // Claim-epoch guard (issue #1459). It is the same race
+            // `queue::release_task_for_capability_miss` already guards.
+            // `poison_pill::requeue_orphan` hands an orphan back as `PENDING`
+            // with `crash_strikes + 1`, and the same worker can win it again.
+            // A `(state, worker_id)` guard alone then matches that new claim.
+            // This reset would re-`PENDING` a row whose replacement handler
+            // already runs, and invite a second concurrent dispatch.
+            .filter(dsl::crash_strikes.eq(claim_crash_strikes)),
     )
     .set((
         dsl::state.eq("PENDING"),

@@ -422,10 +422,14 @@ pub fn classify_export_outcome(
 
 /// Result of resolving an operator's redrive request against the live
 /// cursor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RewindOutcome {
     /// The cursor moves backwards from `from` to `to`; every record with
     /// `seq > to` re-exports.
+    ///
+    /// Not every record in `(to, from]` is guaranteed to still exist. Retention
+    /// can purge part of that window first — see
+    /// [`count_redrive_recoverable`] (issue #1267).
     Rewound { from: i64, to: i64 },
     /// Nothing to do — the request did not move the cursor backwards.
     NoOp { cursor: i64, requested: i64 },
@@ -701,6 +705,41 @@ impl AuditExportBuilderConfig {
 /// to police normal contention on a busy pool.
 pub const SHARD_ACQUIRE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Bound reserved for the acknowledgement query itself, on top of
+/// [`SHARD_ACQUIRE_BOUND`] (Codex review on PR #1520, follow-up P2).
+///
+/// `SHARD_ACQUIRE_BOUND` alone only reserves time for the post-delivery
+/// connection checkout. A checkout that uses nearly all of that bound
+/// leaves `apply_outcome` no margin before `lease_until`. A second exporter
+/// could then reclaim the shard first, and the acknowledgement would be
+/// rejected even though the batch was genuinely delivered.
+///
+/// This reserves additional time for that query alone. Deliberately
+/// generous for a single guarded `UPDATE`, matching `SHARD_ACQUIRE_BOUND`'s
+/// own margin above normal-case latency.
+pub const ACK_QUERY_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Splits a reserve between the post-delivery checkout and the
+/// acknowledgement query. The split keeps their uncapped proportion
+/// (Codex review on PR #1520, follow-up P1).
+///
+/// The caller never passes a `reserve` above `SHARD_ACQUIRE_BOUND` plus
+/// `ACK_QUERY_BOUND`, only at or below it. So this only ever shrinks the
+/// two bounds together, never widens either one. A short lease can cap
+/// `reserve` well below their sum.
+///
+/// Using the fixed, uncapped bounds for each step regardless would let the
+/// checkout alone consume a reserve meant to cover both steps. The
+/// acknowledgement would then get no margin at all.
+#[cfg(feature = "db")]
+fn split_reserve(reserve: std::time::Duration) -> (std::time::Duration, std::time::Duration) {
+    let total = SHARD_ACQUIRE_BOUND + ACK_QUERY_BOUND;
+    let checkout_nanos = reserve.as_nanos() * SHARD_ACQUIRE_BOUND.as_nanos() / total.as_nanos();
+    let checkout =
+        std::time::Duration::from_nanos(u64::try_from(checkout_nanos).unwrap_or(u64::MAX));
+    (checkout, reserve.saturating_sub(checkout))
+}
+
 /// Default lease held on a shard's cursor while a batch is in flight.
 ///
 /// Long enough to cover a slow sink, short enough that a crashed exporter's
@@ -875,7 +914,8 @@ pub struct ClaimedBatch {
     pub lease_until: DateTime<Utc>,
 }
 
-/// Create this shard's cursor row if it does not exist, and stamp it as alive.
+/// Create this shard's cursor row if it does not exist, and heartbeat it if it
+/// does. **Never reactivates a retired cursor** — see issue #1273.
 ///
 /// Deliberately not seeded by the migration: a shard's database cannot know
 /// its own shard id (see the migration's comment, and
@@ -902,11 +942,9 @@ pub async fn ensure_cursor_row(
     // `(shard, seq)` pair that names a *different* record is the one way to
     // make a receiver deduping on that pair discard genuine audit events.
     //
-    // 1. The row is retired rather than deleted (`decommission_cursor`), so
+    // 1. The row is retired rather than deleted ([`decommission_cursor`]), so
     //    `last_assigned_seq` survives even when retention later purges every
-    //    stamped row (issue #953, Codex review round 7 P1). The ON CONFLICT
-    //    arm therefore only clears `retired_at` -- re-enabling export resumes
-    //    the preserved counter, and never resets it.
+    //    stamped row (issue #953).
     // 2. The INSERT arm still seeds from `MAX(export_seq)` rather than 0, for
     //    the paths where the row genuinely went missing anyway: a manual
     //    DELETE, a partial restore (round 4 P1). Restarting at 0 there would
@@ -917,10 +955,28 @@ pub async fn ensure_cursor_row(
     // stamped rows re-delivers them rather than assuming they shipped:
     // at-least-once, deduped by the receiver on a now-stable pair, erring
     // toward re-export over silent loss.
+    //
+    // The ON CONFLICT arm is guarded by `WHERE retired_at IS NULL` (issue
+    // #1273). This call used to clear `retired_at` unconditionally.
+    //
+    // That was a race. A scanner tick reads its config, then calls this
+    // function, with no lock held in between. A tick already under way when
+    // an operator runs [`decommission_cursor`] can still reach this call
+    // afterwards, and used to silently un-retire the shard.
+    //
+    // Postgres checks an `ON CONFLICT DO UPDATE ... WHERE` predicate under
+    // the same lock that resolves the conflict. So this is race-free by
+    // construction: whichever of this call and a decommission commits first
+    // wins, and a retired row is now a no-op here. It gets no heartbeat and
+    // no un-retire.
+    //
+    // Resuming a retired shard is [`reactivate_cursor`]: an explicit, audited
+    // operator action, not a side effect of the exporter noticing new work.
     diesel::sql_query(
         "INSERT INTO harvest_audit_export_cursor (shard_id, last_assigned_seq) \
          SELECT $1, COALESCE(MAX(export_seq), 0) FROM harvest_audit_log \
-         ON CONFLICT (shard_id) DO UPDATE SET updated_at = NOW(), retired_at = NULL",
+         ON CONFLICT (shard_id) DO UPDATE SET updated_at = NOW() \
+         WHERE harvest_audit_export_cursor.retired_at IS NULL",
     )
     .bind::<diesel::sql_types::Integer, _>(shard_id)
     .execute(conn)
@@ -929,7 +985,55 @@ pub async fn ensure_cursor_row(
     Ok(())
 }
 
-/// Remove a shard's export cursor, re-enabling audit retention there.
+/// Result of resolving a decommission or reactivate request against the live
+/// cursor. The two share a shape because they are inverse transitions of the
+/// same state machine — see issue #1273.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecommissionOutcome {
+    /// The cursor moved from active to retired.
+    Retired,
+    /// The cursor was already retired. Idempotent: no write happened.
+    AlreadyRetired,
+    /// No cursor exists for this shard. There is nothing to retire.
+    NotConfigured,
+}
+
+/// The reactivate-side counterpart of [`DecommissionOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReactivateOutcome {
+    /// The cursor moved from retired back to active.
+    Reactivated,
+    /// The cursor was already active. Idempotent: no write happened.
+    AlreadyActive,
+    /// No cursor exists for this shard. There is nothing to reactivate.
+    NotConfigured,
+}
+
+/// Retire a shard's export cursor, re-enabling audit retention there.
+///
+/// Opens its own transaction. The management route pairs the retirement with
+/// its own audit record, so it uses [`decommission_cursor_locked`] instead —
+/// see that function.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub async fn decommission_cursor(
+    conn: &mut diesel_async::AsyncPgConnection,
+    shard_id: i32,
+    now: DateTime<Utc>,
+) -> crate::error::HarvestResult<DecommissionOutcome> {
+    use diesel_async::AsyncConnection;
+
+    Box::pin(
+        conn.transaction::<DecommissionOutcome, crate::error::HarvestError, _>(async |conn| {
+            decommission_cursor_locked(conn, shard_id, now).await
+        }),
+    )
+    .await
+}
+
+/// [`decommission_cursor`] without the surrounding transaction.
 ///
 /// The **explicit decommission step** for audit export (issue #953, Codex
 /// review round 3 P1). While a cursor row exists,
@@ -939,10 +1043,10 @@ pub async fn ensure_cursor_row(
 ///
 /// This deliberately replaced a 24-hour heartbeat TTL. A TTL cannot tell
 /// "export was intentionally removed" from "the worker has been down since
-/// Friday", and it resolves that ambiguity by *deleting audit records* — the
-/// one outcome this feature exists to prevent, arriving precisely during an
-/// outage. Unbounded table growth is the strictly better failure: it is loud
-/// (`harvest.audit.export_lag`, the `last_error` on
+/// Friday". It used to resolve that ambiguity by *deleting audit records* —
+/// the one outcome this feature exists to prevent, arriving precisely during
+/// an outage. Unbounded table growth is the strictly better failure: it is
+/// loud (`harvest.audit.export_lag`, the `last_error` on
 /// `GET /admin/audit-export`), it is bounded by the genuine unexported
 /// backlog rather than by the whole table (fully-acknowledged records are
 /// purged normally), and it is *reversible* — deleted audit records are not.
@@ -959,19 +1063,42 @@ pub async fn ensure_cursor_row(
 /// different records. Keeping the row makes the high-water mark durable
 /// independently of retention.
 ///
-/// Safe to reverse: the next [`ensure_cursor_row`] un-retires the row and
-/// resumes from the preserved `last_assigned_seq`, so re-enabling export
-/// continues the sequence. Records purged while retired are gone and are not
-/// re-delivered — `last_acked_seq` is preserved too.
+/// Reversible via [`reactivate_cursor`], an explicit, audited operator action
+/// that resumes from the preserved `last_assigned_seq`. Records purged while
+/// retired are gone and are not re-delivered — `last_acked_seq` is preserved
+/// too.
+///
+/// **Must be called inside a transaction.** On an autocommit connection the
+/// row lock below is released before the caller can pair it with anything.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
 #[cfg(feature = "db")]
-pub async fn decommission_cursor(
+pub async fn decommission_cursor_locked(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
-) -> crate::error::HarvestResult<bool> {
+    now: DateTime<Utc>,
+) -> crate::error::HarvestResult<DecommissionOutcome> {
+    use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
+
+    use crate::schema::harvest_audit_export_cursor::dsl as cur;
+
+    let cursor: Option<crate::models::AuditExportCursor> = cur::harvest_audit_export_cursor
+        .find(shard_id)
+        .select(crate::models::AuditExportCursor::as_select())
+        .for_update()
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+
+    let Some(cursor) = cursor else {
+        return Ok(DecommissionOutcome::NotConfigured);
+    };
+    if cursor.retired_at.is_some() {
+        return Ok(DecommissionOutcome::AlreadyRetired);
+    }
 
     // Bumping `claim_epoch` invalidates any delivery still in flight (issue
     // #953, Codex review round 13 P2). `apply_outcome` is guarded on
@@ -979,22 +1106,107 @@ pub async fn decommission_cursor(
     // before the retirement could land after it -- advancing the cursor or
     // writing backoff state onto a row the status route now reports as a
     // frozen `RETIRED` snapshot, and racing retention, which is permitted to
-    // purge the shard the moment it is retired. This is exactly what the epoch
-    // is for: it already exists so a slow attempt whose HTTP call outlives its
-    // lease cannot apply a stale outcome over a fresher one. Clearing
-    // `lease_until` in the same statement means the row does not also read as
-    // mid-delivery.
-    let retired = diesel::sql_query(
-        "UPDATE harvest_audit_export_cursor \
-         SET retired_at = NOW(), updated_at = NOW(), \
-             claim_epoch = claim_epoch + 1, lease_until = NULL \
-         WHERE shard_id = $1 AND retired_at IS NULL",
+    // purge the shard the moment it is retired. Clearing `lease_until` in the
+    // same statement means the row does not also read as mid-delivery.
+    diesel::update(cur::harvest_audit_export_cursor.find(shard_id))
+        .set((
+            cur::retired_at.eq(Some(now)),
+            cur::updated_at.eq(now),
+            cur::claim_epoch.eq(cursor.claim_epoch + 1),
+            cur::lease_until.eq(None::<DateTime<Utc>>),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(DecommissionOutcome::Retired)
+}
+
+/// Reactivate a shard's retired export cursor.
+///
+/// Opens its own transaction. The management route pairs the reactivation
+/// with its own audit record, so it uses [`reactivate_cursor_locked`] instead
+/// — see that function.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub async fn reactivate_cursor(
+    conn: &mut diesel_async::AsyncPgConnection,
+    shard_id: i32,
+    now: DateTime<Utc>,
+) -> crate::error::HarvestResult<ReactivateOutcome> {
+    use diesel_async::AsyncConnection;
+
+    Box::pin(
+        conn.transaction::<ReactivateOutcome, crate::error::HarvestError, _>(async |conn| {
+            reactivate_cursor_locked(conn, shard_id, now).await
+        }),
     )
-    .bind::<diesel::sql_types::Integer, _>(shard_id)
-    .execute(conn)
     .await
-    .map_err(crate::error::database_error)?;
-    Ok(retired > 0)
+}
+
+/// [`reactivate_cursor`] without the surrounding transaction.
+///
+/// The **explicit reactivate step** for audit export (issue #1273). It
+/// resumes a shard [`decommission_cursor_locked`] retired, from the
+/// preserved `last_assigned_seq`. New records continue the sequence, rather
+/// than re-issuing numbers a receiver already holds against different
+/// records.
+///
+/// This used to happen as a side effect of [`ensure_cursor_row`]: the next
+/// scanner tick after a re-enable un-retired the row on its own. That made
+/// resumption racy and silent. A scanner tick already under way when an
+/// operator retired a shard could un-retire it moments later. Neither
+/// transition left a record of who asked for it. Reactivation is now its
+/// own operator action, audited exactly like [`decommission_cursor_locked`].
+///
+/// **Must be called inside a transaction.** On an autocommit connection the
+/// row lock below is released before the caller can pair it with anything.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub async fn reactivate_cursor_locked(
+    conn: &mut diesel_async::AsyncPgConnection,
+    shard_id: i32,
+    now: DateTime<Utc>,
+) -> crate::error::HarvestResult<ReactivateOutcome> {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    use crate::schema::harvest_audit_export_cursor::dsl as cur;
+
+    let cursor: Option<crate::models::AuditExportCursor> = cur::harvest_audit_export_cursor
+        .find(shard_id)
+        .select(crate::models::AuditExportCursor::as_select())
+        .for_update()
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+
+    let Some(cursor) = cursor else {
+        return Ok(ReactivateOutcome::NotConfigured);
+    };
+    if cursor.retired_at.is_none() {
+        return Ok(ReactivateOutcome::AlreadyActive);
+    }
+
+    // Bumps `claim_epoch` for the same reason decommission does: every
+    // lifecycle transition invalidates a delivery attempt claimed under an
+    // older one. No claim can be outstanding on a retired row today, since
+    // a retired cursor is not claimable. So this guards a future change to
+    // that rule, not a live hazard.
+    diesel::update(cur::harvest_audit_export_cursor.find(shard_id))
+        .set((
+            cur::retired_at.eq(None::<DateTime<Utc>>),
+            cur::updated_at.eq(now),
+            cur::claim_epoch.eq(cursor.claim_epoch + 1),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(ReactivateOutcome::Reactivated)
 }
 
 /// The `MAX(export_seq)` read back from the sequence-assignment statement —
@@ -1053,15 +1265,17 @@ pub async fn claim_shard(
                 return Ok(None);
             };
 
-            // A retired cursor is inert (issue #953, Codex review round 14 P2).
-            // `export_once_on_conn` calls `ensure_cursor_row` first, which
-            // un-retires, so in the ordinary flow a running exporter never sees
-            // this. The window is a `decommission_cursor` that commits between
-            // that call and this locked read: without the check the scanner
-            // takes a NEW claim and delivers a batch after the retirement.
-            // Bumping the epoch on retirement only invalidates claims taken
-            // *before* it, so this is the other half of that fix -- and it
-            // matters because retention is permitted to purge the shard's
+            // A retired cursor is inert (issue #953; issue #1273).
+            // `export_once_on_conn` calls `ensure_cursor_row` first. That
+            // call never un-retires a row. So a decommissioned shard reaches
+            // this check on every tick, not just in a narrow race window.
+            //
+            // A decommission that commits between `ensure_cursor_row` and
+            // this locked read hits the same check. Without it, the scanner
+            // would take a new claim and deliver a batch after the
+            // retirement. Bumping the epoch on retirement only invalidates
+            // claims taken *before* it. So this is the other half of that
+            // fix. It matters because retention may purge the shard's
             // records the moment it is retired.
             if cursor.retired_at.is_some() {
                 return Ok(None);
@@ -1391,25 +1605,55 @@ pub struct AuditExportShardStatus {
     pub next_attempt_at: DateTime<Utc>,
 }
 
+/// How many of the lowest-sequence pending rows [`export_lag_seconds`] scans
+/// for the true oldest `occurred_at` (issue #1271).
+///
+/// `occurred_at` is transaction start time. A long transaction can commit
+/// after a shorter one that started later. The exporter then sees the long
+/// transaction later and assigns it a higher sequence. Its `occurred_at`
+/// stays older than the short transaction's.
+///
+/// A lookup over only the single lowest-sequence pending row misses this
+/// skew. It reports the short transaction's age instead of the true lag.
+///
+/// This bound trades exactness for a fixed cost. It scans the lowest
+/// [`EXPORT_LAG_LOOKBACK_ROWS`] pending rows and takes their minimum
+/// `occurred_at`. This finds the true oldest row whenever the skew resolves
+/// within that many rows, which covers every ordinary case. The scan cost
+/// never grows with the total backlog.
+pub const EXPORT_LAG_LOOKBACK_ROWS: i64 = 1000;
+
+/// The bounded pending-window scan's single output column.
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct OldestInWindow {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    oldest: Option<DateTime<Utc>>,
+}
+
 /// Age in seconds of the oldest audit record the sink has not acknowledged,
 /// or `0.0` when nothing is pending. This is `harvest.audit.export_lag`.
 ///
-/// Deliberately **two index-servable point lookups** rather than the single
-/// `MIN(occurred_at) WHERE export_seq IS NULL OR export_seq > $1` the admin
-/// view uses (issue #953 review): that disjunction spans both partial indexes
-/// and degenerates into visiting every pending heap tuple. This runs on
-/// **every** scanner tick, and the pending set is largest during exactly the
-/// sink outage when the database is already under stress — so the per-tick
-/// query must not scale with the backlog.
+/// Deliberately **two bounded lookups**, not the single query the admin
+/// view uses: `MIN(occurred_at) WHERE export_seq IS NULL OR export_seq > $1`
+/// (issue #953 review). That disjunction spans both partial indexes. It
+/// degenerates into visiting every pending heap tuple. This runs on every
+/// scanner tick. The pending set grows largest during a sink outage, when
+/// the database is already under stress. So the per-tick query must not
+/// scale with the backlog.
 ///
-/// - Not-yet-sequenced rows: `MIN(occurred_at) WHERE export_seq IS NULL`,
-///   served as an index-min by `harvest_audit_log_unexported_idx`.
-/// - Sequenced-but-unacknowledged rows: the `occurred_at` of the *next*
-///   record the exporter owes the sink, found by `ORDER BY export_seq LIMIT 1`
-///   on `harvest_audit_log_export_seq_idx`. Sequences are assigned in
-///   `(occurred_at, id)` order within a batch, so this is the oldest such
-///   record in every ordinary case, and it is the operationally meaningful
-///   one — "how old is the next thing we owe the sink?" — in any case.
+/// - Not-yet-sequenced rows: `MIN(occurred_at) WHERE export_seq IS NULL`.
+///   An index-min on `harvest_audit_log_unexported_idx` serves this.
+/// - Sequenced-but-unacknowledged rows: `MIN(occurred_at)` over the lowest
+///   [`EXPORT_LAG_LOOKBACK_ROWS`] pending sequences (issue #1271). The
+///   covering index `harvest_audit_log_export_seq_idx` on
+///   `(export_seq, occurred_at)` serves this without a heap fetch, on a
+///   page whose visibility map bit is already set. An unvacuumed page
+///   still costs one fetch. Sequences are assigned in `(occurred_at, id)` order
+///   within one exporter tick. So skew between sequence and `occurred_at`
+///   comes only from a row a later tick sequenced, while an earlier tick's
+///   row stayed invisible. See [`EXPORT_LAG_LOOKBACK_ROWS`] for the
+///   accepted bound.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
@@ -1432,16 +1676,24 @@ pub async fn export_lag_seconds(
         .await
         .map_err(crate::error::database_error)?;
 
-    let next_owed: Option<DateTime<Utc>> = log::harvest_audit_log
-        .filter(log::export_seq.gt(last_acked_seq))
-        .select(log::occurred_at)
-        .order(log::export_seq.asc())
-        .first::<DateTime<Utc>>(conn)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)?;
+    // The oldest `occurred_at` among the lowest `EXPORT_LAG_LOOKBACK_ROWS`
+    // pending sequences, not merely the single lowest one. See the module
+    // doc above and issue #1271.
+    let window: OldestInWindow = diesel::sql_query(
+        "SELECT MIN(occurred_at) AS oldest FROM ( \
+             SELECT occurred_at FROM harvest_audit_log \
+             WHERE export_seq > $1 \
+             ORDER BY export_seq ASC \
+             LIMIT $2 \
+         ) AS pending_window",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(last_acked_seq)
+    .bind::<diesel::sql_types::BigInt, _>(EXPORT_LAG_LOOKBACK_ROWS)
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
 
-    let oldest = match (unsequenced, next_owed) {
+    let oldest = match (unsequenced, window.oldest) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (Some(a), None) | (None, Some(a)) => Some(a),
         (None, None) => None,
@@ -1695,6 +1947,17 @@ pub async fn rewind_cursor_locked(
                     // on `(shard, seq)`, never a missing record. No sequenced
                     // record at or after the instant means there is nothing to
                     // re-export from there, so the cursor stays put.
+                    //
+                    // Known gap (issue #1508): this MIN only sees SURVIVING
+                    // rows. If retention already purged the earliest records
+                    // at or after `instant`, the query lands on the lowest
+                    // row still present instead. The resolved `to` then reads
+                    // as the operator's full request. `from - to` silently
+                    // excludes the purged prefix. `already_purged_records`
+                    // (computed only over the resolved window) then reports
+                    // `0`, even though records the operator's timestamp named
+                    // are gone. Closing this needs a persisted purge
+                    // watermark. No row survives to compute it from here.
                     let lowest: Option<Option<i64>> = log::harvest_audit_log
                         .filter(log::occurred_at.ge(instant))
                         .filter(log::export_seq.is_not_null())
@@ -1731,6 +1994,66 @@ pub async fn rewind_cursor_locked(
             Ok(outcome)
         }
     }
+}
+
+/// Rows still present that a [`RewindOutcome::Rewound`] window can actually
+/// redeliver.
+///
+/// Counts `harvest_audit_log` rows with `to < export_seq <= from`. A retention
+/// sweep does not take the cursor row's `FOR UPDATE` lock (issue #1267). It
+/// can read the pre-rewind cursor and purge part of this window. The rewind
+/// then still commits a lower one. `from - to` is the count the redrive was
+/// asked for; this function is the count it can actually deliver. A caller
+/// compares the two to report a gap instead of a recovery the database
+/// cannot back up.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub async fn count_redrive_recoverable(
+    conn: &mut diesel_async::AsyncPgConnection,
+    from: i64,
+    to: i64,
+) -> crate::error::HarvestResult<i64> {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    use crate::schema::harvest_audit_log::dsl as log;
+
+    log::harvest_audit_log
+        .filter(log::export_seq.gt(to))
+        .filter(log::export_seq.le(from))
+        .count()
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// `(recoverable_records, already_purged_records)` for a
+/// [`rewind_cursor_locked`] outcome (issue #1267).
+///
+/// `(0, 0)` for [`RewindOutcome::NoOp`] and [`RewindOutcome::NotConfigured`]:
+/// a refused rewind moved nothing, so there is no window to measure. For
+/// [`RewindOutcome::Rewound`], see [`count_redrive_recoverable`].
+///
+/// Exact for a [`RewindRequest::Seq`] rewind: `to` is the operator's own
+/// number, independent of what still exists. Understates a purged prefix for
+/// a [`RewindRequest::Before`] rewind (issue #1508). `to` there is derived
+/// from surviving rows. An already-purged prefix is invisible to this count
+/// too, not only to the resolver that picked `to`.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub async fn redrive_recovery_counts(
+    conn: &mut diesel_async::AsyncPgConnection,
+    outcome: RewindOutcome,
+) -> crate::error::HarvestResult<(i64, i64)> {
+    let RewindOutcome::Rewound { from, to } = outcome else {
+        return Ok((0, 0));
+    };
+    let recoverable = count_redrive_recoverable(conn, from, to).await?;
+    Ok((recoverable, (from - to - recoverable).max(0)))
 }
 
 // ---------------------------------------------------------------------
@@ -2178,6 +2501,600 @@ pub async fn fire_due_audit_exports(
     Ok(total)
 }
 
+// ---------------------------------------------------------------------
+// M8: a dedicated per-shard export task (issue #1269)
+// ---------------------------------------------------------------------
+
+/// Acquire one shard's connection, bounded, for the dedicated export task.
+///
+/// `bound` is normally [`SHARD_ACQUIRE_BOUND`], but the post-delivery
+/// reacquire passes a narrower, lease-derived bound instead (Codex review
+/// on PR #1520, follow-up P1) — see [`split_reserve`].
+///
+/// A connection-acquisition failure or timeout is logged and marks the
+/// shard unobserved, then returns `None`. It is not a database error, so
+/// the caller never turns it into an `Err`.
+#[cfg(feature = "db")]
+async fn acquire_shard_conn_for_export(
+    pool: &crate::worker::DbPool,
+    shard_id: i32,
+    shard_u16: u16,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    bound: std::time::Duration,
+) -> Option<
+    deadpool::managed::Object<
+        diesel_async::pooled_connection::AsyncDieselConnectionManager<
+            diesel_async::AsyncPgConnection,
+        >,
+    >,
+> {
+    // Bounded, never a bare `pool.get()` — see `SHARD_ACQUIRE_BOUND`.
+    match tokio::time::timeout(bound, pool.get()).await {
+        Ok(Ok(conn)) => Some(conn),
+        Ok(Err(error)) => {
+            tracing::error!(
+                shard = shard_id,
+                error = %error,
+                "[audit_export] failed to acquire a connection for the export tick"
+            );
+            metrics.record_audit_export_observed(shard_u16, false);
+            None
+        }
+        Err(_elapsed) => {
+            tracing::error!(
+                shard = shard_id,
+                bound = ?bound,
+                "[audit_export] timed out acquiring a connection for the export tick; \
+                 skipping it for one cycle"
+            );
+            metrics.record_audit_export_observed(shard_u16, false);
+            None
+        }
+    }
+}
+
+/// Export one shard's due batch, acquiring connections from `pool` rather
+/// than holding one across the whole call.
+///
+/// [`export_once_on_conn`] holds its caller's connection from the claim
+/// through the acknowledgement, network delivery included. That is fine
+/// when the caller already owns the connection for other reasons — an
+/// embedder driving [`fire_due_audit_exports`] by hand.
+///
+/// It is wrong for [`spawn_audit_export_checker_for_shard`]'s own dedicated
+/// task (Codex review on PR #1520 P1). On a `max_size(1)` shard pool,
+/// holding the connection for the whole delivery would block every other
+/// user of that pool. The timeout checker is one of them, for up to the
+/// claim lease. That is exactly the coupling issue #1269 exists to remove.
+///
+/// This checks a connection out for the claim transaction, then releases it
+/// before the network call. It checks one out again — not necessarily the
+/// same physical connection — for the acknowledgement transaction. No
+/// connection is held during delivery at all.
+///
+/// The delivery deadline reserves `SHARD_ACQUIRE_BOUND` plus
+/// `ACK_QUERY_BOUND` off the lease, capped at half the configured lease.
+/// Both the reserve and its cap follow Codex review on PR #1520 (follow-up
+/// P1 and follow-up P2).
+///
+/// The reserve covers the second checkout and the acknowledgement query it
+/// runs. Both steps are bounded, but bounded is not free. A successful
+/// delivery finishing right at `lease_until` would otherwise leave no time
+/// for either step. A fresher claim could then reclaim the shard. The cap
+/// also keeps a configured lease as short as one second from losing its
+/// entire delivery window to a fixed reserve.
+///
+/// [`split_reserve`] splits that same reserve between the two steps, so a
+/// capped reserve shrinks both bounds together (Codex review on PR #1520,
+/// follow-up P1). Reacquiring under the fixed, uncapped `SHARD_ACQUIRE_BOUND`
+/// regardless of the cap could let the checkout alone consume a reserve
+/// meant to cover both steps.
+///
+/// `cancel` races the delivery wait, never the claim or the acknowledgement
+/// (Codex review on PR #1520, follow-up P1). A shutdown mid-delivery
+/// abandons the wait and leaves the claim exactly where it was, for the
+/// next attempt to redeliver. It never blocks the caller's shutdown for up
+/// to the full lease.
+///
+/// `config_arc` is a snapshot the caller already read, not re-read here
+/// (Codex review on PR #1520, follow-up P2). The caller uses that same
+/// snapshot to decide the registered liveness interval. A second, separate
+/// read inside this function could observe a runtime swap the caller's
+/// read missed. That would register this tick's own tolerance against a
+/// lease it is not actually using.
+///
+/// `fence_against_sink_swap` reads the global fresh, deliberately, and runs
+/// immediately before the acknowledgement write, not right after delivery
+/// (Codex review on PR #1520, follow-up P1). A swap could otherwise land
+/// during the reacquire wait between the two, after an earlier fence check
+/// but before a stale `Advance` outcome commits.
+///
+/// Returns `Ok(0)` before any query when no sink is configured (AC8).
+///
+/// # Errors
+/// Returns `HarvestError` on a genuine database failure inside a claimed
+/// transaction. A sink transport failure, and a connection-acquisition
+/// failure, are never an `Err` here — see [`fire_due_audit_exports`].
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)] // claim + release + deliver + reacquire + apply is one unit
+async fn export_once_via_pool(
+    pool: &crate::worker::DbPool,
+    shard_id: i32,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    cancel: &tokio_util::sync::CancellationToken,
+    config_arc: Option<std::sync::Arc<AuditExportRuntimeConfig>>,
+) -> crate::error::HarvestResult<usize> {
+    let Some(config_arc) = config_arc else {
+        return Ok(0);
+    };
+    let config = config_arc.as_ref();
+    let shard_u16 = u16::try_from(shard_id).unwrap_or(u16::MAX);
+
+    let Some(mut conn) =
+        acquire_shard_conn_for_export(pool, shard_id, shard_u16, metrics, SHARD_ACQUIRE_BOUND)
+            .await
+    else {
+        return Ok(0);
+    };
+    // Raced against `cancel` (Codex review on PR #1520, follow-up P2, fifth
+    // round). `claim_shard`'s locked read can wait indefinitely behind
+    // another session holding the cursor row. A bare await here would then
+    // block graceful shutdown for as long as that lock is held. That is
+    // exactly the failure mode the delivery wait below is raced against.
+    // Nothing has been claimed yet at this point. Abandoning the wait
+    // leaves no state to clean up: the next tick's `claim_shard` retries
+    // the same locked row from scratch.
+    let claim = tokio::select! {
+        result = async {
+            ensure_cursor_row(&mut conn, shard_id).await?;
+            let now = Utc::now();
+            claim_shard(&mut conn, shard_id, config.batch_size, config.lease, now).await
+        } => result?,
+        () = cancel.cancelled() => {
+            tracing::warn!(
+                shard = shard_id,
+                "[audit_export] shutdown requested while claiming a batch; discarding \
+                 the connection and abandoning the wait for the next attempt to retry"
+            );
+            // `claim_shard` runs inside its own Diesel transaction (Codex
+            // review on PR #1520, follow-up P2, sixth round -- P1).
+            // Dropping this future mid-flight sends no ROLLBACK. Silently
+            // returning `conn` to the pool could then hand the next
+            // checkout a connection still holding an open transaction and
+            // the cursor row's lock. `Object::take` detaches it from the
+            // pool instead of recycling it. Dropping the raw connection
+            // then closes the socket, and Postgres rolls back whatever
+            // that session still had open.
+            drop(deadpool::managed::Object::take(conn));
+            return Ok(0);
+        }
+    };
+    let Some(claim) = claim else {
+        // Nothing claimed, but the lag gauge must still be emitted (issue
+        // #1268). An operator's "is export keeping up?" signal has to stay
+        // live exactly when deliveries are NOT happening.
+        emit_lag_and_observed(&mut conn, shard_id, metrics).await;
+        return Ok(0);
+    };
+    // Released before any network I/O -- the whole point of this function.
+    drop(conn);
+
+    let first_seq = claim.records.first().map_or(0, |r| r.seq);
+    let last_seq = claim.records.last().map_or(0, |r| r.seq);
+
+    let body = match serialize_batch(&claim.records) {
+        Ok(body) => body,
+        Err(error) => {
+            // Cannot serialize what we claimed. Hold the cursor AND write a
+            // real backoff, mirroring `export_once_on_conn`'s own handling
+            // of this case.
+            tracing::error!(
+                shard = shard_id,
+                error = %error,
+                "failed to serialize an audit export batch; holding the cursor"
+            );
+            let now = Utc::now();
+            let outcome = classify_export_outcome(
+                &SinkAttempt::transport_error(format!("batch serialization failed: {error}")),
+                last_seq,
+                claim.consecutive_failures,
+                &config.backoff,
+                now,
+            );
+            let Some(mut conn) = acquire_shard_conn_for_export(
+                pool,
+                shard_id,
+                shard_u16,
+                metrics,
+                SHARD_ACQUIRE_BOUND,
+            )
+            .await
+            else {
+                return Ok(0);
+            };
+            apply_outcome(&mut conn, shard_id, claim.claim_epoch, &outcome, now).await?;
+            emit_lag_and_observed(&mut conn, shard_id, metrics).await;
+            return Ok(0);
+        }
+    };
+
+    let delivered_at = Utc::now();
+    let headers = export_headers(
+        &config.secret,
+        &body,
+        shard_id,
+        first_seq,
+        last_seq,
+        delivered_at,
+    );
+    let batch = AuditBatch {
+        shard: shard_id,
+        first_seq,
+        last_seq,
+        records: &claim.records,
+        body: &body,
+        headers: &headers,
+    };
+
+    // The delivery deadline reserves `SHARD_ACQUIRE_BOUND` plus
+    // `ACK_QUERY_BOUND` off the end of the lease. That covers the
+    // post-delivery reacquire-and-acknowledge step below (Codex review on
+    // PR #1520, follow-up P1 and follow-up P2). Without a reserve, a sink
+    // finishing near `lease_until` could leave that step to run PAST the
+    // lease.
+    //
+    // A second exporter would then see the lease already expired. It would
+    // reclaim the shard and bump `claim_epoch`. This attempt's
+    // `apply_outcome` below would be guarded out even though the batch was
+    // genuinely delivered. Under sustained near-lease latency that repeats
+    // forever: delivered, but never acknowledged.
+    //
+    // The reserve is capped at half the configured lease (Codex review on
+    // PR #1520, follow-up P1). A builder-configured lease can be as short
+    // as one second. Subtracting the full, fixed reserve from a lease that
+    // short leaves no delivery window at all. Every batch would then time
+    // out immediately and back off forever. Capping the reserve instead
+    // shrinks the delivery window and the reacquire-and-acknowledge window
+    // together on a short lease. A short lease then always keeps some
+    // genuine delivery time.
+    let reserve = (SHARD_ACQUIRE_BOUND + ACK_QUERY_BOUND).min(config.lease / 2);
+    let delivery_deadline = claim.lease_until
+        - chrono::Duration::from_std(reserve).unwrap_or_else(|_| chrono::Duration::zero());
+
+    // The reserve is split between the reacquire below and the
+    // acknowledgement query that follows it (Codex review on PR #1520,
+    // follow-up P1). The split keeps their uncapped proportion. A capped
+    // `reserve` can be smaller than the fixed `SHARD_ACQUIRE_BOUND`.
+    // Reacquiring under that fixed bound regardless could let the checkout
+    // alone consume the whole capped reserve, leaving the acknowledgement
+    // no margin at all. See [`split_reserve`].
+    let (checkout_bound, ack_bound) = split_reserve(reserve);
+
+    // No connection held during this await. A timeout is classified exactly
+    // like any other transport failure: the cursor is held and the batch is
+    // retried. Never a loss.
+    //
+    // Raced against `cancel` (Codex review on PR #1520 P1). A bare await
+    // here does not return until the sink finishes or the delivery deadline
+    // elapses. Both worker shutdown paths join every export task's handle.
+    // An in-flight delivery could otherwise hold up a graceful shutdown for
+    // the whole lease. That is 60s by default, longer if configured -- well
+    // past a typical deployment's termination grace period.
+    //
+    // Cancellation drops the delivery future without recording an outcome.
+    // The claim's cursor and lease are untouched. The batch is safely
+    // redelivered once this shard's lease expires or the process restarts.
+    let attempt = tokio::select! {
+        attempt = deliver_within_lease(config, &batch, delivery_deadline) => attempt,
+        () = cancel.cancelled() => {
+            tracing::warn!(
+                shard = shard_id,
+                "[audit_export] shutdown requested mid-delivery; abandoning the wait \
+                 and leaving the claim for the next attempt to redeliver"
+            );
+            return Ok(0);
+        }
+    };
+    // Reacquired under `checkout_bound`, the reserve's own share for this
+    // step (Codex review on PR #1520, follow-up P1). The fixed
+    // `SHARD_ACQUIRE_BOUND` above is for the claim checkout only.
+    let Some(mut conn) =
+        acquire_shard_conn_for_export(pool, shard_id, shard_u16, metrics, checkout_bound).await
+    else {
+        // The batch was delivered (or the attempt failed) but the outcome
+        // cannot be recorded this tick. At-least-once: the next tick that
+        // can reach this shard re-claims and re-attempts, so nothing is
+        // silently lost either way.
+        return Ok(0);
+    };
+
+    // Fenced and classified here, immediately before the acknowledgement
+    // write below, not right after delivery (Codex review on PR #1520,
+    // follow-up P1). A sink swap landing during the reacquire wait just
+    // above must still be caught before a stale `Advance` outcome can
+    // commit. Fencing any earlier would miss exactly that swap.
+    //
+    // A swap landing during the acknowledgement write itself, after this
+    // comparison, is not caught (Codex review on PR #1520, follow-up P1,
+    // second round). Closing that too means holding this read across the
+    // `apply_outcome` await below, so no writer can land in between.
+    //
+    // `GLOBAL_AUDIT_EXPORT_CONFIG` is a `std::sync::RwLock`. Its read guard
+    // is not `Send`, confirmed by `cargo test`, not assumed. It cannot
+    // survive an await point inside a spawned, `Send`-bound task. Closing
+    // the gap for real needs an async-aware lock, across every reader and
+    // writer of the global -- a wider change than this fix.
+    //
+    // The residual window is bounded by `ack_bound`. It also requires a
+    // second runtime's `build()` to land inside that window. That only
+    // happens at process startup or an embedder's own rebuild, never on a
+    // request path.
+    let attempt = fence_against_sink_swap(
+        attempt,
+        &config_arc,
+        read_global_audit_export_config().as_ref(),
+    );
+    let outcome = classify_export_outcome(
+        &attempt,
+        last_seq,
+        claim.consecutive_failures,
+        &config.backoff,
+        Utc::now(),
+    );
+
+    // Bounded by `ack_bound`, the reserve's own share for this query
+    // (Codex review on PR #1520, follow-up P1). A timeout here is treated
+    // exactly like the failed-reacquire case above: the outcome cannot be
+    // recorded this tick, but nothing is lost.
+    let applied = match tokio::time::timeout(
+        ack_bound,
+        apply_outcome(&mut conn, shard_id, claim.claim_epoch, &outcome, Utc::now()),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_elapsed) => {
+            tracing::error!(
+                shard = shard_id,
+                bound = ?ack_bound,
+                "[audit_export] timed out acknowledging an export batch; the next tick \
+                 will redeliver it"
+            );
+            // The shard must not still look observed after this (Codex
+            // review on PR #1520, follow-up P2, third round). Without it,
+            // `export_observed` keeps its last-good value. The cursor then
+            // stalls silently behind repeated acknowledgement timeouts.
+            //
+            // Recorded directly, not via `emit_lag_and_observed` (Codex
+            // review on PR #1520, follow-up P2, fourth round). That
+            // helper's own success path reports `true` whenever it can
+            // read the cursor row, which it almost always can. This
+            // acknowledgement is genuinely indeterminate: the write may
+            // have landed on the database side after the client gave up
+            // waiting. `false` is the only honest reading here, not
+            // whatever the row happens to show right now.
+            metrics.record_audit_export_observed(shard_u16, false);
+            // Discarded, not returned to the pool (Codex review on PR
+            // #1520, follow-up P2, seventh round -- P1). This mirrors the
+            // claim-cancellation fix above. Dropping this future does not
+            // cancel the already-dispatched `UPDATE`. A connection stuck
+            // behind a locked row would otherwise be recycled anyway. Every
+            // later user of a size-one shard pool would then queue behind
+            // that same blocked statement.
+            drop(deadpool::managed::Object::take(conn));
+            return Ok(0);
+        }
+    };
+
+    let delivered = match &outcome {
+        ExportOutcome::Advance { .. } if applied => {
+            let count = claim.records.len();
+            metrics.record_audit_exported(shard_u16, count as u64);
+            count
+        }
+        ExportOutcome::Advance { .. } => {
+            // The guarded write did not apply: this attempt's lease expired
+            // and a fresher claim owns the shard, or a redrive bumped the
+            // epoch. The batch was delivered (the receiver dedupes on
+            // `(shard, seq)`) but this attempt must not move the cursor.
+            tracing::warn!(
+                shard = shard_id,
+                claim_epoch = claim.claim_epoch,
+                "audit export batch was acknowledged by the sink but its claim had \
+                 already been superseded; the cursor was not advanced and the batch \
+                 will be re-delivered (at-least-once)"
+            );
+            0
+        }
+        ExportOutcome::Backoff {
+            last_status,
+            last_error,
+            consecutive_failures,
+            ..
+        } => {
+            tracing::warn!(
+                shard = shard_id,
+                status = ?last_status,
+                error = ?last_error,
+                consecutive_failures,
+                "audit export delivery failed; cursor held at its current position"
+            );
+            0
+        }
+    };
+
+    emit_lag_and_observed(&mut conn, shard_id, metrics).await;
+    Ok(delivered)
+}
+
+/// Spawn a dedicated background task that exports one shard's due audit
+/// batches on its own cadence (issue #1269).
+///
+/// [`fire_due_audit_exports`] used to run inline inside
+/// `crate::timeout::enforce_timeouts_once`, sharing that loop's connection
+/// and cadence. A slow or unresponsive sink then delayed every other
+/// resident of that loop. Timeout enforcement, SLA checks, and session
+/// cleanup all waited, for up to one claim lease. Worse, on a shard pool
+/// sized for one connection, the export call's own connection request
+/// competed with the checker's already-held connection. It could never
+/// succeed.
+///
+/// This task owns its connection lifecycle end to end, through
+/// [`export_once_via_pool`]. It never runs nested inside another resident's
+/// checkout. That nesting is what made the old failure permanent: the
+/// checker always held the pool's only connection when it tried to claim a
+/// second one. Every single tick failed the same way, forever.
+///
+/// A `max_size(1)` shard pool now works, in the sense that matters. This
+/// task never holds a connection across a network call. It never blocks
+/// the timeout checker, or anything else sharing the pool, for the
+/// duration of a delivery. Export is no longer permanently wedged, and a
+/// slow sink no longer starves its neighbors on a one-connection pool
+/// either.
+///
+/// Registers under [`crate::scanner_health::Scanner::AuditExport`], so a
+/// wedged export task is visible to `scanner_liveness`, exactly like the
+/// timeout checker and the poison-pill reclaimer.
+///
+/// The registered interval accounts for the configured export lease, not
+/// just the poll interval (Codex review on PR #1520 P2). A single tick can
+/// legitimately run as long as the lease allows. A bare poll-interval
+/// threshold would flag a healthy, still-within-lease delivery as `Stale`
+/// or `Wedged`. Re-checked every tick and re-registered on an actual
+/// change (Codex review on PR #1520, follow-up). A later runtime
+/// publishing a longer lease is picked up without needing this task
+/// restarted.
+///
+/// The three stages are summed, not maxed (Codex review on PR #1520,
+/// follow-up P2, second round). One tick sleeps for `interval`. It then
+/// may spend up to `SHARD_ACQUIRE_BOUND` acquiring its initial connection.
+/// Only then does the lease-bounded claim/delivery/acknowledge cycle
+/// start. These are three sequential stages, not alternatives, so their
+/// worst cases add. The prior formula registered only
+/// `interval.max(lease)`. That understated the true worst case by up to
+/// `SHARD_ACQUIRE_BOUND`, plus whichever of `interval` or `lease` was not
+/// the max. `scanner_liveness` grants `2 x` the registered interval before
+/// paging. That grace could then be shorter than one legitimately slow
+/// tick.
+///
+/// Pass `shard` to attribute this instance to one shard in the liveness
+/// snapshot, mirroring
+/// [`crate::timeout::spawn_timeout_checker_for_shard`]. `sharded_pool`
+/// resolves the shard actually stamped on exported records when `shard` is
+/// `None` (the unsharded fallback). This is the same rule
+/// [`fire_due_audit_exports`] applies in its own unsharded arm.
+/// The worst-case wall-clock span of one audit-export checker tick.
+///
+/// See [`spawn_audit_export_checker_for_shard`]'s doc comment for why the
+/// three stages sum rather than max. Saturating throughout: a
+/// pathological configuration degrades instead of overflowing.
+#[cfg(feature = "db")]
+fn audit_export_liveness_interval(
+    interval: std::time::Duration,
+    config: Option<&AuditExportRuntimeConfig>,
+) -> std::time::Duration {
+    config.map_or(interval, |config| {
+        interval
+            .saturating_add(SHARD_ACQUIRE_BOUND)
+            .saturating_add(config.lease)
+    })
+}
+
+#[must_use]
+#[cfg(feature = "db")]
+pub fn spawn_audit_export_checker_for_shard(
+    pool: crate::worker::DbPool,
+    cancel: tokio_util::sync::CancellationToken,
+    interval: std::time::Duration,
+    telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
+    shard: Option<crate::types::ShardId>,
+    sharded_pool: Option<&crate::shard::ShardedDbPool>,
+) -> tokio::task::JoinHandle<()> {
+    // See this function's doc comment: the registered threshold must cover
+    // the worst legitimate tick, not just the poll cadence.
+    let mut registered_interval =
+        audit_export_liveness_interval(interval, read_global_audit_export_config().as_deref());
+    // Issue #797: declare the loop before its first iteration so the
+    // `scanner_liveness` check expects it and grants it boot grace.
+    let mut owner = crate::scanner_health::register_scanner_for_shard(
+        &*telemetry.metrics,
+        crate::scanner_health::Scanner::AuditExport,
+        registered_interval,
+        shard,
+    );
+    let shard_id = shard.map_or_else(
+        || sharded_pool.map_or(0, |sp| sp.default_shard().as_i32()),
+        crate::types::ShardId::as_i32,
+    );
+    let shard_u16 = u16::try_from(shard_id).unwrap_or(u16::MAX);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+
+            // Read the config ONCE. Use this same snapshot for both the
+            // registration decision below and the tick itself (Codex review
+            // on PR #1520, follow-up P2). Two independent reads could
+            // observe different configs across a mid-tick runtime swap,
+            // registering this tick's tolerance against a lease it is not
+            // actually using.
+            let config_snapshot = read_global_audit_export_config();
+
+            // The registered threshold must track the CURRENTLY configured
+            // lease, not just the one in effect at spawn time (Codex review
+            // on PR #1520 P2). A second runtime can publish a longer lease
+            // at any point (`fence_against_sink_swap`'s doc comment).
+            // A stale, too-tight threshold would misclassify a healthy
+            // delivery under the new lease as `Stale` or `Wedged`. Cheap to
+            // check every tick; only re-registers on an actual change.
+            let desired_interval =
+                audit_export_liveness_interval(interval, config_snapshot.as_deref());
+            if desired_interval != registered_interval {
+                crate::scanner_health::deregister_scanner(owner);
+                owner = crate::scanner_health::register_scanner_for_shard(
+                    &*telemetry.metrics,
+                    crate::scanner_health::Scanner::AuditExport,
+                    desired_interval,
+                    shard,
+                );
+                registered_interval = desired_interval;
+            }
+
+            if let Err(error) = export_once_via_pool(
+                &pool,
+                shard_id,
+                &*telemetry.metrics,
+                &cancel,
+                config_snapshot,
+            )
+            .await
+            {
+                tracing::error!(
+                    shard = shard_id,
+                    error = %error,
+                    "[audit_export] scheduled export tick failed"
+                );
+                telemetry
+                    .metrics
+                    .record_audit_export_observed(shard_u16, false);
+            }
+
+            // Issue #797: unconditional end-of-iteration liveness tick, same
+            // as every other spawned scanner loop.
+            crate::scanner_health::record_scanner_tick(&*telemetry.metrics, owner);
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+        // Issue #797: a graceful stop retires this loop from the expected
+        // scanner set. A panic unwinds past this point, so a panicked loop
+        // stays registered and correctly ages into `Wedged`.
+        crate::scanner_health::deregister_scanner(owner);
+    })
+}
+
 // ── Unit tests (pure, no DB) ─────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2614,6 +3531,88 @@ mod tests {
         assert_eq!(
             AuditExportBuilderConfig::default().effective_lease(),
             DEFAULT_EXPORT_LEASE
+        );
+    }
+
+    // ── `split_reserve` shrinks both post-delivery bounds together ───────────
+    //
+    // Codex review on PR #1520, follow-up P1: a capped reserve must not let
+    // the checkout alone consume it, leaving the acknowledgement no margin.
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn split_reserve_returns_the_fixed_bounds_at_the_uncapped_reserve() {
+        let (checkout, ack) = split_reserve(SHARD_ACQUIRE_BOUND + ACK_QUERY_BOUND);
+        assert_eq!(checkout, SHARD_ACQUIRE_BOUND);
+        assert_eq!(ack, ACK_QUERY_BOUND);
+    }
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn split_reserve_shrinks_both_bounds_proportionally() {
+        let reserve = std::time::Duration::from_secs(1);
+        let (checkout, ack) = split_reserve(reserve);
+
+        assert_eq!(
+            checkout + ack,
+            reserve,
+            "the split must account for every reserved nanosecond"
+        );
+        assert_eq!(checkout, std::time::Duration::from_nanos(714_285_714));
+        assert_eq!(ack, std::time::Duration::from_nanos(285_714_286));
+        assert!(
+            checkout > ack,
+            "the 5:2 ratio between SHARD_ACQUIRE_BOUND and ACK_QUERY_BOUND must survive the \
+             split, or a request storm during the reacquire could still starve the query"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn split_reserve_of_zero_is_zero() {
+        assert_eq!(
+            split_reserve(std::time::Duration::ZERO),
+            (std::time::Duration::ZERO, std::time::Duration::ZERO)
+        );
+    }
+
+    // ── The liveness budget sums every stage of a tick, not just the max ────
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn liveness_interval_is_the_bare_poll_interval_when_unconfigured() {
+        let interval = Duration::from_secs(30);
+        assert_eq!(audit_export_liveness_interval(interval, None), interval);
+    }
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn liveness_interval_sums_sleep_checkout_and_lease() {
+        struct UnusedSink;
+        impl AuditSink for UnusedSink {
+            fn deliver<'a>(&'a self, _batch: &'a AuditBatch<'a>) -> SinkFuture<'a> {
+                unreachable!("this test never delivers a batch")
+            }
+        }
+
+        let interval = Duration::from_secs(60);
+        let lease = Duration::from_secs(60);
+        let config = AuditExportRuntimeConfig {
+            sink: std::sync::Arc::new(UnusedSink),
+            secret: CallbackSecret::new(Vec::new()),
+            batch_size: 100,
+            backoff: ExportBackoff::default(),
+            lease,
+        };
+
+        let budget = audit_export_liveness_interval(interval, Some(&config));
+
+        assert_eq!(
+            budget,
+            interval + SHARD_ACQUIRE_BOUND + lease,
+            "a poll interval close to the lease must not collapse to just their max: the \
+             sleep, the initial checkout, and the lease-bounded cycle are three sequential \
+             stages of one tick, so their worst cases add"
         );
     }
 
