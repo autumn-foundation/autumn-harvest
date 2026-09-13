@@ -8659,9 +8659,10 @@ fn a_reply_the_page_cannot_see_does_not_let_an_older_call_answer() {
 /// keeps text that holds no number. Both were assumed to fail closed here,
 /// and an assumption is not a guard. This measures them.
 ///
-/// A `BLOB` payload reads as JSON, so the turn test names it. Text in `seq`
-/// sorts above every integer, so the bound admits the row. Neither shape can
-/// hide a newer turn.
+/// A `BLOB` payload is counted as a row this daemon cannot classify, because
+/// the engine cannot read one at all. Text in `seq` sorts above every
+/// integer, so the bound admits the row. Neither shape can hide a newer
+/// turn.
 ///
 /// The `exec_id` of the row is the one class this cannot reach. See
 /// [`inspect::UNCLASSIFIED_AFTER_QUERY`].
@@ -9215,6 +9216,108 @@ async fn a_reply_the_engine_cannot_load_offers_no_call() {
 
     let refused = daemon::pending_call(&reader, &exec_id, &signal, false)
         .expect_err("no call may be offered from a row the engine cannot load");
+    assert!(
+        !refused.contains("write_file") && !refused.contains("agent-notes.md"),
+        "and the refusal never names the call: {refused}"
+    );
+    drop(reader);
+
+    // The reason the refusal exists. The engine reads every row into a
+    // `String`, so this run can never be driven again.
+    let mut rt = runtime(&db, &workspace, &calls);
+    let refused = rt
+        .run_until_blocked(exec)
+        .await
+        .expect_err("the engine cannot load a history holding this row");
+    assert!(
+        format!("{refused:?}").contains("event_json"),
+        "the drive fails on the row itself: {refused:?}"
+    );
+}
+
+/// A row after the reply that the ENGINE cannot load offers no call either.
+///
+/// The reply row itself is tested for its class. The rows AFTER it were not.
+/// A `BLOB` holding ordinary JSON answers `json_valid`, carries a readable
+/// kind, and is not a turn schedule. Both evidence counts therefore called it
+/// harmless, and `status` offered the awaited call.
+///
+/// `load_history` reads every `event_json` into a `String`, which a `BLOB`
+/// refuses, so the run can never be driven again. The decision would be
+/// accepted and never consumed.
+///
+/// Measured before the fix, on a REAL parked session. The row after the
+/// newest reply is the `TimerStarted` of the approval deadline. Rewritten in
+/// place, it left the evidence at `(0, 0)`, `status` offered `write_file`,
+/// and the next drive answered `InvalidColumnType(0, "event_json", Blob)`.
+#[tokio::test]
+async fn a_row_after_the_reply_the_engine_cannot_load_offers_no_call() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    std::fs::write(workspace.join("README.md"), "hello").expect("the fixture is written");
+    let db = dir.path().join("after.db");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut rt = runtime(&db, &workspace, &calls);
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
+        .expect("the session starts");
+    let signal = drive_to_approval(&mut rt, exec).await;
+    drop(rt);
+    let exec_id = exec.to_string();
+
+    // The healthy history first. The tool events after the newest reply are
+    // evidence of nothing, and the call is offered.
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let page = inspect::reply_calls(&reader, &exec_id, None, 1).expect("the replies read");
+    let reply_seq = page.first().expect("a reply is recorded").0;
+    assert_eq!(
+        inspect::newer_turn_evidence(&reader, &exec_id, reply_seq).expect("the evidence reads"),
+        (0, 0),
+        "a healthy history records nothing this daemon cannot classify"
+    );
+    assert!(
+        daemon::pending_call(&reader, &exec_id, &signal, false)
+            .expect("the replies read")
+            .is_some(),
+        "and the call is offered before the row changes class"
+    );
+    drop(reader);
+
+    // One row AFTER the reply changes class. Nothing else is touched.
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    let target: i64 = writer
+        .query_row(
+            "SELECT min(seq) FROM harvest_events WHERE exec_id = ?1 AND seq > ?2",
+            rusqlite::params![exec_id, reply_seq],
+            |row| row.get(0),
+        )
+        .expect("a row follows the reply");
+    writer
+        .execute(
+            "UPDATE harvest_events SET event_json = cast(event_json as blob) \
+             WHERE exec_id = ?1 AND seq = ?2",
+            rusqlite::params![exec_id, target],
+        )
+        .expect("the row is rewritten");
+    let class: String = writer
+        .query_row(
+            "SELECT typeof(event_json) FROM harvest_events WHERE exec_id = ?1 AND seq = ?2",
+            rusqlite::params![exec_id, target],
+            |row| row.get(0),
+        )
+        .expect("the storage class reads");
+    assert_eq!(class, "blob", "the fixture must store the class it means");
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    assert_ne!(
+        inspect::newer_turn_evidence(&reader, &exec_id, reply_seq).expect("the evidence reads"),
+        (0, 0),
+        "a row the engine cannot read is evidence this daemon cannot classify"
+    );
+    let refused = daemon::pending_call(&reader, &exec_id, &signal, false)
+        .expect_err("no call may be offered while such a row follows the reply");
     assert!(
         !refused.contains("write_file") && !refused.contains("agent-notes.md"),
         "and the refusal never names the call: {refused}"

@@ -458,9 +458,10 @@ pub const EVENTS_QUERY: &str = "SELECT seq, \
 /// query that dropped it would answer with an older reply instead, and a
 /// tool-use id is unique inside one reply only. See [`ReplyCalls`].
 ///
-/// This is bounded to the rows this page reads. A `BLOB` row ANYWHERE in a
-/// history stops the same loader, and no bounded read here can see one that
-/// far back. The drive is what finds those.
+/// This is bounded to the rows this page reads. The rows AFTER the reply are
+/// tested for their class too, by [`UNCLASSIFIED_AFTER_QUERY`]. A `BLOB` row
+/// EARLIER in a history stops the same loader, and no bounded read here can
+/// see one that far back. The drive is what finds those.
 pub const REPLIES_QUERY: &str = "SELECT seq, \
             CASE WHEN json_valid(event_json) \
                   AND json_type(event_json, '$.data.output.tool_calls') = 'array' \
@@ -494,8 +495,13 @@ pub const REPLIES_QUERY: &str = "SELECT seq, \
 ///
 /// The activity name is a PARAMETER, so it comes from the registration
 /// itself. A hardcoded name could drift from the one the engine records.
+///
+/// Only a TEXT row is classified here. A row in another storage class is one
+/// the engine cannot read at all. Naming such a row a turn, or not a turn,
+/// says nothing useful. [`UNCLASSIFIED_AFTER_QUERY`] counts it instead.
 pub const NEWER_TURN_QUERY: &str = "SELECT count(*) FROM harvest_events \
-     WHERE exec_id = ?1 AND seq > ?2 AND json_valid(event_json) \
+     WHERE exec_id = ?1 AND seq > ?2 \
+     AND typeof(event_json) = 'text' AND json_valid(event_json) \
      AND json_extract(event_json, '$.type') = 'ActivityScheduled' \
      AND json_extract(event_json, '$.data.name') = ?3";
 
@@ -505,8 +511,17 @@ pub const NEWER_TURN_QUERY: &str = "SELECT count(*) FROM harvest_events \
 /// it cannot classify can be a turn it cannot see, so such a row is COUNTED
 /// here rather than passed over in silence.
 ///
-/// Four shapes of damage reach that state, and a count of invalid JSON alone
+/// Five shapes of damage reach that state, and a count of invalid JSON alone
 /// catches one of them:
+///
+/// A row that is not TEXT is one the ENGINE cannot read. `load_history`
+/// reads every `event_json` into a `String`, which a `BLOB` refuses, so a run
+/// holding one can never be driven again. This daemon reads such a row
+/// perfectly well, and a `BLOB` of ordinary JSON classified as harmless left
+/// the evidence at nothing. Measured on a real parked session, on the
+/// `TimerStarted` row of the approval deadline. Rewritten in place, it left
+/// `status` offering the call. The next drive answered
+/// `InvalidColumnType(0, "event_json", Blob)`.
 ///
 /// A row that is not JSON carries no readable kind at all.
 ///
@@ -522,8 +537,9 @@ pub const NEWER_TURN_QUERY: &str = "SELECT count(*) FROM harvest_events \
 /// as a model turn in the engine.
 ///
 /// Every test sits inside a `CASE`, which fixes the order of evaluation. The
-/// validity test is first, because `json_type` over a row that is not JSON
-/// aborts the whole statement.
+/// class test is first, because a row the engine cannot read decides the
+/// answer whatever its payload holds. The validity test follows it, because
+/// `json_type` over a row that is not JSON aborts the whole statement.
 ///
 /// The `json_each` counts are correlated, and the `seq >` seek bounds them.
 /// They read the rows after the reply in hand, which for a parked session are
@@ -538,6 +554,7 @@ pub const NEWER_TURN_QUERY: &str = "SELECT count(*) FROM harvest_events \
 pub const UNCLASSIFIED_AFTER_QUERY: &str = "SELECT count(*) FROM harvest_events \
      WHERE exec_id = ?1 AND seq > ?2 \
      AND CASE \
+           WHEN typeof(event_json) <> 'text' THEN 1 \
            WHEN NOT json_valid(event_json) THEN 1 \
            WHEN json_type(event_json, '$.type') IS NOT 'text' THEN 1 \
            WHEN (SELECT count(*) FROM json_each(event_json, '$') \
