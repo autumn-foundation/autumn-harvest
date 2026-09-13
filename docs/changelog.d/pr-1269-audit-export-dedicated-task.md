@@ -32,10 +32,13 @@ pipeline itself, so the fix is architectural: give export its own task.
   interval** (Codex review on this PR, P2): a single tick can legitimately
   run as long as the configured lease allows, which can far exceed the
   worker's poll interval, so `scanner_liveness` registers with
-  `poll_interval.max(lease)` to avoid flagging a healthy, still-within-lease
-  delivery as `Stale` or `Wedged`. Re-checked every tick and re-registered on
-  a change, so a second runtime publishing a longer lease is picked up
-  without restarting the task (follow-up P2).
+  `poll_interval + SHARD_ACQUIRE_BOUND + lease` to avoid flagging a healthy,
+  still-within-lease delivery as `Stale` or `Wedged`. The three stages sum
+  rather than max (follow-up P2, second round): the sleep, the initial
+  connection checkout, and the lease-bounded cycle are sequential, not
+  alternatives. Re-checked every tick and re-registered on a change, so a
+  second runtime publishing a longer lease is picked up without restarting
+  the task (follow-up P2).
 - **The shipped `harvest_scanner_stalled` alert gives `audit_export` its own
   10m Prometheus window** (follow-up P2), instead of sharing the other
   sub-minute loops' 5m one: a healthy delivery running longer than 5
