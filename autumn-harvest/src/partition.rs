@@ -1232,6 +1232,25 @@ async fn refuse_if_row_security(conn: &mut AsyncPgConnection, verb: &str) -> Har
     )))
 }
 
+/// The `NOT EXISTS (...)` fragment that exempts harvest's own two
+/// constraints from the unique-index refusal below. The direct path, the
+/// scripted plan, and their respective in-lock rechecks all share it, so
+/// the four copies of that refusal cannot drift apart.
+///
+/// Review finding: naming these two constraints was not enough on its
+/// own. An operator's own constraint could reuse one of these two
+/// conventional names. Say, a replacement for
+/// `harvest_events_workflow_exec_id_event_id_key` defined as `UNIQUE
+/// (event_type)`. Name-only matching treated that as harvest-owned. Its
+/// real index would then be excluded from replay. The hard-coded `ADD
+/// CONSTRAINT` step would recreate HARVEST's shape under that name
+/// instead, silently discarding the operator's own uniqueness guarantee.
+/// Verifying `contype` and the exact ordered key columns closes that
+/// gap. Only a constraint shaped exactly like harvest's own pkey
+/// (`(id)`) or unique key (`(workflow_exec_id, event_id)`) is exempt
+/// now. An impostor of the same name no longer qualifies.
+const HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL: &str = "NOT EXISTS (\n                SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid\n                  AND (\n                      (con.conname = 'harvest_events_pkey' AND con.contype = 'p'\n                       AND (SELECT array_agg(a.attname::text ORDER BY k)\n                              FROM generate_series(0, i.indnkeyatts - 1) k\n                              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]\n                           ) = ARRAY['id'])\n                      OR\n                      (con.conname = 'harvest_events_workflow_exec_id_event_id_key' AND con.contype = 'u'\n                       AND (SELECT array_agg(a.attname::text ORDER BY k)\n                              FROM generate_series(0, i.indnkeyatts - 1) k\n                              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]\n                           ) = ARRAY['workflow_exec_id', 'event_id'])\n                  )\n            )";
+
 /// User-defined unique indexes on `harvest_events` that cannot survive
 /// conversion unchanged: either missing `cohort`, or backed by a
 /// constraint the replay step cannot carry forward.
@@ -1274,7 +1293,7 @@ async fn refuse_if_row_security(conn: &mut AsyncPgConnection, verb: &str) -> Har
 pub async fn unique_indexes_missing_cohort(
     conn: &mut AsyncPgConnection,
 ) -> HarvestResult<Vec<String>> {
-    let rows = diesel::sql_query(
+    let rows = diesel::sql_query(format!(
         "SELECT i.indexrelid::regclass::text AS v
            FROM pg_index i
            JOIN pg_class c ON c.oid = i.indrelid
@@ -1283,11 +1302,7 @@ pub async fn unique_indexes_missing_cohort(
              ON cohort_attr.attrelid = c.oid AND cohort_attr.attname = 'cohort'
           WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
             AND i.indisunique
-            AND NOT EXISTS (
-                SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid
-                  AND con.conname IN ('harvest_events_pkey',
-                                      'harvest_events_workflow_exec_id_event_id_key')
-            )
+            AND {HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL}
             AND (
                 EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)
                 OR NOT EXISTS (
@@ -1295,8 +1310,8 @@ pub async fn unique_indexes_missing_cohort(
                      WHERE i.indkey[k] = cohort_attr.attnum
                 )
             )
-          ORDER BY 1",
-    )
+          ORDER BY 1"
+    ))
     .load::<TextRow>(conn)
     .await
     .map_err(database_error)?;
@@ -1675,6 +1690,7 @@ DECLARE
     we_idx_existed boolean;
     bad_view    text;
     bad_trg     text;
+    bad_idx     text;
 {COPY_ACL_DECLARE}
 BEGIN
     -- Idempotent: already partitioned, nothing to do.
@@ -1766,6 +1782,37 @@ the preflight check ran but before this transaction''s ACCESS EXCLUSIVE lock. Dr
 TABLE ... (LIKE ...) (%), installed after the preflight check ran but before this \
 transaction''s ACCESS EXCLUSIVE lock. Drop the trigger (and recreate it against \
 harvest_events afterward), then re-run.', bad_trg;
+    END IF;
+
+    -- Review finding: `idx_defs` above is captured before the rename takes
+    -- ACCESS EXCLUSIVE, from a plain read that does not conflict with a
+    -- concurrent `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE`. Such a
+    -- constraint could commit in that gap; its backing index is excluded
+    -- from `idx_defs` unconditionally, and `capture_index_defs` never
+    -- replays it, so it would silently vanish from every new partition.
+    -- Recheck now, holding the lock, the same way the view and trigger
+    -- checks just did.
+    SELECT string_agg(i.indexrelid::regclass::text, ', ' ORDER BY 1) INTO bad_idx
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_attribute ca
+        ON ca.attrelid = c.oid AND ca.attname = 'cohort'
+     WHERE c.relname = '{LEGACY_PARTITION}' AND n.nspname = current_schema()
+       AND i.indisunique
+       AND {HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL}
+       AND (
+           EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)
+           OR NOT EXISTS (
+               SELECT 1 FROM generate_series(0, i.indnkeyatts - 1) k
+                WHERE i.indkey[k] = ca.attnum
+           )
+       );
+    IF bad_idx IS NOT NULL THEN
+        RAISE EXCEPTION 'harvest #958: harvest_events carries a unique index that cannot \
+survive conversion unchanged (%), added after the preflight check ran but before this \
+transaction''s ACCESS EXCLUSIVE lock. Drop the index or constraint if it is obsolete, or \
+recreate it including `cohort` yourself, then re-run.', bad_idx;
     END IF;
 
     -- Probed only AFTER the rename, which is the first statement to take
@@ -3739,11 +3786,7 @@ fn unique_index_guard_sql(tag: &str) -> String {
          ON ca.attrelid = c.oid AND ca.attname = 'cohort'\n     \
          WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
          AND i.indisunique\n       \
-         AND NOT EXISTS (\n           \
-         SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid\n             \
-         AND con.conname IN ('harvest_events_pkey',\n                                 \
-         'harvest_events_workflow_exec_id_event_id_key')\n       \
-         )\n       \
+         AND {HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL}\n       \
          AND (\n           \
          EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)\n           \
          OR NOT EXISTS (\n               \

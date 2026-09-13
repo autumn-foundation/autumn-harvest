@@ -832,6 +832,69 @@ async fn the_large_table_plans_phase_1_also_refuses_a_compatible_constraint_back
 }
 
 #[tokio::test]
+async fn an_impostor_reusing_harvests_own_constraint_name_still_refuses() {
+    // Review finding: the exemption for harvest's own two constraints
+    // matched by NAME alone. An operator could drop
+    // `harvest_events_workflow_exec_id_event_id_key` and replace it with
+    // a constraint of their own under that exact conventional name but a
+    // different shape. Name-only matching would treat it as harvest-owned.
+    // It would exclude its real index from replay. The hard-coded `ADD
+    // CONSTRAINT` step would then recreate HARVEST's own shape under
+    // that name instead, silently discarding the operator's actual
+    // uniqueness guarantee.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT \
+         IF EXISTS harvest_events_workflow_exec_id_event_id_key",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("drop the real constraint to make room for the impostor");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT \
+         harvest_events_workflow_exec_id_event_id_key UNIQUE (id, event_type)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an impostor reusing harvest's own conventional constraint name");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "an impostor reusing harvest's own constraint name but a different shape \
+             must still refuse -- name alone must not exempt it",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_workflow_exec_id_event_id_key"),
+        "the refusal must name the offending index; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT \
+         harvest_events_workflow_exec_id_event_id_key",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("drop the impostor constraint");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT \
+         harvest_events_workflow_exec_id_event_id_key UNIQUE (workflow_exec_id, event_id)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("restore harvest's own real constraint for later tests");
+}
+
+#[tokio::test]
 async fn a_dependent_view_refuses_the_conversion_instead_of_silently_going_stale() {
     // Issue #1270 item 14: Postgres tracks a view's dependency by relation
     // OID, not by name. Both conversion paths rename `harvest_events` out
@@ -1184,6 +1247,68 @@ async fn enable_sql_rechecks_an_operator_trigger_installed_after_the_preflight()
         .execute(&mut conn)
         .await
         .expect("drop the offending trigger function");
+}
+
+#[tokio::test]
+async fn enable_sql_rechecks_a_unique_index_added_after_the_preflight() {
+    // Same race, the unique-index guard's half. `idx_defs` (the set
+    // replayed onto the new parent) is captured before the rename takes
+    // ACCESS EXCLUSIVE. That capture is a plain read that does not
+    // conflict with a concurrent `ALTER TABLE ... ADD CONSTRAINT ...
+    // UNIQUE`. This test calls `enable_sql` directly, bypassing the Rust
+    // preflight entirely. It proves the script also refuses for itself
+    // once it holds the lock, rather than trusting only a check made
+    // before the window opened.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // A populated table takes the AttachLegacy path. See the dependent-view
+    // test's sibling comment for why the empty path cannot isolate this
+    // recheck from Postgres's own protection.
+    let exec = insert_execution(&mut conn, "race_idx_wf", "race-idx-1", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS uq_race_idx_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray constraint from a previous run");
+    diesel::sql_query("ALTER TABLE harvest_events ADD CONSTRAINT uq_race_idx_958 UNIQUE (id)")
+        .execute(&mut conn)
+        .await
+        .expect("seed a constraint as if added in the gap after the preflight check");
+
+    let err = diesel_async::SimpleAsyncConnection::batch_execute(
+        &mut conn,
+        &partition::enable_sql(&EnableOptions::default()),
+    )
+    .await
+    .expect_err(
+        "enable_sql must refuse under its own lock, not rely solely on a check made \
+         before the script started",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("uq_race_idx_958"),
+        "the refusal must name the offending index; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT uq_race_idx_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending constraint");
 }
 
 #[tokio::test]
