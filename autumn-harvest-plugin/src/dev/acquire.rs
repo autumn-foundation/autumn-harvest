@@ -120,6 +120,24 @@ pub async fn acquire_postgres_binaries() -> Result<PostgresBinaries, DevError> {
         let _ = std::fs::remove_dir_all(&staging);
     }
 
+    // The preflight above only ran if `cache_root` already existed. A fresh
+    // acquire into a versioned subdirectory that did not exist yet skips it,
+    // so an untrusted `HARVEST_DEV_CACHE_DIR` is caught only here, after the
+    // rename. Remove what was just downloaded rather than leaving an install
+    // in a shared location. Report the real reason, not the misleading
+    // "archive did not contain the expected binaries" a bare `cached_install`
+    // miss would otherwise produce.
+    if !directory_is_private(&cache_root) {
+        let _ = std::fs::remove_dir_all(&cache_root);
+        return Err(DevError::Acquire {
+            detail: format!(
+                "the cache directory {} is not private, and its contents would be executed. \
+                 Point HARVEST_DEV_CACHE_DIR somewhere private, or install PostgreSQL yourself",
+                cache_root.display()
+            ),
+        });
+    }
+
     cached_install(&cache_root).ok_or_else(|| DevError::Acquire {
         detail: format!(
             "the downloaded archive did not contain the expected server binaries under {}",
