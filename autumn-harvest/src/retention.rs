@@ -1053,6 +1053,7 @@ async fn run_partition_maintenance_pass(
     resume_cursors: &mut HashMap<ShardId, Option<DateTime<Utc>>>,
     metrics: &dyn MetricsRecorder,
     owner: crate::scanner_health::ScannerOwner,
+    shutdown: &CancellationToken,
 ) {
     if !config.partitions.enabled {
         return;
@@ -1070,6 +1071,13 @@ async fn run_partition_maintenance_pass(
         sweep_opts.straggler_grace = None;
     }
     for (shard, pool) in pools.iter_shards() {
+        // Checked here, between shards, never inside one. No transaction
+        // is open at this point, so returning here can never abandon one
+        // mid-flight the way racing this whole pass with `select!` used
+        // to. The shard already in progress always finishes.
+        if shutdown.is_cancelled() {
+            return;
+        }
         // Review finding: a single tick after this whole pass finishes
         // is not enough. Enough shards hitting the 15-second exact-scan
         // timeout on a blocked partition can make the whole pass run
@@ -1319,12 +1327,22 @@ impl RetentionRuntime {
             // never coalesce with, or crowd out, an operator's own
             // `run_now()`, which still gets a full tick as documented.
             //
-            // Review finding: raced against cancellation, not run bare.
-            // A blocked partitioned shard can spend up to `max_attempts`
-            // ownership probes at `exact_scan_timeout` each here, per
-            // shard -- minutes, at the defaults. `shutdown()` calling
-            // `cancel()` before this pass finishes must still make
-            // `join()` return promptly, not wait out the whole pass.
+            // Review finding: checked cooperatively, not raced with
+            // `select!`. Racing this whole pass against cancellation used
+            // to abort it by dropping its future at an arbitrary await
+            // point. That point can land inside one of its own
+            // transactions, the DEFAULT-partition drain for one. A
+            // dropped future sends no ROLLBACK, so the checked-out
+            // connection could return to the pool with a transaction,
+            // and the locks it holds, still open.
+            // `run_partition_maintenance_pass` checks `shutdown` itself,
+            // between shards, where no transaction is ever open. A
+            // blocked partitioned shard can still spend up to
+            // `max_attempts` ownership probes at `exact_scan_timeout`
+            // each -- minutes, at the defaults. The shard already in
+            // progress always finishes clean. Shutdown takes effect at
+            // the next shard boundary rather than waiting out every
+            // remaining shard.
             //
             // Review finding: this early return must still deregister,
             // same as the graceful-stop path at the loop's own exit
@@ -1333,19 +1351,19 @@ impl RetentionRuntime {
             // `Wedged`. A replacement runtime could then start up
             // healthy while this registry entry keeps `/admin/preflight`
             // unhappy anyway.
-            tokio::select! {
-                () = shutdown_task.cancelled() => {
-                    crate::scanner_health::deregister_scanner(owner);
-                    return;
-                },
-                () = run_partition_maintenance_pass(
-                    &pools,
-                    &config,
-                    &monitor_task,
-                    &mut partition_resume_cursors,
-                    metrics.as_ref(),
-                    owner,
-                ) => {},
+            run_partition_maintenance_pass(
+                &pools,
+                &config,
+                &monitor_task,
+                &mut partition_resume_cursors,
+                metrics.as_ref(),
+                owner,
+                &shutdown_task,
+            )
+            .await;
+            if shutdown_task.is_cancelled() {
+                crate::scanner_health::deregister_scanner(owner);
+                return;
             }
             // A trailing tick for the degenerate case the per-shard tick
             // inside the pass does not cover: zero configured shards. The
@@ -1490,6 +1508,7 @@ impl RetentionRuntime {
                     &mut partition_resume_cursors,
                     metrics.as_ref(),
                     owner,
+                    &shutdown_task,
                 )
                 .await;
 

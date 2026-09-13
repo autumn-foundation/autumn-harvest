@@ -3356,6 +3356,16 @@ const DRAIN_MAX_ROWS: usize = 50_000;
 #[doc(hidden)]
 pub const DRAIN_MAX_COHORTS: usize = 32;
 
+/// How often the oversized-cohort move ticks liveness while it runs.
+///
+/// The move is one SQL statement, so nothing can tick between its rows.
+/// Racing it against a repeating timer, instead, ticks liveness on the
+/// clock without touching the statement itself. Well under
+/// [`crate::scanner_health::MIN_SCANNER_STALENESS_THRESHOLD`], so this
+/// alone cannot make an active move look stale.
+#[cfg(feature = "db")]
+const DRAIN_MOVE_HEARTBEAT: Duration = Duration::from_secs(10);
+
 // A `statement_timeout` inside the drain's window is DELIBERATELY absent, and
 // this is the second thing to know about the pass after the budgets.
 //
@@ -3857,25 +3867,37 @@ async fn drain_default_bounded_inner(
         // Review finding: an oversized single cohort can still make this
         // move itself run long. The row budget bounds the pass overall,
         // but "always at least one" above means a cohort larger than
-        // `max_rows` is still taken whole. Ticked here, right before the
-        // one statement that does the actual moving.
-        if let Some(cb) = &mut progress {
-            cb();
-        }
-        // One statement, so the rows leave `DEFAULT` exactly as they arrive in
-        // their cohort partitions — there is no window in which a row exists in
-        // both, and no `TRUNCATE` that could discard a row this pass did not
-        // move.
-        let moved = diesel::sql_query(format!(
-            "WITH moved AS (
-                 DELETE FROM {DEFAULT_PARTITION} WHERE cohort <= {} RETURNING *
-             )
-             INSERT INTO harvest_events SELECT * FROM moved",
-            ts_literal(cutoff)
-        ))
-        .execute(conn)
-        .await
-        .map_err(database_error)?;
+        // `max_rows` is still taken whole.
+        //
+        // One statement, so the rows leave `DEFAULT` exactly as they arrive
+        // in their cohort partitions — there is no window in which a row
+        // exists in both, and no `TRUNCATE` that could discard a row this
+        // pass did not move. Nothing can tick between rows of one
+        // statement, so a tick right before it starts is not enough on its
+        // own for an oversized cohort. Race it against a repeating timer
+        // instead. The timer ticks liveness on the clock without ever
+        // touching `conn`. The statement stays exactly one round trip.
+        let moved = {
+            let query = diesel::sql_query(format!(
+                "WITH moved AS (
+                     DELETE FROM {DEFAULT_PARTITION} WHERE cohort <= {} RETURNING *
+                 )
+                 INSERT INTO harvest_events SELECT * FROM moved",
+                ts_literal(cutoff)
+            ))
+            .execute(conn);
+            tokio::pin!(query);
+            loop {
+                tokio::select! {
+                    result = &mut query => break result.map_err(database_error)?,
+                    () = tokio::time::sleep(DRAIN_MOVE_HEARTBEAT) => {
+                        if let Some(cb) = &mut progress {
+                            cb();
+                        }
+                    }
+                }
+            }
+        };
 
         for t in &targets {
             exec(
