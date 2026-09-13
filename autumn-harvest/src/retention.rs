@@ -1254,6 +1254,33 @@ impl RetentionRuntime {
                                 continue;
                             }
                         };
+                        // Probed before `maintain` runs it, so an unpartitioned
+                        // shard can be told apart from one that ran and did
+                        // nothing (issue #1270 item 6). `maintain` itself is
+                        // gated the same way and returns a stamped, empty
+                        // outcome for an unpartitioned shard — right for a
+                        // manual `harvest partition maintain`, wrong here:
+                        // `RetentionTickResult.partition_maintenance` is
+                        // documented as `None` on a shard that never opted in,
+                        // and recording `Some(...)` for it every tick would say
+                        // maintenance is active where it never converted.
+                        match crate::partition::detect_layout(&mut conn).await {
+                            Ok(crate::partition::EventLayout::Unpartitioned) => continue,
+                            Ok(crate::partition::EventLayout::Partitioned { .. }) => {}
+                            Err(error) => {
+                                tracing::warn!(
+                                    shard = %shard,
+                                    error = %error,
+                                    "harvest event-partition maintenance could not \
+                                     detect the shard's layout"
+                                );
+                                monitor_task.update_partitions(
+                                    shard,
+                                    crate::partition::MaintenanceOutcome::failed(error.to_string()),
+                                );
+                                continue;
+                            }
+                        }
                         match crate::partition::maintain(
                             &mut conn,
                             now,

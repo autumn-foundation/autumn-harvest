@@ -1307,6 +1307,64 @@ async fn partition_maintenance_runs_at_startup_not_after_a_full_tick_interval() 
 }
 
 #[tokio::test]
+async fn partition_maintenance_stays_none_on_a_shard_that_never_converted() {
+    // Issue #1270 item 6: the maintenance block is gated on
+    // `config.partitions.enabled`, not on the detected layout, and `maintain`
+    // returns a stamped-but-empty outcome for an unpartitioned shard — so a
+    // deployment that turned the config flag on without ever running
+    // `harvest partition enable` reported `Some(...)` after every tick,
+    // claiming maintenance was active on a shard that never opted in.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    // Deliberately NOT calling enable_partitioning: this shard stays flat.
+
+    let pool = build_pool(&url);
+    let pools = ShardedDbPool::single(pool);
+    let config = RetentionConfig::with_max_age(Duration::from_secs(86_400));
+    assert!(
+        config.partitions.enabled,
+        "precondition: partition maintenance must be on so this test actually \
+         exercises the gate rather than an already-disabled config"
+    );
+
+    let runtime = RetentionRuntime::spawn(pools, config, Arc::new(NoopMetrics), None, None)
+        .expect("retention runtime should spawn when enabled");
+    runtime.run_now();
+
+    let mut ran = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snap = runtime.monitor().snapshot();
+        if let Some(r) = snap.per_shard.iter().find(|r| r.shard == 0)
+            && r.ran_at.is_some()
+        {
+            ran = true;
+            break;
+        }
+    }
+    assert!(ran, "the retention tick did not complete in time");
+    // A little more room: on this shard `partition_maintenance` should never
+    // be set, so there is no stamp to wait for — only time to let a
+    // maintenance pass run, if it were going to.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let snap = runtime.monitor().snapshot();
+    runtime.shutdown();
+
+    let result = snap
+        .per_shard
+        .iter()
+        .find(|r| r.shard == 0)
+        .expect("shard 0 result");
+    assert!(
+        result.partition_maintenance.is_none(),
+        "partition_maintenance must stay None on a shard that never opted \
+         into the partitioned layout; got {:?}",
+        result.partition_maintenance
+    );
+}
+
+#[tokio::test]
 async fn an_append_for_an_uncovered_cohort_survives_via_the_default_partition() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
