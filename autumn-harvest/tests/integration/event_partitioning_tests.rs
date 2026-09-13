@@ -5009,6 +5009,64 @@ async fn extending_the_write_window_never_queues_appends_indefinitely() {
 }
 
 #[tokio::test]
+async fn ensure_partitions_treats_already_attached_cohorts_as_coverage() {
+    // Review finding: `ensure_partitions` tracked `created` and
+    // `blocked`, but silently discarded the "already existed" case
+    // (`Ok((_, false))`). Say every cohort already existed from a prior
+    // pass, except one newly blocked. `created` was then left empty,
+    // indistinguishable from total failure, even though the window is
+    // mostly covered. `maintain` calls this before `sweep`, so the false
+    // "no cohort could be created" error would suppress reclamation on
+    // every retry.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // `enable_partitioning` with default options already created steps
+    // 0..=3 (today through +3 days). Force step 4 of a wider 0..=4
+    // window to collide. This call's only new work is then one blocked
+    // cohort, with everything else already attached.
+    let collide_at = Utc::now() + chrono::Duration::days(4);
+    let collide_cohort = partition::cohort_start(collide_at, partition::DEFAULT_COHORT_WIDTH_SECS);
+    let collide_name = partition::partition_name(collide_cohort);
+    diesel::sql_query(format!("DROP TABLE IF EXISTS {collide_name}"))
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray relation from a previous run");
+    diesel::sql_query(format!("CREATE TABLE {collide_name} (id int)"))
+        .execute(&mut conn)
+        .await
+        .expect("seed a colliding relation");
+
+    let (created, blocked) =
+        partition::ensure_partitions(&mut conn, Utc::now(), 4, Duration::from_secs(2))
+            .await
+            .expect(
+                "a window that is already almost fully covered, with one \
+                 newly blocked cohort, must not be reported as total \
+                 coverage failure",
+            );
+    assert!(
+        created.is_empty(),
+        "every cohort except the blocked one already existed from enable; \
+         nothing new should have been created; got {created:?}"
+    );
+    assert_eq!(
+        blocked,
+        vec![collide_cohort.to_rfc3339()],
+        "the one genuinely blocked cohort must still be reported; got {blocked:?}"
+    );
+
+    diesel::sql_query(format!("DROP TABLE {collide_name}"))
+        .execute(&mut conn)
+        .await
+        .expect("drop the colliding relation");
+}
+
+#[tokio::test]
 async fn a_partly_blocked_lookahead_catch_up_is_not_reported_as_a_healthy_pass() {
     // Issue #1270 item 4: `ensure_partitions` keeps creating the REST of the
     // window when one cohort cannot be carved out. That is deliberate, so a

@@ -1017,10 +1017,12 @@ pub async fn ensure_partitions(
     };
     let mut created = Vec::new();
     let mut blocked: Vec<String> = Vec::new();
+    let mut attempted = 0usize;
     for step in 0..=i64::from(lookahead_cohorts) {
         let Some(at) = now.checked_add_signed(chrono::Duration::seconds(width * step)) else {
             break;
         };
+        attempted += 1;
         match ensure_cohort_with_width(conn, at, width, lock_timeout).await {
             Ok((name, true)) => created.push(name),
             Ok((_, false)) => {}
@@ -1050,10 +1052,14 @@ pub async fn ensure_partitions(
             }
         }
     }
-    if created.is_empty() && !blocked.is_empty() {
-        // Nothing at all could be covered — that is not a partial success, and
-        // the caller must record it rather than report an empty, healthy-looking
-        // maintenance pass.
+    if attempted > 0 && blocked.len() == attempted {
+        // EVERY cohort in this window was blocked. Not merely
+        // `created.is_empty()`. A prior pass's already-attached cohorts
+        // (`Ok((_, false))`) are tracked in neither `created` nor
+        // `blocked`. `created` can stay empty even when the window is
+        // nearly fully covered and only the newest cohort is blocked.
+        // That is a partial success, not the total failure this error
+        // reports.
         return Err(HarvestError::Database(format!(
             "no cohort partition could be created; appends will land in \
              {DEFAULT_PARTITION}. blocked cohorts: {}",
