@@ -321,10 +321,17 @@ happened.
   the first signal, which is four orders of magnitude more than that window — but
   the window is not *closed*, and a signal that beat a suspension would be
   recorded as a shorter round trip than it was.
-* **Nothing sweeps up after a crash.** Databases are named uniquely per run and
-  dropped on every ordinary exit, including the error paths. A panic or a Ctrl-C
-  can still leave a handful behind on a server you supplied; they are all named
-  `harvest_e2e_*` and safe to drop.
+* **A crash's databases are swept on the next run, not the same one.** Databases
+  are named uniquely per run and dropped on every ordinary exit, including the
+  error paths. A panic or a Ctrl-C skips that: dropping a database is async, so
+  the harness cannot run it from a `Drop`. Provisioning against an existing
+  server (`HARVEST_TEST_DATABASE_URL` or `HARVEST_BENCH_SHARD_URLS`) sweeps for
+  exactly this before creating its own databases: an advisory lock serializes
+  the sweep against concurrent runs, only a name matching the full minted shape
+  is ever a candidate, and a database still holding a live connection is left
+  alone. A crash between runs is therefore self-healing; no manual cleanup is
+  needed. The testcontainer path has nothing to sweep — the container itself is
+  the whole server, and destroying it reclaims everything.
 * **The throughput window does not verify every shard stayed loaded.** Each
   shard runs a fixed completion quota, and the sustained rate is taken over the
   middle half of all shards' completions pooled together. If one shard finishes

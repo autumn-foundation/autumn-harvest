@@ -46,6 +46,28 @@ fn shard_db_name(cluster: &db::ShardCluster) -> String {
     db_name_from_url(url).expect("a shard url always carries a database path")
 }
 
+/// Wait until the server has actually noticed a dropped connection is gone.
+///
+/// Dropping a Rust-side `AsyncPgConnection` closes the client socket.
+/// PostgreSQL is not guaranteed to remove that backend from
+/// `pg_stat_activity` in the same instant, especially on a busy server. A
+/// test that drops a lease and immediately re-triggers the sweep can
+/// therefore race the server's own cleanup. It could see a
+/// stale-but-still-listed backend, and wrongly skip a database that is
+/// genuinely abandoned. Bounded, so a server that never clears the backend
+/// fails loudly
+/// instead of hanging the suite.
+async fn wait_for_connections_to_clear(admin: &mut AsyncPgConnection, datname: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while super::claim_bench_support::db::database_has_connections(admin, datname).await {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{datname} still shows a backend 10s after its lease was dropped"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// A panicked run's shard database is reclaimed by a later setup.
 ///
 /// Dropping a `ShardCluster` without calling `teardown` is exactly what a
@@ -82,6 +104,10 @@ async fn a_panicked_runs_shard_database_is_reclaimed_by_the_next_setup() {
         "the database must still exist right after drop; this test is about \
          reclaiming it later, not about drop deleting it"
     );
+    // The sweep's own liveness check is exactly `database_has_connections`.
+    // Waiting for that same signal here is what makes the next assertion
+    // test the sweep, not a race against the server's own cleanup.
+    wait_for_connections_to_clear(&mut admin, &stale_name).await;
 
     let Ok(second) = Box::pin(db::setup_shards(1)).await else {
         eprintln!("SKIP a_panicked_runs_shard_database_is_reclaimed_by_the_next_setup: no shard");
