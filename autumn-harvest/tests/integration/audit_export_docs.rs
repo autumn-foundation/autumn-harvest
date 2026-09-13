@@ -203,31 +203,42 @@ fn upgrade_guide_does_not_restate_the_false_claim() {
     );
 }
 
-/// Issue #1272's own fix added a "cost is bounded" claim. That claim has two
-/// independent failure modes in `retention.rs`'s purge gate
-/// (`audit_retention_days > 0 && !config.dry_run`): a zero horizon, and
-/// `dry_run` left on with a positive horizon. An earlier revision of this
-/// fix named only the first. Both sources that make the claim must name
-/// both conditions.
+/// Issue #1272's own fix added a "cost is bounded" claim. Two review rounds
+/// found more preconditions than one sentence can enumerate.
+/// `retention.rs`'s purge gate needs `audit_retention_days > 0` and
+/// `dry_run` false. `audit.rs`'s per-record guard adds a third: no
+/// non-retired export cursor for the shard, and no sink configured in the
+/// sweeping process. Naming a subset inline invites a fourth-round finding.
+/// Point at the existing "Retention interaction" section instead of
+/// re-deriving its conditions. Check that section still documents the
+/// cursor guard, so the pointer cannot go stale by losing the detail it
+/// names.
 #[test]
-fn boundedness_claim_is_qualified_by_retention_setting() {
-    for rel in ["autumn-harvest/src/audit_export.rs", "docs/audit-export.md"] {
+fn boundedness_claim_points_at_retention_interaction() {
+    for rel in [
+        "autumn-harvest/src/audit_export.rs",
+        "docs/audit-export.md",
+        "autumn-harvest/migrations/20260728000000_harvest_audit_export/up.sql",
+    ] {
         let path = repo_root().join(rel);
         let text = read_normalized(&path);
         assert!(
-            markers_near(&text, "cost is bounded", "audit_retention_days"),
-            "{}: a 'cost is bounded' claim must name `audit_retention_days \
-             > 0` as one condition for the bound to hold",
-            path.display()
-        );
-        assert!(
-            markers_near(&text, "cost is bounded", "dry_run"),
-            "{}: a 'cost is bounded' claim must also name `dry_run` — the \
-             purge is skipped when it is true even with a positive \
-             retention horizon",
+            markers_near(&text, "bounded", "Retention interaction"),
+            "{}: a boundedness claim must point at \"Retention interaction\" \
+             rather than re-deriving its conditions inline — that section \
+             is the one place those conditions are kept complete",
             path.display()
         );
     }
+
+    let doc = read_normalized(&repo_root().join("docs/audit-export.md"));
+    assert!(
+        contains_collapsed(&doc, "cursor row exists for the shard")
+            && contains_collapsed(&doc, "sink is configured in the sweeping process"),
+        "docs/audit-export.md's Retention interaction section must still \
+         document both halves of the purge guard; the boundedness claims \
+         elsewhere point here instead of restating them"
+    );
 }
 
 /// The AC8 section header in the DB-gated integration suite must not

@@ -36,9 +36,9 @@
 //! index on `export_seq IS NULL`. An unconfigured deployment leaves every row
 //! `NULL` forever, so the index matches the whole audit table, and every
 //! audit insert pays its maintenance cost. That cost is bounded only while
-//! the audit purge actually runs, which needs both `audit_retention_days >
-//! 0` and `dry_run` set to false. Either condition failing leaves the
-//! table, and the index, growing without bound. Tracked as issue #1272.
+//! retention actually reclaims unexported rows. See `docs/audit-export.md`'s
+//! "Retention interaction" section for the exact conditions: they are more
+//! than one config flag. Tracked as issue #1272.
 //!
 //! # Where the monotonic sequence comes from (and why not `BIGSERIAL`)
 //!
