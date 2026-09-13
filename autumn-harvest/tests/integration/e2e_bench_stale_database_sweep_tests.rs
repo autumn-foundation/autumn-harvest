@@ -1,11 +1,12 @@
 //! Stale-database sweep for the e2e benchmark harness (issue #1288).
 //!
-//! `ShardCluster::teardown` drops the databases a run created, and every
-//! ordinary and error return calls it — but a panic (or a Ctrl-C) skips it:
-//! dropping a database is async, so `ShardCluster` cannot have a useful
-//! `Drop`. This suite proves the provisioning-time sweep reclaims what a
-//! panicked run left behind, and leaves everything else alone. Mirrors
-//! `claim_budget_tests.rs`'s own sweep suite for the claim harness.
+//! `ShardCluster::teardown` drops the databases a run created. Every
+//! ordinary and error return calls it. A panic, or a Ctrl-C, skips it. That
+//! matters because dropping a database is async, so `ShardCluster` cannot
+//! have a useful `Drop`. This suite proves the provisioning-time sweep
+//! reclaims what a panicked run left behind, and leaves everything else
+//! alone. Mirrors `claim_budget_tests.rs`'s own sweep suite for the claim
+//! harness.
 //!
 //! Existing-server mode only (`HARVEST_TEST_DATABASE_URL`), matching its
 //! sibling: the testcontainer path gets a private server per process and has
@@ -44,8 +45,8 @@ fn shard_db_name(cluster: &db::ShardCluster) -> String {
 /// A panicked run's shard database is reclaimed by a later setup.
 ///
 /// Dropping a `ShardCluster` without calling `teardown` is exactly what a
-/// panic leaves behind: the database still exists, but its lease connection
-/// is gone, so it looks abandoned to the next setup's sweep.
+/// panic leaves behind. The database still exists. Its lease connection is
+/// gone, so it looks abandoned to the next setup's sweep.
 #[tokio::test]
 async fn a_panicked_runs_shard_database_is_reclaimed_by_the_next_setup() {
     let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
@@ -92,8 +93,9 @@ async fn a_panicked_runs_shard_database_is_reclaimed_by_the_next_setup() {
 /// A cluster still in use survives a concurrent setup's sweep.
 ///
 /// The sweep only asks the server whether anything holds a backend against a
-/// candidate database; a live `ShardCluster` holds one lease connection per
-/// shard for its whole lifetime, so any backend at all must mean "in use".
+/// candidate database. A live `ShardCluster` holds one lease connection per
+/// shard for its whole lifetime. Any backend at all means the database is
+/// in use.
 #[tokio::test]
 async fn a_live_clusters_databases_survive_a_concurrent_setup() {
     let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
@@ -132,8 +134,8 @@ async fn a_live_clusters_databases_survive_a_concurrent_setup() {
 /// A database that merely shares the harness prefix is never dropped.
 ///
 /// The sweep is the only destructive thing this harness does to a server it
-/// does not own, so what counts as "ours" has to be the full minted shape,
-/// not the prefix alone.
+/// does not own. What counts as "ours" therefore has to be the full minted
+/// shape, not the prefix alone.
 #[tokio::test]
 async fn sweep_never_touches_a_database_it_did_not_mint() {
     let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {

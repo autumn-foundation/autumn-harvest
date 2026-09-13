@@ -127,10 +127,10 @@ async fn run() {
             // every cell already measured, and skips teardown for the databases
             // the remaining cells would have created.
             //
-            // `await_cell` adds a hard wall-clock ceiling on top: a wedged
-            // database can otherwise park this await forever, since
-            // `SCENARIO_BUDGET_SECS` is only a *cooperative* deadline the
-            // scenario checks between its own awaits (issue #1288). A timed-out
+            // `await_cell` adds a hard wall-clock ceiling on top.
+            // `SCENARIO_BUDGET_SECS` is only a *cooperative* deadline; the
+            // scenario checks it between its own awaits. A wedged database can
+            // otherwise park this await forever (issue #1288). A timed-out
             // cell's databases are not dropped here; the next run's
             // stale-database sweep reclaims them.
             let handle = tokio::spawn(run_scenario(scenario, shards));

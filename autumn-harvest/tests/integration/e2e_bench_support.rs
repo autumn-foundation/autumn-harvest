@@ -167,20 +167,20 @@ pub const E2E_DB_PREFIX: &str = "harvest_e2e_";
 /// A shard database is named `{E2E_DB_PREFIX}{token}_{seq}_s{shard}`:
 ///
 /// * `token` — 16 lowercase hex digits, from the claim harness's `db::run_token`.
-///   The e2e harness shares that token function with the claim harness, so a
-///   single process mints one token for the life of its run regardless of
-///   which harness asks.
+///   The e2e harness shares that token function with the claim harness. A
+///   single process therefore mints one token for the life of its run,
+///   regardless of which harness asks.
 /// * `seq` — decimal digits in `u64` range, from an `AtomicU64` counter.
-/// * `shard` — decimal digits in `u32` range. `ShardId::as_i32` is signed, but
-///   every shard this harness ever mints is `idx as i32` for `idx in
-///   0..shard_count`, so it is never negative; checking `u32` here (rather
-///   than `i32`) is what keeps a decoy such as `..._s-1` from round-tripping
-///   as canonical and being handed to the sweep.
+/// * `shard` — decimal digits in `u32` range. `ShardId::as_i32` is signed.
+///   Every shard this harness ever mints is `idx as i32` for `idx in
+///   0..shard_count`. It is therefore never negative. Checking `u32` here,
+///   rather than `i32`, is what keeps a decoy such as `..._s-1` from
+///   round-tripping as canonical and being handed to the sweep.
 ///
-/// Same asymmetry as the claim harness's own `sweep_step`, which this mirrors
-/// for a different name shape rather than extending: refusing to reclaim one
-/// of ours leaks a database; reclaiming one of theirs destroys data. Every
-/// ambiguous case resolves to `SweepStep::Skip`.
+/// Same asymmetry as the claim harness's own `sweep_step`. This mirrors that
+/// check for a different name shape rather than extending it. Refusing to
+/// reclaim one of ours leaks a database. Reclaiming one of theirs destroys
+/// data. Every ambiguous case resolves to `SweepStep::Skip`.
 #[must_use]
 pub fn sweep_step(datname: &str) -> super::claim_bench_support::SweepStep {
     use super::claim_bench_support::{SweepStep, is_canonical_decimal, is_run_token};
@@ -2483,11 +2483,11 @@ pub mod db {
     /// Drop e2e shard databases left behind by an earlier run.
     ///
     /// `ShardCluster::teardown` drops what a run created on every ordinary and
-    /// error return, but a **panic** or a Ctrl-C skips it: dropping a database
-    /// is async, so `ShardCluster` cannot have a useful `Drop` (issue #1288).
-    /// Sweeping at provisioning time, not at teardown, is what reclaims those:
-    /// a run that panicked mid-sweep never reaches its own teardown, but the
-    /// next run's setup still passes through here.
+    /// error return. A **panic** or a Ctrl-C skips it. Dropping a database is
+    /// async, so `ShardCluster` cannot have a useful `Drop` (issue #1288).
+    /// Sweeping at provisioning time, not at teardown, is what reclaims those
+    /// databases. A run that panicked mid-sweep never reaches its own
+    /// teardown. The next run's setup still passes through here.
     ///
     /// Mirrors `claim_bench_support::db::drop_stale_bench_databases` for the
     /// e2e name shape. A database belonging to a **live** run is skipped, so
@@ -2516,10 +2516,10 @@ pub mod db {
             if sweep_step(&row.datname) == super::super::claim_bench_support::SweepStep::Skip {
                 continue;
             }
-            // The server is the one party that sees every client regardless
-            // of host or PID namespace; a live run holds a lease connection
-            // for its database's whole lifetime (see `ShardCluster::leases`),
-            // so any backend at all means "in use".
+            // The server is the one party that sees every client, regardless
+            // of host or PID namespace. A live run holds a lease connection
+            // for its database's whole lifetime (see `ShardCluster::leases`).
+            // Any backend at all therefore means the database is in use.
             if super::super::claim_bench_support::db::database_has_connections(
                 admin,
                 &row.datname,
@@ -2539,11 +2539,11 @@ pub mod db {
     /// Sweep stale e2e databases on `admin_url`'s server, then run `provision`
     /// while still holding the stale-database sweep lock.
     ///
-    /// The lock must span provisioning, not just the sweep: a fresh database
+    /// The lock must span provisioning, not just the sweep. A fresh database
     /// has no lease connection until [`create_shard_database`] finishes
-    /// connecting to it, and a foreign sweep between `CREATE DATABASE` and
-    /// that connect would see zero backends and correctly conclude the
-    /// database is abandoned. Same race, same fix, as
+    /// connecting to it. A foreign sweep between `CREATE DATABASE` and that
+    /// connect would otherwise see zero backends. It would then wrongly
+    /// conclude the database is abandoned. Same race, same fix, as
     /// `claim_bench_support::db::setup_bench_db`.
     ///
     /// Skipped entirely against a testcontainer: nothing outside this process
@@ -2720,8 +2720,8 @@ pub mod db {
             Ok(())
         };
         // One sweep and one lock hold for the whole shard loop here: every
-        // shard shares this one server. Skipped on the testcontainer path —
-        // nothing outside this process can reach that server, so there is
+        // shard shares this one server. Skipped on the testcontainer path.
+        // Nothing outside this process can reach that server. There is
         // nothing to sweep and no peer to serialize against.
         let provisioned = if container.is_none() {
             with_stale_sweep(&admin_url, provision).await

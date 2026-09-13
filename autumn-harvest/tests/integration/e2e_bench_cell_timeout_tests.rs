@@ -1,9 +1,9 @@
 //! Hard wall-clock ceiling on one benchmark cell (issue #1288).
 //!
-//! `SCENARIO_BUDGET_SECS` is a *cooperative* deadline every scenario runner
-//! checks between its own awaits; nothing bounds a single await, so a wedged
-//! database can park a cell forever. `await_cell` is the outer stop: past
-//! budget, it aborts the cell's task rather than waiting on it forever. This
+//! `SCENARIO_BUDGET_SECS` is a *cooperative* deadline. Every scenario runner
+//! checks it between its own awaits. Nothing bounds a single await, so a
+//! wedged database can park a cell forever. `await_cell` is the outer stop.
+//! Past budget, it aborts the cell's task instead of waiting forever. This
 //! suite proves that with a deliberately-hanging fake task, so it needs
 //! neither a database nor the `db` feature.
 
