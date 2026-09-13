@@ -1210,21 +1210,29 @@ pub async fn unique_indexes_missing_cohort(
 /// `insufficient columns in UNIQUE constraint definition` from Postgres
 /// names neither the index nor why it is unsupported.
 #[cfg(feature = "db")]
-async fn refuse_if_unique_index_without_cohort(conn: &mut AsyncPgConnection) -> HarvestResult<()> {
+async fn refuse_if_unique_index_without_cohort(
+    conn: &mut AsyncPgConnection,
+    verb: &str,
+) -> HarvestResult<()> {
     let bad = unique_indexes_missing_cohort(conn).await?;
     if bad.is_empty() {
         return Ok(());
     }
     Err(HarvestError::Config(format!(
-        "refusing to convert harvest_events: it carries a unique index that does not \
-         include `cohort` ({}). Postgres requires the partition key in every unique index \
-         on a partitioned table, so replaying this index onto the partitioned parent would \
-         fail. Adding `cohort` to it is not offered automatically: `cohort` is the row's \
-         append instant, so a unique index that spans it is weaker than the index is today \
-         — exactly the reason the engine's own (workflow_exec_id, event_id) uniqueness moved \
-         into the insert trigger rather than a wider constraint. Drop the index if it is \
-         obsolete, or recreate it including `cohort` yourself if that weaker guarantee is \
+        "refusing to {verb} harvest_events: {} that does not include `cohort` ({}). \
+         Postgres requires the partition key in every unique index on a partitioned \
+         table, so replaying it onto the partitioned parent would fail. Adding `cohort` \
+         to it is not offered automatically: `cohort` is the row's append instant, so a \
+         unique index that spans it is weaker than the index is today — exactly the \
+         reason the engine's own (workflow_exec_id, event_id) uniqueness moved into the \
+         insert trigger rather than a wider constraint. Drop the index if it is obsolete, \
+         or recreate it including `cohort` yourself if that weaker guarantee is \
          acceptable for your use of it.",
+        if bad.len() == 1 {
+            "it carries a unique index"
+        } else {
+            "it carries unique indexes"
+        },
         bad.join(", ")
     )))
 }
@@ -1409,7 +1417,7 @@ pub async fn enable_partitioning(
     }
 
     refuse_if_row_security(conn, "convert").await?;
-    refuse_if_unique_index_without_cohort(conn).await?;
+    refuse_if_unique_index_without_cohort(conn, "convert").await?;
     refuse_if_dependent_views(conn, "convert").await?;
     refuse_if_operator_triggers(conn, "convert").await?;
 

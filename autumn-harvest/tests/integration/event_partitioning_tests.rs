@@ -523,22 +523,22 @@ async fn the_large_table_plans_phase_1_also_refuses_a_unique_index_without_cohor
         .await
         .expect("seed a unique index that does not include cohort");
 
-    let mut refused = false;
+    let mut refusal: Option<String> = None;
     for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
         .into_iter()
         .filter(|s| s.phase == 1)
     {
-        if diesel::sql_query(&step.sql)
-            .execute(&mut conn)
-            .await
-            .is_err()
-        {
-            refused = true;
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            refusal = Some(e.to_string());
         }
     }
+    let msg = refusal.expect("phase 1 of the plan must refuse a unique index missing cohort");
+    // Not just "some phase-1 step failed". Name the offending index. A
+    // regression that fails phase 1 for the WRONG reason must not pass
+    // this test by accident.
     assert!(
-        refused,
-        "phase 1 of the plan must refuse a unique index missing cohort"
+        msg.contains("uq_plan_no_cohort_958"),
+        "the refusal must name the offending index; got {msg}"
     );
 
     diesel::sql_query("DROP INDEX uq_plan_no_cohort_958")
@@ -625,22 +625,20 @@ async fn the_large_table_plans_phase_1_also_refuses_a_dependent_view() {
     .await
     .expect("seed a dependent view");
 
-    let mut refused = false;
+    let mut refusal: Option<String> = None;
     for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
         .into_iter()
         .filter(|s| s.phase == 1)
     {
-        if diesel::sql_query(&step.sql)
-            .execute(&mut conn)
-            .await
-            .is_err()
-        {
-            refused = true;
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            refusal = Some(e.to_string());
         }
     }
+    let msg =
+        refusal.expect("phase 1 of the plan must refuse a view that depends on harvest_events");
     assert!(
-        refused,
-        "phase 1 of the plan must refuse a view that depends on harvest_events"
+        msg.contains("harvest_events_plan_view_958"),
+        "the refusal must name the offending view; got {msg}"
     );
 
     diesel::sql_query("DROP VIEW harvest_events_plan_view_958")
@@ -759,22 +757,21 @@ async fn the_large_table_plans_phase_1_also_refuses_a_dependent_materialized_vie
     .await
     .expect("seed a dependent materialized view");
 
-    let mut refused = false;
+    let mut refusal: Option<String> = None;
     for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
         .into_iter()
         .filter(|s| s.phase == 1)
     {
-        if diesel::sql_query(&step.sql)
-            .execute(&mut conn)
-            .await
-            .is_err()
-        {
-            refused = true;
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            refusal = Some(e.to_string());
         }
     }
+    let msg = refusal.expect(
+        "phase 1 of the plan must refuse a materialized view that depends on harvest_events",
+    );
     assert!(
-        refused,
-        "phase 1 of the plan must refuse a materialized view that depends on harvest_events"
+        msg.contains("harvest_events_plan_matview_958"),
+        "the refusal must name the offending materialized view; got {msg}"
     );
 
     diesel::sql_query("DROP MATERIALIZED VIEW harvest_events_plan_matview_958")
@@ -930,22 +927,20 @@ async fn the_large_table_plans_phase_1_also_refuses_an_operator_trigger() {
     .await
     .expect("seed an operator trigger");
 
-    let mut refused = false;
+    let mut refusal: Option<String> = None;
     for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
         .into_iter()
         .filter(|s| s.phase == 1)
     {
-        if diesel::sql_query(&step.sql)
-            .execute(&mut conn)
-            .await
-            .is_err()
-        {
-            refused = true;
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            refusal = Some(e.to_string());
         }
     }
+    let msg =
+        refusal.expect("phase 1 of the plan must refuse an operator trigger on harvest_events");
     assert!(
-        refused,
-        "phase 1 of the plan must refuse an operator trigger on harvest_events"
+        msg.contains("harvest_events_plan_trg_958"),
+        "the refusal must name the offending trigger; got {msg}"
     );
 
     diesel::sql_query("DROP TRIGGER harvest_events_plan_trg_958 ON harvest_events")
@@ -2068,6 +2063,70 @@ async fn partition_maintenance_stays_none_on_a_shard_that_never_converted() {
         "partition_maintenance must stay None on a shard that never opted \
          into the partitioned layout; got {:?}",
         result.partition_maintenance
+    );
+}
+
+#[tokio::test]
+async fn partition_maintenance_reports_failed_when_the_layout_probe_errors() {
+    // Test-coverage review finding on item 6: the layout probe before
+    // `maintain` has three outcomes -- Unpartitioned (continue, stay
+    // None), Partitioned (run maintain), and Err. Only the first two were
+    // exercised by a prior test. An Err must report
+    // `MaintenanceOutcome::failed`, not silently collapse into looking
+    // like a shard that never converted.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Break the probe's catalog lookup without touching data. It matches
+    // on relname = 'harvest_events', so a rename alone makes it find no
+    // row and return Err(NotFound).
+    diesel::sql_query("ALTER TABLE harvest_events RENAME TO harvest_events_probe_break_958")
+        .execute(&mut conn)
+        .await
+        .expect("rename harvest_events so the layout probe cannot find it");
+
+    let pool = build_pool(&url);
+    let pools = ShardedDbPool::single(pool);
+    let config = RetentionConfig::default();
+
+    let runtime = RetentionRuntime::spawn(pools, config, Arc::new(NoopMetrics), None, None)
+        .expect("retention runtime should spawn when enabled");
+    runtime.run_now();
+
+    let mut outcome = None;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snap = runtime.monitor().snapshot();
+        if let Some(r) = snap.per_shard.iter().find(|r| r.shard == 0)
+            && let Some(m) = &r.partition_maintenance
+        {
+            outcome = Some(m.clone());
+            break;
+        }
+    }
+    runtime.shutdown();
+
+    diesel::sql_query("ALTER TABLE harvest_events_probe_break_958 RENAME TO harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("restore the harvest_events name");
+
+    let outcome = outcome.expect(
+        "a layout-probe failure must report MaintenanceOutcome::failed, not \
+         leave partition_maintenance unset forever",
+    );
+    assert!(
+        outcome.last_error.is_some(),
+        "a layout-probe failure must carry the error, not report an empty \
+         outcome that looks like a healthy pass; got {outcome:?}"
+    );
+    assert!(
+        outcome.created.is_empty() && outcome.sweep.dropped.is_empty(),
+        "a probe failure must not report as if maintain() itself ran; got {outcome:?}"
     );
 }
 
@@ -3731,23 +3790,36 @@ async fn phase_4_refuses_a_valid_index_with_the_right_name_and_the_wrong_shape()
 
     run_plan_phases(&mut conn, 1..=3).await;
 
-    let mut failed = false;
+    let mut failure: Option<String> = None;
     for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
         .into_iter()
         .filter(|s| s.phase == 4)
     {
-        if diesel::sql_query(&step.sql)
-            .execute(&mut conn)
-            .await
-            .is_err()
+        // Phase 4's steps share one transaction (`BEGIN` ... `COMMIT`).
+        // Once the assertion raises, every later step also errors with
+        // Postgres's generic "current transaction is aborted". That is
+        // not the signal, so only the FIRST error is kept. The loop still
+        // runs to the trailing `COMMIT`. Postgres always accepts that,
+        // even mid-abort — it closes the block, as a rollback would.
+        // Skipping it here would leave `conn` mid-transaction for the
+        // cleanup statements below.
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await
+            && failure.is_none()
         {
-            failed = true;
+            failure = Some(e.to_string());
         }
     }
-    assert!(
-        failed,
+    let msg = failure.expect(
         "phase 4 must refuse when a valid index of the right name has the \
-         wrong shape, not count it as the real one"
+         wrong shape, not count it as the real one",
+    );
+    // Not just "some phase-4 step failed": the impostor must be the reason.
+    // Only the legitimate `exec_event_idx` counts, so the assertion must
+    // report exactly 1 of 2 correctly-shaped indexes, not fail for some
+    // unrelated reason.
+    assert!(
+        msg.contains("phase 2 left 1 of 2 valid, correctly-shaped"),
+        "the refusal must report exactly one correctly-shaped index found; got {msg}"
     );
     assert_eq!(
         events_relkind(&mut conn).await,
@@ -4525,6 +4597,16 @@ async fn a_partly_blocked_lookahead_catch_up_is_not_reported_as_a_healthy_pass()
          last_error — the CLI and the retention status API both key off it; \
          got {outcome:?}"
     );
+
+    // Review finding: `collide_name` is a real cohort partition's exact,
+    // deterministic production name for a future date, not a `_958`-tagged
+    // test fixture. Left behind, it would collide with that cohort's real
+    // partition when its date arrives, spuriously blocking maintenance for
+    // an unrelated reason.
+    diesel::sql_query(format!("DROP TABLE {collide_name}"))
+        .execute(&mut conn)
+        .await
+        .expect("drop the colliding relation");
 }
 
 #[tokio::test]
