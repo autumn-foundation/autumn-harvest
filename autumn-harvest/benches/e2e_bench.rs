@@ -68,12 +68,11 @@ mod claim_bench_support;
 mod e2e_bench_support;
 
 use e2e_bench_support::{
-    BenchScenario, CHECK_ENV_VAR, CellOutcome, Metric, PUBLISHED_BASELINES,
-    REPLAY_CONTROL_DRIFT_PCT, REPRO_TOLERANCE_PCT, ReproVerdict, SCENARIO_BUDGET_SECS,
-    SCENARIO_FILTER_ENV_VAR, SHARD_COUNTS, SHARD_FILTER_ENV_VAR, ScenarioReport, await_cell,
-    baseline_for, relative_error_pct, render_matrix, render_value, replay_control_drift_pct,
-    repro_verdict, selected_scenarios, selected_shard_counts, unknown_scenario_ids,
-    unknown_shard_counts,
+    BenchScenario, CELL_HARD_TIMEOUT_SECS, CHECK_ENV_VAR, CellOutcome, Metric, PUBLISHED_BASELINES,
+    REPLAY_CONTROL_DRIFT_PCT, REPRO_TOLERANCE_PCT, ReproVerdict, SCENARIO_FILTER_ENV_VAR,
+    SHARD_COUNTS, SHARD_FILTER_ENV_VAR, ScenarioReport, await_cell, baseline_for,
+    relative_error_pct, render_matrix, render_value, replay_control_drift_pct, repro_verdict,
+    selected_scenarios, selected_shard_counts, unknown_scenario_ids, unknown_shard_counts,
 };
 
 fn main() {
@@ -129,13 +128,20 @@ async fn run() {
             //
             // `await_cell` adds a hard wall-clock ceiling on top.
             // `SCENARIO_BUDGET_SECS` is only a *cooperative* deadline; the
-            // scenario checks it between its own awaits. A wedged database can
-            // otherwise park this await forever (issue #1288). A timed-out
-            // cell's databases are not dropped here; the next run's
+            // scenario checks it between its own awaits, and only starts
+            // counting after `setup_shards` returns. A wedged database can
+            // otherwise park this await forever (issue #1288). `await_cell`'s
+            // own ceiling is `CELL_HARD_TIMEOUT_SECS`, wider than the
+            // scenario's own budget: it also has to cover provisioning and
+            // teardown, which run outside that cooperative deadline. A
+            // timed-out cell's databases are not dropped here; the next run's
             // stale-database sweep reclaims them.
             let handle = tokio::spawn(run_scenario(scenario, shards));
-            let outcome =
-                await_cell(handle, std::time::Duration::from_secs(SCENARIO_BUDGET_SECS)).await;
+            let outcome = await_cell(
+                handle,
+                std::time::Duration::from_secs(CELL_HARD_TIMEOUT_SECS),
+            )
+            .await;
             match outcome {
                 CellOutcome::Report(report) => reports.push(report),
                 CellOutcome::Skipped(reason) => {
@@ -155,8 +161,8 @@ async fn run() {
                 }
                 CellOutcome::TimedOut => {
                     println!(
-                        "\n> **Timed out** `{}` at {shards} shard(s): the {SCENARIO_BUDGET_SECS}s \
-                         scenario budget was exhausted and the task was aborted. Later cells \
+                        "\n> **Timed out** `{}` at {shards} shard(s): the {CELL_HARD_TIMEOUT_SECS}s \
+                         hard cell ceiling was exhausted and the task was aborted. Later cells \
                          still ran; databases this cell created were not dropped and will be \
                          reclaimed by a later run's stale-database sweep.\n",
                         scenario.as_str(),

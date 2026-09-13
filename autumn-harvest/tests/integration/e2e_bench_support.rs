@@ -1021,7 +1021,28 @@ pub fn measured_workflows_per_shard() -> usize {
 /// Wall-clock ceiling for one scenario at one shard count. A scenario that
 /// hits it reports what it collected and is marked unsound rather than
 /// parking the whole suite.
+///
+/// This is a *cooperative* deadline: a scenario runner starts its own clock
+/// against it only after `setup_shards` returns, and checks it between its
+/// own awaits. [`CELL_HARD_TIMEOUT_SECS`] is the outer, uncooperative ceiling
+/// on top of it.
 pub const SCENARIO_BUDGET_SECS: u64 = 900;
+
+/// Extra wall-clock room [`CELL_HARD_TIMEOUT_SECS`] gives a cell beyond
+/// [`SCENARIO_BUDGET_SECS`], to cover provisioning and teardown -- both of
+/// which run outside the scenario's own cooperative deadline.
+///
+/// Provisioning is normally seconds, not minutes. This margin is generous on
+/// purpose. It exists so a merely slow provisioning step can never make the
+/// hard outer timeout fire early. An early fire would cut short a
+/// partial-but-sound report and skip its teardown for no reason. A
+/// connect or query that is genuinely wedged is still caught -- just within
+/// this wider ceiling rather than exactly [`SCENARIO_BUDGET_SECS`].
+pub const CELL_PROVISIONING_GRACE_SECS: u64 = 300;
+
+/// The hard wall-clock ceiling `await_cell` enforces on one whole cell:
+/// provisioning, the scenario's own cooperative deadline, and teardown.
+pub const CELL_HARD_TIMEOUT_SECS: u64 = SCENARIO_BUDGET_SECS + CELL_PROVISIONING_GRACE_SECS;
 
 /// How long to wait after every signal workflow's handler has reached
 /// `wait_for_signal` before the first signal is sent, so the suspension has
@@ -2619,6 +2640,13 @@ pub mod db {
                 return Err(SkipReason(format!("connect to fresh shard database: {e}")));
             }
         };
+        // This connection is the lease `ShardCluster` holds for the shard
+        // database's whole lifetime (see `ShardCluster::leases`). On a server
+        // with `idle_session_timeout` set, an unarmed lease could be reaped
+        // between scenarios. A sweep would then see zero backends and drop a
+        // database this run still needs. Same defense as
+        // `claim_bench_support::db::BenchDb`'s own lease.
+        super::super::claim_bench_support::db::arm_lease_session(&mut conn).await;
         record_server_version(&mut conn).await;
         Ok((url, name, conn))
     }
@@ -3628,7 +3656,7 @@ pub mod db {
     )]
     pub async fn run_throughput(shard_count: u32) -> Result<ScenarioReport, SkipReason> {
         let scenario_started = Instant::now();
-        let cluster = setup_shards(shard_count).await?;
+        let cluster = Box::pin(setup_shards(shard_count)).await?;
         let sharded = cluster.sharded_pool();
         let (registry, _observations) = build_registry();
         let fleet = start_fleet(&cluster, &sharded, &registry);
@@ -3973,7 +4001,7 @@ pub mod db {
     )]
     pub async fn run_dispatch_latency(shard_count: u32) -> Result<ScenarioReport, SkipReason> {
         let scenario_started = Instant::now();
-        let cluster = setup_shards(shard_count).await?;
+        let cluster = Box::pin(setup_shards(shard_count)).await?;
         let sharded = cluster.sharded_pool();
         let (registry, observations) = build_registry();
         let fleet = start_fleet(&cluster, &sharded, &registry);
@@ -4253,7 +4281,7 @@ pub mod db {
     )]
     pub async fn run_signal_roundtrip(shard_count: u32) -> Result<ScenarioReport, SkipReason> {
         let scenario_started = Instant::now();
-        let cluster = setup_shards(shard_count).await?;
+        let cluster = Box::pin(setup_shards(shard_count)).await?;
         let sharded = cluster.sharded_pool();
         let (registry, observations) = build_registry();
         let fleet = start_fleet(&cluster, &sharded, &registry);

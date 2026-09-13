@@ -67,7 +67,7 @@ async fn a_panicked_runs_shard_database_is_reclaimed_by_the_next_setup() {
         return;
     };
 
-    let Ok(first) = db::setup_shards(1).await else {
+    let Ok(first) = Box::pin(db::setup_shards(1)).await else {
         eprintln!("SKIP a_panicked_runs_shard_database_is_reclaimed_by_the_next_setup: no shard");
         return;
     };
@@ -83,7 +83,7 @@ async fn a_panicked_runs_shard_database_is_reclaimed_by_the_next_setup() {
          reclaiming it later, not about drop deleting it"
     );
 
-    let Ok(second) = db::setup_shards(1).await else {
+    let Ok(second) = Box::pin(db::setup_shards(1)).await else {
         eprintln!("SKIP a_panicked_runs_shard_database_is_reclaimed_by_the_next_setup: no shard");
         return;
     };
@@ -116,13 +116,13 @@ async fn a_live_clusters_databases_survive_a_concurrent_setup() {
         return;
     };
 
-    let Ok(live) = db::setup_shards(1).await else {
+    let Ok(live) = Box::pin(db::setup_shards(1)).await else {
         eprintln!("SKIP a_live_clusters_databases_survive_a_concurrent_setup: no shard");
         return;
     };
     let live_name = shard_db_name(&live);
 
-    let Ok(other) = db::setup_shards(1).await else {
+    let Ok(other) = Box::pin(db::setup_shards(1)).await else {
         eprintln!("SKIP a_live_clusters_databases_survive_a_concurrent_setup: no shard");
         return;
     };
@@ -172,7 +172,7 @@ async fn sweep_never_touches_a_database_it_did_not_mint() {
         .await
         .expect("create the decoy");
 
-    let cluster = db::setup_shards(1).await;
+    let cluster = Box::pin(db::setup_shards(1)).await;
 
     let survived = exists(&mut admin, &decoy).await;
     diesel::sql_query(format!("DROP DATABASE IF EXISTS {decoy}"))
