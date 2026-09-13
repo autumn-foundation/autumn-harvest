@@ -437,5 +437,15 @@ harness = false
 name = "run_chain_profile"
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `history_export::export_history` -- the archival-export path
+# `retention.rs`'s reclamation sweep calls once per retiring execution before
+# deleting its row (issue #524/#698/#772/#798), also re-exported at the crate
+# root as public API. No feature requirement: `history_export.rs` is pure and
+# unconditional (no DB access). See `benches/history_export_profile.rs`.
+[[bench]]
+name = "history_export_profile"
+harness = false
+
 [lints]
 workspace = true
