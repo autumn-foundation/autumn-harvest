@@ -1614,7 +1614,10 @@ fn slow_activity<'a>(
     input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // 1500ms, not the original 250ms. See the doc comment on the
+        // `default_start_to_close` field this activity is registered with,
+        // in worker_fails_workflow_when_activity_start_to_close_timeout_elapses.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
         Ok(input)
     })
 }
@@ -3472,7 +3475,18 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     name: "slow_activity",
                     module: "integration_e2e",
                     default_retry_policy: None,
-                    default_start_to_close: Some(Duration::from_millis(50)),
+                    // 300ms, not the original 50ms. This failed twice on
+                    // shared CI runners with the same signature. The
+                    // engine's own timeout-detection tick raced a live,
+                    // still-completing activity. The actual sequence
+                    // recorded ActivityCompleted before the check ever
+                    // fired. The margin between this deadline and
+                    // slow_activity's own 1500ms sleep (below) matters far
+                    // more than either absolute value. It is now 1200ms,
+                    // six times the original 200ms gap. That matches the
+                    // margin issue #1459 needed for a related
+                    // timeout-detection race under contention.
+                    default_start_to_close: Some(Duration::from_millis(300)),
                     default_heartbeat_timeout: None,
                     default_schedule_to_start: None,
                     default_schedule_to_close: None,
