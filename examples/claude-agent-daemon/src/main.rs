@@ -649,6 +649,17 @@ fn session_lines(view: &SessionView, socket: &Path) -> Vec<String> {
             ));
         }
     }
+    // A listing cuts every field it prints, and a tool-use id is accepted up
+    // to nearly a megabyte. A row that cannot carry the call whole carries
+    // none, and points at the view that can. A CUT token would read as a
+    // command and would not be one.
+    if view.call_not_listed {
+        lines.push(format!(
+            "  decide:  read the call first: agentd status{} {}",
+            protocol::socket_flag(socket),
+            view.execution_id,
+        ));
+    }
     if let Some(answer) = &view.answer {
         lines.push(format!("  answer:  {answer}"));
     }

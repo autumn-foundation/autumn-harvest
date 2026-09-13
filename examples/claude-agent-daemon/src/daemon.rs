@@ -1140,6 +1140,40 @@ pub fn sessions(
     ))
 }
 
+/// The decision a LISTING offers, bounded as every other listed field is.
+///
+/// A listing names hundreds of sessions, and every field it prints is cut for
+/// that reason. The awaited call was not. A tool-use id is accepted up to
+/// [`claude::MAX_CALL_ID_BYTES`], which is nearly a megabyte. The id appears
+/// TWICE in a row: once by itself, and once inside the approval token.
+/// Measured at 100000 characters, one row serialised to 200324 bytes.
+/// A full page at the id cap is about 399 `MiB`, built in memory and then
+/// serialised again.
+///
+/// The cut is not a cut. A token must be COPIED to be used, so a shortened
+/// one is worse than none: it reads as a command and is not one. A row whose
+/// call cannot be printed whole therefore offers no decision, and says where
+/// the whole call is. The single status reads ONE session, so it prints it.
+///
+/// The cap is the listing's own, so an ordinary call is unaffected. A real
+/// tool-use id is about 30 characters.
+fn listed_decision(
+    pending: Option<PendingCall>,
+    blocked_on: Option<&str>,
+) -> (Option<PendingCall>, Option<String>, bool) {
+    let cap = inspect::MAX_LISTED_CHARS as usize;
+    let fits = |text: &str| text.chars().count() <= cap;
+    // The reason is written by this daemon and carries the model's own tool
+    // name, so it is cut here like the fields around it.
+    let blocked_on = blocked_on.map(shortened);
+    match pending {
+        Some(call) if !(fits(&call.id) && fits(&call.token) && fits(&call.tool)) => {
+            (None, blocked_on, true)
+        }
+        offered => (offered, blocked_on, false),
+    }
+}
+
 /// One listed field, cut to the printed cap and MARKED when it was cut.
 ///
 /// The projection reads one character past the cap, so a longer field is
@@ -1210,6 +1244,7 @@ fn summary_view(
         .and_then(|id| id.parse::<ExecutionId>().ok())
         .and_then(|exec| blocked.get(&exec));
     let (pending, blocked_on) = decidable(reader, exec_id.unwrap_or_default(), state, full);
+    let (pending, blocked_on, call_not_listed) = listed_decision(pending, blocked_on.as_deref());
 
     SessionView {
         execution_id: exec_id.map_or_else(|| "<unreadable id>".to_string(), shortened),
@@ -1228,6 +1263,7 @@ fn summary_view(
             .map_or_else(|| "<unreadable state>".to_string(), shortened),
         blocked_on,
         pending,
+        call_not_listed,
         answer,
         // A damaged reason is NAMED. A silence there would read as a failure
         // that recorded no reason, and `status` calls the same row
@@ -1335,6 +1371,9 @@ fn view(reader: &Connection, row: &ExecutionRow, blocked: &Parked, full: bool) -
         state: row.state.clone(),
         blocked_on,
         pending,
+        // One status reads ONE session, so it carries the call whole however
+        // long it is. This is the view a listing points AT.
+        call_not_listed: false,
         answer,
         error: row.error.clone(),
     }

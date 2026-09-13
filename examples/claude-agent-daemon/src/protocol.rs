@@ -131,6 +131,19 @@ pub struct SessionView {
     pub blocked_on: Option<String>,
     /// The tool call awaiting a decision, read back from the event log.
     pub pending: Option<PendingCall>,
+    /// Is a decision waiting that this view is too small to carry?
+    ///
+    /// A listing names hundreds of sessions and cuts every field it prints. A
+    /// tool-use id is accepted up to nearly a megabyte, and it appears twice
+    /// in a row: alone, and inside the approval token. A page of those built
+    /// hundreds of megabytes.
+    ///
+    /// A token must be COPIED to be used, so a cut one is worse than none. A
+    /// row that cannot carry the call whole therefore carries no call, and
+    /// this says so. The client renders the command that reads it, because
+    /// only the client knows which socket the operator asked for.
+    #[serde(default)]
+    pub call_not_listed: bool,
     /// The report of a finished session.
     pub answer: Option<String>,
     /// The error of a failed session.

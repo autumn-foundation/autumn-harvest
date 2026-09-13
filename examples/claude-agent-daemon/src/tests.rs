@@ -2052,6 +2052,7 @@ fn a_cut_pending_call_offers_no_approval() {
             input: "{\"path\":\"notes.md\"}".to_string(),
             truncated,
         }),
+        call_not_listed: false,
         answer: None,
         error: None,
     };
@@ -2670,6 +2671,7 @@ fn model_text_cannot_drive_the_terminal() {
             input: "{\"path\":\"notes\u{202e}gnp.md\"}".to_string(),
             truncated: false,
         }),
+        call_not_listed: false,
         answer: Some("done\u{1b}]52;c;cm0K\u{7}".to_string()),
         error: None,
     };
@@ -2823,6 +2825,7 @@ fn the_decide_line_reaches_the_daemon_that_printed_it() {
             input: "{}".to_string(),
             truncated: false,
         }),
+        call_not_listed: false,
         answer: None,
         error: None,
     };
@@ -6092,6 +6095,7 @@ fn the_listing_cursor_reaches_the_daemon_that_printed_it() {
         state: "RUNNING".to_string(),
         blocked_on: None,
         pending: None,
+        call_not_listed: false,
         answer: None,
         error: None,
     };
@@ -8908,6 +8912,172 @@ fn a_field_broken_past_the_slice_is_still_caught() {
             );
         }
     }
+}
+
+/// Five parked sessions, one with an ordinary call id and four with long ones.
+///
+/// Returns the parked state and the id of one session holding a long call.
+fn wide_call_fixture(db: &Path) -> (daemon::Parked, String) {
+    let writer = rusqlite::Connection::open(db).expect("the database opens");
+    fixture_table(&writer);
+    writer
+        .execute_batch(
+            "CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+             PRIMARY KEY (exec_id, seq));",
+        )
+        .expect("the fixture schema is created");
+
+    let rows = 5_usize;
+    let mut blocked = daemon::Parked::new();
+    let mut long_exec = String::new();
+    for i in 0..rows {
+        let exec = format!("00000000-0000-0000-0000-{i:012}");
+        // One row holds an ordinary id. It is the not-the-fault case: the
+        // listing must still offer its decision.
+        let call_id = if i == 0 {
+            "toolu_ordinary".to_string()
+        } else {
+            format!("toolu_{}", "a".repeat(100_000))
+        };
+        if i == 1 {
+            long_exec = exec.clone();
+        }
+        writer
+            .execute(
+                "INSERT INTO harvest_executions VALUES (?1, ?2, 'RUNNING', ?3, NULL, NULL)",
+                rusqlite::params![exec, WORKFLOW_NAME, READABLE_TASK],
+            )
+            .expect("the session is recorded");
+        let scheduled = json!({"type":"ActivityScheduled",
+            "data":{"activity_id":"a1","name":"claude_turn","queue":"default"}})
+        .to_string();
+        let reply = json!({"type":"ActivityCompleted","data":{"activity_id":"a1","output":{
+            "stop_reason":"tool_use",
+            "tool_calls":[{"id":call_id,"name":"write_file",
+                           "input":{"path":"notes.md","content":"x"}}]}}})
+        .to_string();
+        for (seq, row) in [(0_i64, scheduled), (1, reply)] {
+            writer
+                .execute(
+                    "INSERT INTO harvest_events VALUES (?1, ?2, ?3)",
+                    rusqlite::params![exec, seq, row],
+                )
+                .expect("the row is recorded");
+        }
+        blocked.insert(
+            exec.parse().expect("the fixture id parses"),
+            daemon::ParkedState {
+                reason: "waiting for approval of write_file".to_string(),
+                signal: Some(session::approval_signal(2, 0, &call_id)),
+            },
+        );
+    }
+    drop(writer);
+    (blocked, long_exec)
+}
+
+/// A page of sessions carries no call it cannot print.
+///
+/// Every field a listing prints is cut, because a page names hundreds of
+/// sessions. The awaited call was not cut. A tool-use id is accepted up to
+/// `claude::MAX_CALL_ID_BYTES`, nearly a megabyte, and the id appears TWICE
+/// in a row: alone, and inside the approval token.
+///
+/// Measured before the fix, at 100000 characters: five rows serialised to
+/// 1001621 bytes, 200324 of them per row. A full page at the id cap is about
+/// 399 MiB. It is built in memory and then serialised again, while the drive
+/// of every session waits on the same task.
+///
+/// A cut token would be worse than none. A token is COPIED to be used, so a
+/// shortened one reads as a command and is not one. Such a row therefore
+/// offers no call, and says that the call is readable elsewhere. The single
+/// status reads ONE session, so it still carries the whole call.
+#[test]
+fn a_listing_carries_no_call_it_cannot_print() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("wide.db");
+    let (blocked, long_exec) = wide_call_fixture(&db);
+
+    let reader = inspect::open(&db).expect("the reader opens");
+    let (views, _, _) = daemon::sessions(&reader, &blocked, false, None).expect("the listing");
+    let answer = serde_json::to_vec(&views)
+        .expect("the answer serialises")
+        .len();
+
+    // Each listed field is capped, so the whole page is too. The bound is
+    // generous against the caps and far under one unbounded row.
+    assert!(
+        answer < 16 * 1024,
+        "a page of long calls must stay small: {answer} bytes for {} rows",
+        views.len()
+    );
+
+    for view in &views {
+        if view.execution_id.ends_with("000000000000") {
+            let call = view.pending.as_ref().expect("an ordinary call is offered");
+            assert_eq!(call.id, "toolu_ordinary", "and it is the call itself");
+            assert!(
+                !view.call_not_listed,
+                "an ordinary row needs no pointer: {view:?}"
+            );
+            continue;
+        }
+        assert!(
+            view.pending.is_none(),
+            "a call too long to print is not offered: {}",
+            view.execution_id
+        );
+        assert!(
+            view.call_not_listed,
+            "and the row says the call is readable elsewhere"
+        );
+        // The reason still says the session waits, so the row is not silent.
+        let reason = view.blocked_on.as_deref().expect("the wait is still named");
+        assert!(
+            reason.contains("waiting for approval"),
+            "the wait is still named: {reason}"
+        );
+        // No part of the long id reaches the page.
+        let rendered = serde_json::to_string(view).expect("the row serialises");
+        assert!(
+            !rendered.contains("aaaaaaaaaa"),
+            "and no part of the id is carried: {}",
+            view.execution_id
+        );
+    }
+
+    // The view the listing points AT still carries the whole call.
+    let row = inspect::execution(&reader, WORKFLOW_NAME, &long_exec)
+        .expect("the row reads")
+        .expect("the session is there");
+    let signal = blocked
+        .get(&long_exec.parse().expect("the id parses"))
+        .and_then(|state| state.signal.clone())
+        .expect("the session waits");
+    let call = daemon::pending_call(&reader, &row.exec_id, &signal, false)
+        .expect("the replies read")
+        .expect("the single status shows the call");
+    assert_eq!(
+        call.id.chars().count(),
+        100_006,
+        "one status carries the whole id, however long it is"
+    );
+
+    // The client renders the command, because only it knows the socket.
+    let pointer = crate::session_lines(
+        views
+            .iter()
+            .find(|view| view.call_not_listed)
+            .expect("a row points elsewhere"),
+        Path::new("/tmp/other.sock"),
+    )
+    .into_iter()
+    .find(|line| line.contains("decide:"))
+    .expect("the row names how to read the call");
+    assert!(
+        pointer.contains("--socket=/tmp/other.sock") && pointer.contains("agentd status"),
+        "the pointer reaches the daemon that printed it: {pointer}"
+    );
 }
 
 /// A REAL parked session still shows its call, with the evidence read live.
