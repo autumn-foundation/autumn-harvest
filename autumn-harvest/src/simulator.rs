@@ -1275,11 +1275,13 @@ mod tests {
     /// fixed, pre-existing per-suspension cost unrelated to this issue — the
     /// whole retry loop for one `ScheduleActivity` command resolves inside a
     /// *single* suspension, so that fixed cost is paid exactly once
-    /// regardless of `max_attempts`. This test isolates the retry-specific
-    /// cost by asserting elapsed time does not scale with `max_attempts`:
-    /// a policy configured with a 10-second initial backoff and 50 attempts
-    /// must run in essentially the same wall-clock time as one with 2
-    /// attempts, proving no attempt actually sleeps for its configured delay.
+    /// regardless of `max_attempts`. This test asserts an absolute ceiling:
+    /// a policy with a 10-second initial backoff must finish in under 1
+    /// second, for both 2 and 50 attempts. No real backoff can meet that
+    /// ceiling, so a pass proves no attempt slept for its configured delay.
+    /// An earlier version compared elapsed time between two runs instead.
+    /// On a loaded CI runner, scheduling noise alone could exceed that
+    /// delta budget and fail the test (issue #1290).
     #[tokio::test]
     async fn test_simulator_retries_are_logical_only_no_real_sleep() {
         async fn run_with_max_attempts(max_attempts: u32) -> std::time::Duration {
@@ -1296,13 +1298,18 @@ mod tests {
             started.elapsed()
         }
 
-        let few_attempts = run_with_max_attempts(2).await;
-        let many_attempts = run_with_max_attempts(50).await;
+        let no_real_sleep_ceiling = std::time::Duration::from_secs(1);
 
+        let few_attempts = run_with_max_attempts(2).await;
         assert!(
-            many_attempts.abs_diff(few_attempts) < std::time::Duration::from_millis(100),
-            "50 attempts ({many_attempts:?}) took far longer than 2 attempts \
-             ({few_attempts:?}); retries must be logical-only, not real-time sleeps"
+            few_attempts < no_real_sleep_ceiling,
+            "2 attempts took {few_attempts:?}; retries must be logical-only, not real-time sleeps"
+        );
+
+        let many_attempts = run_with_max_attempts(50).await;
+        assert!(
+            many_attempts < no_real_sleep_ceiling,
+            "50 attempts took {many_attempts:?}; retries must be logical-only, not real-time sleeps"
         );
     }
 
