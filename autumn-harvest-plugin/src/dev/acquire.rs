@@ -155,9 +155,21 @@ fn cached_install(cache_root: &std::path::Path) -> Option<PostgresBinaries> {
     complete.then(|| PostgresBinaries::at(bin_dir))
 }
 
+/// Whether `dir` is safe to execute binaries from.
+///
+/// A leaf-only check is not enough (issue #1292). The check and the run
+/// happen at two separate moments. A local user who can write an ancestor
+/// of `dir` can act in between. That user can rename the validated
+/// directory aside. That user can then put a symlink, or a directory of
+/// their own, in its place. Checking every ancestor removes the directory
+/// such a user would need to replace.
+fn directory_is_private(dir: &std::path::Path) -> bool {
+    leaf_is_private(dir) && dir.parent().is_none_or(ancestors_are_private)
+}
+
 /// Whether `dir` exists, is a real directory (not a symlink), is owned by this
 /// user, and is not writable by group or other.
-fn directory_is_private(dir: &std::path::Path) -> bool {
+fn leaf_is_private(dir: &std::path::Path) -> bool {
     let Ok(metadata) = std::fs::symlink_metadata(dir) else {
         return false;
     };
@@ -175,6 +187,52 @@ fn directory_is_private(dir: &std::path::Path) -> bool {
             return false;
         }
     }
+    true
+}
+
+/// Whether `dir` and every directory above it, up to the filesystem root,
+/// resist a rename-and-replace race.
+///
+/// The ownership rule is looser than in [`leaf_is_private`]. An ancestor
+/// may be owned by the current user or by root. This lets root-owned
+/// system directories, such as `/` and `/home`, pass. An ancestor must
+/// still not be a symlink.
+///
+/// A group- or other-writable ancestor is refused, unless it has the
+/// sticky bit. The kernel applies the same rule to `/tmp`. The sticky bit
+/// blocks the actual attack: another user renaming or deleting an entry
+/// they do not own. A plain shared temp directory does not need refusal
+/// to close that attack.
+#[cfg(unix)]
+fn ancestors_are_private(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut current = dir;
+    loop {
+        let Ok(metadata) = std::fs::symlink_metadata(current) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return false;
+        }
+        let untrusted_owner = metadata.uid() != 0
+            && super::reaper::unix_uid().is_some_and(|uid| uid != metadata.uid());
+        let mode = metadata.permissions().mode();
+        let sticky = mode & 0o1000 != 0;
+        let writable_by_others = mode & 0o022 != 0;
+        if untrusted_owner || (writable_by_others && !sticky) {
+            return false;
+        }
+        current = match current.parent() {
+            Some(parent) => parent,
+            None => return true,
+        };
+    }
+}
+
+#[cfg(not(unix))]
+fn ancestors_are_private(_dir: &std::path::Path) -> bool {
     true
 }
 
@@ -200,4 +258,73 @@ fn cache_root() -> Result<PathBuf, DevError> {
         .join("autumn-harvest")
         .join("postgresql")
         .join(MANAGED_CACHE_KEY))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::directory_is_private;
+
+    /// A cache root nested three levels under a fresh, owner-only temp
+    /// directory: the shape a real per-user cache has.
+    fn private_cache_root() -> (tempfile::TempDir, std::path::PathBuf) {
+        let root = tempfile::tempdir().expect("temp dir");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("chmod root");
+        let cache = root.path().join("a").join("b").join("cache");
+        fs::create_dir_all(&cache).expect("mkdir cache");
+        (root, cache)
+    }
+
+    #[test]
+    fn a_cache_root_under_private_ancestors_is_accepted() {
+        let (_root, cache) = private_cache_root();
+        assert!(directory_is_private(&cache));
+    }
+
+    #[test]
+    fn a_world_writable_ancestor_is_refused() {
+        let (root, cache) = private_cache_root();
+        let ancestor = root.path().join("a");
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o777)).expect("chmod");
+        assert!(!directory_is_private(&cache));
+    }
+
+    #[test]
+    fn a_group_writable_ancestor_is_refused() {
+        let (root, cache) = private_cache_root();
+        let ancestor = root.path().join("a");
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o770)).expect("chmod");
+        assert!(!directory_is_private(&cache));
+    }
+
+    #[test]
+    fn a_symlinked_ancestor_is_refused() {
+        let (root, _cache) = private_cache_root();
+        let real_a = root.path().join("a");
+        let link_a = root.path().join("link-a");
+        std::os::unix::fs::symlink(&real_a, &link_a).expect("symlink");
+        let cache_via_link = link_a.join("b").join("cache");
+        assert!(!directory_is_private(&cache_via_link));
+    }
+
+    #[test]
+    fn the_immediate_parent_writable_by_others_is_refused() {
+        let (_root, cache) = private_cache_root();
+        let parent = cache.parent().expect("parent");
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o777)).expect("chmod");
+        assert!(!directory_is_private(&cache));
+    }
+
+    /// A world-writable ancestor with the sticky bit — `/tmp` itself, in
+    /// shape — must still be accepted. Sticky already blocks the rename
+    /// this check exists to catch, and every temp-backed cache root has one.
+    #[test]
+    fn a_sticky_world_writable_ancestor_is_accepted() {
+        let (root, cache) = private_cache_root();
+        let ancestor = root.path().join("a");
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o1777)).expect("chmod");
+        assert!(directory_is_private(&cache));
+    }
 }
