@@ -216,6 +216,22 @@ jobs:
         # durably records them: they vanish on restart. See
         # scripts/check-broker-connector-dead-letter-sink-example.sh.
         run: ./scripts/check-broker-connector-dead-letter-sink-example.sh
+      - name: Check broker-connectors cutover example
+        # Guards a real, reproduced-live defect: chapter 13's "Cutting a
+        # binding over to a new cluster or a recreated topic" example called
+        # .map_json(|order: OrderPlaced| Ok(WorkflowId::new(order.order_id))),
+        # a single-argument closure returning a bare WorkflowId.
+        # SourceBinding::map_json requires
+        # Fn(&MessageCtx, T) -> Result<MappedMessage, E>
+        # (autumn-harvest-plugin/src/connector/binding.rs) -- every other
+        # mapping closure in this chapter, and both shipped examples, take
+        # the message context plus the typed body and return a
+        # MappedMessage. A newcomer following the cutover recipe -- the one
+        # place in the chapter that tells an operator how to rotate a
+        # binding's dedupe namespace during a production cutover -- copies
+        # code that does not type-check. See
+        # scripts/check-broker-connector-cutover-example.sh.
+        run: ./scripts/check-broker-connector-cutover-example.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest
