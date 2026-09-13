@@ -550,6 +550,26 @@ pub struct SweepOutcome {
     pub blocked: Vec<String>,
     /// Orphan rows removed by the opt-in straggler fallback.
     pub straggler_rows_deleted: usize,
+    /// Where the NEXT pass should resume its evaluation, as the name of the
+    /// last partition this pass actually evaluated (dropped or blocked).
+    ///
+    /// Review finding: a fixed oldest-first scan, restarted from the very
+    /// beginning every call, cannot converge when the oldest
+    /// [`SweepOptions::max_attempts`] partitions are permanently blocked.
+    /// Say, by a legal hold, or a long-running execution spanning many
+    /// old cohorts. Every pass would then re-spend its whole budget
+    /// proving the same oldest partitions blocked. A droppable partition
+    /// further along would never be reached.
+    ///
+    /// `None` when this pass reached the end of the partition list. That
+    /// holds whether or not it was `truncated` on the way, as long as it
+    /// got all the way there. The caller should pass `None` back next
+    /// time, restarting from the oldest. `Some(name)` when this pass
+    /// stopped on budget before reaching the end. The caller should pass
+    /// it back as `resume_after`, so the next pass picks up immediately
+    /// after `name` instead of re-attempting the same blocked prefix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_resume: Option<String>,
 }
 
 // ── Layout detection ───────────────────────────────────────────────────────
@@ -2641,6 +2661,9 @@ pub struct DisableReport {
 /// has space not come back?" — the reasons live in the sweep, so a status
 /// command that did not evaluate them could only ever list partitions.
 ///
+/// `resume_after` — see [`SweepOutcome::next_resume`] — is normally `None`
+/// for a one-shot status check. Pass `None` here too.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] on a catalog failure.
@@ -2649,8 +2672,9 @@ pub async fn evaluate(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
     opts: &SweepOptions,
+    resume_after: Option<&str>,
 ) -> HarvestResult<SweepOutcome> {
-    sweep_inner(conn, now, opts, false).await
+    sweep_inner(conn, now, opts, false, resume_after).await
 }
 
 /// Drop every fully-reclaimable cohort partition, oldest first.
@@ -2675,6 +2699,13 @@ pub async fn evaluate(
 /// retried next tick, rather than making the append path queue behind the
 /// sweep.
 ///
+/// `resume_after` continues a bounded pass where a previous one left off —
+/// see [`SweepOutcome::next_resume`]. A one-shot caller (a manual `harvest
+/// partition sweep`) passes `None`. A caller ticking automatically (the
+/// retention runtime) persists the last outcome's `next_resume` and feeds
+/// it back in. That way a permanently blocked oldest run cannot starve
+/// every later partition of ever being attempted.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] on a catalog failure. A per-partition lock
@@ -2685,28 +2716,42 @@ pub async fn sweep(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
     opts: &SweepOptions,
+    resume_after: Option<&str>,
 ) -> HarvestResult<SweepOutcome> {
-    sweep_inner(conn, now, opts, true).await
+    sweep_inner(conn, now, opts, true, resume_after).await
 }
 
 /// The shared body of [`sweep`] and [`evaluate`].
 ///
 /// One implementation so a read-only status report and the pass it predicts can
 /// never disagree about which partitions are droppable or why.
+///
+/// `resume_after` — see [`SweepOutcome::next_resume`] — skips straight past
+/// every partition up to and including the named one before evaluation
+/// starts. A name no longer present (already dropped, or from a stale
+/// caller) is treated the same as `None`: start from the oldest.
 #[cfg(feature = "db")]
 async fn sweep_inner(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
     opts: &SweepOptions,
     apply: bool,
+    resume_after: Option<&str>,
 ) -> HarvestResult<SweepOutcome> {
     let mut outcome = SweepOutcome::default();
     if !detect_layout(conn).await?.is_partitioned() {
         return Ok(outcome);
     }
 
+    let parts = list_partitions(conn).await?;
+    let start_idx = resume_after
+        .and_then(|name| parts.iter().position(|p| p.name == name))
+        .map_or(0, |i| i + 1);
+
     let mut attempts = 0usize;
-    for part in list_partitions(conn).await? {
+    let mut last_attempted: Option<String> = None;
+    let mut reached_end = true;
+    for part in parts.into_iter().skip(start_idx) {
         // The DEFAULT partition is structural: dropping it would make an
         // append for an uncovered cohort fail outright. It is drained, never
         // dropped.
@@ -2733,6 +2778,7 @@ async fn sweep_inner(
         // Those cost nothing and were never going to be attempted anyway.
         if outcome.dropped.len() >= opts.max_drops || attempts >= opts.max_attempts {
             outcome.truncated = true;
+            reached_end = false;
             break;
         }
 
@@ -2742,6 +2788,13 @@ async fn sweep_inner(
         // a dropped one. The cheap skips above (DEFAULT, still open,
         // unbounded) reach no such scan and do not spend the budget.
         attempts += 1;
+        // Review finding: a fixed oldest-first restart every pass cannot
+        // converge past a permanently blocked oldest run — see
+        // `SweepOutcome::next_resume`. Recorded before the outcome of
+        // THIS partition is known. A pass that ends by hitting budget on
+        // the very next iteration then still resumes after this one,
+        // rather than re-attempting it.
+        last_attempted = Some(part.name.clone());
         if let Some(reason) =
             cohort_occupancy(conn, &EventScope::cohort(part.lower, upper), upper, opts).await?
         {
@@ -2782,6 +2835,12 @@ async fn sweep_inner(
                 .push(format!("{} ({RECHECK_REASON})", part.name));
         }
     }
+    // `reached_end` is true whenever the loop ran out of partitions
+    // before it ran out of budget, truncated or not. Either way there is
+    // no later partition this pass left unvisited. The next pass should
+    // restart from the oldest, rather than resuming forever closer to
+    // the end.
+    outcome.next_resume = if reached_end { None } else { last_attempted };
     Ok(outcome)
 }
 
@@ -3582,6 +3641,10 @@ async fn maintenance_owner_gap(
 /// so a cohort freed earlier in the same tick is reclaimed now rather than
 /// next time.
 ///
+/// `resume_after` is threaded straight through to [`sweep`] — see
+/// [`SweepOutcome::next_resume`] for what it does and who should persist it
+/// across calls.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] on a catalog or DDL failure.
@@ -3591,6 +3654,7 @@ pub async fn maintain(
     now: DateTime<Utc>,
     lookahead_cohorts: u32,
     sweep_opts: &SweepOptions,
+    resume_after: Option<&str>,
 ) -> HarvestResult<MaintenanceOutcome> {
     if !detect_layout(conn).await?.is_partitioned() {
         // Still stamped: a caller polling for "maintenance has run" must not
@@ -3634,7 +3698,7 @@ pub async fn maintain(
     };
     let (created, lookahead_blocked) =
         ensure_partitions(conn, now, lookahead_cohorts, sweep_opts.lock_timeout).await?;
-    let sweep = sweep(conn, now, sweep_opts).await?;
+    let sweep = sweep(conn, now, sweep_opts, resume_after).await?;
     // A partial catch-up must not report as a healthy, empty-`last_error`
     // pass. `ensure_partitions` keeps creating the rest of the window when
     // one cohort is blocked (deliberately — see its doc). So `created` can

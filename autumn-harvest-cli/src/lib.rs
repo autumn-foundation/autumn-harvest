@@ -6098,6 +6098,7 @@ async fn run_partition_status(shards: &[String], format: DrFormat) -> Result<(),
                         &mut conn,
                         autumn_harvest::chrono::Utc::now(),
                         &autumn_harvest::partition::SweepOptions::default(),
+                        None,
                     )
                     .await
                     {
@@ -6178,6 +6179,7 @@ async fn run_partition_maintain(
             autumn_harvest::chrono::Utc::now(),
             lookahead_cohorts,
             &sweep,
+            None,
         )
         .await
         {

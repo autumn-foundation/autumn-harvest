@@ -3402,6 +3402,7 @@ async fn the_sweep_is_bounded_and_reports_what_it_dropped_and_blocked() {
             max_drops: 2,
             ..SweepOptions::default()
         },
+        None,
     )
     .await
     .expect("sweep");
@@ -3424,6 +3425,76 @@ async fn the_sweep_is_bounded_and_reports_what_it_dropped_and_blocked() {
             ),
         "AC8: a cohort blocked by a live execution must be reported, not \
          silently skipped; got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_truncated_pass_resumes_past_a_permanently_blocked_oldest_run() {
+    // Review finding: a fixed oldest-first sweep, restarted from scratch
+    // every call, cannot converge when the oldest `max_attempts`
+    // partitions are permanently blocked. Every pass would re-spend its
+    // whole budget proving the same oldest partitions blocked. A
+    // droppable partition further along would never be reached, so
+    // storage would grow without bound.
+    //
+    // Two pinned cohorts (permanently blocked) followed by one droppable
+    // cohort prove both halves, with a budget that exhausts exactly on
+    // the two blocked ones. The first pass cannot reach the droppable
+    // one. Feeding its `next_resume` back into a second pass does.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    for days in [20_i64, 21] {
+        let ts = Utc::now() - chrono::Duration::days(days);
+        let exec =
+            insert_execution(&mut conn, "pinned_wf", &format!("resume-{days}"), ts, None).await;
+        autumn_harvest::store::append_events(
+            &mut conn,
+            ExecutionId::from_uuid(exec),
+            &sample_events(),
+            0,
+        )
+        .await
+        .expect("seed");
+        backdate_events(&mut conn, exec, ts).await;
+    }
+    let droppable_ts = Utc::now() - chrono::Duration::days(19);
+    partition::ensure_cohort(&mut conn, droppable_ts)
+        .await
+        .expect("materialize the droppable cohort");
+
+    let opts = SweepOptions {
+        max_drops: 10,
+        max_attempts: 2,
+        ..SweepOptions::default()
+    };
+
+    let first = partition::sweep(&mut conn, Utc::now(), &opts, None)
+        .await
+        .expect("first sweep");
+    assert!(
+        first.dropped.is_empty(),
+        "the budget must exhaust on the two blocked partitions before reaching \
+         the droppable one; got {first:?}"
+    );
+    assert!(first.truncated, "the budget was spent; got {first:?}");
+    let resume_after = first
+        .next_resume
+        .clone()
+        .expect("a truncated pass must report where to resume");
+
+    let second = partition::sweep(&mut conn, Utc::now(), &opts, Some(&resume_after))
+        .await
+        .expect("second sweep");
+    assert_eq!(
+        second.dropped.len(),
+        1,
+        "resuming past the blocked run must reach and drop the droppable \
+         partition the first pass never got to; got {second:?}"
     );
 }
 
@@ -3465,6 +3536,7 @@ async fn a_sweep_bounds_blocked_evaluations_too_not_only_drops() {
             max_attempts: 2,
             ..SweepOptions::default()
         },
+        None,
     )
     .await
     .expect("sweep");
@@ -3519,6 +3591,7 @@ async fn exhausting_the_budget_on_the_last_eligible_partition_is_not_truncated()
             max_attempts: 1,
             ..SweepOptions::default()
         },
+        None,
     )
     .await
     .expect("sweep");
@@ -3594,6 +3667,7 @@ async fn the_straggler_delete_bounds_its_own_statement_timeout() {
             exact_scan_timeout: Duration::from_millis(200),
             ..SweepOptions::default()
         },
+        None,
     )
     .await;
 
@@ -3888,7 +3962,7 @@ async fn the_legacy_partition_is_never_dropped_while_it_holds_live_history() {
     // ZERO of its rows, conclude "no live owner", and drop the entire
     // pre-conversion history — running executions and legal holds included —
     // on the first tick after conversion.
-    let outcome = partition::sweep(&mut conn, Utc::now(), &SweepOptions::default())
+    let outcome = partition::sweep(&mut conn, Utc::now(), &SweepOptions::default(), None)
         .await
         .expect("sweep must not error on a converted shard");
 
@@ -4584,6 +4658,7 @@ async fn a_drop_attempt_never_blocks_appends_while_it_waits_for_its_partition() 
                 lock_timeout: Duration::from_secs(8),
                 ..SweepOptions::default()
             },
+            None,
         )
         .await
     });
@@ -5750,6 +5825,7 @@ async fn maintenance_says_what_is_wrong_when_the_runtime_role_cannot_own_partiti
         Utc::now(),
         partition::DEFAULT_LOOKAHEAD_COHORTS,
         &SweepOptions::default(),
+        None,
     )
     .await;
     let msg = match err {
@@ -5785,6 +5861,7 @@ async fn maintenance_says_what_is_wrong_when_the_runtime_role_cannot_own_partiti
         Utc::now(),
         partition::DEFAULT_LOOKAHEAD_COHORTS,
         &SweepOptions::default(),
+        None,
     )
     .await
     .expect("maintenance must work once the runtime role owns the table");
@@ -5849,6 +5926,7 @@ async fn a_drop_blocked_by_a_reader_does_not_queue_appends_behind_its_upgrade() 
                 lock_timeout: Duration::from_secs(8),
                 ..SweepOptions::default()
             },
+            None,
         )
         .await
     });
@@ -6243,7 +6321,7 @@ async fn a_partly_blocked_lookahead_catch_up_is_not_reported_as_a_healthy_pass()
         .await
         .expect("seed a colliding relation");
 
-    let outcome = partition::maintain(&mut conn, Utc::now(), 6, &SweepOptions::default())
+    let outcome = partition::maintain(&mut conn, Utc::now(), 6, &SweepOptions::default(), None)
         .await
         .expect("maintain must not hard-fail on a partial lookahead gap");
 

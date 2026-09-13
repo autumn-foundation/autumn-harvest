@@ -1118,11 +1118,27 @@ async fn run_partition_maintenance_pass(
                 continue;
             }
         }
+        // Review finding: a fixed oldest-first sweep, restarted from
+        // scratch every tick, cannot converge past a permanently blocked
+        // oldest run of partitions — see
+        // `crate::partition::SweepOutcome::next_resume`. Read back the
+        // cursor this shard's own last pass left. A truncated pass then
+        // picks up where it stopped, instead of re-spending its whole
+        // budget proving the same oldest partitions blocked, tick after
+        // tick.
+        let resume_after = monitor_task
+            .snapshot()
+            .per_shard
+            .iter()
+            .find(|r| r.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
+            .and_then(|r| r.partition_maintenance.as_ref())
+            .and_then(|m| m.sweep.next_resume.clone());
         match crate::partition::maintain(
             &mut conn,
             now,
             config.partitions.lookahead_cohorts,
             &sweep_opts,
+            resume_after.as_deref(),
         )
         .await
         {
