@@ -741,8 +741,30 @@ pub fn unusable_reply(reply: &TurnReply) -> Option<&'static str> {
 /// identity, which is the point. The rule costs that path nothing. It holds
 /// the recorded one to what that path would have produced.
 pub fn projects_its_content(reply: &TurnReply) -> bool {
+    // Derived from the content ALONE. No `stop_reason` is passed, so this
+    // derivation never takes the synthesis branch, and its text is exactly
+    // what the blocks hold.
     let derived = parse_reply(&serde_json::json!({ "content": reply.content }));
-    derived.text == reply.text && derived.tool_calls == reply.tool_calls
+    if derived.tool_calls != reply.tool_calls {
+        return false;
+    }
+    if derived.text == reply.text {
+        return true;
+    }
+    // ONE text is not derivable. `parse_reply` SYNTHESISES the answer of a
+    // contentless refusal from `stop_details`, which a reply does not keep,
+    // so no re-derivation can reproduce it. Comparing it refused a refusal
+    // the API really sent, on the LIVE path as well as on a restart.
+    //
+    // The exemption is the condition the synthesis runs under, and not the
+    // text it produces: the reason is a refusal, and the content says
+    // nothing. A refusal whose content DOES say something is compared like
+    // any other reply.
+    //
+    // What this leaves: the text of a contentless refusal is not checked, so
+    // a recorded one may carry any answer. Closing that would mean keeping
+    // `stop_details` in the reply, which changes what every session stores.
+    reply.stop_reason == crate::session::STOP_REFUSAL && !says_something(&derived.text)
 }
 
 pub fn malformed_reply(reply: &TurnReply) -> Option<&'static str> {
@@ -1050,7 +1072,7 @@ pub fn parse_reply(payload: &Value) -> TurnReply {
         .to_string();
 
     // A refusal carries no usable content, so the category becomes the answer.
-    if stop_reason == "refusal" && !says_something(&text) {
+    if stop_reason == crate::session::STOP_REFUSAL && !says_something(&text) {
         let category = payload
             .pointer("/stop_details/category")
             .and_then(Value::as_str)

@@ -36,7 +36,11 @@ pub const SIGNAL_TOOL_APPROVAL: &str = "tool_approval";
 pub const WORKFLOW_NAME: &str = "agent_session";
 
 /// The `stop_reason` a safety classifier declines a request with.
-const STOP_REFUSAL: &str = "refusal";
+///
+/// Public because `parse_reply` SYNTHESISES the text of a contentless refusal
+/// under this reason, and [`crate::claude::projects_its_content`] must name
+/// the same reason. A second copy of the literal would let the two drift.
+pub const STOP_REFUSAL: &str = "refusal";
 
 /// The `stop_reason` of a turn cut short by the output cap.
 ///

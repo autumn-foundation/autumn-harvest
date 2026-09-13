@@ -12483,3 +12483,83 @@ fn a_recorded_reply_must_say_the_same_turn_twice() {
         "and the restart accepts it"
     );
 }
+
+/// A refusal the API really sends is accepted, on BOTH paths.
+///
+/// `parse_reply` SYNTHESISES the answer of a contentless refusal from
+/// `stop_details`, which a reply does not keep. A rule that re-derives the
+/// projections and compares them therefore refused a reply the live path had
+/// just built.
+///
+/// Measured before the fix, on the payload the API sends:
+///
+/// ```text
+/// live parse   text = "the model declined this request (category: policy)"
+/// re-derived   text = ""
+/// projects_its_content = false
+/// whole set says       = Some("its recorded calls are not the calls ...")
+/// ```
+///
+/// That refused the activity, so the session FAILED instead of reporting the
+/// refusal its own stop reason names.
+#[test]
+fn a_refusal_the_api_sends_is_accepted() {
+    let payload = json!({
+        "content": [],
+        "stop_reason": session::STOP_REFUSAL,
+        "stop_details": { "category": "policy" },
+    });
+    let reply = claude::parse_reply(&payload);
+    assert_eq!(
+        reply.text, "the model declined this request (category: policy)",
+        "the live path synthesises the answer"
+    );
+    assert!(
+        claude::projects_its_content(&reply),
+        "and the projection rule must not refuse what that path just built"
+    );
+    assert!(
+        claude::unusable_reply(&reply).is_none(),
+        "so the whole set accepts it"
+    );
+
+    // The EXEMPTION is the condition the synthesis runs under, and not a
+    // licence for any refusal. A refusal whose content DOES say something is
+    // compared like any other reply.
+    let speaking = session::TurnReply {
+        content: json!([{ "type": "text", "text": "I will not" }]),
+        stop_reason: session::STOP_REFUSAL.to_string(),
+        text: "something else entirely".to_string(),
+        tool_calls: vec![],
+    };
+    assert!(
+        !claude::projects_its_content(&speaking),
+        "a refusal whose content speaks is still held to its content"
+    );
+
+    // And the exemption covers the TEXT only. A refusal carrying a call its
+    // content does not hold is still refused.
+    let calling = session::TurnReply {
+        content: json!([]),
+        stop_reason: session::STOP_REFUSAL.to_string(),
+        text: "the model declined this request (category: policy)".to_string(),
+        tool_calls: vec![session::ToolCall {
+            id: "toolu_hidden".to_string(),
+            name: tools::TOOL_WRITE_FILE.to_string(),
+            input: json!({ "path": "/etc/passwd", "content": "x" }),
+        }],
+    };
+    assert!(
+        !claude::projects_its_content(&calling),
+        "a refusal holding a call its content does not is still refused"
+    );
+
+    // The round trip an operator actually sees: a refusal resumes.
+    let id = "01234567-89ab-4cde-8f01-23456789abcd";
+    assert_eq!(
+        inspect::outstanding_signal(&one_recorded_reply(id, &reply), "e", 1_000)
+            .expect("the wait query runs"),
+        None,
+        "and a recorded refusal is a history the restart accepts"
+    );
+}
