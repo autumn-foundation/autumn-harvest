@@ -377,26 +377,24 @@ pub struct LineageWalk {
 impl LineageWalk {
     /// Start a walk rooted at `root_id`.
     ///
-    /// `visited` and `nodes` are pre-sized from `limits.max_nodes` — the
-    /// walk's own hard budget on admitted nodes, known up front — rather
-    /// than left to grow from empty one `push`/`insert` at a time. Both
-    /// live for the whole walk and are filled by every `admit_level` call
-    /// across every level, so an unsized start would `hashbrown`-rehash or
-    /// `RawVec`-reallocate on the way up to that same bound repeatedly,
-    /// the same growth-step cost `HistoryIndex::with_capacity`
-    /// (`awaitables.rs`) exists to avoid. `visited` can in principle grow
-    /// past `max_nodes` (a rejected duplicate/cycle id still gets marked
-    /// visited without being admitted), so this is a starting reservation,
-    /// not a cap.
+    /// `visited` and `nodes` start unsized. `limits.max_nodes` is the
+    /// walk's hard *ceiling* -- an operator-accepted request can set it as
+    /// high as `LINEAGE_MAX_NODES_CEILING`. It is not a prediction of this
+    /// walk's actual size, and most triage calls target a small or leaf
+    /// family. An earlier cut of this fix reserved the ceiling up front
+    /// here (Codex review on the PR that introduced it). That would make
+    /// every sparse walk pay for the rare wide one. Both collections
+    /// instead grow incrementally, right-sized per level, in
+    /// [`admit_level`](Self::admit_level).
     #[must_use]
     pub fn new(root_id: ExecutionId, limits: LineageLimits) -> Self {
-        let mut visited = HashSet::with_capacity(limits.max_nodes);
+        let mut visited = HashSet::new();
         visited.insert(root_id.as_uuid());
         Self {
             limits,
             root_id: root_id.as_uuid(),
             visited,
-            nodes: Vec::with_capacity(limits.max_nodes.saturating_sub(1)),
+            nodes: Vec::new(),
             dropped_parents: BTreeSet::new(),
             retained_summary_parents: BTreeSet::new(),
             reason: None,
@@ -452,6 +450,19 @@ impl LineageWalk {
                 .cmp(&b.started_at)
                 .then_with(|| a.exec_id.as_uuid().cmp(&b.exec_id.as_uuid()))
         });
+
+        // Every row is at least attempted against `visited` -- even a
+        // duplicate or a budget-rejected one is inserted there. So
+        // `rows.len()` bounds how much `visited` can grow this call.
+        // `nodes` only grows for rows actually admitted, which can never
+        // exceed the live budget. The smaller of the two therefore avoids
+        // reserving more than this call could possibly use. Sizing from
+        // this level's own batch is deliberate, not from `limits.max_nodes`.
+        // An earlier cut of this fix reserved the walk's whole ceiling up
+        // front instead. That would make a sparse walk pay for the rare
+        // wide one (Codex review).
+        self.visited.reserve(rows.len());
+        self.nodes.reserve(rows.len().min(self.remaining_budget()));
 
         // At most one id per row is ever admitted into `next` -- `rows.len()`
         // is therefore an exact upper bound, known before the loop starts.
@@ -585,10 +596,10 @@ impl LineageWalk {
         // overflow the stack.
         //
         // `self.nodes.len()` is a safe (if loose) upper bound on the number
-        // of distinct parents -- every row has at most one -- so reserving
-        // it up front costs one over-sized allocation instead of however
-        // many `hashbrown` rehashes it takes to reach the real count by
-        // growing from empty.
+        // of distinct parents -- every row has at most one. Reserving it
+        // up front costs one over-sized allocation. The alternative is
+        // however many `hashbrown` rehashes it takes to reach the real
+        // count by growing from empty.
         let mut by_parent: HashMap<uuid::Uuid, Vec<LineageChildRow>> =
             HashMap::with_capacity(self.nodes.len());
         for row in self.nodes {
@@ -643,10 +654,10 @@ fn attach_children(
     let Some(rows) = by_parent.remove(&parent_uuid) else {
         return;
     };
-    // `rows` is `node`'s exact, already-known child count -- reserving it
-    // up front means the loop below never grows `node.children` (it starts
-    // at `Vec::new()`, per `LineageNode`'s own construction) one `push` at
-    // a time.
+    // `rows.len()` is `node`'s exact, already-known child count. Reserving
+    // it up front means the loop below never grows `node.children` one
+    // `push` at a time. It starts at `Vec::new()`, per `LineageNode`'s own
+    // construction.
     node.children.reserve_exact(rows.len());
     for row in rows {
         let mut child = LineageNode {

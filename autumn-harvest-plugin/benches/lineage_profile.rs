@@ -1,44 +1,45 @@
 //! Deterministic (non-criterion) instruction/allocation-count profiling
 //! harness for `lineage::LineageWalk` / `LineageTreeReport::finish` — the
-//! pure half of `GET /workflows/{id}/lineage` (issue #621): a bounded,
-//! cycle-safe frontier walk over `parent_id` edges, nested into a tree and
-//! summarised. The async cross-shard fan-out that *feeds* the walk (one
-//! batched query per level) lives in `crate::api::build_lineage_report` and
-//! is out of scope here — this harness measures only the CPU-bound part
-//! that runs after each level's rows are already in memory.
+//! pure half of `GET /workflows/{id}/lineage` (issue #621). It covers a
+//! bounded, cycle-safe frontier walk over `parent_id` edges, nested into a
+//! tree and summarised. The async cross-shard fan-out that *feeds* the walk
+//! lives in `crate::api::build_lineage_report`. That fan-out issues one
+//! batched query per level and is out of scope here. This harness measures
+//! only the CPU-bound part that runs after each level's rows are already
+//! in memory.
 //!
-//! `harness = false` + its own `main()`, the same shape as
+//! `harness = false` plus its own `main()` matches the shape of
 //! `autumn-harvest/benches/awaitables_profile.rs` and
-//! `autumn-harvest-plugin/benches/dag_graph_profile.rs`: the compiled
-//! artifact is a plain executable meant to be pointed at
-//! `valgrind --tool=callgrind` / `valgrind --tool=dhat` directly. Wall-clock
-//! timing is not admissible evidence on this (shared-vCPU) machine.
+//! `autumn-harvest-plugin/benches/dag_graph_profile.rs`. The compiled
+//! artifact is a plain executable. Point it directly at
+//! `valgrind --tool=callgrind` / `valgrind --tool=dhat`. Wall-clock timing
+//! is not admissible evidence on this (shared-vCPU) machine.
 //!
 //! # Workload
 //!
 //! The module's own doc singles out the realistic case this harness builds:
 //! *"a saga or fan-out workflow spawns children that spawn grandchildren"*.
 //! This harness builds a `LINEAGE_PROFILE_LEVELS`-deep chain of generations
-//! below one root, `LINEAGE_PROFILE_NODES` descendants total spread evenly
-//! across levels, each row explicitly parented to a row in the level above
-//! (round-robin, so fan-out grows realistically once a level is wider than
-//! its parent level). The default (`999` descendants, `9` levels of `111`
-//! each) lands the walk's `node_count` at exactly `1_000` —
-//! `lineage::DEFAULT_LINEAGE_MAX_NODES`, an operator's default request
-//! against a family that just fits under budget without truncating. That is
-//! deliberately the *un-truncated* case: a truncated walk exits its
-//! `admit_level` loop early over a smaller effective node count, which would
-//! measure less work, not more.
+//! below one root. `LINEAGE_PROFILE_NODES` descendants spread evenly across
+//! those levels. Each row is explicitly parented to a row in the level
+//! above, round-robin. Fan-out grows realistically once a level is wider
+//! than its parent level. The default (`999` descendants, `9` levels of
+//! `111` each) lands the walk's `node_count` at exactly `1_000` --
+//! `lineage::DEFAULT_LINEAGE_MAX_NODES`. That is an operator's default
+//! request against a family that just fits under budget without
+//! truncating. It is deliberately the *un-truncated* case: a truncated walk
+//! exits its `admit_level` loop early, over a smaller effective node count.
+//! That would measure less work, not more.
 //!
-//! The driver mirrors the real one in `crate::api::build_lineage_report`:
-//! rows for one level are handed to `admit_level`, repeated per level, then
-//! `record_probe_result` (empty — this fixture's leaves are provably
+//! The driver mirrors the real one in `crate::api::build_lineage_report`.
+//! Rows for one level are handed to `admit_level`, repeated per level, then
+//! `record_probe_result` (empty -- this fixture's leaves are provably
 //! childless) and `finish`. Per-level row `Vec`s are cloned fresh from a
-//! once-built template on every rep, standing in for what would be a fresh
-//! batch of deserialized DB rows in production; `LineageWalk`'s API consumes
-//! rows by value, so a real driver clones or deserializes new owned data on
-//! every call too, and this harness's clone cost is representative of that,
-//! not an artifact of the measurement.
+//! once-built template on every rep. That stands in for what would be a
+//! fresh batch of deserialized DB rows in production. `LineageWalk`'s API
+//! consumes rows by value, so a real driver clones or deserializes new
+//! owned data on every call too. This harness's clone cost is
+//! representative of that, not an artifact of the measurement.
 //!
 //! # Running
 //!
@@ -86,9 +87,9 @@ const WORKFLOW_NAMES: [&str; 4] = [
     "notification_fanout",
 ];
 
-/// The requested root's own row — `parent_id: None`, mirroring what
-/// `root_row_from_execution` projects from a real `WorkflowExecution` (this
-/// harness has no database row to project from, so it is built directly).
+/// The requested root's own row — `parent_id: None`. This mirrors what
+/// `root_row_from_execution` projects from a real `WorkflowExecution`. This
+/// harness has no database row to project from, so it builds one directly.
 fn root_row(root_id: uuid::Uuid) -> LineageChildRow {
     LineageChildRow {
         exec_id: ExecutionId::from_uuid(root_id),
@@ -174,9 +175,9 @@ fn main() {
     let root_id = ExecutionId::new();
     let root_row_fixture = root_row(root_id.as_uuid());
     let template_levels = build_levels(root_id.as_uuid(), levels, per_level);
-    // Budget = exactly root + every descendant, so a fully-realistic family
-    // this size is never truncated -- see the module doc above for why that
-    // matters to the measurement.
+    // Budget = exactly root + every descendant. A fully-realistic family
+    // this size is therefore never truncated -- see the module doc above
+    // for why that matters to the measurement.
     let limits = LineageLimits {
         max_depth: u8::try_from(levels).unwrap_or(u8::MAX) + 1,
         max_nodes: total_nodes + 1,

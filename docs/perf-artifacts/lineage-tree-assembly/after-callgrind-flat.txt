@@ -1,12 +1,12 @@
 --------------------------------------------------------------------------------
-Profile data file 'cg-after-final.out' (creator: callgrind-3.22.0)
+Profile data file 'cg-after-v2.out' (creator: callgrind-3.22.0)
 --------------------------------------------------------------------------------
 I1 cache: 
 D1 cache: 
 LL cache: 
-Timerange: Basic block 0 - 46709583
+Timerange: Basic block 0 - 55657915
 Trigger: Program termination
-Profiled target:  /home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2 (PID 24288, part 1)
+Profiled target:  /home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2 (PID 1661, part 1)
 Events recorded:  Ir
 Events shown:     Ir
 Event sort order: Ir
@@ -18,44 +18,45 @@ Auto-annotation:  on
 --------------------------------------------------------------------------------
 Ir                   
 --------------------------------------------------------------------------------
-271,049,606 (100.0%)  PROGRAM TOTALS
+296,002,192 (100.0%)  PROGRAM TOTALS
 
 --------------------------------------------------------------------------------
 Ir                   file:function
 --------------------------------------------------------------------------------
-53,458,345 (19.72%)  ./malloc/./malloc/malloc.c:_int_malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
-24,405,970 ( 9.00%)  ./malloc/./malloc/malloc.c:_int_free [/usr/lib/x86_64-linux-gnu/libc.so.6]
-15,768,290 ( 5.82%)  ./malloc/./malloc/malloc.c:malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
-14,676,247 ( 5.41%)  ./malloc/./malloc/malloc.c:malloc_consolidate [/usr/lib/x86_64-linux-gnu/libc.so.6]
-13,693,150 ( 5.05%)  ???:uuid::fmt::format_hyphenated [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
-12,595,800 ( 4.65%)  ???:core::hash::BuildHasher::hash_one [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
-12,055,050 ( 4.45%)  ???:autumn_harvest_plugin::lineage::attach_children'2 [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
-12,000,000 ( 4.43%)  ???:uuid::parser::try_parse [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
-11,546,150 ( 4.26%)  ???:<uuid::Uuid as core::hash::Hash>::hash [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
-11,061,787 ( 4.08%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__memcpy_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
- 9,895,992 ( 3.65%)  ./malloc/./malloc/malloc.c:free [/usr/lib/x86_64-linux-gnu/libc.so.6]
- 8,590,694 ( 3.17%)  ./malloc/./malloc/malloc.c:unlink_chunk.isra.0 [/usr/lib/x86_64-linux-gnu/libc.so.6]
- 8,320,400 ( 3.07%)  ???:alloc::raw_vec::RawVecInner<A>::finish_grow [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 6,357,856 ( 2.35%)  ./malloc/./malloc/malloc.c:_int_free_merge_chunk [/usr/lib/x86_64-linux-gnu/libc.so.6]
- 6,338,342 ( 2.34%)  ???:autumn_harvest_plugin::lineage::LineageWalk::finish [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 4,950,000 ( 1.83%)  ???:<alloc::string::String as core::clone::Clone>::clone [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 4,074,647 ( 1.50%)  ???:hashbrown::map::HashMap<K,V,S,A>::remove [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 3,831,750 ( 1.41%)  ???:autumn_harvest_plugin::lineage::LineageWalk::admit_level [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 3,792,894 ( 1.40%)  ???:hashbrown::map::HashMap<K,V,S,A>::insert [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 3,718,800 ( 1.37%)  ???:<alloc::vec::Vec<T,A> as core::clone::Clone>::clone [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 3,598,200 ( 1.33%)  ???:alloc::raw_vec::RawVecInner<A>::reserve::do_reserve_and_handle [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 3,550,198 ( 1.31%)  ???:<alloc::string::String as core::fmt::Write>::write_str [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 3,180,807 ( 1.17%)  ???:__rustc::__rdl_alloc [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 3,132,300 ( 1.16%)  ???:core::ptr::drop_in_place<autumn_harvest_plugin::lineage::LineageNode>'2 [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 2,182,858 ( 0.81%)  ./malloc/./malloc/malloc.c:_int_free_maybe_consolidate [/usr/lib/x86_64-linux-gnu/libc.so.6]
- 1,699,150 ( 0.63%)  ???:uuid::fmt::<impl core::fmt::Display for uuid::Uuid>::fmt [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 1,258,600 ( 0.46%)  ???:<alloc::vec::into_iter::IntoIter<T,A> as core::ops::drop::Drop>::drop [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 1,216,500 ( 0.45%)  ???:core::slice::sort::stable::drift::sort [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 1,148,504 ( 0.42%)  ./malloc/./malloc/malloc.c:alloc_perturb [/usr/lib/x86_64-linux-gnu/libc.so.6]
- 1,072,800 ( 0.40%)  ???:alloc::raw_vec::RawVec<T,A>::grow_one [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 1,060,281 ( 0.39%)  ./malloc/./malloc/arena.c:free
- 1,011,950 ( 0.37%)  ???:autumn_harvest_plugin::lineage::attach_children [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 1,000,000 ( 0.37%)  ???:uuid::parser::<impl core::str::traits::FromStr for uuid::Uuid>::from_str [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+53,633,814 (18.12%)  ./malloc/./malloc/malloc.c:_int_malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+24,425,118 ( 8.25%)  ./malloc/./malloc/malloc.c:_int_free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+19,526,300 ( 6.60%)  ???:core::hash::BuildHasher::hash_one [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+18,449,268 ( 6.23%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__memcpy_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
+15,778,940 ( 5.33%)  ./malloc/./malloc/malloc.c:malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+14,704,813 ( 4.97%)  ./malloc/./malloc/malloc.c:malloc_consolidate [/usr/lib/x86_64-linux-gnu/libc.so.6]
+13,693,150 ( 4.63%)  ???:uuid::fmt::format_hyphenated [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+12,055,050 ( 4.07%)  ???:autumn_harvest_plugin::lineage::attach_children'2 [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+12,000,000 ( 4.05%)  ???:uuid::parser::try_parse [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+11,546,150 ( 3.90%)  ???:<uuid::Uuid as core::hash::Hash>::hash [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 9,902,992 ( 3.35%)  ./malloc/./malloc/malloc.c:free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 8,653,201 ( 2.92%)  ./malloc/./malloc/malloc.c:unlink_chunk.isra.0 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 8,331,400 ( 2.81%)  ???:alloc::raw_vec::RawVecInner<A>::finish_grow [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 6,377,292 ( 2.15%)  ./malloc/./malloc/malloc.c:_int_free_merge_chunk [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 6,346,000 ( 2.14%)  ???:<std::hash::random::DefaultHasher as core::hash::Hasher>::write [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 6,338,421 ( 2.14%)  ???:autumn_harvest_plugin::lineage::LineageWalk::finish [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 4,950,000 ( 1.67%)  ???:<alloc::string::String as core::clone::Clone>::clone [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 4,074,908 ( 1.38%)  ???:hashbrown::map::HashMap<K,V,S,A>::remove [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 3,975,891 ( 1.34%)  ???:hashbrown::map::HashMap<K,V,S,A>::insert [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 3,840,800 ( 1.30%)  ???:autumn_harvest_plugin::lineage::LineageWalk::admit_level [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 3,718,800 ( 1.26%)  ???:<alloc::vec::Vec<T,A> as core::clone::Clone>::clone [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 3,663,530 ( 1.24%)  ???:hashbrown::raw::RawTable<T,A>::reserve_rehash [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 3,607,200 ( 1.22%)  ???:alloc::raw_vec::RawVecInner<A>::reserve::do_reserve_and_handle [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 3,550,198 ( 1.20%)  ???:<alloc::string::String as core::fmt::Write>::write_str [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 3,183,057 ( 1.08%)  ???:__rustc::__rdl_alloc [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 3,132,300 ( 1.06%)  ???:core::ptr::drop_in_place<autumn_harvest_plugin::lineage::LineageNode>'2 [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 2,203,674 ( 0.74%)  ./malloc/./malloc/malloc.c:_int_free_maybe_consolidate [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 1,699,150 ( 0.57%)  ???:uuid::fmt::<impl core::fmt::Display for uuid::Uuid>::fmt [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 1,258,600 ( 0.43%)  ???:<alloc::vec::into_iter::IntoIter<T,A> as core::ops::drop::Drop>::drop [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 1,216,500 ( 0.41%)  ???:core::slice::sort::stable::drift::sort [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 1,148,716 ( 0.39%)  ./malloc/./malloc/malloc.c:alloc_perturb [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 1,072,800 ( 0.36%)  ???:alloc::raw_vec::RawVec<T,A>::grow_one [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 1,061,031 ( 0.36%)  ./malloc/./malloc/arena.c:free
+ 1,011,950 ( 0.34%)  ???:autumn_harvest_plugin::lineage::attach_children [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
 
 --------------------------------------------------------------------------------
 The following files chosen for auto-annotation could not be found:

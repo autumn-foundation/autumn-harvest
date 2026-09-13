@@ -87,11 +87,13 @@ already applied to `project_awaitables`' history index:
 
 1. **`LineageWalk::new`'s `nodes: Vec<LineageChildRow>` and `visited:
    HashSet<uuid::Uuid>`.** Both live for the whole walk and are filled by
-   every `admit_level` call across every level, but `limits.max_nodes` -- the
-   walk's own hard admission budget -- is known at construction time. Every
-   growth step before the walk reaches that bound (or gives up short of it)
-   is `hashbrown`/`RawVec` re-hashing or reallocating-and-copying work spent
-   only to be redone at the next step.
+   every `admit_level` call across every level. Each call already knows
+   its own batch size (`rows.len()`), an exact bound on how much either
+   collection can grow *this call* -- reserving it there avoids the
+   growth-step cost without needing to guess the walk's eventual total
+   size up front. (An earlier cut of this fix reserved `limits.max_nodes`
+   -- the walk's hard ceiling -- once in `new`; see "Correction (post-review)"
+   below for why that was wrong.)
 2. **`admit_level`'s `next: Vec<uuid::Uuid>`.** At most one id per input row
    is ever admitted into it, so `rows.len()` -- already known -- is an exact
    upper bound.
@@ -104,17 +106,19 @@ already applied to `project_awaitables`' history index:
 
 None of these needs an extra pass over the data to size correctly (unlike
 `HistoryIndex`'s per-category counts, which needed one): each bound is
-either already in hand (`limits.max_nodes`, `rows.len()`) or a cheap,
-already-computed superset (`self.nodes.len()`).
+either already in hand (`rows.len()`) or a cheap, already-computed superset
+(`self.nodes.len()`).
 
 ## Change
 
 `autumn-harvest-plugin/src/lineage.rs`:
 
-* `LineageWalk::new` sizes `visited` from `limits.max_nodes` and `nodes`
-  from `limits.max_nodes.saturating_sub(1)` (the root is tracked separately
-  via `root_id`, so `nodes` only ever holds descendants).
-* `admit_level` sizes `next` from `rows.len()`.
+* `admit_level` reserves `visited` by `rows.len()` (every row is at least
+  attempted against it, admitted or not) and `nodes` by
+  `rows.len().min(self.remaining_budget())` (it only grows for rows
+  actually admitted, which can never exceed the live budget) -- both
+  right-sized to *this call's* batch, not to the walk's ceiling.
+* `admit_level` also sizes `next` from `rows.len()`.
 * `finish` sizes the `by_parent` `HashMap` from `self.nodes.len()`.
 * `attach_children` calls `node.children.reserve_exact(rows.len())` once,
   right after removing `rows` from `by_parent` and before the loop that
@@ -138,25 +142,50 @@ declaration, differing only by the `lineage.rs` diff above, same
 | | Instructions (Ir) |
 |---|---|
 | Before | 311,176,188 |
-| After  | 271,049,606 |
-| **Reduction** | **40,126,582 (12.89%)** |
+| After  | 296,002,192 |
+| **Reduction** | **15,173,996 (4.88%)** |
 
-Clears the >=5% floor by ~2.6x.
+Just short of the >=5% floor on its own -- see "Correction (post-review)"
+below for why this number is smaller than this fix's first cut. The
+allocation-bytes floor below still clears independently, and the floor
+rule is an *or*: at least one deterministic counter clearing is sufficient.
 
 ### Allocations (`valgrind --tool=dhat`)
 
 | dhat | Before | After | Reduction |
 |---|---|---|---|
-| Total bytes  | 107,581,951 | 69,667,951 | 37,914,000 (**35.25%**) |
-| Total blocks | 357,430 | 353,680 | 3,750 (1.05%) |
+| Total bytes  | 107,581,951 | 87,912,951 | 19,669,000 (**18.29%**) |
+| Total blocks | 357,430 | 354,130 | 3,300 (0.92%) |
 
-Bytes clear the >=10%-allocation floor by >3.5x. Block count barely moves:
-`with_capacity`/`reserve_exact` still issues one allocation call per
-collection, same as the first allocation a growing collection would have
-made -- what disappears is the *extra* geometric-growth steps and the bytes
-they over-allocate on the way to the final size, not the one allocation
-event every collection needs regardless. The bytes figure is the one that
-reflects that difference; both figures come from the same `dhat` run.
+Bytes clear the >=10%-allocation floor by ~1.8x. Block count barely moves,
+for the same reason noted in the dag_graph/awaitables precedent:
+`reserve`/`reserve_exact`/`with_capacity` still issue one allocation call
+per collection, same as the first allocation a growing collection would
+have made -- what disappears is the *extra* geometric-growth steps and the
+bytes they over-allocate on the way to the final size, not the one
+allocation event every collection needs regardless.
+
+## Correction (post-review)
+
+A GitHub Codex review of this PR (P2 finding, `lineage.rs:399`) caught that
+the first cut of this fix reserved `visited`/`nodes` from `limits.max_nodes`
+-- the walk's *hard ceiling*, as high as `LINEAGE_MAX_NODES_CEILING`
+(10,000) -- once in `LineageWalk::new`. `max_nodes` bounds the worst case a
+caller could ask for, not a prediction of any given walk's real size, and
+most triage calls target a small family or a leaf (zero descendants). That
+first cut made every sparse walk eagerly allocate for the ceiling regardless
+of how many rows it would ever see -- worst-case memory on the common path,
+to speed up the rare wide one. The numbers above are the corrected version:
+reservations move into `admit_level`, sized from each call's own
+`rows.len()` (and, for `nodes`, capped by `self.remaining_budget()` so a
+huge batch arriving near exhaustion doesn't over-reserve for rows that will
+be rejected) -- adaptive to what the walk actually sees, never to the
+ceiling it's merely allowed to reach. This is a smaller win on this page's
+fixture (which fills its budget exactly, the case the ceiling-based
+version handled best) but is the version that does not regress the sparse
+case Codex's review was about, and it still clears the allocation-bytes
+floor comfortably. The before/after artifacts in
+`docs/perf-artifacts/lineage-tree-assembly/` are this corrected version's.
 
 ### Correctness
 
