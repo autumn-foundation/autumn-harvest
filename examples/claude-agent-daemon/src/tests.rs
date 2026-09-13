@@ -11139,3 +11139,145 @@ fn the_history_view_names_no_event_the_engine_cannot_read() {
     );
     assert_eq!(lines.len(), 2, "and the unreadable row is still listed");
 }
+
+/// Every resumed session's history is read, not only one holding a wait.
+///
+/// The class check once sat behind the timer lookup, so it ran only for a
+/// session whose armed timer named a signal. A session that stopped around a
+/// model activity holds no such timer.
+///
+/// Measured before the fix: such a session with a `BLOB` event answered
+/// `Ok(None)`, so the restart reported readiness. The loader answered
+/// `InvalidColumnType(0, "event_json", Blob)` on every drive, and the drive
+/// keeps the session and retries.
+#[test]
+fn a_session_with_no_armed_wait_is_read_too() {
+    let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
+    conn.execute_batch(
+        "CREATE TABLE harvest_timers (timer_id TEXT, exec_id TEXT, fire_at INTEGER, \
+         fired INTEGER NOT NULL DEFAULT 0, arm_seq INTEGER, \
+         PRIMARY KEY (exec_id, timer_id)); \
+         CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+         PRIMARY KEY (exec_id, seq)); \
+         CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+         exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+         delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+    )
+    .expect("the fixture tables are created");
+    // No timer at all, which is the shape the old placement never reached.
+    conn.execute(
+        "INSERT INTO harvest_events VALUES ('e', 0, cast(?1 as blob))",
+        [r#"{"type":"Other","data":{}}"#],
+    )
+    .expect("the unreadable event is appended");
+
+    let refused = inspect::outstanding_signal(&conn, "e", 1_000)
+        .expect_err("a session with no armed wait must still be read");
+    assert!(
+        refused.contains("cannot be told"),
+        "the refusal must say WHY it refuses: {refused}"
+    );
+
+    // The not-the-fault case: the same session with a readable event starts.
+    conn.execute("DELETE FROM harvest_events WHERE exec_id = 'e'", [])
+        .expect("the event is cleared");
+    conn.execute(
+        "INSERT INTO harvest_events VALUES ('e', 0, ?1)",
+        [r#"{"type":"Other","data":{}}"#],
+    )
+    .expect("the readable event is appended");
+    assert_eq!(
+        inspect::outstanding_signal(&conn, "e", 1_000).expect("the wait query runs"),
+        None,
+        "a readable session with no wait still reports no wait"
+    );
+}
+
+/// A staged decision the engine cannot take up never hides a wait.
+///
+/// The staged row ended the wait on its EXISTENCE alone. The backend reads
+/// `payload_json` into a `String` and deserialises it, so three shapes pass
+/// that test and fail the engine. Each is measured here.
+///
+/// Before the fix all three answered `Ok(None)`, so the approval was hidden
+/// while every drive failed without consuming the row.
+#[test]
+fn a_staged_decision_the_engine_cannot_read_is_refused() {
+    let armed = "tool_approval:2:0:toolu_x";
+    let build = |blob: bool, payload: &str| {
+        let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
+        conn.execute_batch(
+            "CREATE TABLE harvest_timers (timer_id TEXT, exec_id TEXT, fire_at INTEGER, \
+             fired INTEGER NOT NULL DEFAULT 0, arm_seq INTEGER, \
+             PRIMARY KEY (exec_id, timer_id)); \
+             CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+             PRIMARY KEY (exec_id, seq)); \
+             CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+             exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+        )
+        .expect("the fixture tables are created");
+        conn.execute(
+            "INSERT INTO harvest_timers VALUES (?1, 'e', 9999, 0, 2)",
+            [format!("__signal_timeout:2:{armed}")],
+        )
+        .expect("the armed timer is recorded");
+        let sql = if blob {
+            "INSERT INTO harvest_signals (exec_id, name, payload_json) \
+             VALUES ('e', ?1, cast(?2 as blob))"
+        } else {
+            "INSERT INTO harvest_signals (exec_id, name, payload_json) VALUES ('e', ?1, ?2)"
+        };
+        conn.execute(sql, rusqlite::params![armed, payload])
+            .expect("the decision is staged");
+        conn
+    };
+
+    for (label, blob, payload) in [
+        (
+            "a class the engine cannot read",
+            true,
+            r#"{"approved":true}"#,
+        ),
+        ("text that is not JSON", false, "{not json"),
+        (
+            "text holding no character",
+            false,
+            r#"{"approved":"\ud800"}"#,
+        ),
+        // A broken escape BELOW the top level. `json_each` reads the top
+        // level only, and `serde_json` refuses the whole document.
+        (
+            "a broken escape nested deeper",
+            false,
+            r#"{"a":{"b":"\ud800"}}"#,
+        ),
+    ] {
+        let conn = build(blob, payload);
+        let refused = inspect::outstanding_signal(&conn, "e", 1_000)
+            .expect_err("a staged decision the engine cannot read must refuse the restart");
+        assert!(
+            refused.contains("never be taken up"),
+            "[{label}] the refusal must say WHY it refuses: {refused}"
+        );
+        assert!(
+            refused.contains(armed),
+            "[{label}] the refusal must name the signal: {refused}"
+        );
+    }
+
+    // The not-the-fault cases. A readable decision still ends the wait, and
+    // so does one holding an astral character, which `status` accepts.
+    for (label, payload) in [
+        ("a plain decision", r#"{"approved":true}"#),
+        ("a decision holding an astral character", r#"{"note":"😀"}"#),
+        ("a decision holding U+D7FF", "{\"note\":\"\u{d7ff}\"}"),
+    ] {
+        let conn = build(false, payload);
+        assert_eq!(
+            inspect::outstanding_signal(&conn, "e", 1_000).expect("the wait query runs"),
+            None,
+            "[{label}] a readable staged decision still ends the wait"
+        );
+    }
+}

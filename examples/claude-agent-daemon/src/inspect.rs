@@ -924,6 +924,21 @@ pub fn outstanding_signal(
     exec_id: &str,
     now_ms: i64,
 ) -> Result<Option<String>, String> {
+    // EVERY resumed session is checked here, and not only one holding an
+    // armed wait. The check once sat in [`answered`], which is reached only
+    // when a timer names a signal. A session that stopped around a model
+    // activity holds no such timer, so its history was never read. A row the
+    // engine cannot load then survived the startup, `load_history` failed on
+    // every drive, and the drive kept the session and retried forever.
+    //
+    // The restart calls this function once for each RUNNING session, so this
+    // is the one place that sees them all.
+    if ambiguous_history(conn, exec_id)? {
+        return Err(format!(
+            "session {exec_id} holds an event this daemon cannot read as the \
+             engine reads it, so whether its decision was taken cannot be told"
+        ));
+    }
     // `fired = 0` is the backend's own proof of a wait that is still armed.
     // An approval that timed out leaves its timer behind with `fired = 1`,
     // and a timed-out wait has no answer either. Reading every timer would
@@ -980,24 +995,15 @@ fn signal_of(timer_id: &str) -> Option<String> {
 /// Reading the event alone would restore the wait over such a decision, and a
 /// second answer would be taken for a call already decided.
 fn answered(conn: &Connection, exec_id: &str, signal: &str) -> Result<bool, String> {
-    let staged = one_row(
-        conn,
-        "SELECT 1 FROM harvest_signals WHERE exec_id = ?1 AND name = ?2 \
-         AND delivered = 0 LIMIT 1",
-        exec_id,
-        signal,
-    )?;
-    if staged {
-        return Ok(true);
-    }
-    // The event read below is only as good as the rows it reads. A row this
-    // daemon reads and the ENGINE cannot is refused first, and so is one that
-    // reads two ways.
-    if ambiguous_history(conn, exec_id)? {
-        return Err(format!(
-            "session {exec_id} holds an event this daemon cannot read as the \
-             engine reads it, so whether its decision was taken cannot be told"
-        ));
+    match staged_decision(conn, exec_id, signal)? {
+        Some(true) => return Ok(true),
+        Some(false) => {
+            return Err(format!(
+                "session {exec_id} holds a staged decision for {signal} that the \
+                 engine cannot read, so the decision can never be taken up"
+            ));
+        }
+        None => {}
     }
     one_row(
         conn,
@@ -1008,6 +1014,65 @@ fn answered(conn: &Connection, exec_id: &str, signal: &str) -> Result<bool, Stri
         exec_id,
         signal,
     )
+}
+
+/// Is a decision STAGED for this signal, and can the engine read it?
+///
+/// `None` means nothing is staged. `Some(true)` is a decision the engine can
+/// take up. `Some(false)` is a row that suppresses the wait and that no drive
+/// can consume.
+///
+/// The existence of the row is not enough. `peek_pending_signal` reads
+/// `payload_json` into a `String` and then deserialises it, so three shapes
+/// fail it while a bare existence test passes. Each one was measured.
+///
+/// A `BLOB` payload fails the column read:
+/// `InvalidColumnType(0, "payload_json", Blob)`.
+///
+/// Text that is not JSON fails the parse: `key must be a string`.
+///
+/// Text holding no character fails it too. `json_valid` accepts a lone
+/// surrogate escape and `serde_json` refuses it, with `unexpected end of hex
+/// escape`. The test is a `GLOB` for a code point between `U+D800` and
+/// `U+DFFF` over the decoded value. It is EXACT: a well-formed pair decodes
+/// to one astral character and is not matched, and `U+D7FF` is not matched.
+/// Both were measured to deserialise.
+///
+/// The surrogate test walks the WHOLE document with `json_tree`. A payload is
+/// an arbitrary value rather than a declared shape, so a broken escape can
+/// sit at any depth. `json_each` reads the top level only. A nested one
+/// was measured: `json_each` passed it and `serde_json` refused it.
+///
+/// The row is chosen with the backend's OWN order. `peek_pending_signal`
+/// takes the earliest-arrived undelivered row, so a bare `LIMIT 1` could
+/// report on a row the engine never reads.
+fn staged_decision(conn: &Connection, exec_id: &str, signal: &str) -> Result<Option<bool>, String> {
+    let sql = "SELECT CASE WHEN typeof(payload_json) <> 'text' THEN 0 \
+                            WHEN NOT json_valid(payload_json) THEN 0 \
+                            WHEN (SELECT count(*) FROM json_tree(payload_json) \
+                                  WHERE value GLOB '*[' || char(55296) \
+                                              || '-' || char(57343) \
+                                              || ']*') > 0 THEN 0 \
+                            ELSE 1 END \
+                 FROM harvest_signals \
+                WHERE exec_id = ?1 AND name = ?2 AND delivered = 0 \
+                ORDER BY received_at, signal_seq LIMIT 1";
+    let mut statement = conn
+        .prepare(sql)
+        .map_err(|e| format!("cannot prepare the staged decision query: {e}"))?;
+    let mut rows = statement
+        .query([exec_id, signal])
+        .map_err(|e| format!("cannot read the staged decisions: {e}"))?;
+    let Some(row) = rows
+        .next()
+        .map_err(|e| format!("cannot read a staged decision: {e}"))?
+    else {
+        return Ok(None);
+    };
+    let readable: i64 = row
+        .get(0)
+        .map_err(|e| format!("cannot read a staged decision: {e}"))?;
+    Ok(Some(readable == 1))
 }
 
 /// Does this history hold an event that does not read ONE way?
