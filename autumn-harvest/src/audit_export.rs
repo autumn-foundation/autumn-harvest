@@ -727,6 +727,7 @@ pub const ACK_QUERY_BOUND: std::time::Duration = std::time::Duration::from_secs(
 /// Using the fixed, uncapped bounds for each step regardless would let the
 /// checkout alone consume a reserve meant to cover both steps. The
 /// acknowledgement would then get no margin at all.
+#[cfg(feature = "db")]
 fn split_reserve(reserve: std::time::Duration) -> (std::time::Duration, std::time::Duration) {
     let total = SHARD_ACQUIRE_BOUND + ACK_QUERY_BOUND;
     let checkout_nanos = reserve.as_nanos() * SHARD_ACQUIRE_BOUND.as_nanos() / total.as_nanos();
@@ -3156,6 +3157,7 @@ mod tests {
     // the checkout alone consume it, leaving the acknowledgement no margin.
 
     #[test]
+    #[cfg(feature = "db")]
     fn split_reserve_returns_the_fixed_bounds_at_the_uncapped_reserve() {
         let (checkout, ack) = split_reserve(SHARD_ACQUIRE_BOUND + ACK_QUERY_BOUND);
         assert_eq!(checkout, SHARD_ACQUIRE_BOUND);
@@ -3163,6 +3165,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "db")]
     fn split_reserve_shrinks_both_bounds_proportionally() {
         let reserve = std::time::Duration::from_secs(1);
         let (checkout, ack) = split_reserve(reserve);
@@ -3182,6 +3185,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "db")]
     fn split_reserve_of_zero_is_zero() {
         assert_eq!(
             split_reserve(std::time::Duration::ZERO),
