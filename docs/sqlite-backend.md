@@ -267,6 +267,11 @@ match rt.outcome(exec)? {
 - **`poll_once()`** for a custom loop — e.g. a background tick where you decide
   the cadence and inspect the `bool` progress flag yourself.
 
+`poll_once()`/`run_until_idle()` drive every execution in a pass even if an
+earlier one errors — see [§11](#11-v01-non-goals-and-follow-ups) for what
+happens to a rejected execution. `run_until_blocked(exec)` is the one
+fail-fast driver, since it already targets a single execution.
+
 `outcome(exec)`, `load_history(exec)`, and `activity_attempts(exec, name)` are
 **pure reads** — they never advance a run.
 

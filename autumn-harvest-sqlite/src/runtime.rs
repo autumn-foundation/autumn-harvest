@@ -979,8 +979,8 @@ impl SqliteRuntime {
     ///
     /// # Errors
     ///
-    /// The FIRST execution to error, in `ExecutionId` order, if any. Every
-    /// other error in the same pass is logged (`tracing::warn!`), not
+    /// Returns the FIRST execution's error, in `ExecutionId` order, if any.
+    /// Every other error in the same pass is logged (`tracing::warn!`), not
     /// dropped. See [`run_until_blocked`](Self::run_until_blocked) for the
     /// error variants a single execution can produce.
     pub async fn poll_once(&mut self) -> SqliteResult<bool> {
