@@ -3072,6 +3072,7 @@ async fn sweep_inner(
                     upper,
                     opts.straggler_batch,
                     opts.exact_scan_timeout,
+                    reborrow_progress(&mut progress),
                 )
                 .await?;
             }
@@ -3533,6 +3534,7 @@ async fn delete_orphan_rows(
     upper: DateTime<Utc>,
     batch: usize,
     timeout: Duration,
+    mut progress: Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<usize> {
     let batch = i64::try_from(batch).unwrap_or(i64::MAX).max(1);
     let ms = u64::try_from(timeout.as_millis())
@@ -3547,6 +3549,14 @@ async fn delete_orphan_rows(
     let max_batches = 16;
     let mut total = 0usize;
     for _ in 0..max_batches {
+        // Review finding: each batch here can run nearly `exact_scan_timeout`
+        // on its own. Sixteen of them can then run past the liveness
+        // scanner's staleness threshold even though this call is itself
+        // bounded progress. Ticking once per batch closes that gap the same
+        // way the caller already ticks once per attempted partition.
+        if let Some(cb) = &mut progress {
+            cb();
+        }
         // Keyed on `(id, cohort)` — the partitioned table's PRIMARY KEY — and
         // NOT on `ctid`.
         //

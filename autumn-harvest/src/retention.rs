@@ -1057,7 +1057,6 @@ async fn run_partition_maintenance_pass(
     if !config.partitions.enabled {
         return;
     }
-    let now = Utc::now();
     let mut sweep_opts = config.partitions.sweep_options();
     // `dry_run` means "do not destroy data". It must NOT stop partition
     // CREATION: `ensure_partitions` and `drain_default` delete nothing,
@@ -1165,6 +1164,13 @@ async fn run_partition_maintenance_pass(
         // long enough on its own to cross the staleness threshold. Ticking
         // once per partition the sweep attempts closes that gap.
         let mut tick_partition = || crate::scanner_health::record_scanner_tick(metrics, owner);
+        // Review finding: a single `now` shared across every shard in this
+        // pass goes stale under a slow earlier shard. A shard maintained
+        // late can then compute lookahead partitions against a clock that
+        // is already behind. Its true current cohort then stays uncovered
+        // until the next tick. Read the clock fresh, right before this
+        // shard's own call.
+        let now = Utc::now();
         match crate::partition::maintain_with_progress(
             &mut conn,
             now,

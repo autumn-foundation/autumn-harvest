@@ -361,12 +361,13 @@ async fn run_one_tick_on(
 
     // Wait for the bucket-GC outcome itself, not for a scanner-tick count.
     // `RetentionRuntime::spawn` runs a startup partition-maintenance pass
-    // before the main loop's first iteration and records a liveness tick
-    // for it even when partitioning is off (the pass's own per-shard ticks
-    // never fire in that case). That startup tick shares the same counter
-    // as the main loop's end-of-iteration tick, so waiting on "the counter
-    // moved" can observe the harmless startup tick and read the snapshot
-    // before `run_now()`'s own iteration has populated this field.
+    // before the main loop's first iteration. It records a liveness tick
+    // for that pass, even when partitioning is off. The pass's own
+    // per-shard ticks never fire in that case. That startup tick shares
+    // the counter with the main loop's end-of-iteration tick. Waiting on
+    // "the counter moved" can therefore observe the harmless startup
+    // tick. The snapshot read then races `run_now()`'s own iteration,
+    // which has not yet populated this field.
     let mut result = None;
     for _ in 0..400 {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -409,9 +410,9 @@ async fn run_one_tick_snapshot(
     .expect("retention runtime should spawn when the bucket GC is active");
     runtime.run_now();
     // See `run_one_tick_on`: wait for every shard's bucket-GC outcome to be
-    // populated rather than for a scanner-tick count, which the startup
-    // partition-maintenance pass can move before this tick's own iteration
-    // runs.
+    // populated. Do not wait for a scanner-tick count. The startup
+    // partition-maintenance pass can move that counter before this tick's
+    // own iteration runs.
     let mut snap = Vec::new();
     for _ in 0..400 {
         tokio::time::sleep(Duration::from_millis(50)).await;
