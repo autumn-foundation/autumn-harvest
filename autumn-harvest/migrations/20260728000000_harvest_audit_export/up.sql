@@ -18,7 +18,9 @@
 -- docs/audit-export.md's "Retention interaction" section for the exact
 -- conditions, which are more than one config flag. Tracked as
 -- autumn-foundation/autumn-harvest#1272, which weighs creating the index
--- lazily on first opt-in against leaving it here.
+-- lazily on first opt-in against leaving it here. Even then the bound is
+-- not total: one decommission record and one reactivation record per
+-- shard stay in the index forever by design.
 
 -- ── The per-shard monotonic sequence (AC4) ────────────────────────────────
 --

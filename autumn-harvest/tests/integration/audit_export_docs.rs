@@ -286,6 +286,14 @@ fn boundedness_claim_points_at_retention_interaction() {
              is the one place those conditions are kept complete",
             path.display()
         );
+        assert!(
+            markers_near(&text, "bounded", "decommission")
+                && markers_near(&text, "bounded", "reactivat"),
+            "{}: a boundedness claim must scope itself to ordinary rows — \
+             decommission/reactivate lifecycle records are never purged, so \
+             the bound never fully closes",
+            path.display()
+        );
     }
 
     let doc = read_normalized(&repo_root().join("docs/audit-export.md"));
@@ -303,6 +311,14 @@ fn boundedness_claim_points_at_retention_interaction() {
          name the top-level `audit_retention_days`/`dry_run` purge gate, \
          not just the per-record cursor/sink guard — a claim pointing here \
          for \"the exact conditions\" needs all of them present"
+    );
+    assert!(
+        contains_collapsed(&doc, "audit_export.decommission")
+            && contains_collapsed(&doc, "audit_export.reactivate")
+            && contains_collapsed(&doc, "never purged"),
+        "docs/audit-export.md's Retention interaction section must still \
+         document that decommission/reactivate records are never purged — \
+         the boundedness claims elsewhere depend on this being here"
     );
 }
 
