@@ -188,7 +188,10 @@ pub struct ToolRequest {
 }
 
 /// One `tool_use` block the model emitted.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// `PartialEq` is derived so a recorded reply's calls can be compared with the
+/// calls its own content derives. See [`crate::claude::projects_its_content`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,

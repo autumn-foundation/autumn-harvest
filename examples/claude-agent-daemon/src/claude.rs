@@ -712,7 +712,37 @@ pub fn unusable_reply(reply: &TurnReply) -> Option<&'static str> {
     if !is_usable(reply) {
         return Some("its response carried no text and no tool call");
     }
+    if !projects_its_content(reply) {
+        return Some("its recorded calls are not the calls its own content holds");
+    }
     None
+}
+
+/// Do this reply's projections say what its CONTENT says?
+///
+/// A reply carries the same turn twice. `content` is the blocks the API
+/// returned, replayed verbatim into the next request. `text` and `tool_calls`
+/// are projections of those blocks, and they are what the session RUNS and
+/// what an operator decides.
+///
+/// The live path derives both from one payload, so they cannot disagree
+/// there. A RECORDED reply can hold two different turns. The daemon then runs
+/// the projection while the next request carries the content, and the
+/// `tool_result` names a call that request never made.
+///
+/// Measured on one such reply: the rules above accepted it, its content held
+/// `read_file notes.md`, and its projection held `write_file /etc/passwd`.
+/// An operator would decide the call the content shows and release the call
+/// the projection holds.
+///
+/// The test DERIVES the projections again, with the live path's own
+/// [`parse_reply`], and compares. Nothing here restates what a projection is,
+/// so the two cannot drift. On the live path this re-derivation is an
+/// identity, which is the point. The rule costs that path nothing. It holds
+/// the recorded one to what that path would have produced.
+pub fn projects_its_content(reply: &TurnReply) -> bool {
+    let derived = parse_reply(&serde_json::json!({ "content": reply.content }));
+    derived.text == reply.text && derived.tool_calls == reply.tool_calls
 }
 
 pub fn malformed_reply(reply: &TurnReply) -> Option<&'static str> {

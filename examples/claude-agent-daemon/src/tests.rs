@@ -12336,7 +12336,12 @@ fn a_recorded_reply_is_held_to_every_live_rule() {
 fn no_reply_rule_is_applied_on_one_path_only() {
     let claude_rs = include_str!("claude.rs");
     let inspect_rs = include_str!("inspect.rs");
-    for rule in ["malformed_reply", "agrees_with_its_content", "is_usable"] {
+    for rule in [
+        "malformed_reply",
+        "agrees_with_its_content",
+        "is_usable",
+        "projects_its_content",
+    ] {
         // One call, inside `unusable_reply`, which takes `reply` by
         // reference already. A call anywhere else passes `&reply`, so BOTH
         // spellings are counted.
@@ -12363,5 +12368,118 @@ fn no_reply_rule_is_applied_on_one_path_only() {
     assert!(
         inspect_rs.contains("unusable_reply(&reply)"),
         "and so must the restart"
+    );
+}
+
+/// A reply must say the SAME turn twice.
+///
+/// A reply carries `content`, which the next request replays verbatim, and
+/// `text`/`tool_calls`, which the session runs and an operator decides. The
+/// live path derives both from one payload, so they cannot disagree there. A
+/// recorded reply can hold two different turns.
+///
+/// Measured before the fix, on one such reply: the other rules accepted it,
+/// its content held `read_file notes.md`, and its projection held
+/// `write_file /etc/passwd`. The operator decides the call the content shows
+/// and releases the call the projection holds.
+#[test]
+fn a_recorded_reply_must_say_the_same_turn_twice() {
+    let id = "01234567-89ab-4cde-8f01-23456789abcd";
+    let shown = json!([{ "type": "tool_use", "id": "toolu_shown",
+                         "name": tools::TOOL_READ_FILE, "input": { "path": "notes.md" } }]);
+
+    let disagreeing: Vec<(&str, session::TurnReply)> = vec![
+        (
+            "a call the content does not hold",
+            session::TurnReply {
+                content: shown,
+                stop_reason: claude::STOP_TOOL_USE.to_string(),
+                text: String::new(),
+                tool_calls: vec![session::ToolCall {
+                    id: "toolu_hidden".to_string(),
+                    name: tools::TOOL_WRITE_FILE.to_string(),
+                    input: json!({ "path": "/etc/passwd", "content": "x" }),
+                }],
+            },
+        ),
+        (
+            "text the content does not hold",
+            session::TurnReply {
+                content: json!([{ "type": "text", "text": "one thing" }]),
+                stop_reason: "end_turn".to_string(),
+                text: "quite another".to_string(),
+                tool_calls: vec![],
+            },
+        ),
+        (
+            // The projection keeps ONE of the two calls the content holds, so
+            // it is not empty and every other rule passes it.
+            "one of the calls the content holds",
+            session::TurnReply {
+                content: json!([
+                    { "type": "tool_use", "id": "toolu_first",
+                      "name": tools::TOOL_READ_FILE, "input": { "path": "a.md" } },
+                    { "type": "tool_use", "id": "toolu_second",
+                      "name": tools::TOOL_READ_FILE, "input": { "path": "b.md" } },
+                ]),
+                stop_reason: claude::STOP_TOOL_USE.to_string(),
+                text: String::new(),
+                tool_calls: vec![session::ToolCall {
+                    id: "toolu_first".to_string(),
+                    name: tools::TOOL_READ_FILE.to_string(),
+                    input: json!({ "path": "a.md" }),
+                }],
+            },
+        ),
+    ];
+    for (label, reply) in &disagreeing {
+        // The SHAPE reads, and every other rule passes it.
+        let as_value = serde_json::to_value(reply).expect("the reply serialises");
+        assert!(
+            serde_json::from_value::<session::TurnReply>(as_value).is_ok(),
+            "[{label}] the reply must be one the type accepts"
+        );
+        assert!(
+            claude::malformed_reply(reply).is_none() && claude::is_usable(reply),
+            "[{label}] and one the other rules pass"
+        );
+        assert!(
+            !claude::projects_its_content(reply),
+            "[{label}] while the two turns it holds disagree"
+        );
+        let message = inspect::outstanding_signal(&one_recorded_reply(id, reply), "e", 1_000)
+            .expect_err("a reply holding two turns must refuse the restart");
+        assert!(
+            message.contains("would have refused"),
+            "[{label}] the refusal must say WHY it refuses: {message}"
+        );
+    }
+
+    // The not-the-fault case: a reply the live path actually built. Its
+    // projections ARE its content, so the rule costs that path nothing.
+    let sound = claude::parse_reply(&json!({
+        "content": [
+            { "type": "text", "text": "reading" },
+            { "type": "tool_use", "id": "toolu_shown", "name": tools::TOOL_READ_FILE,
+              "input": { "path": "notes.md" } },
+        ]
+    }));
+    let sound = session::TurnReply {
+        stop_reason: claude::STOP_TOOL_USE.to_string(),
+        ..sound
+    };
+    assert!(
+        claude::projects_its_content(&sound),
+        "a reply the live path derived says the same turn twice"
+    );
+    assert!(
+        claude::unusable_reply(&sound).is_none(),
+        "so the whole set accepts it"
+    );
+    assert_eq!(
+        inspect::outstanding_signal(&one_recorded_reply(id, &sound), "e", 1_000)
+            .expect("the wait query runs"),
+        None,
+        "and the restart accepts it"
     );
 }
