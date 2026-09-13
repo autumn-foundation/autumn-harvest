@@ -1437,6 +1437,88 @@ async fn a_sweep_bounds_blocked_evaluations_too_not_only_drops() {
     );
 }
 
+#[tokio::test]
+async fn the_straggler_delete_bounds_its_own_statement_timeout() {
+    // Issue #1270 item 2: `delete_orphan_rows` ran with no `statement_timeout`
+    // of its own, so on a partition where a straggler execution has pinned a
+    // cohort, a `DELETE` blocked behind a lock could run — or wait — for as
+    // long as the blocker lives, inside the retention tick. It must fail safe
+    // like every other budget in this module: timed out, not errored, and
+    // retried next tick.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // A cohort pinned by a still-existing execution, so the gate reports
+    // OWNED_REASON (not droppable) and — with straggler_grace configured —
+    // the sweep attempts the targeted orphan DELETE rather than skipping it.
+    let old = Utc::now() - chrono::Duration::days(10);
+    let pinning = insert_execution(&mut conn, "pin_wf", "pin-1", old, None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(pinning),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed");
+    backdate_events(&mut conn, pinning, old).await;
+    let cohort_partition =
+        partition::partition_name(partition::cohort_start(old, partition::DEFAULT_COHORT_WIDTH_SECS));
+
+    // A concurrent SHARE lock on that one partition: it conflicts with the
+    // ROW EXCLUSIVE the straggler DELETE needs (the same conflict the
+    // sweeper's own drop re-check relies on), so the DELETE blocks waiting
+    // for it — and `statement_timeout` bounds a statement's total time
+    // including a lock wait, so this forces the timeout deterministically
+    // with no need for a large or slow dataset.
+    let mut locker = connect(&url).await;
+    diesel::sql_query("BEGIN")
+        .execute(&mut locker)
+        .await
+        .expect("begin");
+    diesel::sql_query(format!("LOCK TABLE {cohort_partition} IN SHARE MODE"))
+        .execute(&mut locker)
+        .await
+        .expect("lock the partition");
+
+    let outcome = partition::sweep(
+        &mut conn,
+        Utc::now(),
+        &SweepOptions {
+            straggler_grace: Some(Duration::from_secs(0)),
+            exact_scan_timeout: Duration::from_millis(200),
+            ..SweepOptions::default()
+        },
+    )
+    .await;
+
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut locker)
+        .await
+        .expect("release the lock");
+
+    let outcome = outcome.expect(
+        "a straggler DELETE that hits its statement_timeout must be reported as \
+         blocked, not returned as a hard Err — the pass must retry next tick, \
+         exactly like the exact ownership scan's own budget",
+    );
+    assert_eq!(
+        outcome.straggler_rows_deleted, 0,
+        "the DELETE never got past the lock wait, so nothing was deleted"
+    );
+    assert!(
+        outcome
+            .blocked
+            .iter()
+            .any(|b| b.contains(&cohort_partition)),
+        "the pinned cohort must still be reported blocked; got {outcome:?}"
+    );
+}
+
 // ══ Pure unit coverage for the cohort algebra ══════════════════════════════
 
 #[test]

@@ -1987,8 +1987,14 @@ async fn sweep_inner(
                 && let Ok(grace) = chrono::Duration::from_std(grace)
                 && upper + grace <= now
             {
-                outcome.straggler_rows_deleted +=
-                    delete_orphan_rows(conn, part.lower, upper, opts.straggler_batch).await?;
+                outcome.straggler_rows_deleted += delete_orphan_rows(
+                    conn,
+                    part.lower,
+                    upper,
+                    opts.straggler_batch,
+                    opts.exact_scan_timeout,
+                )
+                .await?;
             }
             continue;
         }
@@ -2426,14 +2432,25 @@ async fn drop_partition(
 /// Deletes only rows whose owning execution no longer exists, in bounded
 /// batches, so a straggler pass can neither touch a live execution's history
 /// nor open an unbounded transaction.
+///
+/// Each batch runs under `statement_timeout`, exactly like the exact
+/// ownership scan this fallback runs alongside — see [`cohort_occupancy`].
+/// Without it, a batch on a partition where orphans are SPARSE re-scans the
+/// leading owned rows every iteration before finding one to delete, which is
+/// quadratic in the partition size and otherwise runs for as long as that
+/// scan takes, inside the retention tick. A timeout is "did what it could
+/// this tick, retry next" — not an error — matching every other budget in
+/// this module: what was deleted before the timeout stays deleted.
 #[cfg(feature = "db")]
 async fn delete_orphan_rows(
     conn: &mut AsyncPgConnection,
     lower: Option<DateTime<Utc>>,
     upper: DateTime<Utc>,
     batch: usize,
+    timeout: Duration,
 ) -> HarvestResult<usize> {
     let batch = i64::try_from(batch).unwrap_or(i64::MAX).max(1);
+    let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX).max(1);
     // Total work per partition per tick is capped, not just per statement. The
     // inner SELECT restarts from the top of the range each iteration, so on a
     // partition where orphans are SPARSE — the common shape for one pinned by a
@@ -2475,15 +2492,28 @@ async fn delete_orphan_rows(
               )",
             lower.map_or(String::new(), |_| "e.cohort >= $3 AND".to_string())
         );
-        let query = diesel::sql_query(sql)
-            .bind::<Timestamptz, _>(upper)
-            .bind::<BigInt, _>(batch);
-        let deleted = if let Some(lower) = lower {
-            query.bind::<Timestamptz, _>(lower).execute(conn).await
-        } else {
-            query.execute(conn).await
-        }
-        .map_err(database_error)?;
+        let result = Box::pin(conn.transaction::<usize, HarvestError, _>(async |conn| {
+            exec(conn, &format!("SET LOCAL statement_timeout = '{ms}ms'")).await?;
+            let query = diesel::sql_query(sql)
+                .bind::<Timestamptz, _>(upper)
+                .bind::<BigInt, _>(batch);
+            let deleted = if let Some(lower) = lower {
+                query.bind::<Timestamptz, _>(lower).execute(conn).await
+            } else {
+                query.execute(conn).await
+            };
+            deleted.map_err(database_error)
+        }))
+        .await;
+        let deleted = match result {
+            Ok(n) => n,
+            // Fail safe toward "stop here": the rows this pass already deleted
+            // in earlier batches stay deleted, and the rest of this partition
+            // is retried next tick — the same direction every other budget in
+            // this module fails in.
+            Err(HarvestError::Database(msg)) if is_statement_timeout(&msg) => break,
+            Err(e) => return Err(e),
+        };
         total += deleted;
         if deleted == 0 || i64::try_from(deleted).unwrap_or(i64::MAX) < batch {
             break;
