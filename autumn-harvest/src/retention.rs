@@ -1062,6 +1062,18 @@ impl RetentionRuntime {
         let shutdown_task = shutdown.clone();
         let monitor_task = monitor.clone();
         let (trigger_tx, mut trigger_rx) = mpsc::channel(1);
+        // Issue #1270 item 5: run the first tick immediately rather than
+        // waiting a full `tick_interval` (an hour, by default). Partition
+        // maintenance is the sharp edge — a shard that restarts after being
+        // offline longer than its lookahead window has no covering partition
+        // until the first pass runs, and every append meanwhile lands in the
+        // DEFAULT partition, whose later drain is the disruptive path this
+        // module exists to avoid. Buffered here, before the loop below ever
+        // runs: the channel has capacity 1, so this permit is waiting the
+        // moment the first `tokio::select!` polls it, and — since `sleep`
+        // cannot possibly have elapsed yet — the trigger branch always wins
+        // the first iteration.
+        let _ = trigger_tx.try_send(());
         // Issue #797: declare the loop before its first iteration so the
         // `scanner_liveness` check expects it and grants it boot grace.
         let owner = crate::scanner_health::register_scanner(

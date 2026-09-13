@@ -1250,6 +1250,63 @@ async fn the_retention_tick_pre_creates_future_partitions_with_no_operator_cron(
 }
 
 #[tokio::test]
+async fn partition_maintenance_runs_at_startup_not_after_a_full_tick_interval() {
+    // Issue #1270 item 5: the maintenance block used to live only after the
+    // loop's `sleep(tick_interval)`, so a shard that restarted after being
+    // offline longer than its lookahead window had no covering partition for
+    // up to a full tick interval — an hour, by default — during which every
+    // append lands in the DEFAULT partition. `spawn` must trigger the first
+    // pass immediately.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    let pool = build_pool(&url);
+    let pools = ShardedDbPool::single(pool);
+    let config = RetentionConfig {
+        // Long enough that only a startup trigger — not this test's patience —
+        // could make the assertion below pass.
+        tick_interval_secs: 3600,
+        ..RetentionConfig::default()
+    };
+    assert!(
+        config.partitions.enabled,
+        "precondition: partition maintenance must be on by default"
+    );
+
+    let started = Utc::now();
+    let runtime = RetentionRuntime::spawn(pools, config, Arc::new(NoopMetrics), None, None)
+        .expect("retention runtime should spawn when enabled");
+    // Deliberately NOT calling `runtime.run_now()` — that is the crutch every
+    // other test in this file uses, and the whole point here is that `spawn`
+    // alone must be enough.
+
+    let mut saw_maintenance = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snap = runtime.monitor().snapshot();
+        if let Some(r) = snap.per_shard.iter().find(|r| r.shard == 0)
+            && r.partition_maintenance
+                .as_ref()
+                .and_then(|m| m.at)
+                .is_some_and(|at| at >= started)
+        {
+            saw_maintenance = true;
+            break;
+        }
+    }
+    runtime.shutdown();
+    assert!(
+        saw_maintenance,
+        "partition maintenance must run at startup — waiting up to 5s, against \
+         a 3600s tick_interval that only a startup trigger could beat"
+    );
+}
+
+#[tokio::test]
 async fn an_append_for_an_uncovered_cohort_survives_via_the_default_partition() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
