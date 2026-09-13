@@ -1167,6 +1167,77 @@ async fn an_operator_trigger_sharing_the_reserved_fk_trigger_name_still_refuses(
 }
 
 #[tokio::test]
+async fn an_operator_trigger_whose_function_lives_in_another_schema_still_refuses() {
+    // Review finding: the fix for the reserved-name gap added
+    // `p.pronamespace = c.relnamespace` to the join. An INNER JOIN with
+    // that condition drops the row entirely for a trigger whose function
+    // lives in a DIFFERENT schema (an `audit` schema, say). That does
+    // not just fail the name check. It makes the trigger invisible to
+    // the guard altogether. Only the exclusion for harvest's own
+    // function needs same-schema scoping, not the join itself.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query(
+        "DROP TRIGGER IF EXISTS harvest_events_other_schema_trg_958 ON harvest_events",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray trigger from a previous run");
+    diesel::sql_query("DROP SCHEMA IF EXISTS harvest_other_schema_958 CASCADE")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray schema from a previous run");
+    diesel::sql_query("CREATE SCHEMA harvest_other_schema_958")
+        .execute(&mut conn)
+        .await
+        .expect("seed a separate schema");
+    diesel::sql_query(
+        "CREATE FUNCTION harvest_other_schema_958.trg_fn() RETURNS trigger AS $$ \
+         BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a trigger function in another schema");
+    diesel::sql_query(
+        "CREATE TRIGGER harvest_events_other_schema_trg_958 BEFORE INSERT ON harvest_events \
+         FOR EACH ROW EXECUTE FUNCTION harvest_other_schema_958.trg_fn()",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator trigger invoking a function in another schema");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "an operator trigger whose function lives in another schema \
+             must still refuse the conversion, not become invisible to \
+             the guard",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_other_schema_trg_958"),
+        "the refusal must name the offending trigger; got {msg}"
+    );
+
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP TRIGGER harvest_events_other_schema_trg_958 ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending trigger");
+    diesel::sql_query("DROP SCHEMA harvest_other_schema_958 CASCADE")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending schema");
+}
+
+#[tokio::test]
 async fn a_user_index_at_the_identifier_length_limit_survives_conversion() {
     // Issue #1270 item 9: Postgres silently truncates an identifier over 63
     // bytes. Appending a suffix to a name already at that limit renames it

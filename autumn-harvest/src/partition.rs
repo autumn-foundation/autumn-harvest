@@ -1385,10 +1385,11 @@ pub async fn operator_triggers(conn: &mut AsyncPgConnection) -> HarvestResult<Ve
            FROM pg_trigger tg
            JOIN pg_class c ON c.oid = tg.tgrelid
            JOIN pg_namespace n ON n.oid = c.relnamespace
-           JOIN pg_proc p ON p.oid = tg.tgfoid AND p.pronamespace = c.relnamespace
+           JOIN pg_proc p ON p.oid = tg.tgfoid
           WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
             AND NOT tg.tgisinternal
-            AND p.proname <> 'harvest_events_require_execution'
+            AND NOT (p.proname = 'harvest_events_require_execution'
+                     AND p.pronamespace = c.relnamespace)
           ORDER BY 1",
     )
     .load::<TextRow>(conn)
@@ -3764,10 +3765,11 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
              FROM pg_trigger tg\n      \
              JOIN pg_class c ON c.oid = tg.tgrelid\n      \
              JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
-             JOIN pg_proc p ON p.oid = tg.tgfoid AND p.pronamespace = c.relnamespace\n     \
+             JOIN pg_proc p ON p.oid = tg.tgfoid\n     \
              WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
              AND NOT tg.tgisinternal\n       \
-             AND p.proname <> 'harvest_events_require_execution';\n    \
+             AND NOT (p.proname = 'harvest_events_require_execution'\n                      \
+             AND p.pronamespace = c.relnamespace);\n    \
              IF bad IS NOT NULL THEN\n        \
              RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not carried by \
              CREATE TABLE ... (LIKE ...) (%). An operator trigger would stay on the \
