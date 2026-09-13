@@ -107,7 +107,7 @@ fn harden_root(root: &Path) -> Result<(), DevError> {
 /// # Unix vs Windows
 ///
 /// Unix answers directly: the uid on `metadata` must be ours. Windows has no
-/// such check yet — its own follow-up to issue #1287 — so the fallback is a
+/// such check yet. Its own follow-up is issue #1287. The fallback there is a
 /// location heuristic: `dir` must resolve under a per-user root
 /// (`%LOCALAPPDATA%` or `%USERPROFILE%`). That proves WHERE the directory is,
 /// not WHO else can write to it. It is weaker than the Unix answer, and the
@@ -116,10 +116,10 @@ pub(super) fn directory_is_ours(
     dir: &Path,
     metadata: &std::fs::Metadata,
 ) -> Result<(), &'static str> {
-    // Each parameter is read on only one platform below; discarding both up
-    // front keeps every other platform from warning on the unused one,
-    // without a per-cfg `#[allow(unused)]`. References are `Copy`, so the
-    // real reads further down still see the same values.
+    // Each parameter is read on only one platform below. Discarding both up
+    // front keeps every other platform from warning on the unused one.
+    // This needs no per-cfg `#[allow(unused)]`. References are `Copy`, so
+    // the real reads further down still see the same values.
     let _ = (dir, metadata);
     #[cfg(unix)]
     {
@@ -146,11 +146,11 @@ pub(super) fn directory_is_ours(
 ///
 /// A location heuristic, not proof of ownership: nothing stops an
 /// administrator from redirecting `%LOCALAPPDATA%` or `%USERPROFILE%`
-/// machine-wide. It still closes the exposure issue #1287 describes — every
-/// default this crate ever picks on its own (`std::env::temp_dir()`, the
-/// managed-cache root) already resolves under one of these two roots, so this
-/// only ever refuses an explicitly configured shared location, exactly the
-/// case that had no guard at all.
+/// machine-wide. It still closes the exposure issue #1287 describes. Every
+/// default this crate ever picks on its own — `std::env::temp_dir()`, the
+/// managed-cache root — already resolves under one of these two roots. So
+/// this only ever refuses an explicitly configured shared location, exactly
+/// the case that had no guard at all.
 ///
 /// Both sides are canonicalised before comparison, so a case difference or a
 /// `\\?\` prefix does not produce a false refusal.

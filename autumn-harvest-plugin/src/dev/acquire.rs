@@ -155,9 +155,9 @@ fn cached_install(cache_root: &std::path::Path) -> Option<PostgresBinaries> {
     complete.then(|| PostgresBinaries::at(bin_dir))
 }
 
-/// Whether `dir` exists, is a real directory (not a symlink), is ours to
-/// trust (see [`super::reaper::directory_is_ours`]), and — on Unix — is not
-/// writable by group or other.
+/// Whether `dir` exists, is a real directory (not a symlink), and is ours to
+/// trust — see [`super::reaper::directory_is_ours`]. On Unix it must also not
+/// be writable by group or other.
 fn directory_is_private(dir: &std::path::Path) -> bool {
     let Ok(metadata) = std::fs::symlink_metadata(dir) else {
         return false;
