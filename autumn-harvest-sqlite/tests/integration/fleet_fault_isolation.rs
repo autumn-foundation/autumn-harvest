@@ -79,7 +79,9 @@ async fn poll_once_drives_the_rest_of_the_fleet_past_an_unsupported_command() {
     rt.register_workflow(&broken_wf_info());
     rt.register_workflow(&healthy_wf_info());
 
-    let broken = rt.start_workflow("broken_wf", json!(ExecutionId::new())).unwrap();
+    let broken = rt
+        .start_workflow("broken_wf", json!(ExecutionId::new()))
+        .unwrap();
     let healthy_after = start_healthy_after(&mut rt, broken);
 
     let err = rt
@@ -114,7 +116,9 @@ async fn run_until_idle_does_not_permanently_stall_executions_after_a_broken_one
     rt.register_workflow(&broken_wf_info());
     rt.register_workflow(&healthy_wf_info());
 
-    let broken = rt.start_workflow("broken_wf", json!(ExecutionId::new())).unwrap();
+    let broken = rt
+        .start_workflow("broken_wf", json!(ExecutionId::new()))
+        .unwrap();
     let healthy_after = start_healthy_after(&mut rt, broken);
 
     // Mirrors the issue's repro: an application driving the fleet in a loop,
@@ -141,7 +145,9 @@ async fn poll_once_as_of_drives_the_rest_of_the_fleet_past_an_unsupported_comman
     rt.register_workflow(&broken_wf_info());
     rt.register_workflow(&healthy_wf_info());
 
-    let broken = rt.start_workflow("broken_wf", json!(ExecutionId::new())).unwrap();
+    let broken = rt
+        .start_workflow("broken_wf", json!(ExecutionId::new()))
+        .unwrap();
     let healthy_after = start_healthy_after(&mut rt, broken);
 
     let err = rt
