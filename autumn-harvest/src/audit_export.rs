@@ -2756,6 +2756,27 @@ async fn export_once_via_pool(
                 "[audit_export] timed out acknowledging an export batch; the next tick \
                  will redeliver it"
             );
+            // The shard must not still look observed after this (Codex
+            // review on PR #1520, follow-up P2, third round). Without it,
+            // `export_observed` keeps its last-good value. The cursor then
+            // stalls silently behind repeated acknowledgement timeouts.
+            //
+            // `conn`'s in-flight query was abandoned mid-timeout. It is not
+            // reused directly here. A fresh connection is acquired for this
+            // follow-up read instead, mirroring the serialization-failure
+            // branch above. Best-effort: a failed reacquire just skips the
+            // emission, same as everywhere else this helper is called.
+            if let Some(mut conn) = acquire_shard_conn_for_export(
+                pool,
+                shard_id,
+                shard_u16,
+                metrics,
+                SHARD_ACQUIRE_BOUND,
+            )
+            .await
+            {
+                emit_lag_and_observed(&mut conn, shard_id, metrics).await;
+            }
             return Ok(0);
         }
     };
