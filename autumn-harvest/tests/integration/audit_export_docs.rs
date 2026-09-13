@@ -67,10 +67,12 @@ fn markers_near(text: &str, a: &str, b: &str) -> bool {
     flat[lo..hi].contains(b)
 }
 
-/// Both markers must appear, and close enough together that an edit cannot
-/// separate the index name from the issue that explains its cost.
+/// The index name, the issue number, AND an actual cost claim must all sit
+/// near each other. Checking only the name and the issue number lets an
+/// edit delete "pays its maintenance cost" while keeping both markers. That
+/// defeats the point of a guard named for the cost.
 fn names_index_cost_near(text: &str, marker: &str) -> bool {
-    markers_near(text, marker, "1272")
+    markers_near(text, marker, "1272") && markers_near(text, marker, "maintenance cost")
 }
 
 #[test]

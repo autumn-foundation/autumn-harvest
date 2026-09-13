@@ -46,9 +46,10 @@ Harvest now streams them off-box.
   after a sink is removed from the sweeping process.
 - **Opt-in, but one cost is not zero**: no sink configured means no sequence
   is assigned, no cursor row is created, and the scanner returns before
-  issuing a query. The partial index still matches every row and costs
-  insert-time maintenance regardless of configuration. Tracked as issue
-  #1272. **No new `WorkflowEvent` variant, zero replay-determinism impact.**
+  issuing a query. In a deployment that never configures a sink, the
+  partial index matches every row. Every insert still pays its maintenance
+  cost regardless of configuration. Tracked as issue #1272. **No new
+  `WorkflowEvent` variant, zero replay-determinism impact.**
 
 New migration: `20260728000000_harvest_audit_export`. See
 `docs/audit-export.md`.
