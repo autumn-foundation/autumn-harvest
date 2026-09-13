@@ -114,20 +114,25 @@ pub async fn acquire_postgres_binaries() -> Result<PostgresBinaries, DevError> {
         });
     }
 
-    if std::fs::rename(&staging, &cache_root).is_err() {
+    let this_call_created_cache_root = std::fs::rename(&staging, &cache_root).is_ok();
+    if !this_call_created_cache_root {
         // Either another process got there first (fine) or the rename genuinely
         // failed (the completeness check below is the arbiter either way).
         let _ = std::fs::remove_dir_all(&staging);
     }
 
     // The preflight above only ran if `cache_root` already existed. A fresh
-    // acquire into a versioned subdirectory that did not exist yet skips it,
-    // so an untrusted `HARVEST_DEV_CACHE_DIR` is caught only here, after the
-    // rename. Remove what was just downloaded rather than leaving an install
-    // in a shared location. Report the real reason, not the misleading
-    // "archive did not contain the expected binaries" a bare `cached_install`
-    // miss would otherwise produce.
-    if !directory_is_private(&cache_root) {
+    // acquire into a not-yet-existing versioned subdirectory skips it. An
+    // untrusted `HARVEST_DEV_CACHE_DIR` is caught only here, after the
+    // rename — but only when THIS call is the one that just created
+    // `cache_root`. A lost race means some other process owns it now.
+    // This call must not delete a directory it does not own, whatever
+    // `directory_is_private` says about it.
+    if this_call_created_cache_root && !directory_is_private(&cache_root) {
+        // Remove what was just downloaded, rather than leaving an install
+        // in a shared location. Report the real reason, not the misleading
+        // "archive did not contain the expected binaries" a bare
+        // `cached_install` miss would otherwise produce.
         let _ = std::fs::remove_dir_all(&cache_root);
         return Err(DevError::Acquire {
             detail: format!(
