@@ -9,8 +9,20 @@ query per level) lives in `crate::api::build_lineage_report` and is out of
 scope here. Wall-clock timing is not admissible evidence on this
 (shared-vCPU) machine -- every number below is a deterministic instruction
 count (`valgrind --tool=callgrind`) or allocation count/bytes
-(`valgrind --tool=dhat`), reproducible bit-for-bit on the same binary and
-environment.
+(`valgrind --tool=dhat`).
+
+dhat's counts are bit-for-bit reproducible on any machine: allocation count
+and byte totals don't depend on hash values. Callgrind's are not quite:
+this harness's ids (`ExecutionId::new()`) are random UUIDs, and both this
+fixture's own bookkeeping and `LineageWalk`'s internal `HashMap`/`HashSet`
+hash them, so instruction counts vary slightly run to run from
+`std::collections::HashMap`'s randomly-seeded `RandomState` --
+`awaitables_profile.rs` and `dag_graph_profile.rs`'s baselines document the
+same source of variance for the same reason. Measured this session: two
+extra runs each of the before and after binaries gave 311,176,188 /
+311,185,623 / 311,184,058 (spread 9,435, ~0.003%) and 304,149,903 /
+304,131,954 / 304,116,947 (spread 32,956, ~0.011%) -- two to three orders
+of magnitude below the 7,026,285-instruction delta this page reports.
 
 ## Workload
 
@@ -212,6 +224,21 @@ the saving. `by_parent` is now left growing from empty, unchanged from
 both cheap and tight. The numbers above are this final version's; they are
 smaller again than the second round's, since `by_parent`'s own (small, per
 the original profile's attribution) contribution is no longer claimed.
+
+A fourth Codex comment raised a related-looking concern: a multi-shard
+caller merging duplicate rows for the same execution from several shards
+could inflate `rows.len()` well past what `visited`/`nodes`/`next` actually
+admit, the same shape as the second round's finding. This one does not
+apply, though, and no code changed for it. Every execution is routed to
+exactly one shard by rendezvous hash (this module's own doc comment;
+`docs/sharding.md`), and each shard's query in `lineage_children_on_shard`
+(`api.rs`) reads only its own database. So a given child's row is observed
+by exactly one shard's query, not duplicated across them, under normal
+operation -- `rows.len()` after merging is the true distinct-children
+count for that level. `admit_level`'s dedup guard still matters (cycle
+safety against a malformed `parent_id` chain, the narrower case its own
+two-shard test covers), but that is not the routine, request-reproducible
+inflation the finding describes.
 
 ### Correctness
 
