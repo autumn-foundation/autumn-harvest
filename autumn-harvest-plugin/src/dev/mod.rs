@@ -53,7 +53,10 @@ pub mod acquire;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use autumn_web::config::{ConfigError, Env, OsEnv};
 use tokio::sync::Mutex;
+
+use crate::config::{HarvestMode, HarvestModeSource, resolve_harvest_mode_source};
 
 pub use banner::{BannerInputs, StorageDescription, redact_dsn, render_banner};
 pub use discovery::{
@@ -277,6 +280,39 @@ pub enum DevError {
         /// The underlying I/O error.
         source: std::io::Error,
     },
+
+    /// Ambient Harvest configuration could not be read (issue #1291).
+    ///
+    /// Checked before the safety gate, since the gate needs to know which
+    /// storage topology to gate in the first place.
+    #[error("could not read ambient Harvest configuration: {0}")]
+    HarvestConfig(#[from] ConfigError),
+
+    /// Ambient Harvest configuration selects `split`/`external` storage
+    /// (issue #1291).
+    ///
+    /// [`safety::classify_database_url`] only ever gates the **application**
+    /// database. Under `split`/`external`, Harvest storage is a second,
+    /// independently resolved database that gate never sees — so an ambient
+    /// `harvest.mode` could point a worker at an unclassified, possibly remote
+    /// database. The dev runtime owns exactly one ephemeral cluster and has no
+    /// second database to offer, so it refuses here instead.
+    #[error(
+        "refusing to start: {mode_source} sets harvest.mode = {mode:?}. The dev runtime supports \
+         embedded storage only — it owns one ephemeral Postgres cluster and has no second \
+         database for split or external Harvest storage. Unset it, or set it to \"embedded\", \
+         to run `cargo dev`."
+    )]
+    UnsupportedHarvestMode {
+        /// The mode ambient configuration selected.
+        mode: HarvestMode,
+        /// Where that value came from.
+        ///
+        /// Named `mode_source`, not `source`: `thiserror` treats a field
+        /// literally named `source` as this error's cause, which
+        /// [`HarvestModeSource`] is not.
+        mode_source: HarvestModeSource,
+    },
 }
 
 /// How the dev runtime should come up.
@@ -364,6 +400,13 @@ impl DevRuntime {
     /// [`DevError`] for a refused database, unavailable Postgres binaries, a
     /// cluster that will not start, or an HTTP server that never becomes ready.
     pub async fn start(config: DevRuntimeConfig) -> Result<Self, DevError> {
+        // Before anything else: ambient Harvest configuration
+        // (`AUTUMN_HARVEST__MODE`, `autumn.toml`) can select a dedicated
+        // Harvest database that `classify_database_url` never sees (issue
+        // #1291). The dev runtime cannot honour that topology, so check for
+        // it before touching a port, a file, or a database.
+        refuse_unsupported_harvest_mode(&OsEnv)?;
+
         // Before anything binds: `http_host` is a public field documented as
         // loopback-only, and until now nothing enforced it.
         require_loopback_http_host(&config.http_host)?;
@@ -693,6 +736,23 @@ async fn abandon_cluster(
     error
 }
 
+/// Refuse to start if ambient Harvest configuration selects `split`/`external`
+/// storage (issue #1291).
+///
+/// Pure over an injected [`Env`] so the decision is unit-testable without
+/// process environment variables — [`DevRuntime::start`] calls this with
+/// [`OsEnv`], the real process environment.
+fn refuse_unsupported_harvest_mode(env: &dyn Env) -> Result<(), DevError> {
+    let (mode, mode_source) = resolve_harvest_mode_source(env)?;
+    match mode {
+        HarvestMode::Embedded => Ok(()),
+        HarvestMode::Split | HarvestMode::External => Err(DevError::UnsupportedHarvestMode {
+            mode,
+            mode_source,
+        }),
+    }
+}
+
 /// Refuse to serve anywhere but loopback.
 ///
 /// `DevRuntimeConfig::http_host` is public and documented as loopback-only, but
@@ -897,5 +957,77 @@ impl autumn_web::config::ConfigLoader for DevConfigLoader {
         config.database.url = Some(self.database_url.clone());
         config.database.auto_migrate = Some(true);
         std::future::ready(Ok(config))
+    }
+}
+
+#[cfg(test)]
+mod harvest_mode_gate_tests {
+    //! Issue #1291: the dev runtime owns one ephemeral cluster and cannot
+    //! honour a dedicated Harvest database, so ambient `split`/`external`
+    //! configuration must refuse startup rather than run unclassified.
+
+    use autumn_web::config::MockEnv;
+
+    use super::{HarvestModeSource, refuse_unsupported_harvest_mode};
+    use crate::config::HarvestMode;
+    use crate::dev::DevError;
+
+    #[test]
+    fn embedded_mode_is_allowed() {
+        let env = MockEnv::new();
+        refuse_unsupported_harvest_mode(&env).expect("the default mode must be allowed");
+    }
+
+    #[test]
+    fn split_mode_from_the_environment_is_refused_and_named() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST__MODE", "split");
+
+        let error = refuse_unsupported_harvest_mode(&env)
+            .expect_err("split mode must be refused");
+        let message = error.to_string();
+
+        match error {
+            DevError::UnsupportedHarvestMode { mode, mode_source } => {
+                assert_eq!(mode, HarvestMode::Split);
+                assert_eq!(mode_source, HarvestModeSource::Env);
+            }
+            other => panic!("expected UnsupportedHarvestMode, got {other}"),
+        }
+        assert!(
+            message.contains("AUTUMN_HARVEST__MODE"),
+            "the refusal must name the responsible variable: {message}"
+        );
+    }
+
+    #[test]
+    fn external_mode_from_a_config_file_is_refused_and_named() {
+        let dir = std::env::temp_dir().join(format!(
+            "autumn-harvest-plugin-mode-gate-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        let config_path = dir.join("autumn.toml");
+        std::fs::write(
+            &config_path,
+            "[harvest]\nmode = \"external\"\n\n[harvest.database]\nurl = \"postgres://h:h@localhost/h\"\n",
+        )
+        .expect("config file should be written");
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+
+        let error = refuse_unsupported_harvest_mode(&env)
+            .expect_err("external mode must be refused");
+        let message = error.to_string();
+
+        match error {
+            DevError::UnsupportedHarvestMode { mode, mode_source } => {
+                assert_eq!(mode, HarvestMode::External);
+                assert_eq!(mode_source, HarvestModeSource::ConfigFile(config_path.clone()));
+            }
+            other => panic!("expected UnsupportedHarvestMode, got {other}"),
+        }
+        assert!(
+            message.contains(&config_path.display().to_string()),
+            "the refusal must name the responsible file: {message}"
+        );
     }
 }

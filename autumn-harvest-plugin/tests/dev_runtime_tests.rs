@@ -1463,6 +1463,73 @@ async fn a_production_shaped_local_name_needs_the_explicit_opt_in() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Issue #1291 — the gate above only ever classifies the APPLICATION
+// database. Under `harvest.mode = split`/`external`, Harvest storage is a
+// second, independently resolved database the gate never sees, so ambient
+// configuration could point the worker at a database the gate never
+// classified. The dev runtime owns one ephemeral cluster and has no second
+// database to offer, so it refuses instead — see
+// `refuse_unsupported_harvest_mode` in `src/dev/mod.rs`, unit-tested there
+// (including the `autumn.toml` path) since `DevRuntime::start` calls it
+// verbatim as its first step.
+// ---------------------------------------------------------------------------
+
+/// Serializes tests in this binary that mutate process environment variables
+/// read by [`autumn_harvest_plugin::config::resolve_harvest_mode_source`].
+/// Nothing else in this file touches `AUTUMN_HARVEST__MODE` or
+/// `AUTUMN_HARVEST_DATABASE__URL`, but two such tests running concurrently
+/// would still race each other.
+static HARVEST_MODE_ENV_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// Holds `HARVEST_MODE_ENV_SERIAL` across the `.await` below on purpose: the
+// lock exists to keep the env vars stable for the whole call, mirroring the
+// `TEST_SERIAL` pattern in `start_idempotency_integration.rs`.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn starting_with_ambient_split_mode_configuration_is_refused() {
+    // Issue #1291's exact reproduction: a developer environment set up for a
+    // dedicated Harvest database refuses `cargo dev` rather than migrating
+    // and running a worker against it.
+    let _guard = HARVEST_MODE_ENV_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // SAFETY: serialized by `HARVEST_MODE_ENV_SERIAL` above; no other test in
+    // this binary reads these variables.
+    unsafe {
+        std::env::set_var("AUTUMN_HARVEST__MODE", "split");
+        std::env::set_var(
+            "AUTUMN_HARVEST_DATABASE__URL",
+            "postgres://user:pw@db.prod.example.com/harvest",
+        );
+    }
+
+    let result = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
+        http_port: 0,
+        ..DevRuntimeConfig::default()
+    })
+    .await;
+
+    // SAFETY: still serialized by `_guard`.
+    unsafe {
+        std::env::remove_var("AUTUMN_HARVEST__MODE");
+        std::env::remove_var("AUTUMN_HARVEST_DATABASE__URL");
+    }
+
+    let error = result.expect_err("split mode must refuse the dev runtime, not run it");
+    assert!(
+        matches!(
+            error,
+            autumn_harvest_plugin::dev::DevError::UnsupportedHarvestMode { .. }
+        ),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("AUTUMN_HARVEST__MODE"),
+        "the refusal must name the responsible variable: {error}"
+    );
+}
+
 #[test]
 fn no_test_here_reserves_the_fixed_default_http_port() {
     // A test that starts the runtime with `DevRuntimeConfig::default()` inherits
