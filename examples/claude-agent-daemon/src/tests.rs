@@ -9337,6 +9337,176 @@ async fn a_row_after_the_reply_the_engine_cannot_load_offers_no_call() {
     );
 }
 
+/// A reply that reads two ways offers no call at all.
+///
+/// `SQLite` answers with the FIRST value of a repeated key, and the Rust
+/// reader answers with the LAST. A reply row that repeats a key on the path
+/// to its calls therefore shows one call and runs another.
+///
+/// Measured before the fix, with both arrays holding the AWAITED id: `status`
+/// showed `read_file notes.md` and the engine's own reader held
+/// `write_file /etc/passwd`. An operator approves what they read, and the
+/// session writes what they did not.
+///
+/// The row stays in the page. Dropping it would answer with an older reply,
+/// and a tool-use id is unique inside one reply only.
+#[test]
+fn a_reply_that_reads_two_ways_offers_no_call() {
+    let shown = r#"[{"id":"toolu_same","name":"read_file","input":{"path":"notes.md"}}]"#;
+    let run = r#"[{"id":"toolu_same","name":"write_file","input":{"path":"/etc/passwd"}}]"#;
+    let output = |calls: &str| format!(r#"{{"stop_reason":"tool_use","tool_calls":{calls}}}"#);
+    let whole = format!(
+        r#"{{"type":"ActivityCompleted","data":{{"activity_id":"a","output":{}}}}}"#,
+        output(shown)
+    );
+    let cases: [(&str, String); 4] = [
+        (
+            "repeated tool_calls",
+            format!(
+                r#"{{"type":"ActivityCompleted","data":{{"activity_id":"a","output":{{"stop_reason":"tool_use","tool_calls":{shown},"tool_calls":{run}}}}}}}"#
+            ),
+        ),
+        (
+            "repeated output",
+            format!(
+                r#"{{"type":"ActivityCompleted","data":{{"activity_id":"a","output":{},"output":{}}}}}"#,
+                output(shown),
+                output(run)
+            ),
+        ),
+        (
+            "repeated data",
+            format!(
+                r#"{{"type":"ActivityCompleted","data":{{"activity_id":"a","output":{}}},"data":{{"activity_id":"a","output":{}}}}}"#,
+                output(shown),
+                output(run)
+            ),
+        ),
+        (
+            "repeated type",
+            format!(
+                r#"{{"type":"TimerFired","type":"ActivityCompleted","data":{{"activity_id":"a","output":{}}}}}"#,
+                output(shown)
+            ),
+        ),
+    ];
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("two-ways.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    writer
+        .execute_batch(
+            "CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+             PRIMARY KEY (exec_id, seq));",
+        )
+        .expect("the fixture schema is created");
+    for (exec, row) in std::iter::once(&("whole", whole)).chain(cases.iter()) {
+        writer
+            .execute(
+                "INSERT INTO harvest_events VALUES (?1, 7, ?2)",
+                rusqlite::params![exec, row],
+            )
+            .expect("the row is recorded");
+    }
+    drop(writer);
+
+    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let signal = session::approval_signal(2, 0, "toolu_same");
+
+    // The not-the-fault case. One reading, so the call is offered.
+    let page = inspect::reply_calls(&reader, "whole", None, 1).expect("the replies read");
+    assert!(
+        matches!(page.first(), Some((7, inspect::ReplyCalls::Calls(_)))),
+        "a reply with ONE reading still offers its call: {page:?}"
+    );
+
+    for (case, row) in &cases {
+        // The hazard, stated first: the two readers disagree about this row.
+        if *case != "repeated type" {
+            let engine = serde_json::from_str::<serde_json::Value>(row).expect("valid JSON");
+            assert_eq!(
+                engine["data"]["output"]["tool_calls"][0]["name"], "write_file",
+                "[{case}] the engine's reader holds the OTHER call"
+            );
+        }
+
+        let page = inspect::reply_calls(&reader, case, None, 1).expect("the replies read");
+        let (seq, calls) = page.first().expect("the row is still in the page");
+        assert_eq!(*seq, 7, "[{case}] the row stays, so no older reply answers");
+        assert!(
+            matches!(calls, inspect::ReplyCalls::Unreadable),
+            "[{case}] a row that reads two ways offers nothing: {calls:?}"
+        );
+
+        let refused = daemon::pending_call(&reader, case, &signal, false)
+            .expect_err("no call may be offered from a row that reads two ways");
+        assert!(
+            !refused.contains("read_file")
+                && !refused.contains("write_file")
+                && !refused.contains("passwd"),
+            "[{case}] and the refusal names neither reading: {refused}"
+        );
+    }
+}
+
+/// A deadline the backend cannot ARM is refused before a session records it.
+///
+/// The engine records a fire time as a signed 64-bit epoch MILLISECOND. The
+/// backend multiplies the seconds by 1000, adds the epoch, and SATURATES at
+/// `i64::MAX` rather than failing. A deadline it cannot represent becomes one
+/// no session ever reaches, so the call parks for ever instead of being
+/// denied at its promised time.
+///
+/// The old bound was on the SECONDS, which is a thousand times looser. This
+/// asserts the band between the two, and that both the submit path and the
+/// startup check use the same test.
+#[test]
+fn a_deadline_the_backend_cannot_arm_is_refused() {
+    // The value from the finding. It fits an `i64` as seconds, which is what
+    // the old bound asked, and overflows the backend's multiply.
+    let band = 10_000_000_000_000_000_u64;
+    assert!(
+        i64::try_from(band).is_ok(),
+        "the old bound accepted this value, or the test proves nothing"
+    );
+    assert!(
+        i64::try_from(band)
+            .ok()
+            .and_then(|secs| secs.checked_mul(1000))
+            .is_none(),
+        "and the backend's own multiply cannot hold it"
+    );
+    assert!(
+        !daemon::armable_deadline(band),
+        "so a deadline of {band} seconds is refused"
+    );
+    assert!(
+        !daemon::armable_deadline(u64::MAX),
+        "and so is the widest value the field can carry"
+    );
+
+    // Ordinary deadlines are untouched, including a generous one.
+    for secs in [1_u64, 300, 86_400, 3_155_760_000] {
+        assert!(
+            daemon::armable_deadline(secs),
+            "a deadline of {secs} seconds must still be armable"
+        );
+    }
+
+    // Both ends use the same test. The submit path and the startup check are
+    // read as source, because neither is reachable without a live runtime.
+    let daemon_source = include_str!("daemon.rs");
+    assert_eq!(
+        daemon_source.matches("armable_deadline(").count(),
+        3,
+        "the definition and the two call sites"
+    );
+    assert!(
+        !daemon_source.contains("i64::try_from(approval_timeout_secs)"),
+        "and no bound is left in the seconds alone"
+    );
+}
+
 /// One reply carrying a tool call with this id.
 fn reply_with_call_id(id: &str) -> TurnReply {
     TurnReply {

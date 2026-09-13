@@ -446,10 +446,11 @@ fn check_resumable(
         let Some(task) = row.task else {
             return Err(unreadable(&row.exec_id));
         };
-        // The deadline is bounded where `submit` bounds it. A recorded one
-        // past `i64::MAX` seconds cannot be armed as a timer, so a session
-        // carrying one would be driven and could never wait.
-        let armable = i64::try_from(task.approval_timeout_secs).is_ok();
+        // The deadline is bounded where `submit` bounds it, and in the unit
+        // the backend arms it in. A recorded deadline the backend cannot
+        // represent saturates instead of failing, so a session carrying one
+        // would be driven and could never wait. See [`armable_deadline`].
+        let armable = armable_deadline(task.approval_timeout_secs);
         if !task.has_goal || task.max_turns == 0 || !armable {
             return Err(unreadable(&row.exec_id));
         }
@@ -846,11 +847,13 @@ fn submit(
     // SIGNED 64-bit epoch millisecond. A deadline past `i64::MAX` seconds
     // cannot be armed as one. It is refused here so a session is never
     // recorded with a deadline it can never wait on.
-    if i64::try_from(approval_timeout_secs).is_err() {
+    if !armable_deadline(approval_timeout_secs) {
         return Response::Error {
             message: format!(
-                "the approval deadline of {approval_timeout_secs} seconds is past                  {} and cannot be recorded. Choose a smaller one.",
-                i64::MAX
+                "the approval deadline of {approval_timeout_secs} seconds cannot be \
+                 armed as a timer. The engine records a fire time as an epoch \
+                 millisecond, and this one is past what it can hold. Choose a \
+                 smaller one."
             ),
         };
     }
@@ -1003,6 +1006,37 @@ pub fn approve(
             message: format!("cannot deliver the decision: {e}"),
         },
     }
+}
+
+/// Can a deadline of this many seconds be ARMED as the backend arms it?
+///
+/// The engine records a fire time as a signed 64-bit epoch MILLISECOND. The
+/// backend multiplies the seconds by 1000 and adds the epoch, and it
+/// SATURATES at `i64::MAX` rather than failing. A deadline it cannot
+/// represent therefore becomes one no session ever reaches. The session then
+/// parks for ever instead of denying the call at its promised time.
+///
+/// The seconds alone do not show that. A value inside `i64` SECONDS is a
+/// thousand times outside `i64` MILLISECONDS, and the whole band between the
+/// two was accepted. Measured: 10000000000000000 seconds fits an `i64` and
+/// overflows the multiply.
+///
+/// The arithmetic here is the backend's own, so the two cannot drift apart.
+/// The clock moves between this check and the arm, which matters only for a
+/// value within milliseconds of the bound. That bound is 292 million years
+/// out.
+///
+/// A clock this daemon cannot read answers NO. A deadline that cannot be
+/// checked is one it cannot promise.
+pub fn armable_deadline(secs: u64) -> bool {
+    let Ok(now) = epoch_millis() else {
+        return false;
+    };
+    i64::try_from(secs)
+        .ok()
+        .and_then(|secs| secs.checked_mul(1000))
+        .and_then(|millis| millis.checked_add(now))
+        .is_some()
 }
 
 /// Now, as the absolute epoch-millisecond the timer table stores.

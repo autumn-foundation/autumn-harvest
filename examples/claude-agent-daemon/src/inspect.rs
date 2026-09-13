@@ -468,7 +468,16 @@ pub const REPLIES_QUERY: &str = "SELECT seq, \
                  THEN cast(json_extract(event_json, '$.data.output.tool_calls') \
                            as blob) END, \
             json_type(event_json, '$.data.output.tool_calls'), \
-            typeof(event_json) <> 'text' \
+            CASE WHEN typeof(event_json) <> 'text' THEN 1 \
+                 WHEN (SELECT count(*) FROM json_each(event_json) \
+                       WHERE key = 'type') <> 1 THEN 1 \
+                 WHEN (SELECT count(*) FROM json_each(event_json) \
+                       WHERE key = 'data') <> 1 THEN 1 \
+                 WHEN (SELECT count(*) FROM json_each(event_json, '$.data') \
+                       WHERE key = 'output') <> 1 THEN 1 \
+                 WHEN (SELECT count(*) FROM json_each(event_json, '$.data.output') \
+                       WHERE key = 'tool_calls') > 1 THEN 1 \
+                 ELSE 0 END \
      FROM harvest_events \
      WHERE exec_id = ?1 AND seq < ?2 \
      AND json_valid(event_json) \
@@ -707,8 +716,8 @@ pub fn reply_calls(
 
     rows.map(|row| {
         row.map_err(|e| format!("cannot read the replies: {e}"))
-            .map(|(seq, calls, kind, foreign)| {
-                (seq, ReplyCalls::read(calls, kind.as_deref(), foreign))
+            .map(|(seq, calls, kind, ambiguous)| {
+                (seq, ReplyCalls::read(calls, kind.as_deref(), ambiguous))
             })
     })
     .collect()
@@ -744,15 +753,25 @@ impl ReplyCalls {
     ///
     /// An array is read WHOLE, and never cut: a cut array is not JSON.
     ///
-    /// `foreign` says the ROW is not text. The engine loads a history by
-    /// reading every `event_json` into a `String`, which a `BLOB` refuses. A
-    /// run holding one can never be driven again. This daemon reads such a
-    /// row perfectly well. Offering the call inside it would offer a decision
-    /// no drive can consume. See [`REPLIES_QUERY`].
-    fn read(bytes: Option<Vec<u8>>, kind: Option<&str>, foreign: bool) -> Self {
-        // The row reads HERE and not in the engine. That is the first test,
-        // because the field inside it then decides nothing.
-        if foreign {
+    /// `ambiguous` says this daemon cannot prove that the call it would SHOW
+    /// is the call the engine will RUN. Two shapes say that, and both come
+    /// from the row rather than from the calls inside it.
+    ///
+    /// The row is not text. The engine loads a history by reading every
+    /// `event_json` into a `String`, which a `BLOB` refuses. A run holding one
+    /// can never be driven again.
+    ///
+    /// The row repeats a key on the path to the calls. `SQLite` answers with
+    /// the FIRST value of a repeated key, and the Rust reader answers with
+    /// the LAST. The call shown and the call run are then different calls.
+    ///
+    /// Offering a call from either is offering a decision about something
+    /// else. See [`REPLIES_QUERY`].
+    fn read(bytes: Option<Vec<u8>>, kind: Option<&str>, ambiguous: bool) -> Self {
+        // What the ROW is decides first. The field inside it then decides
+        // nothing, because this daemon cannot say the engine reads the same
+        // field.
+        if ambiguous {
             return Self::Unreadable;
         }
         // No field at all. The reply asked for nothing.
