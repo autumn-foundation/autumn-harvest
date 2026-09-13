@@ -114,11 +114,11 @@ either already in hand (`rows.len()`) or a cheap, already-computed superset
 `autumn-harvest-plugin/src/lineage.rs`:
 
 * `admit_level` reserves `visited` by `rows.len()` (every row is at least
-  attempted against it, admitted or not) and `nodes` by
-  `rows.len().min(self.remaining_budget())` (it only grows for rows
-  actually admitted, which can never exceed the live budget) -- both
-  right-sized to *this call's* batch, not to the walk's ceiling.
-* `admit_level` also sizes `next` from `rows.len()`.
+  attempted against it, admitted or not) and both `nodes` and `next` by
+  `rows.len().min(self.remaining_budget())` (both only grow for rows
+  actually admitted, in lockstep, which can never exceed the live budget)
+  -- all three right-sized to *this call's* batch, not to the walk's
+  ceiling.
 * `finish` sizes the `by_parent` `HashMap` from `self.nodes.len()`.
 * `attach_children` calls `node.children.reserve_exact(rows.len())` once,
   right after removing `rows` from `by_parent` and before the loop that
@@ -186,6 +186,17 @@ version handled best) but is the version that does not regress the sparse
 case Codex's review was about, and it still clears the allocation-bytes
 floor comfortably. The before/after artifacts in
 `docs/perf-artifacts/lineage-tree-assembly/` are this corrected version's.
+
+A second Codex round (P2, `lineage.rs:469`) caught the same class of gap in
+`next`: it sizes in lockstep with `nodes` (one push each, same iteration),
+so it needed the same `remaining_budget()` cap, not `rows.len()` alone. A
+multi-shard caller can merge `remaining_budget + 1` rows per shard into one
+`rows` batch (the fetch-window sentinel this module's own
+`note_saturated_fetch_window` documents), so `rows.len()` can run well past
+what one call could ever admit. This session's single-shard-per-level
+harness never sends such an oversized batch, so this fix does not move the
+numbers above -- it closes a gap the harness does not exercise, not one it
+measures. Both `nodes` and `next` now share the `admittable` binding.
 
 ### Correctness
 

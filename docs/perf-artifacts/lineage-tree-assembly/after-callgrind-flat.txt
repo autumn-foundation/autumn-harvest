@@ -1,12 +1,12 @@
 --------------------------------------------------------------------------------
-Profile data file 'cg-after-v2.out' (creator: callgrind-3.22.0)
+Profile data file 'cg-after-v3.out' (creator: callgrind-3.22.0)
 --------------------------------------------------------------------------------
 I1 cache: 
 D1 cache: 
 LL cache: 
-Timerange: Basic block 0 - 55657915
+Timerange: Basic block 0 - 55656768
 Trigger: Program termination
-Profiled target:  /home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2 (PID 1661, part 1)
+Profiled target:  /home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2 (PID 5331, part 1)
 Events recorded:  Ir
 Events shown:     Ir
 Event sort order: Ir
@@ -18,7 +18,7 @@ Auto-annotation:  on
 --------------------------------------------------------------------------------
 Ir                   
 --------------------------------------------------------------------------------
-296,002,192 (100.0%)  PROGRAM TOTALS
+295,997,493 (100.0%)  PROGRAM TOTALS
 
 --------------------------------------------------------------------------------
 Ir                   file:function
@@ -38,13 +38,13 @@ Ir                   file:function
  8,331,400 ( 2.81%)  ???:alloc::raw_vec::RawVecInner<A>::finish_grow [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
  6,377,292 ( 2.15%)  ./malloc/./malloc/malloc.c:_int_free_merge_chunk [/usr/lib/x86_64-linux-gnu/libc.so.6]
  6,346,000 ( 2.14%)  ???:<std::hash::random::DefaultHasher as core::hash::Hasher>::write [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 6,338,421 ( 2.14%)  ???:autumn_harvest_plugin::lineage::LineageWalk::finish [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 6,338,388 ( 2.14%)  ???:autumn_harvest_plugin::lineage::LineageWalk::finish [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
  4,950,000 ( 1.67%)  ???:<alloc::string::String as core::clone::Clone>::clone [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 4,074,908 ( 1.38%)  ???:hashbrown::map::HashMap<K,V,S,A>::remove [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 3,975,891 ( 1.34%)  ???:hashbrown::map::HashMap<K,V,S,A>::insert [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 3,840,800 ( 1.30%)  ???:autumn_harvest_plugin::lineage::LineageWalk::admit_level [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 4,075,126 ( 1.38%)  ???:hashbrown::map::HashMap<K,V,S,A>::remove [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 3,971,249 ( 1.34%)  ???:hashbrown::map::HashMap<K,V,S,A>::insert [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 3,840,550 ( 1.30%)  ???:autumn_harvest_plugin::lineage::LineageWalk::admit_level [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
  3,718,800 ( 1.26%)  ???:<alloc::vec::Vec<T,A> as core::clone::Clone>::clone [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
- 3,663,530 ( 1.24%)  ???:hashbrown::raw::RawTable<T,A>::reserve_rehash [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
+ 3,663,538 ( 1.24%)  ???:hashbrown::raw::RawTable<T,A>::reserve_rehash [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
  3,607,200 ( 1.22%)  ???:alloc::raw_vec::RawVecInner<A>::reserve::do_reserve_and_handle [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
  3,550,198 ( 1.20%)  ???:<alloc::string::String as core::fmt::Write>::write_str [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]
  3,183,057 ( 1.08%)  ???:__rustc::__rdl_alloc [/home/user/autumn-harvest/target/release/deps/lineage_profile-71d3bf3bea88dda2]

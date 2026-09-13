@@ -462,11 +462,17 @@ impl LineageWalk {
         // front instead. That would make a sparse walk pay for the rare
         // wide one (Codex review).
         self.visited.reserve(rows.len());
-        self.nodes.reserve(rows.len().min(self.remaining_budget()));
+        let admittable = rows.len().min(self.remaining_budget());
+        self.nodes.reserve(admittable);
 
-        // At most one id per row is ever admitted into `next` -- `rows.len()`
-        // is therefore an exact upper bound, known before the loop starts.
-        let mut next = Vec::with_capacity(rows.len());
+        // `next` grows in lockstep with `self.nodes` below: one push each,
+        // same loop iteration. So it is bounded by the same live budget,
+        // not by `rows.len()` on its own. A multi-shard caller can merge
+        // `remaining_budget + 1` rows per shard into one `rows` batch --
+        // the fetch-window sentinel `note_saturated_fetch_window`
+        // documents this. So `rows.len()` alone can run well past what
+        // this call could ever admit (Codex review).
+        let mut next = Vec::with_capacity(admittable);
         for row in rows {
             let uuid = row.exec_id.as_uuid();
             // Cycle/duplicate guard. Also rejects a self-parent row (the root
