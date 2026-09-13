@@ -780,6 +780,41 @@ mod tests {
     }
 
     #[test]
+    fn cutover_example_from_getting_started_ch13_type_checks() {
+        // PR #1523: five rounds of review found the shell guard's
+        // pattern-matched approximation of "does this closure type-check"
+        // (arity, parameter types, return type, tail-position) kept
+        // acquiring new gaps as fast as they were patched, because a
+        // markdown fence is not compiled anywhere else. The actual fix is
+        // to compile it. The block between the markers below must stay
+        // byte-identical (this function's indentation aside) to the
+        // "Cutting a binding over to a new cluster or a recreated topic"
+        // example in docs/getting-started/13-broker-connectors.md --
+        // checked for drift by
+        // scripts/check-broker-connector-cutover-example.sh -- so a real
+        // compile of this test (CI's `connector` lib-test job) is what
+        // enforces the doc's correctness, not a regex.
+        #[derive(serde::Deserialize, serde::Serialize)]
+        struct OrderPlaced {
+            order_id: String,
+            #[allow(dead_code)]
+            total_cents: i64,
+        }
+
+        let _binding = {
+            // cutover-example-start
+            SourceBinding::starts("orders", "orders", "order_flow")
+                .map_json(|_ctx, order: OrderPlaced| {
+                    let payload = serde_json::to_value(&order).map_err(|e| e.to_string())?;
+                    Ok::<_, String>(MappedMessage::new(order.order_id, payload))
+                })
+                // Bump on any cutover: new cluster, or a deleted-and-recreated topic.
+                .key_incarnation("2026-08-cutover")
+            // cutover-example-end
+        };
+    }
+
+    #[test]
     fn map_raw_receives_the_raw_bytes() {
         let b = SourceBinding::starts("raw", "raw", "wf").map_raw(|c| {
             Ok(MappedMessage {

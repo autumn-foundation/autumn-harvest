@@ -1,29 +1,26 @@
 #!/usr/bin/env bash
 # Fails if docs/getting-started/13-broker-connectors.md's cutover example
-# calls `.map_json(...)` with the wrong closure signature.
+# has drifted from the compiled copy of it in
+# autumn-harvest-plugin/src/connector/binding.rs.
 #
 # Mechanism this guards against: the "Cutting a binding over to a new
-# cluster or a recreated topic" section's example used to read:
+# cluster or a recreated topic" section's example used to call
+# `.map_json(...)` with the wrong closure signature (PR #1523). Patching a
+# shell-script approximation of "does this closure type-check" -- arity,
+# parameter types, return type, tail position -- kept acquiring new gaps
+# across five rounds of review, because a markdown fence is never compiled
+# anywhere else. There is no bound on how many ways a hand-rolled pattern
+# match can be wrong about Rust; a real compiler has no such gap.
 #
-#   SourceBinding::starts("orders", "orders", "order_flow")
-#       .map_json(|order: OrderPlaced| Ok(WorkflowId::new(order.order_id)))
-#       .key_incarnation("2026-08-cutover")
-#
-# `SourceBinding::map_json` requires
-# `F: Fn(&MessageCtx, T) -> Result<MappedMessage, E>`
-# (autumn-harvest-plugin/src/connector/binding.rs:367-378) -- every other
-# mapping closure in this chapter, and both shipped examples
-# (autumn-harvest-plugin/examples/kafka_connector_quickstart.rs,
-# autumn-harvest-plugin/examples/sqs_connector_quickstart.rs), take the
-# message context plus the typed body and return a `MappedMessage`. This
-# example took the body alone and returned a bare `WorkflowId` -- wrong
-# arity, wrong return type, does not type-check as shown.
-#
-# A newcomer following the cutover recipe copies this into a real binding
-# and hits a compile error with no obvious fix, right at the one moment
-# (a production cutover) where getting the binding wrong risks the
-# duplicate-execution or silent-loss failure the surrounding prose warns
-# about.
+# The fix: the doc's example is now required to be byte-identical (module
+# indentation aside) to the block between the `cutover-example-start` /
+# `cutover-example-end` markers in
+# `cutover_example_from_getting_started_ch13_type_checks`, an ordinary test
+# in autumn-harvest-plugin/src/connector/binding.rs. That test is compiled
+# and run by CI's `connector` lib-test job (`cargo test -p
+# autumn-harvest-plugin --features connectors --lib connector`), so a real
+# compile enforces the example's correctness. This script's only job is to
+# catch the doc and the compiled copy drifting apart.
 #
 # Usage: ./scripts/check-broker-connector-cutover-example.sh
 
@@ -32,144 +29,87 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 doc="docs/getting-started/13-broker-connectors.md"
+src="autumn-harvest-plugin/src/connector/binding.rs"
 
-if [ ! -f "$doc" ]; then
-  echo "$doc: not found" >&2
-  exit 1
-fi
+for f in "$doc" "$src"; do
+  if [ ! -f "$f" ]; then
+    echo "$f: not found" >&2
+    exit 1
+  fi
+done
 
-# Grab the cutover example: its SourceBinding::starts(...) call is unique in
-# the chapter, and .key_incarnation("2026-08-cutover") a few lines below it
-# closes the block.
-window="$(grep -A 6 -F 'SourceBinding::starts("orders", "orders", "order_flow")' "$doc")"
+# The doc's example: its SourceBinding::starts(...) call is unique in the
+# chapter, and .key_incarnation("2026-08-cutover") 6 lines below it closes
+# the block.
+doc_block="$(grep -A 6 -F 'SourceBinding::starts("orders", "orders", "order_flow")' "$doc")"
 
-if [ -z "$window" ]; then
+if [ -z "$doc_block" ]; then
   echo "$doc: could not find the cutover example's" \
     "SourceBinding::starts(\"orders\", \"orders\", \"order_flow\") call;" \
-    "has the chapter been restructured? Update this guard to match." >&2
+    "has the chapter been restructured? Update this guard (and the" \
+    "compiled copy in $src) to match." >&2
   exit 1
 fi
 
-if ! grep -qF 'key_incarnation("2026-08-cutover")' <<<"$window"; then
+if ! grep -qF 'key_incarnation("2026-08-cutover")' <<<"$doc_block"; then
   echo "$doc: found SourceBinding::starts(\"orders\", \"orders\"," \
     "\"order_flow\") but not .key_incarnation(\"2026-08-cutover\") within" \
     "6 lines of it; has the cutover example moved or grown? Update this" \
-    "guard to match." >&2
+    "guard (and the compiled copy in $src) to match." >&2
   exit 1
 fi
 
-# Arity: pull the text between `.map_json(|` and the closure's closing `|`.
-# A Rust closure parameter list never contains a bare `|` (bitwise-or has no
-# place there), so the first `|` after the opening one is always the close.
-# Flagged in PR #1523 review: the prior check
-# (`grep -qE '\.map_json\(\|[A-Za-z_][A-Za-z0-9_]*: '`) only rejected a
-# single argument when it carried an explicit type annotation, so
-# `.map_json(|order| { ... })` -- untyped, still the wrong arity -- slipped
-# through.
-params="$(grep -oP '(?<=\.map_json\(\|)[^|]*' <<<"$window" | head -n1)"
-
-if [ -z "$params" ]; then
-  echo "$doc: could not find a .map_json(|...| closure header in the" \
-    "cutover example; has it moved to map_raw or changed shape? Update" \
-    "this guard to match." >&2
-  exit 1
-fi
-
-# Validate the closure header in one pass: exactly two top-level parameters
-# (splitting on commas only at bracket depth 0, tracking `()` / `<>` / `[]`
-# / `{}` -- a plain comma count or a "does it start with `(`" heuristic both
-# proved unsound in PR #1523 review, against a tuple-destructured single
-# argument, a three-argument closure, and a single argument with a tuple
-# *type*), and the second parameter must carry an explicit `OrderPlaced`
-# type annotation. Also flagged in review: `map_json<T, E, F>`'s `T` is
-# fixed by the closure's own declared parameter type, not inferred from the
-# trait bound or from the closure body -- an untyped `|_ctx, order|`
-# compiles the closure header but then fails with "type annotations
-# needed" (E0282) at `order.order_id`, since nothing else pins down what
-# `order` is.
-validation="$(python3 -c '
+# Pull the compiled copy from between the markers and dedent it: strip
+# whatever leading whitespace every non-blank line shares, so the test
+# function's extra indentation (nested in a fn, a let, and a block) does
+# not itself count as a difference from the doc, which starts at column 0.
+src_block="$(python3 -c '
 import re
 import sys
 
-s = sys.argv[1]
-depth = 0
-parts = [""]
-opens = "([{<"
-closes = ")]}>"
-for ch in s:
-    if ch in opens:
-        depth += 1
-        parts[-1] += ch
-    elif ch in closes:
-        depth = max(0, depth - 1)
-        parts[-1] += ch
-    elif ch == "," and depth == 0:
-        parts.append("")
-    else:
-        parts[-1] += ch
+with open(sys.argv[1]) as f:
+    text = f.read()
 
-parts = [p.strip() for p in parts] if s.strip() else []
+m = re.search(
+    r"// cutover-example-start\n(.*?)\n[ \t]*// cutover-example-end",
+    text,
+    re.DOTALL,
+)
+if not m:
+    sys.exit(1)
 
-if len(parts) != 2:
-    print(f"ARITY\t{len(parts)}")
-elif not re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*:\s*OrderPlaced\b", parts[1]):
-    print(f"TYPE\t{parts[1]}")
-else:
-    print("OK\t")
-' "$params")"
+lines = m.group(1).split("\n")
+indents = [len(l) - len(l.lstrip(" \t")) for l in lines if l.strip()]
+strip = min(indents) if indents else 0
+print("\n".join(l[strip:] if len(l) >= strip else l for l in lines))
+' "$src")"
 
-kind="${validation%%$'\t'*}"
-detail="${validation#*$'\t'}"
+if [ -z "$src_block" ]; then
+  echo "$src: could not find the" \
+    "// cutover-example-start ... // cutover-example-end markers in" \
+    "cutover_example_from_getting_started_ch13_type_checks; has the test" \
+    "moved or been renamed? Update this guard to match." >&2
+  exit 1
+fi
 
-if [ "$kind" = "ARITY" ]; then
-  echo "$doc: the cutover example's .map_json(...) closure takes" \
-    "$detail top-level parameter(s) (\"$params\"), not the two" \
-    "SourceBinding::map_json requires -- Fn(&MessageCtx, T) ->" \
-    "Result<MappedMessage, E>. This does not type-check regardless of the" \
-    "closure body." >&2
+if [ "$doc_block" != "$src_block" ]; then
+  echo "$doc's cutover example has drifted from the compiled copy in" \
+    "$src (between the cutover-example-start/end markers in" \
+    "cutover_example_from_getting_started_ch13_type_checks). Only the" \
+    "compiled copy is verified to type-check, so the two must read" \
+    "identically (module indentation aside)." >&2
   echo >&2
-  echo "Fix: take the message context and the typed body as exactly two" \
-    "separate closure parameters, e.g. |_ctx, order: OrderPlaced|, and" \
-    "return a MappedMessage (see the chapter's other .map_json examples," \
-    "or MappedMessage::new)." >&2
-  exit 1
-fi
-
-if [ "$kind" = "TYPE" ]; then
-  echo "$doc: the cutover example's .map_json(...) closure's second" \
-    "parameter (\"$detail\") is not explicitly typed OrderPlaced." \
-    "map_json<T, E, F>'s T is fixed by the closure's own declared" \
-    "parameter type -- it is not inferred from the trait bound or from" \
-    "the closure body -- so an untyped or differently-typed parameter" \
-    "fails to compile with \"type annotations needed\" (E0282) at" \
-    "order.order_id." >&2
+  echo "--- $doc ---" >&2
+  echo "$doc_block" >&2
   echo >&2
-  echo "Fix: annotate the second parameter explicitly, e.g." \
-    "order: OrderPlaced." >&2
-  exit 1
-fi
-
-if grep -qF 'Ok(WorkflowId::new(' <<<"$window"; then
-  echo "$doc: the cutover example's .map_json(...) closure returns a bare" \
-    "WorkflowId. map_json requires Result<MappedMessage, E> -- construct a" \
-    "MappedMessage instead (see MappedMessage::new)." >&2
-  exit 1
-fi
-
-# Return type: the closure must yield Result<MappedMessage, E>, not a bare
-# MappedMessage. Also flagged in review: a prior check merely required the
-# substring `MappedMessage::new` to appear anywhere in the window, so
-# `.map_json(|_ctx, order| MappedMessage::new(...))` -- missing the `Ok(...)`
-# wrapper -- passed despite not type-checking against `map_json`'s bound.
-if ! grep -qE 'Ok(::<[^)]*>)?\(\s*MappedMessage::new\(' <<<"$window"; then
-  echo "$doc: the cutover example's .map_json(...) closure does not return" \
-    "Ok(MappedMessage::new(...)) -- map_json requires" \
-    "Result<MappedMessage, E>, so a bare MappedMessage (missing the Ok(...)" \
-    "wrapper) does not type-check." >&2
+  echo "--- $src (dedented) ---" >&2
+  echo "$src_block" >&2
   echo >&2
-  echo "Fix: wrap the constructed MappedMessage in Ok(...), e.g." \
-    "Ok::<_, String>(MappedMessage::new(...))." >&2
+  echo "Fix: make one match the other, then re-run 'cargo test -p" \
+    "autumn-harvest-plugin --features connectors --lib" \
+    "connector::binding::tests::cutover_example_from_getting_started_ch13_type_checks'" \
+    "to confirm it still compiles." >&2
   exit 1
 fi
 
-echo "OK: the cutover example's .map_json(...) closure has the correct signature."
+echo "OK: the cutover example matches its compiled copy in $src."
