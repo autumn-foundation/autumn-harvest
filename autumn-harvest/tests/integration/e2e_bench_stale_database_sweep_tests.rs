@@ -38,7 +38,11 @@ async fn exists(admin: &mut AsyncPgConnection, datname: &str) -> bool {
 }
 
 fn shard_db_name(cluster: &db::ShardCluster) -> String {
-    let url = cluster.urls.values().next().expect("setup_shards(1) makes one shard");
+    let url = cluster
+        .urls
+        .values()
+        .next()
+        .expect("setup_shards(1) makes one shard");
     db_name_from_url(url).expect("a shard url always carries a database path")
 }
 
@@ -57,7 +61,9 @@ async fn a_panicked_runs_shard_database_is_reclaimed_by_the_next_setup() {
         return;
     };
     let Ok(mut admin) = AsyncPgConnection::establish(&admin_url).await else {
-        eprintln!("SKIP a_panicked_runs_shard_database_is_reclaimed_by_the_next_setup: admin connect");
+        eprintln!(
+            "SKIP a_panicked_runs_shard_database_is_reclaimed_by_the_next_setup: admin connect"
+        );
         return;
     };
 

@@ -2526,11 +2526,8 @@ pub mod db {
             // of host or PID namespace. A live run holds a lease connection
             // for its database's whole lifetime (see `ShardCluster::leases`).
             // Any backend at all therefore means the database is in use.
-            if super::super::claim_bench_support::db::database_has_connections(
-                admin,
-                &row.datname,
-            )
-            .await
+            if super::super::claim_bench_support::db::database_has_connections(admin, &row.datname)
+                .await
             {
                 continue;
             }
