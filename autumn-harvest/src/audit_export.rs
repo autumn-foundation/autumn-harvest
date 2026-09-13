@@ -701,6 +701,20 @@ impl AuditExportBuilderConfig {
 /// to police normal contention on a busy pool.
 pub const SHARD_ACQUIRE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Bound reserved for the acknowledgement query itself, on top of
+/// [`SHARD_ACQUIRE_BOUND`] (Codex review on PR #1520, follow-up P2).
+///
+/// `SHARD_ACQUIRE_BOUND` alone only reserves time for the post-delivery
+/// connection checkout. A checkout that uses nearly all of that bound
+/// leaves `apply_outcome` no margin before `lease_until`. A second exporter
+/// could then reclaim the shard first, and the acknowledgement would be
+/// rejected even though the batch was genuinely delivered.
+///
+/// This reserves additional time for that query alone. Deliberately
+/// generous for a single guarded `UPDATE`, matching `SHARD_ACQUIRE_BOUND`'s
+/// own margin above normal-case latency.
+pub const ACK_QUERY_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Default lease held on a shard's cursor while a batch is in flight.
 ///
 /// Long enough to cover a slow sink, short enough that a crashed exporter's
@@ -2244,11 +2258,13 @@ async fn acquire_shard_conn_for_export(
 /// same physical connection — for the acknowledgement transaction. No
 /// connection is held during delivery at all.
 ///
-/// The delivery deadline reserves `SHARD_ACQUIRE_BOUND` off the lease for
-/// that second checkout (Codex review on PR #1520, follow-up P1). The
-/// checkout itself is bounded, but bounded is not free. A successful
-/// delivery finishing right at `lease_until` would leave no time to
-/// reacquire before a fresher claim could reclaim the shard.
+/// The delivery deadline reserves `SHARD_ACQUIRE_BOUND` plus
+/// `ACK_QUERY_BOUND` off the lease. That covers the second checkout and
+/// the acknowledgement query it runs (Codex review on PR #1520, follow-up
+/// P1 and follow-up P2). Both steps are bounded, but bounded is not free.
+/// A successful delivery finishing right at `lease_until` would otherwise
+/// leave no time for either step before a fresher claim could reclaim the
+/// shard.
 ///
 /// `cancel` races the delivery wait, never the claim or the acknowledgement
 /// (Codex review on PR #1520, follow-up P1). A shutdown mid-delivery
@@ -2355,11 +2371,12 @@ async fn export_once_via_pool(
         headers: &headers,
     };
 
-    // The delivery deadline reserves `SHARD_ACQUIRE_BOUND` off the end of
-    // the lease for the post-delivery reacquire-and-acknowledge step below
-    // (Codex review on PR #1520, follow-up P1). Without a reserve, a sink
-    // finishing near `lease_until` could leave the reacquire step to run
-    // PAST the lease.
+    // The delivery deadline reserves `SHARD_ACQUIRE_BOUND` plus
+    // `ACK_QUERY_BOUND` off the end of the lease. That covers the
+    // post-delivery reacquire-and-acknowledge step below (Codex review on
+    // PR #1520, follow-up P1 and follow-up P2). Without a reserve, a sink
+    // finishing near `lease_until` could leave that step to run PAST the
+    // lease.
     //
     // A second exporter would then see the lease already expired. It would
     // reclaim the shard and bump `claim_epoch`. This attempt's
@@ -2367,12 +2384,12 @@ async fn export_once_via_pool(
     // genuinely delivered. Under sustained near-lease latency that repeats
     // forever: delivered, but never acknowledged.
     //
-    // Reserving the time up front instead means a successful delivery
-    // always has a full `SHARD_ACQUIRE_BOUND` left to reacquire and
-    // acknowledge. That is before the lease a fresher claim could reclaim
-    // actually elapses.
+    // Reserving both bounds up front means a successful delivery always has
+    // a full `SHARD_ACQUIRE_BOUND` to reacquire a connection. It then has a
+    // full `ACK_QUERY_BOUND` to run the acknowledgement query, both before
+    // the lease a fresher claim could reclaim actually elapses.
     let delivery_deadline = claim.lease_until
-        - chrono::Duration::from_std(SHARD_ACQUIRE_BOUND)
+        - chrono::Duration::from_std(SHARD_ACQUIRE_BOUND + ACK_QUERY_BOUND)
             .unwrap_or_else(|_| chrono::Duration::zero());
 
     // No connection held during this await. A timeout is classified exactly

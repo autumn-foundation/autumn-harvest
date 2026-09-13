@@ -3054,12 +3054,12 @@ async fn graceful_shutdown_does_not_wait_for_an_in_flight_delivery() {
 
 /// The exact hazard a later review pass on PR #1520 raised. A successful
 /// delivery finishing right at `lease_until` must not be left with zero
-/// time to reacquire a connection and acknowledge it.
+/// time to reacquire a connection and run the acknowledgement query.
 ///
-/// The delivery deadline reserves `SHARD_ACQUIRE_BOUND` off the lease. A
-/// still-blocked sink must therefore fail well before the raw lease
-/// elapses. A backoff is recorded then, not only once the raw lease
-/// itself runs out.
+/// The delivery deadline reserves `SHARD_ACQUIRE_BOUND` plus
+/// `ACK_QUERY_BOUND` off the lease. A still-blocked sink must therefore
+/// fail well before the raw lease elapses. A backoff is recorded then, not
+/// only once the raw lease itself runs out.
 #[tokio::test]
 async fn the_delivery_deadline_reserves_time_for_the_acknowledgement() {
     let _guard = TEST_SERIAL.lock().await;
@@ -3068,10 +3068,11 @@ async fn the_delivery_deadline_reserves_time_for_the_acknowledgement() {
         release: Arc::clone(&release),
         status: 200,
     });
-    // SHARD_ACQUIRE_BOUND is 5s. A 6s lease leaves only ~1s of delivery
-    // budget once that is reserved. That is comfortably inside this test's
-    // 3s deadline, and comfortably short of the raw 6s lease.
-    let lease = std::time::Duration::from_secs(6);
+    // SHARD_ACQUIRE_BOUND is 5s and ACK_QUERY_BOUND is 2s, a 7s reserve. A
+    // 12s lease leaves ~5s of delivery budget once that is reserved. That
+    // is comfortably inside this test's 8s deadline, and comfortably short
+    // of the raw 12s lease.
+    let lease = std::time::Duration::from_secs(12);
     {
         let mut lock = GLOBAL_AUDIT_EXPORT_CONFIG
             .write()
@@ -3107,7 +3108,7 @@ async fn the_delivery_deadline_reserves_time_for_the_acknowledgement() {
         None,
     );
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     loop {
         let status = export_status(&mut conn, 0, chrono::Utc::now())
             .await
