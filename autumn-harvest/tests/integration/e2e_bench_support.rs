@@ -2501,10 +2501,16 @@ pub mod db {
             datname: String,
         }
 
-        let Ok(rows) =
-            diesel::sql_query("SELECT datname FROM pg_database WHERE datname LIKE 'harvest_e2e_%'")
-                .load::<NameRow>(admin)
-                .await
+        // This reuses `E2E_DB_PREFIX` rather than a second copy of it. It is
+        // only a loose prefilter, since `_` is a single-character wildcard in
+        // `LIKE`. `sweep_step` below re-checks every candidate against the
+        // full minted shape before anything destructive runs.
+        let Ok(rows) = diesel::sql_query(format!(
+            "SELECT datname FROM pg_database WHERE datname LIKE '{}%'",
+            super::E2E_DB_PREFIX
+        ))
+        .load::<NameRow>(admin)
+        .await
         else {
             return;
         };
@@ -2539,12 +2545,19 @@ pub mod db {
     /// Sweep stale e2e databases on `admin_url`'s server, then run `provision`
     /// while still holding the stale-database sweep lock.
     ///
-    /// The lock must span provisioning, not just the sweep. A fresh database
-    /// has no lease connection until [`create_shard_database`] finishes
+    /// The lock must span `provision`, not just the sweep. A fresh database
+    /// has no lease connection until [`create_shard_database_lease`] finishes
     /// connecting to it. A foreign sweep between `CREATE DATABASE` and that
     /// connect would otherwise see zero backends. It would then wrongly
-    /// conclude the database is abandoned. Same race, same fix, as
-    /// `claim_bench_support::db::setup_bench_db`.
+    /// conclude the database is abandoned.
+    ///
+    /// Callers pass only the lease-acquisition step here, never the slower
+    /// migration that follows it. `claim_bench_support::db::setup_bench_db`
+    /// uses the same reasoning: it releases its own lock before its own
+    /// migration. Holding this lock across a migration would serialize every
+    /// other client's sweep-and-create against it, for no benefit. It also
+    /// risks a peer's [`claim_bench_support::db::take_sweep_lock`] hitting its
+    /// own wait ceiling.
     ///
     /// Skipped entirely against a testcontainer: nothing outside this process
     /// can reach that server, so there is nothing to sweep and no peer to
@@ -2567,7 +2580,12 @@ pub mod db {
         result
     }
 
-    async fn create_shard_database(
+    /// `CREATE DATABASE` plus the lease connect, with no migration.
+    ///
+    /// Kept separate from migration so [`with_stale_sweep`]'s lock can cover
+    /// this step alone: the fast part that actually needs it. See
+    /// [`provision_one_shard`], the only caller.
+    async fn create_shard_database_lease(
         admin_url: &str,
         shard: ShardId,
     ) -> Result<(String, String, AsyncPgConnection), SkipReason> {
@@ -2595,7 +2613,7 @@ pub mod db {
             .map_err(|e| SkipReason(format!("create database {name}: {e}")))?;
         let url = replace_database(admin_url, &name)?;
         // Every failure from here on must drop the database this function just
-        // created, or a connect/migrate error orphans it.
+        // created, or a connect error orphans it.
         let created = [(admin_url.to_owned(), name.clone())];
         let mut conn = match <AsyncPgConnection as AsyncConnection>::establish(&url).await {
             Ok(conn) => conn,
@@ -2605,9 +2623,27 @@ pub mod db {
             }
         };
         record_server_version(&mut conn).await;
+        Ok((url, name, conn))
+    }
+
+    /// Provision one shard database: sweep and create it under the
+    /// stale-database sweep lock, then migrate it after releasing that lock.
+    ///
+    /// `sweep` is false only for the testcontainer path, where nothing
+    /// outside this process can reach the server.
+    async fn provision_one_shard(
+        admin_url: &str,
+        shard: ShardId,
+        sweep: bool,
+    ) -> Result<(String, String, AsyncPgConnection), SkipReason> {
+        let (url, name, mut conn) = if sweep {
+            with_stale_sweep(admin_url, create_shard_database_lease(admin_url, shard)).await?
+        } else {
+            create_shard_database_lease(admin_url, shard).await?
+        };
         if let Err(e) = conn.batch_execute(&autumn_harvest::test_init_sql()).await {
             drop(conn);
-            drop_created(&created).await;
+            drop_created(&[(admin_url.to_owned(), name)]).await;
             return Err(SkipReason(format!("migrate shard database: {e}")));
         }
         Ok((url, name, conn))
@@ -2650,7 +2686,7 @@ pub mod db {
                 let shard = ShardId::new(i32::try_from(idx).unwrap_or(0));
                 // Each admin URL is potentially a different server, so the
                 // stale-database sweep and its lock are per-shard here.
-                match with_stale_sweep(admin, create_shard_database(admin, shard)).await {
+                match provision_one_shard(admin, shard, true).await {
                     Ok((url, name, lease)) => {
                         urls.insert(shard, url);
                         created.push(((*admin).to_owned(), name));
@@ -2705,33 +2741,24 @@ pub mod db {
         let mut urls = BTreeMap::new();
         let mut leases = Vec::new();
         let mut created = Vec::new();
-        let provision = async {
-            for idx in 0..count {
-                let shard = ShardId::new(i32::try_from(idx).unwrap_or(0));
-                match create_shard_database(&admin_url, shard).await {
-                    Ok((url, name, lease)) => {
-                        urls.insert(shard, url);
-                        created.push((admin_url.clone(), name));
-                        leases.push(lease);
-                    }
-                    Err(e) => return Err(e),
+        // Every shard shares this one server, so each gets its own sweep and
+        // lock hold. This is skipped only on the testcontainer path. Nothing
+        // outside this process can reach that server at all.
+        let sweep = container.is_none();
+        for idx in 0..count {
+            let shard = ShardId::new(i32::try_from(idx).unwrap_or(0));
+            match provision_one_shard(&admin_url, shard, sweep).await {
+                Ok((url, name, lease)) => {
+                    urls.insert(shard, url);
+                    created.push((admin_url.clone(), name));
+                    leases.push(lease);
+                }
+                Err(e) => {
+                    drop(leases);
+                    drop_created(&created).await;
+                    return Err(e);
                 }
             }
-            Ok(())
-        };
-        // One sweep and one lock hold for the whole shard loop here: every
-        // shard shares this one server. Skipped on the testcontainer path.
-        // Nothing outside this process can reach that server. There is
-        // nothing to sweep and no peer to serialize against.
-        let provisioned = if container.is_none() {
-            with_stale_sweep(&admin_url, provision).await
-        } else {
-            provision.await
-        };
-        if let Err(e) = provisioned {
-            drop(leases);
-            drop_created(&created).await;
-            return Err(e);
         }
         Ok(ShardCluster {
             urls,
