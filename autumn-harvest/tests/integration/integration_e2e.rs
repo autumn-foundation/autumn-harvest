@@ -1613,8 +1613,12 @@ fn slow_activity<'a>(
     _ctx: &'a ActivityContext,
     input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    // The gap between this sleep and the 100ms StartToClose timeout above
+    // must survive a delayed scanner tick on a loaded CI runner. 600ms
+    // keeps a wide margin, and stays under the 1s worker shutdown_timeout
+    // below so the activity task still drains instead of getting aborted.
     Box::pin(async move {
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
         Ok(input)
     })
 }
@@ -3472,7 +3476,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     name: "slow_activity",
                     module: "integration_e2e",
                     default_retry_policy: None,
-                    default_start_to_close: Some(Duration::from_millis(50)),
+                    default_start_to_close: Some(Duration::from_millis(100)),
                     default_heartbeat_timeout: None,
                     default_schedule_to_start: None,
                     default_schedule_to_close: None,
