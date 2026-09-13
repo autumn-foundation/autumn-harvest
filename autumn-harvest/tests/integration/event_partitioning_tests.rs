@@ -6104,6 +6104,79 @@ async fn re_running_the_plan_rebuilds_an_index_a_cancelled_build_left_invalid() 
 }
 
 #[tokio::test]
+async fn phase_2_refuses_when_a_reserved_index_name_is_squatted_elsewhere() {
+    // Review finding: matching phase 2's invalid-index cleanup by schema
+    // and name alone selected any invalid index bearing one of the three
+    // reserved names. It matched on any table. An operator's own
+    // cancelled `CREATE INDEX CONCURRENTLY` build could coincidentally
+    // land on one of those names, on a completely unrelated table. The
+    // fix checks the expected table and column shape per name. It
+    // refuses rather than either destroying the unrelated object or
+    // silently leaving it squatting on the name this plan needs to
+    // build under.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP TABLE IF EXISTS harvest_events_reindex_decoy_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray decoy table from a previous run");
+    diesel::sql_query("CREATE TABLE harvest_events_reindex_decoy_958 (x int)")
+        .execute(&mut conn)
+        .await
+        .expect("seed an unrelated table");
+    diesel::sql_query(format!(
+        "CREATE INDEX {} ON harvest_events_reindex_decoy_958 (x)",
+        plan_pk_index()
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed an index squatting on the reserved name, on an unrelated table");
+    invalidate_index(&mut conn, &plan_pk_index()).await;
+
+    run_plan_phases(&mut conn, 1..=1).await;
+
+    let mut refusal: Option<String> = None;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 2)
+    {
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            refusal = Some(e.to_string());
+        }
+    }
+    let msg = refusal.expect(
+        "phase 2 must refuse when a reserved index name is squatted by an unrelated \
+         table, not silently destroy or silently skip past it",
+    );
+    assert!(
+        msg.contains(&plan_pk_index()) && msg.contains("harvest_events_reindex_decoy_958"),
+        "the refusal must name both the offending index and the table it is actually \
+         on; got {msg}"
+    );
+    assert!(
+        scalar_bool(
+            &mut conn,
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM pg_class c \
+                 JOIN pg_index i ON i.indexrelid = c.oid \
+                 WHERE c.relname = '{}' \
+                 AND i.indrelid = 'harvest_events_reindex_decoy_958'::regclass) AS v",
+                plan_pk_index()
+            ),
+        )
+        .await,
+        "the unrelated decoy index must survive untouched, on its own table"
+    );
+
+    diesel::sql_query("DROP TABLE harvest_events_reindex_decoy_958 CASCADE")
+        .execute(&mut conn)
+        .await
+        .expect("drop the decoy table and its squatting index");
+}
+
+#[tokio::test]
 async fn the_lock_window_refuses_to_open_over_an_invalid_index() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
