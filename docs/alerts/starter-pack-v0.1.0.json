@@ -1009,7 +1009,7 @@
       "id": "harvest_scanner_stalled",
       "status": "enforceable",
       "signal_source": "ADR-0001/#797 counter harvest.scanner.tick, incremented unconditionally at the end of EVERY background control-loop iteration (label scanner). Companion in-process check: the scanner_liveness entry in GET /api/harvest/admin/preflight.",
-      "default_threshold": "Page when a scanner series stops incrementing for longer than its loop's cadence allows, while the process is up. The windows are per-cadence, NOT uniform: seven of the eight loops poll sub-minute (timeout/sla/external_outbox/audit_export 500ms, schedule 1s, poison_pill/pause_auto_resume 5s), so a 5m window is ~300x their interval and never flaps; the retention janitor polls hourly by default, so it gets a 3h window. A uniform 5m window would page continuously on a HEALTHY retention loop. Retune both windows if you have changed WorkerConfig::poll_interval or RetentionConfig's tick interval. These windows are the coarse fleet-wide signal; the scanner_liveness preflight check is the low-latency one (max(2 x poll_interval, 60s) -- audit_export registers against max(poll_interval, its configured export lease) instead of the bare poll interval, so a legitimately slow-but-within-lease delivery is not misclassified as wedged).",
+      "default_threshold": "Page when a scanner series stops incrementing for longer than its loop's cadence allows, while the process is up. The windows are per-cadence, NOT uniform: six of the eight loops poll sub-minute (timeout/sla/external_outbox 500ms, schedule 1s, poison_pill/pause_auto_resume 5s), so a 5m window is ~300x their interval and never flaps. `audit_export` gets its own 10m window (see the audit_export-specific expression's own note): its per-tick duration is bounded by the operator-configurable audit_export_lease, not the poll interval, so it cannot share the sub-minute window the way the other five do. The retention janitor polls hourly by default, so it gets a 3h window. A uniform 5m window would page continuously on a HEALTHY retention loop. Retune all three windows if you have changed WorkerConfig::poll_interval, RetentionConfig's tick interval, or audit_export_lease respectively. These windows are the coarse fleet-wide signal; the scanner_liveness preflight check is the low-latency one (max(2 x poll_interval, 60s) -- audit_export registers against max(poll_interval, its configured export lease) instead of the bare poll interval, so a legitimately slow-but-within-lease delivery is not misclassified as wedged).",
       "severity": "page",
       "owner_persona": "service on-call",
       "description": "A background control loop has stopped completing iterations. Because the tick fires even on no-work iterations, a flat-lined series means the loop is wedged (panicked, deadlocked on a poisoned connection, or stalled on a never-returning query) rather than idle. Whichever enforcement it owns -- workflow/activity timeouts, SLA breaches, poison-pill reclaim, external signal/cancel outbox delivery, retention, schedule firing, bounded-pause auto-resume, or audit-record export -- is silently not running.",
@@ -1032,7 +1032,12 @@
         "expressions": [
           {
             "kind": "promql",
-            "expr": "rate(harvest_scanner_tick_total{scanner!=\"retention\"}[5m]) == 0"
+            "expr": "rate(harvest_scanner_tick_total{scanner!=\"retention\",scanner!=\"audit_export\"}[5m]) == 0"
+          },
+          {
+            "kind": "promql",
+            "expr": "rate(harvest_scanner_tick_total{scanner=\"audit_export\"}[10m]) == 0",
+            "note": "A 10m window, not the shared 5m one: a single audit-export tick can legitimately run as long as the configured audit_export_lease allows (default 60s, operator-configurable). 10m covers any lease up to a few minutes without retuning; a fleet configured with a longer lease must widen this window to stay ahead of it, exactly like the retention window below must track RetentionConfig's tick interval."
           },
           {
             "kind": "promql",

@@ -2729,6 +2729,92 @@ async fn an_unconfigured_dedicated_task_never_attempts_a_connection_checkout() {
     let _ = handle.await;
 }
 
+/// The registered staleness threshold must track the CURRENTLY configured
+/// export lease. It must not just track the one in effect at spawn time
+/// (Codex review on PR #1520, follow-up P2).
+///
+/// A later runtime can publish a longer lease at any point
+/// (`fence_against_sink_swap`'s doc comment documents that this is
+/// supported). The already-running task must pick it up without needing a
+/// restart.
+#[tokio::test]
+async fn audit_export_checker_re_registers_when_the_configured_lease_grows() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let shard = ShardId::new(9001);
+    let telemetry = Arc::new(autumn_harvest::telemetry::TelemetryConfig::default());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let poll_interval = std::time::Duration::from_millis(20);
+
+    let (_conn, container) = make_conn().await;
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(url);
+    let pool = autumn_harvest::worker::DbPool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("pool");
+
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        poll_interval,
+        telemetry,
+        Some(shard),
+        None,
+    );
+
+    let find_status = || {
+        autumn_harvest::scanner_health::global_scanner_liveness()
+            .snapshot()
+            .into_iter()
+            .find(|s| {
+                s.scanner == autumn_harvest::scanner_health::Scanner::AuditExport
+                    && s.shard == Some(shard)
+            })
+    };
+
+    // Unconfigured: the registered interval is the bare poll interval.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if find_status().is_some_and(|s| s.poll_interval == poll_interval) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the task must register itself with the bare poll interval when \
+             unconfigured; last saw {:?}",
+            find_status()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // A second runtime publishes a sink with a long lease.
+    let long_lease = std::time::Duration::from_secs(120);
+    let _installed = install_with_lease(Arc::new(RecordingSink::new(200)), 100, long_lease);
+
+    // The registered interval must grow to match, without restarting the task.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if find_status().is_some_and(|s| s.poll_interval == long_lease) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the task must re-register with the new, longer lease once it \
+             observes the config change; last saw {:?}",
+            find_status()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    cancel.cancel();
+    let _ = handle.await;
+    uninstall();
+}
+
 /// The property this issue's fix rests on. Codex review rounds 15/18 on PR
 /// #1261 named the specific old hazard. The multi-shard fan-out arm of
 /// `fire_due_audit_exports` ran inline while the timeout checker's own

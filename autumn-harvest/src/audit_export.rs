@@ -2434,7 +2434,10 @@ async fn export_once_via_pool(
 /// just the poll interval (Codex review on PR #1520 P2). A single tick can
 /// legitimately run as long as the lease allows. A bare poll-interval
 /// threshold would flag a healthy, still-within-lease delivery as `Stale`
-/// or `Wedged`.
+/// or `Wedged`. Re-checked every tick and re-registered on an actual
+/// change (Codex review on PR #1520, follow-up). A later runtime
+/// publishing a longer lease is picked up without needing this task
+/// restarted.
 ///
 /// Pass `shard` to attribute this instance to one shard in the liveness
 /// snapshot, mirroring
@@ -2454,11 +2457,11 @@ pub fn spawn_audit_export_checker_for_shard(
 ) -> tokio::task::JoinHandle<()> {
     // See this function's doc comment: the registered threshold must cover
     // the worst legitimate tick, not just the poll cadence.
-    let registered_interval =
+    let mut registered_interval =
         read_global_audit_export_config().map_or(interval, |config| interval.max(config.lease));
     // Issue #797: declare the loop before its first iteration so the
     // `scanner_liveness` check expects it and grants it boot grace.
-    let owner = crate::scanner_health::register_scanner_for_shard(
+    let mut owner = crate::scanner_health::register_scanner_for_shard(
         &*telemetry.metrics,
         crate::scanner_health::Scanner::AuditExport,
         registered_interval,
@@ -2474,6 +2477,26 @@ pub fn spawn_audit_export_checker_for_shard(
             tokio::select! {
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
+            }
+
+            // The registered threshold must track the CURRENTLY configured
+            // lease, not just the one in effect at spawn time (Codex review
+            // on PR #1520 P2). A second runtime can publish a longer lease
+            // at any point (`fence_against_sink_swap`'s doc comment).
+            // A stale, too-tight threshold would misclassify a healthy
+            // delivery under the new lease as `Stale` or `Wedged`. Cheap to
+            // check every tick; only re-registers on an actual change.
+            let desired_interval = read_global_audit_export_config()
+                .map_or(interval, |config| interval.max(config.lease));
+            if desired_interval != registered_interval {
+                crate::scanner_health::deregister_scanner(owner);
+                owner = crate::scanner_health::register_scanner_for_shard(
+                    &*telemetry.metrics,
+                    crate::scanner_health::Scanner::AuditExport,
+                    desired_interval,
+                    shard,
+                );
+                registered_interval = desired_interval;
             }
 
             if let Err(error) = export_once_via_pool(&pool, shard_id, &*telemetry.metrics).await {
