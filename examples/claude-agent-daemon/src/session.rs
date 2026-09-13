@@ -335,6 +335,19 @@ pub async fn agent_session(
             return Ok(report(&last_text, turn, tool_calls, &reply.stop_reason));
         }
 
+        // The COUNT is answered BEFORE any call runs, because the reply says
+        // it. A batch OVER the bound can never be answered. Running part of
+        // it would spend filesystem operations and durable events for results
+        // that are then discarded. See [`MAX_TURN_CALLS`].
+        //
+        // The test is on the EXCESS, not on the last permitted call. A reply
+        // of exactly `MAX_TURN_CALLS` calls is within the documented bound
+        // and runs whole. It once ran whole and was discarded anyway, which
+        // reported `batch_full` for a batch the bound permits.
+        if reply.tool_calls.len() > MAX_TURN_CALLS {
+            return Ok(report(&last_text, turn, tool_calls, STOP_BATCH_FULL));
+        }
+
         // Every tool_use block of one assistant turn must be answered in ONE
         // user message. A split teaches the model to stop calling tools in
         // parallel, so the results are collected first and pushed together.
@@ -347,11 +360,9 @@ pub async fn agent_session(
         // own durable events. A reply that is itself within the reply cap
         // could therefore spend far more than one request may carry.
         //
-        // TWO bounds, because one reply can be too much in two ways. The
-        // results can be too LARGE, and the calls can be too MANY. A cheap
-        // call passes the size bound and still costs a filesystem operation
-        // and a durable event. A size bound alone therefore leaves the work
-        // unbounded. See [`MAX_TURN_CALLS`].
+        // The SIZE is answered while the batch runs, because no reply says
+        // how large its results will be. The count above is answered before
+        // it, because the reply does say how many calls it asks for.
         //
         // The size bound is the results ALONE against the cap a request may carry.
         // That is conservative. Results over the cap cannot fit a request
@@ -380,11 +391,6 @@ pub async fn agent_session(
             results.push(block);
             if spent > autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES {
                 return Ok(report(&last_text, turn, tool_calls, STOP_TRANSCRIPT_FULL));
-            }
-            // The COUNT is bounded beside the size, because the two bound
-            // different things. See [`MAX_TURN_CALLS`].
-            if position + 1 >= MAX_TURN_CALLS {
-                return Ok(report(&last_text, turn, tool_calls, STOP_BATCH_FULL));
             }
         }
         messages.push(Message::user(Value::Array(results)));

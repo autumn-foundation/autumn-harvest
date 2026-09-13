@@ -935,10 +935,9 @@ pub fn outstanding_signal(
     //
     // The restart calls this function once for each RUNNING session, so this
     // is the one place that sees them all.
-    if ambiguous_history(conn, exec_id)? {
+    if let Some(reason) = ambiguous_history(conn, exec_id)? {
         return Err(format!(
-            "session {exec_id} holds an event this daemon cannot read as the \
-             engine reads it, so whether its decision was taken cannot be told"
+            "session {exec_id} {reason}, so it cannot be driven again"
         ));
     }
     // `fired = 0` is the backend's own proof of a wait that is still armed.
@@ -1007,26 +1006,15 @@ fn answered(conn: &Connection, exec_id: &str, signal: &str) -> Result<bool, Stri
         }
         None => {}
     }
-    match delivered_decision(conn, exec_id, signal)? {
-        Some(true) => Ok(true),
-        Some(false) => Err(format!(
-            "session {exec_id} recorded a decision for {signal} that the workflow \
-             cannot read, so the session fails on every drive"
-        )),
-        None => Ok(false),
-    }
+    delivered_decision(conn, exec_id, signal)
 }
 
-/// Is a decision for this signal in the LOG, and can the workflow read it?
+/// Is a decision for this signal in the LOG?
 ///
-/// `None` means the log holds none. `Some(true)` is a decision the replay
-/// takes up. `Some(false)` is one that ends the session.
-///
-/// The event is read as `WorkflowEvent`, and then its payload as the type the
-/// workflow asks for. BOTH reads are needed, because the variant declares
-/// `payload` as an untyped `Value`. An event holding `{}` is a valid
-/// `WorkflowEvent` and an invalid `ApprovalDecision`. A read of the event
-/// alone therefore reports a decision the replay cannot take up.
+/// Only PRESENCE is answered here. The payload is read as the type the
+/// workflow asks for by [`ambiguous_history`], for EVERY recorded approval.
+/// That pass runs before this one and refuses the session. A second test
+/// here would be a test no history can fail.
 ///
 /// Measured on three delivered events. Every one deserialised as an event.
 /// `{"approved":true}` read as a decision, and `{}` and
@@ -1044,11 +1032,7 @@ fn answered(conn: &Connection, exec_id: &str, signal: &str) -> Result<bool, Stri
 ///
 /// One row is held at a time and dropped. [`ambiguous_history`] has already
 /// proven every row deserialises, so this pass reads rows it knows are sound.
-fn delivered_decision(
-    conn: &Connection,
-    exec_id: &str,
-    signal: &str,
-) -> Result<Option<bool>, String> {
+fn delivered_decision(conn: &Connection, exec_id: &str, signal: &str) -> Result<bool, String> {
     let mut statement = conn
         .prepare("SELECT event_json FROM harvest_events WHERE exec_id = ?1 ORDER BY seq")
         .map_err(|e| format!("cannot prepare the delivery query: {e}"))?;
@@ -1070,12 +1054,11 @@ fn delivered_decision(
             continue;
         };
         if signal_name == signal {
-            return Ok(Some(
-                serde_json::from_value::<ApprovalDecision>(payload).is_ok(),
-            ));
+            let _ = payload;
+            return Ok(true);
         }
     }
-    Ok(None)
+    Ok(false)
 }
 
 /// Is a decision STAGED for this signal, and can the engine read it?
@@ -1166,7 +1149,7 @@ fn staged_decision(conn: &Connection, exec_id: &str, signal: &str) -> Result<Opt
 /// event and not the history. The first drive of each session reads the same
 /// rows through `load_history`, so this repeats that work rather than adding
 /// work of a new kind.
-fn ambiguous_history(conn: &Connection, exec_id: &str) -> Result<bool, String> {
+fn ambiguous_history(conn: &Connection, exec_id: &str) -> Result<Option<String>, String> {
     let mut statement = conn
         .prepare("SELECT event_json FROM harvest_events WHERE exec_id = ?1 ORDER BY seq")
         .map_err(|e| format!("cannot prepare the history query: {e}"))?;
@@ -1184,10 +1167,10 @@ fn ambiguous_history(conn: &Connection, exec_id: &str) -> Result<bool, String> {
         // `load_history` reads this column as a `String`, so a non-text class
         // fails HERE, exactly as it fails there.
         let Ok(event) = row.get::<_, String>(0) else {
-            return Ok(true);
+            return Ok(Some("holds an event the engine cannot read".to_string()));
         };
         let Ok(event) = serde_json::from_str::<WorkflowEvent>(&event) else {
-            return Ok(true);
+            return Ok(Some("holds an event the engine cannot read".to_string()));
         };
         match event {
             WorkflowEvent::ActivityScheduled {
@@ -1199,17 +1182,33 @@ fn ambiguous_history(conn: &Connection, exec_id: &str) -> Result<bool, String> {
                 activity_id,
                 output,
             } => {
-                if unreadable_output(scheduled.get(&activity_id.to_string()), output) {
-                    return Ok(true);
+                if let Some(reason) =
+                    unreadable_output(scheduled.get(&activity_id.to_string()), output)
+                {
+                    return Ok(Some(reason));
+                }
+            }
+            // EVERY recorded approval is read, and not only the one an armed
+            // timer names. A session that stopped somewhere else still
+            // replays its earlier approvals, and
+            // `receive_signal_timeout::<ApprovalDecision>` refuses a payload
+            // the type cannot read. Measured on a history holding one earlier
+            // approval of `{}` and no armed timer: the restart answered
+            // `Ok(None)`, and the payload answered `missing field approved`.
+            WorkflowEvent::SignalReceived { payload, .. } => {
+                if serde_json::from_value::<ApprovalDecision>(payload).is_err() {
+                    return Ok(Some(
+                        "recorded a decision the workflow cannot read".to_string(),
+                    ));
                 }
             }
             _ => {}
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
-/// Is this recorded result one the WORKFLOW cannot read?
+/// Is this recorded result one the WORKFLOW cannot read, and why?
 ///
 /// `WorkflowEvent::ActivityCompleted` declares `output` as an untyped
 /// `Value`, so an event that deserialises says nothing about the result
@@ -1222,20 +1221,33 @@ fn ambiguous_history(conn: &Connection, exec_id: &str) -> Result<bool, String> {
 /// the value on the first replay, `agent_session` propagates that, and the
 /// runtime seals a repairable session `FAILED`.
 ///
+/// A model reply is held to MORE than its shape. The live path refuses a
+/// reply whose calls carry an id that is blank, repeated, or unsafe in a
+/// shell. A recorded one reaches the operator by the same route. A reply
+/// this daemon would never have accepted is therefore not a history it can
+/// resume. The test is [`crate::claude::malformed_reply`] itself, so the two
+/// paths cannot drift. Measured on a recorded reply whose id holds `;`: the
+/// event read as `Ok` and `malformed_reply` refused it.
+///
 /// A result this daemon declares NO type for is passed over. The activity may
 /// belong to another workflow in the same file, and the id may name a
 /// schedule this page never read. Neither is this daemon's to judge.
-fn unreadable_output(name: Option<&String>, output: serde_json::Value) -> bool {
-    let Some(name) = name else {
-        return false;
-    };
+fn unreadable_output(name: Option<&String>, output: serde_json::Value) -> Option<String> {
+    let name = name?;
     if name == session::claude_turn_info().name {
-        return serde_json::from_value::<session::TurnReply>(output).is_err();
+        let Ok(reply) = serde_json::from_value::<session::TurnReply>(output) else {
+            return Some("recorded a model reply the workflow cannot read".to_string());
+        };
+        return crate::claude::malformed_reply(&reply).map(|why| {
+            format!("recorded a model reply this daemon would have refused, because {why}")
+        });
     }
     if name == session::run_tool_info().name {
-        return serde_json::from_value::<session::ToolOutcome>(output).is_err();
+        return serde_json::from_value::<session::ToolOutcome>(output)
+            .is_err()
+            .then(|| "recorded a tool result the workflow cannot read".to_string());
     }
-    false
+    None
 }
 
 /// Is this timer the deadline of that signal's wait?

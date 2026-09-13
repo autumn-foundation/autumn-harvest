@@ -11091,7 +11091,7 @@ fn a_restart_refuses_a_history_that_reads_two_ways() {
         let refused = inspect::outstanding_signal(&conn, "e", 1_000)
             .expect_err("a history that reads two ways must refuse the restart");
         assert!(
-            refused.contains("cannot be told"),
+            refused.contains("cannot be driven again"),
             "[{label}] the refusal must say WHY it refuses: {refused}"
         );
         assert!(
@@ -11191,7 +11191,7 @@ fn a_session_with_no_armed_wait_is_read_too() {
     let refused = inspect::outstanding_signal(&conn, "e", 1_000)
         .expect_err("a session with no armed wait must still be read");
     assert!(
-        refused.contains("cannot be told"),
+        refused.contains("cannot be driven again"),
         "the refusal must say WHY it refuses: {refused}"
     );
 
@@ -11377,7 +11377,7 @@ fn a_history_is_read_with_the_engines_own_type() {
         let refused = inspect::outstanding_signal(&conn, "e", 1_000)
             .expect_err("a history the engine cannot read must refuse the restart");
         assert!(
-            refused.contains("cannot be told"),
+            refused.contains("cannot be driven again"),
             "[{label}] the refusal must say WHY it refuses: {refused}"
         );
         // The engine is the authority, so assert the loader agrees.
@@ -11532,9 +11532,16 @@ fn a_delivered_decision_is_read_as_the_type_the_workflow_asks_for() {
         );
         let refused = inspect::outstanding_signal(&conn, "e", 1_000)
             .expect_err("a recorded decision the workflow cannot read must refuse the restart");
+        // The refusal comes from the whole-history pass, which reads EVERY
+        // recorded approval. It once came from the read of the one approval
+        // an armed timer names, and an earlier approval was never read.
         assert!(
-            refused.contains("fails on every drive"),
+            refused.contains("recorded a decision the workflow cannot read"),
             "[{label}] the refusal must say WHY it refuses: {refused}"
+        );
+        assert!(
+            refused.contains("cannot be driven again"),
+            "[{label}] and what it means for the session: {refused}"
         );
     }
 
@@ -11558,9 +11565,12 @@ fn a_delivered_decision_is_read_as_the_type_the_workflow_asks_for() {
             "[{label}] a decision the workflow reads still ends the wait"
         );
     }
+}
 
-    // A delivery for ANOTHER signal is not this signal's answer, so the wait
-    // it guards is still restored.
+/// A delivery for ANOTHER signal is not this signal's answer.
+#[test]
+fn a_delivery_for_another_signal_leaves_this_wait_outstanding() {
+    let armed = "tool_approval:2:0:toolu_x";
     let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
     conn.execute_batch(
         "CREATE TABLE harvest_timers (timer_id TEXT, exec_id TEXT, fire_at INTEGER, \
@@ -11578,9 +11588,19 @@ fn a_delivered_decision_is_read_as_the_type_the_workflow_asks_for() {
         [format!("__signal_timeout:2:{armed}")],
     )
     .expect("the armed timer is recorded");
+    // A REAL decision. The whole-history pass reads every recorded approval.
+    // An empty payload would refuse this history for the payload, and the
+    // question here is the signal NAME.
     conn.execute(
         "INSERT INTO harvest_events VALUES ('e', 0, ?1)",
-        [r#"{"type":"SignalReceived","data":{"signal_name":"tool_approval:1:0:other","payload":{}}}"#],
+        [json!({
+            "type": "SignalReceived",
+            "data": {
+                "signal_name": "tool_approval:1:0:other",
+                "payload": { "approved": true },
+            },
+        })
+        .to_string()],
     )
     .expect("the other delivery is appended");
     assert_eq!(
@@ -11744,14 +11764,12 @@ async fn one_turn_runs_no_more_calls_than_a_turn_may_run() {
         session::STOP_TRANSCRIPT_FULL,
         "the transcript is not full, so the report must not say it is"
     );
+    // NO call runs. The reply says how many it asks for. A batch over the
+    // bound is therefore refused before any call spends a filesystem
+    // operation or a durable event. It once ran 200 and discarded them.
     assert_eq!(
-        report.tool_calls as usize,
-        session::MAX_TURN_CALLS,
-        "and it must run exactly the calls a turn may run"
-    );
-    assert!(
-        (report.tool_calls as usize) < files,
-        "which is fewer than the reply asked for"
+        report.tool_calls, 0,
+        "a batch over the bound runs no call at all"
     );
     assert_eq!(report.turns, 1, "one turn ran");
 }
@@ -11792,11 +11810,16 @@ fn a_recorded_result_is_read_as_the_type_its_activity_declares() {
         // is unknowable, which the last case below covers.
         conn.execute(
             "INSERT INTO harvest_events VALUES ('e', 0, ?1)",
-            [format!(
-                r#"{{"type":"ActivityScheduled","data":{{"activity_id":"{id}",\
-                   "name":"{activity}","input":{{}},"queue":"default"}}}}"#
-            )
-            .replace("\\\n                   ", "")],
+            [json!({
+                "type": "ActivityScheduled",
+                "data": {
+                    "activity_id": id,
+                    "name": activity,
+                    "input": {},
+                    "queue": "default",
+                },
+            })
+            .to_string()],
         )
         .expect("the schedule is appended");
         conn.execute(
@@ -11822,7 +11845,7 @@ fn a_recorded_result_is_read_as_the_type_its_activity_declares() {
         let refused = inspect::outstanding_signal(&conn, "e", 1_000)
             .expect_err("a result the workflow cannot read must refuse the restart");
         assert!(
-            refused.contains("cannot be told"),
+            refused.contains("cannot be driven again"),
             "[{label}] the refusal must say WHY it refuses: {refused}"
         );
         // The event is SOUND. That is the point: the history read cannot see
@@ -11865,5 +11888,298 @@ fn a_recorded_result_is_read_as_the_type_its_activity_declares() {
         inspect::outstanding_signal(&conn, "e", 1_000).expect("the wait query runs"),
         None,
         "a result of an activity this daemon does not declare is not judged"
+    );
+}
+
+/// A batch of EXACTLY the bound is permitted, and runs whole.
+///
+/// The bound documents how many calls a turn MAY run. The test once fired on
+/// the last permitted call. A reply of exactly that many then ran whole, had
+/// every result discarded, and reported `batch_full`. The excess is what ends
+/// a turn, and not the last call within it.
+#[tokio::test]
+async fn a_batch_of_exactly_the_bound_is_answered() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    let files = session::MAX_TURN_CALLS;
+    for index in 0..files {
+        std::fs::write(workspace.join(format!("empty-{index}.txt")), "")
+            .expect("the fixture is written");
+    }
+
+    // Ask for exactly the bound on the first turn, then end cleanly. The
+    // second reply proves the results were GIVEN BACK rather than discarded.
+    let turns = Arc::new(AtomicUsize::new(0));
+    let counted = turns.clone();
+    let model = move |input: Value| -> Result<Value, String> {
+        let request: TurnRequest =
+            serde_json::from_value(input).map_err(|e| format!("bad request: {e}"))?;
+        let seen = counted.fetch_add(1, Ordering::SeqCst);
+        if seen > 0 {
+            // The transcript must carry the results of the whole batch.
+            let carried = serde_json::to_string(&request.messages).expect("messages serialise");
+            let answered = (0..files)
+                .filter(|index| carried.contains(&format!("toolu_read_{index}")))
+                .count();
+            assert_eq!(
+                answered, files,
+                "every call of the batch must be answered back to the model"
+            );
+            return serde_json::to_value(session::TurnReply {
+                content: json!([{ "type": "text", "text": "done" }]),
+                stop_reason: "end_turn".to_string(),
+                text: "done".to_string(),
+                tool_calls: vec![],
+            })
+            .map_err(|e| format!("bad reply: {e}"));
+        }
+        let reads: Vec<Value> = (0..files)
+            .map(|index| {
+                json!({
+                    "type": "tool_use",
+                    "id": format!("toolu_read_{index}"),
+                    "name": tools::TOOL_READ_FILE,
+                    "input": { "path": format!("empty-{index}.txt") },
+                })
+            })
+            .collect();
+        let mut content = vec![json!({ "type": "text", "text": "reading" })];
+        content.extend(reads);
+        serde_json::to_value(session::TurnReply {
+            content: Value::Array(content),
+            stop_reason: claude::STOP_TOOL_USE.to_string(),
+            text: "reading".to_string(),
+            tool_calls: (0..files)
+                .map(|index| session::ToolCall {
+                    id: format!("toolu_read_{index}"),
+                    name: tools::TOOL_READ_FILE.to_string(),
+                    input: json!({ "path": format!("empty-{index}.txt") }),
+                })
+                .collect(),
+        })
+        .map_err(|e| format!("bad reply: {e}"))
+    };
+
+    let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
+    rt.register_workflow(&session::agent_session_info());
+    rt.register_activity(&session::claude_turn_info(), model);
+    rt.register_activity(
+        &session::run_tool_info(),
+        tools::activity_body(workspace.clone()),
+    );
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
+        .expect("the session starts");
+    let state = rt.run_until_blocked(exec).await.expect("the run advances");
+
+    let RunState::Completed(output) = state else {
+        panic!("the session must finish: {state:?}");
+    };
+    let report: session::SessionReport = serde_json::from_value(output).expect("the report reads");
+    assert_eq!(
+        report.stop, "end_turn",
+        "a batch of exactly the bound is not `batch_full`: {report:?}"
+    );
+    assert_ne!(
+        report.stop,
+        session::STOP_BATCH_FULL,
+        "the bound was not exceeded, so it must not be named"
+    );
+    assert_eq!(
+        report.tool_calls as usize, files,
+        "and every call of the batch ran"
+    );
+}
+
+/// A recorded model reply is held to the LIVE path's safety checks.
+///
+/// A reply whose call id is unsafe in a shell is refused when it arrives. A
+/// recorded one is therefore a history this daemon could never have
+/// produced. Its shape alone reads: `TurnReply` accepts the id, and only
+/// `malformed_reply` refuses it.
+///
+/// The consequence is not a failed session but a printed command. The replay
+/// parks on that call, and the token reaches an operator on a line meant to
+/// be pasted into a shell.
+///
+/// The test is `malformed_reply` itself, so the restart and the live path
+/// cannot drift apart.
+#[test]
+fn a_recorded_reply_is_held_to_the_live_safety_checks() {
+    let id = "01234567-89ab-4cde-8f01-23456789abcd";
+    let build = |reply: &session::TurnReply| {
+        let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
+        conn.execute_batch(
+            "CREATE TABLE harvest_timers (timer_id TEXT, exec_id TEXT, fire_at INTEGER, \
+             fired INTEGER NOT NULL DEFAULT 0, arm_seq INTEGER, \
+             PRIMARY KEY (exec_id, timer_id)); \
+             CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+             PRIMARY KEY (exec_id, seq)); \
+             CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+             exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+        )
+        .expect("the fixture tables are created");
+        conn.execute(
+            "INSERT INTO harvest_events VALUES ('e', 0, ?1)",
+            [json!({
+                "type": "ActivityScheduled",
+                "data": {
+                    "activity_id": id,
+                    "name": session::claude_turn_info().name,
+                    "input": {},
+                    "queue": "default",
+                },
+            })
+            .to_string()],
+        )
+        .expect("the schedule is appended");
+        conn.execute(
+            "INSERT INTO harvest_events VALUES ('e', 1, ?1)",
+            [json!({
+                "type": "ActivityCompleted",
+                "data": { "activity_id": id, "output": reply },
+            })
+            .to_string()],
+        )
+        .expect("the completion is appended");
+        conn
+    };
+    let reply = |id: &str| session::TurnReply {
+        content: json!([{ "type": "tool_use", "id": id, "name": tools::TOOL_READ_FILE,
+                          "input": { "path": "x" } }]),
+        stop_reason: claude::STOP_TOOL_USE.to_string(),
+        text: String::new(),
+        tool_calls: vec![session::ToolCall {
+            id: id.to_string(),
+            name: tools::TOOL_READ_FILE.to_string(),
+            input: json!({ "path": "x" }),
+        }],
+    };
+
+    for (label, call_id) in [
+        ("an id carrying shell syntax", "toolu_a;rm -rf /"),
+        ("an id carrying a quote", "toolu_a\"b"),
+        ("a blank id", ""),
+    ] {
+        let bad = reply(call_id);
+        // The SHAPE reads. That is why the type check alone cannot see this.
+        let as_value = serde_json::to_value(&bad).expect("the reply serialises");
+        assert!(
+            serde_json::from_value::<session::TurnReply>(as_value).is_ok(),
+            "[{label}] the reply must be one the type accepts"
+        );
+        // The live path is the authority.
+        assert!(
+            claude::malformed_reply(&bad).is_some(),
+            "[{label}] and one the live path refuses"
+        );
+        let refused = inspect::outstanding_signal(&build(&bad), "e", 1_000)
+            .expect_err("a recorded reply the live path refuses must refuse the restart");
+        assert!(
+            refused.contains("would have refused"),
+            "[{label}] the refusal must say WHY it refuses: {refused}"
+        );
+    }
+
+    // The not-the-fault case: an ordinary id is not refused.
+    let good = reply("toolu_01abcDEF");
+    assert!(
+        claude::malformed_reply(&good).is_none(),
+        "the live path accepts an ordinary id"
+    );
+    assert_eq!(
+        inspect::outstanding_signal(&build(&good), "e", 1_000).expect("the wait query runs"),
+        None,
+        "so the restart accepts it too"
+    );
+}
+
+/// EVERY recorded approval is read, and not only the one a timer names.
+///
+/// A session that stopped somewhere else still replays its earlier
+/// approvals. `receive_signal_timeout` refuses a payload the type cannot
+/// read, which seals an otherwise repairable run.
+///
+/// Measured before the fix, on a history holding one earlier approval of
+/// `{}` and NO armed timer. The restart answered `Ok(None)`. The payload
+/// answered `missing field approved`.
+#[test]
+fn every_recorded_approval_is_read_and_not_only_the_awaited_one() {
+    let build = |payload: &str, armed: bool| {
+        let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
+        conn.execute_batch(
+            "CREATE TABLE harvest_timers (timer_id TEXT, exec_id TEXT, fire_at INTEGER, \
+             fired INTEGER NOT NULL DEFAULT 0, arm_seq INTEGER, \
+             PRIMARY KEY (exec_id, timer_id)); \
+             CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+             PRIMARY KEY (exec_id, seq)); \
+             CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+             exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+        )
+        .expect("the fixture tables are created");
+        if armed {
+            conn.execute(
+                "INSERT INTO harvest_timers VALUES \
+                 ('__signal_timeout:9:tool_approval:9:0:toolu_now', 'e', 9999, 0, 9)",
+                [],
+            )
+            .expect("the armed timer is recorded");
+        }
+        conn.execute(
+            "INSERT INTO harvest_events VALUES ('e', 0, ?1)",
+            [json!({
+                "type": "SignalReceived",
+                "data": {
+                    "signal_name": "tool_approval:1:0:earlier",
+                    "payload": serde_json::from_str::<Value>(payload).expect("the payload parses"),
+                },
+            })
+            .to_string()],
+        )
+        .expect("the earlier approval is appended");
+        conn
+    };
+
+    // NO armed timer, so the session stopped somewhere else entirely and the
+    // read of the awaited signal never looks at this event.
+    for (label, payload) in [
+        ("an object with no declared field", "{}"),
+        (
+            "a declared field of the wrong type",
+            r#"{"approved":"yes"}"#,
+        ),
+    ] {
+        let refused = inspect::outstanding_signal(&build(payload, false), "e", 1_000)
+            .expect_err("an earlier approval the workflow cannot read must refuse the restart");
+        assert!(
+            refused.contains("recorded a decision the workflow cannot read"),
+            "[{label}] the refusal must say WHY it refuses: {refused}"
+        );
+        assert!(
+            serde_json::from_str::<session::ApprovalDecision>(payload).is_err(),
+            "[{label}] and the workflow itself must refuse the payload"
+        );
+    }
+
+    // The not-the-fault cases. An earlier approval the workflow reads leaves
+    // the session resumable, with or without a wait outstanding now.
+    assert_eq!(
+        inspect::outstanding_signal(&build(r#"{"approved":true}"#, false), "e", 1_000)
+            .expect("the wait query runs"),
+        None,
+        "a readable earlier approval is not refused"
+    );
+    assert_eq!(
+        inspect::outstanding_signal(
+            &build(r#"{"approved":false,"note":"no"}"#, true),
+            "e",
+            1_000
+        )
+        .expect("the wait query runs"),
+        Some("tool_approval:9:0:toolu_now".to_string()),
+        "and the wait it stopped on is still restored"
     );
 }
