@@ -15,6 +15,7 @@ mod activity_pause_tests;
 mod admission_gate_authoritative_tests;
 mod admission_gate_tests;
 mod alert_pack_docs;
+mod audit_export_docs;
 #[cfg(feature = "db")]
 mod audit_export_tests;
 mod audit_tests;
@@ -144,6 +145,8 @@ mod payload_offload_db_tests;
 #[cfg(feature = "testing")]
 mod payload_offload_replay_tests;
 mod performance_docs;
+#[cfg(feature = "db")]
+mod poison_pill_reclaim_perf;
 mod poison_pill_tests;
 mod priority_tests;
 #[cfg(feature = "testing")]

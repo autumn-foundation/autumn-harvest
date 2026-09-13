@@ -41,11 +41,15 @@ Harvest now streams them off-box.
   itself writes an audit record.
 - **Retention will never purge an unexported record.** A sweep that removed one
   would be a silent compliance gap — gone from the database *and* absent from
-  the SIEM. When no sink is configured the guard finds nothing and the purge is
-  unchanged.
-- **Opt-in and zero-cost when unconfigured**: no sink registered means no
-  sequence assigned, no cursor row, and the scanner returns before issuing a
-  query. **No new `WorkflowEvent` variant, zero replay-determinism impact.**
+  the SIEM. See `docs/audit-export.md`'s "Retention interaction" section for
+  exactly when the guard applies: a durable cursor row keeps applying even
+  after a sink is removed from the sweeping process.
+- **Opt-in, but one cost is not zero**: no sink configured means no sequence
+  is assigned, no cursor row is created, and the scanner returns before
+  issuing a query. In a deployment that never configures a sink, the
+  partial index matches every row. Every insert still pays its maintenance
+  cost regardless of configuration. Tracked as issue #1272. **No new
+  `WorkflowEvent` variant, zero replay-determinism impact.**
 
 New migration: `20260728000000_harvest_audit_export`. See
 `docs/audit-export.md`.
