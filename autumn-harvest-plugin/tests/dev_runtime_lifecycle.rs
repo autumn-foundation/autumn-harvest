@@ -140,9 +140,22 @@ fn binaries() -> Option<PostgresBinaries> {
 /// invisible to `ci_run_coverage.rs`. `HARVEST_DEV_REQUIRE_POSTGRES=1` makes a
 /// runner image that lost its `PostgreSQL` a red build rather than a green
 /// no-op.
+///
+/// Reads through `DEV_RUNTIME_START_SERIAL` (Codex review, issue #1291),
+/// the same lock every `EnvVarGuard` mutation in this file holds. A bare
+/// `std::env::var` here could run from an unguarded test in parallel with
+/// a guarded one's `set`/`remove`. That would race a live mutation of the
+/// process environment — undefined behavior on Unix, not merely a wrong
+/// answer.
 fn skip(reason: &str) -> Option<PostgresBinaries> {
+    let require_postgres = {
+        let _serial = DEV_RUNTIME_START_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::var("HARVEST_DEV_REQUIRE_POSTGRES")
+    };
     assert!(
-        std::env::var("HARVEST_DEV_REQUIRE_POSTGRES").as_deref() != Ok("1"),
+        require_postgres.as_deref() != Ok("1"),
         "HARVEST_DEV_REQUIRE_POSTGRES=1 but this suite would have skipped: {reason}"
     );
     eprintln!("SKIP: {reason}");
