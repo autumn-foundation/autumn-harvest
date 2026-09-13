@@ -415,6 +415,79 @@ async fn spawned_poison_pill_reclaimer_registers_ticks_and_deregisters() {
     );
 }
 
+/// The same register/tick/deregister proof as the poison-pill reclaimer
+/// above, for the dedicated audit-export task (issue #1269).
+///
+/// No sink is installed, so this also exercises AC3's "ticks even with
+/// nothing to do" property on the new loop. It must tick on every
+/// iteration even though every tick is a no-op: no sink configured means no
+/// connection is even attempted.
+#[tokio::test]
+async fn spawned_audit_export_checker_registers_ticks_and_deregisters() {
+    // Serialize against sibling tests that touch the process-global registry;
+    // the delta assertions below are only sound with exclusive access.
+    let _serial = TEST_SERIAL.lock().await;
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let recorder = std::sync::Arc::new(TickRecorder::default());
+    let telemetry = std::sync::Arc::new(autumn_harvest::telemetry::TelemetryConfig {
+        metrics: recorder.clone(),
+        ..Default::default()
+    });
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    let before = global_scanner_liveness().registrations(Scanner::AuditExport);
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool.clone(),
+        cancel.clone(),
+        Duration::from_millis(50),
+        telemetry,
+        Some(ShardId::new(0)),
+        None,
+    );
+    assert_eq!(
+        global_scanner_liveness().registrations(Scanner::AuditExport),
+        before + 1,
+        "the loop must register itself at spawn time, before its first iteration"
+    );
+    assert!(
+        global_scanner_liveness()
+            .snapshot()
+            .iter()
+            .any(|status| status.scanner == Scanner::AuditExport
+                && status.shard == Some(ShardId::new(0))),
+        "the spawner's shard must reach the liveness snapshot"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if recorder
+            .ticks()
+            .iter()
+            .filter(|t| *t == "audit_export")
+            .count()
+            >= 2
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the export task must tick on every iteration with no sink \
+             configured; got {:?}",
+            recorder.ticks()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    cancel.cancel();
+    let _ = handle.await;
+    assert_eq!(
+        global_scanner_liveness().registrations(Scanner::AuditExport),
+        before,
+        "a graceful stop must release the registration"
+    );
+}
+
 /// A wedged loop is detectable within `2 x` its poll interval — the issue's
 /// success metric, expressed against the real classifier rather than a
 /// hand-computed threshold.

@@ -39,6 +39,12 @@
 //!   and `a_shard_whose_database_is_unreachable_is_marked_unobserved` — issue
 //!   #1268: `harvest.audit.export_observed` reports an unreachable shard, so
 //!   the lag gauge is never the only signal.
+//! - `enforce_timeouts_once_no_longer_exports_audit_records`,
+//!   `spawn_audit_export_checker_for_shard_exports_independently`, and
+//!   `a_dedicated_export_task_still_exports_on_a_size_one_pool_shared_with_the_timeout_checker`
+//!   — issue #1269. Export runs on its own task now, decoupled from the
+//!   timeout checker's cadence and connection. A shard pool sized for one
+//!   connection can still export.
 
 use std::sync::{Arc, Mutex};
 
@@ -174,12 +180,13 @@ impl AuditSink for RecordingSink {
 }
 
 /// Records `harvest.audit.export_lag` / `harvest.audit.export_observed` /
-/// `harvest.audit.exported` samples.
+/// `harvest.audit.exported` samples, plus `harvest.scanner.tick` labels.
 #[derive(Default)]
 struct RecordingMetrics {
     lag: Mutex<Vec<(u16, f64)>>,
     observed: Mutex<Vec<(u16, bool)>>,
     exported: Mutex<Vec<(u16, u64)>>,
+    ticks: Mutex<Vec<String>>,
 }
 
 impl MetricsRecorder for RecordingMetrics {
@@ -197,6 +204,29 @@ impl MetricsRecorder for RecordingMetrics {
             .lock()
             .expect("exported lock")
             .push((shard, count));
+    }
+    fn record_scanner_tick(&self, scanner: &str, shard: &str) {
+        let _ = shard;
+        self.ticks
+            .lock()
+            .expect("ticks lock")
+            .push(scanner.to_owned());
+    }
+}
+
+/// A sink that blocks until released. A test can hold a delivery open for as
+/// long as it needs, to observe what happens while it is in flight.
+struct SlowSink {
+    release: Arc<tokio::sync::Notify>,
+    status: u16,
+}
+
+impl AuditSink for SlowSink {
+    fn deliver<'a>(&'a self, _batch: &'a AuditBatch<'a>) -> SinkFuture<'a> {
+        Box::pin(async move {
+            self.release.notified().await;
+            SinkAttempt::success(self.status)
+        })
     }
 }
 
@@ -1904,15 +1934,12 @@ async fn a_shard_whose_database_is_unreachable_is_marked_unobserved() {
     );
 }
 
-// Codex review on PR #1505: the two tests above cover a failure INSIDE
-// `fire_due_audit_exports`'s own per-shard loop. But `enforce_timeouts_once`
-// -- and therefore `fire_due_audit_exports` -- is only reached after the
-// timeout checker's OWN, earlier connection acquisition succeeds. If a
-// shard's database is unreachable even for that first checkout, the inner
-// mechanism never runs at all this tick.
-// `spawn_timeout_checker_for_shard` must mark the shard unobserved itself.
+// Issue #1269: audit export moved off the timeout checker's shared loop onto
+// its own dedicated task. `spawn_audit_export_checker_for_shard` must mark
+// ITS OWN shard unobserved when it cannot acquire a connection -- the
+// timeout checker's connection health is no longer coupled to export's.
 #[tokio::test]
-async fn a_checkers_own_connection_failure_marks_its_shard_unobserved() {
+async fn a_dedicated_export_tasks_own_connection_failure_marks_its_shard_unobserved() {
     let _guard = TEST_SERIAL.lock().await;
     let _installed = install(Arc::new(RecordingSink::new(200)), 100);
 
@@ -1930,20 +1957,13 @@ async fn a_checkers_own_connection_failure_marks_its_shard_unobserved() {
     });
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    let handle = autumn_harvest::timeout::spawn_timeout_checker_for_shard(
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
         pool,
         cancel.clone(),
         std::time::Duration::from_millis(50),
         telemetry,
-        std::time::Duration::from_secs(5),
+        Some(autumn_harvest::types::ShardId::new(7)),
         None,
-        vec![autumn_harvest::types::ShardId::new(0)],
-        Arc::new(autumn_harvest::circuit_breaker::CircuitBreakerRegistry::default()),
-        None,
-        60,
-        Some(autumn_harvest::types::ShardId::new(0)),
-        autumn_harvest::payload_codec::PayloadCodecs::default(),
-        0,
     );
 
     // Poll (bounded) rather than sleeping a fixed span: fast when the fix
@@ -1954,14 +1974,14 @@ async fn a_checkers_own_connection_failure_marks_its_shard_unobserved() {
             .observed
             .lock()
             .expect("observed")
-            .contains(&(0_u16, false))
+            .contains(&(7_u16, false))
         {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the checker must mark its own shard unobserved when it cannot even \
-             acquire its own connection; got {:?}",
+            "the export task must mark its own shard unobserved when it \
+             cannot even acquire its own connection; got {:?}",
             metrics.observed.lock().expect("observed")
         );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -1969,7 +1989,7 @@ async fn a_checkers_own_connection_failure_marks_its_shard_unobserved() {
     assert!(
         metrics.lag.lock().expect("lag").is_empty(),
         "the lag gauge must not be given a fabricated reading for a shard \
-         whose checker could never even acquire a connection"
+         whose export task could never acquire a connection"
     );
 
     cancel.cancel();
@@ -1977,24 +1997,18 @@ async fn a_checkers_own_connection_failure_marks_its_shard_unobserved() {
     uninstall();
 }
 
-// Issue #1268: the legacy `spawn_timeout_checker` entry point passes
-// `shard: None` for a process-wide loop. That loop can still cover a real,
-// non-default `shard_assignments` (e.g. `[7]`) when driving a sharded pool.
-// The fix above must label the shards `shard_assignments` actually names.
-// It must never fall back to the pool's own default shard. Otherwise a
-// connection failure here would mark the WRONG shard (0) unobserved, while
-// the actually-affected shard (7) stays frozen.
+// The unsharded-fallback sibling: `shard: None` must resolve the reported
+// shard from `sharded_pool`'s own default, never a hardcoded label, mirroring
+// `fire_due_audit_exports`'s unsharded arm.
 #[tokio::test]
-async fn a_process_wide_checkers_connection_failure_marks_its_real_shards_unobserved() {
+async fn a_dedicated_export_tasks_unsharded_fallback_labels_the_pools_default_shard() {
     let _guard = TEST_SERIAL.lock().await;
     let _installed = install(Arc::new(RecordingSink::new(200)), 100);
 
     let (_conn, container) = make_conn().await;
     let pool = single_connection_pool(&container).await;
-    // `ShardedDbPool::single` always defaults to shard 0. That is exactly
-    // the wrong-shard label a naive fix would fall back to, so the
-    // assignment below names a different shard on purpose. Built before
-    // the container stops: `get_host_port_ipv4` needs the live mapping.
+    // `ShardedDbPool::single` always defaults to shard 0. Built before the
+    // container stops: `get_host_port_ipv4` needs the live mapping.
     let sharded =
         autumn_harvest::shard::ShardedDbPool::single(single_connection_pool(&container).await);
     container
@@ -2009,20 +2023,13 @@ async fn a_process_wide_checkers_connection_failure_marks_its_real_shards_unobse
     });
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    let handle = autumn_harvest::timeout::spawn_timeout_checker_for_shard(
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
         pool,
         cancel.clone(),
         std::time::Duration::from_millis(50),
         telemetry,
-        std::time::Duration::from_secs(5),
-        Some(sharded),
-        vec![autumn_harvest::types::ShardId::new(7)],
-        Arc::new(autumn_harvest::circuit_breaker::CircuitBreakerRegistry::default()),
         None,
-        60,
-        None, // the legacy, process-wide entry point's own shard label
-        autumn_harvest::payload_codec::PayloadCodecs::default(),
-        0,
+        Some(&sharded),
     );
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -2031,29 +2038,18 @@ async fn a_process_wide_checkers_connection_failure_marks_its_real_shards_unobse
             .observed
             .lock()
             .expect("observed")
-            .contains(&(7_u16, false))
+            .contains(&(0_u16, false))
         {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the checker must mark shard 7 -- the shard `shard_assignments` \
-             actually names -- unobserved, never the pool's own default \
-             shard 0; got {:?}",
+            "the unsharded fallback must label the pool's own default shard \
+             (0); got {:?}",
             metrics.observed.lock().expect("observed")
         );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    assert!(
-        !metrics
-            .observed
-            .lock()
-            .expect("observed")
-            .contains(&(0_u16, false)),
-        "shard 0 was never assigned to this loop and must not be reported \
-         at all; got {:?}",
-        metrics.observed.lock().expect("observed")
-    );
 
     cancel.cancel();
     let _ = handle.await;
@@ -3318,4 +3314,623 @@ fn an_embedder_sink_needs_no_http_client() {
     // And the record type is plain data an embedder can map freely.
     fn assert_serde<T: serde::Serialize + serde::de::DeserializeOwned>() {}
     assert_serde::<AuditExportRecord>();
+}
+
+// ── Issue #1269: audit export runs on its own dedicated task ────────────────
+
+/// Before this fix, `enforce_timeouts_once` drove `fire_due_audit_exports`
+/// inline. A due audit record was exported as a side effect of a single
+/// timeout-enforcement pass. This pins the decoupling: calling
+/// `enforce_timeouts_once` directly must export nothing at all, on any
+/// shard, ever -- export happens only through
+/// `spawn_audit_export_checker_for_shard`'s own task now.
+#[tokio::test]
+async fn enforce_timeouts_once_no_longer_exports_audit_records() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 3).await;
+
+    autumn_harvest::timeout::enforce_timeouts_once(
+        &mut conn,
+        &autumn_harvest::telemetry::NoOpMetrics,
+        std::time::Duration::from_secs(60),
+        &None,
+        &[],
+        None,
+        None,
+        60,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
+    )
+    .await
+    .expect("enforce_timeouts_once");
+    uninstall();
+
+    assert!(
+        sink.captured().is_empty(),
+        "enforce_timeouts_once must no longer drive audit export at all"
+    );
+    assert!(
+        export_seqs(&mut conn).await.iter().all(Option::is_none),
+        "no sequence may be assigned by enforce_timeouts_once; only the \
+         dedicated export task claims and stamps audit rows now"
+    );
+    assert_eq!(
+        export_status(&mut conn, 0, chrono::Utc::now())
+            .await
+            .expect("status query"),
+        None,
+        "enforce_timeouts_once must not create a cursor row either"
+    );
+}
+
+/// The dedicated task exports on its own, with no `enforce_timeouts_once`
+/// tick anywhere in the picture.
+#[tokio::test]
+async fn spawn_audit_export_checker_for_shard_exports_independently() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, container) = make_conn().await;
+    insert_audit_rows(&mut conn, 5).await;
+
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(url);
+    let pool = autumn_harvest::worker::DbPool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("pool");
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(20),
+        std::sync::Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        Some(autumn_harvest::types::ShardId::new(0)),
+        None,
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while sink.all_seqs().len() < 5 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dedicated task must export the due records on its own \
+             cadence; got {:?}",
+            sink.all_seqs()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(sink.all_seqs(), (1..=5).collect::<Vec<i64>>());
+
+    cancel.cancel();
+    let _ = handle.await;
+    uninstall();
+}
+
+/// AC8 on the dedicated task: with no sink configured, the task must never
+/// even attempt a connection checkout, not merely fail gracefully if it
+/// did. Proven here by pointing the task at an unreachable database: if it
+/// ever called `pool.get()`, that call would fail and mark the shard
+/// unobserved. Across several tick intervals with no sink installed,
+/// nothing is ever marked unobserved. That is only possible if the
+/// connection checkout was skipped every single tick.
+#[tokio::test]
+async fn an_unconfigured_dedicated_task_never_attempts_a_connection_checkout() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+
+    let (_conn, container) = make_conn().await;
+    let pool = single_connection_pool(&container).await;
+    container
+        .stop_with_timeout(Some(0))
+        .await
+        .expect("stop container");
+
+    let metrics = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(autumn_harvest::telemetry::TelemetryConfig {
+        metrics: metrics.clone(),
+        ..Default::default()
+    });
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(20),
+        telemetry,
+        Some(autumn_harvest::types::ShardId::new(0)),
+        None,
+    );
+
+    // Several tick intervals' worth of real time, not just one: a single
+    // lucky tick proves nothing about every subsequent one.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    assert!(
+        metrics.observed.lock().expect("observed").is_empty(),
+        "an unconfigured task must never mark a shard unobserved -- that can \
+         only happen after a connection checkout was attempted, which AC8 \
+         forbids; got {:?}",
+        metrics.observed.lock().expect("observed")
+    );
+
+    cancel.cancel();
+    let _ = handle.await;
+}
+
+/// The registered staleness threshold must track the CURRENTLY configured
+/// export lease. It must not just track the one in effect at spawn time
+/// (Codex review on PR #1520, follow-up P2).
+///
+/// A later runtime can publish a longer lease at any point
+/// (`fence_against_sink_swap`'s doc comment documents that this is
+/// supported). The already-running task must pick it up without needing a
+/// restart.
+#[tokio::test]
+async fn audit_export_checker_re_registers_when_the_configured_lease_grows() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let shard = ShardId::new(9001);
+    let telemetry = Arc::new(autumn_harvest::telemetry::TelemetryConfig::default());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let poll_interval = std::time::Duration::from_millis(20);
+
+    let (_conn, container) = make_conn().await;
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(url);
+    let pool = autumn_harvest::worker::DbPool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("pool");
+
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        poll_interval,
+        telemetry,
+        Some(shard),
+        None,
+    );
+
+    let find_status = || {
+        autumn_harvest::scanner_health::global_scanner_liveness()
+            .snapshot()
+            .into_iter()
+            .find(|s| {
+                s.scanner == autumn_harvest::scanner_health::Scanner::AuditExport
+                    && s.shard == Some(shard)
+            })
+    };
+
+    // Unconfigured: the registered interval is the bare poll interval.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if find_status().is_some_and(|s| s.poll_interval == poll_interval) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the task must register itself with the bare poll interval when \
+             unconfigured; last saw {:?}",
+            find_status()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // A second runtime publishes a sink with a long lease.
+    let long_lease = std::time::Duration::from_secs(120);
+    let _installed = install_with_lease(Arc::new(RecordingSink::new(200)), 100, long_lease);
+
+    // The registered interval must grow to match, without restarting the
+    // task. It sums the poll interval, the checkout bound, and the lease,
+    // not their max (Codex review on PR #1520, follow-up P2, second
+    // round). See `audit_export_liveness_interval`.
+    let expected_interval =
+        poll_interval + autumn_harvest::audit_export::SHARD_ACQUIRE_BOUND + long_lease;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if find_status().is_some_and(|s| s.poll_interval == expected_interval) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the task must re-register with the new, longer lease once it \
+             observes the config change; last saw {:?}",
+            find_status()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    cancel.cancel();
+    let _ = handle.await;
+    uninstall();
+}
+
+/// The property this issue's fix rests on. Codex review rounds 15/18 on PR
+/// #1261 named the specific old hazard. The multi-shard fan-out arm of
+/// `fire_due_audit_exports` ran inline while the timeout checker's own
+/// connection from the same pool was still held. It tried to acquire a
+/// SECOND connection from a `max_size(1)` pool and could never succeed.
+///
+/// This test does not re-drive that exact inline call site -- it is gone,
+/// and `enforce_timeouts_once_no_longer_exports_audit_records` above pins
+/// that directly. It instead checks the fix's replacement property. A
+/// shard pool sized for one connection, shared by the timeout checker AND
+/// the export task as two independent tasks, still exports. Neither task
+/// ever holds the connection while asking for a second one. They simply
+/// take turns.
+#[tokio::test]
+async fn a_dedicated_export_task_still_exports_on_a_size_one_pool_shared_with_the_timeout_checker()
+{
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, container) = make_conn().await;
+    insert_audit_rows(&mut conn, 3).await;
+
+    let pool = single_connection_pool(&container).await;
+    let telemetry = std::sync::Arc::new(autumn_harvest::telemetry::TelemetryConfig::default());
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    // The timeout checker: same pool, same shard, ticking concurrently. It
+    // finds nothing to enforce every tick, but it periodically holds the
+    // pool's one connection exactly like it did before this fix.
+    let checker_handle = autumn_harvest::timeout::spawn_timeout_checker_for_shard(
+        pool.clone(),
+        cancel.clone(),
+        std::time::Duration::from_millis(15),
+        telemetry.clone(),
+        std::time::Duration::from_secs(5),
+        None,
+        vec![],
+        Arc::new(autumn_harvest::circuit_breaker::CircuitBreakerRegistry::default()),
+        None,
+        60,
+        Some(autumn_harvest::types::ShardId::new(0)),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
+    );
+    let export_handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(20),
+        telemetry,
+        Some(autumn_harvest::types::ShardId::new(0)),
+        None,
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while sink.all_seqs().len() < 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a one-connection shard pool must still export once the timeout \
+             checker and the export task are independent tasks; got {:?}",
+            sink.all_seqs()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(sink.all_seqs(), vec![1, 2, 3]);
+
+    cancel.cancel();
+    let _ = checker_handle.await;
+    let _ = export_handle.await;
+    uninstall();
+}
+
+/// The exact hazard PR #1520's own review raised on this issue's fix. A
+/// slow, still-in-flight delivery must never occupy a `max_size(1)` shard
+/// pool's only connection. If it did, the timeout checker sharing that pool
+/// could not tick even once until the delivery finished.
+///
+/// Proven with a sink that blocks until released. While it is blocked, the
+/// export task must hold NO connection at all. The checker keeps ticking on
+/// the pool's one connection the whole time.
+#[tokio::test]
+async fn an_in_flight_slow_delivery_never_blocks_the_timeout_checker_on_a_size_one_pool() {
+    let _guard = TEST_SERIAL.lock().await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let sink: Arc<dyn AuditSink> = Arc::new(SlowSink {
+        release: Arc::clone(&release),
+        status: 200,
+    });
+    {
+        // A long lease: this test holds the delivery open on purpose, and
+        // the lease must not classify that as a timeout while we do.
+        let mut lock = GLOBAL_AUDIT_EXPORT_CONFIG
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *lock = Some(Arc::new(AuditExportRuntimeConfig {
+            sink,
+            secret: CallbackSecret::new(b"test-secret".to_vec()),
+            batch_size: 100,
+            backoff: ExportBackoff::default(),
+            lease: std::time::Duration::from_secs(300),
+        }));
+    }
+    let (mut conn, container) = make_conn().await;
+    insert_audit_rows(&mut conn, 1).await;
+
+    let pool = single_connection_pool(&container).await;
+    let metrics = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(autumn_harvest::telemetry::TelemetryConfig {
+        metrics: metrics.clone(),
+        ..Default::default()
+    });
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    let checker_handle = autumn_harvest::timeout::spawn_timeout_checker_for_shard(
+        pool.clone(),
+        cancel.clone(),
+        std::time::Duration::from_millis(15),
+        telemetry.clone(),
+        std::time::Duration::from_secs(5),
+        None,
+        vec![],
+        Arc::new(autumn_harvest::circuit_breaker::CircuitBreakerRegistry::default()),
+        None,
+        60,
+        Some(autumn_harvest::types::ShardId::new(0)),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
+    );
+    let export_handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(20),
+        telemetry,
+        Some(autumn_harvest::types::ShardId::new(0)),
+        None,
+    );
+
+    // Give the export task time to claim the row and enter its delivery
+    // call, which is now blocked on `release`.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // While the delivery is still blocked, the checker must keep ticking --
+    // proof it can still acquire the pool's one connection.
+    let before = metrics
+        .ticks
+        .lock()
+        .expect("ticks")
+        .iter()
+        .filter(|t| *t == "timeout")
+        .count();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let after = metrics
+        .ticks
+        .lock()
+        .expect("ticks")
+        .iter()
+        .filter(|t| *t == "timeout")
+        .count();
+    assert!(
+        after > before,
+        "the timeout checker must keep ticking while a slow delivery is in \
+         flight on a size-one pool, proving the export task released the \
+         connection before the network call; got before={before} after={after}"
+    );
+
+    release.notify_one();
+    cancel.cancel();
+    let _ = checker_handle.await;
+    let _ = export_handle.await;
+    uninstall();
+}
+
+/// Graceful shutdown must not wait for an in-flight delivery (Codex review
+/// on PR #1520, follow-up P1). Both worker shutdown paths join every
+/// export task's `JoinHandle`. Without a fix, a slow or blackholed sink
+/// would hold up shutdown for as long as the claim lease allows.
+#[tokio::test]
+async fn graceful_shutdown_does_not_wait_for_an_in_flight_delivery() {
+    let _guard = TEST_SERIAL.lock().await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let sink: Arc<dyn AuditSink> = Arc::new(SlowSink {
+        release: Arc::clone(&release),
+        status: 200,
+    });
+    {
+        // A long lease: without the fix, shutdown would block for this
+        // whole duration once a delivery is in flight.
+        let mut lock = GLOBAL_AUDIT_EXPORT_CONFIG
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *lock = Some(Arc::new(AuditExportRuntimeConfig {
+            sink,
+            secret: CallbackSecret::new(b"test-secret".to_vec()),
+            batch_size: 100,
+            backoff: ExportBackoff::default(),
+            lease: std::time::Duration::from_secs(300),
+        }));
+    }
+    let (mut conn, container) = make_conn().await;
+    insert_audit_rows(&mut conn, 1).await;
+
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(url);
+    let pool = autumn_harvest::worker::DbPool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("pool");
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(20),
+        Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        Some(autumn_harvest::types::ShardId::new(0)),
+        None,
+    );
+
+    // Give the task time to claim the row and enter the blocked delivery.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    cancel.cancel();
+    let shutdown_bound = std::time::Duration::from_secs(5);
+    let result = tokio::time::timeout(shutdown_bound, handle).await;
+    assert!(
+        result.is_ok(),
+        "graceful shutdown must not wait for an in-flight delivery; the \
+         task did not exit within {shutdown_bound:?} of a still-blocked sink \
+         with a 300s lease"
+    );
+
+    // Nothing is awaiting the sink anymore -- harmless, but tidy.
+    release.notify_one();
+    uninstall();
+}
+
+/// The exact hazard a later review pass on PR #1520 raised. A successful
+/// delivery finishing right at `lease_until` must not be left with zero
+/// time to reacquire a connection and run the acknowledgement query.
+///
+/// The delivery deadline reserves `SHARD_ACQUIRE_BOUND` plus
+/// `ACK_QUERY_BOUND` off the lease. A still-blocked sink must therefore
+/// fail well before the raw lease elapses. A backoff is recorded then, not
+/// only once the raw lease itself runs out.
+#[tokio::test]
+async fn the_delivery_deadline_reserves_time_for_the_acknowledgement() {
+    let _guard = TEST_SERIAL.lock().await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let sink: Arc<dyn AuditSink> = Arc::new(SlowSink {
+        release: Arc::clone(&release),
+        status: 200,
+    });
+    // SHARD_ACQUIRE_BOUND is 5s and ACK_QUERY_BOUND is 2s, a 7s reserve. A
+    // 12s lease leaves ~5s of delivery budget once that is reserved. That
+    // is comfortably inside this test's 8s deadline, and comfortably short
+    // of the raw 12s lease.
+    let lease = std::time::Duration::from_secs(12);
+    {
+        let mut lock = GLOBAL_AUDIT_EXPORT_CONFIG
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *lock = Some(Arc::new(AuditExportRuntimeConfig {
+            sink,
+            secret: CallbackSecret::new(b"test-secret".to_vec()),
+            batch_size: 100,
+            backoff: ExportBackoff::default(),
+            lease,
+        }));
+    }
+    let (mut conn, container) = make_conn().await;
+    insert_audit_rows(&mut conn, 1).await;
+
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(url);
+    let pool = autumn_harvest::worker::DbPool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("pool");
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(20),
+        Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        Some(autumn_harvest::types::ShardId::new(0)),
+        None,
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        let status = export_status(&mut conn, 0, chrono::Utc::now())
+            .await
+            .expect("status query");
+        if status.is_some_and(|s| s.consecutive_failures >= 1) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a delivery blocked well past the reserved delivery deadline must \
+             be classified as a failure long before the raw {lease:?} lease \
+             elapses; the reserve was not applied"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    cancel.cancel();
+    release.notify_one();
+    let _ = handle.await;
+    uninstall();
+}
+
+/// The exact hazard a later review pass on PR #1520 raised. The reserve,
+/// `SHARD_ACQUIRE_BOUND` plus `ACK_QUERY_BOUND`, is longer than some
+/// supported leases. The builder allows a lease as short as one second.
+///
+/// Subtracting the reserve unconditionally would place `delivery_deadline`
+/// at or before the claim itself. Every batch would then time out
+/// immediately, regardless of how fast the sink actually is.
+///
+/// A four-second lease is well under the seven-second reserve. Without the
+/// cap, this instant sink would still be classified as a timeout. With the
+/// cap, the delivery, checkout, and acknowledgement windows all shrink,
+/// but stay positive, and the batch is delivered and acknowledged.
+#[tokio::test]
+async fn a_short_lease_still_keeps_a_positive_delivery_window() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install_with_lease(
+        Arc::new(RecordingSink::new(200)),
+        100,
+        std::time::Duration::from_secs(4),
+    );
+    let (mut conn, container) = make_conn().await;
+    insert_audit_rows(&mut conn, 1).await;
+
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(url);
+    let pool = autumn_harvest::worker::DbPool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("pool");
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(20),
+        Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        Some(autumn_harvest::types::ShardId::new(0)),
+        None,
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let status = export_status(&mut conn, 0, chrono::Utc::now())
+            .await
+            .expect("status query");
+        if status.is_some_and(|s| s.cursor_seq >= 1) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a short, builder-supported lease must still leave a positive \
+             delivery window; the cursor never advanced, so the reserve \
+             consumed the entire lease"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(sink.all_seqs(), vec![1]);
+
+    cancel.cancel();
+    let _ = handle.await;
+    uninstall();
 }
