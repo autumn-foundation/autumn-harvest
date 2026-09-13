@@ -1308,6 +1308,24 @@ impl RetentionRuntime {
                     &mut partition_resume_cursors,
                 ) => {},
             }
+            // Review finding: `register_scanner` above seeds this loop's
+            // liveness series at zero. That is the instant the process
+            // registered, not the instant this pass -- which can run
+            // long on a blocked partitioned shard -- actually finishes.
+            //
+            // `scanner_liveness`'s staleness threshold is measured from
+            // that same zero point. A startup pass alone can exceed it
+            // before the loop below ever gets to its own first tick.
+            // `/admin/preflight` would then see a scanner it must
+            // consider stale or wedged. That happens even though the
+            // process spent that whole window doing exactly the work it
+            // is registered for.
+            //
+            // Ticking here sends the same signal the loop's own
+            // end-of-iteration tick does: proof of life, not proof of
+            // deleted rows. It fires the moment real startup work
+            // finishes.
+            crate::scanner_health::record_scanner_tick(metrics.as_ref(), owner);
             loop {
                 tokio::select! {
                     () = shutdown_task.cancelled() => break,
