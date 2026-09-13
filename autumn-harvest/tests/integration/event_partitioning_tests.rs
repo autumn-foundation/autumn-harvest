@@ -3310,7 +3310,9 @@ async fn extending_the_write_window_never_queues_appends_indefinitely() {
     let ensure_url = url.clone();
     let ensurer = tokio::spawn(async move {
         let mut c = connect(&ensure_url).await;
-        partition::ensure_partitions(&mut c, far, 0, Duration::from_secs(2)).await
+        partition::ensure_partitions(&mut c, far, 0, Duration::from_secs(2))
+            .await
+            .map(|(created, _blocked)| created)
     });
 
     // Let the creation reach its lock wait before appending — otherwise the
@@ -3346,6 +3348,68 @@ async fn extending_the_write_window_never_queues_appends_indefinitely() {
 
     // Blocked, not an error: the cohort is retried next tick.
     ensurer.await.expect("ensure task").ok();
+}
+
+#[tokio::test]
+async fn a_partly_blocked_lookahead_catch_up_is_not_reported_as_a_healthy_pass() {
+    // Issue #1270 item 4: `ensure_partitions` keeps creating the REST of the
+    // window when one cohort cannot be carved out — deliberate, so a
+    // maintenance gap does not become self-perpetuating. But `maintain` must
+    // not then report a healthy, empty-`last_error` pass just because
+    // `created` is non-empty: an operator needs to see that part of the
+    // write window is still uncovered.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // `enable_partitioning` with default options already pre-created steps
+    // 0..=3 (today through +3 days) — `EnableOptions::default()`'s lookahead.
+    // Force step 5 of a wider 0..=6 window to be blocked instead: a generated
+    // partition name colliding with an unrelated, already-existing relation —
+    // one of the two ways `ensure_cohort_with_width` reports a cohort blocked
+    // (the other is a lock timeout, exercised above).
+    let collide_at = Utc::now() + chrono::Duration::days(5);
+    let collide_cohort = partition::cohort_start(collide_at, partition::DEFAULT_COHORT_WIDTH_SECS);
+    let collide_name = partition::partition_name(collide_cohort);
+    // `IF EXISTS` first: on a suite re-run against a persistent (rather than
+    // fresh-per-run) database, a stray relation left by an interrupted earlier
+    // run must not make this test fail for a reason unrelated to what it
+    // checks.
+    diesel::sql_query(format!("DROP TABLE IF EXISTS {collide_name}"))
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray relation from a previous run");
+    diesel::sql_query(format!("CREATE TABLE {collide_name} (id int)"))
+        .execute(&mut conn)
+        .await
+        .expect("seed a colliding relation");
+
+    let outcome = partition::maintain(&mut conn, Utc::now(), 6, &SweepOptions::default())
+        .await
+        .expect("maintain must not hard-fail on a partial lookahead gap");
+
+    assert!(
+        !outcome.created.is_empty(),
+        "the OTHER cohorts in the window must still be created; got {outcome:?}"
+    );
+    assert_eq!(
+        outcome.lookahead_blocked,
+        vec![collide_cohort.to_rfc3339()],
+        "the blocked cohort must be named individually, not folded into a \
+         count; got {outcome:?}"
+    );
+    assert!(
+        outcome
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("not fully covered")),
+        "a partial catch-up must not look like a healthy pass with no \
+         last_error — the CLI and the retention status API both key off it; \
+         got {outcome:?}"
+    );
 }
 
 #[tokio::test]

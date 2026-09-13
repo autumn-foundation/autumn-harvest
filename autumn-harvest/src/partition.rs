@@ -916,18 +916,27 @@ async fn cohort_partition_is_attached(
 /// This is what makes AC8's "no operator cron required" true: the retention
 /// runtime calls it every tick and at startup.
 ///
+/// Returns `(created, blocked)`. `blocked` names each cohort in the window
+/// that could not be carved out this pass — a generated name colliding with an
+/// unrelated relation, or a bounded lock attempt that ran out of time — even
+/// when the rest of the window was created successfully. A caller that only
+/// looks at `created` cannot tell "the window is fully covered" from "part of
+/// it is not", which is exactly the distinction an uncovered write range needs
+/// reported.
+///
 /// # Errors
 ///
-/// [`HarvestError::Database`] on a catalog or DDL failure.
+/// [`HarvestError::Database`] on a catalog or DDL failure, or when NONE of the
+/// window could be covered (every step blocked).
 #[cfg(feature = "db")]
 pub async fn ensure_partitions(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
     lookahead_cohorts: u32,
     lock_timeout: Duration,
-) -> HarvestResult<Vec<String>> {
+) -> HarvestResult<(Vec<String>, Vec<String>)> {
     let width = match detect_layout(conn).await? {
-        EventLayout::Unpartitioned => return Ok(Vec::new()),
+        EventLayout::Unpartitioned => return Ok((Vec::new(), Vec::new())),
         EventLayout::Partitioned { cohort_width_secs } => cohort_width_secs,
     };
     let mut created = Vec::new();
@@ -975,7 +984,7 @@ pub async fn ensure_partitions(
             blocked.join(", ")
         )));
     }
-    Ok(created)
+    Ok((created, blocked))
 }
 
 // ── Enabling the layout ────────────────────────────────────────────────────
@@ -1230,8 +1239,19 @@ pub async fn enable_partitioning(
         None => EnableMode::Fresh,
     };
 
-    let partitions_created =
+    let (partitions_created, lookahead_blocked) =
         ensure_partitions(conn, now, opts.lookahead_cohorts, opts.lock_timeout).await?;
+    if !lookahead_blocked.is_empty() {
+        // Not an error: the conversion itself already committed and `created`
+        // is non-empty (the all-blocked case errors inside `ensure_partitions`
+        // above), so this is a partial catch-up gap, not a failed enable. Left
+        // for the next maintenance tick to close, same as any other tick.
+        tracing::warn!(
+            blocked = %lookahead_blocked.join(", "),
+            "harvest partition enable: the lookahead window is not fully covered; \
+             the next maintenance tick will retry the rest"
+        );
+    }
     Ok(EnableReport {
         mode,
         partitions_created,
@@ -2861,14 +2881,34 @@ pub async fn maintain(
         Ok(n) => (n, None),
         Err(e) => (0, Some(e.to_string())),
     };
-    let created = ensure_partitions(conn, now, lookahead_cohorts, sweep_opts.lock_timeout).await?;
+    let (created, lookahead_blocked) =
+        ensure_partitions(conn, now, lookahead_cohorts, sweep_opts.lock_timeout).await?;
     let sweep = sweep(conn, now, sweep_opts).await?;
+    // A partial catch-up must not report as a healthy, empty-`last_error`
+    // pass: `ensure_partitions` keeps creating the rest of the window when one
+    // cohort is blocked (deliberately — see its doc), so `created` can be
+    // non-empty even though the write window is still not fully covered. Never
+    // overwrites `drain_error`; both are real, independent failures this tick
+    // and neither may hide the other.
+    let last_error = if lookahead_blocked.is_empty() {
+        drain_error
+    } else {
+        let msg = format!(
+            "the lookahead window is not fully covered: {} of {} cohort(s) blocked ({}); \
+             appends for those cohorts land in {DEFAULT_PARTITION} until a later pass succeeds",
+            lookahead_blocked.len(),
+            lookahead_cohorts + 1,
+            lookahead_blocked.join(", ")
+        );
+        Some(drain_error.map_or_else(|| msg.clone(), |prev| format!("{prev}; {msg}")))
+    };
     Ok(MaintenanceOutcome {
         at: Some(Utc::now()),
         created,
+        lookahead_blocked,
         drained,
         sweep,
-        last_error: drain_error,
+        last_error,
     })
 }
 
@@ -2886,6 +2926,17 @@ pub struct MaintenanceOutcome {
     pub at: Option<DateTime<Utc>>,
     /// Cohort partitions created to extend the lookahead window.
     pub created: Vec<String>,
+    /// Cohorts in the lookahead window that could NOT be created this pass —
+    /// a generated name colliding with an unrelated relation, or a bounded
+    /// lock attempt that ran out of time.
+    ///
+    /// Non-empty here means the write window is not fully covered even though
+    /// `created` may also be non-empty: `ensure_partitions` keeps creating the
+    /// rest of the window when one cohort is blocked, so a partial catch-up
+    /// must not be mistaken for a healthy pass. Retried automatically next
+    /// tick.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lookahead_blocked: Vec<String>,
     /// Rows moved out of the `DEFAULT` partition.
     pub drained: usize,
     /// The sweep result.

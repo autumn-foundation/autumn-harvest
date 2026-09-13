@@ -6300,6 +6300,12 @@ fn emit_partition_report(
                     for b in &m.sweep.blocked {
                         println!("  blocked: {b}");
                     }
+                    // A partial catch-up: some of the lookahead window covered,
+                    // some not. Named individually so an operator can tell
+                    // exactly which range still lands in the DEFAULT partition.
+                    for b in &m.lookahead_blocked {
+                        println!("  lookahead blocked: {b}");
+                    }
                 }
                 if let Some(sweep) = &r.would_sweep {
                     println!(
