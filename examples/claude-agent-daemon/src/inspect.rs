@@ -1223,11 +1223,17 @@ fn ambiguous_history(conn: &Connection, exec_id: &str) -> Result<Option<String>,
 ///
 /// A model reply is held to MORE than its shape. The live path refuses a
 /// reply whose calls carry an id that is blank, repeated, or unsafe in a
-/// shell. A recorded one reaches the operator by the same route. A reply
-/// this daemon would never have accepted is therefore not a history it can
-/// resume. The test is [`crate::claude::malformed_reply`] itself, so the two
-/// paths cannot drift. Measured on a recorded reply whose id holds `;`: the
-/// event read as `Ok` and `malformed_reply` refused it.
+/// shell. It refuses two more shapes the type accepts. One is a turn that
+/// ends and still asks for a tool. The other is a finished turn carrying no
+/// text and no call. A recorded one reaches the operator by the same route.
+/// A reply this
+/// daemon would never have accepted is therefore not a history it can
+/// resume.
+///
+/// The test is [`crate::claude::unusable_reply`] itself, which is the WHOLE
+/// set the live path applies. One of its three rules was applied here once,
+/// and the other two shapes resumed. Measured: `malformed_reply` answers
+/// "not malformed" for a reply that ends and still calls a tool.
 ///
 /// A result this daemon declares NO type for is passed over. The activity may
 /// belong to another workflow in the same file, and the id may name a
@@ -1238,7 +1244,7 @@ fn unreadable_output(name: Option<&String>, output: serde_json::Value) -> Option
         let Ok(reply) = serde_json::from_value::<session::TurnReply>(output) else {
             return Some("recorded a model reply the workflow cannot read".to_string());
         };
-        return crate::claude::malformed_reply(&reply).map(|why| {
+        return crate::claude::unusable_reply(&reply).map(|why| {
             format!("recorded a model reply this daemon would have refused, because {why}")
         });
     }

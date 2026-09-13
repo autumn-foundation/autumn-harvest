@@ -11791,7 +11791,9 @@ async fn one_turn_runs_no_more_calls_than_a_turn_may_run() {
 #[test]
 fn a_recorded_result_is_read_as_the_type_its_activity_declares() {
     let id = "01234567-89ab-4cde-8f01-23456789abcd";
-    let good_reply = r#"{"content":[],"stop_reason":"end_turn","text":"","tool_calls":[]}"#;
+    // A reply the LIVE path accepts. An empty one carries no text and no
+    // call, which that path refuses, so it cannot stand for a sound history.
+    let good_reply = r#"{"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn",           "text":"done","tool_calls":[]}"#;
     let good_outcome = r#"{"output":"done","is_error":false}"#;
     let build = |activity: &str, output: &str| {
         let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
@@ -11867,7 +11869,7 @@ fn a_recorded_result_is_read_as_the_type_its_activity_declares() {
         (
             "a reply holding an unknown key",
             "claude_turn",
-            r#"{"content":[],"stop_reason":"end_turn","text":"","tool_calls":[],"extra":1}"#,
+            r#"{"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn",               "text":"done","tool_calls":[],"extra":1}"#,
         ),
         // A tool outcome recorded against the MODEL activity would be read as
         // a reply and refused, so the pairing is what picks the type.
@@ -12181,5 +12183,185 @@ fn every_recorded_approval_is_read_and_not_only_the_awaited_one() {
         .expect("the wait query runs"),
         Some("tool_approval:9:0:toolu_now".to_string()),
         "and the wait it stopped on is still restored"
+    );
+}
+
+/// A history holding ONE recorded model reply, for the reply-rule tests.
+fn one_recorded_reply(id: &str, reply: &session::TurnReply) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
+    conn.execute_batch(
+        "CREATE TABLE harvest_timers (timer_id TEXT, exec_id TEXT, fire_at INTEGER, \
+         fired INTEGER NOT NULL DEFAULT 0, arm_seq INTEGER, \
+         PRIMARY KEY (exec_id, timer_id)); \
+         CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+         PRIMARY KEY (exec_id, seq)); \
+         CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+         exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+         delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+    )
+    .expect("the fixture tables are created");
+    conn.execute(
+        "INSERT INTO harvest_events VALUES ('e', 0, ?1)",
+        [json!({
+            "type": "ActivityScheduled",
+            "data": {
+                "activity_id": id,
+                "name": session::claude_turn_info().name,
+                "input": {},
+                "queue": "default",
+            },
+        })
+        .to_string()],
+    )
+    .expect("the schedule is appended");
+    conn.execute(
+        "INSERT INTO harvest_events VALUES ('e', 1, ?1)",
+        [json!({
+            "type": "ActivityCompleted",
+            "data": { "activity_id": id, "output": reply },
+        })
+        .to_string()],
+    )
+    .expect("the completion is appended");
+    conn
+}
+
+/// A recorded reply is held to EVERY live rule, and not one of them.
+///
+/// The live path applies three semantic tests. A restart that applied one
+/// resumed a session the live path would have refused. Each shape below is
+/// one the type accepts and `malformed_reply` alone passes.
+///
+/// Measured, before the whole set was applied:
+///
+/// ```text
+/// [end_turn WITH a tool call ] malformed=false agrees=false usable=true
+/// [tool_use with NO calls    ] malformed=false agrees=true  usable=false
+/// [end_turn with NOTHING     ] malformed=false agrees=true  usable=false
+/// ```
+#[test]
+fn a_recorded_reply_is_held_to_every_live_rule() {
+    let id = "01234567-89ab-4cde-8f01-23456789abcd";
+    let build = |reply: &session::TurnReply| one_recorded_reply(id, reply);
+    let call = session::ToolCall {
+        id: "toolu_01abcDEF".to_string(),
+        name: tools::TOOL_READ_FILE.to_string(),
+        input: json!({ "path": "x" }),
+    };
+
+    let refused: Vec<(&str, session::TurnReply)> = vec![
+        (
+            "a turn that ends and still asks for a tool",
+            session::TurnReply {
+                content: json!([{ "type": "tool_use", "id": "toolu_01abcDEF",
+                                  "name": tools::TOOL_READ_FILE, "input": { "path": "x" } }]),
+                stop_reason: "end_turn".to_string(),
+                text: "done".to_string(),
+                tool_calls: vec![call],
+            },
+        ),
+        (
+            "a tool turn that asks for nothing",
+            session::TurnReply {
+                content: json!([{ "type": "text", "text": "hm" }]),
+                stop_reason: claude::STOP_TOOL_USE.to_string(),
+                text: "hm".to_string(),
+                tool_calls: vec![],
+            },
+        ),
+        (
+            "a finished turn carrying nothing",
+            session::TurnReply {
+                content: json!([]),
+                stop_reason: "end_turn".to_string(),
+                text: String::new(),
+                tool_calls: vec![],
+            },
+        ),
+    ];
+    for (label, reply) in &refused {
+        // The SHAPE reads, and the one rule applied before passes it. That is
+        // why the whole set is what the restart must apply.
+        let as_value = serde_json::to_value(reply).expect("the reply serialises");
+        assert!(
+            serde_json::from_value::<session::TurnReply>(as_value).is_ok(),
+            "[{label}] the reply must be one the type accepts"
+        );
+        assert!(
+            claude::malformed_reply(reply).is_none(),
+            "[{label}] and one the single rule passes"
+        );
+        // The live path is the authority.
+        assert!(
+            claude::unusable_reply(reply).is_some(),
+            "[{label}] while the whole set refuses it"
+        );
+        let message = inspect::outstanding_signal(&build(reply), "e", 1_000)
+            .expect_err("a recorded reply the live path refuses must refuse the restart");
+        assert!(
+            message.contains("would have refused"),
+            "[{label}] the refusal must say WHY it refuses: {message}"
+        );
+    }
+
+    // The not-the-fault case: a reply the live path accepts still resumes.
+    let good = session::TurnReply {
+        content: json!([{ "type": "text", "text": "done" }]),
+        stop_reason: "end_turn".to_string(),
+        text: "done".to_string(),
+        tool_calls: vec![],
+    };
+    assert!(
+        claude::unusable_reply(&good).is_none(),
+        "the live path accepts an ordinary reply"
+    );
+    assert_eq!(
+        inspect::outstanding_signal(&build(&good), "e", 1_000).expect("the wait query runs"),
+        None,
+        "so the restart accepts it too"
+    );
+}
+
+/// No reply rule is applied on ONE path only.
+///
+/// The rules have two readers, and a rule added to the live path alone would
+/// let a restart resume a session that path refuses. That is the fault this
+/// guard exists for, and it already happened once: the restart applied
+/// `malformed_reply` while the live path applied three tests.
+///
+/// A unit test cannot reach "every future call site", so the source is read
+/// as data. Each rule may be called in ONE place, which is the set they are
+/// gathered into.
+#[test]
+fn no_reply_rule_is_applied_on_one_path_only() {
+    let claude_rs = include_str!("claude.rs");
+    let inspect_rs = include_str!("inspect.rs");
+    for rule in ["malformed_reply", "agrees_with_its_content", "is_usable"] {
+        // One call, inside `unusable_reply`, which takes `reply` by
+        // reference already. A call anywhere else passes `&reply`, so BOTH
+        // spellings are counted.
+        let inside = claude_rs.matches(&format!("{rule}(reply)")).count();
+        let outside = claude_rs.matches(&format!("{rule}(&reply)")).count();
+        assert_eq!(
+            inside, 1,
+            "{rule} must be gathered into the set, and got {inside} call(s) there"
+        );
+        assert_eq!(
+            outside, 0,
+            "{rule} must not be applied beside the set, and got {outside}"
+        );
+        assert!(
+            !inspect_rs.contains(&format!("{rule}(&reply)")),
+            "{rule} must not be applied on the restart path by itself"
+        );
+    }
+    // And the set itself IS what both paths call.
+    assert!(
+        claude_rs.contains("unusable_reply(&reply)"),
+        "the live path must apply the whole set"
+    );
+    assert!(
+        inspect_rs.contains("unusable_reply(&reply)"),
+        "and so must the restart"
     );
 }

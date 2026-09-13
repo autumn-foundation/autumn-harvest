@@ -311,26 +311,19 @@ fn call_api(
     // not is malformed, and it is refused before it can reach the gate.
     // Checked BEFORE the tool calls are handed back, because a block that
     // cannot be replayed fails the turn after the tools have already run.
-    if let Some(reason) = malformed_reply(&reply) {
-        return Err(body_failure(status, reason));
-    }
+    //
     // A turn cannot both end and ask for a tool. The pair is malformed, and it
-    // is refused here rather than resolved by a guess.
-    if !agrees_with_its_content(&reply) {
-        return Err(body_failure(
-            status,
-            "its response ended the turn and still asked for a tool",
-        ));
-    }
+    // is refused rather than resolved by a guess.
+    //
     // A finished turn that says nothing and calls nothing is not an answer. A
     // malformed block, or an empty `content`, reaches this point as a clean
     // `end_turn` with no text. That would report a billed non-answer as a
     // finished session.
-    if !is_usable(&reply) {
-        return Err(body_failure(
-            status,
-            "its response carried no text and no tool call",
-        ));
+    //
+    // All three are ONE test, because a recorded reply is held to the same
+    // rules on a restart. See [`unusable_reply`].
+    if let Some(reason) = unusable_reply(&reply) {
+        return Err(body_failure(status, reason));
     }
     // The reply is measured as it will be STORED, which no arithmetic over
     // the body can promise. `MAX_BODY_BYTES` divides the recorded cap by the
@@ -694,6 +687,34 @@ pub fn is_message(payload: &Value) -> bool {
 /// nothing by `parse_reply`. The report would then show an EARLIER turn's
 /// text as a clean finish. `max_tokens` names the session incomplete, so it
 /// claims nothing a damaged block could falsify.
+/// Every semantic rule a model reply must satisfy, as ONE test.
+///
+/// The rules have TWO readers. A reply is tested when it arrives, and a
+/// RECORDED reply is tested again when a stopped daemon reads the history it
+/// sits in. A restart that applied a smaller set would resume a session the
+/// live path would never have accepted.
+///
+/// That is why this exists rather than three calls at each site. A rule added
+/// here reaches both readers, and neither can hold a copy that goes stale.
+/// `no_reply_rule_is_applied_on_one_path_only` reads this file as data and
+/// fails if a rule is called anywhere but here.
+///
+/// Measured on three replies the shape alone accepts: `end_turn` carrying a
+/// tool call, `tool_use` carrying none, and `end_turn` carrying nothing.
+/// `malformed_reply` answered "not malformed" for every one of them.
+pub fn unusable_reply(reply: &TurnReply) -> Option<&'static str> {
+    if let Some(reason) = malformed_reply(reply) {
+        return Some(reason);
+    }
+    if !agrees_with_its_content(reply) {
+        return Some("its response ended the turn and still asked for a tool");
+    }
+    if !is_usable(reply) {
+        return Some("its response carried no text and no tool call");
+    }
+    None
+}
+
 pub fn malformed_reply(reply: &TurnReply) -> Option<&'static str> {
     if reply.stop_reason == crate::session::STOP_MAX_TOKENS {
         return None;
