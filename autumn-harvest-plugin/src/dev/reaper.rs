@@ -18,6 +18,9 @@
 //!    Sessions never live directly in the world-writable system temp directory,
 //!    where any other local account could create `harvest-dev-*/session.json`
 //!    naming a pid of ours, or a `bin_dir` whose `pg_ctl` we would then run.
+//!    Ownership is a real, uid-based check on Unix. Windows has no such check
+//!    yet (issue #1287); `directory_is_ours` falls back to a weaker location
+//!    heuristic there, and says so in its own doc comment.
 //! 2. **The record must be self-consistent.** Its `data_dir` has to be the one
 //!    this layout puts inside the session directory; a record pointing elsewhere
 //!    is corrupt or planted and is left alone.
@@ -70,23 +73,20 @@ fn harden_root(root: &Path) -> Result<(), DevError> {
             reason: "it is a symlink, so another local user could repoint it",
         });
     }
+    if let Err(reason) = directory_is_ours(root, &metadata) {
+        return Err(DevError::UntrustedSessionRoot {
+            path: root.to_path_buf(),
+            reason,
+        });
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::fs::PermissionsExt as _;
         // Ownership, not permission to chmod. For an unprivileged user those
         // are the same question, but `root` can `chmod` a directory any local
         // user pre-created — so a successful chmod proves nothing at uid 0,
         // and the records inside name a `bin_dir` whose `pg_ctl` the reaper
-        // then runs. Ask who owns it instead.
-        if let Some(uid) = unix_uid()
-            && metadata.uid() != uid
-        {
-            return Err(DevError::UntrustedSessionRoot {
-                path: root.to_path_buf(),
-                reason: "it belongs to another user, so its records are not ours to act on",
-            });
-        }
+        // then runs. `directory_is_ours` above is what actually decides.
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).map_err(|_| {
             DevError::UntrustedSessionRoot {
                 path: root.to_path_buf(),
@@ -95,6 +95,81 @@ fn harden_root(root: &Path) -> Result<(), DevError> {
         })?;
     }
     Ok(())
+}
+
+/// Whether a non-symlink directory is ours alone to trust.
+///
+/// The ownership question `harden_root` above and `directory_is_private`
+/// (`acquire.rs`) both ask, before this crate executes or deletes anything a
+/// directory holds. One helper, so the two sites cannot drift the way a
+/// `cfg(unix)`-only gap once let them (issue #1287).
+///
+/// # Unix vs Windows
+///
+/// Unix answers directly: the uid on `metadata` must be ours. Windows has no
+/// such check yet. Its own follow-up is issue #1287. The fallback there is a
+/// location heuristic: `dir` must resolve under a per-user root
+/// (`%LOCALAPPDATA%` or `%USERPROFILE%`). That proves WHERE the directory is,
+/// not WHO else can write to it. It is weaker than the Unix answer, and the
+/// error text below says so rather than claiming ownership was verified.
+pub(super) fn directory_is_ours(
+    dir: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), &'static str> {
+    // Each parameter is read on only one platform below. Discarding both up
+    // front keeps every other platform from warning on the unused one.
+    // This needs no per-cfg `#[allow(unused)]`. References are `Copy`, so
+    // the real reads further down still see the same values.
+    let _ = (dir, metadata);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if let Some(uid) = unix_uid()
+            && metadata.uid() != uid
+        {
+            return Err("it belongs to another user, so its contents are not ours to trust");
+        }
+    }
+    #[cfg(windows)]
+    {
+        if !windows_path_is_per_user(dir) {
+            return Err(
+                "on Windows its ownership cannot yet be verified, and it is not under a \
+                 per-user directory (%LOCALAPPDATA% or %USERPROFILE%) either",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether `dir` resolves under a per-user Windows root.
+///
+/// A location heuristic, not proof of ownership: nothing stops an
+/// administrator from redirecting `%LOCALAPPDATA%` or `%USERPROFILE%`
+/// machine-wide. It still closes the exposure issue #1287 describes. Every
+/// default this crate ever picks on its own — `std::env::temp_dir()`, the
+/// managed-cache root — already resolves under one of these two roots. So
+/// this only ever refuses an explicitly configured shared location, exactly
+/// the case that had no guard at all.
+///
+/// Both sides are canonicalised before comparison, so a case difference or a
+/// `\\?\` prefix does not produce a false refusal. Canonicalisation failure
+/// fails closed. A directory that cannot be resolved (a broken junction, say)
+/// is refused rather than compared by its unresolved, lexical path. The
+/// resolved target could turn out to be shared once the failure clears.
+#[cfg(windows)]
+fn windows_path_is_per_user(dir: &Path) -> bool {
+    let Ok(dir) = std::fs::canonicalize(dir) else {
+        return false;
+    };
+    ["LOCALAPPDATA", "USERPROFILE"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .filter(|root| !root.is_empty())
+        .any(|root| {
+            std::fs::canonicalize(&root)
+                .is_ok_and(|canonical_root| dir.starts_with(&canonical_root))
+        })
 }
 
 /// A stable, filesystem-safe identifier for the current user.
@@ -603,4 +678,49 @@ pub fn rewrite_owner_pid_for_test(session_dir: &Path, owner_pid: u32) {
     let mut record = SessionRecord::from_json(&raw).expect("session record should parse");
     record.owner_pid = owner_pid;
     std::fs::write(&path, record.to_json().expect("serialize")).expect("rewrite session record");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::directory_is_ours;
+
+    /// Issue #1287 regression: the Unix answer must not change. A directory
+    /// we own, with default `tempfile` permissions, is still trusted.
+    #[cfg(unix)]
+    #[test]
+    fn an_owner_owned_directory_is_still_trusted_on_unix() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let metadata = std::fs::symlink_metadata(dir.path()).expect("metadata");
+        assert!(directory_is_ours(dir.path(), &metadata).is_ok());
+    }
+
+    /// Issue #1287. Before this fix, `directory_is_ours` (formerly inlined in
+    /// `harden_root`) always returned `Ok` on Windows, for any non-symlink
+    /// directory. `%LOCALAPPDATA%` is per-user by Windows convention, so a
+    /// directory under it must still be trusted.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_under_localappdata_is_trusted_on_windows() {
+        let base = std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA must be set on Windows");
+        // A unique temp dir, not a fixed name: a fixed name could already
+        // exist with real contents, which dropping a `TempDir` would delete.
+        let dir = tempfile::tempdir_in(base).expect("temp dir under LOCALAPPDATA");
+        let metadata = std::fs::symlink_metadata(dir.path()).expect("metadata");
+        assert!(directory_is_ours(dir.path(), &metadata).is_ok());
+    }
+
+    /// Issue #1287's actual regression: a directory outside any per-user root
+    /// must be refused, not silently trusted. `C:\Windows\Temp` is the
+    /// machine-wide location the issue names as the realistic exposure (a
+    /// service, or a CI agent, whose `TEMP` points there).
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_outside_any_per_user_root_is_refused_on_windows() {
+        let dir = std::path::PathBuf::from(r"C:\Windows\Temp");
+        let metadata = std::fs::symlink_metadata(&dir).expect("metadata");
+        assert!(
+            directory_is_ours(&dir, &metadata).is_err(),
+            "a directory outside %LOCALAPPDATA%/%USERPROFILE% must be refused"
+        );
+    }
 }

@@ -102,6 +102,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          mutex_lease_reclaim_perf
 linux        autumn-harvest         integration                      -                          mutex_tests
 linux        autumn-harvest         integration                      -                          panic_containment_tests
+linux        autumn-harvest         integration                      -                          poison_pill_reclaim_perf
 linux        autumn-harvest         integration                      -                          queue_pause_success_metric_tests
 linux        autumn-harvest         integration                      -                          queue_pause_tests
 linux        autumn-harvest         integration                      -                          quota_enforcement_tests
