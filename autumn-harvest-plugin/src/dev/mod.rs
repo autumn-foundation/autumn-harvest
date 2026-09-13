@@ -420,6 +420,18 @@ impl DevRuntime {
         let (database_url, storage, postgres) = provision_storage(&config).await?;
         let postgres = Arc::new(Mutex::new(postgres));
 
+        // The mode check above could not be PROVEN to still hold across
+        // provisioning. `autumn.toml` is a file this dev runtime does not
+        // own, and provisioning is the long step (Codex review, issue
+        // #1291). Re-check now, while teardown is still ours to run. The
+        // window narrows from the whole provisioning duration down to the
+        // microseconds before the server starts. This mirrors the port
+        // reservation below, re-proven rather than trusted from before
+        // provisioning.
+        if let Err(error) = refuse_unsupported_harvest_mode(&OsEnv) {
+            return Err(abandon_cluster(&postgres, error).await);
+        }
+
         // The reservation above could not be *held* across provisioning —
         // autumn-web binds this same port itself — and provisioning is the long
         // step. Two `cargo dev` runs that both found 3000 free will therefore

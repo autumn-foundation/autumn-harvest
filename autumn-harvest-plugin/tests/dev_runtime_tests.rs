@@ -1648,6 +1648,52 @@ async fn starting_with_split_mode_from_autumn_toml_is_refused() {
 }
 
 #[test]
+fn the_harvest_mode_gate_is_re_checked_after_provisioning() {
+    // Codex review (P1) on issue #1291's pull request. `provision_storage`
+    // can run for a long time, downloading Postgres on a clean machine.
+    // `autumn.toml` is a file this dev runtime does not own. A single check
+    // before provisioning proves nothing about ambient config once
+    // provisioning finishes. `DevRuntime::start` must re-check right before
+    // starting the server. It already re-proves its HTTP port the same way,
+    // rather than trusting the reservation from before provisioning.
+    //
+    // Asserted on the source, the same way the root-refusal ordering above
+    // is. The property is an ordering, not a single behavior. A test could
+    // not observe it without a way to mutate `autumn.toml` mid-provisioning.
+    let mod_rs = workspace_root().join("autumn-harvest-plugin/src/dev/mod.rs");
+    let body = strip_comment_lines(&std::fs::read_to_string(&mod_rs).expect("mod.rs"));
+
+    // `mod.rs` also defines `refuse_unsupported_harvest_mode` itself, and
+    // calls it from its own unit tests. So this counts every occurrence in
+    // the file rather than a fixed number. The two assertions below pin what
+    // actually matters: at least one call before `provision_storage`, and at
+    // least one between it and `spawn_server`.
+    let checks: Vec<_> = body
+        .match_indices("refuse_unsupported_harvest_mode(")
+        .collect();
+
+    let provision_call = body
+        .find("provision_storage(&config).await?")
+        .expect("DevRuntime::start must call provision_storage");
+    let spawn_call = body
+        .find("spawn_server(&config,")
+        .expect("DevRuntime::start must call spawn_server");
+
+    let before_provisioning = checks.iter().any(|(index, _)| *index < provision_call);
+    let between_provisioning_and_spawn = checks
+        .iter()
+        .any(|(index, _)| *index > provision_call && *index < spawn_call);
+    assert!(
+        before_provisioning,
+        "the mode gate must run before provisioning starts"
+    );
+    assert!(
+        between_provisioning_and_spawn,
+        "the mode gate must be re-checked after provisioning and before the server starts"
+    );
+}
+
+#[test]
 fn no_test_here_reserves_the_fixed_default_http_port() {
     // A test that starts the runtime with `DevRuntimeConfig::default()` inherits
     // the default port 3000 and really does bind it, because `DevRuntime::start`
