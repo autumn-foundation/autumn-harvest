@@ -20,9 +20,9 @@ hash them, so instruction counts vary slightly run to run from
 `awaitables_profile.rs` and `dag_graph_profile.rs`'s baselines document the
 same source of variance for the same reason. Measured this session: two
 extra runs each of the before and after binaries gave 311,176,188 /
-311,185,623 / 311,184,058 (spread 9,435, ~0.003%) and 304,149,903 /
-304,131,954 / 304,116,947 (spread 32,956, ~0.011%) -- two to three orders
-of magnitude below the 7,026,285-instruction delta this page reports.
+311,185,623 / 311,184,058 (spread 9,435, ~0.003%) and 303,796,813 /
+303,793,068 / 303,787,356 (spread 9,457, ~0.003%) -- three orders of
+magnitude below the 7,379,375-instruction delta this page reports.
 
 ## Workload
 
@@ -97,45 +97,50 @@ or cheaply computable, before the loop that fills them starts -- the same
 class of fix `HistoryIndex::with_capacity` (`autumn-harvest/src/awaitables.rs`)
 already applied to `project_awaitables`' history index:
 
-1. **`LineageWalk::new`'s `nodes: Vec<LineageChildRow>` and `visited:
-   HashSet<uuid::Uuid>`.** Both live for the whole walk and are filled by
-   every `admit_level` call across every level. Each call already knows
-   its own batch size (`rows.len()`), an exact bound on how much either
-   collection can grow *this call* -- reserving it there avoids the
-   growth-step cost without needing to guess the walk's eventual total
-   size up front. (An earlier cut of this fix reserved `limits.max_nodes`
-   -- the walk's hard ceiling -- once in `new`; see "Correction (post-review)"
-   below for why that was wrong.)
+1. **`admit_level`'s `visited: HashSet<uuid::Uuid>`.** It lives for the
+   whole walk and is filled by every `admit_level` call across every
+   level. Each call already knows its own batch size (`rows.len()`), an
+   exact bound on how much it can grow *this call* -- reserving it there
+   avoids the growth-step cost without needing to guess the walk's
+   eventual total size up front. (An earlier cut of this fix reserved
+   `limits.max_nodes` -- the walk's hard ceiling -- once in `new`; see
+   "Correction (post-review)" below for why that was wrong.)
 2. **`admit_level`'s `next: Vec<uuid::Uuid>`.** At most one id per input row
-   is ever admitted into it, so `rows.len()` -- already known -- is an exact
-   upper bound.
+   is ever admitted into it, so `rows.len().min(remaining_budget())` --
+   already known -- is an exact upper bound. `next` is fresh every call
+   (never reused across levels), so sizing it costs exactly one allocation
+   for its whole lifetime.
 3. **`attach_children`'s `node.children: Vec<LineageNode>`.**
    `attach_children` already holds `rows` -- the exact, already-known count
    of the node's own children -- before the loop that fills
-   `node.children`.
+   `node.children`. Also fresh per call, same reasoning as `next`.
 
-None of these needs an extra pass over the data to size correctly (unlike
-`HistoryIndex`'s per-category counts, which needed one): each bound is
-already in hand as `rows.len()`. (`finish`'s `by_parent` map -- the fourth
-collection this call path grows from empty -- has no such cheap bound; see
-"Correction (post-review)" below for why it is deliberately left unsized.)
+Each bound above is already in hand, no extra pass needed (unlike
+`HistoryIndex`'s per-category counts, which needed one). `LineageWalk::new`'s
+`nodes: Vec<LineageChildRow>` and `finish`'s `by_parent` map -- the other
+two collections this call path grows from empty -- are deliberately left
+unsized; see "Correction (post-review)" below for why both are exceptions,
+for two different reasons.
 
 ## Change
 
 `autumn-harvest-plugin/src/lineage.rs`:
 
 * `admit_level` reserves `visited` by `rows.len()` (every row is at least
-  attempted against it, admitted or not) and both `nodes` and `next` by
-  `rows.len().min(self.remaining_budget())` (both only grow for rows
-  actually admitted, in lockstep, which can never exceed the live budget)
-  -- all three right-sized to *this call's* batch, not to the walk's
-  ceiling.
+  attempted against it, admitted or not) and `next` by
+  `rows.len().min(self.remaining_budget())` (it only grows for rows
+  actually admitted, which can never exceed the live budget) -- both
+  right-sized to *this call's* batch, not to the walk's ceiling.
 * `attach_children` calls `node.children.reserve_exact(rows.len())` once,
   right after removing `rows` from `by_parent` and before the loop that
   pushes into it.
 
+`self.nodes` deliberately does **not** get the same `admit_level` treatment
+`next` does, despite growing for the same rows -- see "Correction
+(post-review)" below.
+
 Behavior is unchanged: every value inserted, every key, every ordering, and
-every returned field is identical -- these four calls only change when the
+every returned field is identical -- these calls only change when the
 underlying allocator is asked for memory, never what ends up in it. No
 existing test's expectation needed to change; all 27 `lineage::tests::*`
 unit tests pass unmodified.
@@ -152,11 +157,11 @@ declaration, differing only by the `lineage.rs` diff above, same
 | | Instructions (Ir) |
 |---|---|
 | Before | 311,176,188 |
-| After  | 304,149,903 |
-| **Reduction** | **7,026,285 (2.26%)** |
+| After  | 303,796,813 |
+| **Reduction** | **7,379,375 (2.37%)** |
 
 Short of the >=5% floor on its own -- see "Correction (post-review)" below
-for why this number is smaller than this fix's first two cuts. The
+for why this number differs from this fix's earlier cuts. The
 allocation-bytes floor below still clears independently, and the floor
 rule is an *or*: at least one deterministic counter clearing is sufficient.
 
@@ -164,10 +169,10 @@ rule is an *or*: at least one deterministic counter clearing is sufficient.
 
 | dhat | Before | After | Reduction |
 |---|---|---|---|
-| Total bytes  | 107,581,951 | 87,911,151 | 19,670,800 (**18.29%**) |
-| Total blocks | 357,430 | 354,530 | 2,900 (0.81%) |
+| Total bytes  | 107,581,951 | 78,411,551 | 29,170,400 (**27.12%**) |
+| Total blocks | 357,430 | 354,730 | 2,700 (0.76%) |
 
-Bytes clear the >=10%-allocation floor by ~1.8x. Block count barely moves,
+Bytes clear the >=10%-allocation floor by ~2.7x. Block count barely moves,
 for the same reason noted in the dag_graph/awaitables precedent:
 `reserve`/`reserve_exact`/`with_capacity` still issue one allocation call
 per collection, same as the first allocation a growing collection would
@@ -220,10 +225,10 @@ dominant shape rarely pays for a worst-case over-allocation it always
 would. Computing a tight distinct-parent count first would need a second
 pass over `self.nodes` that itself hashes every row's parent id, undoing
 the saving. `by_parent` is now left growing from empty, unchanged from
-`HEAD` -- this fix touches only the three collections with a bound that is
-both cheap and tight. The numbers above are this final version's; they are
-smaller again than the second round's, since `by_parent`'s own (small, per
-the original profile's attribution) contribution is no longer claimed.
+`HEAD` -- at this point in the review, the fix touched three collections
+with a bound both cheap and tight (`visited`, `next`, `node.children`),
+alongside `nodes`, sized the same way as `visited`. See the fifth round
+below for why `nodes` was later dropped from that list too.
 
 A fourth Codex comment raised a related-looking concern: a multi-shard
 caller merging duplicate rows for the same execution from several shards
@@ -239,6 +244,27 @@ count for that level. `admit_level`'s dedup guard still matters (cycle
 safety against a malformed `parent_id` chain, the narrower case its own
 two-shard test covers), but that is not the routine, request-reproducible
 inflation the finding describes.
+
+A fifth Codex round (P2, `lineage.rs:466` at the time) caught a real
+regression in `self.nodes`'s own reservation, backed by the committed dhat
+artifacts rather than a hypothetical: reserving `self.nodes` per level
+(`self.nodes.reserve(admittable)`) interacts badly with `Vec`'s amortized
+doubling. `self.nodes` persists across every `admit_level` call for the
+whole walk, so each level's `reserve` that must grow at all jumps to
+double *whatever capacity `self.nodes` already had*, not to that level's
+own small top-up -- and those jumps do not line up with the walk's real
+total. On this page's 9-level, 999-row shape that left `self.nodes` at
+capacity 1776 (23,398,800 bytes at that allocation site) versus plain
+`push`-driven growth's capacity 1024 (13,899,200 bytes) -- a real
+regression at the exact site the fix's first cut claimed as a win, exactly
+as Codex's cited dhat numbers showed. `next`, by contrast, is unaffected by
+this failure mode: it is a fresh `Vec` every call, sized once via
+`with_capacity` and never `reserve`d again within that call's lifetime, so
+there is no repeated-doubling interaction to trigger. `self.nodes` is now
+reverted to growing from `push` alone, like `by_parent`. The numbers above
+are this fix's final, fifth-round-corrected shape: both Ir and dhat bytes
+improved over the fourth round's, since removing a regression is itself a
+net win, not just a wash.
 
 ### Correctness
 

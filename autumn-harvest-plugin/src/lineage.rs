@@ -453,25 +453,40 @@ impl LineageWalk {
 
         // Every row is at least attempted against `visited` -- even a
         // duplicate or a budget-rejected one is inserted there. So
-        // `rows.len()` bounds how much `visited` can grow this call.
-        // `nodes` only grows for rows actually admitted, which can never
-        // exceed the live budget. The smaller of the two therefore avoids
-        // reserving more than this call could possibly use. Sizing from
-        // this level's own batch is deliberate, not from `limits.max_nodes`.
-        // An earlier cut of this fix reserved the walk's whole ceiling up
-        // front instead. That would make a sparse walk pay for the rare
-        // wide one (Codex review).
+        // `rows.len()` bounds how much `visited` can grow this call. Sizing
+        // from this level's own batch is deliberate, not from
+        // `limits.max_nodes`. An earlier cut of this fix reserved the
+        // walk's whole ceiling up front instead. That would make a sparse
+        // walk pay for the rare wide one (Codex review).
         self.visited.reserve(rows.len());
-        let admittable = rows.len().min(self.remaining_budget());
-        self.nodes.reserve(admittable);
 
-        // `next` grows in lockstep with `self.nodes` below: one push each,
-        // same loop iteration. So it is bounded by the same live budget,
-        // not by `rows.len()` on its own. A multi-shard caller can merge
-        // `remaining_budget + 1` rows per shard into one `rows` batch --
-        // the fetch-window sentinel `note_saturated_fetch_window`
-        // documents this. So `rows.len()` alone can run well past what
-        // this call could ever admit (Codex review).
+        // `next` only grows for rows actually admitted, which can never
+        // exceed the live budget. So it is capped by `remaining_budget()`,
+        // not by `rows.len()` alone. A multi-shard caller can merge
+        // `remaining_budget + 1` rows per shard into one `rows` batch. The
+        // fetch-window sentinel `note_saturated_fetch_window` documents
+        // this. So `rows.len()` alone can run well past what this call
+        // could ever admit (Codex review). `next` is fresh every call,
+        // never reused across levels. So a single `with_capacity` here
+        // costs one allocation for its whole lifetime, no regrowth.
+        //
+        // `self.nodes`, in contrast, is NOT sized here despite growing for
+        // exactly the same rows `next` does. `self.nodes` persists across
+        // every `admit_level` call for the whole walk. A `reserve` on it
+        // here interacts badly with `Vec`'s amortized doubling. Each level
+        // that must grow jumps to double *whatever `self.nodes`' capacity
+        // already was*, not to this level's own small top-up. Those jumps
+        // do not line up with the walk's real total. This was measured
+        // directly (Codex review, backed by this page's own dhat
+        // artifacts). On this harness's 9-level, 999-row shape, reserving
+        // `self.nodes` per level left it at capacity 1776 for 999 rows
+        // (23,398,800 bytes at this allocation site). Plain `push`-driven
+        // growth's capacity 1024 (13,899,200 bytes) does better. That is a
+        // regression, not a saving, at the exact site this fix's first
+        // cut claimed as a win. `self.nodes` is left growing from `push`
+        // alone, same as `by_parent` above and for the same reason: no
+        // reservation beats guessing wrong.
+        let admittable = rows.len().min(self.remaining_budget());
         let mut next = Vec::with_capacity(admittable);
         for row in rows {
             let uuid = row.exec_id.as_uuid();
