@@ -4990,15 +4990,13 @@ async fn wait_for_completion_with_diagnostics(
 ///
 /// **2026-09-12 fix:** `reset_timed_out_workflow_task`'s pool-retry budget
 /// widened from four attempts over 2.7 seconds toward a longer schedule.
-/// Codex review (PR #1517) found the first version still did not help.
-/// Harvest configures no deadpool `Timeouts`, so an unbounded
-/// `pool.get().await` under real saturation never returns. A retry loop
-/// around a call like that never reruns. Each attempt is now itself
-/// bounded, so a stuck checkout counts as one failed attempt rather than
-/// parking the whole recovery path. The schedule now bounds the whole
-/// reset to roughly thirty seconds worst case. The gap itself -- no
-/// backstop once that budget is genuinely exhausted -- is still open;
-/// see issue #1459.
+/// Later review on PR #1516/#1517 then found the same recovery path had
+/// two more unbounded `pool.get().await` calls. It also found that a
+/// flat per-attempt bound would itself wrongly cancel a slow-but-real
+/// connection creation. The shared retry helper in `worker.rs`'s
+/// "Workflow-task timeout helpers" section has the current, corrected
+/// shape. The underlying gap -- no backstop once every attempt is
+/// genuinely exhausted -- is still open; see issue #1459.
 #[tokio::test(flavor = "multi_thread", worker_threads = 12)]
 async fn worker_completes_ten_child_fan_out_within_wall_clock_bound() {
     let (database_url, _container) = setup_test_database_url().await;
