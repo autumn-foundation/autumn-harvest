@@ -3579,7 +3579,22 @@ async fn delete_orphan_rows(
               )",
             lower.map_or(String::new(), |_| "e.cohort >= $3 AND".to_string())
         );
+        // Review finding: `SET LOCAL` here scopes cleanly only when this
+        // call opens the outer transaction itself. Diesel implements a
+        // nested `.transaction()` as a `SAVEPOINT`. `RELEASE SAVEPOINT`
+        // does not undo a `SET LOCAL` made inside it. Only `ROLLBACK TO
+        // SAVEPOINT` does, which the error path below gets for free
+        // since the closure returns `Err` there. A caller that already
+        // had `conn` inside a transaction would see `statement_timeout`
+        // stay pinned to `{ms}ms` for the rest of it on the success
+        // path. Capture the prior value first and restore it, inside
+        // this same savepoint, before returning.
         let result = Box::pin(conn.transaction::<usize, HarvestError, _>(async |conn| {
+            let prior = diesel::sql_query("SELECT current_setting('statement_timeout') AS v")
+                .get_result::<TextRow>(conn)
+                .await
+                .map_err(database_error)?
+                .v;
             exec(conn, &format!("SET LOCAL statement_timeout = '{ms}ms'")).await?;
             let query = diesel::sql_query(sql)
                 .bind::<Timestamptz, _>(upper)
@@ -3588,8 +3603,17 @@ async fn delete_orphan_rows(
                 query.bind::<Timestamptz, _>(lower).execute(conn).await
             } else {
                 query.execute(conn).await
-            };
-            deleted.map_err(database_error)
+            }
+            .map_err(database_error)?;
+            exec(
+                conn,
+                &format!(
+                    "SET LOCAL statement_timeout = '{}'",
+                    prior.replace('\'', "''")
+                ),
+            )
+            .await?;
+            Ok(deleted)
         }))
         .await;
         let deleted = match result {

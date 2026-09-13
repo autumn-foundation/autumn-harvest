@@ -4034,6 +4034,92 @@ async fn the_straggler_delete_bounds_its_own_statement_timeout() {
     );
 }
 
+#[tokio::test]
+async fn the_straggler_delete_restores_statement_timeout_inside_a_caller_transaction() {
+    // Review finding: `delete_orphan_rows`'s own `SET LOCAL
+    // statement_timeout` runs inside a `conn.transaction()`. A nested
+    // `.transaction()` -- one opened while `conn` is already inside a
+    // transaction -- is a `SAVEPOINT` under Diesel. `RELEASE SAVEPOINT`
+    // does not undo a `SET LOCAL` made inside it; only `ROLLBACK TO
+    // SAVEPOINT` does. A caller already inside its own transaction
+    // would otherwise see `statement_timeout` silently pinned to the
+    // sweep's own budget for the rest of it.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // A cohort with a genuine straggler, pinning it against the drop, and
+    // a real orphan alongside it. The targeted DELETE then has something
+    // to remove and actually succeeds, rather than timing out on a lock
+    // wait like the sibling test above.
+    let old = Utc::now() - chrono::Duration::days(10);
+    let pinning = insert_execution(&mut conn, "pin2_wf", "pin2-1", old, None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(pinning),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed the pinning execution");
+    backdate_events(&mut conn, pinning, old).await;
+
+    let orphan = insert_execution(&mut conn, "orphan_wf", "orphan-1", old, None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(orphan),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed the soon-to-be-orphaned execution");
+    backdate_events(&mut conn, orphan, old).await;
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(orphan)
+        .execute(&mut conn)
+        .await
+        .expect("collect the execution, leaving orphans in the pinned cohort");
+
+    conn.transaction::<(), autumn_harvest::HarvestError, _>(async |conn| {
+        diesel::sql_query("SET LOCAL statement_timeout = '54321ms'")
+            .execute(conn)
+            .await?;
+
+        let outcome = partition::sweep(
+            conn,
+            Utc::now(),
+            &SweepOptions {
+                straggler_grace: Some(Duration::from_secs(0)),
+                ..SweepOptions::default()
+            },
+            None,
+        )
+        .await?;
+        assert!(
+            outcome.straggler_rows_deleted > 0,
+            "precondition: the DELETE must actually remove the orphan rows, \
+             not merely attempt to; got {outcome:?}"
+        );
+
+        let timeout = diesel::sql_query("SELECT current_setting('statement_timeout') AS v")
+            .get_result::<TextRow>(conn)
+            .await?
+            .v;
+        assert_eq!(
+            timeout, "54321ms",
+            "the straggler DELETE must restore the caller's statement_timeout \
+             inside its own savepoint, not leave its own budget pinned for the \
+             rest of the caller's transaction"
+        );
+        Ok(())
+    })
+    .await
+    .expect("outer transaction");
+}
+
 // ══ Pure unit coverage for the cohort algebra ══════════════════════════════
 
 #[test]
