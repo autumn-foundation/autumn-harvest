@@ -1464,14 +1464,37 @@ impl Drop for EnvVarGuard {
     }
 }
 
-/// Every env var `resolve_harvest_mode_source` reads, forced absent so a
-/// `DevRuntime::start` test asserting a non-Harvest-mode refusal sees the
-/// embedded default regardless of what this process inherited.
-fn harvest_mode_env_cleared() -> [EnvVarGuard; 3] {
+/// Every env var `resolve_harvest_mode_source` reads, forced to a known-safe
+/// state. A `DevRuntime::start` test asserting a non-Harvest-mode refusal
+/// then sees the embedded default. This holds regardless of what the
+/// process inherited.
+///
+/// `AUTUMN_MANIFEST_DIR` is pointed at a fresh directory holding its own
+/// empty `autumn.toml`, not merely unset (Codex review, issue #1291).
+///
+/// `find_config_file_named` falls back to the process's current directory.
+/// It does this whenever the manifest directory has no matching file.
+/// Merely unsetting or emptying the directory still lets an ambient
+/// checkout-root config file leak in that way.
+///
+/// Pointing it at a real, empty file makes the lookup succeed there
+/// instead. That happens before the fallback ever runs.
+///
+/// `AUTUMN_PROFILE` is forced unset too. Then no `autumn-<profile>.toml`
+/// lookup ever happens, closing the same fallback for a profile file.
+fn harvest_mode_env_cleared() -> [EnvVarGuard; 4] {
+    let manifest_dir = std::env::temp_dir().join(format!(
+        "autumn-harvest-plugin-embedded-manifest-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&manifest_dir).expect("manifest directory should be created");
+    std::fs::write(manifest_dir.join("autumn.toml"), "")
+        .expect("empty root config file should be written");
     [
         EnvVarGuard::unset("AUTUMN_HARVEST__MODE"),
         EnvVarGuard::unset("AUTUMN_HARVEST_DATABASE__URL"),
-        EnvVarGuard::unset("AUTUMN_MANIFEST_DIR"),
+        EnvVarGuard::unset("AUTUMN_PROFILE"),
+        EnvVarGuard::set("AUTUMN_MANIFEST_DIR", &manifest_dir),
     ]
 }
 
