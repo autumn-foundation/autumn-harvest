@@ -175,6 +175,23 @@ fn migration_index_comment_does_not_restate_the_false_claim() {
     );
 }
 
+/// The opening summary claimed "nothing runs on the hot path". The same
+/// header contradicts that three paragraphs later: every insert pays index
+/// maintenance when unconfigured.
+#[test]
+fn migration_header_hot_path_claim_is_scoped_to_the_exporter() {
+    let path =
+        repo_root().join("autumn-harvest/migrations/20260728000000_harvest_audit_export/up.sql");
+    let text = read_normalized(&path);
+    assert!(
+        !contains_collapsed(&text, "nothing runs on the hot path"),
+        "{}: an unscoped 'nothing runs on the hot path' claim contradicts \
+         the index-maintenance cost documented lower in this same header \
+         (issue #1272); scope it to the exporter",
+        path.display()
+    );
+}
+
 /// `docs/upgrading/0.5.0.md`'s migration-table row for this migration made
 /// the same false claim about both partial indexes, and called the whole
 /// migration "inert" with no caveat.

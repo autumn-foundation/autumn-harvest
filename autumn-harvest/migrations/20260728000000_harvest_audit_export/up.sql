@@ -5,9 +5,9 @@
 -- `WorkflowEvent` variant, no change to `harvest_events`, no replay impact —
 -- the exporter only READS `harvest_audit_log` and writes its own bookkeeping.
 --
--- Nothing here is seeded and nothing runs on the hot path: with no sink
--- configured, `export_seq` stays NULL on every row forever and the cursor
--- table stays empty.
+-- Nothing here is seeded, and the exporter adds no hot-path work: with no
+-- sink configured, `export_seq` stays NULL on every row forever and the
+-- cursor table stays empty.
 --
 -- One cost is NOT zero, and saying otherwise would be wrong: the partial index
 -- below is predicated on `export_seq IS NULL`, which for an unconfigured
