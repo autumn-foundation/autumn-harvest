@@ -2094,8 +2094,18 @@ fn only_an_accepted_request_is_refused_a_retry() {
         "a lost response to an accepted request must not be retried"
     );
 
-    // A rate limit produced no turn, so it must still back off and retry.
-    for status in [StatusCode::TOO_MANY_REQUESTS, StatusCode::BAD_GATEWAY] {
+    // These three produced no turn, so each must still back off and retry. A
+    // rate limit refused the request before reading it. A server fault is the
+    // server's own. A REQUEST TIMEOUT says the request never arrived whole,
+    // so nothing was read and nothing was charged.
+    //
+    // The request timeout was terminal, which failed a session permanently
+    // for a transport fault the transport layer already retries.
+    for status in [
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::BAD_GATEWAY,
+        StatusCode::REQUEST_TIMEOUT,
+    ] {
         let transient = parse_error_payload_full(&claude::body_failure(status, "it went away"));
         assert!(
             !transient.non_retryable,
@@ -2103,12 +2113,20 @@ fn only_an_accepted_request_is_refused_a_retry() {
         );
     }
 
-    // A rejected request fails the same way whether or not its body read.
-    let rejected = parse_error_payload_full(&claude::body_failure(StatusCode::BAD_REQUEST, "gone"));
-    assert!(
-        rejected.non_retryable,
-        "a rejected request must not be retried"
-    );
+    // A request the server READ and rejected fails the same way whether or
+    // not its body read. Neither of these says the request went unread, so
+    // neither joins the retryable side.
+    for status in [
+        StatusCode::BAD_REQUEST,
+        StatusCode::CONFLICT,
+        StatusCode::TOO_EARLY,
+    ] {
+        let rejected = parse_error_payload_full(&claude::body_failure(status, "gone"));
+        assert!(
+            rejected.non_retryable,
+            "{status} is a rejected request and must not be retried"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3696,6 +3714,107 @@ fn a_session_named_in_bytes_is_still_this_workflows() {
             "[{exec}] and history refuses it as a typo"
         );
     }
+}
+
+/// A report in the wrong storage class is NAMED, not passed over.
+///
+/// Every report projection guards on `typeof(output_json) = 'text'`, so a
+/// `BLOB` holding a whole report answers every one of them with nothing. The
+/// row then took the same branch as a session that has not finished. The
+/// listing showed a COMPLETED session with no answer at all.
+///
+/// The single status does not agree with that. It reads the column as a
+/// `String`, which a `BLOB` refuses, so the whole read fails. Measured:
+/// `cannot read session blob-report: Invalid column type Blob at index: 3,
+/// name: output_json`.
+///
+/// An absent report is a different thing and still says nothing. A session
+/// that has not finished has no report to show.
+#[test]
+fn a_report_in_the_wrong_class_is_named_unreadable() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("classes.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+    let report = r#"{"stop":"end_turn","turns":1,"tool_calls":0,"answer":"done"}"#;
+    for (exec, sql) in [
+        (
+            "text-report",
+            "INSERT INTO harvest_executions VALUES (?1, ?2, 'COMPLETED', ?3, ?4, NULL)",
+        ),
+        (
+            "blob-report",
+            "INSERT INTO harvest_executions \
+             VALUES (?1, ?2, 'COMPLETED', ?3, cast(?4 as blob), NULL)",
+        ),
+    ] {
+        writer
+            .execute(
+                sql,
+                rusqlite::params![exec, WORKFLOW_NAME, READABLE_TASK, report],
+            )
+            .expect("the session is recorded");
+    }
+    writer
+        .execute(
+            "INSERT INTO harvest_executions VALUES ('no-report', ?1, 'RUNNING', ?2, NULL, NULL)",
+            rusqlite::params![WORKFLOW_NAME, READABLE_TASK],
+        )
+        .expect("the unfinished session is recorded");
+    drop(writer);
+
+    let reader = inspect::open(&db).expect("the reader opens");
+    let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
+    let (views, _, _) = daemon::sessions(&reader, &daemon::Parked::new(), false, None)
+        .expect("the listing renders");
+    let shown = |exec: &str| -> Option<String> {
+        views
+            .iter()
+            .find(|view| view.execution_id == exec)
+            .expect("the session is listed")
+            .answer
+            .clone()
+    };
+
+    assert_eq!(
+        shown("text-report").as_deref(),
+        Some("[end_turn after 1 turns, 0 tool calls] done"),
+        "a readable report is shown as it stands"
+    );
+    assert_eq!(
+        shown("blob-report").as_deref(),
+        Some("<unreadable report>"),
+        "a report in a class nothing can read is NAMED"
+    );
+    assert!(
+        listed_row(&listed, "blob-report").report_is_damaged,
+        "and the row carries that fault itself"
+    );
+    assert_eq!(
+        shown("no-report"),
+        None,
+        "while a session that has not finished still says nothing"
+    );
+    assert!(
+        !listed_row(&listed, "no-report").report_is_damaged,
+        "and is not called damaged for having no report yet"
+    );
+
+    // The reason the listing must not call it an absent report. The single
+    // status reads the column as a `String`, and refuses the whole row.
+    let refused = inspect::execution(&reader, WORKFLOW_NAME, "blob-report")
+        .map(|_| ())
+        .expect_err("the status cannot read a report in that class");
+    assert!(
+        refused.contains("output_json"),
+        "the status names the column it could not read: {refused}"
+    );
+    assert!(
+        inspect::execution(&reader, WORKFLOW_NAME, "no-report")
+            .expect("the row reads")
+            .is_some(),
+        "while an unfinished session reads perfectly well"
+    );
 }
 
 /// One damaged row does not hide every other session.

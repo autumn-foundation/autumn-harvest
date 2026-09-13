@@ -1074,17 +1074,17 @@ pub const SESSIONS_QUERY: &str = "SELECT \
                          THEN coalesce(substr(cast(error as blob), 1, ?3), \
                                        zeroblob(0)) END, \
                     error IS NOT NULL AND typeof(error) <> 'text', \
-                    CASE WHEN typeof(output_json) = 'text' \
-                         THEN CASE WHEN json_valid(output_json) \
-                                   THEN (SELECT count(*) FROM json_each(output_json) \
-                                         WHERE key IN ('answer', 'turns', \
-                                                       'tool_calls', 'stop')) > 4 \
-                                     OR (SELECT count(*) FROM json_each(output_json) \
-                                         WHERE key IN ('answer', 'stop') \
-                                           AND value GLOB '*[' || char(55296) \
-                                                       || '-' || char(57343) \
-                                                       || ']*') > 0 \
-                                   ELSE 0 END \
+                    CASE WHEN typeof(output_json) = 'null' THEN 0 \
+                         WHEN typeof(output_json) <> 'text' THEN 1 \
+                         WHEN NOT json_valid(output_json) THEN 0 \
+                         WHEN (SELECT count(*) FROM json_each(output_json) \
+                               WHERE key IN ('answer', 'turns', \
+                                             'tool_calls', 'stop')) > 4 THEN 1 \
+                         WHEN (SELECT count(*) FROM json_each(output_json) \
+                               WHERE key IN ('answer', 'stop') \
+                                 AND value GLOB '*[' || char(55296) \
+                                             || '-' || char(57343) \
+                                             || ']*') > 0 THEN 1 \
                          ELSE 0 END, \
                     CASE WHEN typeof(input_json) = 'text' \
                          THEN CASE WHEN json_valid(input_json) \

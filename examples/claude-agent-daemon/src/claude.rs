@@ -602,13 +602,29 @@ pub fn body_failure(status: reqwest::StatusCode, detail: &str) -> String {
 
 /// Classify a non-2xx response.
 ///
-/// A rate limit and a server fault are transient, so they keep the plain error
-/// string and the retry policy applies. Anything else is a rejected request:
-/// the same bytes fail again, so the attempt fails terminally instead of
-/// burning the retry curve.
+/// The line is whether the request produced a TURN. A turn that ran was
+/// billed, and a retry buys it twice. A request that never ran costs nothing
+/// to send again.
+///
+/// Three answers say no turn ran. A rate limit refused the request before it
+/// was read. A server fault is the server's own, and the same bytes may work
+/// on the next attempt. A request timeout says the request never arrived
+/// whole, so nothing was read and nothing was charged. Each keeps the plain
+/// error string, and the retry policy applies.
+///
+/// The transport timeout already takes the retry path, so a request timeout
+/// reported as a STATUS belongs on the same side. It was on the other one.
+///
+/// Anything else is a request the server read and rejected. The same bytes
+/// fail again, so the attempt fails terminally instead of burning the retry
+/// curve. A `409` or a `425` is not included: neither says the request went
+/// unread, and this daemon retries only what it knows was never processed.
 fn http_failure(status: reqwest::StatusCode, body: &str) -> String {
     let detail = body.chars().take(400).collect::<String>();
-    if status.as_u16() == 429 || status.is_server_error() {
+    let transient = status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error();
+    if transient {
         return format!("the Claude API returned {status}: {detail}");
     }
     ActivityFailure::non_retryable(
