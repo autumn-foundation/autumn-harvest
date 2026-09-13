@@ -1050,6 +1050,7 @@ async fn run_partition_maintenance_pass(
     pools: &ShardedDbPool,
     config: &RetentionConfig,
     monitor_task: &RetentionMonitor,
+    resume_cursors: &mut HashMap<ShardId, Option<DateTime<Utc>>>,
 ) {
     if !config.partitions.enabled {
         return;
@@ -1100,8 +1101,12 @@ async fn run_partition_maintenance_pass(
             Ok(crate::partition::EventLayout::Unpartitioned) => {
                 // A shard that reverted via `harvest partition disable`
                 // must not keep showing its last outcome from before the
-                // revert.
+                // revert. Its resume cursor goes with it. A later
+                // `enable` starts a fresh partition set at fresh cohort
+                // instants, all later than anything this stale cursor
+                // could name.
                 monitor_task.clear_partitions(shard);
+                resume_cursors.remove(&shard);
                 continue;
             }
             Ok(crate::partition::EventLayout::Partitioned { .. }) => {}
@@ -1126,19 +1131,27 @@ async fn run_partition_maintenance_pass(
         // picks up where it stopped, instead of re-spending its whole
         // budget proving the same oldest partitions blocked, tick after
         // tick.
-        let resume_after = monitor_task
-            .snapshot()
-            .per_shard
-            .iter()
-            .find(|r| r.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
-            .and_then(|r| r.partition_maintenance.as_ref())
-            .and_then(|m| m.sweep.next_resume.clone());
+        //
+        // Review finding: kept in `resume_cursors`, a map local to this
+        // task, deliberately NOT read back from the monitor's stored
+        // outcome. The history-retention phase's own `monitor_task.update`
+        // (elsewhere in this loop) replaces a shard's whole
+        // `RetentionTickResult`. It does that with a fresh default
+        // whenever a history age is configured -- the common case. That
+        // wipes `partition_maintenance` back to `None` before this pass
+        // ever read it.
+        //
+        // `scan_cursors` above solves the identical problem for history
+        // retention the same way. Local state this task owns outright,
+        // untouched by anything that replaces the monitor's reported
+        // snapshot.
+        let resume_after = resume_cursors.get(&shard).copied().flatten();
         match crate::partition::maintain(
             &mut conn,
             now,
             config.partitions.lookahead_cohorts,
             &sweep_opts,
-            resume_after.as_deref(),
+            resume_after,
         )
         .await
         {
@@ -1164,6 +1177,7 @@ async fn run_partition_maintenance_pass(
                         "harvest event-partition maintenance"
                     );
                 }
+                resume_cursors.insert(shard, outcome.sweep.next_resume);
                 monitor_task.update_partitions(shard, outcome);
             }
             Err(err) => {
@@ -1250,6 +1264,12 @@ impl RetentionRuntime {
         );
         let handle = tokio::spawn(async move {
             let mut scan_cursors: HashMap<ShardId, Option<RetentionScanCursor>> = HashMap::new();
+            // See `run_partition_maintenance_pass`'s review finding on
+            // `resume_cursors`. Local state this task owns outright, for
+            // the identical reason `scan_cursors` above is local rather
+            // than read back from the monitor.
+            let mut partition_resume_cursors: HashMap<ShardId, Option<DateTime<Utc>>> =
+                HashMap::new();
             // Issue #1270 item 5: run partition maintenance immediately
             // rather than waiting a full `tick_interval` (an hour, by
             // default). A shard that restarts after being offline longer
@@ -1272,7 +1292,22 @@ impl RetentionRuntime {
             // immediacy without touching that channel at all. So it can
             // never coalesce with, or crowd out, an operator's own
             // `run_now()`, which still gets a full tick as documented.
-            run_partition_maintenance_pass(&pools, &config, &monitor_task).await;
+            //
+            // Review finding: raced against cancellation, not run bare.
+            // A blocked partitioned shard can spend up to `max_attempts`
+            // ownership probes at `exact_scan_timeout` each here, per
+            // shard -- minutes, at the defaults. `shutdown()` calling
+            // `cancel()` before this pass finishes must still make
+            // `join()` return promptly, not wait out the whole pass.
+            tokio::select! {
+                () = shutdown_task.cancelled() => return,
+                () = run_partition_maintenance_pass(
+                    &pools,
+                    &config,
+                    &monitor_task,
+                    &mut partition_resume_cursors,
+                ) => {},
+            }
             loop {
                 tokio::select! {
                     () = shutdown_task.cancelled() => break,
@@ -1401,7 +1436,13 @@ impl RetentionRuntime {
                 // (#752) and deleted its executions. Running it here reclaims
                 // in the SAME tick that frees the cohort rather than the next
                 // one.
-                run_partition_maintenance_pass(&pools, &config, &monitor_task).await;
+                run_partition_maintenance_pass(
+                    &pools,
+                    &config,
+                    &monitor_task,
+                    &mut partition_resume_cursors,
+                )
+                .await;
 
                 // Purge old audit records once per tick, best-effort.
                 // Audit rows may live on any shard (workflow starts use shard-aware

@@ -895,6 +895,70 @@ async fn an_impostor_reusing_harvests_own_constraint_name_still_refuses() {
 }
 
 #[tokio::test]
+async fn a_deferrable_impostor_of_harvests_own_constraint_still_refuses() {
+    // Review finding: `contype` and the key columns are not the whole
+    // shape. Harvest's own constraint is a plain, immediate one -- never
+    // `DEFERRABLE`. An operator's replacement with the exact same name,
+    // type and columns, but made `DEFERRABLE`, still passed a check that
+    // verified only type and columns. It would be exempted. Its real
+    // (deferrable) definition would then be excluded from replay.
+    // Conversion would silently swap it for an immediate constraint,
+    // breaking any transaction that relied on deferring the uniqueness
+    // check.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT \
+         IF EXISTS harvest_events_workflow_exec_id_event_id_key",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("drop the real constraint to make room for the deferrable impostor");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT \
+         harvest_events_workflow_exec_id_event_id_key UNIQUE (workflow_exec_id, event_id) \
+         DEFERRABLE",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a deferrable impostor with harvest's own name, type and columns");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "a deferrable impostor of harvest's own constraint must still refuse -- \
+             matching name, type and columns must not be enough",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_workflow_exec_id_event_id_key"),
+        "the refusal must name the offending index; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT \
+         harvest_events_workflow_exec_id_event_id_key",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("drop the deferrable impostor constraint");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT \
+         harvest_events_workflow_exec_id_event_id_key UNIQUE (workflow_exec_id, event_id)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("restore harvest's own real constraint for later tests");
+}
+
+#[tokio::test]
 async fn a_dependent_view_refuses_the_conversion_instead_of_silently_going_stale() {
     // Issue #1270 item 14: Postgres tracks a view's dependency by relation
     // OID, not by name. Both conversion paths rename `harvest_events` out
@@ -3484,10 +3548,9 @@ async fn a_truncated_pass_resumes_past_a_permanently_blocked_oldest_run() {
     assert!(first.truncated, "the budget was spent; got {first:?}");
     let resume_after = first
         .next_resume
-        .clone()
         .expect("a truncated pass must report where to resume");
 
-    let second = partition::sweep(&mut conn, Utc::now(), &opts, Some(&resume_after))
+    let second = partition::sweep(&mut conn, Utc::now(), &opts, Some(resume_after))
         .await
         .expect("second sweep");
     assert_eq!(

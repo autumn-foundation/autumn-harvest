@@ -550,8 +550,9 @@ pub struct SweepOutcome {
     pub blocked: Vec<String>,
     /// Orphan rows removed by the opt-in straggler fallback.
     pub straggler_rows_deleted: usize,
-    /// Where the NEXT pass should resume its evaluation, as the name of the
-    /// last partition this pass actually evaluated (dropped or blocked).
+    /// Where the NEXT pass should resume its evaluation: the cohort upper
+    /// bound of the last partition this pass actually evaluated (dropped
+    /// or blocked).
     ///
     /// Review finding: a fixed oldest-first scan, restarted from the very
     /// beginning every call, cannot converge when the oldest
@@ -564,12 +565,22 @@ pub struct SweepOutcome {
     /// `None` when this pass reached the end of the partition list. That
     /// holds whether or not it was `truncated` on the way, as long as it
     /// got all the way there. The caller should pass `None` back next
-    /// time, restarting from the oldest. `Some(name)` when this pass
-    /// stopped on budget before reaching the end. The caller should pass
-    /// it back as `resume_after`, so the next pass picks up immediately
-    /// after `name` instead of re-attempting the same blocked prefix.
+    /// time, restarting from the oldest.
+    ///
+    /// `Some(instant)` when this pass stopped on budget before reaching
+    /// the end. The caller should pass it back as `resume_after`. The
+    /// next pass then skips straight past every partition at or before
+    /// `instant`, instead of re-attempting the same blocked prefix.
+    ///
+    /// Review finding: an instant, not a partition name. A name would go
+    /// stale the moment the partition it names is dropped. That is the
+    /// common case for the LAST attempted partition in a truncated pass,
+    /// which is exactly the boundary this field exists to preserve.
+    /// Comparing by boundary instant instead survives that. It needs no
+    /// partition to still exist at that name, only the ordering the
+    /// sweep already relies on (oldest first, by cohort upper bound).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_resume: Option<String>,
+    pub next_resume: Option<DateTime<Utc>>,
 }
 
 // ── Layout detection ───────────────────────────────────────────────────────
@@ -1269,7 +1280,17 @@ async fn refuse_if_row_security(conn: &mut AsyncPgConnection, verb: &str) -> Har
 /// gap. Only a constraint shaped exactly like harvest's own pkey
 /// (`(id)`) or unique key (`(workflow_exec_id, event_id)`) is exempt
 /// now. An impostor of the same name no longer qualifies.
-const HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL: &str = "NOT EXISTS (\n                SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid\n                  AND (\n                      (con.conname = 'harvest_events_pkey' AND con.contype = 'p'\n                       AND (SELECT array_agg(a.attname::text ORDER BY k)\n                              FROM generate_series(0, i.indnkeyatts - 1) k\n                              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]\n                           ) = ARRAY['id'])\n                      OR\n                      (con.conname = 'harvest_events_workflow_exec_id_event_id_key' AND con.contype = 'u'\n                       AND (SELECT array_agg(a.attname::text ORDER BY k)\n                              FROM generate_series(0, i.indnkeyatts - 1) k\n                              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]\n                           ) = ARRAY['workflow_exec_id', 'event_id'])\n                  )\n            )";
+///
+/// Review finding: `contype` and the key columns are not the whole
+/// shape. Harvest's own two constraints are plain, immediate ones — the
+/// migration that creates them names neither `DEFERRABLE` nor `INITIALLY
+/// DEFERRED`. A `DEFERRABLE` replacement of the same name, type and
+/// columns still passed this check. Conversion then silently swapped it
+/// for an immediate constraint, breaking any transaction that relied on
+/// deferring the uniqueness check. `con.condeferrable` is checked
+/// directly now, closing that gap the same way `contype` closed the
+/// name-only one.
+const HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL: &str = "NOT EXISTS (\n                SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid\n                  AND NOT con.condeferrable\n                  AND (\n                      (con.conname = 'harvest_events_pkey' AND con.contype = 'p'\n                       AND (SELECT array_agg(a.attname::text ORDER BY k)\n                              FROM generate_series(0, i.indnkeyatts - 1) k\n                              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]\n                           ) = ARRAY['id'])\n                      OR\n                      (con.conname = 'harvest_events_workflow_exec_id_event_id_key' AND con.contype = 'u'\n                       AND (SELECT array_agg(a.attname::text ORDER BY k)\n                              FROM generate_series(0, i.indnkeyatts - 1) k\n                              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]\n                           ) = ARRAY['workflow_exec_id', 'event_id'])\n                  )\n            )";
 
 /// User-defined unique indexes on `harvest_events` that cannot survive
 /// conversion unchanged: either missing `cohort`, or backed by a
@@ -2672,7 +2693,7 @@ pub async fn evaluate(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
     opts: &SweepOptions,
-    resume_after: Option<&str>,
+    resume_after: Option<DateTime<Utc>>,
 ) -> HarvestResult<SweepOutcome> {
     sweep_inner(conn, now, opts, false, resume_after).await
 }
@@ -2716,7 +2737,7 @@ pub async fn sweep(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
     opts: &SweepOptions,
-    resume_after: Option<&str>,
+    resume_after: Option<DateTime<Utc>>,
 ) -> HarvestResult<SweepOutcome> {
     sweep_inner(conn, now, opts, true, resume_after).await
 }
@@ -2736,7 +2757,7 @@ async fn sweep_inner(
     now: DateTime<Utc>,
     opts: &SweepOptions,
     apply: bool,
-    resume_after: Option<&str>,
+    resume_after: Option<DateTime<Utc>>,
 ) -> HarvestResult<SweepOutcome> {
     let mut outcome = SweepOutcome::default();
     if !detect_layout(conn).await?.is_partitioned() {
@@ -2744,14 +2765,20 @@ async fn sweep_inner(
     }
 
     let parts = list_partitions(conn).await?;
-    let start_idx = resume_after
-        .and_then(|name| parts.iter().position(|p| p.name == name))
-        .map_or(0, |i| i + 1);
+    // Review finding: skipping was keyed on `resume_after` matching a
+    // partition NAME. A truncated pass's own last attempted partition is
+    // exactly as likely to have been DROPPED as blocked, though. A
+    // dropped partition's name matches nothing next time, silently
+    // falling back to the oldest and reopening the very starvation this
+    // exists to close. Comparing by cohort upper bound instead needs no
+    // partition to still exist at that instant, only the ordering the
+    // sweep already relies on.
+    let mut skipping = resume_after.is_some();
 
     let mut attempts = 0usize;
-    let mut last_attempted: Option<String> = None;
+    let mut last_attempted: Option<DateTime<Utc>> = None;
     let mut reached_end = true;
-    for part in parts.into_iter().skip(start_idx) {
+    for part in parts {
         // The DEFAULT partition is structural: dropping it would make an
         // append for an uncovered cohort fail outright. It is drained, never
         // dropped.
@@ -2767,6 +2794,12 @@ async fn sweep_inner(
                 .push(format!("{} ({UNBOUNDED_REASON})", part.name));
             continue;
         };
+        if skipping {
+            if resume_after.is_some_and(|cursor| upper <= cursor) {
+                continue;
+            }
+            skipping = false;
+        }
         if upper > now {
             continue;
         }
@@ -2794,7 +2827,7 @@ async fn sweep_inner(
         // THIS partition is known. A pass that ends by hitting budget on
         // the very next iteration then still resumes after this one,
         // rather than re-attempting it.
-        last_attempted = Some(part.name.clone());
+        last_attempted = Some(upper);
         if let Some(reason) =
             cohort_occupancy(conn, &EventScope::cohort(part.lower, upper), upper, opts).await?
         {
@@ -3654,7 +3687,7 @@ pub async fn maintain(
     now: DateTime<Utc>,
     lookahead_cohorts: u32,
     sweep_opts: &SweepOptions,
-    resume_after: Option<&str>,
+    resume_after: Option<DateTime<Utc>>,
 ) -> HarvestResult<MaintenanceOutcome> {
     if !detect_layout(conn).await?.is_partitioned() {
         // Still stamped: a caller polling for "maintenance has run" must not
