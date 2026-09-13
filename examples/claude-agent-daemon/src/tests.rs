@@ -3560,7 +3560,10 @@ fn a_listed_report_is_shown_only_when_it_reads() {
         "part",
         r#"{"stop":"end_turn","turns":"many","tool_calls":2,"answer":"done"}"#,
     );
-    // Nothing readable at all, which is the shape of a damaged report.
+    // Nothing readable at all, which is the shape of a damaged report. The
+    // document is PRESENT, so the row is named. It once said nothing here,
+    // and a COMPLETED session then read exactly like one still running. See
+    // `a_report_that_answers_no_projection_is_named_unreadable`.
     report("none", "}{");
     // A session that ended with no text is a real outcome, not a fault.
     report(
@@ -3592,9 +3595,9 @@ fn a_listed_report_is_shown_only_when_it_reads() {
         "a report missing a field it asserts is named unreadable"
     );
     assert_eq!(
-        shown("none"),
-        None,
-        "a report with nothing readable says nothing, as the status does"
+        shown("none").as_deref(),
+        Some("<unreadable report>"),
+        "a report with nothing readable is named, as the status now names it"
     );
     assert_eq!(
         shown("quiet").as_deref(),
@@ -10840,4 +10843,168 @@ fn a_listed_goal_is_shown_only_when_the_whole_task_reads() {
             );
         }
     }
+}
+
+/// A report that answers NO projection is NAMED, not passed over.
+///
+/// Each of the four fields is projected on its own. A report that fails only
+/// some of them therefore shows itself. The caller reads a partial tuple and
+/// names the row unreadable. A document that answers NONE of them reads
+/// exactly like a session that recorded no report at all.
+///
+/// Four shapes reach that state, and each one is measured here. The object is
+/// empty. The object holds none of the four keys. Every declared key holds
+/// the wrong type. The column holds text that is not JSON.
+///
+/// Measured before the fix, every one of them listed as a COMPLETED session
+/// with no answer, which is what a session still running shows.
+///
+/// The single status agreed, and that is why it is fixed with the listing.
+/// `SessionReport` refuses all four documents, so `status` also showed
+/// nothing. Naming the fault in the listing alone would make the two readers
+/// disagree, which is the fault this suite exists to catch.
+#[test]
+fn a_report_that_answers_no_projection_is_named_unreadable() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("projections.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+
+    // Every one of these is a PRESENT report that `SessionReport` refuses and
+    // that no projection answers.
+    let unreadable = [
+        ("empty-object", "{}"),
+        ("other-keys", r#"{"elsewhere":1}"#),
+        (
+            "all-wrong-type",
+            r#"{"answer":1,"turns":"a","tool_calls":null,"stop":[]}"#,
+        ),
+        ("not-json", "{not json"),
+    ];
+    // The not-the-fault cases. A whole report reads. A report failing only
+    // SOME projections is already named by the partial tuple, so the fix must
+    // not be what names it. A row with no report says nothing, and must keep
+    // saying nothing.
+    let readable = r#"{"stop":"end_turn","turns":1,"tool_calls":0,"answer":"done"}"#;
+    let partial = r#"{"stop":"end_turn","turns":1.5,"tool_calls":0,"answer":"x"}"#;
+    for (exec, output) in unreadable
+        .into_iter()
+        .chain([("whole-report", readable), ("partial-report", partial)])
+    {
+        writer
+            .execute(
+                "INSERT INTO harvest_executions VALUES (?1, ?2, 'COMPLETED', ?3, ?4, NULL)",
+                rusqlite::params![exec, WORKFLOW_NAME, READABLE_TASK, output],
+            )
+            .expect("the session is recorded");
+    }
+    writer
+        .execute(
+            "INSERT INTO harvest_executions VALUES ('no-report', ?1, 'RUNNING', ?2, NULL, NULL)",
+            rusqlite::params![WORKFLOW_NAME, READABLE_TASK],
+        )
+        .expect("the unfinished session is recorded");
+    drop(writer);
+
+    let reader = inspect::open(&db).expect("the reader opens");
+    let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
+    let (views, _, _) = daemon::sessions(&reader, &daemon::Parked::new(), false, None)
+        .expect("the listing renders");
+    let shown = |exec: &str| -> Option<String> {
+        views
+            .iter()
+            .find(|view| view.execution_id == exec)
+            .expect("the session is listed")
+            .answer
+            .clone()
+    };
+
+    for (exec, output) in unreadable {
+        assert_eq!(
+            shown(exec).as_deref(),
+            Some("<unreadable report>"),
+            "[{exec}] a present report no projection answers is NAMED"
+        );
+        assert!(
+            listed_row(&listed, exec).report_is_damaged,
+            "[{exec}] and the row carries that fault itself"
+        );
+        // The reason the listing must name it: the single status refuses the
+        // same document. A silence in one reader and a name in the other is
+        // the disagreement this fix exists to prevent.
+        assert_eq!(
+            daemon::status_report(output),
+            None,
+            "[{exec}] the single status refuses the same document"
+        );
+    }
+
+    assert_eq!(
+        shown("whole-report").as_deref(),
+        Some("[end_turn after 1 turns, 0 tool calls] done"),
+        "a readable report is shown as it stands"
+    );
+    assert!(
+        !listed_row(&listed, "whole-report").report_is_damaged,
+        "and the row is not called damaged"
+    );
+    assert_eq!(
+        shown("partial-report").as_deref(),
+        Some("<unreadable report>"),
+        "a report failing SOME projections is named, as it was before"
+    );
+    assert_eq!(
+        shown("no-report"),
+        None,
+        "a session that recorded NO report still says nothing"
+    );
+    assert!(
+        !listed_row(&listed, "no-report").report_is_damaged,
+        "and an absent report is never called damaged"
+    );
+}
+
+/// The single status names a present report it cannot read.
+///
+/// The listing and the status must answer alike. Before the fix both said
+/// NOTHING for a present document `SessionReport` refuses, so a COMPLETED
+/// session read as one still running in BOTH readers.
+#[test]
+fn the_status_names_a_report_it_cannot_read() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("status-report.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+    writer
+        .execute(
+            "INSERT INTO harvest_executions VALUES ('damaged', ?1, 'COMPLETED', ?2, '{}', NULL)",
+            rusqlite::params![WORKFLOW_NAME, READABLE_TASK],
+        )
+        .expect("the session is recorded");
+    writer
+        .execute(
+            "INSERT INTO harvest_executions VALUES ('running', ?1, 'RUNNING', ?2, NULL, NULL)",
+            rusqlite::params![WORKFLOW_NAME, READABLE_TASK],
+        )
+        .expect("the unfinished session is recorded");
+    drop(writer);
+
+    let reader = inspect::open(&db).expect("the reader opens");
+    let parked = daemon::Parked::new();
+    let read = |exec: &str| {
+        let row = inspect::execution(&reader, WORKFLOW_NAME, exec)
+            .expect("the status reads the session")
+            .expect("the session is there");
+        daemon::view(&reader, &row, &parked, false)
+    };
+    assert_eq!(
+        read("damaged").answer.as_deref(),
+        Some("<unreadable report>"),
+        "a present report the status cannot read is NAMED"
+    );
+    assert_eq!(
+        read("running").answer,
+        None,
+        "a session that recorded no report still says nothing"
+    );
 }

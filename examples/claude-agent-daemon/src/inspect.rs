@@ -133,10 +133,27 @@ pub struct SessionSummary {
     pub error_is_damaged: bool,
     /// Is the recorded report a document this daemon cannot read as a whole?
     ///
-    /// Each field is projected on its own, so a document that repeats a key
+    /// The test is the whole declared shape, as
+    /// [`SessionSummary::task_is_damaged`] is. Every field `SessionReport`
+    /// declares must be present once, and of the type and range that field
+    /// reads as. A document that answers no projection at all is the reason
+    /// the test must be the whole shape.
+    ///
+    /// Each field is projected on its own, so a PARTIAL failure shows itself.
+    /// The caller reads some fields and not others. It then names the row
+    /// unreadable. Two shapes escape that. A document that repeats a key
     /// answers every projection and still fails to deserialise as a whole.
     /// `json_type` reports the FIRST value of a repeated key, so even a
     /// repeat of another type passes the type guards.
+    ///
+    /// The other shape is a document that answers NO projection. Four shapes
+    /// reached that state. The object is empty. The object holds none of the
+    /// four keys. Every declared key holds the wrong type. The column holds
+    /// text that is not JSON. Every projection answered nothing, which is what a
+    /// session with NO report answers. The caller then showed a COMPLETED
+    /// session with no result, and the report it could not read was never
+    /// named. Invalid JSON is therefore reported here, and not left to the
+    /// projections.
     ///
     /// A projection is also a PREFIX. The listing cuts a long field in the
     /// database, and the caller decodes what it is given. Text that holds no
@@ -1076,16 +1093,28 @@ pub const SESSIONS_QUERY: &str = "SELECT \
                     error IS NOT NULL AND typeof(error) <> 'text', \
                     CASE WHEN typeof(output_json) = 'null' THEN 0 \
                          WHEN typeof(output_json) <> 'text' THEN 1 \
-                         WHEN NOT json_valid(output_json) THEN 0 \
-                         WHEN (SELECT count(*) FROM json_each(output_json) \
-                               WHERE key IN ('answer', 'turns', \
-                                             'tool_calls', 'stop')) > 4 THEN 1 \
-                         WHEN (SELECT count(*) FROM json_each(output_json) \
-                               WHERE key IN ('answer', 'stop') \
-                                 AND value GLOB '*[' || char(55296) \
-                                             || '-' || char(57343) \
-                                             || ']*') > 0 THEN 1 \
-                         ELSE 0 END, \
+                         WHEN NOT json_valid(output_json) THEN 1 \
+                         ELSE NOT coalesce(( \
+                                  json_type(output_json, '$.stop') = 'text' \
+                              AND json_type(output_json, '$.answer') = 'text' \
+                              AND json_type(output_json, '$.turns') = 'integer' \
+                              AND typeof(json_extract(output_json, '$.turns')) \
+                                  = 'integer' \
+                              AND json_extract(output_json, '$.turns') \
+                                  BETWEEN 0 AND ?5 \
+                              AND json_type(output_json, '$.tool_calls') = 'integer' \
+                              AND typeof(json_extract(output_json, '$.tool_calls')) \
+                                  = 'integer' \
+                              AND json_extract(output_json, '$.tool_calls') \
+                                  BETWEEN 0 AND ?5 \
+                              AND (SELECT count(*) FROM json_each(output_json) \
+                                   WHERE key IN ('answer', 'turns', \
+                                                 'tool_calls', 'stop')) = 4 \
+                              AND (SELECT count(*) FROM json_each(output_json) \
+                                   WHERE key IN ('answer', 'stop') \
+                                     AND value GLOB '*[' || char(55296) \
+                                                 || '-' || char(57343) \
+                                                 || ']*') = 0), 0) END, \
                     CASE WHEN typeof(input_json) = 'text' \
                          THEN CASE WHEN json_valid(input_json) \
                                    THEN NOT coalesce(( \

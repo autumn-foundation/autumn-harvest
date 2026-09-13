@@ -1239,10 +1239,13 @@ fn summary_view(
     // and a zero in its place would present a damaged report as a genuine
     // result: `[end_turn after 0 turns, 0 tool calls]`.
     //
-    // A row with none of them readable says nothing, which is what the single
-    // status does with a report it cannot deserialise. A row with some of
-    // them is named as unreadable. The line cannot be built, and a silence
-    // would read as "no report yet".
+    // A row with some of them readable is named as unreadable. The line
+    // cannot be built, and a silence would read as "no report yet".
+    //
+    // A row with NONE of them readable says nothing ONLY when the row holds
+    // no report. A present document that answers no projection is reported by
+    // `report_is_damaged` above, so it reaches the first arm instead. Both
+    // readers name it, because a fix to one alone would make them disagree.
     //
     // The ANSWER is one of the four. An empty answer is a real outcome: a
     // session can end with the model writing no text. The projection reports
@@ -1392,9 +1395,16 @@ pub fn task_goal(input_json: &str) -> Option<String> {
 }
 
 /// Build one operator view.
-fn view(reader: &Connection, row: &ExecutionRow, blocked: &Parked, full: bool) -> SessionView {
+pub fn view(reader: &Connection, row: &ExecutionRow, blocked: &Parked, full: bool) -> SessionView {
     let goal = task_goal(&row.input_json).unwrap_or_else(|| "<unreadable task>".to_string());
-    let answer = row.output_json.as_deref().and_then(status_report);
+    // A report that is PRESENT and unreadable is named, exactly as the goal
+    // beside it is. A silence here would read as "no report yet", which is
+    // what a running session shows. The listing carries the same split, and
+    // the two must agree: see [`inspect::SessionSummary::report_is_damaged`].
+    let answer = row
+        .output_json
+        .as_deref()
+        .map(|output| status_report(output).unwrap_or_else(|| "<unreadable report>".to_string()));
     let exec = row.exec_id.parse::<ExecutionId>().ok();
     let state = exec.and_then(|exec| blocked.get(&exec));
     let (pending, blocked_on) = decidable(reader, &row.exec_id, state, full);
