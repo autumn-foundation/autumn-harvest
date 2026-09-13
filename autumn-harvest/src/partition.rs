@@ -3936,15 +3936,26 @@ impl MaintenanceOutcome {
 /// operator class. `indkey` is an `int2vector`, whose Postgres-defined
 /// array lower bound is `0`, so `indkey[0]` is the first key column.
 ///
-/// Review finding: also checks `indnullsnotdistinct`. Harvest's own
-/// phase-2 indexes are ordinary ones — `NULLS DISTINCT`, the default.
-/// An operator's own `UNIQUE NULLS NOT DISTINCT` index under one of
-/// these reserved names, with otherwise matching columns, still passed
-/// every check above. `ATTACH PARTITION` requires that property to
-/// match the parent's index. Phase 4 would then find this impostor
-/// unattachable. It would build a replacement over the legacy table
-/// instead, under `ACCESS EXCLUSIVE` — exactly the unplanned rebuild
-/// this assertion exists to catch in advance.
+/// Review finding: also checks for `NULLS NOT DISTINCT`. Harvest's own
+/// phase-2 indexes are ordinary ones — `NULLS DISTINCT`, the default. An
+/// operator's own `UNIQUE NULLS NOT DISTINCT` index under one of these
+/// reserved names, with otherwise matching columns, still passed every
+/// check above. `ATTACH PARTITION` requires that property to match the
+/// parent's index. Phase 4 would then find this impostor unattachable.
+/// It would build a replacement over the legacy table instead, under
+/// `ACCESS EXCLUSIVE` — exactly the unplanned rebuild this assertion
+/// exists to catch in advance.
+///
+/// Review finding: checked through `pg_get_indexdef`, not
+/// `pg_index.indnullsnotdistinct` directly. That column does not exist
+/// before PostgreSQL 15. `docs/partitioned-events.md` still supports 14,
+/// and a literal reference to it fails every phase-4 run there with
+/// "column does not exist", potentially hours into phases 1–3.
+/// `pg_get_indexdef` exists on every supported version. It renders
+/// `NULLS NOT DISTINCT` in its output exactly when the feature is
+/// present. The same textual check works everywhere, then: it can never
+/// appear in the reconstructed definition on a version that has no way
+/// to create it.
 #[must_use]
 fn index_shape_check_sql(index_name: &str, columns: &[&str]) -> String {
     let col_checks: String = columns
@@ -3960,7 +3971,8 @@ fn index_shape_check_sql(index_name: &str, columns: &[&str]) -> String {
         .join(" AND ");
     let n = columns.len();
     format!(
-        "(c.relname = '{index_name}' AND i.indisunique AND NOT i.indnullsnotdistinct \
+        "(c.relname = '{index_name}' AND i.indisunique \
+         AND pg_get_indexdef(i.indexrelid) NOT ILIKE '%NULLS NOT DISTINCT%' \
          AND i.indpred IS NULL \
          AND i.indexprs IS NULL AND i.indnkeyatts = {n} AND i.indnatts = {n} \
          AND {col_checks} \

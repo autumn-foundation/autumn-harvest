@@ -1051,6 +1051,8 @@ async fn run_partition_maintenance_pass(
     config: &RetentionConfig,
     monitor_task: &RetentionMonitor,
     resume_cursors: &mut HashMap<ShardId, Option<DateTime<Utc>>>,
+    metrics: &dyn MetricsRecorder,
+    owner: crate::scanner_health::ScannerOwner,
 ) {
     if !config.partitions.enabled {
         return;
@@ -1069,6 +1071,17 @@ async fn run_partition_maintenance_pass(
         sweep_opts.straggler_grace = None;
     }
     for (shard, pool) in pools.iter_shards() {
+        // Review finding: a single tick after this whole pass finishes
+        // is not enough. Enough shards hitting the 15-second exact-scan
+        // timeout on a blocked partition can make the whole pass run
+        // longer than the scanner's own staleness threshold. `/admin/
+        // preflight` would then see it as stale or wedged for the
+        // entire pass, not just before it starts.
+        //
+        // Ticking once per shard here is bounded progress. Proof of
+        // life, spaced no farther apart than one shard's worth of work,
+        // however long the whole pass takes.
+        crate::scanner_health::record_scanner_tick(metrics, owner);
         let mut conn = match pool.get().await {
             Ok(conn) => conn,
             Err(error) => {
@@ -1317,25 +1330,17 @@ impl RetentionRuntime {
                     &config,
                     &monitor_task,
                     &mut partition_resume_cursors,
+                    metrics.as_ref(),
+                    owner,
                 ) => {},
             }
-            // Review finding: `register_scanner` above seeds this loop's
-            // liveness series at zero. That is the instant the process
-            // registered, not the instant this pass -- which can run
-            // long on a blocked partitioned shard -- actually finishes.
-            //
-            // `scanner_liveness`'s staleness threshold is measured from
-            // that same zero point. A startup pass alone can exceed it
-            // before the loop below ever gets to its own first tick.
-            // `/admin/preflight` would then see a scanner it must
-            // consider stale or wedged. That happens even though the
-            // process spent that whole window doing exactly the work it
-            // is registered for.
-            //
-            // Ticking here sends the same signal the loop's own
-            // end-of-iteration tick does: proof of life, not proof of
-            // deleted rows. It fires the moment real startup work
-            // finishes.
+            // A trailing tick for the degenerate case the per-shard tick
+            // inside the pass does not cover: zero configured shards. The
+            // loop above never ran at all in that case. `register_scanner`
+            // seeds the liveness series at registration time, not at this
+            // instant. A shardless pass has no other chance to prove the
+            // process is alive before the main loop's own first
+            // iteration.
             crate::scanner_health::record_scanner_tick(metrics.as_ref(), owner);
             loop {
                 tokio::select! {
@@ -1470,6 +1475,8 @@ impl RetentionRuntime {
                     &config,
                     &monitor_task,
                     &mut partition_resume_cursors,
+                    metrics.as_ref(),
+                    owner,
                 )
                 .await;
 
