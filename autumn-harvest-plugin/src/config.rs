@@ -1419,8 +1419,7 @@ key_prefix = "from_toml"
     #[test]
     fn mode_source_defaults_to_embedded_with_no_override() {
         let env = MockEnv::new();
-        let (mode, source) =
-            resolve_harvest_mode_source(&env).expect("resolution should succeed");
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
         assert_eq!(mode, HarvestMode::Embedded);
         assert_eq!(source, HarvestModeSource::Default);
     }
@@ -1428,8 +1427,7 @@ key_prefix = "from_toml"
     #[test]
     fn mode_source_names_the_environment_variable() {
         let env = MockEnv::new().with("AUTUMN_HARVEST__MODE", "split");
-        let (mode, source) =
-            resolve_harvest_mode_source(&env).expect("resolution should succeed");
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
         assert_eq!(mode, HarvestMode::Split);
         assert_eq!(source, HarvestModeSource::Env);
     }
@@ -1450,8 +1448,7 @@ url = "postgres://harvest:harvest@localhost:5432/harvest"
         );
         let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
 
-        let (mode, source) =
-            resolve_harvest_mode_source(&env).expect("resolution should succeed");
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
 
         assert_eq!(mode, HarvestMode::External);
         assert_eq!(source, HarvestModeSource::ConfigFile(root_path));
@@ -1482,8 +1479,7 @@ url = "postgres://harvest:harvest@localhost:5432/harvest"
             .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
             .with("AUTUMN_PROFILE", "dev");
 
-        let (mode, source) =
-            resolve_harvest_mode_source(&env).expect("resolution should succeed");
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
 
         assert_eq!(mode, HarvestMode::Split);
         assert_eq!(source, HarvestModeSource::ConfigFile(profile_path));
@@ -1506,8 +1502,7 @@ url = "postgres://harvest:harvest@localhost:5432/harvest"
             .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
             .with("AUTUMN_HARVEST__MODE", "embedded");
 
-        let (mode, source) =
-            resolve_harvest_mode_source(&env).expect("resolution should succeed");
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
 
         assert_eq!(mode, HarvestMode::Embedded);
         assert_eq!(source, HarvestModeSource::Env);

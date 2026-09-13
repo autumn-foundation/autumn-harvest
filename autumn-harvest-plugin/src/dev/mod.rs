@@ -746,10 +746,9 @@ fn refuse_unsupported_harvest_mode(env: &dyn Env) -> Result<(), DevError> {
     let (mode, mode_source) = resolve_harvest_mode_source(env)?;
     match mode {
         HarvestMode::Embedded => Ok(()),
-        HarvestMode::Split | HarvestMode::External => Err(DevError::UnsupportedHarvestMode {
-            mode,
-            mode_source,
-        }),
+        HarvestMode::Split | HarvestMode::External => {
+            Err(DevError::UnsupportedHarvestMode { mode, mode_source })
+        }
     }
 }
 
@@ -982,8 +981,7 @@ mod harvest_mode_gate_tests {
     fn split_mode_from_the_environment_is_refused_and_named() {
         let env = MockEnv::new().with("AUTUMN_HARVEST__MODE", "split");
 
-        let error = refuse_unsupported_harvest_mode(&env)
-            .expect_err("split mode must be refused");
+        let error = refuse_unsupported_harvest_mode(&env).expect_err("split mode must be refused");
         let message = error.to_string();
 
         match error {
@@ -1014,14 +1012,17 @@ mod harvest_mode_gate_tests {
         .expect("config file should be written");
         let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
 
-        let error = refuse_unsupported_harvest_mode(&env)
-            .expect_err("external mode must be refused");
+        let error =
+            refuse_unsupported_harvest_mode(&env).expect_err("external mode must be refused");
         let message = error.to_string();
 
         match error {
             DevError::UnsupportedHarvestMode { mode, mode_source } => {
                 assert_eq!(mode, HarvestMode::External);
-                assert_eq!(mode_source, HarvestModeSource::ConfigFile(config_path.clone()));
+                assert_eq!(
+                    mode_source,
+                    HarvestModeSource::ConfigFile(config_path.clone())
+                );
             }
             other => panic!("expected UnsupportedHarvestMode, got {other}"),
         }
