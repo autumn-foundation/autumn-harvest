@@ -75,29 +75,45 @@ if [ -z "$params" ]; then
   exit 1
 fi
 
-# A leading `(` means the whole parameter list is one tuple-destructured
-# argument (e.g. `|(_ctx, order): (&MessageCtx, OrderPlaced)|`), which
-# implements `Fn((&MessageCtx, OrderPlaced))` -- a single tuple parameter --
-# not the required `Fn(&MessageCtx, OrderPlaced)`. Flagged in PR #1523
-# review: a bare comma count treats this as two arguments because a tuple
-# pattern's internal comma still counts, so it passed despite being the
-# same wrong arity as the untyped and typed single-argument cases above.
-trimmed_params="$(sed -E 's/^[[:space:]]+//' <<<"$params")"
+# Count top-level parameters exactly, splitting on commas only at bracket
+# depth 0 -- a plain comma count or "does it start with `(`" heuristic both
+# proved unsound in PR #1523 review: a tuple-destructured single argument
+# (`|(_ctx, order): (&MessageCtx, OrderPlaced)|`) has an internal comma that
+# a bare count mistakes for two arguments, a three-argument closure
+# (`|_ctx, order: OrderPlaced, extra|`) has two commas but is not the
+# required two-argument form, and a single argument with a tuple *type*
+# (`|order: (OrderPlaced, String)|`) has a comma with no leading `(` on the
+# parameter list itself. None of those are top-level commas once `()` /
+# `<>` / `[]` / `{}` nesting is tracked, which is what this counts instead.
+param_count="$(python3 -c '
+import sys
 
-if [ -z "$trimmed_params" ] || ! grep -q ',' <<<"$trimmed_params" \
-  || [ "${trimmed_params:0:1}" = "(" ]; then
-  echo "$doc: the cutover example's .map_json(...) closure takes a single" \
-    "argument (\"$params\") -- either the typed body alone, or both" \
-    "parameters destructured together as one tuple pattern. Either way it" \
-    "implements Fn(T) or Fn((&MessageCtx, T)), not the" \
-    "Fn(&MessageCtx, T) -> Result<MappedMessage, E> that SourceBinding::" \
-    "map_json requires, so this closure has the wrong arity and does not" \
-    "type-check." >&2
+s = sys.argv[1]
+depth = 0
+count = 1
+opens = "([{<"
+closes = ")]}>"
+for ch in s:
+    if ch in opens:
+        depth += 1
+    elif ch in closes:
+        depth = max(0, depth - 1)
+    elif ch == "," and depth == 0:
+        count += 1
+print(count if s.strip() else 0)
+' "$params")"
+
+if [ "$param_count" -ne 2 ]; then
+  echo "$doc: the cutover example's .map_json(...) closure takes" \
+    "$param_count top-level parameter(s) (\"$params\"), not the two" \
+    "SourceBinding::map_json requires -- Fn(&MessageCtx, T) ->" \
+    "Result<MappedMessage, E>. This does not type-check regardless of the" \
+    "closure body." >&2
   echo >&2
-  echo "Fix: take the message context and the typed body as two separate" \
-    "closure parameters, e.g. |_ctx, order: OrderPlaced|, and return a" \
-    "MappedMessage (see the chapter's other .map_json examples, or" \
-    "MappedMessage::new)." >&2
+  echo "Fix: take the message context and the typed body as exactly two" \
+    "separate closure parameters, e.g. |_ctx, order: OrderPlaced|, and" \
+    "return a MappedMessage (see the chapter's other .map_json examples," \
+    "or MappedMessage::new)." >&2
   exit 1
 fi
 
