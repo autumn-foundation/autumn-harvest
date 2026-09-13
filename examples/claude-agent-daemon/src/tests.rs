@@ -11008,3 +11008,134 @@ fn the_status_names_a_report_it_cannot_read() {
         "a session that recorded no report still says nothing"
     );
 }
+
+/// A restart refuses a history that does not read ONE way.
+///
+/// The restart reads each durable wait before the socket accepts anything. It
+/// asked whether a decision was already taken, and it read the delivery event
+/// to answer. That read trusted the row.
+///
+/// Two shapes broke it, and each one is measured here. A delivery in a class
+/// the ENGINE cannot load closed the wait, so the daemon announced readiness
+/// with no pending call while every drive failed. A delivery that repeats
+/// `type` reads as `SignalReceived` here and as `Other` in the engine. The
+/// wait then closed over a decision the engine never took.
+///
+/// The startup refuses instead of choosing a reading. Restoring the wait
+/// would offer a token for a session no drive can advance.
+#[test]
+fn a_restart_refuses_a_history_that_reads_two_ways() {
+    let armed = "tool_approval:2:0:toolu_x";
+    let delivery = json!({
+        "type": "SignalReceived",
+        "data": { "signal_name": armed, "payload": { "approved": true } },
+    })
+    .to_string();
+    // The same delivery with `type` recorded twice.
+    let repeated =
+        format!(r#"{{"type":"SignalReceived","data":{{"signal_name":"{armed}"}},"type":"Other"}}"#);
+    // The not-the-fault case: an ordinary readable delivery still closes the
+    // wait, so the refusal is the damage and not the reading.
+    let waiting = r#"{"type":"Other","data":{}}"#.to_string();
+
+    let build = |blob: bool, event: &str| {
+        let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
+        conn.execute_batch(
+            "CREATE TABLE harvest_timers (timer_id TEXT, exec_id TEXT, fire_at INTEGER, \
+             fired INTEGER NOT NULL DEFAULT 0, arm_seq INTEGER, \
+             PRIMARY KEY (exec_id, timer_id)); \
+             CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+             PRIMARY KEY (exec_id, seq)); \
+             CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+             exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+             delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)",
+        )
+        .expect("the fixture tables are created");
+        conn.execute(
+            "INSERT INTO harvest_timers VALUES (?1, 'e', 9999, 0, 2)",
+            [format!("__signal_timeout:2:{armed}")],
+        )
+        .expect("the armed timer is recorded");
+        let sql = if blob {
+            "INSERT INTO harvest_events VALUES ('e', 0, cast(?1 as blob))"
+        } else {
+            "INSERT INTO harvest_events VALUES ('e', 0, ?1)"
+        };
+        conn.execute(sql, [event])
+            .expect("the delivery is appended");
+        conn
+    };
+
+    for (label, blob, event) in [
+        ("a class the engine cannot load", true, delivery.as_str()),
+        ("a repeated declared key", false, repeated.as_str()),
+    ] {
+        let conn = build(blob, event);
+        let refused = inspect::outstanding_signal(&conn, "e", 1_000)
+            .expect_err("a history that reads two ways must refuse the restart");
+        assert!(
+            refused.contains("cannot be told"),
+            "[{label}] the refusal must say WHY it refuses: {refused}"
+        );
+        assert!(
+            refused.contains('e'),
+            "[{label}] the refusal must name the session: {refused}"
+        );
+    }
+
+    // A readable delivery still closes the wait.
+    let closed = build(false, &delivery);
+    assert_eq!(
+        inspect::outstanding_signal(&closed, "e", 1_000).expect("the wait query runs"),
+        None,
+        "a readable delivery still ends the wait"
+    );
+    // A readable history with no delivery still restores the wait.
+    let open = build(false, &waiting);
+    assert_eq!(
+        inspect::outstanding_signal(&open, "e", 1_000).expect("the wait query runs"),
+        Some(armed.to_string()),
+        "an undecided wait is still restored"
+    );
+}
+
+/// The history view names no event the engine cannot read.
+///
+/// The view projected `type` and `data` from any row `json_valid` accepted. A
+/// `BLOB` answers that, so the view showed a sound history for a run whose
+/// every drive fails. The row stays listed, because dropping it would hide
+/// the one row that explains the failure.
+#[test]
+fn the_history_view_names_no_event_the_engine_cannot_read() {
+    let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
+    conn.execute_batch(
+        "CREATE TABLE harvest_events (exec_id TEXT NOT NULL, seq INTEGER NOT NULL, \
+         event_json TEXT NOT NULL, PRIMARY KEY (exec_id, seq))",
+    )
+    .expect("the fixture table is created");
+    let event = r#"{"type":"SignalReceived","data":{"signal_name":"s"}}"#;
+    conn.execute("INSERT INTO harvest_events VALUES ('e', 0, ?1)", [event])
+        .expect("the readable event is appended");
+    conn.execute(
+        "INSERT INTO harvest_events VALUES ('e', 1, cast(?1 as blob))",
+        [event],
+    )
+    .expect("the unreadable event is appended");
+
+    let lines = inspect::event_lines(&conn, "e", None, 10).expect("the history reads");
+    let label = |seq: i64| {
+        lines
+            .iter()
+            .find(|line| line.seq == seq)
+            .expect("the event is listed")
+            .label
+            .clone()
+    };
+    assert_eq!(label(0), "SignalReceived", "a readable event is named");
+    assert_eq!(
+        label(1),
+        "unknown",
+        "an event in a class the engine cannot read is NOT named"
+    );
+    assert_eq!(lines.len(), 2, "and the unreadable row is still listed");
+}

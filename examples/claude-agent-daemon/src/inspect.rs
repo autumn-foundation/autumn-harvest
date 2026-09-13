@@ -437,12 +437,23 @@ pub fn no_cursor(before: Option<i64>) -> i64 {
 }
 
 /// One page of a session's events, newest first. See [`no_cursor`].
+///
+/// Both projections ask whether the row is TEXT. A `BLOB` holding the same
+/// bytes answers `json_valid` and every test beside it, so this view named
+/// the event and showed its detail. The ENGINE cannot read that row at all,
+/// so the history an operator read as sound belonged to a run no drive can
+/// advance. Measured on one delivery rewritten as a `BLOB`: this view showed
+/// `SignalReceived`, and the loader answered
+/// `InvalidColumnType(0, "event_json", Blob)`.
+///
+/// The row is still SELECTED, and its type reads as `unknown`. Dropping it
+/// would hide the one row that explains why the run stopped.
 pub const EVENTS_QUERY: &str = "SELECT seq, \
-            CASE WHEN json_valid(event_json) \
+            CASE WHEN typeof(event_json) = 'text' AND json_valid(event_json) \
                   AND json_type(event_json, '$.type') = 'text' \
                  THEN coalesce(substr(cast(json_extract(event_json, '$.type') as blob), \
                                        1, ?4), zeroblob(0)) END, \
-            CASE WHEN json_valid(event_json) \
+            CASE WHEN typeof(event_json) = 'text' AND json_valid(event_json) \
                  THEN coalesce(substr(cast(json_extract(event_json, '$.data') as blob), \
                                        1, ?4), zeroblob(0)) END \
      FROM harvest_events \
@@ -979,6 +990,15 @@ fn answered(conn: &Connection, exec_id: &str, signal: &str) -> Result<bool, Stri
     if staged {
         return Ok(true);
     }
+    // The event read below is only as good as the rows it reads. A row this
+    // daemon reads and the ENGINE cannot is refused first, and so is one that
+    // reads two ways.
+    if ambiguous_history(conn, exec_id)? {
+        return Err(format!(
+            "session {exec_id} holds an event this daemon cannot read as the \
+             engine reads it, so whether its decision was taken cannot be told"
+        ));
+    }
     one_row(
         conn,
         "SELECT 1 FROM harvest_events WHERE exec_id = ?1 \
@@ -988,6 +1008,52 @@ fn answered(conn: &Connection, exec_id: &str, signal: &str) -> Result<bool, Stri
         exec_id,
         signal,
     )
+}
+
+/// Does this history hold an event that does not read ONE way?
+///
+/// Two faults are asked for together, because both make the answer above a
+/// guess rather than a reading.
+///
+/// A row in a class the engine cannot load strands the run. `load_history`
+/// reads every `event_json` into a `String`, which a `BLOB` refuses. This
+/// daemon answers `json_valid` and every test above it on the same row. The
+/// restart therefore read the delivery and closed the wait. It then reported
+/// readiness with no pending call, and every drive failed. Measured on one delivery
+/// rewritten as a `BLOB`: the wait was suppressed, and the loader answered
+/// `InvalidColumnType(0, "event_json", Blob)`.
+///
+/// A row that REPEATS a declared key reads two ways. `json_extract` reports
+/// the FIRST value and `serde_json` the LAST. Measured on a delivery holding
+/// `type` twice: this daemon read `SignalReceived` and the engine read
+/// `Other`. The wait was closed over a decision the engine never took.
+///
+/// The startup refuses rather than choosing one reading. Restoring the wait
+/// instead would print a token for a session no drive can advance, which is a
+/// decision nothing can consume. See [`REPLIES_QUERY`].
+fn ambiguous_history(conn: &Connection, exec_id: &str) -> Result<bool, String> {
+    // A CASE, and not a chain of `OR`. The class test must run BEFORE any
+    // test that reads the document, and only a CASE orders them.
+    let sql = "SELECT 1 FROM harvest_events WHERE exec_id = ?1 \
+         AND CASE WHEN typeof(event_json) <> 'text' THEN 1 \
+                  WHEN NOT json_valid(event_json) THEN 1 \
+                  WHEN (SELECT count(*) FROM json_each(event_json) \
+                        WHERE key = 'type') <> 1 THEN 1 \
+                  WHEN json_extract(event_json, '$.type') <> 'SignalReceived' THEN 0 \
+                  WHEN (SELECT count(*) FROM json_each(event_json) \
+                        WHERE key = 'data') <> 1 THEN 1 \
+                  WHEN (SELECT count(*) FROM json_each(event_json, '$.data') \
+                        WHERE key = 'signal_name') <> 1 THEN 1 \
+                  ELSE 0 END LIMIT 1";
+    let mut statement = conn
+        .prepare(sql)
+        .map_err(|e| format!("cannot prepare the history class query: {e}"))?;
+    let mut rows = statement
+        .query([exec_id])
+        .map_err(|e| format!("cannot read the history classes: {e}"))?;
+    rows.next()
+        .map(|row| row.is_some())
+        .map_err(|e| format!("cannot read a history class: {e}"))
 }
 
 /// Does this query find a row?
