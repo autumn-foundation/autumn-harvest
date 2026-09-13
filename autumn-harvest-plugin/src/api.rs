@@ -445,10 +445,10 @@ pub struct HarvestApiState {
     /// Set only by the dev runtime (`crate::dev`), which owns one ephemeral
     /// cluster and has no second database for `split`/`external` storage.
     /// Every ordinary embedder leaves this `false` and keeps full support
-    /// for both modes. A backstop, not the primary gate: the dev runtime
-    /// already refuses before provisioning and again before the server
-    /// starts, so this only matters if ambient configuration changed in the
-    /// narrow window after that.
+    /// for both modes. This is a backstop, not the primary gate. The dev
+    /// runtime already refuses before provisioning, and again before the
+    /// server starts. This only matters if ambient configuration changed in
+    /// the narrow window after that.
     require_embedded_harvest_mode: Arc<Mutex<bool>>,
 }
 

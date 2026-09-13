@@ -260,9 +260,9 @@ pub struct HarvestPlugin {
     /// `embedded` mode (issue #1291). Set only by the dev runtime
     /// (`crate::dev`) via [`Self::require_embedded_harvest_mode`]; every
     /// ordinary embedder leaves this `false` and keeps full `split`/
-    /// `external` support. A backstop: the dev runtime's own startup gate
-    /// already refuses this case earlier, so this only matters if ambient
-    /// configuration changed in the narrow window since.
+    /// `external` support. This is a backstop: the dev runtime's own
+    /// startup gate already refuses this case earlier. It only matters if
+    /// ambient configuration changed in the narrow window since.
     require_embedded_harvest_mode: bool,
 }
 
@@ -812,9 +812,9 @@ impl HarvestPlugin {
     /// Crate-internal: only the dev runtime (`crate::dev`) calls this. It
     /// owns one ephemeral cluster and has no second database to offer
     /// `split`/`external` storage. It already refuses ambient non-embedded
-    /// configuration before this plugin is ever built; this flag is a
+    /// configuration before this plugin is ever built. This flag is a
     /// backstop against ambient configuration changing in the narrow window
-    /// since that check, checked again both at build time
+    /// since that check. It is checked again both at build time
     /// ([`register_plugin_migrations`]) and at startup
     /// ([`start_harvest_runtime`]).
     #[cfg(feature = "dev-runtime")]
