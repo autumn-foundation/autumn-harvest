@@ -342,9 +342,13 @@ happened.
   seconds of each other, so the effect is small — but it is unmeasured, and
   closing it needs an aligned per-shard window. Tracked in
   [#1288](https://github.com/autumn-foundation/autumn-harvest/issues/1288).
-* **A supplied URL must be able to `CREATE DATABASE`.** `HARVEST_BENCH_SHARD_URLS`
-  and `HARVEST_TEST_DATABASE_URL` are treated as **admin** URLs. A role without
-  that right produces a skip notice, not an error.
+* **A supplied URL must be able to `CREATE DATABASE`, and to `CONNECT` to the
+  `postgres` database on that server.** `HARVEST_BENCH_SHARD_URLS` and
+  `HARVEST_TEST_DATABASE_URL` are treated as **admin** URLs. The
+  stale-database sweep and its advisory lock always connect through
+  `postgres` specifically, regardless of which database the URL names, so
+  that every client sweeping the same server agrees on where the lock lives.
+  A role without either right produces a skip notice, not an error.
 
 ## Relationship to the other performance pages
 
