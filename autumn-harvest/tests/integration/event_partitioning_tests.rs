@@ -1067,6 +1067,83 @@ async fn enable_survives_a_rename_target_collision_on_the_built_in_pkey() {
 }
 
 #[tokio::test]
+async fn enable_survives_a_rename_target_collision_on_an_unrelated_relation() {
+    // Review finding: `bounded_rename_fn`'s free-name check for a
+    // constraint only queried `pg_constraint`, scoped to the table.
+    // Renaming a primary-key or unique constraint also renames its
+    // backing index, which Postgres resolves against the whole schema's
+    // `pg_class`, not just this table's constraints. An unrelated
+    // relation already bearing the exact conventional rename target for
+    // the pkey passed the old, `pg_constraint`-only free-name check.
+    // `ALTER TABLE ... RENAME CONSTRAINT` then failed outright when its
+    // implicit index rename collided with that relation, aborting the
+    // whole conversion.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(
+        &mut conn,
+        "relname_collide_wf",
+        "relname-collide-1",
+        day(2026, 2, 3),
+        None,
+    )
+    .await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    // The decoy: an unrelated table occupying the exact name
+    // `bounded_rename_fn` would otherwise pick for the renamed pkey
+    // constraint (and, implicitly, its backing index). No `pg_constraint`
+    // row uses this name, so the old, `pg_constraint`-only free-name
+    // check reported it available.
+    diesel::sql_query("DROP TABLE IF EXISTS harvest_events_pkey__pre958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray decoy from a previous run");
+    diesel::sql_query("CREATE TABLE harvest_events_pkey__pre958 (id int)")
+        .execute(&mut conn)
+        .await
+        .expect("seed the decoy occupying the rename target's relation name");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect(
+            "enable must survive a rename-target collision on an unrelated relation, \
+             not abort the whole conversion when the implicit index rename collides",
+        );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "p",
+        "the conversion must succeed despite the collision"
+    );
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT EXISTS (SELECT 1 FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = current_schema() \
+             AND c.relname = 'harvest_events_pkey__pre958' AND c.relkind = 'r') AS v",
+        )
+        .await,
+        "the operator's own decoy table must survive untouched -- it is not \
+         harvest's to drop"
+    );
+
+    diesel::sql_query("DROP TABLE IF EXISTS harvest_events_pkey__pre958")
+        .execute(&mut conn)
+        .await
+        .expect("clean up the decoy table");
+}
+
+#[tokio::test]
 async fn a_dependent_view_refuses_the_conversion_instead_of_silently_going_stale() {
     // Issue #1270 item 14: Postgres tracks a view's dependency by relation
     // OID, not by name. Both conversion paths rename `harvest_events` out
@@ -5484,6 +5561,95 @@ async fn phase_4_refuses_a_nulls_not_distinct_impostor_of_the_pk_index() {
     let msg = failure.expect(
         "phase 4 must refuse when a valid, correctly-shaped index of the right \
          name is NULLS NOT DISTINCT, not count it as the real one",
+    );
+    assert!(
+        msg.contains("phase 2 left 1 of 2 valid, correctly-shaped"),
+        "the refusal must report exactly one correctly-shaped index found; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused window must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {pk}"))
+        .execute(&mut conn)
+        .await
+        .expect("drop the impostor index");
+    diesel::sql_query(format!(
+        "DROP INDEX IF EXISTS {}_exec_event_idx",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the index phase 2 legitimately built");
+    diesel::sql_query(format!(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS {}_cohort_ck",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the constraint phase 3 legitimately built");
+}
+
+#[tokio::test]
+async fn phase_4_refuses_a_differently_ordered_impostor_of_the_pk_index() {
+    // Review finding: the shape check verified the key columns and their
+    // positions, but not their sort direction. Harvest's own phase-2
+    // indexes sort every key column in plain ascending order. An
+    // operator's own index under the reserved pk-index name, with the
+    // exact right columns and positions but one sorted `DESC`, still
+    // passed every other check. `ATTACH PARTITION` requires matching
+    // sort direction per column, so phase 4 would find this impostor
+    // unattachable. It would build a replacement under `ACCESS
+    // EXCLUSIVE` instead -- exactly the unplanned rebuild this assertion
+    // exists to catch in advance.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(&mut conn, "desc_wf", "desc-1", day(2026, 2, 3), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    let pk = plan_pk_index();
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {pk}"))
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query(format!(
+        "CREATE UNIQUE INDEX {pk} ON harvest_events (id DESC, cohort)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed an impostor index with the pk-index name, columns and shape, but id DESC");
+    assert!(
+        index_is_valid(&mut conn, &pk).await,
+        "precondition: the impostor is VALID, not merely present"
+    );
+
+    run_plan_phases(&mut conn, 1..=3).await;
+
+    let mut failure: Option<String> = None;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 4)
+    {
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await
+            && failure.is_none()
+        {
+            failure = Some(e.to_string());
+        }
+    }
+    let msg = failure.expect(
+        "phase 4 must refuse when a valid, correctly-shaped index of the right \
+         name sorts a key column DESC, not count it as the real one",
     );
     assert!(
         msg.contains("phase 2 left 1 of 2 valid, correctly-shaped"),

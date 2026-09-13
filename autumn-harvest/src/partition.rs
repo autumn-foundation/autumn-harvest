@@ -2269,11 +2269,13 @@ $harvest_enable_958$;
 /// "generate, then verify the result is actually free", not "generate and
 /// hope".
 ///
-/// Scoped correctly per kind. A constraint name only has to be unique among
-/// the constraints of `p_relid` (`pg_constraint.conrelid`). An index, or any
-/// other relation, name has to be unique across the whole schema
-/// (`pg_class`). That is why the function takes a `p_relid`, used only for
-/// the `'constraint'` case.
+/// Scoped correctly per kind. An index, or any other relation, name has to
+/// be unique across the whole schema (`pg_class`). A constraint name only
+/// has to be unique among the constraints of `p_relid`
+/// (`pg_constraint.conrelid`). A constraint's rename can also rename a
+/// backing index, though, so the `'constraint'` case checks `pg_class`
+/// too. That is why the function takes a `p_relid`, used only for the
+/// `'constraint'` case.
 ///
 /// Created immediately before the rename loops that use it and dropped right
 /// after — schema debris a re-run should not leave behind.
@@ -2309,8 +2311,22 @@ BEGIN
             candidate := left(p_base, keep) || '_' || disambig || p_suffix;
         END IF;
         IF p_kind = 'constraint' THEN
+            -- Review finding: a primary-key or unique constraint's rename
+            -- also renames its backing index, per `pg_class`, not just
+            -- its `pg_constraint` row. A candidate free among this
+            -- table's constraints can still collide with an unrelated
+            -- relation's name, and `RENAME CONSTRAINT` then aborts on
+            -- that second, implicit rename. Checking both catalogs for
+            -- every constraint, indexed or not, costs nothing extra in
+            -- the common case. It only adds an occasional disambiguation
+            -- round for a plain constraint that shares a name with some
+            -- unrelated relation.
             SELECT EXISTS (
                 SELECT 1 FROM pg_constraint WHERE conrelid = p_relid AND conname = candidate
+            ) OR EXISTS (
+                SELECT 1 FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = current_schema() AND c.relname = candidate
             ) INTO taken;
         ELSE
             SELECT EXISTS (
@@ -4182,6 +4198,17 @@ impl MaintenanceOutcome {
 /// operator class. `indkey` is an `int2vector`, whose Postgres-defined
 /// array lower bound is `0`, so `indkey[0]` is the first key column.
 ///
+/// Review finding: also checks `indoption` for each key column. Harvest's
+/// own phase-2 indexes sort every key column in plain ascending order. An
+/// operator's own index under one of the reserved names can share every
+/// key column and position with Harvest's own index. One column merely
+/// sorted `DESC` still passed every check above it. `ATTACH PARTITION`
+/// requires matching sort direction per column, so that impostor was
+/// unattachable too. Phase 4 then built an unplanned replacement over the
+/// legacy table under `ACCESS EXCLUSIVE`. `indoption` packs one flag byte
+/// per key column at the same position as `indkey`. `0` means ascending
+/// with nulls last, the only shape Harvest's own indexes ever take.
+///
 /// Review finding: also checks for `NULLS NOT DISTINCT`. Harvest's own
 /// phase-2 indexes are ordinary ones — `NULLS DISTINCT`, the default. An
 /// operator's own `UNIQUE NULLS NOT DISTINCT` index under one of these
@@ -4210,7 +4237,8 @@ fn index_shape_check_sql(index_name: &str, columns: &[&str]) -> String {
         .map(|(pos, col)| {
             format!(
                 "i.indkey[{pos}] = (SELECT a.attnum FROM pg_attribute a \
-                 WHERE a.attrelid = 'harvest_events'::regclass AND a.attname = '{col}')"
+                 WHERE a.attrelid = 'harvest_events'::regclass AND a.attname = '{col}') \
+                 AND i.indoption[{pos}] = 0"
             )
         })
         .collect::<Vec<_>>()
@@ -5404,10 +5432,14 @@ mod tests {
             // expression and every append lands in the legacy partition.
             "ALTER COLUMN cohort SET DEFAULT harvest_event_cohort(clock_timestamp())",
             // ATTACH propagates the parent PK; the child may not keep its own.
+            // The suffixed name below is a comment's illustrative example,
+            // not a literal rename target. `bounded_rename_fn` computes and
+            // disambiguates the real one at runtime. Only the bare,
+            // built-in name it looks for is literal text in either plan.
             "harvest_events_pkey__pre958",
-            "harvest_events_workflow_exec_id_event_id_key__pre958",
+            "harvest_events_workflow_exec_id_event_id_key",
             // The FK whose cascade is the delete storm being eliminated.
-            "harvest_events_workflow_exec_id_fkey__pre958",
+            "harvest_events_workflow_exec_id_fkey",
             // The partitioned shape itself.
             "PARTITION BY RANGE (cohort)",
             "PRIMARY KEY (id, cohort)",
