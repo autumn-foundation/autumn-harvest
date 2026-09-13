@@ -8571,6 +8571,156 @@ fn an_ordinary_row_after_the_newest_reply_counts_as_nothing() {
     );
 }
 
+/// The documents [`a_field_broken_past_the_slice_is_still_caught`] reads.
+///
+/// Each row is a name, a task document, a report document, and whether the
+/// single status reads BOTH of them.
+fn broken_slice_cases() -> [(&'static str, String, String, bool); 7] {
+    let long = "a".repeat(2100);
+    let task = |goal: &str, workspace: &str| {
+        format!(
+            "{{\"goal\":\"{goal}\",\"max_turns\":4,\"approval_timeout_secs\":300,\
+             \"workspace\":\"{workspace}\",\"model\":\"offline\"}}"
+        )
+    };
+    let report = |stop: &str, answer: &str, extra: &str| {
+        format!(
+            "{{\"stop\":\"{stop}\",\"turns\":1,\"tool_calls\":0,\
+             \"answer\":\"{answer}\"{extra}}}"
+        )
+    };
+    [
+        (
+            "goal-broken-late",
+            task(&format!("{long}\\ud800"), "/tmp/w"),
+            report("end_turn", "done", ""),
+            false,
+        ),
+        (
+            "answer-broken-late",
+            task("do it", "/tmp/w"),
+            report("end_turn", &format!("{long}\\ud800"), ""),
+            false,
+        ),
+        (
+            "stop-broken",
+            task("do it", "/tmp/w"),
+            report("end\\udfff", "done", ""),
+            false,
+        ),
+        (
+            "workspace-broken",
+            task("do it", "\\ud800"),
+            report("end_turn", "done", ""),
+            false,
+        ),
+        (
+            "pair-late",
+            task(&format!("{long}\\ud83d\\ude00"), "/tmp/w"),
+            report("end_turn", &format!("{long}\\ud83d\\ude00"), ""),
+            true,
+        ),
+        (
+            "near-surrogate",
+            task("do \\ud7ff it", "/tmp/w"),
+            report("end_turn", "done \\ud7ff", ""),
+            true,
+        ),
+        (
+            "undeclared-broken",
+            task("do it", "/tmp/w"),
+            report("end_turn", "done", ",\"note\":\"\\ud800\""),
+            true,
+        ),
+    ]
+}
+
+/// Text that holds no character is caught BEYOND the slice the listing reads.
+///
+/// Every listed field is cut in the database, and the caller decodes what it
+/// is given. A field that decodes cleanly for its first 500 characters and
+/// holds a broken escape after them therefore passed both ends of the read.
+/// The listing showed a plausible goal and a plausible report, and `status`
+/// refused the whole document.
+///
+/// The test now runs in the database, over the DECODED value, so the length
+/// of the field does not enter into it.
+///
+/// The last three rows are the other end of the rule, and each was measured
+/// against the real reader. A well-formed pair decodes to one astral
+/// character. `U+D7FF` shares the lead byte of a surrogate and is an ordinary
+/// character. A broken escape inside an UNDECLARED key never reaches the
+/// reader at all. `status` accepts all three, so the listing must show them.
+#[test]
+fn a_field_broken_past_the_slice_is_still_caught() {
+    let cases = broken_slice_cases();
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let db = dir.path().join("slices.db");
+    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    fixture_table(&writer);
+    for (exec, input, output, _) in &cases {
+        writer
+            .execute(
+                "INSERT INTO harvest_executions \
+                 VALUES (?1, ?2, 'COMPLETED', ?3, ?4, NULL)",
+                rusqlite::params![exec, WORKFLOW_NAME, input, output],
+            )
+            .expect("the session is recorded");
+    }
+    drop(writer);
+
+    let reader = inspect::open(&db).expect("the reader opens");
+    let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
+    let (views, _, _) = daemon::sessions(&reader, &daemon::Parked::new(), false, None)
+        .expect("the listing renders");
+
+    for (exec, input, output, reads) in &cases {
+        let row = listed_row(&listed, exec);
+        let view = views
+            .iter()
+            .find(|view| view.execution_id == *exec)
+            .expect("the session is listed");
+        // The readers the single status uses, called directly.
+        let goal = daemon::task_goal(input);
+        let answer = daemon::status_report(output);
+
+        assert_eq!(
+            goal.is_some() && answer.is_some(),
+            *reads,
+            "[{exec}] the fixture must be the document this case means"
+        );
+        assert_eq!(
+            !row.task_is_damaged && !row.report_is_damaged,
+            *reads,
+            "[{exec}] the listing must reach the same verdict as the status"
+        );
+        if *reads {
+            assert_ne!(
+                view.goal, "<unreadable task>",
+                "[{exec}] a whole task is shown"
+            );
+            assert_ne!(
+                view.answer.as_deref(),
+                Some("<unreadable report>"),
+                "[{exec}] and a whole report with it"
+            );
+        } else {
+            assert!(
+                view.goal == "<unreadable task>"
+                    || view.answer.as_deref() == Some("<unreadable report>"),
+                "[{exec}] the listing refuses what the status refuses: {view:?}"
+            );
+            // The letters before the break are never shown as the field.
+            assert!(
+                !view.goal.starts_with("aaaa"),
+                "[{exec}] and never the readable prefix of a broken field: {}",
+                view.goal
+            );
+        }
+    }
+}
+
 /// A REAL parked session still shows its call, with the evidence read live.
 ///
 /// The refusals above must cost nothing a healthy history needs. This runs

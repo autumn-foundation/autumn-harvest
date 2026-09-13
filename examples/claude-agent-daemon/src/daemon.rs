@@ -1293,6 +1293,22 @@ pub fn decidable(
     }
 }
 
+/// The report ONE status shows, or nothing when the document is not one.
+///
+/// The whole document must deserialise, as the task beside it must. The
+/// listing carries its own test of the same question, and the two must answer
+/// alike: see [`inspect::SessionSummary::report_is_damaged`].
+pub fn status_report(output_json: &str) -> Option<String> {
+    serde_json::from_str::<SessionReport>(output_json)
+        .ok()
+        .map(|report| {
+            format!(
+                "[{} after {} turns, {} tool calls] {}",
+                report.stop, report.turns, report.tool_calls, report.answer
+            )
+        })
+}
+
 /// The goal ONE status shows, or nothing when the document is not a task.
 ///
 /// The whole document must deserialise. A status reads one session, so it can
@@ -1308,16 +1324,7 @@ pub fn task_goal(input_json: &str) -> Option<String> {
 /// Build one operator view.
 fn view(reader: &Connection, row: &ExecutionRow, blocked: &Parked, full: bool) -> SessionView {
     let goal = task_goal(&row.input_json).unwrap_or_else(|| "<unreadable task>".to_string());
-    let answer = row
-        .output_json
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<SessionReport>(raw).ok())
-        .map(|report| {
-            format!(
-                "[{} after {} turns, {} tool calls] {}",
-                report.stop, report.turns, report.tool_calls, report.answer
-            )
-        });
+    let answer = row.output_json.as_deref().and_then(status_report);
     let exec = row.exec_id.parse::<ExecutionId>().ok();
     let state = exec.and_then(|exec| blocked.get(&exec));
     let (pending, blocked_on) = decidable(reader, &row.exec_id, state, full);

@@ -131,21 +131,30 @@ pub struct SessionSummary {
     /// session with a damaged reason would otherwise look like one that
     /// recorded no reason, and `status` calls the same row unreadable.
     pub error_is_damaged: bool,
-    /// Does the recorded report repeat one of the four fields it declares?
+    /// Is the recorded report a document this daemon cannot read as a whole?
     ///
     /// Each field is projected on its own, so a document that repeats a key
     /// answers every projection and still fails to deserialise as a whole.
     /// `json_type` reports the FIRST value of a repeated key, so even a
     /// repeat of another type passes the type guards.
     ///
+    /// A projection is also a PREFIX. The listing cuts a long field in the
+    /// database, and the caller decodes what it is given. Text that holds no
+    /// character beyond that cut therefore reached neither end. An `answer` of
+    /// 2100 letters and then a broken escape decoded cleanly here, and failed
+    /// to deserialise in `status`.
+    ///
+    /// The surrogate test below answers for the WHOLE value, and the database
+    /// answers it. See [`SessionSummary::task_is_damaged`], which states how.
+    ///
     /// The listing then showed a genuine report for a document the single
     /// status refuses. The two must agree, so the repeat is reported and the
     /// caller names the row unreadable.
     ///
-    /// Only the DECLARED keys are counted. A repeated key the report does not
+    /// Only the DECLARED keys are tested. A repeated key the report does not
     /// declare is measured to deserialise, because the whole document reads
-    /// and the field is ignored. Counting every key would refuse a report
-    /// that `status` shows.
+    /// and the field is ignored. So is a broken escape inside one. Testing
+    /// every key would refuse a report that `status` shows.
     ///
     /// The count is filtered rather than made distinct. A `count(DISTINCT)`
     /// sorts in a temporary B-tree, which the plan guard refuses for this
@@ -160,23 +169,37 @@ pub struct SessionSummary {
     ///
     /// Five shapes reach that state, and each one is measured. A declared key
     /// is repeated. A declared key is absent. A declared key holds the wrong
-    /// type. A count sits outside the range of the Rust field. A text field
-    /// holds no character.
+    /// type. A count sits outside the range of the Rust field. A declared text
+    /// field holds no character.
     ///
     /// The test is therefore the whole declared shape, and not the goal
     /// alone. Every field `SessionTask` declares must be present once, and of
     /// the type and range that field reads as.
     ///
-    /// Only the DECLARED keys are counted, as with
+    /// # Text that holds no character
+    ///
+    /// `json_valid` accepts an unpaired surrogate escape, and `json_type`
+    /// calls the field text. The database DECODES one into bytes no character
+    /// has, which is what the Rust reader refuses.
+    ///
+    /// The test is a `GLOB` over the decoded value, for a code point between
+    /// `U+D800` and `U+DFFF`. It runs in the database, so it answers for the
+    /// whole field and not for the prefix the listing cuts. A field of 2100
+    /// letters and then a broken escape is caught by it.
+    ///
+    /// The test is EXACT, and not a pattern over the recorded text. A
+    /// well-formed pair decodes to one astral character and is not matched.
+    /// `U+D7FF` encodes with the same lead byte and is not matched either.
+    /// Both were measured, and `status` accepts both.
+    ///
+    /// Only the DECLARED keys are tested, as with
     /// [`SessionSummary::report_is_damaged`]. An undeclared key is measured to
     /// deserialise, and its value is never decoded. A broken escape inside one
     /// therefore does not stop the whole document from reading.
     ///
-    /// Two limits stand. `approval_timeout_secs` is a `u64`, and `SQLite`
+    /// One limit stands. `approval_timeout_secs` is a `u64`, and `SQLite`
     /// holds integers as `i64`. The top of that range is compared as a float,
-    /// which does not separate the last few values exactly. The `workspace`
-    /// and `model` fields are read only as far as the listing cuts them. Text
-    /// that holds no character BEYOND that cut is therefore not seen.
+    /// which does not separate the last few values exactly.
     pub task_is_damaged: bool,
     /// Where this row sits in the table, which is the cursor that reads the
     /// rows BEFORE it. The listing is capped, so an old session waiting for a
@@ -970,10 +993,17 @@ pub const SESSIONS_QUERY: &str = "SELECT \
                          THEN coalesce(substr(cast(error as blob), 1, ?3), \
                                        zeroblob(0)) END, \
                     error IS NOT NULL AND typeof(error) <> 'text', \
-                    CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
-                         THEN (SELECT count(*) FROM json_each(output_json) \
-                               WHERE key IN ('answer', 'turns', 'tool_calls', 'stop')) \
-                              > 4 \
+                    CASE WHEN typeof(output_json) = 'text' \
+                         THEN CASE WHEN json_valid(output_json) \
+                                   THEN (SELECT count(*) FROM json_each(output_json) \
+                                         WHERE key IN ('answer', 'turns', \
+                                                       'tool_calls', 'stop')) > 4 \
+                                     OR (SELECT count(*) FROM json_each(output_json) \
+                                         WHERE key IN ('answer', 'stop') \
+                                           AND value GLOB '*[' || char(55296) \
+                                                       || '-' || char(57343) \
+                                                       || ']*') > 0 \
+                                   ELSE 0 END \
                          ELSE 0 END, \
                     CASE WHEN typeof(input_json) = 'text' \
                          THEN CASE WHEN json_valid(input_json) \
@@ -992,17 +1022,14 @@ pub const SESSIONS_QUERY: &str = "SELECT \
                                     AND (SELECT count(*) FROM json_each(input_json) \
                                          WHERE key IN ('goal', 'max_turns', \
                                                        'approval_timeout_secs', \
-                                                       'workspace', 'model')) = 5), 0) \
+                                                       'workspace', 'model')) = 5 \
+                                    AND (SELECT count(*) FROM json_each(input_json) \
+                                         WHERE key IN ('goal', 'workspace', 'model') \
+                                           AND value GLOB '*[' || char(55296) \
+                                                       || '-' || char(57343) \
+                                                       || ']*') = 0), 0) \
                                    ELSE 1 END \
                          ELSE 1 END, \
-                    CASE WHEN typeof(input_json) = 'text' AND json_valid(input_json) \
-                          AND json_type(input_json, '$.workspace') = 'text' \
-                         THEN coalesce(substr(cast(json_extract(input_json, '$.workspace') \
-                                                   as blob), 1, ?3), zeroblob(0)) END, \
-                    CASE WHEN typeof(input_json) = 'text' AND json_valid(input_json) \
-                          AND json_type(input_json, '$.model') = 'text' \
-                         THEN coalesce(substr(cast(json_extract(input_json, '$.model') \
-                                                   as blob), 1, ?3), zeroblob(0)) END, \
                     rowid \
              FROM harvest_executions WHERE +workflow_name = ?1 \
              AND rowid < ?4 \
@@ -1092,14 +1119,8 @@ pub fn executions(
                     error: cut_text(row.get(7)?, LISTED_READ_CHARS, MAX_LISTED_BYTES),
                     error_is_damaged: row.get(8)?,
                     report_is_damaged: row.get(9)?,
-                    // The query decides the shape of the document. The two
-                    // short text fields beside it are decoded HERE. Only Rust
-                    // reads the bytes as characters, and a field that holds
-                    // none is a field `status` refuses.
-                    task_is_damaged: row.get::<_, bool>(10)?
-                        || cut_text(row.get(11)?, LISTED_READ_CHARS, MAX_LISTED_BYTES).is_none()
-                        || cut_text(row.get(12)?, LISTED_READ_CHARS, MAX_LISTED_BYTES).is_none(),
-                    row: row.get(13)?,
+                    task_is_damaged: row.get(10)?,
+                    row: row.get(11)?,
                 })
             },
         )
