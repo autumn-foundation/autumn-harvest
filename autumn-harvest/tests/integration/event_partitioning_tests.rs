@@ -1626,6 +1626,70 @@ async fn enable_sql_rechecks_a_unique_index_added_after_the_preflight() {
 }
 
 #[tokio::test]
+async fn enable_sql_rechecks_an_unreplayable_constraint_installed_after_the_preflight() {
+    // Same race, the CHECK/foreign-key constraint guard's half. This test
+    // calls `enable_sql` directly, bypassing the Rust preflight entirely.
+    // It proves the script also refuses for itself once it holds the
+    // lock, rather than trusting only a check made before the window
+    // opened.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // A populated table takes the AttachLegacy path. See the dependent-view
+    // test's sibling comment for why the empty path cannot isolate this
+    // recheck from Postgres's own protection.
+    let exec = insert_execution(&mut conn, "race_con_wf", "race-con-1", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS harvest_events_race_check_958",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray constraint from a previous run");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_race_check_958 \
+         CHECK (event_type <> '')",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a constraint as if added in the gap after the preflight check");
+
+    let err = diesel_async::SimpleAsyncConnection::batch_execute(
+        &mut conn,
+        &partition::enable_sql(&EnableOptions::default()),
+    )
+    .await
+    .expect_err(
+        "enable_sql must refuse under its own lock, not rely solely on a check made \
+         before the script started",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_race_check_958"),
+        "the refusal must name the offending constraint; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT harvest_events_race_check_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending constraint");
+}
+
+#[tokio::test]
 async fn a_plain_compatible_unique_index_survives_the_direct_enable_path() {
     // Review finding: `idx_defs` is the set of index definitions replayed
     // onto the new parent. It used to be captured by a plain read with no
@@ -2694,6 +2758,57 @@ async fn an_impostor_reusing_harvests_own_foreign_key_name_still_refuses() {
         .execute(&mut conn)
         .await
         .expect("drop the target table");
+}
+
+#[tokio::test]
+async fn an_impostor_reusing_harvests_reserved_cohort_check_name_still_refuses() {
+    // Review finding: name, type, table and column alone must not identify
+    // harvest's own generated `{LEGACY_PARTITION}_cohort_ck`. An operator's
+    // own `CHECK` on `cohort` could reuse the exact reserved name while
+    // enforcing a different expression -- a floor rather than a ceiling,
+    // say. Matching on the rendered `pg_get_constraintdef` output too is
+    // what closes that gap, the same way the foreign key's shape check
+    // does above.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS harvest_events_legacy_cohort_ck",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray decoy from a previous run");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_legacy_cohort_ck \
+         CHECK (cohort > '2020-01-01T00:00:00Z'::timestamptz)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an impostor reusing harvest's reserved cohort-check name");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "an impostor reusing harvest's reserved cohort-check name but a different \
+             expression must still refuse -- name, type and column alone must not \
+             exempt it",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_legacy_cohort_ck"),
+        "the refusal must name the offending constraint; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT harvest_events_legacy_cohort_ck")
+        .execute(&mut conn)
+        .await
+        .expect("drop the impostor constraint");
 }
 
 #[tokio::test]

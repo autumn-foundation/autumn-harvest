@@ -175,6 +175,24 @@ pub const PARTITION_PREFIX: &str = "harvest_events_p_";
 /// new parent can reuse their original names.
 const LEGACY_RENAME_SUFFIX: &str = "__pre958";
 
+/// A POSIX regex matching `pg_get_constraintdef`'s rendering of harvest's own
+/// `{LEGACY_PARTITION}_cohort_ck` (`CHECK (cohort < cutover) NOT VALID`).
+///
+/// Review finding: name, type, table and column alone do not identify
+/// harvest's own generated check. An operator's own `CHECK` on `cohort`
+/// could reuse the exact reserved name with a different expression --
+/// enforcing, say, a floor rather than a ceiling. Matching the rendered
+/// definition itself closes that gap. The cutover literal varies per
+/// conversion, so only its shape is pinned. `NOT VALID` is optional: it
+/// disappears once [`enable_sql`] validates the constraint, in the same
+/// transaction that adds it.
+///
+/// SQL-quoted for direct interpolation into a single-quoted string
+/// literal (`''` doubles each literal quote) -- every call site embeds
+/// it inside one via `format!`.
+const LEGACY_COHORT_CK_DEF_RE: &str =
+    r"^CHECK \(\(cohort < ''[^'']+''::timestamp with time zone\)\)( NOT VALID)?$";
+
 /// The validate-only `BEFORE INSERT` trigger that replaces the FK's
 /// insert-time half. It must never modify `NEW`: Postgres rejects a `BEFORE
 /// ROW` trigger that changes a partitioned row's destination.
@@ -1664,6 +1682,7 @@ pub async fn unreplayable_constraints(conn: &mut AsyncPgConnection) -> HarvestRe
                        FROM generate_subscripts(con.conkey, 1) k
                        JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]
                     ) = ARRAY['cohort']
+                AND pg_get_constraintdef(con.oid) ~ '{LEGACY_COHORT_CK_DEF_RE}'
             )
           ORDER BY 1"
     ))
@@ -2009,6 +2028,7 @@ DECLARE
     bad_view    text;
     bad_trg     text;
     bad_idx     text;
+    bad_con     text;
     bad_rls     text;
     rls_flag    boolean;
     bad_pub     text;
@@ -2184,6 +2204,49 @@ reproduce it on the converted layout by hand, then re-run.',
 survive conversion unchanged (%), added after the preflight check ran but before this \
 transaction''s ACCESS EXCLUSIVE lock. Drop the index or constraint if it is obsolete, or \
 recreate it including `cohort` yourself, then re-run.', bad_idx;
+    END IF;
+
+    -- Review finding: the view, trigger, row-security, publication and
+    -- unique-index rechecks above all close the same preflight-to-lock
+    -- gap for a CHECK or foreign-key constraint too -- see
+    -- `unreplayable_constraints` for why `CREATE TABLE ... (LIKE ...)`
+    -- cannot carry either kind forward.
+    SELECT string_agg(DISTINCT con.conname, ', ' ORDER BY con.conname) INTO bad_con
+      FROM pg_constraint con
+      JOIN pg_class c ON c.oid = con.conrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relname = '{LEGACY_PARTITION}' AND n.nspname = current_schema()
+       AND con.contype IN ('c', 'f')
+       AND NOT (
+           con.conname = 'harvest_events_workflow_exec_id_fkey'
+           AND con.contype = 'f'
+           AND NOT con.condeferrable
+           AND con.confdeltype = 'c'
+           AND con.confrelid = 'harvest_workflow_executions'::regclass
+           AND (SELECT array_agg(a.attname::text ORDER BY k)
+                  FROM generate_subscripts(con.conkey, 1) k
+                  JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]
+               ) = ARRAY['workflow_exec_id']
+           AND (SELECT array_agg(a.attname::text ORDER BY k)
+                  FROM generate_subscripts(con.confkey, 1) k
+                  JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = con.confkey[k]
+               ) = ARRAY['id']
+       )
+       AND NOT (
+           con.conname IN ('{LEGACY_PARTITION}_cohort_ck', '{LEGACY_PARTITION}_cohort_ck{LEGACY_RENAME_SUFFIX}')
+           AND con.contype = 'c'
+           AND NOT con.condeferrable
+           AND (SELECT array_agg(a.attname::text ORDER BY k)
+                  FROM generate_subscripts(con.conkey, 1) k
+                  JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]
+               ) = ARRAY['cohort']
+           AND pg_get_constraintdef(con.oid) ~ '{LEGACY_COHORT_CK_DEF_RE}'
+       );
+    IF bad_con IS NOT NULL THEN
+        RAISE EXCEPTION 'harvest #958: harvest_events carries a constraint that cannot \
+survive conversion unchanged (%), added after the preflight check ran but before this \
+transaction''s ACCESS EXCLUSIVE lock. Drop the constraint (and recreate it against \
+harvest_events afterward, if it is still needed), then re-run.', bad_con;
     END IF;
 
     -- Safe only because the explicit `LOCK TABLE` above already holds
@@ -2868,6 +2931,27 @@ pub async fn disable_partitioning(
                     } else {
                         policies.join(", ")
                     }
+                )));
+            }
+            // Review finding: the view, trigger and row-security rechecks
+            // above closed the identical preflight-to-lock gap for a
+            // CHECK or foreign-key constraint too. Same reason as
+            // `refuse_if_unreplayable_constraints` above, under the same
+            // lock this revert holds for the rest of the transaction.
+            let constraints = unreplayable_constraints(conn).await?;
+            if !constraints.is_empty() {
+                return Err(HarvestError::Config(format!(
+                    "refusing to revert harvest_events: {} not carried by CREATE TABLE \
+                     ... (LIKE ...) ({}), added after the preflight check ran but before \
+                     this transaction's ACCESS EXCLUSIVE lock. Drop the constraint (and \
+                     recreate it against harvest_events afterward, if it is still \
+                     needed), then re-run.",
+                    if constraints.len() == 1 {
+                        "a constraint is"
+                    } else {
+                        "constraints are"
+                    },
+                    constraints.join(", ")
                 )));
             }
 
@@ -4739,7 +4823,8 @@ fn unreplayable_constraints_guard_sql(tag: &str) -> String {
          AND (SELECT array_agg(a.attname::text ORDER BY k)\n                  \
          FROM generate_subscripts(con.conkey, 1) k\n                  \
          JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]\n               \
-         ) = ARRAY['cohort']\n       \
+         ) = ARRAY['cohort']\n           \
+         AND pg_get_constraintdef(con.oid) ~ '{LEGACY_COHORT_CK_DEF_RE}'\n       \
          );\n    \
          IF bad IS NOT NULL THEN\n        \
          RAISE EXCEPTION 'harvest #958: constraint(s) on harvest_events not carried by \
