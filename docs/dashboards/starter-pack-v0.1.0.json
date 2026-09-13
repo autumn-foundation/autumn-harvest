@@ -5715,7 +5715,7 @@
               }
             }
           ],
-          "description": "Liveness heartbeat rate of each background control loop (issue #797). Every loop ticks on EVERY iteration, including no-work iterations, so a series that flat-lines to zero means that loop is wedged (panicked, deadlocked, or stalled on a never-returning query) -- not merely idle. Kept per-instance deliberately: every replica runs its own copy of all seven loops, so summing across instances would let a healthy replica mask a wedged one. Note `retention` polls hourly by default, so at short rate intervals its line sits indistinguishably near zero when healthy -- judge it on the 3h panel beside this one, whose window is longer than the janitor's cadence. Alert: harvest_scanner_stalled. Bounded `scanner` label (7 values); execution.id is never a label (ADR-0001 SS7)."
+          "description": "Liveness heartbeat rate of each background control loop (issue #797). Every loop ticks on EVERY iteration, including no-work iterations, so a series that flat-lines to zero means that loop is wedged (panicked, deadlocked, or stalled on a never-returning query) -- not merely idle. Kept per-instance deliberately: every replica runs its own copy of all eight loops, so summing across instances would let a healthy replica mask a wedged one. Note `retention` polls hourly by default, so at short rate intervals its line sits indistinguishably near zero when healthy -- judge it on the 3h panel beside this one, whose window is longer than the janitor's cadence. Alert: harvest_scanner_stalled. Bounded `scanner` label (8 values); execution.id is never a label (ADR-0001 SS7)."
         },
         {
           "id": 927,

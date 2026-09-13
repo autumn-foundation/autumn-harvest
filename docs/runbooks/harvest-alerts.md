@@ -1823,11 +1823,11 @@ redriven later).
 correctness in production depends on a fleet of control loops that run as
 bare spawned Tokio tasks *inside the embedder's process* — timeout
 enforcement, the soft-SLA scanner, poison-pill orphan reclaim, the external
-signal/cancel/await outboxes, the retention janitor, the schedule ticker, and
-the bounded-pause auto-resumer. If one panics, deadlocks on a poisoned
-connection, or stalls on a never-returning query, it fails **silently**: the
-work it owns simply stops happening, and every other part of the process keeps
-running normally.
+signal/cancel/await outboxes, the retention janitor, the schedule ticker, the
+bounded-pause auto-resumer, and the dedicated audit-export task (issue
+#1269). If one panics, deadlocks on a poisoned connection, or stalls on a
+never-returning query, it fails **silently**: the work it owns simply stops
+happening, and every other part of the process keeps running normally.
 
 `harvest.scanner.tick` (issue #797) closes that blind spot. It is incremented
 **unconditionally at the end of every iteration** — including iterations that
@@ -1838,7 +1838,7 @@ in the catalogue (`harvest.retention.deleted`,
 only emit when there *is* work, so a healthy idle loop and a dead one both read
 zero. Here, **a flat-lined series is the wedge signal.**
 
-There are seven `scanner` label values but **five** spawned loops: `sla` and
+There are eight `scanner` label values but **six** spawned loops: `sla` and
 `external_outbox` are enforcement responsibilities *inside* the `timeout` loop,
 not tasks of their own. All three are ticked together by that loop, so they
 **share one liveness fate and cannot diverge** — `timeout` healthy implies `sla`
@@ -1856,6 +1856,7 @@ own work counters and its `tracing::error!`, not this heartbeat.
 | `retention` | `RetentionRuntime::spawn` | History/audit/summary GC (#737, #752) |
 | `schedule` | `Scheduler::spawn_sharded` | Every cron/interval schedule firing |
 | `pause_auto_resume` | `spawn_pause_auto_resumer` | Bounded-pause auto-resume (#383) |
+| `audit_export` | `spawn_audit_export_checker_for_shard` | Audit-record export to the configured SIEM sink (#1269) |
 
 ### Triage steps
 
@@ -1875,7 +1876,7 @@ own work counters and its `tracing::error!`, not this heartbeat.
    `rate(harvest_scanner_tick_total{scanner!="retention"}[5m])` — the wedged
    loop reads `0` on the affected `instance` while its siblings and the other
    replicas keep incrementing. Deliberately **not** `sum by (scanner)`: every
-   replica runs its own copy of all seven loops, so summing lets a healthy
+   replica runs its own copy of all eight loops, so summing lets a healthy
    replica mask a wedged one. Use a wider window for `retention`
    (`increase(harvest_scanner_tick_total{scanner="retention"}[3h])`), which
    polls hourly by default.
