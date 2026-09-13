@@ -153,18 +153,22 @@ pub(super) fn directory_is_ours(
 /// the case that had no guard at all.
 ///
 /// Both sides are canonicalised before comparison, so a case difference or a
-/// `\\?\` prefix does not produce a false refusal.
+/// `\\?\` prefix does not produce a false refusal. Canonicalisation failure
+/// fails closed. A directory that cannot be resolved (a broken junction, say)
+/// is refused rather than compared by its unresolved, lexical path. The
+/// resolved target could turn out to be shared once the failure clears.
 #[cfg(windows)]
 fn windows_path_is_per_user(dir: &Path) -> bool {
-    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let Ok(dir) = std::fs::canonicalize(dir) else {
+        return false;
+    };
     ["LOCALAPPDATA", "USERPROFILE"]
         .into_iter()
         .filter_map(std::env::var_os)
         .filter(|root| !root.is_empty())
         .any(|root| {
-            let canonical_root =
-                std::fs::canonicalize(&root).unwrap_or_else(|_| PathBuf::from(&root));
-            dir.starts_with(&canonical_root)
+            std::fs::canonicalize(&root)
+                .is_ok_and(|canonical_root| dir.starts_with(&canonical_root))
         })
 }
 

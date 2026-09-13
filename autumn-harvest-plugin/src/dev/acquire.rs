@@ -235,6 +235,10 @@ mod tests {
     #[test]
     fn a_directory_outside_any_per_user_root_is_not_private_on_windows() {
         let dir = std::path::PathBuf::from(r"C:\Windows\Temp");
+        // `directory_is_private` reads `false` both for "correctly rejected"
+        // and for "could not even be stat'd". Stat it here first, so a
+        // broken runner fails loudly instead of passing this test vacuously.
+        std::fs::symlink_metadata(&dir).expect("C:\\Windows\\Temp must be stat-able");
         assert!(
             !directory_is_private(&dir),
             "a shared directory must not be treated as a private cache"
