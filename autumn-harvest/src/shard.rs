@@ -1511,6 +1511,17 @@ impl ShardedDbPool {
 
     /// Build a sharded pool from a pre-computed map of shard → pool.
     ///
+    /// Colocated shards must share one `DbPool` clone (issue #1266). Two
+    /// shards reaching the same physical database through separately
+    /// constructed `DbPool` handles are grouped as unrelated instead.
+    /// Retention then purges each apparent group on its own schedule. A
+    /// faster group can delete rows a slower, colocated group has not
+    /// yet acknowledged. The grouping relies on `Pool::manager()`
+    /// pointer identity, not on what database a pool actually targets.
+    /// [`ShardedDbPool::from_dsns`] groups by a canonical form of the
+    /// connection string instead, for callers building pools from raw
+    /// DSNs rather than handing in pre-built ones.
+    ///
     /// # Panics
     ///
     /// Panics if `pools` is empty or does not contain `default_shard`.
