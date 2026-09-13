@@ -1842,17 +1842,30 @@ fn bounded_rename_fn_sql() -> String {
         "CREATE FUNCTION {BOUNDED_RENAME_FN}(p_kind text, p_relid oid, p_base text, p_suffix text)
 RETURNS text LANGUAGE plpgsql AS $harvest_bounded_rename_958_fn$
 DECLARE
-    max_base  int := 63 - length(p_suffix);
+    budget    int;
+    keep      int;
     candidate text;
     disambig  int := 0;
     taken     boolean;
 BEGIN
     LOOP
         IF disambig = 0 THEN
-            candidate := left(p_base, max_base) || p_suffix;
+            budget := 63 - octet_length(p_suffix);
         ELSE
-            candidate := left(p_base, greatest(max_base - length(disambig::text) - 1, 1))
-                         || '_' || disambig || p_suffix;
+            budget := greatest(63 - octet_length('_' || disambig || p_suffix), 1);
+        END IF;
+        -- `left()` counts characters, but Postgres's 63 limit is BYTES.
+        -- Shrinking one character at a time, checking `octet_length` each
+        -- time, never splits a multibyte character mid-codepoint --
+        -- `left()` itself only ever cuts on a character boundary.
+        keep := length(p_base);
+        WHILE keep > 0 AND octet_length(left(p_base, keep)) > budget LOOP
+            keep := keep - 1;
+        END LOOP;
+        IF disambig = 0 THEN
+            candidate := left(p_base, keep) || p_suffix;
+        ELSE
+            candidate := left(p_base, keep) || '_' || disambig || p_suffix;
         END IF;
         IF p_kind = 'constraint' THEN
             SELECT EXISTS (

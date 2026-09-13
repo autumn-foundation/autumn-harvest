@@ -1244,6 +1244,83 @@ async fn a_user_index_at_the_identifier_length_limit_survives_disable() {
     );
 }
 
+#[tokio::test]
+async fn a_multibyte_user_index_name_near_the_limit_survives_conversion() {
+    // Review finding on item 9: the PL/pgSQL rename helper budgeted with
+    // `length()` and cut with `left()`. Both count CHARACTERS. Postgres's
+    // 63 limit counts BYTES. A multibyte name near the limit could still
+    // produce a candidate over 63 bytes. Postgres then truncates it
+    // itself, landing on a name the preceding uniqueness check never saw.
+    // The rename could then still self-collide or hit an unseen one.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(&mut conn, "mbidx_wf", "mb-1", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed");
+
+    // "é" is 2 bytes in UTF-8. `ix_` (3 bytes) plus 30 of them is exactly
+    // 63 bytes. Already at the limit, so Postgres stores it unchanged,
+    // exactly like the ASCII item-9 test's `long_name`.
+    //
+    // A character-based budget sees only 33 characters against a
+    // 55-character allowance, so it appends the suffix unchanged.
+    // Postgres then truncates the 71-byte result back down to precisely
+    // this same 63-byte name. The rename self-collides, just as it would
+    // with a plain ASCII name.
+    let requested = format!("ix_{}", "é".repeat(30));
+    assert_eq!(
+        requested.len(),
+        63,
+        "precondition: exactly at the 63-byte limit"
+    );
+    diesel::sql_query(format!("DROP INDEX IF EXISTS \"{requested}\""))
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query(format!(
+        "CREATE INDEX \"{requested}\" ON harvest_events (event_type)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed a user index with a multibyte name at the identifier limit");
+
+    let report = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect(
+            "enable must not fail on a multibyte user index name near the \
+             63-byte identifier limit",
+        );
+    assert!(
+        matches!(report.mode, EnableMode::AttachLegacy { .. }),
+        "precondition: must exercise the legacy rename loop, got {:?}",
+        report.mode
+    );
+    assert_eq!(events_relkind(&mut conn).await, "p");
+
+    let on_new_parent = scalar_bool(
+        &mut conn,
+        &format!(
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() \
+             AND tablename = 'harvest_events' AND indexname = '{requested}') AS v"
+        ),
+    )
+    .await;
+    assert!(
+        on_new_parent,
+        "the user's multibyte-named index must be replayed onto the new \
+         parent under its original stored name; a byte-unsafe rename could \
+         leave the name unfreed or garbled instead"
+    );
+}
+
 // ══ AC2: byte-identical per-execution event semantics ══════════════════════
 
 #[tokio::test]
