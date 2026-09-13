@@ -54,9 +54,17 @@ fn markers_near(text: &str, a: &str, b: &str) -> bool {
     let Some(a_at) = flat.find(a) else {
         return false;
     };
-    let start = a_at.saturating_sub(WINDOW);
-    let end = (a_at + a.len() + WINDOW).min(flat.len());
-    flat[start..end].contains(b)
+    let lo = a_at.saturating_sub(WINDOW);
+    let hi = (a_at + a.len() + WINDOW).min(flat.len());
+    // Never split a UTF-8 character: these docs use em dashes.
+    let lo = (lo..=a_at)
+        .find(|&i| flat.is_char_boundary(i))
+        .unwrap_or(a_at);
+    let hi = (a_at..=hi)
+        .rev()
+        .find(|&i| flat.is_char_boundary(i))
+        .unwrap_or(a_at);
+    flat[lo..hi].contains(b)
 }
 
 /// Both markers must appear, and close enough together that an edit cannot
