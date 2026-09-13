@@ -91,6 +91,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          dag_execution_timeout_tests
 linux        autumn-harvest         integration                      -                          event_batch_tests
 linux        autumn-harvest         integration                      -                          event_partitioning_tests
+linux        autumn-harvest         integration                      -                          external_outbox_scan_tests
 linux        autumn-harvest         integration                      -                          force_fail
 linux        autumn-harvest         integration                      -                          history_ceiling_claim_tests
 linux        autumn-harvest         integration                      -                          integration_e2e
@@ -157,6 +158,7 @@ linux        autumn-harvest-plugin  conflict_policy_integration      -          
 linux        autumn-harvest-plugin  connector_integration            connectors                 -
 linux        autumn-harvest-plugin  connector_sqs_broker             sqs                        -
 linux        autumn-harvest-plugin  dag_run_graph_integration        -                          -
+linux        autumn-harvest-plugin  dead_letter_ui_detail_batch_perf -                          -
 linux        autumn-harvest-plugin  dev_runtime_lifecycle            dev-runtime                -
 linux        autumn-harvest-plugin  dlq_aggregate_integration        -                          -
 linux        autumn-harvest-plugin  dlq_bulk_discard_perf            -                          -
