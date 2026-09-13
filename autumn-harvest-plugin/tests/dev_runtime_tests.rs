@@ -1413,6 +1413,68 @@ fn banner_never_leaks_a_password() {
 /// `UnsupportedHarvestMode` instead of the refusal it actually asserts.
 static DEV_RUNTIME_START_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Sets or unsets one env var for a test, restoring exactly what was there
+/// before — present or absent — even if the test panics.
+///
+/// Every `DevRuntime::start` test in this file holds
+/// `DEV_RUNTIME_START_SERIAL` for as long as a guard like this is alive.
+/// This struct does no locking of its own. It assumes that lock is already
+/// held.
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    /// Set `key` to `value` for the life of this guard.
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: the caller holds `DEV_RUNTIME_START_SERIAL` for this
+        // guard's whole life, so no concurrent test observes `key` mid-change.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+
+    /// Remove `key` for the life of this guard, whatever an inherited test
+    /// environment set it to.
+    ///
+    /// A `DevRuntime::start` test that expects a refusal OTHER than
+    /// `UnsupportedHarvestMode` must not depend on this process's ambient
+    /// environment. It must not assume that leaves Harvest mode at its
+    /// embedded default. An inherited `AUTUMN_HARVEST__MODE=split` would
+    /// otherwise make it see the new gate's refusal. That is not the refusal
+    /// it actually asserts (Codex review on issue #1291's pull request).
+    fn unset(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: see `set`.
+        unsafe { std::env::remove_var(key) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `set`.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+/// Every env var `resolve_harvest_mode_source` reads, forced absent so a
+/// `DevRuntime::start` test asserting a non-Harvest-mode refusal sees the
+/// embedded default regardless of what this process inherited.
+fn harvest_mode_env_cleared() -> [EnvVarGuard; 3] {
+    [
+        EnvVarGuard::unset("AUTUMN_HARVEST__MODE"),
+        EnvVarGuard::unset("AUTUMN_HARVEST_DATABASE__URL"),
+        EnvVarGuard::unset("AUTUMN_MANIFEST_DIR"),
+    ]
+}
+
 // Holds `DEV_RUNTIME_START_SERIAL` across the `.await` below on purpose. The
 // lock keeps ambient env state stable for the whole call, mirroring the
 // `TEST_SERIAL` pattern in `start_idempotency_integration.rs`.
@@ -1422,6 +1484,7 @@ async fn starting_against_a_remote_database_is_refused() {
     let _guard = DEV_RUNTIME_START_SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = harvest_mode_env_cleared();
     let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         database_url: Some("postgres://u:p@db.prod.example.com:5432/app".to_owned()),
         // Kernel-chosen. These tests are about DSN classification, but the port
@@ -1451,6 +1514,7 @@ async fn a_remote_database_is_refused_even_with_the_suspicious_name_opt_in() {
     let _guard = DEV_RUNTIME_START_SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = harvest_mode_env_cleared();
     let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         database_url: Some("postgres://u:p@db.prod.example.com:5432/app".to_owned()),
         allow_suspicious_database_name: true,
@@ -1474,6 +1538,7 @@ async fn a_production_shaped_local_name_needs_the_explicit_opt_in() {
     let _guard = DEV_RUNTIME_START_SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = harvest_mode_env_cleared();
     let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         database_url: Some("postgres://u:p@127.0.0.1:5432/myapp_production".to_owned()),
         http_port: 0,
@@ -1514,27 +1579,18 @@ async fn starting_with_ambient_split_mode_configuration_is_refused() {
     let _guard = DEV_RUNTIME_START_SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // SAFETY: serialized by `DEV_RUNTIME_START_SERIAL` above, which every
-    // `DevRuntime::start` test in this file also holds while it runs.
-    unsafe {
-        std::env::set_var("AUTUMN_HARVEST__MODE", "split");
-        std::env::set_var(
-            "AUTUMN_HARVEST_DATABASE__URL",
-            "postgres://user:pw@db.prod.example.com/harvest",
-        );
-    }
+    let _manifest = EnvVarGuard::unset("AUTUMN_MANIFEST_DIR");
+    let _mode = EnvVarGuard::set("AUTUMN_HARVEST__MODE", "split");
+    let _url = EnvVarGuard::set(
+        "AUTUMN_HARVEST_DATABASE__URL",
+        "postgres://user:pw@db.prod.example.com/harvest",
+    );
 
     let result = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         http_port: 0,
         ..DevRuntimeConfig::default()
     })
     .await;
-
-    // SAFETY: still serialized by `_guard`.
-    unsafe {
-        std::env::remove_var("AUTUMN_HARVEST__MODE");
-        std::env::remove_var("AUTUMN_HARVEST_DATABASE__URL");
-    }
 
     let error = result.expect_err("split mode must refuse the dev runtime, not run it");
     assert!(
@@ -1567,21 +1623,15 @@ async fn starting_with_split_mode_from_autumn_toml_is_refused() {
          url = \"postgres://user:pw@db.prod.example.com/harvest\"\n",
     )
     .expect("autumn.toml should be written");
-    // SAFETY: serialized by `DEV_RUNTIME_START_SERIAL` above.
-    unsafe {
-        std::env::set_var("AUTUMN_MANIFEST_DIR", dir.path());
-    }
+    let _mode = EnvVarGuard::unset("AUTUMN_HARVEST__MODE");
+    let _url = EnvVarGuard::unset("AUTUMN_HARVEST_DATABASE__URL");
+    let _manifest = EnvVarGuard::set("AUTUMN_MANIFEST_DIR", dir.path());
 
     let result = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         http_port: 0,
         ..DevRuntimeConfig::default()
     })
     .await;
-
-    // SAFETY: still serialized by `_guard`.
-    unsafe {
-        std::env::remove_var("AUTUMN_MANIFEST_DIR");
-    }
 
     let error = result.expect_err("split mode from autumn.toml must refuse the dev runtime");
     assert!(
@@ -1887,6 +1937,7 @@ async fn provisioning_as_root_creates_no_session_root() {
     let _guard = DEV_RUNTIME_START_SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = harvest_mode_env_cleared();
     let base = tempfile::tempdir().expect("temp dir");
     let config = DevRuntimeConfig {
         session_root: Some(base.path().to_path_buf()),
@@ -1993,6 +2044,7 @@ async fn a_non_loopback_http_host_is_refused() {
     let _guard = DEV_RUNTIME_START_SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = harvest_mode_env_cleared();
     for host in ["0.0.0.0", "::", "192.0.2.1"] {
         let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
             http_host: (*host).to_owned(),
