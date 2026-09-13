@@ -57,12 +57,10 @@ fn init_sql() -> Vec<u8> {
     autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
-/// Capturing recorder for `record_rate_limit_buckets_deleted` (issue #1127)
-/// plus the end-of-iteration liveness tick used to await a whole tick.
+/// Capturing recorder for `record_rate_limit_buckets_deleted` (issue #1127).
 #[derive(Default)]
 struct CapturingMetrics {
     buckets_deleted: Mutex<Vec<(String, u64)>>,
-    completed_ticks: Mutex<u64>,
 }
 
 impl CapturingMetrics {
@@ -77,10 +75,6 @@ impl CapturingMetrics {
         }
         out
     }
-
-    fn completed_ticks(&self) -> u64 {
-        *self.completed_ticks.lock().unwrap()
-    }
 }
 
 impl MetricsRecorder for CapturingMetrics {
@@ -91,9 +85,7 @@ impl MetricsRecorder for CapturingMetrics {
             .push((family.to_string(), count));
     }
 
-    fn record_scanner_tick(&self, _scanner: &str, _shard: &str) {
-        *self.completed_ticks.lock().unwrap() += 1;
-    }
+    fn record_scanner_tick(&self, _scanner: &str, _shard: &str) {}
 }
 
 async fn setup_db() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -367,23 +359,27 @@ async fn run_one_tick_on(
     .expect("retention runtime should spawn when the bucket GC is active");
     runtime.run_now();
 
-    // The end-of-iteration liveness tick (#797) is unconditional and runs last,
-    // so observing it is exactly "the whole iteration completed" — waiting on
-    // `ran_at` would race the passes that run after the history phase.
-    let baseline = metrics.completed_ticks();
+    // Wait for the bucket-GC outcome itself, not for a scanner-tick count.
+    // `RetentionRuntime::spawn` runs a startup partition-maintenance pass
+    // before the main loop's first iteration and records a liveness tick
+    // for it even when partitioning is off (the pass's own per-shard ticks
+    // never fire in that case). That startup tick shares the same counter
+    // as the main loop's end-of-iteration tick, so waiting on "the counter
+    // moved" can observe the harmless startup tick and read the snapshot
+    // before `run_now()`'s own iteration has populated this field.
     let mut result = None;
     for _ in 0..400 {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        if metrics.completed_ticks() <= baseline {
-            continue;
-        }
         let snap = runtime.monitor().snapshot();
         // `.iter().find(...)`, never `.first()`: diesel's blanket `RunQueryDsl`
         // impl shadows `Vec::first` in a diesel-importing scope.
-        if let Some(r) = snap.per_shard.iter().find(|r| r.shard == 0) {
+        let Some(r) = snap.per_shard.iter().find(|r| r.shard == 0) else {
+            continue;
+        };
+        if r.rate_limit_bucket_gc.is_some() {
             result = Some(r.clone());
+            break;
         }
-        break;
     }
     runtime.shutdown();
     result.expect("retention tick did not complete in time")
@@ -412,15 +408,18 @@ async fn run_one_tick_snapshot(
     )
     .expect("retention runtime should spawn when the bucket GC is active");
     runtime.run_now();
-    let baseline = metrics.completed_ticks();
+    // See `run_one_tick_on`: wait for every shard's bucket-GC outcome to be
+    // populated rather than for a scanner-tick count, which the startup
+    // partition-maintenance pass can move before this tick's own iteration
+    // runs.
     let mut snap = Vec::new();
     for _ in 0..400 {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        if metrics.completed_ticks() <= baseline {
-            continue;
+        let candidate = runtime.monitor().snapshot().per_shard;
+        if !candidate.is_empty() && candidate.iter().all(|r| r.rate_limit_bucket_gc.is_some()) {
+            snap = candidate;
+            break;
         }
-        snap = runtime.monitor().snapshot().per_shard;
-        break;
     }
     runtime.shutdown();
     assert!(!snap.is_empty(), "retention tick did not complete in time");
