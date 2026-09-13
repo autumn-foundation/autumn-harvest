@@ -917,7 +917,11 @@ async fn run_app(
                 .workflows(sample::workflows())
                 .activities(sample::activities())
                 .worker(autumn_harvest::WorkerConfig::default())
-                .api(api_path),
+                .api(api_path)
+                // Issue #1291: a backstop against ambient Harvest config
+                // changing between the checks in `DevRuntime::start` and
+                // this plugin actually building and starting.
+                .require_embedded_harvest_mode(),
         )
         .run()
         .await;
