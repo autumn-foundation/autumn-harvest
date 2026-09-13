@@ -3130,3 +3130,69 @@ async fn the_delivery_deadline_reserves_time_for_the_acknowledgement() {
     let _ = handle.await;
     uninstall();
 }
+
+/// The exact hazard a later review pass on PR #1520 raised. The reserve,
+/// `SHARD_ACQUIRE_BOUND` plus `ACK_QUERY_BOUND`, is longer than some
+/// supported leases. The builder allows a lease as short as one second.
+///
+/// Subtracting the reserve unconditionally would place `delivery_deadline`
+/// at or before the claim itself. Every batch would then time out
+/// immediately, regardless of how fast the sink actually is.
+///
+/// A two-second lease is well under the seven-second reserve. Without the
+/// cap, this instant sink would still be classified as a timeout. With the
+/// cap, the delivery window shrinks, but stays positive, and the batch is
+/// delivered and acknowledged.
+#[tokio::test]
+async fn a_short_lease_still_keeps_a_positive_delivery_window() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install_with_lease(
+        Arc::new(RecordingSink::new(200)),
+        100,
+        std::time::Duration::from_secs(2),
+    );
+    let (mut conn, container) = make_conn().await;
+    insert_audit_rows(&mut conn, 1).await;
+
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(url);
+    let pool = autumn_harvest::worker::DbPool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("pool");
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(20),
+        Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        Some(autumn_harvest::types::ShardId::new(0)),
+        None,
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let status = export_status(&mut conn, 0, chrono::Utc::now())
+            .await
+            .expect("status query");
+        if status.is_some_and(|s| s.cursor_seq >= 1) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a short, builder-supported lease must still leave a positive \
+             delivery window; the cursor never advanced, so the reserve \
+             consumed the entire lease"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(sink.all_seqs(), vec![1]);
+
+    cancel.cancel();
+    let _ = handle.await;
+    uninstall();
+}

@@ -1036,8 +1036,8 @@
           },
           {
             "kind": "promql",
-            "expr": "rate(harvest_scanner_tick_total{scanner=\"audit_export\"}[10m]) == 0",
-            "note": "A 10m window, not the shared 5m one: a single audit-export tick can legitimately run as long as the configured audit_export_lease allows (default 60s, operator-configurable). 10m covers any lease up to a few minutes without retuning; a fleet configured with a longer lease must widen this window to stay ahead of it, exactly like the retention window below must track RetentionConfig's tick interval."
+            "expr": "rate(harvest_scanner_tick_total{scanner=\"audit_export\"}[10m]) == 0 and max_over_time(harvest_scanner_tick_total{scanner=\"audit_export\"}[10m]) > 0",
+            "note": "A 10m window, not the shared 5m one: a single audit-export tick can legitimately run as long as the configured audit_export_lease allows (default 60s, operator-configurable). 10m covers any lease up to a few minutes without retuning; a fleet configured with a longer lease must widen this window to stay ahead of it, exactly like the retention window below must track RetentionConfig's tick interval. Carries the same startup gate as the retention expression below (Codex review on PR #1520, follow-up P2): the series starts at zero at registration, and a healthy first tick can legitimately still be in flight when Prometheus evaluates a partial 10m window, so a bare rate(...) == 0 would page through every healthy startup. ANDing on the counter having reached a nonzero value in the same window rules that out, exactly like the retention gate below."
           },
           {
             "kind": "promql",

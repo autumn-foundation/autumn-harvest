@@ -2259,12 +2259,17 @@ async fn acquire_shard_conn_for_export(
 /// connection is held during delivery at all.
 ///
 /// The delivery deadline reserves `SHARD_ACQUIRE_BOUND` plus
-/// `ACK_QUERY_BOUND` off the lease. That covers the second checkout and
-/// the acknowledgement query it runs (Codex review on PR #1520, follow-up
-/// P1 and follow-up P2). Both steps are bounded, but bounded is not free.
-/// A successful delivery finishing right at `lease_until` would otherwise
-/// leave no time for either step before a fresher claim could reclaim the
-/// shard.
+/// `ACK_QUERY_BOUND` off the lease, capped at half the configured lease.
+/// Both the reserve and its cap follow Codex review on PR #1520 (follow-up
+/// P1 and follow-up P2).
+///
+/// The reserve covers the second checkout and the acknowledgement query it
+/// runs.
+/// Both steps are bounded, but bounded is not free. A successful delivery
+/// finishing right at `lease_until` would otherwise leave no time for
+/// either step. A fresher claim could then reclaim the shard. The cap
+/// also keeps a configured lease as short as one second from losing its
+/// entire delivery window to a fixed reserve.
 ///
 /// `cancel` races the delivery wait, never the claim or the acknowledgement
 /// (Codex review on PR #1520, follow-up P1). A shutdown mid-delivery
@@ -2384,13 +2389,17 @@ async fn export_once_via_pool(
     // genuinely delivered. Under sustained near-lease latency that repeats
     // forever: delivered, but never acknowledged.
     //
-    // Reserving both bounds up front means a successful delivery always has
-    // a full `SHARD_ACQUIRE_BOUND` to reacquire a connection. It then has a
-    // full `ACK_QUERY_BOUND` to run the acknowledgement query, both before
-    // the lease a fresher claim could reclaim actually elapses.
+    // The reserve is capped at half the configured lease (Codex review on
+    // PR #1520, follow-up P1). A builder-configured lease can be as short
+    // as one second. Subtracting the full, fixed reserve from a lease that
+    // short leaves no delivery window at all. Every batch would then time
+    // out immediately and back off forever. Capping the reserve instead
+    // shrinks the delivery window and the reacquire-and-acknowledge window
+    // together on a short lease. A short lease then always keeps some
+    // genuine delivery time.
+    let reserve = (SHARD_ACQUIRE_BOUND + ACK_QUERY_BOUND).min(config.lease / 2);
     let delivery_deadline = claim.lease_until
-        - chrono::Duration::from_std(SHARD_ACQUIRE_BOUND + ACK_QUERY_BOUND)
-            .unwrap_or_else(|_| chrono::Duration::zero());
+        - chrono::Duration::from_std(reserve).unwrap_or_else(|_| chrono::Duration::zero());
 
     // No connection held during this await. A timeout is classified exactly
     // like any other transport failure: the cursor is held and the batch is

@@ -61,14 +61,30 @@ pipeline itself, so the fix is architectural: give export its own task.
   landing between the two reads could register one lease while delivering
   against another. `export_once_via_pool` now takes the snapshot as a
   parameter instead of reading it itself.
-- **The delivery deadline reserves `SHARD_ACQUIRE_BOUND` off the claim
-  lease** (follow-up P1): a delivery finishing right at `lease_until` left
-  zero time for the reacquire-and-acknowledge step that follows it. A
-  second exporter could then reclaim the shard before the first one's
-  acknowledgement lands, so a batch delivered under sustained near-lease
-  latency was never acknowledged. Reserving the acquire bound up front
-  guarantees a successful delivery always has that time left to
-  acknowledge.
+- **The delivery deadline reserves `SHARD_ACQUIRE_BOUND` plus the new
+  `ACK_QUERY_BOUND` off the claim lease** (follow-up P1 and follow-up P2):
+  a delivery finishing right at `lease_until` left zero time for the
+  reacquire-and-acknowledge step that follows it, and an initial fix that
+  reserved only the checkout bound still left the acknowledgement query
+  itself no margin. A second exporter could then reclaim the shard before
+  the first one's acknowledgement lands, so a batch delivered under
+  sustained near-lease latency was never acknowledged. Reserving both
+  bounds guarantees a successful delivery always has that time left to
+  reacquire a connection and acknowledge.
+- **That reserve is capped at half the configured lease** (follow-up P1):
+  the fixed reserve above exceeds leases the builder explicitly supports
+  down to one second. Subtracting it unconditionally would place the
+  delivery deadline at or before the claim itself, timing out every batch
+  on a short lease immediately and backing off forever. The cap instead
+  shrinks the delivery window and the reserve together on a short lease,
+  so a short lease always keeps some genuine delivery time.
+- **The `audit_export` Prometheus expression carries the same startup gate
+  as `retention`** (follow-up P2): the series starts at zero at
+  registration, so a fresh worker's still-in-flight first delivery could
+  read `0` over a partial `[10m]` window and page despite being healthy.
+  `docs/alerts/starter-pack-v0.1.0.json` ANDs the expression on the
+  counter having reached a nonzero value in the same window, mirroring the
+  retention expression's own gate.
 - **`docs/telemetry.md`** updated to list `audit_export.rs` among the
   per-shard scanner loops, with the eight-label / seven-loop counts and
   the `audit_export` label value.
@@ -95,7 +111,13 @@ pipeline itself, so the fix is architectural: give export its own task.
   `an_in_flight_slow_delivery_never_blocks_the_timeout_checker_on_a_size_one_pool`
   (a blocking-until-released sink proves the connection-release property
   directly), `audit_export_checker_re_registers_when_the_configured_lease_grows`,
-  `graceful_shutdown_does_not_wait_for_an_in_flight_delivery`, and
+  `graceful_shutdown_does_not_wait_for_an_in_flight_delivery`,
   `the_delivery_deadline_reserves_time_for_the_acknowledgement` (a
-  still-blocked sink proves the effective delivery bound is
-  `lease - SHARD_ACQUIRE_BOUND`, not the raw lease).
+  still-blocked sink proves the effective delivery bound is well short of
+  the raw lease), and `a_short_lease_still_keeps_a_positive_delivery_window`
+  (an instant sink still succeeds on a two-second lease, proving the cap
+  keeps the delivery window positive rather than losing it entirely to the
+  fixed reserve). `alert_pack_docs.rs` adds
+  `scanner_stalled_audit_export_expression_carries_the_same_startup_gate`,
+  pinning the `audit_export` expression's startup gate the same way the
+  existing test pins the retention expression's.

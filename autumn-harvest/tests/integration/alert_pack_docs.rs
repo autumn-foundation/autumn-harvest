@@ -570,6 +570,55 @@ fn scanner_stalled_retention_expression_cannot_fire_during_the_startup_hour() {
     );
 }
 
+/// Codex review on PR #1520, follow-up P2: `audit_export` shares the same
+/// startup hazard as `retention`. Its series also starts at zero at
+/// registration, and its own first tick can legitimately still be in
+/// flight when Prometheus evaluates a partial `[10m]` window. A bare
+/// `rate(...) == 0` would page through every healthy startup, exactly like
+/// the un-gated retention expression this pack already fixed.
+///
+/// Pin the gate textually, mirroring
+/// `scanner_stalled_retention_expression_cannot_fire_during_the_startup_hour`
+/// above, so a future edit cannot drop it.
+#[test]
+fn scanner_stalled_audit_export_expression_carries_the_same_startup_gate() {
+    let pack = read_pack();
+    let rules = pack["rules"].as_array().expect("rules must be an array");
+    let stalled = rules
+        .iter()
+        .find(|rule| rule["id"].as_str() == Some("harvest_scanner_stalled"))
+        .expect("scanner stalled alert must exist");
+    let exprs: Vec<&str> = stalled["prometheus"]["expressions"]
+        .as_array()
+        .expect("scanner stalled alert must carry PromQL expressions")
+        .iter()
+        .filter_map(|expr| expr["expr"].as_str())
+        .collect();
+    let audit_export = exprs
+        .iter()
+        .find(|expr| expr.contains("scanner=\"audit_export\""))
+        .expect("scanner stalled alert must carry an audit_export-specific expression");
+
+    assert!(
+        audit_export
+            .contains("and max_over_time(harvest_scanner_tick_total{scanner=\"audit_export\""),
+        "the audit_export expression must gate on the counter having ticked at least once, so \
+         the registration-time zero cannot page through a healthy startup: {audit_export}"
+    );
+
+    // Same label-set hazard as the retention gate: the `and` side must be a
+    // function result, not a bare selector, or the match drops __name__ on
+    // one side only and the alert silently never fires.
+    let (_, gate) = audit_export
+        .split_once(" and ")
+        .expect("the audit_export expression must carry an `and` gate");
+    assert!(
+        !gate.trim_start().starts_with("harvest_scanner_tick_total"),
+        "the gate must not be a bare selector -- it would carry __name__ while the rate() side \
+         does not, so the `and` would match no series and the alert would never fire: {gate}"
+    );
+}
+
 /// Shared accessor for the capability-miss alert-shape pins below.
 ///
 /// Hoisted out of the test body when the pin was split in two (issue #804,
