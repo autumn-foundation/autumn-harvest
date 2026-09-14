@@ -3395,10 +3395,11 @@ async fn a_fresh_pass_under_a_different_key_arms_its_own_deadline() {
 ///
 /// The churn guard skips [`write_cursor`] whenever a tick changes nothing
 /// the cursor tracks. On an idle, fully-converged shard whose deadline just
-/// came due, the claim is the ONLY write that tick makes. If the claim did
-/// not also touch `updated_at`, a healthy shard that is periodically
-/// re-censused would still read as though its cursor had never been
-/// written since the original pass completed.
+/// came due, the claim is the ONLY write that tick makes.
+///
+/// If the claim did not also touch `updated_at`, a healthy, periodically
+/// re-censused shard would read wrong. Its cursor would look as though it
+/// had never been written since the original pass completed.
 #[tokio::test]
 async fn a_claimed_idle_revalidation_still_bumps_updated_at() {
     let (url, _c) = setup_isolated_db().await;
