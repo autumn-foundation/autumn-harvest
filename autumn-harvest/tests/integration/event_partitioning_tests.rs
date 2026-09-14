@@ -4393,6 +4393,85 @@ async fn disable_preserves_an_operators_pre_existing_drop_gate_index() {
 }
 
 #[tokio::test]
+async fn the_scripted_plans_drop_gate_marker_survives_separate_sessions() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // The scripted plan's own documentation tells an operator to run its
+    // CONCURRENTLY statements one at a time. An operator can do that from
+    // separate `psql` invocations, each its own connection. A session-local
+    // marker — a GUC, an earlier revision of this fix — would read back
+    // empty in a later session. It would then default to marking an
+    // operator's own pre-existing index as engine-owned: the opposite of
+    // what the marker exists to prevent. The fix communicates
+    // through a real table instead, which has no such session boundary.
+    diesel::sql_query("DROP INDEX IF EXISTS idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query(
+        "CREATE INDEX idx_harvest_we_created_at \
+         ON harvest_workflow_executions (created_at)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("plant an operator's own pre-existing index of this name");
+
+    let steps = partition::migration_plan_steps(&EnableOptions::default(), Utc::now());
+    let probe = steps
+        .iter()
+        .find(|s| s.sql.contains("harvest_1270_drop_gate_probe") && s.sql.contains("INSERT INTO"))
+        .expect("the plan must probe whether it will own the drop-gate index");
+    let build = steps
+        .iter()
+        .find(|s| {
+            s.sql.contains("CREATE INDEX CONCURRENTLY")
+                && s.sql.contains("idx_harvest_we_created_at")
+        })
+        .expect("the plan must build the drop-gate index");
+    let mark = steps
+        .iter()
+        .find(|s| s.sql.contains("harvest_dropgate_mark_958"))
+        .expect("the plan must mark the drop-gate index conditionally");
+
+    // Each step over its OWN fresh connection: the point under test is
+    // that the mechanism does not depend on session-local state.
+    let mut probe_conn = connect(&url).await;
+    diesel::sql_query(&probe.sql)
+        .execute(&mut probe_conn)
+        .await
+        .expect("probe");
+    let mut build_conn = connect(&url).await;
+    diesel::sql_query(&build.sql)
+        .execute(&mut build_conn)
+        .await
+        .expect("build (a no-op here: the index already exists)");
+    let mut mark_conn = connect(&url).await;
+    diesel::sql_query(&mark.sql)
+        .execute(&mut mark_conn)
+        .await
+        .expect("mark");
+
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT obj_description('idx_harvest_we_created_at'::regclass, 'pg_class') \
+              IS DISTINCT FROM 'harvest#958 drop-gate index; created by partition enable, \
+              safe for partition disable to remove' AS v",
+        )
+        .await,
+        "an operator's pre-existing index must not be marked engine-owned, \
+         even when the probe and mark steps run in separate sessions"
+    );
+
+    diesel::sql_query("DROP INDEX IF EXISTS idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
 async fn enable_preserves_an_operator_constraint_that_looks_like_a_renamed_legacy_one() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;

@@ -3857,18 +3857,28 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // optional here: a plain build holds SHARE for its duration and every
         // insert, state update and retention delete waits behind it.
         //
-        // Whether it already existed is stashed in a session GUC before the
-        // build. `CREATE INDEX CONCURRENTLY` cannot run inside a `DO` block
-        // or transaction, so this cannot check-and-mark atomically the way
-        // `enable_sql` does. `disable_partitioning` later reads a comment
-        // this only stamps when it was this step that created the index —
-        // see `DROP_GATE_INDEX_MARKER`.
+        // Whether it already existed is stashed in an ordinary table before
+        // the build, read back after. `CREATE INDEX CONCURRENTLY` cannot run
+        // inside a `DO` block or transaction. So this cannot check-and-mark
+        // atomically the way `enable_sql` does. The runbook itself documents
+        // running its `CONCURRENTLY` statements one at a time, which an
+        // operator can do from separate `psql` invocations, each its own
+        // session. A session-local marker (a GUC, say) would read back
+        // empty in a later session. It would then default to marking an
+        // operator's own pre-existing index as engine-owned — the opposite
+        // of what the marker exists to prevent. A real table has no such session
+        // boundary. `disable_partitioning` later reads a comment this only
+        // stamps when it was this step that created the index — see
+        // `DROP_GATE_INDEX_MARKER`.
         step(
             2,
-            "SELECT set_config('harvest_1270.drop_gate_idx_preexisted',\n    \
-             (EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace\n              \
-             WHERE c.relname = 'idx_harvest_we_created_at' AND n.nspname = current_schema()))::text,\n    \
-             false)"
+            "DO $harvest_dropgate_probe_958$\nBEGIN\n    \
+             CREATE TABLE IF NOT EXISTS harvest_1270_drop_gate_probe (existed boolean);\n    \
+             DELETE FROM harvest_1270_drop_gate_probe;\n    \
+             INSERT INTO harvest_1270_drop_gate_probe\n    \
+             SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace\n                    \
+             WHERE c.relname = 'idx_harvest_we_created_at' AND n.nspname = current_schema());\n\
+             END\n$harvest_dropgate_probe_958$"
                 .to_string(),
         ),
         concurrent(
@@ -3880,12 +3890,14 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         step(
             2,
             format!(
-                "DO $harvest_dropgate_mark_958$\nBEGIN\n    \
-                 IF current_setting('harvest_1270.drop_gate_idx_preexisted', true)\n           \
-                 IS DISTINCT FROM 'true' THEN\n        \
+                "DO $harvest_dropgate_mark_958$\nDECLARE preexisted boolean;\nBEGIN\n    \
+                 SELECT existed INTO preexisted FROM harvest_1270_drop_gate_probe;\n    \
+                 IF preexisted IS DISTINCT FROM true THEN\n        \
                  EXECUTE 'COMMENT ON INDEX idx_harvest_we_created_at IS '\n             \
                  || quote_literal('{DROP_GATE_INDEX_MARKER}');\n    \
-                 END IF;\nEND\n$harvest_dropgate_mark_958$"
+                 END IF;\n    \
+                 DROP TABLE IF EXISTS harvest_1270_drop_gate_probe;\n\
+                 END\n$harvest_dropgate_mark_958$"
             ),
         ),
         // ── 3: pre-validate so ATTACH skips its own scan ──────────────────

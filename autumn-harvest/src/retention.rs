@@ -1035,6 +1035,21 @@ impl RetentionMonitor {
             .iter_mut()
             .find(|x| x.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
         {
+            // A bare overwrite, by design. The retention candidate loop
+            // never measures `partition_maintenance`, so clearing it here
+            // is safe. It goes back to `None` until maintenance sets it
+            // again a moment later, in the SAME tick.
+            //
+            // A caller polling for "this tick has finished" needs that
+            // gap. It matches `ran_at` against a timestamp. Preserving
+            // the PRIOR pass's outcome across the gap would let such a
+            // poll land between this call and maintenance's own update.
+            // It would read `ran_at` as fresh and take the PRIOR,
+            // possibly stale, outcome for this tick's.
+            //
+            // Any cursor `sweep_options` needs to carry forward is read
+            // by the caller BEFORE this update runs. See
+            // `run_partition_maintenance`'s caller in the tick loop.
             *existing = result;
         }
     }
@@ -1070,6 +1085,7 @@ async fn run_partition_maintenance(
     pools: &ShardedDbPool,
     config: &RetentionConfig,
     monitor: &RetentionMonitor,
+    cursor_snapshot: &RetentionStatus,
 ) {
     if !config.partitions.enabled {
         return;
@@ -1087,15 +1103,21 @@ async fn run_partition_maintenance(
         sweep_opts.max_drops = 0;
         sweep_opts.straggler_grace = None;
     }
-    // Each shard's own rotation cursor, read from the outcome this same
-    // monitor recorded last pass. A bounded sweep always restarting at the
-    // oldest partition would spend its whole budget on the same prefix
-    // every tick. That happens when the prefix is permanently blocked — a
-    // long legal hold, say. It would never reach a reclaimable partition
-    // past it. The monitor is already the durable record of "what the
-    // last pass did". So it doubles as the cursor's home, with no extra
-    // state to plumb through.
-    let last_snapshot = monitor.snapshot();
+    // Each shard's own rotation cursor, read from the outcome the monitor
+    // recorded last pass. A bounded sweep always restarting at the oldest
+    // partition would spend its whole budget on the same prefix every
+    // tick. That happens when the prefix is permanently blocked — a long
+    // legal hold, say. It would never reach a reclaimable partition past
+    // it.
+    //
+    // Read from a snapshot the CALLER took before this tick's own
+    // history-retention update, not from `monitor` directly. `update`
+    // clears `partition_maintenance` back to `None` for the gap between
+    // that call and this pass's own. A caller polling for "this tick
+    // finished" needs that gap. Otherwise it could mistake the PRIOR
+    // pass's outcome for this one's. Reading through `monitor.snapshot()`
+    // here instead would race exactly that gap.
+    let last_snapshot = cursor_snapshot;
     for (shard, pool) in pools.iter_shards() {
         let mut conn = match pool.get().await {
             Ok(conn) => conn,
@@ -1236,7 +1258,10 @@ impl RetentionRuntime {
             // has no covering partition until this runs. Every append lands
             // in DEFAULT until either this pass or the first tick creates
             // the missing cohort. And `tick_interval` defaults to one hour.
-            run_partition_maintenance(&pools, &config, &monitor_task).await;
+            {
+                let cursor_snapshot = monitor_task.snapshot();
+                run_partition_maintenance(&pools, &config, &monitor_task, &cursor_snapshot).await;
+            }
             loop {
                 tokio::select! {
                     () = shutdown_task.cancelled() => break,
@@ -1245,6 +1270,12 @@ impl RetentionRuntime {
                         while trigger_rx.try_recv().is_ok() {}
                     }
                 }
+
+                // Captured before this tick's own history-retention `update`
+                // calls below, which clear `partition_maintenance` back to
+                // `None` per shard. Partition maintenance further down this
+                // loop needs LAST tick's cursor, not that transient gap.
+                let cursor_snapshot = monitor_task.snapshot();
 
                 // Workflow-history retention: runs when the global max_age OR
                 // any per-workflow-type override is configured (issue #737).
@@ -1367,7 +1398,7 @@ impl RetentionRuntime {
                 // way a restart after an outage does not wait a full
                 // tick_interval for its first coverage check (issue #1270
                 // item 5).
-                run_partition_maintenance(&pools, &config, &monitor_task).await;
+                run_partition_maintenance(&pools, &config, &monitor_task, &cursor_snapshot).await;
 
                 // Purge old audit records once per tick, best-effort.
                 // Audit rows may live on any shard (workflow starts use shard-aware
@@ -3764,6 +3795,80 @@ mod tests {
         assert_eq!(snapshot.per_shard.len(), 2);
         assert_eq!(snapshot.per_shard[0].shard, 0);
         assert_eq!(snapshot.per_shard[1].shard, 1);
+    }
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn a_caller_snapshot_taken_before_update_keeps_the_rotation_cursor() {
+        // `run_partition_maintenance` runs AFTER the per-shard
+        // history-retention loop in the SAME tick. That loop's own
+        // `monitor.update(shard, result)` call builds `result` fresh, with
+        // `partition_maintenance` at its `None` default, and overwrites the
+        // per-shard entry with it. Reading the cursor through
+        // `monitor.snapshot()` at that point would lose the prior tick's
+        // `SweepOutcome::resume_after`.
+        //
+        // The fix is not in `update` itself. `RetentionRuntime`'s tick loop
+        // takes its own snapshot before calling `update`, and hands that
+        // snapshot to `run_partition_maintenance` as its cursor source. This
+        // test proves that pattern keeps the cursor, and that `update`
+        // still clears the live field the way callers polling `ran_at`
+        // depend on.
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600));
+        let shard = ShardId::new(0);
+        let monitor = RetentionMonitor::new(config, std::iter::once(shard));
+
+        let outcome = crate::partition::MaintenanceOutcome {
+            sweep: crate::partition::SweepOutcome {
+                resume_after: Some("harvest_events_p_20260101000000".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        monitor.update_partitions(shard, outcome);
+        assert!(
+            monitor.snapshot().per_shard[0]
+                .partition_maintenance
+                .is_some(),
+            "precondition: the prior tick's outcome must be recorded"
+        );
+
+        // The caller-side snapshot `run_partition_maintenance` would receive
+        // as its `cursor_snapshot` argument, taken before this tick's own
+        // history-retention update.
+        let cursor_snapshot = monitor.snapshot();
+
+        // The history-retention half of the SAME tick reporting in, exactly
+        // as `RetentionRuntime`'s tick loop does before it calls
+        // `run_partition_maintenance`.
+        monitor.update(
+            shard,
+            RetentionTickResult {
+                shard: 0,
+                candidate_count: 3,
+                ..RetentionTickResult::default()
+            },
+        );
+
+        let after = monitor.snapshot();
+        assert_eq!(
+            after.per_shard[0].candidate_count, 3,
+            "the history-retention fields this update reports must still land"
+        );
+        assert!(
+            after.per_shard[0].partition_maintenance.is_none(),
+            "update clears the live field; a poller matching a fresh ran_at \
+             must not see the prior tick's partition-maintenance outcome"
+        );
+        assert_eq!(
+            cursor_snapshot.per_shard[0]
+                .partition_maintenance
+                .as_ref()
+                .and_then(|m| m.sweep.resume_after.as_deref()),
+            Some("harvest_events_p_20260101000000"),
+            "the snapshot taken before update must still carry the prior \
+             tick's rotation cursor"
+        );
     }
 
     #[tokio::test]
