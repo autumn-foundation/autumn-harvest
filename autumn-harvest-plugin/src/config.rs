@@ -449,6 +449,77 @@ impl HarvestRuntimeConfig {
     }
 }
 
+/// Where a resolved `harvest.mode` value came from (issue #1291).
+///
+/// A refusal that only names the resolved mode leaves a developer guessing
+/// where it came from. This says exactly that, so a refusal message can name
+/// the variable or file to change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HarvestModeSource {
+    /// No override anywhere. The value is the built-in default, `embedded`.
+    Default,
+    /// The `AUTUMN_HARVEST__MODE` environment variable set it.
+    Env,
+    /// This config file set it, in its `[harvest]` table.
+    ConfigFile(PathBuf),
+}
+
+impl std::fmt::Display for HarvestModeSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => write!(f, "the built-in default"),
+            Self::Env => write!(f, "the AUTUMN_HARVEST__MODE environment variable"),
+            Self::ConfigFile(path) => write!(f, "{}", path.display()),
+        }
+    }
+}
+
+/// Resolve `harvest.mode` and say where the value came from.
+///
+/// A narrow twin of [`HarvestRuntimeConfig::load_with_env`]. It reads the
+/// same config files under the same precedence — root file, then
+/// profile-specific file, then environment — but tracks one field only.
+/// A caller that must name the responsible variable or file reads the
+/// source here. The dev runtime's startup gate does this (issue #1291). A
+/// fully loaded [`HarvestRuntimeConfig`] drops that provenance.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] when a config file cannot be read or parsed, or
+/// when `AUTUMN_HARVEST__MODE` names an unrecognised mode.
+pub fn resolve_harvest_mode_source(
+    env: &dyn Env,
+) -> Result<(HarvestMode, HarvestModeSource), ConfigError> {
+    let profile = resolve_profile(env);
+    let mut mode = HarvestMode::default();
+    let mut source = HarvestModeSource::Default;
+
+    let root_path = find_config_file_named("autumn.toml", env);
+    if let Some(root) = load_partial_root(&root_path)?
+        && let Some(configured) = root.harvest.mode
+    {
+        mode = configured;
+        source = HarvestModeSource::ConfigFile(root_path);
+    }
+
+    if let Some(profile) = &profile {
+        let profile_path = find_config_file_named(&format!("autumn-{profile}.toml"), env);
+        if let Some(root) = load_partial_root(&profile_path)?
+            && let Some(configured) = root.harvest.mode
+        {
+            mode = configured;
+            source = HarvestModeSource::ConfigFile(profile_path);
+        }
+    }
+
+    if let Ok(raw) = env.var("AUTUMN_HARVEST__MODE") {
+        mode = parse_mode(&raw)?;
+        source = HarvestModeSource::Env;
+    }
+
+    Ok((mode, source))
+}
+
 impl Default for HarvestRuntimeConfig {
     fn default() -> Self {
         Self {
@@ -1339,6 +1410,110 @@ key_prefix = "from_toml"
         let env = MockEnv::new();
 
         HarvestRuntimeConfig::load_with_env(&env).expect("the redis defaults must validate");
+    }
+
+    // -----------------------------------------------------------------
+    // `resolve_harvest_mode_source` (issue #1291)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn mode_source_defaults_to_embedded_with_no_override() {
+        let env = MockEnv::new();
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
+        assert_eq!(mode, HarvestMode::Embedded);
+        assert_eq!(source, HarvestModeSource::Default);
+    }
+
+    #[test]
+    fn mode_source_names_the_environment_variable() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST__MODE", "split");
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
+        assert_eq!(mode, HarvestMode::Split);
+        assert_eq!(source, HarvestModeSource::Env);
+    }
+
+    #[test]
+    fn mode_source_names_the_root_config_file() {
+        let dir = unique_temp_dir("harvest-mode-source-root");
+        let root_path = dir.join("autumn.toml");
+        write_file(
+            &root_path,
+            r#"
+[harvest]
+mode = "external"
+
+[harvest.database]
+url = "postgres://harvest:harvest@localhost:5432/harvest"
+"#,
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
+
+        assert_eq!(mode, HarvestMode::External);
+        assert_eq!(source, HarvestModeSource::ConfigFile(root_path));
+    }
+
+    #[test]
+    fn mode_source_prefers_the_profile_file_over_the_root_file() {
+        let dir = unique_temp_dir("harvest-mode-source-profile");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest]
+mode = "embedded"
+"#,
+        );
+        let profile_path = dir.join("autumn-dev.toml");
+        write_file(
+            &profile_path,
+            r#"
+[harvest]
+mode = "split"
+
+[harvest.database]
+url = "postgres://harvest:harvest@localhost:5432/harvest"
+"#,
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_PROFILE", "dev");
+
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
+
+        assert_eq!(mode, HarvestMode::Split);
+        assert_eq!(source, HarvestModeSource::ConfigFile(profile_path));
+    }
+
+    #[test]
+    fn mode_source_env_overrides_a_config_file() {
+        let dir = unique_temp_dir("harvest-mode-source-env-over-file");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest]
+mode = "split"
+
+[harvest.database]
+url = "postgres://harvest:harvest@localhost:5432/harvest"
+"#,
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_HARVEST__MODE", "embedded");
+
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
+
+        assert_eq!(mode, HarvestMode::Embedded);
+        assert_eq!(source, HarvestModeSource::Env);
+    }
+
+    #[test]
+    fn mode_source_rejects_an_unrecognised_environment_value() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST__MODE", "sideways");
+        let error = resolve_harvest_mode_source(&env)
+            .expect_err("an unrecognised mode must fail resolution");
+        assert!(error.to_string().contains("sideways"), "{error}");
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

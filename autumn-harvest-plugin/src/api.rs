@@ -439,6 +439,17 @@ pub struct HarvestApiState {
     /// read model can resolve the probe interval / staleness window. `None`
     /// when the canary is disabled.
     canary_config: Arc<Mutex<Option<crate::canary::CanaryConfig>>>,
+    /// Refuse `start_harvest_runtime` unless ambient Harvest configuration
+    /// resolves to `embedded` mode (issue #1291).
+    ///
+    /// Set only by the dev runtime (`crate::dev`), which owns one ephemeral
+    /// cluster and has no second database for `split`/`external` storage.
+    /// Every ordinary embedder leaves this `false` and keeps full support
+    /// for both modes. This is a backstop, not the primary gate. The dev
+    /// runtime already refuses before provisioning, and again before the
+    /// server starts. This only matters if ambient configuration changed in
+    /// the narrow window after that.
+    require_embedded_harvest_mode: Arc<Mutex<bool>>,
 }
 
 impl Default for HarvestApiState {
@@ -490,6 +501,7 @@ impl Default for HarvestApiState {
                 crate::status_summary::StatusThresholds::default(),
             )),
             canary_config: Arc::new(Mutex::new(None)),
+            require_embedded_harvest_mode: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -752,6 +764,34 @@ impl HarvestApiState {
             .lock()
             .expect("harvest api state lock poisoned")
             .clone()
+    }
+
+    /// Mirror [`crate::plugin::HarvestPlugin`]'s dev-runtime-only flag (issue
+    /// #1291), so `start_harvest_runtime` can also refuse a non-embedded
+    /// ambient mode. See the field doc on `require_embedded_harvest_mode`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub(crate) fn set_require_embedded_harvest_mode(&self, value: bool) {
+        *self
+            .require_embedded_harvest_mode
+            .lock()
+            .expect("harvest api state lock poisoned") = value;
+    }
+
+    /// Whether `start_harvest_runtime` must refuse a non-embedded ambient
+    /// Harvest mode (issue #1291). See the field doc on
+    /// `require_embedded_harvest_mode`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub(crate) fn require_embedded_harvest_mode(&self) -> bool {
+        *self
+            .require_embedded_harvest_mode
+            .lock()
+            .expect("harvest api state lock poisoned")
     }
 
     /// Whether read-path payload decoding is enabled (issue #608).
