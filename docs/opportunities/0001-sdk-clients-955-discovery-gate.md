@@ -81,8 +81,10 @@ competitors' *shipped SDK* offerings. It does not mention that this
 project's own OpenAPI 3.1 spec (issue #694) already **shipped** (closed,
 merged) before #955 was filed. That spec makes today's actual cheapest
 current hire not "hand-write raw HTTP" but "run `openapi-generator` (or
-`openapi-typescript`) against the published contract once, locally, for
-free." Nothing in #955 measures whether teams have tried that path and
+`openapi-typescript`) against the already-served/published OpenAPI
+document ([`docs/openapi.json`](../openapi.json), per
+[`docs/openapi.md`](../openapi.md)) once, locally, for free." Nothing in
+#955 measures whether teams have tried that path and
 found it insufficient, or whether they've tried it at all. A demand case
 for a hand-maintained ergonomic layer that never engages with the free
 self-serve alternative it would have to outcompete is not yet a demand
@@ -124,14 +126,24 @@ the SDKs do not exist yet):
    awkward."* Count distinct responding organizations/teams (self-identified,
    not anonymous reactions) that describe an existing hand-rolled
    integration or a documented pain point.
-2. **Self-serve-path instrumentation.** Add one line to
-   `docs/management-api.md` and the OpenAPI spec's own README pointing at
-   `openapi-generator-cli generate -i api-contract.json -g typescript-fetch`
-   (and the Python equivalent) as "the fastest way to get a typed client
-   today." Track distinct clone/view activity on that doc section via
-   existing repo traffic analytics (coarse proxy; no new instrumentation
-   infra implied) as a revealed-preference signal for whether people are
-   already reaching for the cheap substitute.
+2. **Self-serve-path signal, via a distinguishable action, not page
+   traffic.** Add one line to `docs/openapi.md`'s existing "Generate a typed
+   client in under ten minutes" section and to `docs/management-api.md`,
+   pointing at the commands that section already documents and verifies —
+   `openapi-typescript` / `openapi-python-client` against the served
+   `GET {api_path}/openapi.json` endpoint, or the offline
+   [`docs/openapi.json`](../openapi.json) copy for review diffs (**not**
+   [`docs/api-contract.json`](../api-contract.json), which is Harvest's
+   pre-OpenAPI canonical contract that `docs/openapi.json` is generated
+   from, not an OpenAPI document itself, and not something any OpenAPI
+   generator can read) — with a direct call to action: *"Tried this? Tell
+   us in [the same Discussion] whether it covered your case, or where it
+   fell short."* Count replies to that specific prompt as the
+   revealed-preference signal. A reply is a distinguishable, attributable
+   event; repository page-view or clone counts are not, since nothing on
+   this repository's traffic dashboards can attribute a view of that page
+   to this newly added line rather than to any other reason someone opened
+   it — an unattributable count is not evidence, whatever its size.
 
 **Segment:** teams or organizations embedding Harvest that self-identify as
 primarily non-Rust in the Discussion thread.
