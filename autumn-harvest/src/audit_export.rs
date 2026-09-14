@@ -534,7 +534,10 @@ pub(crate) fn redact_webhook_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return "<unparseable webhook url redacted>".to_string();
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // `url::Url::parse` treats `\` the same as `/` for `http`/`https` (issue
+    // #1274): it ends the authority just like `/`, `?`, and `#` do. Without
+    // it here, `https://evil.com\token` kept the whole tail as "authority".
+    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or_default();
     // Strip any userinfo (`user:pass@host`), itself a credential.
     let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     if host.is_empty() {
@@ -3801,6 +3804,18 @@ mod tests {
             let rendered = redact_webhook_url(junk);
             assert_eq!(rendered, "<unparseable webhook url redacted>");
         }
+    }
+
+    #[test]
+    fn redact_webhook_url_stops_the_authority_at_a_backslash() {
+        // Issue #1274: `url::Url::parse` treats a backslash as a path
+        // separator for `https`/`http`, the same as a forward slash.
+        // `redact_webhook_url` split only on `/`, `?`, and `#`, so a
+        // backslash-delimited secret rode along as part of the authority.
+        assert_eq!(
+            redact_webhook_url("https://evil.com\\bearer-secret"),
+            "https://evil.com/<redacted>"
+        );
     }
 
     /// A delivery whose sink was swapped mid-flight must not advance the
