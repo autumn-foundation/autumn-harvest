@@ -72,13 +72,24 @@ reproducible:
    All scoped to `autumn-foundation/autumn-harvest`, no state filter (open
    and closed issues and PRs both in scope), default ranking, first 20
    results requested. The first three matched **0** issues or PRs; the
-   fourth matched exactly **#955 itself** and nothing else. Four
-   differently-worded queries converging on the same zero (modulo #955)
-   is stronger than resting on one query's phrasing, but it is still not a
-   proof of absence — a fifth phrasing could in principle surface
-   something these four didn't. This is disclosed, not fixed, by adding
-   more queries; see the ledger's methodology note on this corpus's
-   inherent limits as a customer-behavior instrument.
+   fourth matched exactly **#955 itself** and nothing else.
+
+   **A negative-control test, and what it actually shows.** Rather than
+   keep adding queries indefinitely — there is no principled stopping
+   point for "enough" phrasings — this entry ran one decisive check
+   instead: a query paraphrasing #955's own ask with almost no literal
+   term overlap (`developers coding in other languages need a proper
+   library instead of writing raw calls by hand to talk to this engine`).
+   If the tool's claimed semantic matching is reliable, this should still
+   surface #955, a known conceptually-identical match. **It did not** —
+   0 results. That means this tool cannot be trusted to catch a real
+   complaint phrased far enough from these queries' vocabulary, which is
+   a real limit on Tier 1, not a solved problem: the four queries above
+   rule out complaints using similar wording to them, and nothing
+   stronger. The deterministic, query-independent evidence — search 2
+   below — is accordingly the more load-bearing of the two, and Tier 1's
+   overall confidence is downgraded to reflect this rather than papered
+   over with a fifth or sixth query.
 2. `git grep -c curl -- ':!docs/opportunities/*'` (the exhaustive form — an
    initial pass used GitHub's hosted code search, which returned only 40 of
    the corpus's actual matches and undercounted; git grep is the
@@ -101,19 +112,21 @@ fetches, git fetches in CI), so a bare `\bfetch\b` grep returns 257 hits
 across ~90 files that are almost entirely noise, and no finite keyword list
 covers every client library a workaround might use anyway. Search 2 is
 therefore reported for what it actually is: a spot-check that the code
-corpus's `curl` idiom is 100% first-party documentation, nothing more. The
-instrument that actually carries the "does anyone report this regardless
-of which library they used" weight is **search 1** — run as four
-differently-worded queries specifically so it does not depend on any one
-phrasing (or on the tool's own claim of semantic matching) to catch a
-complaint about a hand-rolled Axios or `requests` client the same way it
-would a curl-based one. Search 1 found nothing across all four; search 2
-independently confirms the code corpus has no case of the one raw-HTTP
-idiom checked directly.
+corpus's `curl` idiom is 100% first-party documentation, nothing more, but
+it is deterministic and query-independent, unlike search 1 — given the
+negative-control result above, search 2 is the more trustworthy of the
+two, not merely a supplement to it.
 
-This repository is the engine's own issue tracker, not a support desk or
-sales-call archive — a `0` here is *absence of evidence in the only corpus
-available to this process*, not proof of absence; see the ledger's
+**What this Tier 1 evidence actually supports, stated at the confidence it
+earns:** no complaint using vocabulary close to the five tried phrasings
+exists in this repository's issues or PRs, and the code corpus's one
+checked raw-HTTP idiom (`curl`) is 100% first-party. It does **not**
+support a stronger claim that no differently-worded complaint could exist
+in this repository, since the negative-control test shows this search
+instrument can miss a known match. This repository is also the engine's
+own issue tracker, not a support desk or sales-call archive — a `0` here
+is *absence of evidence in the only corpus available to this process*, on
+top of being a weaker `0` than initially presented; see the ledger's
 methodology note. It is nonetheless the totality of what this run could
 check, and it found nothing.
 
@@ -232,16 +245,25 @@ all, and soliciting two unrelated people would let the floor pass on
 noise. Live linkage from `README.md` and `docs/management-api.md` is
 necessary but not sufficient either way.
 
-This repository's accessible record currently names **zero** contacts
-meeting that bar — the same Tier 1 sweep that found no workaround evidence
-also found nobody visibly integrating Harvest from outside Rust. Finding
-at least 2 concrete, qualifying contacts is part of running this probe,
-not an afterthought, and should happen before the 60-day window opens. If
-none can be found at all, that absence is itself the finding worth
+**What is actually known about this count, stated honestly:** this
+repository's own issues/PRs name zero such contacts (the same Tier 1
+sweep). But two of the three qualifying paths above — an account that
+authored a public repository *outside this one* referencing `HarvestPlugin`
+or the management API, or otherwise engaging with Harvest elsewhere on
+GitHub — were never searched, because this process's GitHub access is
+scoped to `autumn-foundation/autumn-harvest` only and cannot reach or
+search any other repository or account. The correct status for that part
+of the count is **not searched**, not **zero** — this entry originally
+overstated it, and the fix is disclosure, not a claim this process cannot
+back up. Finding at least 2 concrete, qualifying contacts (which requires
+that broader search) is part of running this probe, not an afterthought,
+and should happen before the 60-day window opens, by whoever runs it with
+that access. If none can be found at all even with full GitHub search
+reach, that absence is itself the finding worth
 reporting — it would mean this job cannot yet be probed through any
-channel this process has access to, and closing that harness gap (finding
-or building a way to reach the named segment) becomes the next
-demand-report deliverable, ahead of any pursue/kill verdict on #955
+channel, and closing that harness gap (finding or building a way to reach
+the named segment) becomes the next demand-report deliverable, ahead of
+any pursue/kill verdict on #955
 itself. Short of clearing the 2-contact floor, the window's silence is
 **inconclusive**, not a kill.
 
@@ -296,6 +318,20 @@ formal kill of #955 with this entry as the citation, not silent archival.
   use `git grep`, not GitHub's hosted code search, which undercounted this
   corpus by 5x). Zero independent-workaround or complaint hits beyond #955
   itself.
+- Negative-control test on the issue search, also reproducible: query
+  `developers coding in other languages need a proper library instead of
+  writing raw calls by hand to talk to this engine` (deliberately low
+  literal overlap with #955's own title/body) returns **0** results,
+  failing to retrieve #955 itself despite being a conceptually identical
+  paraphrase. This is the basis for downgrading Tier 1's confidence in the
+  issue-search instrument in favor of the deterministic `git grep`.
+- Scope limitation on the exposure-floor contact search: this process's
+  GitHub access is restricted to `autumn-foundation/autumn-harvest`, so
+  the "identifiable non-Rust-adjacent contacts" criterion's
+  external-repository and external-account paths were never searched —
+  only this repository's own issues/PRs were. That part of the "zero
+  known contacts" count should be read as "not searched," not "searched
+  and found none."
 - Chronology check for this entry: `mcp__github__issue_read` / `pull_request_read`
   on #694 and PR #1404 — #694 merged 2026-09-07, #955 was filed 2026-07-08.
 - Probe configuration: as pre-registered above. Whoever runs it should link
