@@ -42,6 +42,23 @@ This is a **measurement re-run**, not a new mechanism test — the code under
 test is the same integration, on a codebase that has changed in exactly one
 relevant way since ledger #8's numbers were taken.
 
+> **Correction, added after the assay ran, caught in PR review — left
+> attached to the original claim rather than silently rewritten:** "exactly
+> one relevant way" was wrong even at the time this was written, and the
+> report this document gated found two more: #1478 added a per-shard
+> quota-key reconciler running on every worker's heartbeat cadence (both
+> arms), and #1447 replaced `persist_scheduled_activities`'s per-row
+> enqueue loop with a batched call — both land between ledger #8's `df4bd0d`
+> baseline and this run's tree, alongside #1468. Neither this document's
+> "one relevant way" framing below nor the Conditions section's implicit
+> assumption that only #1468 changed should be read as established; see
+> `docs/assays/0009-redis-dispatch-tail-latency-post-sampler-fix.md`'s
+> Verdict section for the full, honestly-widened confound list. The
+> pre-registered line and criteria are unaffected — they do not depend on
+> this claim being true — but the framing sentence was inaccurate as
+> written and is preserved above, uncorrected in place, so the record of
+> what was believed at commit time stays honest.
+
 ## 👤 Decision this feeds
 
 Whether issue #1429 item 1 ("tail latency under dispatch") still needs the
