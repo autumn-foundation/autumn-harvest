@@ -1425,7 +1425,24 @@ async fn refuse_if_row_security(conn: &mut AsyncPgConnection, verb: &str) -> Har
 /// deferring the uniqueness check. `con.condeferrable` is checked
 /// directly now, closing that gap the same way `contype` closed the
 /// name-only one.
-const HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL: &str = "NOT EXISTS (\n                SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid\n                  AND NOT con.condeferrable\n                  AND (\n                      (con.conname = 'harvest_events_pkey' AND con.contype = 'p'\n                       AND (SELECT array_agg(a.attname::text ORDER BY k)\n                              FROM generate_series(0, i.indnkeyatts - 1) k\n                              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]\n                           ) = ARRAY['id'])\n                      OR\n                      (con.conname = 'harvest_events_workflow_exec_id_event_id_key' AND con.contype = 'u'\n                       AND (SELECT array_agg(a.attname::text ORDER BY k)\n                              FROM generate_series(0, i.indnkeyatts - 1) k\n                              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]\n                           ) = ARRAY['workflow_exec_id', 'event_id'])\n                  )\n            )";
+///
+/// Review finding: key columns are still not the whole backing-index
+/// shape. An operator can build `harvest_events_pkey PRIMARY KEY (id)
+/// INCLUDE (workflow_exec_id)` -- key columns, type and deferrability
+/// all match harvest's own. The `INCLUDEd` column does not. That index
+/// still qualified. `capture_index_defs` then excludes it from replay,
+/// same as any other constraint-backed index. Conversion recreates
+/// only harvest's plain constraint in its place. That silently
+/// discards the `INCLUDEd` column and the index-only-scan behavior it
+/// existed for. `i.indnatts = i.indnkeyatts` requires zero `INCLUDEd`
+/// columns.
+///
+/// Harvest's own two constraints also never specify a non-default
+/// opclass or a descending key column. A table constraint's `UNIQUE`
+/// or `PRIMARY KEY` clause cannot name one directly. Either can only
+/// arise via `ADD CONSTRAINT ... USING INDEX` against a hand-built
+/// index. The opclass and sort-order checks close that route too.
+const HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL: &str = "NOT EXISTS (\n                SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid\n                  AND NOT con.condeferrable\n                  AND i.indnatts = i.indnkeyatts\n                  AND NOT EXISTS (\n                          SELECT 1 FROM unnest(i.indclass) AS oc(opclass)\n                            JOIN pg_opclass op ON op.oid = oc.opclass\n                           WHERE NOT op.opcdefault\n                      )\n                  AND NOT EXISTS (\n                          SELECT 1 FROM unnest(i.indoption) AS o(bits) WHERE bits <> 0\n                      )\n                  AND (\n                      (con.conname = 'harvest_events_pkey' AND con.contype = 'p'\n                       AND (SELECT array_agg(a.attname::text ORDER BY k)\n                              FROM generate_series(0, i.indnkeyatts - 1) k\n                              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]\n                           ) = ARRAY['id'])\n                      OR\n                      (con.conname = 'harvest_events_workflow_exec_id_event_id_key' AND con.contype = 'u'\n                       AND (SELECT array_agg(a.attname::text ORDER BY k)\n                              FROM generate_series(0, i.indnkeyatts - 1) k\n                              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]\n                           ) = ARRAY['workflow_exec_id', 'event_id'])\n                  )\n            )";
 
 /// User-defined unique indexes on `harvest_events` that cannot survive
 /// conversion unchanged: either missing `cohort`, or backed by a

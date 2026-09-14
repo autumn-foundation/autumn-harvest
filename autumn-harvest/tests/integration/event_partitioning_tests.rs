@@ -2222,6 +2222,61 @@ async fn an_operator_index_squatting_a_reserved_legacy_name_still_refuses_the_re
 }
 
 #[tokio::test]
+async fn a_reserved_constraint_with_an_include_column_still_refuses_conversion() {
+    // Review finding: the shared exemption for harvest's own two
+    // built-in constraints matched constraint name, type, key columns
+    // and deferrability. It never checked the backing index's full
+    // shape. An operator can rebuild `harvest_events_pkey` as
+    // `PRIMARY KEY (id) INCLUDE (workflow_exec_id)`. Every checked
+    // property still matches harvest's own. The INCLUDEd column does
+    // not, and the old check never looked at it, so this impostor
+    // still qualified as harvest-owned. `capture_index_defs` excludes
+    // every constraint-backed index from replay unconditionally.
+    // Conversion recreates only harvest's plain, INCLUDE-less
+    // constraint in its place. That silently discards the INCLUDEd
+    // column and the index-only-scan behavior it existed for.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT harvest_events_pkey")
+        .execute(&mut conn)
+        .await
+        .expect("drop harvest's own plain primary key");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events \
+         ADD CONSTRAINT harvest_events_pkey PRIMARY KEY (id) INCLUDE (workflow_exec_id)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator impostor: same key column, plus an INCLUDEd one");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "a reserved constraint name rebuilt with an INCLUDEd column must refuse \
+             conversion rather than silently discarding that column",
+        );
+    assert!(
+        err.to_string().contains("harvest_events_pkey"),
+        "the refusal must name the impostor constraint's backing index: {err}"
+    );
+
+    // Restore harvest's own plain primary key so later tests see the
+    // ordinary flat-table shape `reset_to_unpartitioned` expects.
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT harvest_events_pkey")
+        .execute(&mut conn)
+        .await
+        .expect("drop the impostor");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_pkey PRIMARY KEY (id)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("restore harvest's own plain primary key");
+}
+
+#[tokio::test]
 async fn a_dependent_materialized_view_refuses_the_conversion_too() {
     // Review finding on item 14: Postgres records a materialized view's
     // dependency the same way as an ordinary view, by relation OID
