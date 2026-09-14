@@ -58,15 +58,23 @@
 //!   [`require_harvest_admin`](crate::api::require_harvest_admin) draws the
 //!   same line.
 //!
-//! A fourth shape is admitted only as a last resort, after `Sec-Fetch-Site`
-//! and `Origin` have both been checked and neither was present: a
-//! non-CORS-simple `Content-Type`. `application/json` is the one that
-//! matters most — the documented, headerless `curl`-based runbooks this
-//! router also serves use it. Reaching this router with that content type
-//! normally needs a CORS preflight this server does not answer. The one
-//! exception is `<a ping>`/`sendBeacon`, which is exactly why
-//! `Sec-Fetch-Site` is checked first rather than treating the content type
-//! alone as proof.
+//! A fourth shape is admitted only as a last resort. This applies after
+//! `Sec-Fetch-Site` and `Origin` have both been checked, and neither was
+//! present. The shape is a `Content-Type` of exactly `application/json`.
+//! Documented, headerless `curl`-based API clients this router also serves
+//! use exactly that value.
+//!
+//! A cross-site `fetch`/XHR sending `application/json` needs a CORS
+//! preflight this server does not answer. `<a ping>` cannot send it at
+//! all. The HTML standard fixes its content type to `text/ping`. So this
+//! fallback only ever admits the one shape a real direct API client
+//! produces, not an open set of "anything non-simple."
+//!
+//! A cross-site `sendBeacon` can set an attacker-chosen content type,
+//! `application/json` included. It always carries `Origin` on a
+//! cross-site call, though, regardless of `Sec-Fetch-Site` support. The
+//! `Origin` check above catches it first, so it never falls through to
+//! here.
 
 use autumn_web::reexports::axum;
 use axum::extract::Request;
@@ -108,20 +116,20 @@ fn is_first_party_cli(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("cli"))
 }
 
-/// Whether `headers` carries one of the three content types a plain HTML
-/// `<form>` can send without a CORS preflight. A body-less form submission
-/// carries no `Content-Type` at all, and counts as simple too.
-fn is_cors_simple_content_type(headers: &HeaderMap) -> bool {
+/// Whether `headers` declares `Content-Type: application/json`, the one
+/// value a documented direct API client sends with no browser-origin
+/// evidence at all. Admitted only as the last resort in [`is_same_origin`],
+/// after `Sec-Fetch-Site` and `Origin` were both checked and neither was
+/// present.
+fn is_json_content_type(headers: &HeaderMap) -> bool {
     let Some(raw) = headers.get(header::CONTENT_TYPE) else {
-        return true;
+        return false;
     };
     let Ok(raw) = raw.to_str() else {
-        return true;
+        return false;
     };
     let media_type = raw.split(';').next().unwrap_or(raw).trim();
-    media_type.eq_ignore_ascii_case("application/x-www-form-urlencoded")
-        || media_type.eq_ignore_ascii_case("multipart/form-data")
-        || media_type.eq_ignore_ascii_case("text/plain")
+    media_type.eq_ignore_ascii_case("application/json")
 }
 
 /// The Fetch Metadata / `Origin` same-origin check. Pure function of the
@@ -129,8 +137,9 @@ fn is_cors_simple_content_type(headers: &HeaderMap) -> bool {
 ///
 /// `Sec-Fetch-Site`, when present, is always the final word — checked
 /// before `Origin` and never overridden by it. Only when *neither* header
-/// is present does a non-CORS-simple `Content-Type` admit the request; see
-/// the module docs for why that order matters (`<a ping>`/`sendBeacon`).
+/// is present does an `application/json` `Content-Type` admit the
+/// request. See the module docs for why that order, and that one exact
+/// value, matter (`<a ping>`/`sendBeacon`).
 fn is_same_origin(headers: &HeaderMap) -> bool {
     if let Some(site) = headers.get("sec-fetch-site") {
         return site
@@ -139,7 +148,7 @@ fn is_same_origin(headers: &HeaderMap) -> bool {
     }
 
     let Some(origin) = headers.get(header::ORIGIN) else {
-        return !is_cors_simple_content_type(headers);
+        return is_json_content_type(headers);
     };
     let Ok(origin) = origin.to_str() else {
         return false;
@@ -467,6 +476,20 @@ mod tests {
         // a CORS preflight, so it carries none of the risk this layer guards.
         let status = post_with_headers(&[("content-type", "application/json")]).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ping_content_type_without_fetch_metadata_or_origin_is_rejected() {
+        // Regression (Codex): the last-resort content-type fallback used to
+        // admit any non-CORS-simple type, not only `application/json`. An
+        // `<a ping>` request can reach this server with neither
+        // `Sec-Fetch-Site` nor `Origin` present. An old browser, or an
+        // intermediary that strips both headers, can cause this. Such a
+        // request carries `Content-Type: text/ping`, a value no real
+        // direct API client ever sends. That must stay rejected rather
+        // than fall through as "not simple, so safe."
+        let status = post_with_headers(&[("content-type", "text/ping")]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
