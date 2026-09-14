@@ -939,9 +939,9 @@ fn reap_removes_a_session_that_died_before_recording_a_postmaster() {
 
 #[test]
 fn a_tokenless_but_live_postmaster_is_skipped_not_stopped() {
-    // Issue #1295. A tokenless record used to fall back to plain liveness,
-    // so a live pid at the recorded number was treated as a match — even
-    // when the OS had long since reused that pid for something else.
+    // Issue #1295. A tokenless record used to fall back to plain liveness.
+    // A live pid at the recorded number was treated as a match. That held
+    // even when the OS had long reused that pid for something else.
     // `decide_reap` must now skip, never `StopThenRemove`, on unknown
     // identity: the pid could be ours, or could be a stranger.
     let decision = decide_reap(

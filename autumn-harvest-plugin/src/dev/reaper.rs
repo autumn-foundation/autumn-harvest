@@ -742,10 +742,10 @@ mod tests {
     }
 
     /// Issue #1295. A live pid whose start token does not match the record
-    /// is `NotRunning`, not `Unknown`: the recorded postmaster already
+    /// is `NotRunning`, not `Unknown`. The recorded postmaster already
     /// exited, and the OS reused its pid for an unrelated live process. The
-    /// reaper must not signal that process, but it is safe to remove the
-    /// directory the departed postmaster left behind.
+    /// reaper must not signal that process. Removing the directory the
+    /// departed postmaster left behind is still safe.
     #[cfg(unix)]
     #[test]
     fn a_mismatched_token_reads_as_not_running_not_unknown() {
