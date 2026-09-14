@@ -150,39 +150,51 @@ does the crate's full 1,178-test `--lib` suite.
 
 ## 📊 Measurement
 
-`valgrind --tool=callgrind --branch-sim=no --cache-sim=no`:
+**Correction (Codex review, PR #1554, second round).** The 145,203,167 /
+23,624,878 figures published earlier in this PR compared two *different*
+harness scaffoldings: the 145,203,167 baseline predates the review-addendum
+fix to this harness's own self-check oracle (which added ~150 extra
+`String` allocations to compute `paused_in_uncovered_range` correctly), so
+part of that delta was harness setup cost, not the algorithm. Separately,
+the indexed path's `HashSet<&str>` uses `std::collections::HashSet`'s
+default per-process-random `RandomState`, so — contrary to this page's
+earlier claim — its instruction count is not bit-for-bit reproducible
+(see the harness's own corrected doc comment). Both numbers below are
+re-measured on the *current* harness (oracle fix included) on both sides of
+the algorithm change, and the indexed side is reported as an observed range
+over five runs rather than a single misleadingly-precise figure.
+
+`valgrind --tool=callgrind --branch-sim=no --cache-sim=no`, current harness
+on both sides:
+
+| | before (pre-fix algorithm) | after (indexed, 5 runs) | delta |
+|:--|--:|--:|--:|
+| Instructions (Ir) | 145,305,864 (identical across 5 runs — no `HashSet` on this path) | 23,780,878-23,784,259 (spread ≈0.014%) | **-83.63% to -83.64%** |
+
+`valgrind --tool=dhat`, same before/after commits:
 
 | | before | after | delta |
 |:--|--:|--:|--:|
-| Instructions (Ir) | 145,203,167 | 23,784,217 | **-83.62%** |
+| Allocated bytes | 1,642,580 | 1,781,952 | +8.5% |
+| Allocated blocks | 31,188 | 31,199 | +11 |
+| Bytes read | 184,189,913 | ≈2,759,700 (±small) | -98.5% |
 
-The realistic (2,000-pending) workload always takes the indexed path — the
-small-`pending` fallback added after review only changes behavior for
-`pending.len() <= 1`, which this harness never exercises — so the tiny
-change from the pre-addendum 23,624,878 figure is the added dispatch branch
-and the extra function-call boundary, not a regression in the indexed path
-itself.
-
-`valgrind --tool=dhat`:
-
-| | before | after | delta |
-|:--|--:|--:|--:|
-| Allocated bytes | 1,630,612 | 1,781,952 | +9.3% |
-| Allocated blocks | 31,021 | 31,199 | +178 |
-| Bytes read | 184,163,764 | 2,758,320 | -98.5% |
-
-Allocation count/bytes move slightly *up* (one `HashSet` build per call,
-plus, after the review addendum, the harness's own oracle now materializing
-150 uncovered-range name strings it previously only counted by index) —
-this change is not an allocation-count win and isn't claimed as one. The
-admissible evidence here is the instruction-count delta (clears the ≥5%
-floor by more than an order of magnitude) and the asymptotic argument: the
-nested O(pending × workers × queues-per-worker) scan is now O(pending +
-workers × queues-per-worker), which is why the win *grows* with fleet size
-rather than being a fixed constant-factor improvement. Bytes-read is a
-strong corroborating signal (98.5% fewer memory reads, consistent with
-almost all the O(n×m) string comparisons disappearing) but isn't one of the
-named impact-floor categories on its own.
+dhat's allocation count and bytes are unaffected by `RandomState`'s
+per-process seed (allocation *count* does not depend on bucket layout, only
+on how many entries are inserted) and were confirmed stable across repeated
+runs, unlike the instruction count. Allocation count/bytes move slightly
+*up* (one `HashSet` build per call, where the pre-fix code allocated
+nothing extra in its hot loop) — this change is not an allocation-count win
+and isn't claimed as one. The admissible evidence here is the
+instruction-count delta (clears the ≥5% floor by more than an order of
+magnitude, comfortably outside the ~0.014% measurement spread) and the
+asymptotic argument: the nested O(pending × workers × queues-per-worker)
+scan is now O(pending + workers × queues-per-worker), which is why the win
+*grows* with fleet size rather than being a fixed constant-factor
+improvement. Bytes-read is a strong corroborating signal (98.5% fewer
+memory reads, consistent with almost all the O(n×m) string comparisons
+disappearing) but isn't one of the named impact-floor categories on its
+own.
 
 ## 🔬 Reproduce
 
@@ -190,13 +202,20 @@ named impact-floor categories on its own.
 BIN=$(cargo bench -p autumn-harvest-plugin --no-default-features \
   --bench queue_coverage_profile --no-run --message-format=json 2>/dev/null \
   | jq -r 'select(.reason=="compiler-artifact" and .target.name=="queue_coverage_profile") | .executable')
-valgrind --tool=callgrind --branch-sim=no --cache-sim=no --callgrind-out-file=cg.out "$BIN"
-callgrind_annotate --threshold=95 cg.out
+for i in 1 2 3 4 5; do
+  valgrind --tool=callgrind --branch-sim=no --cache-sim=no \
+    --callgrind-out-file=cg-$i.out "$BIN" 2>&1 | grep 'I   refs'
+done
 valgrind --tool=dhat --dhat-out-file=dhat.json "$BIN"
 ```
 
-Checking out the harness-only commit (before the algorithm change, same
-commit series) and re-running reproduces the 145,203,167-instruction
-baseline exactly; the current tree reproduces the 23,784,217-instruction
-figure (a few thousand instructions of run-to-run noise from `rustc`/`std`
-codegen details are expected and immaterial at this scale).
+The current tree reproduces the 23,780,878-23,784,259-instruction range on
+the indexed path (run several times, per above, rather than trusting a
+single sample — see the corrected doc comment in
+`queue_coverage_profile.rs`). To reproduce the 145,305,864-instruction
+pre-fix figure, temporarily restore `partition_uncovered_and_paused` /
+`worker_covers_queue` to the single-function nested-scan form from commit
+`baddbef` (the harness-only commit at the start of this PR) without
+reverting `benches/queue_coverage_profile.rs` itself — the two figures in
+the table above are both measured against today's harness, not against
+that older commit's own (since-corrected) oracle.

@@ -7,13 +7,23 @@
 //! Wall-clock timing is not admissible evidence on this (shared-vCPU)
 //! machine. Every number this harness produces is evidence of a
 //! deterministic instruction count (`valgrind --tool=callgrind`) or an
-//! allocation count/bytes figure (`valgrind --tool=dhat`). Both are
-//! reproducible bit-for-bit on any machine. The workload below hashes only
-//! `&str`/`String` *keys* it looks up in a `HashSet`, and every key and
-//! every worker/queue name is a fixed, non-random string. So, unlike
-//! `dlq_aggregate_profile.rs` / `run_chain_profile.rs`, there is no
-//! `Uuid`-keyed hash map on the measured path, and this harness has no
-//! run-to-run variance to document.
+//! allocation count/bytes figure (`valgrind --tool=dhat`).
+//!
+//! **Correction (Codex review, PR #1554):** this doc comment previously
+//! claimed callgrind counts were bit-for-bit reproducible here. The
+//! reasoning was that every queue/worker name is a fixed, non-random
+//! string. That reasoning was wrong. `std::collections::HashSet`'s default
+//! `RandomState` reseeds every process. So hash *values* differ run to run,
+//! regardless of whether the *keys* are random. Fixed keys only avoid the
+//! *additional* variance source `dlq_aggregate_profile.rs` /
+//! `run_chain_profile.rs` document: a `Uuid`-keyed map, where the key
+//! itself is fresh per run.
+//! Measured spread on this machine, five callgrind runs of the indexed
+//! path: 23,780,878-23,784,259 instructions (about 0.014%). dhat's
+//! allocation count/bytes are unaffected by hash values (allocation
+//! *count* does not depend on bucket layout) and were confirmed identical
+//! across repeated runs. See `docs/performance-queue-coverage.md`'s
+//! "Measurement" section for the full before/after range.
 //!
 //! # Workload
 //!
