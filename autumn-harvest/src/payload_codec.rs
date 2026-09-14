@@ -1302,7 +1302,8 @@ impl PayloadCodecs {
     fn envelope(codec_id: &str, key_id: &str, encoded: &[u8], force_nested: bool) -> Value {
         let keyed = key_id != CODEC_LEGACY_KEY_ID;
         let data = Value::from(base64::engine::general_purpose::STANDARD.encode(encoded));
-        let mut envelope = serde_json::Map::with_capacity(if keyed || force_nested { 1 } else { 4 });
+        let mut envelope =
+            serde_json::Map::with_capacity(if keyed || force_nested { 1 } else { 4 });
         if keyed || force_nested {
             let mut nested = serde_json::Map::with_capacity(3);
             nested.insert("codec_id".to_string(), Value::from(codec_id));
@@ -2801,7 +2802,9 @@ mod tests {
             "escaped via the identity codec, since no real codec is configured: {stored}"
         );
 
-        let read_back = codecs.decode_payload(&stored).expect("decode must not error");
+        let read_back = codecs
+            .decode_payload(&stored)
+            .expect("decode must not error");
         assert_eq!(
             read_back, business_data,
             "the original business value round-trips byte-identical, never garbled or rejected \
@@ -2821,7 +2824,10 @@ mod tests {
                 "data": "whatever a caller might legitimately name these fields",
             }
         });
-        assert!(is_codec_envelope(&business_data), "sanity: this IS envelope-shaped");
+        assert!(
+            is_codec_envelope(&business_data),
+            "sanity: this IS envelope-shaped"
+        );
 
         let codecs = PayloadCodecs::default();
         let stored = codecs
@@ -2832,7 +2838,9 @@ mod tests {
             "must be escaped one level deeper, not stored as-is: {stored}"
         );
 
-        let read_back = codecs.decode_payload(&stored).expect("decode must not error");
+        let read_back = codecs
+            .decode_payload(&stored)
+            .expect("decode must not error");
         assert_eq!(read_back, business_data);
     }
 
