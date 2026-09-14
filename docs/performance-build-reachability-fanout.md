@@ -105,6 +105,23 @@ catalog but absent from a given map defaults to zero for that map's
 counters, matching the old per-build query's `COUNT(*) = 0` behavior on a
 build with no matching rows in that table.
 
+**Snapshot consistency (post-review fix).** The four queries run inside one
+`REPEATABLE READ`, `READ ONLY` transaction (`conn.build_transaction()`),
+not as four autocommit statements. Under `READ COMMITTED`, each statement
+takes its own snapshot: a task could move from `PENDING` to claimed between
+the open-executions read and the pending-tasks read, so the execution query
+runs too early to see the new execution and the task query runs too late
+to still see it pending. The merge would then count that build in neither
+column and report `safe_to_retire: true` for a build with a live, running
+execution. `build_reachability` never had this gap — its four counters come
+from one `SELECT` with four correlated subqueries, which Postgres evaluates
+against a single snapshot. `REPEATABLE READ` restores that same
+single-snapshot guarantee across the four separate statements, at the cost
+of one `BEGIN`/`COMMIT` round trip; `BEGIN`/`COMMIT` do not reference
+`build_id` and so do not appear in the `pg_stat_statements` filter above,
+and the measured buffer/call counts are unchanged with the transaction in
+place (confirmed by re-running the evidence capture after adding it).
+
 ## 📏 Measurement
 
 `before.result-rows.txt` and `after.result-rows.txt` list every one of the

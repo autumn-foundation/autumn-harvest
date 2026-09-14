@@ -789,40 +789,70 @@ pub async fn all_build_reachability(
         stale_workers: i64,
     }
 
-    // Reference build-id catalog: fixes output order and covers a build that
-    // appears in one source table but not the other two.
-    let id_rows: Vec<IdRow> = diesel::sql_query(all_build_ids_query())
-        .load(conn)
-        .await
-        .map_err(database_error)?;
-
-    let open_executions: HashMap<String, i64> =
-        diesel::sql_query(all_build_open_executions_query())
-            .load::<CountRow>(conn)
-            .await
-            .map_err(database_error)?
-            .into_iter()
-            .map(|r| (r.build_id, r.n))
-            .collect();
-
-    let pending_tasks: HashMap<String, i64> = diesel::sql_query(all_build_pending_tasks_query())
-        .load::<CountRow>(conn)
-        .await
-        .map_err(database_error)?
-        .into_iter()
-        .map(|r| (r.build_id, r.n))
-        .collect();
+    type ReachabilityQueryResults = (
+        Vec<IdRow>,
+        HashMap<String, i64>,
+        HashMap<String, i64>,
+        HashMap<String, (i64, i64)>,
+    );
 
     let threshold_secs = i64::try_from(stale_threshold.as_secs()).unwrap_or(i64::MAX);
-    let worker_counts: HashMap<String, (i64, i64)> =
-        diesel::sql_query(all_build_worker_counts_query())
-            .bind::<diesel::sql_types::BigInt, _>(threshold_secs)
-            .load::<WorkerCountRow>(conn)
-            .await
-            .map_err(database_error)?
-            .into_iter()
-            .map(|r| (r.build_id, (r.active_workers, r.stale_workers)))
-            .collect();
+
+    // The four queries below must read one consistent point in time.
+    // Under `READ COMMITTED`, each takes its own snapshot. A task could
+    // then move from `PENDING` to claimed between the open-executions and
+    // pending-tasks reads. The execution query runs too early to see the
+    // new execution. The task query runs too late to still see it
+    // pending. The merge then counts the build in neither column and
+    // reports `safe_to_retire: true` for a build that still has live
+    // work. `build_reachability`, the per-build helper this function
+    // replaces the *loop* over, avoided this. It folded all four counters
+    // into one `SELECT`, which PostgreSQL evaluates against a single
+    // snapshot. `REPEATABLE READ` restores that guarantee here. Every
+    // statement in the transaction shares the snapshot taken at its first
+    // query. The four grouped passes then observe one instant, the same
+    // way one multi-subquery `SELECT` did.
+    let (id_rows, open_executions, pending_tasks, worker_counts): ReachabilityQueryResults = conn
+        .build_transaction()
+        .repeatable_read()
+        .read_only()
+        .run(async |conn| -> HarvestResult<_> {
+            let id_rows: Vec<IdRow> = diesel::sql_query(all_build_ids_query())
+                .load(conn)
+                .await
+                .map_err(database_error)?;
+
+            let open_executions: HashMap<String, i64> =
+                diesel::sql_query(all_build_open_executions_query())
+                    .load::<CountRow>(conn)
+                    .await
+                    .map_err(database_error)?
+                    .into_iter()
+                    .map(|r| (r.build_id, r.n))
+                    .collect();
+
+            let pending_tasks: HashMap<String, i64> =
+                diesel::sql_query(all_build_pending_tasks_query())
+                    .load::<CountRow>(conn)
+                    .await
+                    .map_err(database_error)?
+                    .into_iter()
+                    .map(|r| (r.build_id, r.n))
+                    .collect();
+
+            let worker_counts: HashMap<String, (i64, i64)> =
+                diesel::sql_query(all_build_worker_counts_query())
+                    .bind::<diesel::sql_types::BigInt, _>(threshold_secs)
+                    .load::<WorkerCountRow>(conn)
+                    .await
+                    .map_err(database_error)?
+                    .into_iter()
+                    .map(|r| (r.build_id, (r.active_workers, r.stale_workers)))
+                    .collect();
+
+            Ok((id_rows, open_executions, pending_tasks, worker_counts))
+        })
+        .await?;
 
     Ok(id_rows
         .into_iter()
