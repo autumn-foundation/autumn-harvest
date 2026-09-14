@@ -1797,7 +1797,27 @@ pub async fn constraint_backed_unique_indexes_on_partitioned_parent(
                 -- matches a whole quoted identifier, doubled internal
                 -- quotes included, or a whole run of non-quote
                 -- non-space characters.
+                --
+                -- Review finding: this branch never checked that the
+                -- candidate leaf index itself carries no constraint.
+                -- An operator can add a real `UNIQUE` constraint
+                -- directly to `{LEGACY_PARTITION}`. Its backing index
+                -- can coincidentally share its shape with a plain
+                -- index harvest already replayed onto the parent for
+                -- an unrelated reason. That coincidence is not the
+                -- rename residual this branch exists to recognize.
+                -- The candidate is a real constraint the operator
+                -- still wants, and exempting it here means
+                -- `capture_index_defs` -- which only ever replays
+                -- plain indexes -- drops both the index and the
+                -- constraint behind it when the legacy partition is
+                -- later dropped. `NOT EXISTS (pg_constraint)` limits
+                -- this branch to genuinely constraint-free candidates,
+                -- the only shape a rename residual can ever have.
                 c.relname = '{LEGACY_PARTITION}'
+                AND NOT EXISTS (
+                    SELECT 1 FROM pg_constraint con2 WHERE con2.conindid = i.indexrelid
+                )
                 AND EXISTS (
                     SELECT 1
                       FROM pg_index i2

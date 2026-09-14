@@ -2277,6 +2277,96 @@ async fn a_reserved_constraint_with_an_include_column_still_refuses_conversion()
 }
 
 #[tokio::test]
+async fn a_leaf_constraint_coincidentally_matching_a_parent_index_still_refuses_the_revert() {
+    // Review finding: `enable`'s rename-to-free-a-name step leaves a
+    // harmless remnant behind: a plain leaf index whose shape survives
+    // on the parent too. The residual-shape exemption recognizes that
+    // case, but it never checked that the leaf candidate itself carries no
+    // constraint. An operator can add a real `UNIQUE` constraint
+    // directly to the (already-partitioned) legacy table. Its backing
+    // index can coincidentally share its shape with an unrelated plain
+    // index harvest replayed onto the parent. That coincidence is not
+    // the rename residual this exemption exists to recognize. The
+    // candidate is a real constraint the operator still wants.
+    // `capture_index_defs` only ever replays plain indexes. Exempting
+    // it here means both the index and the constraint behind it
+    // vanish, unreplayed, when the reverted flat table's `DROP
+    // TABLE ... CASCADE` removes the legacy partition.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(
+        &mut conn,
+        "leaf_constraint_coincidence_wf",
+        "leaf-constraint-coincidence-1",
+        Utc::now(),
+        None,
+    )
+    .await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // An operator's own constraint, added directly to the legacy table
+    // after conversion -- not caught by any preflight, since it never
+    // touches the still-partitioned parent.
+    diesel::sql_query(
+        "ALTER TABLE harvest_events_legacy \
+         ADD CONSTRAINT leaf_operator_uniq UNIQUE (event_type, cohort)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator constraint directly on the legacy table");
+    // A coincidentally shape-identical PLAIN index on the parent.
+    // `ON ONLY` keeps it local to the parent. It neither recurses to
+    // nor auto-links with the leaf constraint's own index. The two
+    // must stay structurally independent, so this isolates the
+    // exemption clause under test, not `ATTACH PARTITION`'s own
+    // structural auto-linking.
+    diesel::sql_query(
+        "CREATE UNIQUE INDEX leaf_operator_uniq_shape_twin \
+         ON ONLY harvest_events (event_type, cohort)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a coincidentally shape-identical plain parent index");
+
+    let err = partition::disable_partitioning(&mut conn).await.expect_err(
+        "an operator's own leaf constraint must refuse the revert even when its \
+         backing index coincidentally matches an unrelated plain parent index",
+    );
+    assert!(
+        err.to_string().contains("leaf_operator_uniq"),
+        "the refusal must name the operator's constraint-backed index: {err}"
+    );
+
+    // Clear both scratch objects and finish the revert, so later tests
+    // see the ordinary flat-table shape `reset_to_unpartitioned` expects.
+    diesel::sql_query("DROP INDEX leaf_operator_uniq_shape_twin")
+        .execute(&mut conn)
+        .await
+        .expect("drop the parent-side shape twin");
+    diesel::sql_query("ALTER TABLE harvest_events_legacy DROP CONSTRAINT leaf_operator_uniq")
+        .execute(&mut conn)
+        .await
+        .expect("drop the operator's own leaf constraint");
+    partition::disable_partitioning(&mut conn)
+        .await
+        .expect("revert now that both scratch objects are gone")
+        .expect("the shard was partitioned");
+}
+
+#[tokio::test]
 async fn a_dependent_materialized_view_refuses_the_conversion_too() {
     // Review finding on item 14: Postgres records a materialized view's
     // dependency the same way as an ordinary view, by relation OID
