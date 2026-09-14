@@ -5019,13 +5019,52 @@ async fn partition_maintenance_stays_none_on_a_shard_that_never_converted() {
 }
 
 #[tokio::test]
+async fn maintenance_outcome_reports_whether_the_shard_was_partitioned() {
+    // Review finding: the retention loop used to probe the layout with
+    // its own separate catalog query before calling `maintain`. It then
+    // reported that earlier probe's result to the monitor. A concurrent
+    // `enable_partitioning`/`disable_partitioning` landing between the
+    // two probes could make them disagree — see the review finding on
+    // `run_partition_maintenance_pass` at its call site. The fix reads
+    // the layout only once, inside `maintain` itself. The caller then
+    // reports THAT probe's result via this field, so the two can never
+    // disagree. This test pins the field's accuracy directly, since
+    // `run_partition_maintenance_pass` now depends on it entirely.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let outcome = partition::maintain(&mut conn, Utc::now(), 0, &SweepOptions::default(), None)
+        .await
+        .expect("maintain is a safe no-op on an unpartitioned shard");
+    assert!(
+        !outcome.partitioned,
+        "an unpartitioned shard must report partitioned: false; got {outcome:?}"
+    );
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    let outcome = partition::maintain(&mut conn, Utc::now(), 0, &SweepOptions::default(), None)
+        .await
+        .expect("maintain on a partitioned shard");
+    assert!(
+        outcome.partitioned,
+        "a partitioned shard must report partitioned: true, even on an \
+         otherwise-empty pass; got {outcome:?}"
+    );
+}
+
+#[tokio::test]
 async fn partition_maintenance_reports_failed_when_the_layout_probe_errors() {
-    // Test-coverage review finding on item 6: the layout probe before
-    // `maintain` has three outcomes -- Unpartitioned (continue, stay
-    // None), Partitioned (run maintain), and Err. Only the first two were
-    // exercised by a prior test. An Err must report
-    // `MaintenanceOutcome::failed`, not silently collapse into looking
-    // like a shard that never converted.
+    // Test-coverage review finding on item 6: `maintain`'s own internal
+    // layout probe has three outcomes. Unpartitioned (stamped empty
+    // outcome, `partitioned: false`), Partitioned (run maintain), and
+    // Err (propagated to the caller). Only the first two were exercised
+    // by a prior test. An Err must report `MaintenanceOutcome::failed`,
+    // not silently collapse into looking like a shard that never
+    // converted.
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;

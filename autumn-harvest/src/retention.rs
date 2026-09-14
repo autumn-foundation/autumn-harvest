@@ -1213,41 +1213,20 @@ async fn run_partition_maintenance_pass(
                 }
             },
         };
-        // Probed before `maintain` runs it, so an unpartitioned shard can
-        // be told apart from one that ran and did nothing (issue #1270
-        // item 6). `maintain` itself is gated the same way, and returns a
-        // stamped, empty outcome for an unpartitioned shard. That is
-        // right for a manual `harvest partition maintain`, but wrong
-        // here: `RetentionTickResult.partition_maintenance` is documented
-        // as `None` on a shard that never opted in. Recording `Some(...)`
-        // for it every call would say maintenance is active where it
-        // never converted.
-        match crate::partition::detect_layout(&mut conn).await {
-            Ok(crate::partition::EventLayout::Unpartitioned) => {
-                // A shard that reverted via `harvest partition disable`
-                // must not keep showing its last outcome from before the
-                // revert. Its resume cursor goes with it. A later
-                // `enable` starts a fresh partition set at fresh cohort
-                // instants, all later than anything this stale cursor
-                // could name.
-                monitor_task.clear_partitions(shard);
-                resume_cursors.remove(&shard);
-                continue;
-            }
-            Ok(crate::partition::EventLayout::Partitioned { .. }) => {}
-            Err(error) => {
-                tracing::warn!(
-                    shard = %shard,
-                    error = %error,
-                    "harvest event-partition maintenance could not detect the shard's layout"
-                );
-                monitor_task.update_partitions(
-                    shard,
-                    crate::partition::MaintenanceOutcome::failed(error.to_string()),
-                );
-                continue;
-            }
-        }
+        // Review finding: a standalone probe used to run here, before
+        // calling `maintain` below. That told an unpartitioned shard
+        // apart from one that ran and did nothing (issue #1270 item 6).
+        // It worked, but raced `maintain`'s OWN internal probe. A
+        // `disable_partitioning` (or `enable_partitioning`) commit
+        // landing between the two could make them disagree. This loop
+        // then reported whichever one ran here, not the one the
+        // maintenance pass below actually acted on. `outcome.partitioned`
+        // is sourced from `maintain`'s own probe, the one that actually
+        // gates its work, so branching on it below cannot disagree with
+        // what just ran. `maintain` is unconditionally safe to call on
+        // an unpartitioned shard: one cheap catalog query, nothing
+        // else. Removing this separate probe costs nothing.
+        //
         // Review finding: a fixed oldest-first sweep, restarted from
         // scratch every tick, cannot converge past a permanently blocked
         // oldest run of partitions — see
@@ -1294,6 +1273,18 @@ async fn run_partition_maintenance_pass(
         )
         .await
         {
+            Ok(outcome) if !outcome.partitioned => {
+                // `outcome.partitioned` comes from `maintain`'s own
+                // probe, the same one that gated its (empty) pass below
+                // -- see the review finding above. A shard that reverted
+                // via `harvest partition disable` (or never converted)
+                // must not keep showing its last outcome from before
+                // that. Its resume cursor goes with it. A later `enable`
+                // starts a fresh partition set at fresh cohort instants,
+                // all later than anything this stale cursor could name.
+                monitor_task.clear_partitions(shard);
+                resume_cursors.remove(&shard);
+            }
             Ok(outcome) => {
                 // `blocked` is in the condition deliberately. The
                 // steady-state failure — nothing created (the window is

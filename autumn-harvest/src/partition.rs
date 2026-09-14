@@ -5068,6 +5068,7 @@ async fn maintain_inner(
     };
     Ok(MaintenanceOutcome {
         at: Some(Utc::now()),
+        partitioned: true,
         created,
         lookahead_blocked,
         drained,
@@ -5088,6 +5089,21 @@ pub struct MaintenanceOutcome {
     /// different instants — and an operator diagnosing "why is space not coming
     /// back?" needs to know which one they are looking at.
     pub at: Option<DateTime<Utc>>,
+    /// Whether the shard was on the partitioned layout, per this pass's own
+    /// probe -- the same probe that gates every step below.
+    ///
+    /// Review finding: a caller that probes the layout separately before
+    /// calling [`maintain`] or [`maintain_with_progress`] can race a
+    /// concurrent `enable`/`disable_partitioning`. That race lands
+    /// between the caller's own probe and this call's internal one.
+    /// Basing a report on that earlier, separate probe can then
+    /// disagree with what this pass actually observed and acted on.
+    /// This field lets a caller derive its report from the exact probe
+    /// that gated the work, so the two can never disagree. `true` only
+    /// on the return after the probe below finds the shard partitioned.
+    /// `false` on the unpartitioned early return, and on
+    /// [`Self::failed`], which never gets far enough to probe at all.
+    pub partitioned: bool,
     /// Cohort partitions created to extend the lookahead window.
     pub created: Vec<String>,
     /// Cohorts in the lookahead window that could NOT be created this pass.
