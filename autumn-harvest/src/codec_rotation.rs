@@ -434,6 +434,8 @@ mod db {
         completed_at: Option<DateTime<Utc>>,
         #[diesel(sql_type = Timestamptz)]
         updated_at: DateTime<Utc>,
+        #[diesel(sql_type = Nullable<Timestamptz>)]
+        next_revalidation_at: Option<DateTime<Utc>>,
     }
 
     #[derive(diesel::QueryableByName)]
@@ -463,8 +465,17 @@ mod db {
         /// everything it saw — "this key is safe to gate on", not merely "the
         /// scan ran off the end".
         pub completed_at: Option<DateTime<Utc>>,
-        /// Last time the cursor advanced.
+        /// Last time this row was written (issue #1258). Cursor liveness, for
+        /// an operator to read — NOT the revalidation deadline. An ordinary
+        /// advancing write updates this on every batch, including on a
+        /// converged shard that is still busy.
         pub updated_at: DateTime<Utc>,
+        /// Deadline for the next re-census of a completed pass (issue #1258).
+        /// `None` while a pass has not completed. Armed when a pass first
+        /// completes. Rearmed only by the claim that wins each interval —
+        /// never by an ordinary advancing write. So busy traffic on a
+        /// converged shard cannot starve revalidation.
+        pub next_revalidation_at: Option<DateTime<Utc>>,
     }
 
     /// One shard's answer to "how far along is the rotation?" (issue #948, AC7).
@@ -647,7 +658,7 @@ mod db {
     ) -> HarvestResult<Option<CodecRotationCursor>> {
         let rows: Vec<CursorRow> = diesel::sql_query(
             "SELECT active_key_id, last_event_id, rows_reencrypted, unresolved_rows, \
-                    completed_at, updated_at \
+                    completed_at, updated_at, next_revalidation_at \
              FROM harvest_codec_rotation_cursor WHERE shard_id = $1",
         )
         .bind::<Integer, _>(shard_id)
@@ -661,6 +672,7 @@ mod db {
             unresolved_rows: row.unresolved_rows,
             completed_at: row.completed_at,
             updated_at: row.updated_at,
+            next_revalidation_at: row.next_revalidation_at,
         }))
     }
 
@@ -860,8 +872,14 @@ mod db {
         // nothing past the cursor. Censusing on that condition alone would run
         // a full scan of `harvest_events` per shard per tick, forever, at the
         // scanner's interval (500 ms by default). So an already-complete cursor
-        // re-confirms itself on a slow clock instead, using its own
-        // `updated_at` as the timer.
+        // re-confirms itself on a slow clock instead: `next_revalidation_at`
+        // (issue #1258).
+        //
+        // That column is its own timer, separate from `updated_at`. An
+        // ordinary advancing write on a busy converged shard bumps
+        // `updated_at` every tick. It must not also push the revalidation
+        // deadline out every tick, or a shard that never idles never
+        // revalidates.
         //
         // The clock has to be the stored one, not an in-process one: several
         // workers sweep the same shard, and a DB-side timestamp makes the
@@ -936,10 +954,10 @@ mod db {
         // while doing no work, which is exactly backwards for an operator
         // watching it.
         //
-        // A revalidation tick needs no exception here: the claim statement has
-        // already bumped `updated_at`, so a clean re-census writes nothing and
-        // a dirty one falls through this guard anyway, its reset changing the
-        // fields below.
+        // A revalidation tick needs no exception here. The claim statement
+        // has already bumped `next_revalidation_at`, so a clean re-census
+        // writes nothing. A dirty one falls through this guard anyway, its
+        // reset changing the fields below.
         let cursor_unchanged = batch_len == 0
             && resumed.is_some_and(|cursor| {
                 cursor.completed_at.is_some()
@@ -1049,37 +1067,63 @@ mod db {
     ///
     /// Returns `true` for the ONE caller that wins the interval.
     ///
-    /// Two properties, both of which a read-then-decide check gets wrong:
+    /// Claims and rearms `next_revalidation_at` (issue #1258). This column is
+    /// dedicated to the deadline, separate from `updated_at`.
     ///
-    /// - **The comparison happens on the database clock.** `updated_at` is
-    ///   written with `NOW()`, so testing it against the worker's `Utc::now()`
-    ///   measures host clock skew as much as elapsed time: a worker running
-    ///   five minutes fast finds the cursor due immediately after every
-    ///   refresh and censuses on every tick, which is precisely the per-tick
-    ///   full scan the throttle exists to stop. A worker running slow silently
-    ///   stretches the recovery window instead. `NOW()` on both sides of the
-    ///   predicate removes the host clock from the question entirely.
+    /// Deadline and last-write time used to be the same column. An ordinary
+    /// advancing write on a busy converged shard bumped it every tick. So the
+    /// deadline never came due on a shard that never went idle. See the
+    /// field's doc on [`CodecRotationCursor::next_revalidation_at`].
     ///
-    /// - **The claim and the bump are one statement.** Several replicas run a
-    ///   timeout checker over the same shard. Reading the timestamp, deciding,
-    ///   then censusing, then writing, lets every replica pass the check before
-    ///   any of them writes -- so a large shard takes one simultaneous
-    ///   sequential scan *per replica* every interval, which is worse than the
-    ///   unthrottled single-worker case this was meant to fix. `UPDATE ...
-    ///   WHERE updated_at < deadline RETURNING` makes exactly one replica win,
-    ///   because the row lock serialises them and the loser's predicate no
-    ///   longer holds.
+    /// This statement also refreshes `updated_at`. On an idle shard whose
+    /// deadline just came due, this claim is the only write the tick makes.
+    /// [`sweep_codec_reencryption_once`]'s churn guard skips [`write_cursor`]
+    /// entirely when nothing else changed. `updated_at` must still record
+    /// that write, or a healthy, periodically-revalidating idle shard would
+    /// read as stale forever. Safe to bump here now: `updated_at` no longer
+    /// gates any throttle, so this cannot reopen the starvation this column
+    /// split fixes.
     ///
-    /// Bumping `updated_at` before the census rather than after is deliberate:
-    /// the interval is a rate limit on an expensive scan, not a lease on
-    /// completing it. A crash mid-census costs one skipped revalidation, which
-    /// the next interval picks up.
+    /// Two more properties, both of which a read-then-decide check gets wrong:
+    ///
+    /// - **The comparison happens on the database clock.** The deadline is
+    ///   written with `NOW()`. Testing it against the worker's `Utc::now()`
+    ///   would measure host clock skew as much as elapsed time. A worker
+    ///   running five minutes fast would find the cursor due right after
+    ///   every refresh, and census on every tick. That is precisely the
+    ///   per-tick full scan the throttle exists to stop. A worker running
+    ///   slow would silently stretch the recovery window instead. `NOW()` on
+    ///   both sides of the predicate removes the host clock from the
+    ///   question entirely.
+    ///
+    /// - **The claim and the rearm are one statement.** Several replicas run
+    ///   a timeout checker over the same shard. Reading the deadline,
+    ///   deciding, then censusing, then writing would let every replica pass
+    ///   the check before any of them writes. A large shard would then take
+    ///   one simultaneous sequential scan *per replica* every interval. That
+    ///   is worse than the unthrottled single-worker case this was meant to
+    ///   fix. `UPDATE ... WHERE next_revalidation_at <= NOW() RETURNING`
+    ///   makes exactly one replica win. The row lock serialises them, so the
+    ///   loser's predicate no longer holds.
+    ///
+    /// Rearming the deadline before the census, not after, is deliberate. The
+    /// interval is a rate limit on an expensive scan, not a lease on
+    /// completing it. A crash mid-census costs one skipped revalidation,
+    /// which the next interval picks up.
+    ///
+    /// A `NULL` deadline on an already-completed cursor claims immediately,
+    /// rather than staying stuck forever. This should not occur in the
+    /// steady state: [`write_cursor`] always arms a deadline when a pass
+    /// completes. But a row predating issue #1258's migration is backfilled
+    /// to `NOW()`, so this is belt-and-suspenders, not the primary path.
+    /// Any future gap must resolve toward re-checking, never toward silently
+    /// skipping the check forever.
     ///
     /// ## Fencing (issue #954, issue #1257)
     ///
     /// Fenced the same way as [`write_cursor`]. Claiming the interval writes
-    /// `updated_at`, so a worker pinned to a superseded generation must not
-    /// be the one who wins the claim.
+    /// `next_revalidation_at`. A worker pinned to a superseded generation
+    /// must not be the one who wins the claim.
     async fn claim_completed_cursor_revalidation(
         conn: &mut AsyncPgConnection,
         shard: crate::types::ShardId,
@@ -1104,10 +1148,11 @@ mod db {
     ) -> HarvestResult<bool> {
         let claimed = diesel::sql_query(
             "UPDATE harvest_codec_rotation_cursor \
-                SET updated_at = NOW() \
+                SET next_revalidation_at = NOW() + make_interval(secs => $2), \
+                    updated_at = NOW() \
               WHERE shard_id = $1 \
                 AND completed_at IS NOT NULL \
-                AND updated_at < NOW() - make_interval(secs => $2)",
+                AND (next_revalidation_at IS NULL OR next_revalidation_at <= NOW())",
         )
         .bind::<Integer, _>(shard_id)
         .bind::<diesel::sql_types::Double, _>(super::COMPLETED_CURSOR_REVALIDATION_SECS)
@@ -1149,6 +1194,21 @@ mod db {
     ///   higher stored `last_event_id`. It still needs `rows_reencrypted`
     ///   to pass its own check, or a stale rewind could drop rows from the
     ///   count it carries forward.
+    ///
+    /// ## `next_revalidation_at` moves only on a real state change (issue #1258)
+    ///
+    /// `completed_at` transitioning `NULL` → some value arms the deadline.
+    /// Transitioning to `NULL` clears it. Neither value changing — an
+    /// ordinary write that advances `last_event_id` over a pass that stays
+    /// complete — leaves the stored deadline untouched. A busy shard that
+    /// keeps this pass complete on every tick still reaches its deadline on
+    /// schedule. See [`claim_completed_cursor_revalidation`], the only other
+    /// writer of this column.
+    ///
+    /// A different `active_key_id` always arms a fresh deadline, even when
+    /// both the old and new `completed_at` are set. Those two `completed_at`
+    /// values belong to different passes, so the old row's deadline is not
+    /// this pass's deadline to inherit.
     ///
     /// ## Fencing (issue #954, issue #1257)
     ///
@@ -1223,15 +1283,26 @@ mod db {
         let applied = diesel::sql_query(
             "INSERT INTO harvest_codec_rotation_cursor \
                  (shard_id, active_key_id, last_event_id, rows_reencrypted, unresolved_rows, \
-                  completed_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, NOW()) \
+                  completed_at, updated_at, next_revalidation_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), \
+                     CASE WHEN $6 IS NOT NULL \
+                          THEN NOW() + make_interval(secs => $7) \
+                          ELSE NULL END) \
              ON CONFLICT (shard_id) DO UPDATE SET \
                  active_key_id = EXCLUDED.active_key_id, \
                  last_event_id = EXCLUDED.last_event_id, \
                  rows_reencrypted = EXCLUDED.rows_reencrypted, \
                  unresolved_rows = EXCLUDED.unresolved_rows, \
                  completed_at = EXCLUDED.completed_at, \
-                 updated_at = NOW() \
+                 updated_at = NOW(), \
+                 next_revalidation_at = CASE \
+                     WHEN EXCLUDED.completed_at IS NULL THEN NULL \
+                     WHEN harvest_codec_rotation_cursor.completed_at IS NULL \
+                       OR harvest_codec_rotation_cursor.active_key_id \
+                          <> EXCLUDED.active_key_id \
+                         THEN NOW() + make_interval(secs => $7) \
+                     ELSE harvest_codec_rotation_cursor.next_revalidation_at \
+                 END \
              WHERE harvest_codec_rotation_cursor.active_key_id <> EXCLUDED.active_key_id \
                 OR ( \
                      (EXCLUDED.last_event_id = 0 \
@@ -1246,6 +1317,7 @@ mod db {
         .bind::<BigInt, _>(rows_reencrypted)
         .bind::<BigInt, _>(unresolved_rows)
         .bind::<Nullable<Timestamptz>, _>(completed_at)
+        .bind::<Double, _>(super::COMPLETED_CURSOR_REVALIDATION_SECS)
         .execute(conn)
         .await
         .map_err(database_error)?;
