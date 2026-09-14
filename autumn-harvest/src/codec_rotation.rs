@@ -1075,6 +1075,15 @@ mod db {
     /// deadline never came due on a shard that never went idle. See the
     /// field's doc on [`CodecRotationCursor::next_revalidation_at`].
     ///
+    /// This statement also refreshes `updated_at`. On an idle shard whose
+    /// deadline just came due, this claim is the only write the tick makes.
+    /// [`sweep_codec_reencryption_once`]'s churn guard skips [`write_cursor`]
+    /// entirely when nothing else changed. `updated_at` must still record
+    /// that write, or a healthy, periodically-revalidating idle shard would
+    /// read as stale forever. Safe to bump here now: `updated_at` no longer
+    /// gates any throttle, so this cannot reopen the starvation this column
+    /// split fixes.
+    ///
     /// Two more properties, both of which a read-then-decide check gets wrong:
     ///
     /// - **The comparison happens on the database clock.** The deadline is
@@ -1139,7 +1148,8 @@ mod db {
     ) -> HarvestResult<bool> {
         let claimed = diesel::sql_query(
             "UPDATE harvest_codec_rotation_cursor \
-                SET next_revalidation_at = NOW() + make_interval(secs => $2) \
+                SET next_revalidation_at = NOW() + make_interval(secs => $2), \
+                    updated_at = NOW() \
               WHERE shard_id = $1 \
                 AND completed_at IS NOT NULL \
                 AND (next_revalidation_at IS NULL OR next_revalidation_at <= NOW())",

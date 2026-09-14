@@ -46,8 +46,9 @@
 //! - **Issue #1258** (the revalidation deadline is its own column, not
 //!   `updated_at`) —
 //!   [`an_ordinary_advancing_write_does_not_reset_the_revalidation_deadline`],
-//!   [`a_busy_shard_still_revalidates_once_the_deadline_is_due`], and
-//!   [`a_fresh_pass_under_a_different_key_arms_its_own_deadline`].
+//!   [`a_busy_shard_still_revalidates_once_the_deadline_is_due`],
+//!   [`a_fresh_pass_under_a_different_key_arms_its_own_deadline`], and
+//!   [`a_claimed_idle_revalidation_still_bumps_updated_at`] (Codex review).
 //!
 //! # Issue #1244: the two structural fleet-wide preconditions
 //!
@@ -3387,5 +3388,75 @@ async fn a_fresh_pass_under_a_different_key_arms_its_own_deadline() {
         deadline > Utc::now(),
         "a fresh pass under a different key must arm its own deadline, not \
          inherit the previous key's stale one; got {deadline:?}"
+    );
+}
+
+/// A claimed revalidation on an idle shard must still refresh `updated_at`.
+///
+/// The churn guard skips [`write_cursor`] whenever a tick changes nothing
+/// the cursor tracks. On an idle, fully-converged shard whose deadline just
+/// came due, the claim is the ONLY write that tick makes. If the claim did
+/// not also touch `updated_at`, a healthy shard that is periodically
+/// re-censused would still read as though its cursor had never been
+/// written since the original pass completed.
+#[tokio::test]
+async fn a_claimed_idle_revalidation_still_bumps_updated_at() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "idle_claim_updated_at").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+
+    codecs.set_active_key("k2").expect("flip");
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("first pass");
+    let first = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .cursor
+        .expect("cursor written");
+    assert!(
+        first.completed_at.is_some(),
+        "the pass must converge, or this test does not exercise the hazard"
+    );
+
+    // Simulate the interval elapsing, with no traffic at all in between.
+    diesel::sql_query(
+        "UPDATE harvest_codec_rotation_cursor \
+         SET next_revalidation_at = now() - interval '1 minute' WHERE shard_id = 0",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("age the deadline");
+
+    // Idle tick: no new rows, so the batch is empty and the churn guard
+    // would skip `write_cursor` entirely if the claim did not fire.
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("idle tick at the due deadline");
+
+    let second = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .cursor
+        .expect("cursor still there");
+    assert!(
+        second.next_revalidation_at > first.next_revalidation_at,
+        "the deadline must have been claimed and rearmed"
+    );
+    assert!(
+        second.updated_at > first.updated_at,
+        "the claim is the only write this idle tick makes, so it must be \
+         the one that keeps updated_at from reading as stale forever on a \
+         healthy, periodically-revalidated shard"
     );
 }
