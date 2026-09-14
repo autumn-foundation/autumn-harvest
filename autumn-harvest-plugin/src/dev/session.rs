@@ -129,6 +129,29 @@ pub enum SkipReason {
     OwnedByThisProcess,
     /// Another live process owns it — a concurrent `cargo dev`.
     OwnerAlive,
+    /// A pid is recorded and alive, but its identity cannot be proven.
+    ///
+    /// The record has no start token, or the platform cannot supply one.
+    /// Issue #1295: unknown identity is not a match, so the reaper does not
+    /// signal the pid or delete the directory.
+    PostmasterIdentityUnknown,
+}
+
+/// Identity of the process at a recorded postmaster pid.
+///
+/// Pids are reused. A live pid alone does not prove identity. The window
+/// between a `SIGKILL`ed run and the next `cargo dev` is exactly where reuse
+/// happens. Issue #1295: `Unknown` must never be treated as a match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostmasterIdentity {
+    /// The pid is alive and its start token matches the record.
+    Confirmed,
+    /// The pid is not alive, or its start token does not match the record.
+    /// The recorded postmaster is gone either way.
+    NotRunning,
+    /// The pid is alive, but identity cannot be proven. The record has no
+    /// start token, or the platform cannot supply one.
+    Unknown,
 }
 
 /// Whether a session record describes a directory we are willing to act on.
@@ -144,13 +167,19 @@ pub fn record_is_self_consistent(record: &SessionRecord, session_dir: &Path) -> 
 
 /// Decide what to do with one session record.
 ///
-/// Pure: liveness is supplied by the caller so the whole table can be tested
-/// without processes.
+/// Pure: liveness and identity are supplied by the caller so the whole table
+/// can be tested without processes.
+///
+/// `postmaster` decides between three outcomes, not two. `Confirmed` reaps
+/// through `StopThenRemove`. `NotRunning` removes the directory with no
+/// signal — nothing is there to signal. `Unknown` skips reaping. The pid is
+/// alive, but identity is unproven, so neither stopping it nor deleting its
+/// directory is safe (issue #1295).
 #[must_use]
 pub const fn decide_reap(
     record: &SessionRecord,
     owner_alive: bool,
-    postmaster_alive: bool,
+    postmaster: PostmasterIdentity,
     self_pid: u32,
 ) -> ReapDecision {
     // Liveness first, and `owner_alive` is an *identity* answer: the caller
@@ -169,8 +198,13 @@ pub const fn decide_reap(
             ReapDecision::Skip(SkipReason::OwnerAlive)
         };
     }
-    match record.postmaster_pid {
-        Some(postmaster_pid) if postmaster_alive => ReapDecision::StopThenRemove { postmaster_pid },
+    match (record.postmaster_pid, postmaster) {
+        (Some(postmaster_pid), PostmasterIdentity::Confirmed) => {
+            ReapDecision::StopThenRemove { postmaster_pid }
+        }
+        (Some(_), PostmasterIdentity::Unknown) => {
+            ReapDecision::Skip(SkipReason::PostmasterIdentityUnknown)
+        }
         _ => ReapDecision::Remove,
     }
 }

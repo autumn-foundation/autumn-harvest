@@ -25,7 +25,9 @@
 //!    this layout puts inside the session directory; a record pointing elsewhere
 //!    is corrupt or planted and is left alone.
 //! 3. **A pid is not an identity.** The recorded postmaster start time must
-//!    still match, so a reused pid is never mistaken for the process we started.
+//!    still match, so a reused pid is never mistaken for the process we
+//!    started. A record with no start time is *unknown*, not a match — a
+//!    live pid there is left alone rather than reaped (issue #1295).
 //! 4. **No blind kill.** A cluster we could not stop through `pg_ctl` is left
 //!    running *and* its directory is left in place, because deleting the data
 //!    directory out from under a live postmaster is worse than leaking it.
@@ -34,8 +36,9 @@ use std::path::{Path, PathBuf};
 
 use super::discovery::PostgresBinaries;
 use super::session::{
-    ReapDecision, SESSION_RECORD_FILE, SESSION_ROOT_PREFIX, SessionRecord, decide_reap,
-    effective_postmaster_pid, is_session_dir, parse_postmaster_pid, record_is_self_consistent,
+    PostmasterIdentity, ReapDecision, SESSION_RECORD_FILE, SESSION_ROOT_PREFIX, SessionRecord,
+    SkipReason, decide_reap, effective_postmaster_pid, is_session_dir, parse_postmaster_pid,
+    record_is_self_consistent,
 };
 use super::{DevError, postgres};
 
@@ -354,15 +357,25 @@ pub fn reap_stale_sessions(root: &Path) -> Result<usize, std::io::Error> {
         }
         record.postmaster_pid = effective_postmaster_pid(&record, pid_file.contents());
 
+        let postmaster = record
+            .postmaster_pid
+            .map_or(PostmasterIdentity::NotRunning, |pid| {
+                postmaster_identity(&record, pid)
+            });
         let decision = decide_reap(
             &record,
             owner_is_the_recorded_one(&record),
-            record
-                .postmaster_pid
-                .is_some_and(|pid| postmaster_is_the_recorded_one(&record, pid)),
+            postmaster,
             self_pid,
         );
         match decision {
+            ReapDecision::Skip(SkipReason::PostmasterIdentityUnknown) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    "dev runtime: leaving a session whose postmaster identity cannot be confirmed"
+                );
+                continue;
+            }
             ReapDecision::Skip(_) => continue,
             ReapDecision::StopThenRemove { postmaster_pid } => {
                 // The record's own `bin_dir` first: a cluster started from the
@@ -437,49 +450,50 @@ fn owner_is_the_recorded_one(record: &SessionRecord) -> bool {
     }
 }
 
-/// Whether the process at `pid` is still the postmaster this record recorded.
+/// Identity of the process at `pid`, against the postmaster this record
+/// started.
 ///
-/// A live pid alone is not enough: pids are reused, and the window between a
-/// `SIGKILL`ed run and the next `cargo dev` is exactly where that happens. When
-/// the record predates start-token recording (or the platform cannot supply
-/// one), this falls back to plain liveness.
+/// Pids are reused. A live pid alone does not prove identity. The window
+/// between a `SIGKILL`ed run and the next `cargo dev` is exactly where reuse
+/// happens.
 ///
-/// **That fallback is not safe, and issue #1295 tracks fixing it.** The
-/// rationale it was written with — that the `pg_ctl`-only stop path below
-/// cannot signal the wrong process — does not hold: see `stop_orphan`.
-fn postmaster_is_the_recorded_one(record: &SessionRecord, pid: u32) -> bool {
+/// `Unknown` is the answer when the record predates start-token recording,
+/// or the platform cannot supply one — issue #1295. An earlier version of
+/// this function treated that case as a match; that was wrong, for the
+/// reason `stop_orphan` explains. Callers must treat `Unknown` as "leave it
+/// alone", never as a match.
+fn postmaster_identity(record: &SessionRecord, pid: u32) -> PostmasterIdentity {
     if !process_is_alive(pid) {
-        return false;
+        return PostmasterIdentity::NotRunning;
     }
     match (&record.postmaster_start_token, process_start_token(pid)) {
-        (Some(recorded), Some(current)) => recorded == &current,
-        _ => true,
+        (Some(recorded), Some(current)) if recorded == &current => PostmasterIdentity::Confirmed,
+        (Some(_), Some(_)) => PostmasterIdentity::NotRunning,
+        _ => PostmasterIdentity::Unknown,
     }
 }
 
 /// Stop an orphaned cluster. Returns whether it is now confirmed stopped.
 ///
-/// A direct `kill` is used **only** when the recorded start token still matches,
-/// which proves the pid has not been reused — and on Windows there is no such
-/// token, so `pg_ctl` is the only path at all. That is why the record carries
-/// the `bin_dir` that started the cluster: without it, a force-killed run that
-/// had downloaded its own `PostgreSQL` would be unstoppable on Windows.
+/// # Callers must already know the pid's identity
 ///
-/// # `pg_ctl` is not the identity guarantee this once claimed (issue #1295)
+/// `decide_reap` reaches `StopThenRemove` only on `PostmasterIdentity::Confirmed`.
+/// This function runs only on that path. The identity proof happens in the
+/// caller, not here.
 ///
-/// An earlier version of this comment argued that `pg_ctl` is safe to run on a
-/// tokenless record "because it derives the pid from the data directory itself
-/// rather than trusting the record". That is wrong, and stating it stopped the
-/// gap being noticed. `pg_ctl stop` reads `postmaster.pid`, which a `SIGKILL`
-/// leaves **stale** — `PostgreSQL` only removes it on a clean shutdown — then
-/// checks `kill(pid, 0)` and signals. A reused pid passes that liveness check
-/// and nothing there verifies identity, so `pg_ctl` trusts a stale pid file
-/// exactly as much as this code would have trusted a stale record. The liveness
-/// check below runs only *after* the signal has gone out.
+/// It cannot happen here: `pg_ctl stop` reads `postmaster.pid` itself. A
+/// `SIGKILL` leaves that file stale. `PostgreSQL` removes the file only on a
+/// clean shutdown. The `pg_ctl` liveness check on a stale pid also passes
+/// for a reused pid. So `pg_ctl` is not a substitute identity check. Issue
+/// #1295 fixed this by moving the proof into `decide_reap`, ahead of every
+/// call here.
 ///
-/// The fix is to treat unknown identity as a reason not to act, which needs a
-/// Windows `process_start_token` to avoid stranding every Windows session;
-/// tracked in #1295 alongside #1287.
+/// A direct `kill` below runs only when the recorded start token still
+/// matches. That re-proves the same fact right before the signal. Windows
+/// has no such token, so `pg_ctl` is the only path there. That is why the
+/// record carries the `bin_dir` that started the cluster. Without it, a
+/// force-killed run that had downloaded its own `PostgreSQL` would be
+/// unstoppable on Windows.
 fn stop_orphan(
     binaries: Option<&PostgresBinaries>,
     record: &SessionRecord,
@@ -682,7 +696,81 @@ pub fn rewrite_owner_pid_for_test(session_dir: &Path, owner_pid: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::directory_is_ours;
+    use super::{PostmasterIdentity, SessionRecord, directory_is_ours, postmaster_identity};
+
+    /// A pid guaranteed dead: past the 32-bit ceiling, above every `pid_max`
+    /// this crate supports.
+    const fn dead_pid() -> u32 {
+        u32::MAX - 1
+    }
+
+    fn minimal_record(postmaster_start_token: Option<String>) -> SessionRecord {
+        SessionRecord {
+            owner_pid: 1,
+            owner_start_token: None,
+            postmaster_pid: None,
+            postmaster_start_token,
+            bin_dir: None,
+            data_dir: std::path::PathBuf::from("/tmp/harvest-dev-0/session-1-aa/data"),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Issue #1295. A tokenless record must read as `Unknown`, not as a
+    /// match, even when the pid is genuinely alive. This is the exact gap
+    /// the issue reports: a fallback to plain liveness let a reused pid pass
+    /// as the recorded postmaster.
+    #[test]
+    fn a_tokenless_record_reads_as_unknown_identity_for_a_live_pid() {
+        let record = minimal_record(None);
+        let pid = std::process::id();
+        assert_eq!(
+            postmaster_identity(&record, pid),
+            PostmasterIdentity::Unknown
+        );
+    }
+
+    /// Issue #1295. A dead pid is `NotRunning` regardless of the recorded
+    /// token. Nothing is there to have an identity.
+    #[test]
+    fn a_dead_pid_reads_as_not_running_even_with_a_recorded_token() {
+        let record = minimal_record(Some("anything".to_owned()));
+        assert_eq!(
+            postmaster_identity(&record, dead_pid()),
+            PostmasterIdentity::NotRunning
+        );
+    }
+
+    /// Issue #1295. A live pid whose start token does not match the record
+    /// is `NotRunning`, not `Unknown`: the recorded postmaster already
+    /// exited, and the OS reused its pid for an unrelated live process. The
+    /// reaper must not signal that process, but it is safe to remove the
+    /// directory the departed postmaster left behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_mismatched_token_reads_as_not_running_not_unknown() {
+        let pid = std::process::id();
+        let record = minimal_record(Some("not-the-real-token".to_owned()));
+        assert_eq!(
+            postmaster_identity(&record, pid),
+            PostmasterIdentity::NotRunning
+        );
+    }
+
+    /// The steady state this fix must not regress: a matching token confirms
+    /// identity for a live pid.
+    #[cfg(unix)]
+    #[test]
+    fn a_matching_token_confirms_identity_for_a_live_pid() {
+        let pid = std::process::id();
+        let token =
+            super::process_start_token(pid).expect("a live process has a start token on unix");
+        let record = minimal_record(Some(token));
+        assert_eq!(
+            postmaster_identity(&record, pid),
+            PostmasterIdentity::Confirmed
+        );
+    }
 
     /// Issue #1287 regression: the Unix answer must not change. A directory
     /// we own, with default `tempfile` permissions, is still trusted.
