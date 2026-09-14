@@ -4037,14 +4037,8 @@ async fn a_timed_out_workflow_task_reset_preserves_the_capability_miss_budget() 
     .expect("seed a claimed, previously-missed task");
     assert_eq!(load_task(&url, task_id).await.capability_misses, 4);
 
-    autumn_harvest::worker::reset_timed_out_workflow_task(
-        &pool,
-        task_id,
-        "slow-but-capable",
-        0,
-        0,
-    )
-    .await;
+    autumn_harvest::worker::reset_timed_out_workflow_task(&pool, task_id, "slow-but-capable", 0, 0)
+        .await;
 
     let task = load_task(&url, task_id).await;
     assert_eq!(

@@ -720,7 +720,10 @@ async fn dead_worker_stuck_workflow_task_goes_through_the_crash_strike_path_only
 
     let (state, strikes, worker) = task_state(&mut conn, task_id).await;
     assert_eq!(state, "PENDING");
-    assert_eq!(strikes, 1, "the crash-strike path ran, not the stuck-running one");
+    assert_eq!(
+        strikes, 1,
+        "the crash-strike path ran, not the stuck-running one"
+    );
     assert_eq!(worker, None);
 }
 

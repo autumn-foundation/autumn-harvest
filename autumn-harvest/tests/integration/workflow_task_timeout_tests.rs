@@ -305,13 +305,11 @@ async fn reset_does_not_clobber_a_reclaim_at_a_newer_claim_epoch() {
 
     // The orphan requeue bumped crash_strikes; the re-claim that followed
     // bumped attempt. The same worker won it back.
-    diesel::sql_query(
-        "UPDATE harvest_task_queue SET crash_strikes = 1, attempt = 2 WHERE id = $1",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(task_id)
-    .execute(&mut conn)
-    .await
-    .expect("bump the claim epoch");
+    diesel::sql_query("UPDATE harvest_task_queue SET crash_strikes = 1, attempt = 2 WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .execute(&mut conn)
+        .await
+        .expect("bump the claim epoch");
 
     // The in-flight reset still carries the epoch it claimed at.
     reset_timed_out_workflow_task(&pool, task_id, "worker-1", 0, 1).await;
