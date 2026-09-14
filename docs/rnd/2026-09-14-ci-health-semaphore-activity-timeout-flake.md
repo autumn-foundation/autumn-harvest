@@ -8,21 +8,21 @@ PR opened against `ci.yml`, no test changed. Continues the series in
 `docs/rnd/2026-09-0[3-8]-ci-health-semaphore*.md` and
 `docs/rnd/2026-09-1[1-3]-ci-health-semaphore*.md`.
 
-**Correction (post-publication, four review rounds):** this report's first
+**Correction (post-publication, five review rounds):** this report's first
 version grouped three occurrences of
 `worker_fails_workflow_when_activity_start_to_close_timeout_elapses` into one
-cluster with one candidate mechanism, misreported the span between the two
-outer timestamps as 3h11m, proposed four candidate mechanisms for the
-remaining occurrence that are each ruled out by source (`ScheduleToStart`/
-`Heartbeat` timeouts disabled by construction; the enforcement sweep's
-re-check-under-lock structurally prevents double enforcement; the effective
-`workflow_task_timeout` is 60s, not the 10s that looked coincidentally
-coupled to the test's wait loop), had an internally inconsistent
-dashboard-collision run count (4 vs. 7 vs. 6), and claimed the dashboard fix
-"has not recurred" from a partition that was both missing 11 unaudited
-cancelled runs and, separately, using run timestamp rather than tree content
-to decide which runs were "post-fix." A Codex review on PR #1559 caught all
-seven; each was verified directly against source or this session's own raw
+cluster with one candidate mechanism, misreported the timestamp span as
+3h11m, proposed four candidate mechanisms for the remaining occurrence that
+are each ruled out by source, had an internally inconsistent
+dashboard-collision run count (4 vs. 7 vs. 6), claimed the dashboard fix "has
+not recurred" from a partition missing 11 unaudited cancelled runs and using
+run timestamp rather than tree content to decide "post-fix," miscounted a
+section heading (said two single-occurrence candidates, listed three), and
+overclaimed that a same-file blob match proved a branch "carries the fix"
+when the match itself was independently convergent, not descended, on a
+branch confirmed by its own commit message to lack the actual root-cause
+change. A Codex review on PR #1559 caught every one of these across five
+rounds; each was verified directly against source or this session's own raw
 data before fixing, not taken on faith. The span is 3h20m38s (21:45:08 to
 01:05:46, arithmetic error in the original); two of the three occurrences ran
 a pre-hardening version of the test that a same-day fix (`7fbfebb`) had
@@ -194,29 +194,38 @@ originally done. Spot-checked the two explicit post-fix failures' own
 `docs/dashboards/starter-pack-v0.1.0.json` blobs against `e98a676`'s
 (`f825390`, via `get_file_contents(..., sha=<commit>)`):
 
-- `34800863625`'s commit `9de44b68` carries blob `f825390` — **matches**
-  `e98a676` exactly (the branch's own porting commit, see below, happens to
-  land on the identical fixed content).
-- `34799721202`'s commit `dd619f4c` carries blob `767bc5d` — **does not
-  match** `e98a676`; this branch's dashboard file is in some other state,
-  neither confirmed pre-fix nor post-fix from this check alone. Irrelevant to
-  whether `dashboard_pack_docs` failed in that specific run (it didn't — that
-  run failed on `retention_summary_tests`, item 3 below), but it demonstrates
-  the general problem: this run's timestamp says "post-fix," its tree says
-  otherwise, and nothing here can tell which of those tells you about panel
-  collisions.
+- `34800863625`'s commit `9de44b68` carries blob `f825390` — **byte-identical
+  to** `e98a676`'s JSON, but this is **not** the same as "carries the
+  root-cause fix," a second Codex review catch on top of the first. `9de44b68`
+  is its own PR's independent one-line port of the *specific* 960→961
+  renumbering (its own commit message says so — see below); the branch does
+  not contain `e98a676`'s actual root-cause change,
+  `docs/dashboards/next-panel-id.py`, or the convention doc pointing new
+  panels at it. The two commits' JSON happened to converge because both fixed
+  the same single collision the same way, not because one descends from the
+  other. A blob match on this one file proves nothing about whether a branch
+  has the tooling that prevents the *next* collision — only ancestry (or
+  checking for `next-panel-id.py`'s presence) can show that.
+- `34799721202`'s commit `dd619f4c` carries blob `767bc5d` — does not match
+  `e98a676` either. Irrelevant to whether `dashboard_pack_docs` failed in
+  that specific run (it didn't — that run failed on `retention_summary_tests`,
+  item 3 below), but it demonstrates the general problem from the other
+  direction: this run's timestamp says "post-fix," its tree doesn't match the
+  fixed blob, and a blob check alone can't say why (stale branch, or a
+  different independent fix, or something else).
 
 Given both gaps, **the evidence in this report supports only "0/2 explicit
 post-fix failures carried the collision signature,"** not "no occurrences in
-the post-fix window" and not "the fix is holding." **Routed forward, not
-audited**: before either of those broader claims, (a) job-log the 11 post-fix
-cancelled runs for the `dashboard_pack_docs` signature, and (b) for any run
-counted as "post-fix" either way, confirm its dashboard-file blob or commit
-ancestry against `e98a676` rather than trusting its timestamp — the same
-discipline item 1 above had to learn from a review catch, applied here
-proactively instead of waiting for a fourth one.
+the post-fix window" and not "the fix is holding" — and not even "one of the
+two post-fix runs carries the fix," since the one blob match found does not
+establish that. **Routed forward, not audited**: before any "is holding"
+claim, (a) job-log the 11 post-fix cancelled runs for the `dashboard_pack_docs`
+signature, and (b) for any run counted as "post-fix" either way, check its
+commit ancestry against `e98a676` (or the presence of `next-panel-id.py` on
+its branch) rather than a same-file blob match, which this round showed can
+converge independently.
 
-### 3. Two single-occurrence candidates — not clustered, not claimed as rates
+### 3. Three single-occurrence candidates — not clustered, not claimed as rates
 
 - `retention_summary_tests::summary_gc_deletes_expired_and_emits_metric`
   (run `34799721202`, 02:35:29Z, `Test DB (linux, shard 0)`) — an `i64`
@@ -389,7 +398,9 @@ print(Counter(r['conclusion'] for r in post))  # {'cancelled': 11, 'success': 4,
 git show e98a676:docs/dashboards/starter-pack-v0.1.0.json | git hash-object --stdin
 # f82539072a7d0ce8ac0325a253cf35495d1fe28e
 # get_file_contents(path="docs/dashboards/starter-pack-v0.1.0.json", sha=9de44b68)
-#   -> blob f825390... (matches -- this run's tree carries the fix)
+#   -> blob f825390... (byte-identical JSON, but 9de44b68 is its own
+#      independent port, not a descendant of e98a676 -- doesn't carry
+#      next-panel-id.py. A blob match is not an ancestry check.)
 # get_file_contents(path="docs/dashboards/starter-pack-v0.1.0.json", sha=dd619f4c)
 #   -> blob 767bc5d... (does not match -- timestamp said "post-fix", tree didn't)
 
