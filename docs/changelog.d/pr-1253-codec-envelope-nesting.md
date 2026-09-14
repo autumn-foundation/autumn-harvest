@@ -58,7 +58,7 @@ The worker fleet-readiness gate (`activate_codec_key`) is unchanged: it
 still requires version-2 (flat, keyed) support, because that is still the
 only shape a keyed write ever produces.
 
-**Residual, documented gaps.** Two, both accepted rather than gated:
+**Residual, documented gaps.** Three, all accepted rather than gated:
 
 1. The collision-escape path is not fleet-gated — it can fire on a
    deployment that never rotates a key at all. A pre-#1253 reader hitting
@@ -73,10 +73,21 @@ only shape a keyed write ever produces.
    risk the flat shapes already carried for rows written before #1253, not
    a new one. Every reserved marker this crate has introduced carried this
    exact risk once, at the moment it started being recognized.
+3. `harvest_workflow_executions.input`/`output`, and similar denormalized
+   queue and dead-letter columns, are populated directly from
+   caller-supplied values and never go through `encode_payload` at all —
+   `decode_value_lossy` can misread a coincidental collision there the same
+   way it can on `harvest_events`. This predates #1253 and applied to the
+   legacy flat shapes too. An escape guard on `encode_payload` cannot close
+   it, because these columns never reach `encode_payload` to escape
+   through; they stay directly queryable by design, and a codec envelope
+   would break that. Out of scope for this fix.
 
-Neither is fixable without rewriting stored history, which the append-only
-invariant forbids outside the two sanctioned exceptions in `CLAUDE.md`
-(unchanged by this fix — still exactly two).
+The first two are not fixable without rewriting stored history, which the
+append-only invariant forbids outside the two sanctioned exceptions in
+`CLAUDE.md` (unchanged by this fix — still exactly two). The third is a
+separate, larger design decision about which storage surfaces the codec
+covers at all.
 
 **The escape guard checks every depth, not only the field root.** The
 operator lossy-decode path (`decode_value_lossy`) recurses into every

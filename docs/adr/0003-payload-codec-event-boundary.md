@@ -149,3 +149,18 @@ otherwise misread it.
 Test: `a_descendant_envelope_shaped_field_is_also_escaped_on_encode` proves
 the escape, the round trip, and that `decode_value_lossy` decodes the
 escape wrapper once and never re-examines the recovered descendant.
+
+**Third residual: columns `encode_payload` never touches at all.**
+`harvest_workflow_executions.input`/`output`, and similar denormalized
+queue and dead-letter columns, are populated directly from
+caller-supplied values. They never go through `encode_payload`, so
+`decode_value_lossy` can misread a coincidental collision there the same
+way it can on `harvest_events`.
+
+This predates issue #1253 and applied to the legacy flat shapes too, so
+it is not new. An escape guard on `encode_payload` cannot close it,
+because these columns never reach `encode_payload` to escape through.
+Those columns stay directly queryable by design — indexing and search
+attribute matching read them straight via SQL — and a codec envelope
+would break that, so encoding them is a separate, larger design decision
+out of scope for this fix.

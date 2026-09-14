@@ -416,6 +416,21 @@ impl<'a> CodecEnvelopeParts<'a> {
 /// stored history. `harvest_events` being append-only forbids that outside
 /// the two sanctioned exceptions in `CLAUDE.md`. The legacy flat shapes
 /// above carry the identical, pre-existing residual for the same reason.
+///
+/// **Third residual: columns [`PayloadCodecs::encode_payload`] never
+/// touches at all.** `harvest_workflow_executions.input`/`output` and
+/// similar denormalized queue and dead-letter columns are populated
+/// directly from caller-supplied values. They never go through
+/// `encode_payload`. So [`PayloadCodecs::decode_value_lossy`] can misread
+/// a coincidental collision there, for the same reason it can on
+/// `harvest_events`.
+///
+/// This predates issue #1253. It applied to the legacy flat shapes too,
+/// so it is not new. An escape guard on `encode_payload` cannot close it,
+/// because these columns never reach `encode_payload` to escape through.
+/// Out of scope for this fix — see issue #1253's PR discussion. Those
+/// columns stay directly queryable by design, which a codec envelope
+/// would break.
 fn codec_envelope_parts(payload: &Value) -> Option<CodecEnvelopeParts<'_>> {
     let obj = payload.as_object()?;
     let marker = obj.get(CODEC_ENVELOPE_KEY)?;
