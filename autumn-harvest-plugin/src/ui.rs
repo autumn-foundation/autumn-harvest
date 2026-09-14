@@ -8165,6 +8165,13 @@ const fn schedule_is_resumable(row: &HarvestSchedule) -> bool {
 /// `max_runs = 0` is **unlimited**, not "spent": the `max > 0` guard is the
 /// engine's convention at every bound check (and is pinned by
 /// `backfill_max_runs_zero_is_treated_as_unlimited`).
+///
+/// The `end_at` bound is judged on the jitter-adjusted pending fire time, not
+/// the raw slot (issue #1293). The scheduler's own secondary `end_at` guard in
+/// `scheduler.rs` rejects a fire whose `effective_fire_time` is at or past
+/// `end_at`, even when the raw slot is still before it. Reading the raw slot
+/// here would call such a row healthy until a tick happens to stamp
+/// `exhausted_at`.
 fn schedule_is_bounded_out(row: &HarvestSchedule, now: DateTime<Utc>) -> bool {
     if row.exhausted_at.is_some() {
         return true;
@@ -8184,10 +8191,13 @@ fn schedule_is_bounded_out(row: &HarvestSchedule, now: DateTime<Utc>) -> bool {
     // the cutoff is still legal and will be processed once the clock has passed
     // it (we would call it exhausted). Fall back to the wall clock only when
     // there is no pending slot to judge.
-    row.end_at.is_some_and(|end_at| {
-        row.next_run_at
-            .map_or(now >= end_at, |next_run_at| next_run_at >= end_at)
-    })
+    //
+    // `effective_fire_time` returns `None` for `jitter_secs <= 0`, so an
+    // unjittered schedule falls back to the raw slot below.
+    let pending = crate::api::effective_fire_time(row.id, row.next_run_at, row.jitter_secs)
+        .or(row.next_run_at);
+    row.end_at
+        .is_some_and(|end_at| pending.map_or(now >= end_at, |t| t >= end_at))
 }
 
 /// Derive a row's health flags. Pure: every badge, sort and summary decision on
@@ -17436,6 +17446,61 @@ mod tests {
             !html.contains("produces no future firings"),
             "must not blame the expression for an auto-pause: {html}"
         );
+    }
+
+    // -- issue #1293 regression --
+
+    /// The scheduler's secondary `end_at` guard in `scheduler.rs` rejects a
+    /// fire when the jitter-adjusted `effective_fire_time` is at or past
+    /// `end_at`. It rejects the fire even when the raw slot is still before
+    /// `end_at`. This predicate must judge the same pending time. Otherwise
+    /// the badge, the filter and the sort report the schedule as healthy. The
+    /// tick never fires it again.
+    #[test]
+    fn end_at_exhaustion_accounts_for_jitter() {
+        let now = chrono::Utc::now();
+        let id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000001293")
+            .expect("valid fixture uuid");
+        let next_run_at = chrono::DateTime::parse_from_rfc3339("2026-09-01T12:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+        let jitter_secs = 300i64;
+
+        let offset = autumn_harvest::policy::compute_jitter_offset(
+            id,
+            next_run_at,
+            std::time::Duration::from_secs(jitter_secs.cast_unsigned()),
+        );
+        let effective_fire_time = next_run_at
+            + chrono::Duration::from_std(offset).expect("offset fits in a chrono duration");
+        assert!(
+            effective_fire_time > next_run_at,
+            "fixture needs a non-zero offset to exercise the jitter path"
+        );
+
+        // The raw slot is still before end_at. Its jitter-adjusted fire time
+        // is not. The tick never dispatches this slot.
+        let row = HarvestSchedule {
+            id,
+            next_run_at: Some(next_run_at),
+            jitter_secs,
+            end_at: Some(effective_fire_time),
+            ..make_schedule(Some("jittered_wf"), None, false)
+        };
+        assert!(
+            schedule_is_bounded_out(&row, now),
+            "a slot whose jitter-adjusted fire time is at/past end_at is bounded out"
+        );
+
+        // An unjittered schedule still judges the raw slot only. The common
+        // case must not regress.
+        let unjittered = HarvestSchedule {
+            next_run_at: Some(next_run_at),
+            jitter_secs: 0,
+            end_at: Some(next_run_at + chrono::Duration::minutes(1)),
+            ..make_schedule(Some("plain_wf"), None, false)
+        };
+        assert!(!schedule_is_bounded_out(&unjittered, now));
     }
 
     /// The backfill confirmation interpolates the schedule UUID into its
