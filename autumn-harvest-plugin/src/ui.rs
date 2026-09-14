@@ -8169,9 +8169,9 @@ const fn schedule_is_resumable(row: &HarvestSchedule) -> bool {
 /// The `end_at` bound is judged on the jitter-adjusted pending fire time, not
 /// the raw slot (issue #1293). The scheduler's own secondary `end_at` guard in
 /// `scheduler.rs` rejects a fire whose `effective_fire_time` is at or past
-/// `end_at`, even when the raw slot is still before it. Reading the raw slot
-/// here would call such a row healthy until a tick happens to stamp
-/// `exhausted_at`.
+/// `end_at`. It rejects the fire even when the raw slot is still before
+/// `end_at`. Reading the raw slot here would call such a row healthy until a
+/// tick happens to stamp `exhausted_at`.
 fn schedule_is_bounded_out(row: &HarvestSchedule, now: DateTime<Utc>) -> bool {
     if row.exhausted_at.is_some() {
         return true;
