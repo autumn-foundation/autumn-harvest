@@ -15,11 +15,16 @@
 //! compared against the request's own host (`X-Forwarded-Host`, when a
 //! trusted reverse proxy reports one, takes precedence over `Host`) and
 //! its scheme. A proxy-reported `X-Forwarded-Proto` must match `Origin`'s
-//! scheme exactly. Without one, only `https` is accepted: a browser cannot
-//! lie about `Origin`, but an unconfirmed `http` claim is indistinguishable
-//! from a downgrade attack. A request with neither
-//! `Sec-Fetch-Site` nor `Origin` is rejected — it is never admitted by
-//! default.
+//! scheme exactly.
+//!
+//! Without a proxy-reported scheme, the fallback rejects outright,
+//! whatever scheme `Origin` claims. `Origin` proves only that the
+//! requesting *page* used that scheme. It proves nothing about the
+//! scheme *this* connection arrived over. A mixed-content form on an
+//! `https` page can still target a plain `http` listener on the same
+//! host. This server cannot tell the two apart without a trusted
+//! proxy's word for it. A request with neither `Sec-Fetch-Site` nor
+//! `Origin` is rejected too — it is never admitted by default.
 //!
 //! `Sec-Fetch-Site`, when present, is always decisive — checked before
 //! anything else below, including `Content-Type`. A browser sends it on
@@ -166,23 +171,20 @@ fn is_same_origin(headers: &HeaderMap) -> bool {
         return false;
     };
     // A TLS-terminating proxy is the only reliable source for the scheme
-    // this server was actually reached over; a plain request carries none.
-    // A confirmed scheme must match `Origin`'s claim exactly. Unconfirmed,
-    // only `https` may proceed. A browser cannot lie about `Origin`, so
-    // `https://dashboard.example` is proof the requesting page really was
-    // HTTPS, regardless of what this server independently knows. `http`
-    // gets no such benefit. Unconfirmed, it is indistinguishable from a
-    // downgrade attack against an HTTPS deployment, so it is rejected
-    // rather than assumed legitimate.
-    let proxy_scheme = forwarded_scheme(headers);
-    let scheme_confirmed = proxy_scheme.map_or_else(
-        || origin_scheme.eq_ignore_ascii_case("https"),
-        |expected| origin_scheme.eq_ignore_ascii_case(expected),
-    );
-    if !scheme_confirmed {
+    // this server was actually reached over. A plain request carries none.
+    // `Origin` proves only that the requesting page used its claimed
+    // scheme. It says nothing about the scheme of this connection. So a
+    // proxy-confirmed match is required either way, `https` included. A
+    // mixed-content form on an `https` page can still target a plain
+    // `http` listener on the same host. Without a proxy's word for it,
+    // this server cannot tell that request apart from a same-origin one.
+    let Some(proxy_scheme) = forwarded_scheme(headers) else {
+        return false;
+    };
+    if !origin_scheme.eq_ignore_ascii_case(proxy_scheme) {
         return false;
     }
-    let effective_scheme = proxy_scheme.unwrap_or(origin_scheme);
+    let effective_scheme = proxy_scheme;
     // A browser never includes a default port in `Origin`. A `Host` /
     // `X-Forwarded-Host` value that spells one out explicitly
     // (`dashboard.example:443` over `https`) is still the same origin.
@@ -299,6 +301,7 @@ mod tests {
         let status = post_with_headers(&[
             ("origin", "https://dashboard.example"),
             ("host", "dashboard.example"),
+            ("x-forwarded-proto", "https"),
         ])
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -309,6 +312,7 @@ mod tests {
         let status = post_with_headers(&[
             ("origin", "https://attacker.example"),
             ("host", "dashboard.example"),
+            ("x-forwarded-proto", "https"),
         ])
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -366,16 +370,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn https_origin_passes_without_a_proxy_scheme_signal() {
-        // A browser cannot lie about `Origin`. `https://dashboard.example`
-        // is proof the requesting page really was HTTPS, so it needs no
-        // proxy confirmation the way an `http` claim does.
+    async fn https_origin_is_rejected_without_a_proxy_scheme_signal() {
+        // Regression (Codex): `Origin` proves only that the requesting
+        // page used `https`. It proves nothing about the scheme this
+        // connection arrived over. A mixed-content form on an `https`
+        // page can still target a plain `http` listener on the same
+        // host. So an unconfirmed `https` claim gets no more benefit of
+        // the doubt than an unconfirmed `http` one.
         let status = post_with_headers(&[
             ("origin", "https://dashboard.example"),
             ("host", "dashboard.example"),
         ])
         .await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -386,6 +393,7 @@ mod tests {
             ("origin", "https://dashboard.example"),
             ("host", "harvest-upstream:3000"),
             ("x-forwarded-host", "dashboard.example"),
+            ("x-forwarded-proto", "https"),
         ])
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -397,6 +405,7 @@ mod tests {
             ("origin", "https://dashboard.example"),
             ("host", "harvest-upstream:3000"),
             ("x-forwarded-host", "dashboard.example, edge.internal"),
+            ("x-forwarded-proto", "https"),
         ])
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -408,6 +417,7 @@ mod tests {
             ("origin", "https://attacker.example"),
             ("host", "harvest-upstream:3000"),
             ("x-forwarded-host", "dashboard.example"),
+            ("x-forwarded-proto", "https"),
         ])
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -611,6 +621,7 @@ mod tests {
         let status = post_with_headers(&[
             ("origin", "https://dashboard.example"),
             ("host", "dashboard.example:443"),
+            ("x-forwarded-proto", "https"),
         ])
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -633,6 +644,7 @@ mod tests {
         let status = post_with_headers(&[
             ("origin", "https://dashboard.example"),
             ("host", "dashboard.example:8443"),
+            ("x-forwarded-proto", "https"),
         ])
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
