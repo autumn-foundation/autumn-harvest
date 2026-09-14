@@ -1,6 +1,7 @@
 //! Time-based retention janitor for completed workflow history.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(feature = "db")]
@@ -928,6 +929,23 @@ pub struct RetentionStatus {
 #[derive(Debug, Clone)]
 pub struct RetentionMonitor {
     inner: Arc<Mutex<RetentionStatus>>,
+    /// Count of full main-loop iterations completed.
+    ///
+    /// One iteration covers history retention, partition maintenance, and
+    /// the audit, schedule, summary, and rate-limit-bucket GC passes. This
+    /// counter advances once, at the same point as the unconditional
+    /// end-of-iteration liveness tick from issue #797.
+    ///
+    /// This counter is separate from that liveness tick's own counter,
+    /// `crate::scanner_health::record_scanner_tick`. That counter advances
+    /// more than once per iteration under partitioned layout. It advances
+    /// once per shard inside `run_partition_maintenance_pass`, and again
+    /// before the main loop even starts. Crossing a baseline on that
+    /// counter proves only that some scanner tick happened somewhere. It
+    /// does not prove the whole iteration, GC phases included, finished. A
+    /// caller that needs that stronger guarantee must watch this counter
+    /// instead.
+    iterations_completed: Arc<AtomicU64>,
 }
 
 impl RetentionMonitor {
@@ -942,7 +960,25 @@ impl RetentionMonitor {
             .collect();
         Self {
             inner: Arc::new(Mutex::new(RetentionStatus { config, per_shard })),
+            iterations_completed: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Returns the count of full main-loop iterations completed so far.
+    /// See the `iterations_completed` field above for the exact guarantee.
+    #[must_use]
+    pub fn iterations_completed(&self) -> u64 {
+        // Fully qualified: `diesel_async::RunQueryDsl::load` is in scope
+        // and, resolved by receiver-type autoderef, wins over the inherent
+        // `AtomicU64::load` on plain `.load(...)` syntax.
+        AtomicU64::load(&self.iterations_completed, Ordering::Relaxed)
+    }
+
+    /// Marks one full main-loop iteration as finished. Call this once, at
+    /// the same point as the unconditional end-of-iteration liveness tick.
+    #[cfg(feature = "db")]
+    fn record_iteration_complete(&self) {
+        AtomicU64::fetch_add(&self.iterations_completed, 1, Ordering::Relaxed);
     }
 
     /// # Panics
@@ -1688,6 +1724,10 @@ impl RetentionRuntime {
                 // tick that deleted nothing still proves the janitor is alive —
                 // which `harvest.retention.deleted` (work-only) cannot.
                 crate::scanner_health::record_scanner_tick(metrics.as_ref(), owner);
+                // See `RetentionMonitor::iterations_completed`'s field doc:
+                // this is the one point in the loop that proves the whole
+                // iteration, GC phases included, actually finished.
+                monitor_task.record_iteration_complete();
             }
             // Issue #797: a graceful stop retires this loop from the expected
             // scanner set. A panic unwinds past here, so a panicked loop stays
