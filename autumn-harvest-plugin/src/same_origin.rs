@@ -12,11 +12,13 @@
 //! `same-origin` passes; `cross-site`, `same-site`, and `none` do not, since
 //! any of them can carry a forged form submission. A browser that omits
 //! `Sec-Fetch-Site` falls back to the `Origin` header instead. That is
-//! compared against the request's own host, and against its scheme when a
-//! trusted reverse proxy reports one. `X-Forwarded-Host` and
-//! `X-Forwarded-Proto` take precedence over `Host` and a bare request's own
-//! scheme, respectively. A request with neither `Sec-Fetch-Site` nor
-//! `Origin` is rejected — it is never admitted by
+//! compared against the request's own host (`X-Forwarded-Host`, when a
+//! trusted reverse proxy reports one, takes precedence over `Host`) and
+//! its scheme. A proxy-reported `X-Forwarded-Proto` must match `Origin`'s
+//! scheme exactly. Without one, only `https` is accepted: a browser cannot
+//! lie about `Origin`, but an unconfirmed `http` claim is indistinguishable
+//! from a downgrade attack. A request with neither
+//! `Sec-Fetch-Site` nor `Origin` is rejected — it is never admitted by
 //! default.
 //!
 //! `Sec-Fetch-Site`, when present, is always decisive — checked before
@@ -155,13 +157,20 @@ fn is_same_origin(headers: &HeaderMap) -> bool {
         return false;
     };
     // A TLS-terminating proxy is the only reliable source for the scheme
-    // the browser actually used; a plain request carries none. When it is
-    // absent, fall back to `origin_scheme` instead. Autumn-web's own
-    // method-override same-origin check documents and accepts that same
-    // trade-off. It is still enough to normalize a default port even with
-    // no proxy in front of this server.
+    // this server was actually reached over; a plain request carries none.
+    // A confirmed scheme must match `Origin`'s claim exactly. Unconfirmed,
+    // only `https` may proceed. A browser cannot lie about `Origin`, so
+    // `https://dashboard.example` is proof the requesting page really was
+    // HTTPS, regardless of what this server independently knows. `http`
+    // gets no such benefit. Unconfirmed, it is indistinguishable from a
+    // downgrade attack against an HTTPS deployment, so it is rejected
+    // rather than assumed legitimate.
     let proxy_scheme = forwarded_scheme(headers);
-    if !proxy_scheme.is_none_or(|expected| origin_scheme.eq_ignore_ascii_case(expected)) {
+    let scheme_confirmed = proxy_scheme.map_or_else(
+        || origin_scheme.eq_ignore_ascii_case("https"),
+        |expected| origin_scheme.eq_ignore_ascii_case(expected),
+    );
+    if !scheme_confirmed {
         return false;
     }
     let effective_scheme = proxy_scheme.unwrap_or(origin_scheme);
@@ -334,12 +343,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_origin_passes_without_a_proxy_scheme_signal() {
-        // No `X-Forwarded-Proto` means the scheme cannot be observed. Falling
-        // back to the authority match alone matches autumn-web's own
-        // method-override same-origin check.
+    async fn http_origin_is_rejected_without_a_proxy_scheme_signal() {
+        // Regression (Codex): with no `X-Forwarded-Proto`, this server
+        // cannot independently confirm the scheme. An `http` claim gets no
+        // benefit of the doubt here, since it is indistinguishable from a
+        // downgrade attack against an HTTPS deployment.
         let status = post_with_headers(&[
             ("origin", "http://dashboard.example"),
+            ("host", "dashboard.example"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn https_origin_passes_without_a_proxy_scheme_signal() {
+        // A browser cannot lie about `Origin`. `https://dashboard.example`
+        // is proof the requesting page really was HTTPS, so it needs no
+        // proxy confirmation the way an `http` claim does.
+        let status = post_with_headers(&[
+            ("origin", "https://dashboard.example"),
             ("host", "dashboard.example"),
         ])
         .await;
