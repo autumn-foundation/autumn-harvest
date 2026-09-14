@@ -1856,3 +1856,9 @@ standalone note rather than part of the claim-path attribution table above:
   redundant second edge-set traversal in
   `critical_path::CriticalPathAnalyzer::analyze`'s sink detection, folded
   into the existing per-level DP loop (instructions -15.45%, PR #1500).
+* [`docs/performance-queue-coverage.md`](performance-queue-coverage.md) — the
+  O(pending queues x workers x queues-per-worker) nested scan in
+  `queue_coverage::partition_uncovered_and_paused`, the per-shard core of
+  `GET /admin/queue-coverage` (issue #774), indexed into an O(1)-average
+  `HashSet` lookup per pending queue (instructions -83.6%; falls back to
+  the original direct scan for a `?queue_name=`-filtered single-row call).
