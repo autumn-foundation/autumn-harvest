@@ -1,11 +1,24 @@
-# 🚦 Semaphore CI health — a new clustered flake
-# (`worker_fails_workflow_when_activity_start_to_close_timeout_elapses`),
-# the dashboard panel-id root-cause fix holding, and two single-occurrence
+# 🚦 Semaphore CI health — a same-day "no race left to lose" fix that
+# still failed post-merge, a stale-branch echo of the bug it fixed, the
+# dashboard panel-id root-cause fix holding, and two single-occurrence
 # candidates not yet worth a rate claim
 
-**Status:** health report / issue filed (#1558) — no PR opened against `ci.yml`,
-no test changed. Continues the series in `docs/rnd/2026-09-0[3-8]-ci-health-
-semaphore*.md` and `docs/rnd/2026-09-1[1-3]-ci-health-semaphore*.md`.
+**Status:** health report / issue filed (#1558, corrected after review) — no
+PR opened against `ci.yml`, no test changed. Continues the series in
+`docs/rnd/2026-09-0[3-8]-ci-health-semaphore*.md` and
+`docs/rnd/2026-09-1[1-3]-ci-health-semaphore*.md`.
+
+**Correction (post-publication):** this report's first version grouped three
+occurrences of `worker_fails_workflow_when_activity_start_to_close_timeout_elapses`
+into one cluster with one candidate mechanism, and misreported the span
+between the two outer timestamps as 3h11m. A Codex review on PR #1559 caught
+both errors: the span is 3h20m38s (21:45:08 to 01:05:46, arithmetic error in
+the original), and — materially — two of the three occurrences ran a
+pre-hardening version of the test that a same-day fix (`7fbfebb`) had already
+addressed, while the third ran the **post-hardening** version and still
+failed the identical assertion about an hour after that fix merged. Verified
+directly against each commit's blob for `integration_e2e.rs` (below); section
+1 is rewritten to reflect this. Issue #1558 has been corrected to match.
 
 ## 🎯 Verdict path
 
@@ -23,16 +36,15 @@ falling back to the signed `logs_url` + direct fetch when a job's log exceeded
 the tool's inline size limit, and to `list_workflow_jobs` with pagination when
 `get_job_logs`'s own job enumeration undercounted — see 🔬 below).
 
-### 1. New clustered flake: `integration_e2e::worker_fails_workflow_when_activity_start_to_close_timeout_elapses` — 3/17 occurrences, 3 branches, 3h11m span
+### 1. `worker_fails_workflow_when_activity_start_to_close_timeout_elapses`: two occurrences of an already-fixed bug, and one occurrence of the fix itself still failing
 
-| Run | Job | When (UTC) | Branch | Commit | Panic line |
-|---|---|---|---|---|---|
-| `34781980082` | Test DB (linux, shard 0) | 21:45:08 | `claude/gracious-noether-a7mahx` | `403c0652` | `integration_e2e.rs:3529:5` |
-| `34787239282` | Test DB (linux, shard 0) | 01:05:46 | `claude/vibrant-hamilton-s6oknw` | `97969f2f` | `integration_e2e.rs:3529:5` |
-| `34789424377` | Test DB (linux, shard 7) | 23:56:26 | `claude/hopeful-rubin-rlkl1n` | `874784b9` | `integration_e2e.rs:3541:5` |
+| Run | Job | When (UTC) | Branch | Commit | Panic line | Test revision at that commit |
+|---|---|---|---|---|---|---|
+| `34781980082` | Test DB (linux, shard 0) | 21:45:08 | `claude/gracious-noether-a7mahx` | `403c0652` | `integration_e2e.rs:3529:5` | **pre-hardening** (blob `8eeeb87`) |
+| `34787239282` | Test DB (linux, shard 0) | 01:05:46 | `claude/vibrant-hamilton-s6oknw` | `97969f2f` | `integration_e2e.rs:3529:5` | **pre-hardening** (blob `8eeeb87`) |
+| `34789424377` | Test DB (linux, shard 7) | 23:56:26 | `claude/hopeful-rubin-rlkl1n` | `874784b9` | `integration_e2e.rs:3541:5` | **post-hardening** (blob `27509aa`) |
 
-Identical assertion in all three (the line number differs only because
-unrelated edits elsewhere in the file shifted it on those branches):
+Identical assertion in all three:
 
 ```
 assertion failed: matches!(history.events.as_slice(),
@@ -43,31 +55,53 @@ assertion failed: matches!(history.events.as_slice(),
     WorkflowEvent::WorkflowFailed { .. },])
 ```
 
-In all three the test's first assertion (`execution.state == "FAILED"`,
-polled for up to 10s) already passed — only the exact 5-event history-shape
-check afterward failed. Filed as **issue #1558** with the full mechanism
-candidate; not summarized again here beyond the headline, per this role's own
-rule against re-litigating a filed finding in a second document. Not
-previously reported by this series (checked via `search_issues` before
-filing — the 5 existing matches are all issue #1459's ten-child-fan-out
-test, a different test).
+**The line number difference is not incidental.** `7fbfebb` (merged
+2026-09-13T22:53:08Z, changing this file's blob from `8eeeb87` to `27509aa`)
+hardened this exact test against this exact assertion, in two steps within
+the same PR: first widening `slow_activity`'s sleep from 250ms to 600ms
+against a 50ms→100ms `default_start_to_close` (still racy — it failed twice
+in that PR's own CI), then abandoning the margin approach entirely and
+setting the sleep to 30 seconds, past the test's own 10-second wait-loop
+bound, with the commit message stating "no race left to lose" — the activity
+can no longer complete before the test gives up, so the only way to reach
+`FAILED` is meant to be the `StartToClose` timeout, deterministically.
 
-**Test-vs-product verdict: not rendered.** 3 occurrences across 3 unrelated
-branches in 3h11m is enough to call this a real cluster, not enough to say
-which side the nondeterminism lives on — the hard gate's own "must show the
-nondeterminism lives in the test, not the product, before touching either"
-requirement is not met by frequency-in-the-wild data alone. Corroborating
-(not confirming) evidence for a wall-clock-margin mechanism: the test uses a
-100ms `default_start_to_close` against a 25ms worker `poll_interval`, and the
-timeout-enforcement sweep that detects `StartToClose` breaches
-(`autumn-harvest/src/timeout.rs:4594-4644`) explicitly skips a tick under
-pool contention, logging `"pool acquisition exceeded the tick interval;
-skipping this tick"` (`timeout.rs:4645`) — a line seen firing routinely in
-this same 17-hour sample's **passing** `workflow_retry_tests` legs (at
-`interval=50ms`), so tick-skipping under load is confirmed to be happening on
-these runners generally, just not yet confirmed as the specific cause of
-*this* test's failure. No same-commit rerun was run this session — see 📋 in
-issue #1558 for the requested follow-up before any fix.
+Fetched each occurrence's exact commit tree via `get_file_contents(...,
+sha=<commit>)` and compared blob SHAs against `7fbfebb`'s diff:
+
+- `403c0652` and `97969f2f` both carry blob `8eeeb87` — the **pre-hardening**
+  test (250ms sleep, 50ms timeout). These are not a new bug: they are the
+  exact race `7fbfebb` already fixed, recurring only because those two
+  branches had not yet merged `trunk-dev` past that fix (`97969f2f`'s CI run
+  at 01:05:46Z postdates the fix's 22:53:08Z merge by over 2 hours, but the
+  branch's own tree still predates it — a stale-branch echo, not a live
+  defect). **Not routed forward as an open item**; a rebase closes it.
+- `874784b9` carries blob `27509aa` — the **post-hardening** test (30s
+  sleep, 100ms timeout, the "no race left to lose" version) — and still hit
+  the identical event-history assertion, 1h03m18s after `7fbfebb` merged.
+  This is the one finding worth carrying forward from this test, and it is
+  more concerning than the original (uncorrected) report's framing: a fix
+  whose own commit message asserts the race is structurally impossible
+  ("the activity then cannot complete before the wait loop gives up") failed
+  the same way anyway, on its very next occurrence. Whatever produced the
+  mismatched event history here cannot be "the activity finished before the
+  timeout sweep noticed" — that path is closed by construction. The
+  mechanism is unknown.
+
+**Test-vs-product verdict: not rendered — and now for a narrower, more
+consequential question.** Issue #1558 is corrected to ask specifically: given
+`874784b9`'s config makes the original race provably impossible, what
+produced the same wrong event-history shape anyway? Candidates not yet
+distinguished: a *different* timeout type firing first (`ScheduleToStart` or
+`Heartbeat`, both present in `timeout.rs` alongside `StartToClose`), the
+timeout-enforcement sweep firing more than once for the same task, or an
+interaction with this test's own 10-second `workflow_task_timeout` config
+(also 10s, the same bound the wait loop uses — worth checking whether that is
+coincidence or coupling). This session did not have the diagnostic dump
+needed to tell which; the `matches!` assertion does not print the actual
+event sequence on failure, so the next occurrence should capture
+`history.events` before asserting, not just after it panics. One occurrence
+is not a rate. No same-commit rerun was run this session.
 
 ### 2. Dashboard panel-id collision: the same-day "root cause" fix (#1550) has not recurred in ~7 hours of post-merge sample
 
@@ -129,12 +163,18 @@ protocol or revert-check machinery applies to.
 
 ## 🔍 Diagnosis
 
-**Item 1** is a genuine new cluster (3 same-signature failures, 3 unrelated
-branches, 3h11m span) but the test-vs-product verdict is explicitly **not
-rendered** in this report — filed as issue #1558 with the evidence and a
-named candidate mechanism instead of guessing which side to fix. Per the hard
-gate, opening a fix PR without a same-commit rerun protocol and a rendered
-verdict would be exactly the "retry in disguise" this role exists to refuse.
+**Item 1** splits into two: two occurrences are a stale-branch echo of a bug
+already fixed by `7fbfebb` (no action needed — a rebase resolves it), and one
+occurrence is a genuinely new, unexplained failure of the fix itself, on a
+test configuration where the originally-diagnosed race is provably
+impossible. The test-vs-product verdict for that third occurrence is
+explicitly **not rendered** in this report — issue #1558 (corrected) carries
+the evidence and the narrowed question instead of guessing which side to fix.
+Per the hard gate, opening a fix PR without a same-commit rerun protocol and
+a rendered verdict would be exactly the "retry in disguise" this role exists
+to refuse — doubly so here, since the obvious-looking fix (widen the margin
+further, or add another `sleep`) has already been tried once and did not
+hold.
 
 **Item 2** is not a new finding — it is confirmation that a same-day
 root-cause fix already shipped by this repo's own maintainers is (so far)
@@ -147,20 +187,26 @@ mechanism, no clustering. Recorded so a repeat is recognized as a repeat.
 
 ## 🔧 Treatment
 
-- **Filed:** issue #1558 (the new clustered flake, with mechanism candidate
-  and requested rerun-protocol follow-up).
+- **Filed, then corrected:** issue #1558 — originally described a 3-occurrence
+  cluster with one candidate mechanism; edited after this PR's own review
+  caught that two occurrences were a stale-branch echo of an already-fixed
+  bug, to instead ask the narrower, more consequential question about the
+  one occurrence on the already-hardened test.
 - **No PR opened against `ci.yml` or any test** — correct per the hard gate,
   since no rerun protocol has been run and no verdict has been rendered for
   item 1, and items 2-4 need no suite change.
 
 ## 📊 Measurement
 
-- **Item 1:** 3/3 occurrences confirmed same assertion, same event-history
-  shape check, via direct job-log inspection (not inferred from job
-  conclusion alone). Not a same-commit rerun — 3 different commits — so this
-  is frequency-in-the-wild clustering evidence per this role's own Tier
-  distinctions, not a Tier-1 measured rate. Offered as grounds to prioritize
-  issue #1558's requested rerun protocol, not as a standalone rate claim.
+- **Item 1:** 3/3 occurrences confirmed same assertion via direct job-log
+  inspection; 3/3 commit trees fetched and their `integration_e2e.rs` blob
+  SHAs compared against `7fbfebb`'s diff, confirming 2 pre-hardening / 1
+  post-hardening as stated above (not inferred from panic line numbers
+  alone — the line numbers were what prompted checking, not what proved it).
+  Not a same-commit rerun for either group — this is frequency-in-the-wild
+  evidence per this role's own Tier distinctions, not a Tier-1 measured rate.
+  1 occurrence of the post-hardening failure is offered as grounds to
+  prioritize issue #1558's narrowed question, not as a rate claim.
 - **Item 2:** 0/17 sampled failures after 2026-09-14T02:29:41Z (the
   root-cause fix's merge time) carried the collision signature, against 6
   direct occurrences before it in the same 17-hour window. ~7h post-fix
@@ -194,7 +240,25 @@ mechanism, no clustering. Recorded so a repeat is recognized as a repeat.
 #     signed logs_url, then curl it directly and grep, when tail_lines=500
 #     still shows only "FAILED SUITES:" with no panic detail above it.
 
-# Item 1 mechanism corroboration:
+# Item 1 -- pre/post-hardening split (the correction):
+git show 7fbfebb -- autumn-harvest/tests/integration/integration_e2e.rs
+# diff header: index 8eeeb87..27509aa -- the pre/post blobs.
+# Then, per occurrence commit, confirm which blob it carries:
+# get_file_contents(owner, repo, path="autumn-harvest/tests/integration/integration_e2e.rs",
+#   sha=<403c0652|97969f2f|874784b9>) -- each result's "successfully
+#   downloaded text file (SHA: ...)" line names the blob directly.
+python3 -c "
+from datetime import datetime
+a = datetime.fromisoformat('2026-09-13T21:45:08')
+b = datetime.fromisoformat('2026-09-14T01:05:46')
+print('pre-hardening pair span:', b - a)          # 3:20:38, not 3:11 as first reported
+c = datetime.fromisoformat('2026-09-13T22:53:08')  # 7fbfebb merge (UTC)
+d = datetime.fromisoformat('2026-09-13T23:56:26')  # post-hardening failure
+print('fix merge to post-hardening failure:', d - c)
+"
+
+# Item 1 mechanism corroboration (still applies to the pre-hardening pair,
+# not confirmed for the post-hardening occurrence):
 grep -n "pool acquisition exceeded the tick interval" \
   <(curl -s "$SIGNED_LOG_URL_FOR_A_PASSING_workflow_retry_tests_LEG")
 sed -n '4594,4650p' autumn-harvest/src/timeout.rs
