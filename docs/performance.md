@@ -1856,6 +1856,12 @@ standalone note rather than part of the claim-path attribution table above:
   redundant second edge-set traversal in
   `critical_path::CriticalPathAnalyzer::analyze`'s sink detection, folded
   into the existing per-level DP loop (instructions -15.45%, PR #1500).
+* [`docs/performance-poison-pill-orphan-recheck.md`](performance-poison-pill-orphan-recheck.md)
+  — the per-orphan worker-liveness re-check in
+  `poison_pill::reclaim_orphaned_tasks`'s requeue path, folded into the
+  write that follows the row-lock statement, not the row lock itself
+  (3-to-2 statement reduction; total statements -33% at every swept size;
+  worker-liveness calls n → 0, PR #1545).
 * [`docs/performance-queue-coverage.md`](performance-queue-coverage.md) — the
   O(pending queues x workers x queues-per-worker) nested scan in
   `queue_coverage::partition_uncovered_and_paused`, the per-shard core of
