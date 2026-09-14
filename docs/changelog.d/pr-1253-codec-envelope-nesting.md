@@ -61,9 +61,11 @@ the append-only invariant forbids outside the two sanctioned exceptions in
 No new `WorkflowEvent` variant, no migration, no change to the
 adjacently-tagged event JSON contract.
 
-Tests: 6 new `payload_codec.rs` unit tests (flat- and nested-shaped
+Tests: 5 new `payload_codec.rs` unit tests (flat- and nested-shaped
 collision escape and round-trip, ordinary-payload non-interference, nested
 shape strictness, un-rotated real-codec byte-identity); 8 existing
-`payload_codec.rs` tests updated for the nested write shape; 2 new
-`codec_rotation_db_tests.rs` integration tests pinning the SQL predicate's
-new branch against a real sweep.
+`payload_codec.rs` tests and 4 existing `codec_rotation.rs` unit tests
+updated for the nested write shape; 2 new `codec_rotation_db_tests.rs`
+integration tests pinning the SQL predicate's new branch against a real
+sweep, plus 3 existing ones updated for the fleet-readiness gate's new
+required version.

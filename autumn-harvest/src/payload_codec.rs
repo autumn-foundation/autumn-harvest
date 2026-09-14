@@ -60,21 +60,22 @@ pub const UNDECODABLE_MARKER_KEY: &str = "_harvest_undecodable";
 /// Envelope key carrying the **codec key id** a payload was encoded under
 /// (issue #948).
 ///
-/// Optional by design. An envelope written before key rotation existed — and
-/// one written while the [`CODEC_LEGACY_KEY_ID`] key is active, which is the
-/// canonical spelling of the same thing — carries no `kid` at all. An absent
-/// `kid` **is** [`CODEC_LEGACY_KEY_ID`]; the two forms are one key id, not two.
+/// Optional by design. An envelope written before key rotation existed
+/// carries no `kid` at all. Neither does one written while the
+/// [`CODEC_LEGACY_KEY_ID`] key is active — that is the canonical spelling of
+/// the same thing. An absent `kid` **is** [`CODEC_LEGACY_KEY_ID`]. The two
+/// forms are one key id, not two.
 ///
 /// Before issue #1253, an un-rotated deployment's *encoded* envelope bytes
 /// were byte-identical to pre-#948. That claim now holds only for the
-/// overwhelmingly common case where the field is never encoded at all — an
-/// identity-codec deployment stores such a field verbatim, with no envelope,
-/// exactly as before. A field that IS encoded (a real codec, or the rare
-/// [`PayloadCodecs::encode_payload`] escape case) now always nests — see
+/// common case: the field is never encoded at all. An identity-codec
+/// deployment stores such a field verbatim, with no envelope, exactly as
+/// before. A field that IS encoded — a real codec, or the rare
+/// [`PayloadCodecs::encode_payload`] escape case — now always nests. See
 /// [`CODEC_ENVELOPE_VERSION_NESTED`].
 ///
 /// The key id rides *inside* the codec envelope, which is already opaque
-/// payload content, so rotation adds no `WorkflowEvent` variant and does not
+/// payload content. Rotation adds no `WorkflowEvent` variant, and does not
 /// touch the adjacently-tagged event JSON contract.
 pub const CODEC_ENVELOPE_KID_KEY: &str = "kid";
 
@@ -105,39 +106,43 @@ pub const CODEC_ENVELOPE_VERSION_LEGACY: i64 = 1;
 /// was never ciphertext. Version `2` is a shape no prior release could write or
 /// accept, so nothing already stored is reinterpreted.
 ///
-/// It did not, however, close the hazard going forward: a *new* business
-/// value shaped exactly like this — four keys, integer `2` under the
-/// discriminator, a `kid` passing [`validate_key_id`] — collided with it too.
-/// That is issue #1253, and the fix is [`CODEC_ENVELOPE_VERSION_NESTED`], not
-/// a version `3` flat shape (bumping the version again only relocates the
-/// same collision).
+/// It did not close the hazard going forward, however. A *new* business
+/// value shaped exactly like this one collided too: four keys, integer `2`
+/// under the discriminator, a `kid` passing [`validate_key_id`].
+///
+/// That is issue #1253. The fix is [`CODEC_ENVELOPE_VERSION_NESTED`], not a
+/// version `3` flat shape. Bumping the version again only relocates the same
+/// collision.
 pub const CODEC_ENVELOPE_VERSION_KEYED: i64 = 2;
 
-/// Discriminator shape of the **current** codec envelope (issue #1253): the
-/// payload-bearing field's *only* top-level key is [`CODEC_ENVELOPE_KEY`],
-/// and its value is an object carrying `codec_id`, an optional
-/// [`CODEC_ENVELOPE_KID_KEY`], and `data`.
+/// Discriminator shape of the **current** codec envelope (issue #1253).
+///
+/// The payload-bearing field's *only* top-level key is
+/// [`CODEC_ENVELOPE_KEY`]. Its value is an object carrying `codec_id`, an
+/// optional [`CODEC_ENVELOPE_KID_KEY`], and `data`.
 ///
 /// Nesting, not another version integer, is the fix. A flat envelope's
-/// "envelope-ness" depends on an exact combination of sibling keys, types and
-/// key count — a shape business data can coincidentally match, and every
-/// version bump so far has re-created that hazard one shape later (see
-/// [`CODEC_ENVELOPE_VERSION_KEYED`]'s doc). A nested envelope's "envelope-ness"
-/// depends on one fact: is [`CODEC_ENVELOPE_KEY`] the object's only key. That
-/// is the same convention this module's own [`UNDECODABLE_MARKER_KEY`] marker
-/// already uses safely — [`undecodable_marker`] nests under it the same way.
+/// "envelope-ness" depends on an exact combination of sibling keys, types,
+/// and key count. That is a shape business data can coincidentally match.
+/// Every version bump so far has re-created that hazard one shape later —
+/// see [`CODEC_ENVELOPE_VERSION_KEYED`]'s doc. A nested envelope's
+/// "envelope-ness" depends on one fact: is [`CODEC_ENVELOPE_KEY`] the
+/// object's only key. That is the same convention this module's own
+/// [`UNDECODABLE_MARKER_KEY`] marker already uses safely —
+/// [`undecodable_marker`] nests under it the same way.
 ///
 /// [`PayloadCodecs::encode_payload`] also refuses to let this remain merely
-/// improbable: it escapes ANY payload already shaped like a recognized
-/// envelope (this one or a legacy flat one) into a nested envelope before
-/// storing it, so nothing written from this version onward can ever collide —
-/// by construction, not by improbability. See
-/// [`PayloadCodecs::encode_payload`]'s doc for the escape mechanism and its one
-/// residual gap.
+/// improbable. It escapes any payload already shaped like a recognized
+/// envelope, nested or legacy flat, into a nested envelope before storing
+/// it. So nothing written from this version onward can ever collide — by
+/// construction, not by improbability. See
+/// [`PayloadCodecs::encode_payload`]'s doc for the escape mechanism and its
+/// one residual gap.
 ///
-/// Not stored inside the envelope itself — the nesting alone disambiguates, so
-/// there is no integer here to collide with. [`CODEC_ENVELOPE_CAPABILITY_LABEL`]
-/// advertises fleet-wide readiness to *read* this shape.
+/// Not stored inside the envelope itself — the nesting alone disambiguates,
+/// so there is no integer here to collide with.
+/// [`CODEC_ENVELOPE_CAPABILITY_LABEL`] advertises fleet-wide readiness to
+/// *read* this shape.
 pub const CODEC_ENVELOPE_VERSION_NESTED: i64 = 3;
 
 /// The designated key id for envelopes that carry no explicit
@@ -329,52 +334,59 @@ impl<'a> CodecEnvelopeParts<'a> {
 /// (`decode_payload`) and lossy (`decode_value_lossy`) read paths, so the two
 /// can never disagree about what an envelope is. Three shapes qualify.
 ///
-/// **Current (issue #1253):** [`CODEC_ENVELOPE_VERSION_NESTED`] — the
-/// payload-bearing field's only top-level key is [`CODEC_ENVELOPE_KEY`], and
-/// its value is an object with string `codec_id`, string `data`, and either
+/// **Current (issue #1253):** [`CODEC_ENVELOPE_VERSION_NESTED`]. The
+/// payload-bearing field's only top-level key is [`CODEC_ENVELOPE_KEY`].
+/// Its value is an object with string `codec_id`, string `data`, and either
 /// nothing else or a [`CODEC_ENVELOPE_KID_KEY`] that satisfies
 /// [`validate_key_id`]. [`PayloadCodecs::encode_payload`] writes this shape
-/// for a genuinely rotated key, or for its collision-escape case; see that
+/// for a genuinely rotated key, or for its collision-escape case. See that
 /// method's doc for when the flat legacy shape below is still written on
 /// purpose.
 ///
 /// **Legacy, read-only:** the flat shapes issue #948 introduced, kept so
 /// history written before #1253 keeps decoding. Both require the whole
-/// object (not a nested one) to match:
+/// object, not a nested one, to match:
 ///
 /// - [`CODEC_ENVELOPE_VERSION_LEGACY`] with **exactly three** keys —
 ///   `_harvest_codec_envelope`, string `codec_id`, string `data`.
 /// - [`CODEC_ENVELOPE_VERSION_KEYED`] with **exactly four** — those three plus
 ///   a [`CODEC_ENVELOPE_KID_KEY`] that satisfies [`validate_key_id`].
 ///
-/// Anything else is **not** an envelope: an unknown discriminator value, a
-/// legacy version carrying a `kid`, a keyed version without one, a non-string
-/// or malformed `kid`, a nested object with the wrong key count. That
-/// preserves the pre-#948 strictness against near-envelopes (offload
+/// Anything else is **not** an envelope. None of these qualify:
+///
+/// - an unknown discriminator value
+/// - a legacy version carrying a `kid`
+/// - a keyed version without one
+/// - a non-string or malformed `kid`
+/// - a nested object with the wrong key count
+///
+/// That preserves the pre-#948 strictness against near-envelopes — offload
 /// envelopes, erase tombstones, business data carrying its own `codec_id`
-/// field).
+/// field.
 ///
 /// # Why nesting, and not a version 3 flat shape
 ///
-/// Issue #1253: business data shaped *exactly* like a legacy flat envelope —
-/// three or four keys, the right discriminator, a `kid` passing
-/// [`validate_key_id`] — is structurally indistinguishable from a real one,
-/// and a pre-#948 reader that rejected the shape outright could have stored
-/// it as plaintext. Bumping the version (as issue #948 did once already, and
-/// as a hypothetical version 3 flat shape would do again) only relocates the
-/// collision: whichever shape a reader newly recognises, data coincidentally
-/// matching it stops being plaintext the moment that reader ships.
+/// Issue #1253: business data shaped *exactly* like a legacy flat envelope
+/// is structurally indistinguishable from a real one. Three or four keys,
+/// the right discriminator, a `kid` passing [`validate_key_id`] — that is
+/// all it takes. A pre-#948 reader that rejected the shape outright could
+/// have stored such data as plaintext.
+///
+/// Bumping the version only relocates the collision. Issue #948 did once
+/// already, and a hypothetical version 3 flat shape would do it again.
+/// Whichever shape a reader newly recognises, data coincidentally matching
+/// it stops being plaintext the moment that reader ships.
 ///
 /// A nested envelope's "envelope-ness" depends on one fact instead of an
 /// exact key combination: is [`CODEC_ENVELOPE_KEY`] the object's *only* key.
 /// [`PayloadCodecs::encode_payload`] makes that fact true by construction
-/// rather than by improbability, by escaping any payload already shaped like
-/// a recognized envelope (nested or legacy flat) before it is ever stored —
+/// rather than by improbability. It escapes any payload already shaped like
+/// a recognized envelope, nested or legacy flat, before it is ever stored —
 /// see that method's doc. The legacy flat shapes above keep their
-/// pre-existing, un-eliminated collision risk for rows already written; there
-/// is no way to fix that retroactively without rewriting stored history,
-/// which `harvest_events` being append-only forbids outside the two
-/// sanctioned exceptions in `CLAUDE.md`.
+/// pre-existing, un-eliminated collision risk for rows already written.
+/// There is no way to fix that retroactively without rewriting stored
+/// history, which `harvest_events` being append-only forbids outside the
+/// two sanctioned exceptions in `CLAUDE.md`.
 fn codec_envelope_parts(payload: &Value) -> Option<CodecEnvelopeParts<'_>> {
     let obj = payload.as_object()?;
     let marker = obj.get(CODEC_ENVELOPE_KEY)?;
@@ -388,8 +400,8 @@ fn codec_envelope_parts(payload: &Value) -> Option<CodecEnvelopeParts<'_>> {
 ///
 /// `obj` is the whole payload-bearing field; `nested` is the value already
 /// resolved to sit under [`CODEC_ENVELOPE_KEY`]. Requires `obj` to have no
-/// other top-level key — that is the entire structural guarantee this shape
-/// is built on, so it is checked first and unconditionally.
+/// other top-level key. That is the entire structural guarantee this shape
+/// is built on, so this checks it first and unconditionally.
 fn parse_nested_envelope<'a>(
     obj: &'a serde_json::Map<String, Value>,
     nested: &'a serde_json::Map<String, Value>,
@@ -797,27 +809,27 @@ impl PayloadCodecs {
     ///
     /// Activating a **non-legacy** key switches new writes to the nested
     /// envelope shape ([`CODEC_ENVELOPE_VERSION_NESTED`], issue #1253). A
-    /// reader built before that fix recognises an envelope only as one of the
-    /// flat shapes issue #948 introduced, and its decoder returns anything
+    /// reader built before that fix recognises an envelope only as one of
+    /// the flat shapes issue #948 introduced. Its decoder returns anything
     /// else **unchanged**:
     ///
     /// ```text
     /// let Some(parts) = codec_envelope_parts(payload) else { return Ok(payload.clone()) };
     /// ```
     ///
-    /// So a pre-#1253 worker does not reject a nested envelope loudly — it
-    /// hands the raw `{_harvest_codec_envelope: {codec_id, kid, data}}` object
-    /// to workflow code as if it were the payload. That is silent wrong data,
-    /// not an error.
+    /// So a pre-#1253 worker does not reject a nested envelope loudly. It
+    /// hands the raw `{_harvest_codec_envelope: {codec_id, kid, data}}`
+    /// object to workflow code as if it were the payload. That is silent
+    /// wrong data, not an error.
     ///
     /// Therefore: **deploy the nested-capable binary to every reader in the
     /// fleet first, and only then activate a keyed codec.** While the legacy
-    /// key is active no `kid` is written and envelopes stay flat (unless
-    /// [`PayloadCodecs::encode_payload`]'s rare collision-escape case fires —
-    /// see its doc), so the upgrade itself is safe to roll out in any order —
-    /// it is the *activation* that must come last. This crate cannot enforce
-    /// the ordering: it has no
-    /// fleet-wide view of which binaries are running.
+    /// key is active no `kid` is written and envelopes stay flat — unless
+    /// [`PayloadCodecs::encode_payload`]'s rare collision-escape case fires;
+    /// see its doc. So the upgrade itself is safe to roll out in any order.
+    /// It is the *activation* that must come last. This crate cannot
+    /// enforce the ordering: it has no fleet-wide view of which binaries
+    /// are running.
     ///
     /// # Errors
     ///
@@ -1121,10 +1133,10 @@ impl PayloadCodecs {
     /// **active** key (issue #948).
     ///
     /// Returns `payload` unchanged when the active codec is the identity
-    /// codec, UNLESS `payload` is itself already shaped like a recognized
-    /// codec envelope (nested or legacy flat) — see "The escape case" below.
-    /// The emitted envelope carries a [`CODEC_ENVELOPE_KID_KEY`] only when the
-    /// active key id is not [`CODEC_LEGACY_KEY_ID`].
+    /// codec. The one exception: `payload` is itself already shaped like a
+    /// recognized codec envelope, nested or legacy flat — see "The escape
+    /// case" below. The emitted envelope carries a [`CODEC_ENVELOPE_KID_KEY`]
+    /// only when the active key id is not [`CODEC_LEGACY_KEY_ID`].
     ///
     /// Public so the re-encryption sweep can re-encode a field it has just
     /// decoded with a retired key, without duplicating the envelope-writing
@@ -1133,38 +1145,44 @@ impl PayloadCodecs {
     /// # The escape case (issue #1253)
     ///
     /// An identity-codec deployment stores payload fields verbatim, with no
-    /// envelope at all — that is the whole point of the identity codec. If
-    /// `payload` happens to already be shaped like a codec envelope, storing
-    /// it verbatim is exactly the collision issue #1253 reports: a later
-    /// read cannot tell that plaintext apart from real ciphertext by shape
-    /// alone. So this checks [`is_codec_envelope`] before the identity
-    /// fast-path bails out, and when it matches, falls through to the normal
-    /// encode flow — which for the identity codec means wrapping `payload`
-    /// byte-for-byte (via `IdentityCodec::encode`, the identity function) in
-    /// a nested envelope naming `codec_id: "identity"`. [`decode_payload`]
-    /// reverses it the same way it reverses any other envelope, recovering
-    /// `payload` unchanged, because `"identity"` is always registered.
+    /// envelope at all. That is the whole point of the identity codec.
+    ///
+    /// If `payload` happens to already be shaped like a codec envelope,
+    /// though, storing it verbatim is exactly the collision issue #1253
+    /// reports. A later read cannot tell that plaintext apart from real
+    /// ciphertext by shape alone.
+    ///
+    /// So this checks [`is_codec_envelope`] before the identity fast-path
+    /// bails out. When it matches, encoding falls through to the normal
+    /// flow instead. For the identity codec that means wrapping `payload`
+    /// byte-for-byte — via `IdentityCodec::encode`, the identity function —
+    /// in a nested envelope naming `codec_id: "identity"`.
+    /// [`decode_payload`] reverses it the same way it reverses any other
+    /// envelope, recovering `payload` unchanged, because `"identity"` is
+    /// always registered.
     ///
     /// This closes the collision **by construction, not by improbability**,
-    /// for everything written through this method from here on: nothing this
-    /// method ever stores can be shaped like a recognized envelope without
-    /// actually being one.
+    /// for everything written through this method from here on. Nothing
+    /// this method ever stores can be shaped like a recognized envelope
+    /// without actually being one.
     ///
     /// **Residual gap.** The fleet-readiness gate
     /// (`codec_rotation::activate_codec_key`) only runs when an operator
-    /// explicitly activates a keyed codec — it is not consulted here, because
-    /// this escape path can fire on a deployment that has never rotated a key
-    /// at all. So a worker running a pre-#1253 binary cannot parse a nested
-    /// envelope this escape path wrote: it falls through
-    /// `codec_envelope_parts`'s flat-only check and hands the wrapped object
-    /// to workflow code as literal data, same as any other unrecognized
-    /// shape. That is silently wrong output, not silent data loss — the
-    /// original collision this method closes was the latter, corrupted by a
+    /// explicitly activates a keyed codec. It is not consulted here,
+    /// because this escape path can fire on a deployment that has never
+    /// rotated a key at all. So a worker running a pre-#1253 binary cannot
+    /// parse a nested envelope this escape path wrote. It falls through
+    /// `codec_envelope_parts`'s flat-only check, and hands the wrapped
+    /// object to workflow code as literal data, same as any other
+    /// unrecognized shape.
+    ///
+    /// That is silently wrong output, not silent data loss. The original
+    /// collision this method closes was the latter kind — corrupted by a
     /// re-encryption sweep that could never be undone. Triggering this gap
-    /// needs both the pre-existing collision (independently assessed as
-    /// remote) and a live mixed-binary rollout window, so it is accepted and
-    /// documented rather than gated: upgrade every reader before relying on
-    /// data that might hit it.
+    /// needs both the pre-existing collision, independently assessed as
+    /// remote, and a live mixed-binary rollout window. So it is accepted
+    /// and documented rather than gated: upgrade every reader before
+    /// relying on data that might hit it.
     ///
     /// # Errors
     ///
@@ -1272,13 +1290,15 @@ impl PayloadCodecs {
     ///
     /// **Shape (issue #1253):** nested — [`CODEC_ENVELOPE_VERSION_NESTED`] —
     /// whenever `key_id` is not [`CODEC_LEGACY_KEY_ID`] (a genuinely rotated
-    /// write) or `force_nested` is set (the [`PayloadCodecs::encode_payload`]
-    /// collision-escape case, which can arise even under the legacy key id).
+    /// write), or `force_nested` is set. That flag is the
+    /// [`PayloadCodecs::encode_payload`] collision-escape case, which can
+    /// arise even under the legacy key id.
+    ///
     /// Otherwise flat [`CODEC_ENVELOPE_VERSION_LEGACY`], byte-identical to
-    /// every pre-#948 envelope — the common case (a single non-identity
-    /// codec, no rotation ever configured) keeps writing exactly the bytes it
-    /// always has, so this fix changes nothing for the deployments that were
-    /// never at risk of the collision in the first place.
+    /// every pre-#948 envelope. The common case — a single non-identity
+    /// codec, no rotation ever configured — keeps writing exactly the bytes
+    /// it always has. So this fix changes nothing for the deployments that
+    /// were never at risk of the collision in the first place.
     fn envelope(codec_id: &str, key_id: &str, encoded: &[u8], force_nested: bool) -> Value {
         let keyed = key_id != CODEC_LEGACY_KEY_ID;
         let data = Value::from(base64::engine::general_purpose::STANDARD.encode(encoded));
@@ -2743,24 +2763,28 @@ mod tests {
     #[test]
     fn a_flat_envelope_shaped_plaintext_is_escaped_on_encode_and_round_trips() {
         // Issue #1253's acceptance criterion: store an envelope-shaped
-        // plaintext value through the identity ("prior") representation --
-        // i.e. run it through `encode_payload` with no real codec configured
-        // -- then read it back, and it must round-trip as plaintext rather
-        // than ever being classified as ciphertext.
+        // plaintext value through the identity ("prior") representation.
+        // Run it through `encode_payload` with no real codec configured,
+        // then read it back. It must round-trip as plaintext, never get
+        // classified as ciphertext.
         //
-        // Before this fix, `encode_payload`'s identity fast path returned
-        // such a value completely unchanged: exactly the collision this test
-        // guards against, because a later read could not tell it apart from
-        // a real four-key version-2 envelope.
+        // This shape -- four keys, discriminator `2`, a valid `kid` -- is
+        // EXACTLY the version-2 envelope shape. `is_codec_envelope` says so
+        // correctly below; that coincidence is the whole collision issue
+        // #1253 reports. Before this fix, `encode_payload`'s identity fast
+        // path stored such a value completely unchanged, ambiguous forever
+        // after. Any later read had no way to tell it apart from a real
+        // version-2 envelope.
         let business_data = json!({
-            CODEC_ENVELOPE_KEY: CODEC_ENVELOPE_VERSION_LEGACY,
+            CODEC_ENVELOPE_KEY: CODEC_ENVELOPE_VERSION_KEYED,
             "codec_id": "xor",
             "data": "AAAA",
             CODEC_ENVELOPE_KID_KEY: "k1",
         });
         assert!(
-            !is_codec_envelope(&business_data),
-            "sanity: this is the exact collision shape from the four-key-version-1 test above"
+            is_codec_envelope(&business_data),
+            "sanity: this business value coincidentally matches the flat version-2 shape -- \
+             that ambiguity is exactly what this test exercises"
         );
 
         let codecs = PayloadCodecs::default();
@@ -2788,8 +2812,9 @@ mod tests {
     #[test]
     fn a_nested_envelope_shaped_plaintext_is_also_escaped_on_encode() {
         // The same collision, but shaped like the CURRENT nested envelope
-        // (issue #1253) rather than a legacy flat one -- proving the escape
-        // guard checks every recognized shape, not just the ones it replaces.
+        // (issue #1253) rather than a legacy flat one. This proves the
+        // escape guard checks every recognized shape, not just the ones it
+        // replaces.
         let business_data = json!({
             CODEC_ENVELOPE_KEY: {
                 "codec_id": "evil",
@@ -2872,10 +2897,10 @@ mod tests {
     #[test]
     fn a_real_codec_without_rotation_still_writes_the_legacy_flat_shape() {
         // Scoping check: this fix must not change stored bytes for the vast
-        // majority of deployments that were never at risk of the collision
-        // -- a single non-identity codec, no key rotation ever configured.
-        // Only a genuinely rotated key, or the rare escape case, should ever
-        // produce the new nested shape.
+        // majority of deployments that were never at risk of the collision.
+        // That is a single non-identity codec, no key rotation ever
+        // configured. Only a genuinely rotated key, or the rare escape
+        // case, must ever produce the new nested shape.
         let mut codecs = PayloadCodecs::default();
         codecs.set_default(Arc::new(ReverseCodec));
         let encoded = codecs

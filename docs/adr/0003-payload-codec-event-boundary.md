@@ -103,6 +103,6 @@ window.
 
 Test: `payload_codec.rs`'s
 `a_flat_envelope_shaped_plaintext_is_escaped_on_encode_and_round_trips` stores
-the exact four-key version-1 collision shape through `encode_payload` under
-the identity codec, and asserts it round-trips byte-identical instead of
-being stored verbatim.
+the exact four-key version-2 collision shape (this issue's own reproduction)
+through `encode_payload` under the identity codec, and asserts it round-trips
+byte-identical instead of being stored verbatim.

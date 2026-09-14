@@ -365,9 +365,10 @@ mod db {
     };
 
     /// The exact SQL mirror of
-    /// [`codec_envelope_parts`](crate::payload_codec) — the current nested
+    /// [`codec_envelope_parts`](crate::payload_codec): the current nested
     /// shape (issue #1253), or one of the two flat shapes issue #948 wrote
-    /// before it, kept read-only for history written before that fix.
+    /// before it. The flat shapes are kept read-only, for history written
+    /// before issue #1253.
     ///
     /// Kept byte-for-byte in step with the Rust shape check so the census can
     /// never count a row the sweep is unable to convert (which would make the
@@ -2235,7 +2236,7 @@ mod db {
 mod tests {
     use super::*;
     use crate::payload_codec::{
-        CODEC_ENVELOPE_KID_KEY, CODEC_LEGACY_KEY_ID, CodecError, PayloadCodec,
+        CODEC_ENVELOPE_KEY, CODEC_ENVELOPE_KID_KEY, CODEC_LEGACY_KEY_ID, CodecError, PayloadCodec,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -2291,13 +2292,19 @@ mod tests {
     fn reencrypts_a_field_carrying_a_non_active_key_id() {
         let codecs = rotated_registry();
         let mut event = event_under(&codecs, "k1", json!({"user": "alice"}));
-        assert_eq!(event["data"]["input"][CODEC_ENVELOPE_KID_KEY], "k1");
+        assert_eq!(
+            event["data"]["input"][CODEC_ENVELOPE_KEY][CODEC_ENVELOPE_KID_KEY],
+            "k1"
+        );
 
         let outcome = reencrypt_event_payload_fields(&codecs, &mut event).expect("reencrypt");
 
         assert_eq!(outcome.fields_reencrypted, 1);
         assert!(outcome.changed());
-        assert_eq!(event["data"]["input"][CODEC_ENVELOPE_KID_KEY], "k2");
+        assert_eq!(
+            event["data"]["input"][CODEC_ENVELOPE_KEY][CODEC_ENVELOPE_KID_KEY],
+            "k2"
+        );
     }
 
     #[test]
@@ -2316,7 +2323,8 @@ mod tests {
             "timestamps are never touched"
         );
         assert_ne!(
-            event["data"]["input"]["data"], before["data"]["input"]["data"],
+            event["data"]["input"][CODEC_ENVELOPE_KEY]["data"],
+            before["data"]["input"][CODEC_ENVELOPE_KEY]["data"],
             "the ciphertext bytes did change"
         );
         let decoded = codecs.decode_event(event).expect("decode after sweep");
@@ -2418,7 +2426,10 @@ mod tests {
         let outcome = reencrypt_event_payload_fields(&codecs, &mut event).expect("reencrypt");
 
         assert_eq!(outcome.fields_reencrypted, 1);
-        assert_eq!(event["data"]["input"][CODEC_ENVELOPE_KID_KEY], "k2");
+        assert_eq!(
+            event["data"]["input"][CODEC_ENVELOPE_KEY][CODEC_ENVELOPE_KID_KEY],
+            "k2"
+        );
     }
 
     #[test]
@@ -2507,7 +2518,7 @@ mod tests {
         assert_eq!(outcome.fields_reencrypted, PAYLOAD_FIELD_KEYS.len());
         for key in PAYLOAD_FIELD_KEYS {
             assert_eq!(
-                event["data"][key][CODEC_ENVELOPE_KID_KEY], "k2",
+                event["data"][key][CODEC_ENVELOPE_KEY][CODEC_ENVELOPE_KID_KEY], "k2",
                 "field {key}"
             );
         }

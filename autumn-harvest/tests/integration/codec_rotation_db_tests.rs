@@ -2218,8 +2218,8 @@ async fn a_four_key_version_1_payload_is_not_counted_by_the_census() {
 
 /// Issue #1253: the census SQL must recognize the current nested envelope
 /// shape too, not just the two legacy flat ones. `append_under_key` writes
-/// real rows through `PayloadCodecs::encode_event`, which now nests any row
-/// encoded under a genuinely active (non-legacy) key -- so this exercises the
+/// real rows through `PayloadCodecs::encode_event`. That now nests any row
+/// encoded under a genuinely active (non-legacy) key. So this exercises the
 /// SQL predicate's new branch end to end, against real ciphertext.
 #[tokio::test]
 async fn a_nested_envelope_is_counted_and_swept() {
@@ -2264,9 +2264,9 @@ async fn a_nested_envelope_is_counted_and_swept() {
     );
 }
 
-/// The nested-shape sibling of `a_near_envelope_is_neither_counted_nor_swept`:
-/// business data shaped almost, but not quite, like a nested envelope (a
-/// sibling key breaking the one-key guarantee) must not be counted.
+/// The nested-shape sibling of `a_near_envelope_is_neither_counted_nor_swept`.
+/// Business data shaped almost, but not quite, like a nested envelope must
+/// not be counted -- here, a sibling key breaking the one-key guarantee.
 #[tokio::test]
 async fn a_nested_near_envelope_is_neither_counted_nor_swept() {
     use autumn_harvest::schema::harvest_events;
