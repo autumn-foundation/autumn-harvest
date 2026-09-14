@@ -369,10 +369,14 @@ struct BlockedOnData {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct WorkerListParams {
+    // `page`/`limit` are `String`, not `i64` — see `list_workers_ui`'s
+    // handling for why: an `i64`-typed field fails axum's query
+    // deserialization on non-numeric text with a bare 400 before this
+    // handler ever runs, discarding every other filter already on the URL.
     #[serde(default)]
-    page: Option<i64>,
+    page: Option<String>,
     #[serde(default)]
-    limit: Option<i64>,
+    limit: Option<String>,
     /// Filter by lifecycle status: `Active`, `Draining`, or `Stopped`.
     #[serde(default)]
     status: Option<String>,
@@ -2815,11 +2819,18 @@ async fn list_workers_ui(
     let (shard_filter, shard_raw, shard_error) =
         parse_shard_id_filter("shard", params.shard.as_deref());
 
-    let limit = params
-        .limit
-        .unwrap_or(DEFAULT_PAGE_SIZE)
-        .clamp(1, MAX_PAGE_SIZE);
-    let page = params.page.unwrap_or(0).max(0);
+    // Issue: `page`/`limit` were still typed `Option<i64>` directly on
+    // `WorkerListParams` — the two fields left over after status/stale/shard
+    // above got this same fix. A non-numeric value on either — a
+    // hand-edited URL, a bookmarked link past the current worker count, a
+    // pasted "Per page" value — failed axum's own query deserialization
+    // with a bare 400 before the filter form or any worker row rendered,
+    // discarding every other filter the operator had already entered. Same
+    // fix as `parse_page_query_field`/`parse_limit_query_field` on the
+    // Workflows page (#1540): degrade to a default and report the bad
+    // value inline instead of aborting the page.
+    let (limit, limit_raw, limit_error) = parse_limit_query_field(params.limit.as_deref());
+    let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
     let offset = page.saturating_mul(limit);
 
     let stale_threshold = api_state.worker_stale_threshold();
@@ -2918,6 +2929,9 @@ async fn list_workers_ui(
         stale_error.as_deref(),
         build_id_filter,
         params.refresh,
+        &limit_raw,
+        limit_error.as_deref(),
+        page_error.as_deref(),
     ))
 }
 
@@ -4307,6 +4321,9 @@ fn render_workers_page(
     stale_error: Option<&str>,
     build_id_filter: Option<&str>,
     refresh: Option<u64>,
+    limit_raw: &str,
+    limit_error: Option<&str>,
+    page_error: Option<&str>,
 ) -> Markup {
     let total_workers: usize = grouped.iter().map(|(_, rows)| rows.len()).sum();
 
@@ -4320,7 +4337,7 @@ fn render_workers_page(
         (render_paused_queues_banner(&paused_queues.rows, &paused_queues.unreadable_shards))
 
         // Filters
-        (render_worker_filters(status_filter, status_raw, status_error, shard_raw, shard_error, stale_only, stale_raw, stale_error, build_id_filter, limit))
+        (render_worker_filters(status_filter, status_raw, status_error, shard_raw, shard_error, stale_only, stale_raw, stale_error, build_id_filter, limit, limit_raw, limit_error))
 
         // Worker table (grouped by shard if multi-shard)
         @if total_workers == 0 && shard_errors.is_empty() {
@@ -4353,7 +4370,7 @@ fn render_workers_page(
             }
         }
 
-        (render_worker_pagination(page, limit, has_next, status_raw, shard_raw, stale_raw, build_id_filter))
+        (render_worker_pagination(page, limit, limit_raw, has_next, status_raw, shard_raw, stale_raw, build_id_filter, page_error))
     };
 
     layout_workers("Workers · Vantage", &body, refresh)
@@ -4447,8 +4464,18 @@ fn render_worker_filters(
     stale_error: Option<&str>,
     build_id_filter: Option<&str>,
     limit: i64,
+    limit_raw: &str,
+    limit_error: Option<&str>,
 ) -> Markup {
     let build_id_value = build_id_filter.unwrap_or("");
+    // Echo exactly what the operator typed on a parse failure, matching the
+    // Workflows page's `render_filters`. Fall back to the resolved value
+    // when the field was absent or already valid.
+    let limit_value = if limit_raw.is_empty() {
+        limit.to_string()
+    } else {
+        limit_raw.to_string()
+    };
     html! {
         form.filters method="get" action="workers" {
             label {
@@ -4497,7 +4524,16 @@ fn render_worker_filters(
             }
             label {
                 "Per page"
-                input type="number" name="limit" min="1" max=(MAX_PAGE_SIZE) value=(limit);
+                // `type="text"`, not `type="number"`. A number input
+                // sanitizes an invalid value (e.g. "not-a-number") to
+                // blank at render time, so the operator could never see or
+                // correct their own bad input — matches the Workflows
+                // page's "Per page" field and this page's own `shard`
+                // filter.
+                input type="text" inputmode="numeric" pattern="[0-9]*" name="limit" value=(limit_value);
+                @if let Some(error) = limit_error {
+                    span.field-error role="alert" { (error) }
+                }
             }
             button type="submit" { "Apply" }
             a.reset href="workers" { "Reset" }
@@ -4505,17 +4541,30 @@ fn render_worker_filters(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_worker_pagination(
     page: i64,
     limit: i64,
+    limit_raw: &str,
     has_next: bool,
     status_raw: &str,
     shard_raw: &str,
     stale_raw: &str,
     build_id_filter: Option<&str>,
+    page_error: Option<&str>,
 ) -> Markup {
-    let base = build_worker_query_string(limit, status_raw, shard_raw, stale_raw, build_id_filter);
+    let base = build_worker_query_string(
+        limit,
+        limit_raw,
+        status_raw,
+        shard_raw,
+        stale_raw,
+        build_id_filter,
+    );
     html! {
+        @if let Some(error) = page_error {
+            span.field-error role="alert" { (error) }
+        }
         div.pagination {
             @if page > 0 {
                 a href={ "workers?page=" (page - 1) (PreEscaped(&base)) } {
@@ -4540,13 +4589,21 @@ fn render_worker_pagination(
 
 fn build_worker_query_string(
     limit: i64,
+    limit_raw: &str,
     status_raw: &str,
     shard_raw: &str,
     stale_raw: &str,
     build_id_filter: Option<&str>,
 ) -> String {
     let mut out = String::new();
-    if limit != DEFAULT_PAGE_SIZE {
+    // `limit_raw` is non-empty only on a genuine parse failure (see
+    // `parse_limit_query_field`), never for a valid-but-clamped value. An
+    // invalid limit the operator has not yet corrected must not silently
+    // vanish from a Next/Previous link — same as the Workflows page's
+    // `build_query_string`.
+    if !limit_raw.is_empty() {
+        let _ = write!(out, "&limit={}", url_encode(limit_raw));
+    } else if limit != DEFAULT_PAGE_SIZE {
         let _ = write!(out, "&limit={limit}");
     }
     // Carry the raw text (not the parsed value) so an invalid value's inline
@@ -12766,14 +12823,14 @@ mod tests {
     #[test]
     fn build_worker_query_string_empty_defaults() {
         assert_eq!(
-            build_worker_query_string(DEFAULT_PAGE_SIZE, "", "", "", None),
+            build_worker_query_string(DEFAULT_PAGE_SIZE, "", "", "", "", None),
             ""
         );
     }
 
     #[test]
     fn build_worker_query_string_includes_all_params() {
-        let q = build_worker_query_string(10, "Active", "1", "true", None);
+        let q = build_worker_query_string(10, "", "Active", "1", "true", None);
         assert!(q.contains("limit=10"));
         assert!(q.contains("status=Active"));
         assert!(q.contains("shard=1"));
@@ -12786,7 +12843,7 @@ mod tests {
     /// filter and its inline error (Codex review, #1378 P2).
     #[test]
     fn build_worker_query_string_carries_invalid_raw_values() {
-        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, "zombie", "north", "True", None);
+        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, "", "zombie", "north", "True", None);
         assert!(
             q.contains("status=zombie"),
             "an invalid status must still round-trip through pagination: {q}"
@@ -12798,6 +12855,19 @@ mod tests {
         assert!(
             q.contains("stale=True"),
             "an invalid stale value must still round-trip through pagination: {q}"
+        );
+    }
+
+    /// Same Codex finding as the Workflows page's
+    /// `build_query_string_preserves_invalid_limit_text_for_pagination`:
+    /// `limit_raw` is non-empty only on a genuine parse failure, and must
+    /// override the resolved `limit` in the Next/Previous link rather than
+    /// being silently dropped alongside it.
+    #[test]
+    fn build_worker_query_string_preserves_invalid_limit_text_for_pagination() {
+        assert_eq!(
+            build_worker_query_string(DEFAULT_PAGE_SIZE, "not-a-number", "", "", "", None),
+            "&limit=not-a-number"
         );
     }
 
@@ -14052,6 +14122,8 @@ mod tests {
             None,
             None,
             DEFAULT_PAGE_SIZE,
+            "",
+            None,
         )
         .into_string();
         assert!(
@@ -14073,6 +14145,8 @@ mod tests {
             Some("Unknown stale value 'True'; expected 'true' or 'false'. Filter not applied."),
             None,
             DEFAULT_PAGE_SIZE,
+            "",
+            None,
         )
         .into_string();
         assert!(
@@ -14107,11 +14181,73 @@ mod tests {
             None,
             None,
             DEFAULT_PAGE_SIZE,
+            "",
+            None,
         )
         .into_string();
         assert!(
             html.contains("option value=\"zombie\" selected"),
             "the invalid status must be echoed back as the selected option: {html}"
+        );
+    }
+
+    /// GREEN — the fix under test: the Workers page's "Per page" field is a
+    /// text control, matching the Workflows page's own fix (Codex review on
+    /// #1540). A `type="number"` input sanitizes an invalid value to blank
+    /// at render time, so the operator could never see or correct their own
+    /// bad input even though the HTML source already carried it.
+    #[test]
+    fn worker_per_page_input_is_a_text_control_that_can_hold_invalid_text() {
+        let html = render_worker_filters(
+            None,
+            "",
+            None,
+            "",
+            None,
+            false,
+            "",
+            None,
+            None,
+            DEFAULT_PAGE_SIZE,
+            "not-a-number",
+            Some("Invalid limit 'not-a-number'; expected a whole number. Showing 50 per page."),
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"input type="text" inputmode="numeric" pattern="[0-9]*" name="limit""#),
+            "the Per page field must be a text control, not type=\"number\": {html}"
+        );
+        assert!(
+            html.contains("value=\"not-a-number\""),
+            "the operator's invalid input must be preserved: {html}"
+        );
+        assert!(
+            html.contains("field-error") && html.contains("not-a-number"),
+            "the limit error must render inline: {html}"
+        );
+    }
+
+    /// GREEN — the fix under test: an invalid `page` value renders a
+    /// `field-error` above the pagination controls (which have no backing
+    /// form field of their own), matching the Workflows page's
+    /// `render_pagination`.
+    #[test]
+    fn render_worker_pagination_shows_page_error() {
+        let html = render_worker_pagination(
+            0,
+            DEFAULT_PAGE_SIZE,
+            "",
+            false,
+            "",
+            "",
+            "",
+            None,
+            Some("Invalid page 'nope'; expected a whole number. Showing page 1."),
+        )
+        .into_string();
+        assert!(
+            html.contains("field-error") && html.contains("Invalid page 'nope'"),
+            "the page error must render inline: {html}"
         );
     }
 
@@ -14211,7 +14347,7 @@ mod tests {
 
     #[test]
     fn build_worker_query_string_includes_build_id() {
-        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, "", "", "", Some("abc123"));
+        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, "", "", "", "", Some("abc123"));
         assert!(
             q.contains("build_id=abc123"),
             "query string must include build_id"
