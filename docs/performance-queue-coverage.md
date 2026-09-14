@@ -118,6 +118,30 @@ harness assert a wrong expected count against the function's own correct
 output. Fixed by intersecting the deduplicated `paused` set with the
 uncovered-range name set instead of counting raw indices.
 
+**Considered and not pursued: a wider or cost-aware cutoff.** A follow-up
+review round pointed out that `<= 1` does not help an unfiltered shard with,
+say, two pending queues both covered by an early worker — that case still
+builds the full index. The `<= 1` cutoff is not arbitrary: it is the
+worst-case break-even point. Index-build cost is O(workers ×
+queues-per-worker) regardless of `pending.len()`; the direct scan's
+worst-case cost (every demand genuinely uncovered, no short-circuit) is
+O(pending × workers × queues-per-worker), which equals the index cost at
+`pending == 1` and exceeds it for any `pending > 1`. "Many genuinely
+uncovered queues, no short-circuit" is this endpoint's own documented real
+scenario, not a corner case, so preserving that worst-case bound is the
+priority. Closing the gap the review raised (few pending, mostly covered by
+an early worker) would need a genuinely cost-aware hybrid — scan directly
+while counting worker-visits, and only build the index if that count
+crosses what building it would have cost. That is real, additional,
+stateful complexity, and there is no profiling evidence this workload shape
+(small unfiltered `pending`, mostly covered) occurs on any real deployment;
+the two shapes this page can point to and has measured are the
+`?queue_name=`-filtered single row and the fleet-wide scan in the thousands.
+Shipping the hybrid anyway would be exactly the unmeasured tuning this
+agent's own charter rules out. Left as a documented trade-off rather than a
+follow-up PR, pending production telemetry on `pending.len()`'s real
+distribution.
+
 Behavior is unchanged: a queue is covered iff at least one live,
 shard-assigned worker lists it, exactly as before — all 35 `queue_coverage`
 unit tests (including the full `worker_covers_queue` liveness/shard/queue
