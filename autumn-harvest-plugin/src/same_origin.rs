@@ -17,9 +17,18 @@
 //!
 //! # Exemptions
 //!
-//! Two request shapes skip the check, because neither can be produced by a
-//! bare cross-site `<form>` submission:
+//! Three request shapes skip the check, because none can be produced by a
+//! bare cross-site `<form>` submission or a cross-site `no-cors` fetch:
 //!
+//! - **A method other than `POST`.** A `<form>` can only ever submit `GET`
+//!   or `POST`. `PUT`, `PATCH`, and `DELETE` are not CORS-simple methods at
+//!   all. A cross-site `fetch`/XHR in `no-cors` mode cannot send them, and
+//!   any other mode needs a preflight this server does not answer. A route
+//!   reached over `POST` through autumn-web's HTML method-override
+//!   convention is still safe. That convention rewrites `POST` to
+//!   `PUT`/`PATCH`/`DELETE` on a hidden `_method` form field, and the
+//!   rewrite carries its own, stricter same-origin check upstream of this
+//!   layer.
 //! - **A non-CORS-simple `Content-Type`.** A `<form>` can only emit
 //!   `application/x-www-form-urlencoded`, `multipart/form-data`, or
 //!   `text/plain`. Anything else — `application/json`, most of all — needs a
@@ -46,25 +55,18 @@ const REJECTION_MESSAGE: &str = "cross-site request rejected";
 /// Mount with `axum::middleware::from_fn`. Carries no state, so it composes
 /// with `require_harvest_admin` in either order.
 pub(crate) async fn require_same_origin(request: Request, next: Next) -> Response {
-    if is_exempt(&request) || passes_same_origin_check(request.headers()) {
+    if is_exempt(&request) || is_same_origin(request.headers()) {
         return next.run(request).await;
     }
     (StatusCode::FORBIDDEN, REJECTION_MESSAGE).into_response()
 }
 
-/// Requests this layer never inspects: safe methods, non-CORS-simple bodies,
-/// and callers already holding an explicit bearer credential.
+/// Requests this layer never inspects: non-`POST` methods, non-CORS-simple
+/// bodies, and callers already holding an explicit bearer credential.
 fn is_exempt(request: &Request) -> bool {
-    is_safe_method(request.method())
+    request.method() != Method::POST
         || !is_cors_simple_content_type(request.headers())
         || request.extensions().get::<TokenPrincipal>().is_some()
-}
-
-const fn is_safe_method(method: &Method) -> bool {
-    matches!(
-        method,
-        &Method::GET | &Method::HEAD | &Method::OPTIONS | &Method::TRACE
-    )
 }
 
 /// Whether `headers` carries one of the three content types a plain HTML
@@ -85,7 +87,7 @@ fn is_cors_simple_content_type(headers: &HeaderMap) -> bool {
 
 /// The Fetch Metadata / `Origin` same-origin check. Pure function of the
 /// request headers, so it is unit-testable without building a full request.
-fn passes_same_origin_check(headers: &HeaderMap) -> bool {
+fn is_same_origin(headers: &HeaderMap) -> bool {
     if let Some(site) = headers.get("sec-fetch-site") {
         return site
             .to_str()
@@ -99,10 +101,42 @@ fn passes_same_origin_check(headers: &HeaderMap) -> bool {
     let (Ok(origin), Ok(host)) = (origin.to_str(), host.to_str()) else {
         return false;
     };
-    let authority = origin
+    let Some((origin_scheme, origin_authority)) = split_origin(origin) else {
+        return false;
+    };
+    if !origin_authority.eq_ignore_ascii_case(host) {
+        return false;
+    }
+    // A TLS-terminating proxy is the only reliable source for the scheme the
+    // browser actually used; a plain request carries none. When it is
+    // absent, fall back to the authority match alone — the same trade-off
+    // autumn-web's own method-override same-origin check documents and
+    // accepts.
+    forwarded_scheme(headers).is_none_or(|expected| origin_scheme.eq_ignore_ascii_case(expected))
+}
+
+/// Split an `Origin` header value into its scheme and authority
+/// (`host[:port]`), e.g. `"https://dashboard.example"` -> `("https",
+/// "dashboard.example")`. Returns `None` for an opaque origin (`"null"`) or
+/// any value that is not `http://` or `https://`.
+fn split_origin(origin: &str) -> Option<(&str, &str)> {
+    origin
         .strip_prefix("https://")
-        .or_else(|| origin.strip_prefix("http://"));
-    authority.is_some_and(|a| a.eq_ignore_ascii_case(host))
+        .map(|authority| ("https", authority))
+        .or_else(|| {
+            origin
+                .strip_prefix("http://")
+                .map(|authority| ("http", authority))
+        })
+}
+
+/// The scheme a TLS-terminating proxy reports via `X-Forwarded-Proto`, or
+/// `None` when the header is absent. Takes the leftmost value of a
+/// comma-separated proxy chain, matching `X-Forwarded-For` convention.
+fn forwarded_scheme(headers: &HeaderMap) -> Option<&str> {
+    let raw = headers.get("x-forwarded-proto")?.to_str().ok()?;
+    let scheme = raw.split(',').next().unwrap_or(raw).trim();
+    (!scheme.is_empty()).then_some(scheme)
 }
 
 #[cfg(test)]
@@ -111,13 +145,14 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
-    use axum::routing::{get, post};
+    use axum::routing::{delete, get, post};
     use tower::ServiceExt as _;
 
     fn app() -> Router {
         Router::new()
             .route("/mutate", post(|| async { "ok" }))
             .route("/read", get(|| async { "ok" }))
+            .route("/delete", delete(|| async { "ok" }))
             .layer(axum::middleware::from_fn(require_same_origin))
     }
 
@@ -180,6 +215,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_origin_is_rejected_when_proxy_reports_https() {
+        // A TLS-terminating proxy reports the real scheme via
+        // `X-Forwarded-Proto`. An `http://` Origin on the same host is a
+        // scheme downgrade, not the same origin, even though the host
+        // matches.
+        let status = post_with_headers(&[
+            ("origin", "http://dashboard.example"),
+            ("host", "dashboard.example"),
+            ("x-forwarded-proto", "https"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn https_origin_passes_when_proxy_reports_https() {
+        let status = post_with_headers(&[
+            ("origin", "https://dashboard.example"),
+            ("host", "dashboard.example"),
+            ("x-forwarded-proto", "https"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn forwarded_proto_takes_the_leftmost_value_of_a_chain() {
+        let status = post_with_headers(&[
+            ("origin", "https://dashboard.example"),
+            ("host", "dashboard.example"),
+            ("x-forwarded-proto", "https, http"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn http_origin_passes_without_a_proxy_scheme_signal() {
+        // No `X-Forwarded-Proto` means the scheme cannot be observed. Falling
+        // back to the authority match alone matches autumn-web's own
+        // method-override same-origin check.
+        let status = post_with_headers(&[
+            ("origin", "http://dashboard.example"),
+            ("host", "dashboard.example"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn neither_header_is_rejected() {
         let status = post_with_headers(&[]).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -192,18 +277,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_without_origin_is_rejected() {
+        let status = post_with_headers(&[("host", "dashboard.example")]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn opaque_null_origin_is_rejected() {
         let status = post_with_headers(&[("origin", "null"), ("host", "dashboard.example")]).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
-    async fn safe_method_is_never_checked() {
+    async fn get_is_never_checked() {
         let response = app()
             .oneshot(
                 HttpRequest::builder()
                     .method("GET")
                     .uri("/read")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn delete_is_never_checked() {
+        // DELETE is not a CORS-simple method. A cross-site `<form>` cannot
+        // send it, and a cross-site `fetch`/XHR needs a preflight this
+        // server does not answer. So this layer only ever checks POST.
+        let response = app()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("DELETE")
+                    .uri("/delete")
                     .body(Body::empty())
                     .unwrap(),
             )

@@ -1448,6 +1448,8 @@ async fn drive_nested(app: &Router, method: Method, uri: &str) -> (StatusCode, S
     let req = Request::builder()
         .method(method)
         .uri(uri)
+        // issue #1278: required by the same-origin guard on a POST.
+        .header("sec-fetch-site", "same-origin")
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();

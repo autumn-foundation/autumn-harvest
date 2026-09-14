@@ -371,6 +371,8 @@ async fn post_diagnosis(app: &HarvestApiApp, id: &str) -> (StatusCode, Value) {
                 .method("POST")
                 .uri(format!("/workflows/{id}/replay-diagnosis"))
                 .header("x-harvest-admin", "true")
+                // issue #1278: required by the same-origin guard.
+                .header("sec-fetch-site", "same-origin")
                 .body(Body::empty())
                 .unwrap(),
         )
