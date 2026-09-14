@@ -18,6 +18,16 @@ gate's letter ("you may not start building until [pre-registration is
 committed]") was not honored in sequence. Recorded as a process lapse,
 not excused as harmless by assertion.
 
+**Remediated, per PR review, not left as a disclosed defect:** a reviewer
+correctly rejected disclosure alone as insufficient to restore the
+required sequencing. The run built under that lapse was discarded outright
+— its numbers are not reported anywhere as evidence. The apparatus was
+`cargo clean`'d (996.6 MiB removed) and rebuilt from scratch, and the
+registered paced sweep in
+`docs/assays/0009-redis-dispatch-tail-latency-post-sampler-fix.md` was
+rerun in full, both actions taken well after this commit. The verdict in
+that report rests on the clean rerun only.
+
 ## 🎯 Question
 
 Assay ledger #8 killed the integrated Redis dispatch path on two of three

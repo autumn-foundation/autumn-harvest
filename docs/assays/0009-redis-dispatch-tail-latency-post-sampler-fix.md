@@ -1,4 +1,4 @@
-# ⛏️ Prospect: does Redis dispatch clear the L3 tail-latency line now that the sampler confound is fixed? (pursue: 63.69 ms mean vs 250 ms line, ledger #9)
+# ⛏️ Prospect: does Redis dispatch clear the L3 tail-latency line now that the sampler confound is fixed? (pursue: 50.02 ms mean vs 250 ms line, ledger #9)
 
 ## 🎯 Question
 
@@ -37,7 +37,12 @@ both places), before any measurement was taken:
 against the hard gate's letter: the archived apparatus's background
 rebuild (unmodified source) had already started a few minutes earlier,
 though no output existed yet and nothing about the plan below was written
-with any measurement in hand.
+with any measurement in hand. **Remediated, not just disclosed:** PR
+review correctly rejected disclosure alone as insufficient, so the first
+run built under that lapse was discarded and the apparatus was `cargo
+clean`'d and rebuilt from scratch, then rerun in full, unambiguously
+after this commit. The data reported below is from that clean rerun —
+see the note in the Apparatus section.
 
 - **Line (unchanged from #8's L3):** Redis arm p99 dispatch latency **≤ 250
   ms**, mean over 3 reps, paced shape. Kill if above.
@@ -103,6 +108,22 @@ its numbers are not reported as data (n=432 per arm, well under the
 registered rep's n=2,595) and did not affect the registered run's
 configuration.
 
+**A first registered run was discarded, not disclosed-and-kept, after PR
+review correctly rejected disclosure as an insufficient remedy.** The
+apparatus's background `cargo build --release` for that run had started
+around 09:06 UTC, a few minutes before the 09:09:34 pre-registration
+commit (`704c8c5`) — no measurement existed at commit time and nothing
+below was written with any result in hand, but the hard gate's letter
+("no building before pre-registration") was violated in sequence, and a
+reviewer correctly held that annotating the report afterward doesn't
+restore it. The fix: `cargo clean` (996.6 MiB of build output removed,
+confirmed empty), a full `cargo build --release` from scratch, and the
+registered paced sweep rerun in full — all executed now, unambiguously
+after the pre-registration commit. The data and verdict below are from
+that clean rerun; the first run's numbers (redis p99 mean 63.69 ms,
+control 35.21 ms) are superseded and not reported as evidence, though
+they told the same story.
+
 ## 📊 Assay
 
 Paced shape, 86.52 workflows/s target, 30 s per rep, 3 reps, alternating
@@ -110,16 +131,16 @@ arms, same invocation as #8's own reproduce block:
 
 | arm | rep | target wf/s | started | achieved wf/s | n | activity p50 ms | **activity p99 ms** | all-task p50 ms | all-task p99 ms | negative samples |
 |:--|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| redis | 1 | 86.52 | 2,595 | 86.09 | 2,595 | 5.711 | **81.091** | 5.228 | 83.433 | 0 |
-| control | 1 | 86.52 | 2,595 | 85.78 | 2,595 | 7.316 | 34.020 | 7.973 | 35.774 | 176 |
-| redis | 2 | 86.52 | 2,595 | 86.22 | 2,595 | 5.131 | **54.082** | 4.660 | 50.020 | 0 |
-| control | 2 | 86.52 | 2,595 | 85.35 | 2,595 | 7.888 | 30.535 | 8.506 | 34.319 | 147 |
-| redis | 3 | 86.52 | 2,595 | 86.09 | 2,595 | 5.915 | **55.890** | 5.479 | 54.653 | 0 |
-| control | 3 | 86.52 | 2,595 | 85.86 | 2,595 | 7.449 | 41.076 | 7.990 | 42.636 | 173 |
+| redis | 1 | 86.52 | 2,595 | 86.21 | 2,595 | 5.072 | **61.337** | 4.630 | 56.047 | 0 |
+| control | 1 | 86.52 | 2,595 | 86.01 | 2,595 | 6.810 | 28.745 | 7.343 | 30.222 | 167 |
+| redis | 2 | 86.52 | 2,595 | 86.13 | 2,595 | 5.127 | **33.522** | 4.728 | 32.752 | 0 |
+| control | 2 | 86.52 | 2,595 | 85.80 | 2,595 | 6.954 | 27.582 | 7.373 | 27.714 | 178 |
+| redis | 3 | 86.52 | 2,595 | 85.93 | 2,595 | 6.250 | **55.204** | 5.777 | 56.297 | 0 |
+| control | 3 | 86.52 | 2,595 | 85.83 | 2,595 | 7.112 | 27.571 | 7.638 | 28.776 | 165 |
 
-Redis arm mean **p99 63.69 ms** (range 54.08–81.09 ms) on the activity
-population; control arm mean **p99 35.21 ms** (range 30.54–41.08 ms).
-Redis arm mean p50 5.59 ms, control arm mean p50 7.55 ms. `negative`
+Redis arm mean **p99 50.02 ms** (range 33.52–61.34 ms) on the activity
+population; control arm mean **p99 27.97 ms** (range 27.57–28.75 ms).
+Redis arm mean p50 5.48 ms, control arm mean p50 6.96 ms. `negative`
 samples on the control arm (event-ordering artifacts already present and
 unexplained in #8) recur at similar counts; the Redis arm shows none in
 either assay, consistent with #8.
@@ -134,15 +155,15 @@ different host:
 
 | | #8 (2026-09-07) | #9 (this run) | ratio |
 |:--|--:|--:|--:|
-| Redis p99 mean | 426.96 ms | 63.69 ms | 6.7x lower |
-| Control p99 mean | 146.09 ms | 35.21 ms | 4.1x lower |
-| Redis p50 mean | 6.55 ms | 5.59 ms | 1.2x lower |
+| Redis p99 mean | 426.96 ms | 50.02 ms | 8.5x lower |
+| Control p99 mean | 146.09 ms | 27.97 ms | 5.2x lower |
+| Redis p50 mean | 6.55 ms | 5.48 ms | 1.2x lower |
 
 ## 🏁 Verdict
 
-**Pursue, against the pre-set line — clear.** Redis arm p99 mean 63.69 ms
-against a ≤250 ms line: 3.9x of headroom on the mean, and every individual
-rep clears independently (worst rep 81.091 ms, still 3.1x under the line).
+**Pursue, against the pre-set line — clear.** Redis arm p99 mean 50.02 ms
+against a ≤250 ms line: 5.0x of headroom on the mean, and every individual
+rep clears independently (worst rep 61.337 ms, still 4.1x under the line).
 The correctness precondition held in all six runs. L3, as re-chartered,
 passes.
 
