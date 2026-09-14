@@ -3787,14 +3787,29 @@ pub mod db {
         let inflight = super::inflight_target();
         let per_shard_total = super::measured_workflows_per_shard();
         let warm_per_shard = warmup_batch_for(per_shard_total);
-        let warm_loops =
-            run_closed_loop(&cluster, "warm", warm_per_shard, inflight, deadline).await;
+        let warm_loops = run_closed_loop(
+            &cluster,
+            "warm",
+            warm_per_shard,
+            inflight,
+            deadline,
+            &census,
+        )
+        .await;
         let warm_drained: Vec<u64> = warm_loops
             .iter()
             .map(|l| u64::try_from(l.completed).unwrap_or(0))
             .collect();
 
-        let loops = run_closed_loop(&cluster, "meas", per_shard_total, inflight, deadline).await;
+        let loops = run_closed_loop(
+            &cluster,
+            "meas",
+            per_shard_total,
+            inflight,
+            deadline,
+            &census,
+        )
+        .await;
         let requested = per_shard_total * shards.len();
 
         // Completion instants come from the database clock (`completed_at`), so
@@ -3933,6 +3948,7 @@ pub mod db {
         per_shard: usize,
         inflight: usize,
         deadline: Instant,
+        census: &super::TaskCensus,
     ) -> Vec<LoopOutcome> {
         // A `JoinSet`, not loose `JoinHandle`s: if one shard's loop panics, the
         // `expect` below unwinds and dropping loose handles would DETACH the
@@ -3941,6 +3957,11 @@ pub mod db {
         // (Codex review round 3, PR #1282). Dropping a `JoinSet` aborts what it
         // owns, so the containment in `benches/e2e_bench.rs` actually contains.
         //
+        // Each task also holds a `census` guard. Dropping the `JoinSet` on a
+        // forced abort only requests cancellation, same as `Fleet`'s
+        // handles. The caller needs the same way to learn once the feeder
+        // connections these tasks own have actually closed.
+        //
         // Results come back in completion order, so each task carries its shard
         // index and the outcomes are restored to shard order before returning --
         // every per-shard verdict downstream is reported against a shard number.
@@ -3948,7 +3969,9 @@ pub mod db {
         for (idx, shard) in cluster.shard_ids().into_iter().enumerate() {
             let url = cluster.urls[&shard].clone();
             let cohort = cohort.to_owned();
+            let guard = census.enter();
             tasks.spawn(async move {
+                let _guard = guard;
                 (
                     idx,
                     closed_loop_on_shard(&url, shard, &cohort, per_shard, inflight, deadline).await,
@@ -4054,17 +4077,24 @@ pub mod db {
         count: usize,
         per_shard_rate: f64,
         deadline: Instant,
+        census: &super::TaskCensus,
     ) -> (Vec<ExecutionId>, std::time::Duration) {
         let period = std::time::Duration::from_secs_f64(1.0 / per_shard_rate);
         let started = Instant::now();
         // `JoinSet` for the same reason as `run_closed_loop`: a panic in one
         // shard's seeder must not detach its siblings onto the rest of the sweep.
+        // Each task also holds a `census` guard, for the same reason
+        // `run_closed_loop`'s does. A forced abort only requests the
+        // `JoinSet`'s cancellation. The caller needs a way to learn once
+        // this task's own connection has actually closed.
         let mut tasks = tokio::task::JoinSet::new();
         for shard in cluster.shard_ids() {
             let url = cluster.urls[&shard].clone();
             let workflow_name = workflow_name.to_owned();
             let cohort = cohort.to_owned();
+            let guard = census.enter();
             tasks.spawn(async move {
+                let _guard = guard;
                 let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
                     .await
                     .expect("connect for paced seeding");
@@ -4152,6 +4182,7 @@ pub mod db {
             DISPATCH_WORKFLOWS_PER_SHARD,
             PACED_STARTS_PER_SEC_PER_SHARD,
             deadline,
+            &census,
         )
         .await;
         let requested = paced_ids.len();
