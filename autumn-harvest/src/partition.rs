@@ -5510,6 +5510,18 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // `docs/partitioned-events.md` still supports 14. A literal
         // reference there would fail this `DO` block to parse on every
         // supported-14 deployment, even one with no invalid index at all.
+        //
+        // Review finding: the shape checks never looked at the access
+        // method. Every reserved name here is built as a btree. Take an
+        // operator's own failed `CREATE INDEX CONCURRENTLY ... USING
+        // hash` at the same reserved name, over the same columns. It
+        // can still pass every other check. A hash opclass can be the
+        // default one too, and hash carries no sort options, so
+        // `indoption` is all zero regardless. Left unchecked, this loop
+        // would drop that operator's index and replace it with
+        // harvest's own btree. That is exactly the "destroy the
+        // unrelated object" outcome the rest of this shape rigor exists
+        // to refuse instead of doing.
         step(2, "BEGIN".to_string()),
         step(2, format!("SET LOCAL lock_timeout = '{lock_ms}ms'")),
         step(
@@ -5520,7 +5532,7 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
                  i.indrelid AS reloid, i.indkey AS indkey, i.indnkeyatts AS nkeyatts,\n                            \
                  i.indnatts AS natts, i.indisunique AS uniq,\n                            \
                  i.indpred AS pred, i.indexprs AS exprs, i.indclass AS opclasses,\n                            \
-                 i.indoption AS opts\n                       \
+                 i.indoption AS opts, c.relam AS relam\n                       \
                  FROM pg_class c\n                \
                  JOIN pg_index i ON i.indexrelid = c.oid\n                \
                  JOIN pg_namespace n2 ON n2.oid = c.relnamespace\n               \
@@ -5531,6 +5543,7 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
                  'idx_harvest_we_created_at')\n    \
                  LOOP\n        \
                  ok := idx.pred IS NULL AND idx.exprs IS NULL\n              \
+                 AND idx.relam = (SELECT oid FROM pg_am WHERE amname = 'btree')\n              \
                  AND NOT EXISTS (SELECT 1 FROM unnest(idx.opclasses) AS oc(opclass)\n                             \
                  JOIN pg_opclass op ON op.oid = oc.opclass WHERE NOT op.opcdefault)\n              \
                  AND NOT EXISTS (SELECT 1 FROM unnest(idx.opts) AS o(bits) WHERE bits <> 0);\n        \

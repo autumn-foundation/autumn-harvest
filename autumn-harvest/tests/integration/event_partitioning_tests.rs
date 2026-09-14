@@ -6802,6 +6802,70 @@ async fn phase_2_refuses_an_invalid_nulls_not_distinct_impostor_of_the_pk_index(
 }
 
 #[tokio::test]
+async fn phase_2_refuses_an_invalid_impostor_using_a_different_access_method() {
+    // Review finding: the shape checks never looked at the access
+    // method. An invalid index could sit at the reserved
+    // `idx_harvest_we_created_at` name, on the right table and column,
+    // non-unique like harvest's own. It could still be built `USING
+    // hash` instead of btree. A hash opclass can be the default one
+    // too, and hash carries no sort options, so every other check here
+    // passes. It
+    // must still refuse rather than being treated as this plan's own
+    // remnant and dropped in favor of harvest's btree.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP INDEX IF EXISTS idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query(
+        "CREATE INDEX idx_harvest_we_created_at \
+         ON harvest_workflow_executions USING hash (created_at)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an impostor index with the reserved name and column, but a hash access method");
+    invalidate_index(&mut conn, "idx_harvest_we_created_at").await;
+
+    run_plan_phases(&mut conn, 1..=1).await;
+
+    let mut refusal: Option<String> = None;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 2)
+    {
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            refusal = Some(e.to_string());
+        }
+    }
+    let msg = refusal.expect(
+        "phase 2 must refuse an invalid hash-access-method impostor of the reserved \
+         index, not treat it as this plan's own remnant",
+    );
+    assert!(
+        msg.contains("idx_harvest_we_created_at"),
+        "the refusal must name the offending index; got {msg}"
+    );
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT EXISTS (SELECT 1 FROM pg_class c \
+             JOIN pg_am am ON am.oid = c.relam \
+             WHERE c.relname = 'idx_harvest_we_created_at' AND am.amname = 'hash') AS v",
+        )
+        .await,
+        "the operator's hash-access-method impostor must survive untouched"
+    );
+
+    diesel::sql_query("DROP INDEX idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .expect("drop the impostor index");
+}
+
+#[tokio::test]
 async fn the_lock_window_refuses_to_open_over_an_invalid_index() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
