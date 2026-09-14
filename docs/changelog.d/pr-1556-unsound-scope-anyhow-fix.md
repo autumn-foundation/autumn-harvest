@@ -1,4 +1,4 @@
-## Dependency ledger: `unsound` advisory scope gap + anyhow RUSTSEC-2026-0190 fix (PR #1555)
+## Dependency ledger: `unsound` advisory scope gap + anyhow RUSTSEC-2026-0190 fix (PR #1556)
 
 Routine Ballast ledger sweep. `cargo deny check` came back fully green (no
 errors), but with one warning: the `RUSTSEC-2026-0253` (lru) ignore entry in
