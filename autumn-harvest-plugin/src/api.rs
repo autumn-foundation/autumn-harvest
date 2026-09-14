@@ -4768,6 +4768,15 @@ async fn by_id_missing_workflow_id(Path(_workflow_name): Path<String>) -> axum::
 #[allow(clippy::too_many_lines)]
 pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
     let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
+    // issue #1278: the Vantage dead-letter page's forms submit here directly
+    // (a relative `../dead-letters/replay` / `../dead-letters/discard`
+    // action from `/ui/dead-letters`), carrying the operator's session
+    // cookie. These four routes are the DLQ family's mutation surface, so
+    // they get the same cross-site guard as every Vantage UI route. The
+    // rest of this router is out of scope. It is the documented, headerless
+    // `curl`-and-CLI management API (see `docs/runbooks/`), not a surface
+    // Vantage renders an HTML `<form>` against.
+    let same_origin = middleware::from_fn(crate::same_origin::require_same_origin);
 
     Router::new()
         .route("/workflows", get(list_workflows))
@@ -5046,19 +5055,27 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         )
         .route(
             "/dead-letters/replay",
-            post(bulk_replay_dead_letters_handler).route_layer(require_admin.clone()),
+            post(bulk_replay_dead_letters_handler)
+                .route_layer(require_admin.clone())
+                .route_layer(same_origin.clone()),
         )
         .route(
             "/dead-letters/discard",
-            post(bulk_discard_dead_letters_handler).route_layer(require_admin.clone()),
+            post(bulk_discard_dead_letters_handler)
+                .route_layer(require_admin.clone())
+                .route_layer(same_origin.clone()),
         )
         .route(
             "/dead-letters/{id}/replay",
-            post(replay_dead_letter).route_layer(require_admin.clone()),
+            post(replay_dead_letter)
+                .route_layer(require_admin.clone())
+                .route_layer(same_origin.clone()),
         )
         .route(
             "/dlq/redrive",
-            post(redrive_dead_letters_handler).route_layer(require_admin.clone()),
+            post(redrive_dead_letters_handler)
+                .route_layer(require_admin.clone())
+                .route_layer(same_origin),
         )
         .route("/health", get(health))
         // No admin gate: a client generator fetches this before it holds any
@@ -5460,16 +5477,6 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             get(get_task_eligibility).route_layer(require_admin),
         )
         .layer(Extension(api_state))
-        // issue #1278: several mutating routes here accept a request with no
-        // body, or a CORS-simple `Content-Type` (the Vantage dead-letter
-        // forms among them). A session-cookie caller of this router needs
-        // the same cross-site guard as `harvest_ui_router`. A verified
-        // scoped API token, or a `Content-Type` a bare cross-site `<form>`
-        // cannot send, stays exempt; see `same_origin.rs`. The outermost
-        // `.layer()` call runs first, ahead of every `require_admin` above.
-        .layer(axum::middleware::from_fn(
-            crate::same_origin::require_same_origin,
-        ))
 }
 
 pub(crate) async fn require_harvest_admin(

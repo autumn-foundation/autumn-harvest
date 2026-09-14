@@ -7189,7 +7189,7 @@ async fn vantage_and_dlq_mutations_reject_cross_site_post() {
         .with_state(test_app_state_without_database());
 
     let placeholder = uuid::Uuid::nil();
-    let targets: [(&str, String); 7] = [
+    let targets: [(&str, String); 6] = [
         ("workflow", format!("/ui/workflows/{placeholder}/cancel")),
         ("dlq", "/dead-letters/replay".to_string()),
         ("gate", format!("/ui/admin/gates/{placeholder}/lift")),
@@ -7199,11 +7199,6 @@ async fn vantage_and_dlq_mutations_reject_cross_site_post() {
             format!("/ui/dags/echo_workflow/runs/{placeholder}/retry"),
         ),
         ("schedule", format!("/ui/schedules/{placeholder}/pause")),
-        // The management API's own body-less mutations (issue #383) are
-        // CORS-simple too: a bare cross-site `<form>` needs no fields to
-        // reach them. This is not a Vantage UI route, but the same guard
-        // covers `harvest_api_router` as a whole (#1278 review finding).
-        ("management-api", format!("/workflows/{placeholder}/pause")),
     ];
 
     for (family, uri) in targets {

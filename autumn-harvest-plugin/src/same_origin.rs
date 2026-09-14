@@ -19,10 +19,21 @@
 //! `Origin` is rejected — it is never admitted by
 //! default.
 //!
+//! `Sec-Fetch-Site`, when present, is always decisive — checked before
+//! anything else below, including `Content-Type`. A browser sends it on
+//! *every* request it originates, not only `fetch`/XHR. Hyperlink auditing
+//! (`<a ping>`) and `navigator.sendBeacon` are two mechanisms that reach a
+//! server with a non-CORS-simple `Content-Type` and no preflight. So
+//! treating "not CORS-simple" as proof of safety on its own would be
+//! wrong. `Sec-Fetch-Site` closes that gap: a truthful `cross-site` (or
+//! `same-site`, or `none`) rejects the request regardless of what its body
+//! looks like.
+//!
 //! # Exemptions
 //!
-//! Four request shapes skip the check. None can be produced by a bare
-//! cross-site `<form>` submission or a cross-site `no-cors` fetch:
+//! Three request shapes skip the check outright, before `Sec-Fetch-Site` is
+//! even read. None can be produced by a bare cross-site `<form>`
+//! submission or a cross-site `no-cors` fetch:
 //!
 //! - **A method other than `POST`.** A `<form>` can only ever submit `GET`
 //!   or `POST`. `PUT`, `PATCH`, and `DELETE` are not CORS-simple methods at
@@ -33,25 +44,27 @@
 //!   `PUT`/`PATCH`/`DELETE` on a hidden `_method` form field, and the
 //!   rewrite carries its own, stricter same-origin check upstream of this
 //!   layer.
-//! - **A non-CORS-simple `Content-Type`.** A `<form>` can only emit
-//!   `application/x-www-form-urlencoded`, `multipart/form-data`, or
-//!   `text/plain`. Anything else — `application/json`, most of all — needs a
-//!   CORS preflight the attacker's page cannot pass.
 //! - **The `X-Harvest-Source: cli` header the `harvest` CLI sends on every
 //!   mutation** (`autumn-harvest-cli/src/lib.rs`). A custom header is not
 //!   CORS-safelisted. A bare cross-site `<form>` cannot add it at all, and a
 //!   cross-site `fetch`/XHR that tries needs a preflight this server does
-//!   not answer. This is deliberately narrower than "no session cookie".
-//!   An embedder may use browser-cached HTTP Basic or Digest auth instead
-//!   of a cookie. That credential rides along on a forged cross-site
-//!   request too, with no `Cookie` header in sight. So cookielessness
-//!   alone does not prove a request is not a browser.
+//!   not answer.
 //! - **A request carrying a [`TokenPrincipal`](crate::api_token::TokenPrincipal).**
 //!   A verified scoped API token is an explicit credential. A browser never
 //!   attaches one on its own, so it carries none of the ambient-credential
 //!   risk this layer defends against.
 //!   [`require_harvest_admin`](crate::api::require_harvest_admin) draws the
 //!   same line.
+//!
+//! A fourth shape is admitted only as a last resort, after `Sec-Fetch-Site`
+//! and `Origin` have both been checked and neither was present: a
+//! non-CORS-simple `Content-Type`. `application/json` is the one that
+//! matters most — the documented, headerless `curl`-based runbooks this
+//! router also serves use it. Reaching this router with that content type
+//! normally needs a CORS preflight this server does not answer. The one
+//! exception is `<a ping>`/`sendBeacon`, which is exactly why
+//! `Sec-Fetch-Site` is checked first rather than treating the content type
+//! alone as proof.
 
 use autumn_web::reexports::axum;
 use axum::extract::Request;
@@ -74,12 +87,11 @@ pub(crate) async fn require_same_origin(request: Request, next: Next) -> Respons
     (StatusCode::FORBIDDEN, REJECTION_MESSAGE).into_response()
 }
 
-/// Requests this layer never inspects: non-`POST` methods, non-CORS-simple
-/// bodies, the first-party CLI's own requests, and callers already holding
-/// an explicit bearer credential.
+/// Requests this layer never inspects: non-`POST` methods, the first-party
+/// CLI's own requests, and callers already holding an explicit bearer
+/// credential. Checked before `Sec-Fetch-Site`/`Origin`, unconditionally.
 fn is_exempt(request: &Request) -> bool {
     request.method() != Method::POST
-        || !is_cors_simple_content_type(request.headers())
         || is_first_party_cli(request.headers())
         || request.extensions().get::<TokenPrincipal>().is_some()
 }
@@ -112,6 +124,11 @@ fn is_cors_simple_content_type(headers: &HeaderMap) -> bool {
 
 /// The Fetch Metadata / `Origin` same-origin check. Pure function of the
 /// request headers, so it is unit-testable without building a full request.
+///
+/// `Sec-Fetch-Site`, when present, is always the final word — checked
+/// before `Origin` and never overridden by it. Only when *neither* header
+/// is present does a non-CORS-simple `Content-Type` admit the request; see
+/// the module docs for why that order matters (`<a ping>`/`sendBeacon`).
 fn is_same_origin(headers: &HeaderMap) -> bool {
     if let Some(site) = headers.get("sec-fetch-site") {
         return site
@@ -120,7 +137,7 @@ fn is_same_origin(headers: &HeaderMap) -> bool {
     }
 
     let Some(origin) = headers.get(header::ORIGIN) else {
-        return false;
+        return !is_cors_simple_content_type(headers);
     };
     let Ok(origin) = origin.to_str() else {
         return false;
@@ -427,6 +444,42 @@ mod tests {
         // a CORS preflight, so it carries none of the risk this layer guards.
         let status = post_with_headers(&[("content-type", "application/json")]).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cross_site_fetch_metadata_beats_a_non_simple_content_type() {
+        // Regression (Codex): hyperlink auditing (`<a ping>`) and
+        // `navigator.sendBeacon` reach a server with a non-CORS-simple
+        // `Content-Type` and no preflight, credentialed, and still carry a
+        // truthful `Sec-Fetch-Site`. That must reject the request even
+        // though its content type alone would otherwise admit it.
+        let status = post_with_headers(&[
+            ("sec-fetch-site", "cross-site"),
+            ("content-type", "text/ping"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn same_origin_fetch_metadata_beats_a_non_simple_content_type() {
+        let status = post_with_headers(&[
+            ("sec-fetch-site", "same-origin"),
+            ("content-type", "text/ping"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mismatched_origin_beats_a_non_simple_content_type() {
+        let status = post_with_headers(&[
+            ("origin", "https://attacker.example"),
+            ("host", "dashboard.example"),
+            ("content-type", "text/ping"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
