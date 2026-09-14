@@ -108,20 +108,31 @@ async fn counting_broken_wf(ctx: &WorkflowContext, target: ExecutionId) -> Resul
 /// Starts executions of `workflow_name` until one sorts, as an
 /// `ExecutionId` string, after `after`. It then lands later in
 /// `running_executions`'s ascending scan — the ordering the issue's repro
-/// forces (~1-2 tries on average).
+/// forces (~1-2 tries in the common case).
+///
+/// `ExecutionId::new()` fixes the first two bytes to the
+/// `ShardId::UNENCODED` sentinel (`0xFFFF`). Every generated id already
+/// sorts near the TOP of the id space. Sometimes `after` ALSO draws a
+/// near-maximum byte right after that fixed prefix (about 1-in-256 calls).
+/// Then a fresh random candidate's odds of landing higher collapse. This
+/// is a real, measured case, not a paranoid one. A repro run of 500 trials
+/// against this exact runtime hit it 3 times. Each needed several hundred
+/// tries. 50 tries is not a safe bound for that case. The retry count
+/// below is sized so even that unlucky case fails astronomically rarely.
+/// The common case still costs 1-2 tries.
 fn start_after(
     rt: &mut SqliteRuntime,
     workflow_name: &str,
     input: &serde_json::Value,
     after: ExecutionId,
 ) -> ExecutionId {
-    for _ in 0..50i64 {
+    for _ in 0..20_000i64 {
         let id = rt.start_workflow(workflow_name, input.clone()).unwrap();
         if id.to_string() > after.to_string() {
             return id;
         }
     }
-    panic!("did not land an execution after the target one in 50 tries");
+    panic!("did not land an execution after the target one in 20,000 tries");
 }
 
 fn start_healthy_after(rt: &mut SqliteRuntime, broken: ExecutionId) -> ExecutionId {
