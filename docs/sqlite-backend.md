@@ -383,8 +383,12 @@ specific command/feature:
   (`start_timer` / `TimerHandle::…` — use the fire-once `ctx.timer(...)`).
 
 A rejected execution stays `RUNNING` and keeps erroring on every later drive.
-It does not block unrelated executions, though. `poll_once`/`run_until_idle`
-still drive the rest of the fleet in the same pass (issue #1530).
+It does not block unrelated executions, though. `poll_once` still drives the
+rest of the fleet in the same pass (issue #1530), and `run_until_idle` still
+converges the rest of the fleet to quiescence in one call — it no longer
+stops after one internal pass the first time the broken execution errors
+(issue #1555). Both keep reporting the broken execution's error to the
+caller; neither drops it.
 
 Backend-level non-goals: distributed / multi-writer workers, `LISTEN`/`NOTIFY`
 push wake-ups, multi-server crash recovery, schedules, the management API,
