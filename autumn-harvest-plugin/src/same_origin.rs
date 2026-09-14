@@ -17,8 +17,9 @@
 //!
 //! # Exemptions
 //!
-//! Three request shapes skip the check, because none can be produced by a
-//! bare cross-site `<form>` submission or a cross-site `no-cors` fetch:
+//! Four request shapes skip the check. None can be produced by a bare
+//! cross-site `<form>` submission or a cross-site `no-cors` fetch. None
+//! carries the ambient credential a forged request relies on, either:
 //!
 //! - **A method other than `POST`.** A `<form>` can only ever submit `GET`
 //!   or `POST`. `PUT`, `PATCH`, and `DELETE` are not CORS-simple methods at
@@ -33,6 +34,14 @@
 //!   `application/x-www-form-urlencoded`, `multipart/form-data`, or
 //!   `text/plain`. Anything else — `application/json`, most of all — needs a
 //!   CORS preflight the attacker's page cannot pass.
+//! - **No `Cookie` header at all.** CSRF is specifically the forgery of a
+//!   request that rides on a cookie the browser attaches automatically. A
+//!   cross-site page cannot set a `Cookie` header itself; the browser
+//!   reserves it. So a forged request either carries the victim's real
+//!   session cookie, or this layer never sees it as a threat at all. A
+//!   non-browser caller — the `harvest` CLI among them — never sends a
+//!   cookie either. This keeps first-party tooling working no matter which
+//!   auth mechanism, if any, is configured.
 //! - **A request carrying a [`TokenPrincipal`](crate::api_token::TokenPrincipal).**
 //!   A verified scoped API token is an explicit credential. A browser never
 //!   attaches one on its own, so it carries none of the ambient-cookie risk
@@ -62,10 +71,12 @@ pub(crate) async fn require_same_origin(request: Request, next: Next) -> Respons
 }
 
 /// Requests this layer never inspects: non-`POST` methods, non-CORS-simple
-/// bodies, and callers already holding an explicit bearer credential.
+/// bodies, cookieless callers, and callers already holding an explicit
+/// bearer credential.
 fn is_exempt(request: &Request) -> bool {
     request.method() != Method::POST
         || !is_cors_simple_content_type(request.headers())
+        || !request.headers().contains_key(header::COOKIE)
         || request.extensions().get::<TokenPrincipal>().is_some()
 }
 
@@ -156,8 +167,14 @@ mod tests {
             .layer(axum::middleware::from_fn(require_same_origin))
     }
 
+    /// Every case below models a browser that already holds a session
+    /// cookie, so `Cookie` is always present here. The one exemption
+    /// covered separately is `cookieless_request_is_exempt`.
     async fn post_with_headers(headers: &[(&str, &str)]) -> StatusCode {
-        let mut builder = HttpRequest::builder().method("POST").uri("/mutate");
+        let mut builder = HttpRequest::builder()
+            .method("POST")
+            .uri("/mutate")
+            .header("cookie", "harvest_session=abc123");
         for (name, value) in headers {
             builder = builder.header(*name, *value);
         }
@@ -367,6 +384,27 @@ mod tests {
             .layer(axum::middleware::from_fn(mutate_with_token));
 
         let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/mutate")
+                    // A cookie is present too, so this proves the token
+                    // bypass itself, not the separate cookieless exemption.
+                    .header("cookie", "harvest_session=abc123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cookieless_request_is_exempt() {
+        // The `harvest` CLI, and any other non-browser caller, never sends
+        // a `Cookie` header. With no ambient credential to ride on, this is
+        // not the threat this layer defends against.
+        let response = app()
             .oneshot(
                 HttpRequest::builder()
                     .method("POST")
