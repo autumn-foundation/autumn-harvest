@@ -3382,6 +3382,26 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
     ));
 }
 
+/// Formats a history for a failed shape assertion.
+///
+/// Issue #1558 found a bare `matches!` assertion silent on mismatch. The
+/// debug output shows the actual event sequence instead.
+fn describe_unexpected_history(events: &[WorkflowEvent]) -> String {
+    format!("history did not match the expected event shape:\n{events:#?}")
+}
+
+#[test]
+fn describe_unexpected_history_includes_event_debug_output() {
+    let events = vec![WorkflowEvent::WorkflowCancelled {
+        reason: "boom".to_string(),
+    }];
+
+    let message = describe_unexpected_history(&events);
+
+    assert!(message.contains("WorkflowCancelled"));
+    assert!(message.contains("boom"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
@@ -3538,8 +3558,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
     }));
 
     let history = load_history_from_url(&database_url, exec_id).await;
-    assert!(matches!(
-        history.events.as_slice(),
+    match history.events.as_slice() {
         [
             WorkflowEvent::WorkflowStarted { .. },
             WorkflowEvent::ActivityScheduled { .. },
@@ -3549,8 +3568,9 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 ..
             },
             WorkflowEvent::WorkflowFailed { .. },
-        ]
-    ));
+        ] => {}
+        other => panic!("{}", describe_unexpected_history(other)),
+    }
 
     let tasks = load_tasks_for_execution_from_url(&database_url, exec_id).await;
     assert_eq!(tasks.len(), 2);
