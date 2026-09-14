@@ -2282,7 +2282,7 @@ fn a_tokenless_but_live_postmaster_survives_the_full_reap_pipeline() {
     let mut stale = record(u32::MAX - 1, Some(live_pid));
     stale.owner_start_token = None;
     stale.postmaster_start_token = None;
-    stale.data_dir = data_dir.clone();
+    stale.data_dir = data_dir;
     std::fs::write(
         session_dir.join("session.json"),
         stale.to_json().expect("json"),
