@@ -216,6 +216,18 @@ jobs:
         # durably records them: they vanish on restart. See
         # scripts/check-broker-connector-dead-letter-sink-example.sh.
         run: ./scripts/check-broker-connector-dead-letter-sink-example.sh
+      - name: Check claude-agent-daemon runtime artifacts are git-ignored
+        # Guards a real, reproduced-live defect: examples/claude-agent-daemon's
+        # README tells the reader to run every `agentd` command "from the
+        # repository root", and the daemon's own defaults (`agentd.db`,
+        # `agentd.sock`) write relative to the current directory. Nothing
+        # excluded them, so following the "Try it in one minute" walkthrough
+        # verbatim from a clean checkout leaves `git status` dirty — and,
+        # against a real API key, parks an actual conversation transcript
+        # (the doc's own words: "every prompt, tool input, and tool result")
+        # as an untracked file one `git add -A` away from being committed.
+        # See scripts/check-agentd-runtime-artifacts-ignored.sh.
+        run: ./scripts/check-agentd-runtime-artifacts-ignored.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest
