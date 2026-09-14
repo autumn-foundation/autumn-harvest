@@ -427,6 +427,14 @@ pub struct EnableOptions {
     /// and why `publish_via_partition_root` alone is not enough. Set this only
     /// when the subscriber runs the partitioned layout too, or when the
     /// publication is not feeding a Harvest standby at all.
+    ///
+    /// Does not cover a publication that EXPLICITLY lists `harvest_events`
+    /// (`FOR TABLE harvest_events`, or `ADD TABLE harvest_events`), as
+    /// opposed to one covering it via `FOR ALL TABLES` or
+    /// `FOR TABLES IN SCHEMA`. See [`explicitly_published_by`]. An
+    /// explicit membership is pinned to the relation's OID. It does not
+    /// follow the rename-and-recreate this conversion performs, so the
+    /// conversion still refuses on that case regardless of this flag.
     pub allow_incompatible_publications: bool,
 }
 
@@ -1280,6 +1288,45 @@ pub async fn incompatible_publications(conn: &mut AsyncPgConnection) -> HarvestR
     Ok(rows.into_iter().map(|r| r.v).collect())
 }
 
+/// Publications that EXPLICITLY list `harvest_events` as a member, rather
+/// than covering it via `FOR ALL TABLES` or `FOR TABLES IN SCHEMA`.
+///
+/// Review finding: [`EnableOptions::allow_incompatible_publications`]
+/// documents its supported configuration as a `FOR ALL TABLES` publication,
+/// with the standby already running the partitioned layout. That
+/// publication resolves membership by name, at apply time, so it
+/// automatically covers the new parent the conversion creates. An explicit
+/// `FOR TABLE harvest_events` membership does not work the same way.
+/// Postgres pins it to the listed relation's OID. The conversion renames
+/// that relation to `harvest_events_legacy` and creates a brand new
+/// relation named `harvest_events`; the publication stays attached to the
+/// old one. The new parent, and every cohort partition created under it
+/// afterward, publish nothing, even with
+/// `publish_via_partition_root = true`. `allow_incompatible_publications`
+/// cannot cover this case, so callers must keep refusing on an explicit
+/// membership even when the operator has set that flag.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] on a catalog failure.
+#[cfg(feature = "db")]
+pub async fn explicitly_published_by(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
+    let rows = diesel::sql_query(
+        "SELECT DISTINCT p.pubname AS v
+           FROM pg_publication p
+           JOIN pg_publication_rel pr ON pr.prpubid = p.oid
+           JOIN pg_class c ON c.oid = pr.prrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = current_schema()
+            AND c.relname = 'harvest_events'
+          ORDER BY 1",
+    )
+    .load::<TextRow>(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows.into_iter().map(|r| r.v).collect())
+}
+
 /// Row-level security configured on the events table, if any.
 ///
 /// Returns the policy names, plus whether row security is enabled at all — a
@@ -1643,10 +1690,32 @@ pub async fn constraint_backed_unique_indexes_on_partitioned_parent(
             AND NOT (
                 -- On the parent itself: harvest's own two, by exact name
                 -- and shape, backed by a never-DEFERRABLE table constraint.
+                --
+                -- Review finding: this revert-path predicate is separate
+                -- from [`HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL`]. It
+                -- checked only name, type and key columns. An operator
+                -- can recreate either reserved constraint with an
+                -- INCLUDEd column, a non-default opclass, or a
+                -- descending column, and still pass. `capture_index_defs`
+                -- excludes a constraint-backed index, so
+                -- `disable_partitioning` would then recreate only the
+                -- plain built-in constraint, discarding the operator's
+                -- extra index properties. The checks added below match
+                -- the same rigor [`HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL`]
+                -- already applies.
                 c.relname = 'harvest_events'
                 AND EXISTS (
                     SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid
                       AND NOT con.condeferrable
+                      AND i.indnatts = i.indnkeyatts
+                      AND NOT EXISTS (
+                              SELECT 1 FROM unnest(i.indclass) AS oc(opclass)
+                                JOIN pg_opclass op ON op.oid = oc.opclass
+                               WHERE NOT op.opcdefault
+                          )
+                      AND NOT EXISTS (
+                              SELECT 1 FROM unnest(i.indoption) AS o(bits) WHERE bits <> 0
+                          )
                       AND (
                           (con.conname = 'harvest_events_pkey' AND con.contype = 'p'
                            AND (SELECT array_agg(a.attname::text ORDER BY k)
@@ -2276,7 +2345,30 @@ pub async fn enable_partitioning(
         });
     }
 
-    if !opts.allow_incompatible_publications {
+    if opts.allow_incompatible_publications {
+        // Review finding: the override above is documented for a FOR ALL
+        // TABLES publication. It resolves membership by name, so it
+        // covers the new parent this call creates automatically. An
+        // EXPLICIT membership does not: it stays pinned to the OID of the
+        // relation this call renames away. See `explicitly_published_by`.
+        // The override cannot cover that case, so this check still
+        // refuses even though the broad one below was skipped.
+        let explicit = explicitly_published_by(conn).await?;
+        if !explicit.is_empty() {
+            return Err(HarvestError::Config(format!(
+                "harvest_events is explicitly listed in {}, not merely covered by a FOR \
+                 ALL TABLES or FOR TABLES IN SCHEMA publication. allow_incompatible_publications \
+                 does not cover this case: explicit membership is pinned to this \
+                 relation's OID. This conversion renames it to harvest_events_legacy and \
+                 creates a new relation named harvest_events, so the publication stays \
+                 attached to the old one and the new parent publishes nothing, even with \
+                 publish_via_partition_root = true. Switch {} to a FOR ALL TABLES or FOR \
+                 TABLES IN SCHEMA publication, or drop this membership, before converting.",
+                explicit.join(", "),
+                explicit.join(", ")
+            )));
+        }
+    } else {
         let pubs = incompatible_publications(conn).await?;
         if !pubs.is_empty() {
             return Err(HarvestError::Config(format!(
@@ -2399,12 +2491,31 @@ pub fn enable_sql(opts: &EnableOptions) -> String {
     // See `incompatible_publications` for why a leaf-publishing
     // publication silently stops a logical-replication standby.
     //
-    // Omitted entirely under the override, mirroring how the Rust
-    // preflight above skips its own publication check. An operator who
-    // has already accepted the risk must not have this recheck refuse
-    // over the same publication moments later.
+    // Narrowed, not omitted, under the override -- mirroring how the Rust
+    // preflight above narrows its own publication check. See
+    // `explicitly_published_by` for why the override cannot cover an
+    // EXPLICIT membership. It stays pinned to the OID of the relation
+    // this block is about to rename. So this recheck must still catch
+    // one added in the preflight-to-lock gap.
     let publication_recheck = if opts.allow_incompatible_publications {
-        String::new()
+        format!(
+            "    SELECT string_agg(DISTINCT p.pubname, ', ') INTO bad_pub\n      \
+             FROM pg_publication p\n     \
+             JOIN pg_publication_rel pr ON pr.prpubid = p.oid\n     \
+             JOIN pg_class c ON c.oid = pr.prrelid\n     \
+             JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
+             WHERE n.nspname = current_schema()\n       \
+             AND c.relname = '{LEGACY_PARTITION}';\n    \
+             IF bad_pub IS NOT NULL THEN\n        \
+             RAISE EXCEPTION 'harvest #958: harvest_events is explicitly listed in %, \
+             added after the preflight check ran. allow_incompatible_publications does \
+             not cover this: explicit membership is pinned to this relation''s OID, so \
+             the rename below leaves the publication attached to harvest_events_legacy, \
+             and the new partitioned parent publishes nothing. Switch % to a FOR ALL \
+             TABLES or FOR TABLES IN SCHEMA publication, or drop this membership, \
+             before re-running.', bad_pub, bad_pub;\n    \
+             END IF;\n"
+        )
     } else {
         format!(
             "    SELECT string_agg(DISTINCT t.pubname, ', ') INTO bad_pub\n      \
@@ -5377,6 +5488,41 @@ fn publications_guard_sql(tag: &str) -> String {
     )
 }
 
+/// A `DO` block refusing only when a publication EXPLICITLY lists
+/// `harvest_events` as a member. Tagged with `tag`, so it can appear more
+/// than once in the same generated script.
+///
+/// Used in place of [`publications_guard_sql`] under
+/// [`EnableOptions::allow_incompatible_publications`]. See
+/// `explicitly_published_by` for why that override cannot cover this
+/// narrower case. An explicit membership is pinned to the relation's OID.
+/// Phase 4's rename-and-recreate step leaves the publication attached
+/// to `harvest_events_legacy`, not the new parent. A `FOR ALL TABLES` or
+/// `FOR TABLES IN SCHEMA` publication resolves by name instead, so it
+/// automatically covers the new parent and stays exempt under the
+/// override, same as before.
+#[must_use]
+fn explicit_publications_guard_sql(tag: &str) -> String {
+    format!(
+        "DO ${tag}$\nDECLARE bad text;\nBEGIN\n    \
+         SELECT string_agg(DISTINCT p.pubname, ', ') INTO bad\n      \
+         FROM pg_publication p\n     \
+         JOIN pg_publication_rel pr ON pr.prpubid = p.oid\n     \
+         JOIN pg_class c ON c.oid = pr.prrelid\n     \
+         JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
+         WHERE n.nspname = current_schema()\n       \
+         AND c.relname = 'harvest_events';\n    \
+         IF bad IS NOT NULL THEN\n        \
+         RAISE EXCEPTION 'harvest #958: harvest_events is explicitly listed in %. \
+         allow_incompatible_publications does not cover this: explicit membership is \
+         pinned to this relation''s OID, so this plan''s rename leaves the publication \
+         attached to harvest_events_legacy, and the new partitioned parent publishes \
+         nothing. Switch % to a FOR ALL TABLES or FOR TABLES IN SCHEMA publication, or \
+         drop this membership, before re-running this plan.', bad, bad;\n    \
+         END IF;\nEND\n${tag}$;"
+    )
+}
+
 /// One statement of the large-live-table conversion plan.
 ///
 /// The plan exists in exactly one form — this list — and
@@ -6050,17 +6196,31 @@ rename it) by hand, then re-run this plan.', idx.n, idx.tbl;\n        \
     // has done the supported thing: brought the subscriber onto the
     // partitioned layout with `publish_via_partition_root = true`. `plan`
     // is the only path large deployments are told to use. The tag is
-    // unique to this one `DO` block, so filtering on it cannot drop any
+    // unique to this one `DO` block, so matching on it cannot touch any
     // other step.
     //
     // The phase-4 cutover recheck of the same guard needs the identical
     // override. An operator who has already accepted the risk at phase
     // 1 would otherwise still have the plan refuse hours later. That
     // refusal would land at the lock window, over the same publication.
+    //
+    // Review finding: narrowed to `explicit_publications_guard_sql`, not
+    // removed. An explicit `FOR TABLE harvest_events` publication is
+    // pinned to that relation's OID, so it does not follow the rename
+    // phase 4 performs. `allow_incompatible_publications` documents a
+    // `FOR ALL TABLES` publication -- which resolves by name, and so
+    // covers the new parent automatically -- as the supported
+    // configuration. It cannot cover the explicit-membership case, so
+    // this guard still has to fire for that case even with the override
+    // set.
     if opts.allow_incompatible_publications {
-        steps.retain(|s| {
-            !s.sql.contains("$harvest_pub_958$") && !s.sql.contains("$harvest_pub_cutover_958$")
-        });
+        for s in &mut steps {
+            if s.sql.contains("$harvest_pub_958$") {
+                s.sql = explicit_publications_guard_sql("harvest_pub_958");
+            } else if s.sql.contains("$harvest_pub_cutover_958$") {
+                s.sql = explicit_publications_guard_sql("harvest_pub_cutover_958");
+            }
+        }
     }
     steps
 }
@@ -6381,7 +6541,7 @@ mod tests {
     }
 
     #[test]
-    fn allow_incompatible_publications_omits_the_phase_1_publication_guard() {
+    fn allow_incompatible_publications_narrows_the_phase_1_publication_guard() {
         // Issue #1270 item 7: `enable_partitioning` already honours the
         // override for this guard. The scripted large-table plan must too.
         // Otherwise an operator could use the override on `enable` but not
@@ -6393,8 +6553,10 @@ mod tests {
         assert!(
             default_steps
                 .iter()
-                .any(|s| s.sql.contains("$harvest_pub_958$")),
-            "the guard must be present by default"
+                .any(|s| s.sql.contains("$harvest_pub_958$")
+                    && s.sql.contains("pg_publication_tables")),
+            "the broad guard, covering every publication mechanism, must be \
+             present by default"
         );
         // Review finding: the phase-4 cutover recheck of the same guard
         // needs the identical override. Otherwise an operator who
@@ -6404,8 +6566,10 @@ mod tests {
         assert!(
             default_steps
                 .iter()
-                .any(|s| s.sql.contains("$harvest_pub_cutover_958$")),
-            "the phase-4 cutover recheck of the same guard must be present by default"
+                .any(|s| s.sql.contains("$harvest_pub_cutover_958$")
+                    && s.sql.contains("pg_publication_tables")),
+            "the phase-4 cutover recheck of the same broad guard must be \
+             present by default"
         );
 
         let overridden_steps = migration_plan_steps(
@@ -6415,24 +6579,36 @@ mod tests {
             },
             now,
         );
+        // Review finding: an explicit `FOR TABLE harvest_events`
+        // publication is pinned to that relation's OID, so it does not
+        // follow the rename this plan performs at cutover. The override
+        // is documented for a `FOR ALL TABLES` publication, which
+        // resolves by name and so needs no such check. So the tag must
+        // survive -- narrowed to `pg_publication_rel`, the catalog that
+        // records only an EXPLICIT membership -- rather than vanish.
         assert!(
             overridden_steps
                 .iter()
-                .all(|s| !s.sql.contains("$harvest_pub_958$")),
-            "the override must omit the guard entirely, not merely neuter it, \
-             so the printed script does not confuse an operator with a check \
-             that can never fire"
+                .any(|s| s.sql.contains("$harvest_pub_958$")
+                    && s.sql.contains("pg_publication_rel")
+                    && !s.sql.contains("pg_publication_tables")),
+            "the override must narrow the guard to an explicit-membership \
+             check, not omit it: an explicit publication does not follow \
+             the rename this plan performs, so it cannot be waved through"
         );
         assert!(
             overridden_steps
                 .iter()
-                .all(|s| !s.sql.contains("$harvest_pub_cutover_958$")),
-            "the override must also omit the phase-4 cutover recheck of the same \
-             guard, not just phase 1's copy"
+                .any(|s| s.sql.contains("$harvest_pub_cutover_958$")
+                    && s.sql.contains("pg_publication_rel")
+                    && !s.sql.contains("pg_publication_tables")),
+            "the override must also narrow the phase-4 cutover recheck of \
+             the same guard, not just phase 1's copy"
         );
 
         // Every other phase-1 guard (already-partitioned, row security) must
-        // survive — the override is specific to the publication check.
+        // survive unchanged — the override is specific to the publication
+        // check.
         assert!(
             overridden_steps
                 .iter()

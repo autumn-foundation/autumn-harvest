@@ -8320,6 +8320,74 @@ async fn converting_refuses_while_any_publication_covers_harvest_events() {
 }
 
 #[tokio::test]
+async fn converting_still_refuses_an_explicit_publication_even_with_the_override() {
+    // Review finding: `allow_incompatible_publications` is documented for
+    // a `FOR ALL TABLES` publication -- the kind `docs/cross-region-dr.md`
+    // tells an operator to create. It is also the kind the test above
+    // proves the override unlocks. That publication resolves membership
+    // by name. It automatically covers the new parent this conversion
+    // creates under the name `harvest_events`. An EXPLICIT `FOR TABLE
+    // harvest_events`
+    // publication does not. Postgres pins that membership to the original
+    // relation's OID. The conversion renames the original relation to
+    // `harvest_events_legacy` and creates a brand new relation named
+    // `harvest_events`, so the publication stays attached to the old one.
+    // The new parent, and every future cohort partition, publish nothing,
+    // even with `publish_via_partition_root = true`. The override cannot
+    // cover this case, so it must still refuse.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP PUBLICATION IF EXISTS harvest_explicit_pub_958")
+        .execute(&mut conn)
+        .await
+        .expect("clean slate");
+    diesel::sql_query(
+        "CREATE PUBLICATION harvest_explicit_pub_958 FOR TABLE harvest_events \
+         WITH (publish_via_partition_root = true)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("create an explicit-membership publication");
+
+    let err = match partition::enable_partitioning(
+        &mut conn,
+        &EnableOptions {
+            allow_incompatible_publications: true,
+            ..EnableOptions::default()
+        },
+    )
+    .await
+    {
+        Err(e) => e.to_string(),
+        Ok(report) => panic!(
+            "the override must not let an explicit membership through: its OID pin \
+             means the new parent this conversion creates is never a member, so every \
+             future cohort partition would silently stop replicating. Got {report:?}"
+        ),
+    };
+    assert!(
+        err.contains("harvest_explicit_pub_958"),
+        "the refusal must name the publication: {err}"
+    );
+    assert!(
+        err.contains("OID"),
+        "the refusal must explain why the override does not cover this case: {err}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "and it must refuse BEFORE converting anything"
+    );
+
+    diesel::sql_query("DROP PUBLICATION harvest_explicit_pub_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the publication");
+}
+
+#[tokio::test]
 async fn the_online_phase_is_resumable_after_its_validation_fails() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
