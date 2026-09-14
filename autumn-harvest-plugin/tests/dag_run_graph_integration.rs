@@ -407,9 +407,9 @@ async fn seed_run(
     // Raw insert, not `store::append_events`: several fixtures above hand-build
     // an already-enveloped payload field to reproduce a codec deployment's
     // on-disk shape (issue #1253). `append_events` runs every field through
-    // the identity codec's `encode_payload`, which now escapes anything
-    // already shaped like an envelope by nesting it (the issue #1253 fix) —
-    // so a second pass here would corrupt these fixtures' hand-built shape.
+    // the identity codec's `encode_payload`. That now escapes anything
+    // already shaped like an envelope, by nesting it (the issue #1253 fix).
+    // A second pass here would corrupt these fixtures' hand-built shape.
     // A direct insert stores each event's JSON exactly as constructed, which
     // is what this test suite has always intended by "identity stores it
     // verbatim".

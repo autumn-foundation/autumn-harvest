@@ -363,9 +363,9 @@ async fn append_events(
     // Raw insert, not `store::append_events`: these fixtures hand-build an
     // already-enveloped payload field (`envelope_for` et al.) to reproduce a
     // codec deployment's on-disk shape (module doc above). `append_events`
-    // runs every field through the identity codec's `encode_payload`, which
-    // now escapes anything already shaped like an envelope by nesting it
-    // (issue #1253) — a second pass here would corrupt the fixture's
+    // runs every field through the identity codec's `encode_payload`. That
+    // now escapes anything already shaped like an envelope, by nesting it
+    // (issue #1253). A second pass here would corrupt the fixture's
     // hand-built shape instead of storing it verbatim.
     let rows: Vec<NewHarvestEvent> = events
         .iter()

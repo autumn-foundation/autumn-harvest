@@ -67,12 +67,14 @@ pub const UNDECODABLE_MARKER_KEY: &str = "_harvest_undecodable";
 /// forms are one key id, not two.
 ///
 /// Before issue #1253, an un-rotated deployment's *encoded* envelope bytes
-/// were byte-identical to pre-#948. That claim now holds only for the
-/// common case: the field is never encoded at all. An identity-codec
-/// deployment stores such a field verbatim, with no envelope, exactly as
-/// before. A field that IS encoded — a real codec, or the rare
-/// [`PayloadCodecs::encode_payload`] escape case — now always nests. See
-/// [`CODEC_ENVELOPE_VERSION_NESTED`].
+/// were byte-identical to pre-#948. That still holds: a real (non-identity)
+/// codec's write always stays flat, version 1 or 2. It is never the
+/// [`PayloadCodecs::encode_payload`] escape case — encrypting a coincidental
+/// collision already changes its bytes, so there is nothing to escape.
+///
+/// Only the identity codec's collision-escape case nests — see
+/// [`CODEC_ENVELOPE_VERSION_NESTED`]. An identity-codec deployment otherwise
+/// stores the field verbatim, with no envelope, exactly as before.
 ///
 /// The key id rides *inside* the codec envelope, which is already opaque
 /// payload content. Rotation adds no `WorkflowEvent` variant, and does not
