@@ -99,11 +99,30 @@ replace repeated linear scans with one upfront index.
   `dlq::group_dead_letter_rows`/`DlqRawGroup` are `pub`. Neither is part of
   the crate's HTTP-facing API.
 
+**Review addendum (Codex, PR #1554).** Building the index is worth its
+O(workers × queues-per-worker) cost only when it answers more than one
+question. A `?queue_name=` filtered request narrows `pending` to at most one
+row, where the pre-fix direct scan could short-circuit on the first covering
+worker instead of indexing the whole fleet up front. `partition_uncovered_and_paused`
+now dispatches: `pending.len() <= 1` falls back to
+`partition_uncovered_and_paused_direct` (the original per-demand `.any()`
+scan, kept verbatim), and only a larger `pending` builds the index. Both
+paths share one `classify_pending_demand` helper for the
+paused/covered/uncovered decision, so they cannot drift on that logic. A
+second review finding was in the harness itself: its self-check oracle
+counted paused-and-uncovered queue names from the raw `paused_indices`
+array rather than the deduplicated `paused` set, so a custom
+`QUEUE_COVERAGE_PROFILE_*` combination whose generated indices collide
+(e.g. `PENDING=100 UNCOVERED=60 QUEUES_PER_WORKER=10 WORKERS=4`) made the
+harness assert a wrong expected count against the function's own correct
+output. Fixed by intersecting the deduplicated `paused` set with the
+uncovered-range name set instead of counting raw indices.
+
 Behavior is unchanged: a queue is covered iff at least one live,
-shard-assigned worker lists it, exactly as before — all 33 existing
-`queue_coverage` unit tests (including the full `worker_covers_queue`
-liveness/shard/queue matrix) pass unmodified, as does the crate's full
-1,176-test `--lib` suite.
+shard-assigned worker lists it, exactly as before — all 35 `queue_coverage`
+unit tests (including the full `worker_covers_queue` liveness/shard/queue
+matrix, and two new tests for the small-`pending` direct path) pass, as
+does the crate's full 1,178-test `--lib` suite.
 
 ## 📊 Measurement
 
@@ -111,19 +130,27 @@ liveness/shard/queue matrix) pass unmodified, as does the crate's full
 
 | | before | after | delta |
 |:--|--:|--:|--:|
-| Instructions (Ir) | 145,203,167 | 23,624,878 | **-83.73%** |
+| Instructions (Ir) | 145,203,167 | 23,784,217 | **-83.62%** |
+
+The realistic (2,000-pending) workload always takes the indexed path — the
+small-`pending` fallback added after review only changes behavior for
+`pending.len() <= 1`, which this harness never exercises — so the tiny
+change from the pre-addendum 23,624,878 figure is the added dispatch branch
+and the extra function-call boundary, not a regression in the indexed path
+itself.
 
 `valgrind --tool=dhat`:
 
 | | before | after | delta |
 |:--|--:|--:|--:|
-| Allocated bytes | 1,630,612 | 1,769,984 | +8.5% |
-| Allocated blocks | 31,021 | 31,032 | +11 |
-| Bytes read | 184,163,764 | 2,719,079 | -98.5% |
+| Allocated bytes | 1,630,612 | 1,781,952 | +9.3% |
+| Allocated blocks | 31,021 | 31,199 | +178 |
+| Bytes read | 184,163,764 | 2,758,320 | -98.5% |
 
 Allocation count/bytes move slightly *up* (one `HashSet` build per call,
-where the pre-fix code allocated nothing extra in its hot loop) — this
-change is not an allocation-count win and isn't claimed as one. The
+plus, after the review addendum, the harness's own oracle now materializing
+150 uncovered-range name strings it previously only counted by index) —
+this change is not an allocation-count win and isn't claimed as one. The
 admissible evidence here is the instruction-count delta (clears the ≥5%
 floor by more than an order of magnitude) and the asymptotic argument: the
 nested O(pending × workers × queues-per-worker) scan is now O(pending +
@@ -146,6 +173,6 @@ valgrind --tool=dhat --dhat-out-file=dhat.json "$BIN"
 
 Checking out the harness-only commit (before the algorithm change, same
 commit series) and re-running reproduces the 145,203,167-instruction
-baseline exactly; the current tree reproduces the 23,624,878-instruction
+baseline exactly; the current tree reproduces the 23,784,217-instruction
 figure (a few thousand instructions of run-to-run noise from `rustc`/`std`
 codegen details are expected and immaterial at this scale).

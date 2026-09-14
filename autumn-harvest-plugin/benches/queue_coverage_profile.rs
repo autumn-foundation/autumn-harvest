@@ -206,10 +206,17 @@ fn main() {
         .filter(|i| *i < num_pending)
         .map(queue_name)
         .collect();
-    let paused_in_uncovered_range = paused_indices
-        .into_iter()
-        .filter(|i| *i >= covered_pool && *i < num_pending)
-        .count();
+    // Derived from the deduplicated `paused` set intersected with the
+    // uncovered-range names, not a raw count of `paused_indices`. A custom
+    // `QUEUE_COVERAGE_PROFILE_*` combination can make `covered_pool + 10`
+    // or `covered_pool + 40` collide with one of the fixed indices above,
+    // or with each other. `paused` already dedups that collision by
+    // construction, but a raw index count would not. That would then
+    // disagree with the function's own (correct) output on such a
+    // combination.
+    let uncovered_range_names: BTreeSet<String> =
+        (covered_pool..num_pending).map(queue_name).collect();
+    let paused_in_uncovered_range = paused.intersection(&uncovered_range_names).count();
     let expected_uncovered_rows = uncovered - paused_in_uncovered_range;
 
     let mut total_uncovered_rows = 0usize;

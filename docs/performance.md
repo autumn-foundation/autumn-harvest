@@ -1860,4 +1860,5 @@ standalone note rather than part of the claim-path attribution table above:
   O(pending queues x workers x queues-per-worker) nested scan in
   `queue_coverage::partition_uncovered_and_paused`, the per-shard core of
   `GET /admin/queue-coverage` (issue #774), indexed into an O(1)-average
-  `HashSet` lookup per pending queue (instructions -83.73%).
+  `HashSet` lookup per pending queue (instructions -83.62%; falls back to
+  the original direct scan for a `?queue_name=`-filtered single-row call).

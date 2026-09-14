@@ -554,6 +554,18 @@ pub fn partition_uncovered_and_paused(
     paused: &BTreeSet<String>,
     shard_id: i32,
 ) -> (Vec<UncoveredQueueDemand>, BTreeSet<String>) {
+    // Building the coverage index below costs O(workers x
+    // queues-per-worker), no matter how many pending queues it then serves.
+    // That cost is worth paying only when the index answers more than one
+    // question. A `?queue_name=` filtered request narrows `pending` to at
+    // most one row (issue #774 review). There, the pre-fix direct scan can
+    // short-circuit on the first covering worker. So indexing the entire
+    // fleet up front would make a cheap targeted check slower on a large
+    // fleet. Fall back to the direct per-demand scan for that case.
+    if pending.len() <= 1 {
+        return partition_uncovered_and_paused_direct(pending, workers, paused, shard_id);
+    }
+
     // `shard_id` is fixed for the whole call. Which workers are live and
     // assigned to it does not depend on `demand`. Precompute the union of
     // their queue names once instead: O(workers x queues-per-worker). This
@@ -572,24 +584,62 @@ pub fn partition_uncovered_and_paused(
         .into_iter()
         .filter_map(|demand| {
             let has_coverage = covered_queues.contains(demand.queue_name.as_str());
-            if paused.contains(&demand.queue_name) {
-                if !has_coverage {
-                    paused_uncovered.insert(demand.queue_name);
-                }
-                return None;
-            }
-            if has_coverage {
-                return None;
-            }
-            Some(UncoveredQueueDemand {
-                queue_name: demand.queue_name,
-                pending_count: demand.pending_count,
-                sample_task_ids: demand.sample_task_ids,
-                sample_execution_ids: demand.sample_execution_ids,
-            })
+            classify_pending_demand(demand, has_coverage, paused, &mut paused_uncovered)
         })
         .collect();
     (rows, paused_uncovered)
+}
+
+/// The pre-fix per-demand scan, kept for the small-`pending` case. See
+/// [`partition_uncovered_and_paused`]'s doc comment. There is no upfront
+/// index here, so a single filtered demand costs at most one pass over
+/// `workers`, short-circuiting on the first covering one.
+fn partition_uncovered_and_paused_direct(
+    pending: Vec<PendingQueueDemand>,
+    workers: &[WorkerRow],
+    paused: &BTreeSet<String>,
+    shard_id: i32,
+) -> (Vec<UncoveredQueueDemand>, BTreeSet<String>) {
+    let mut paused_uncovered = BTreeSet::new();
+    let rows = pending
+        .into_iter()
+        .filter_map(|demand| {
+            let has_coverage = workers
+                .iter()
+                .any(|worker| worker_covers_queue(worker, &demand.queue_name, shard_id));
+            classify_pending_demand(demand, has_coverage, paused, &mut paused_uncovered)
+        })
+        .collect();
+    (rows, paused_uncovered)
+}
+
+/// Shared classification step for one pending demand, given its already-
+/// computed coverage. Paused-and-uncovered goes into `paused_uncovered`.
+/// Paused-and-covered or unpaused-and-covered is reported nowhere.
+/// Unpaused-and-uncovered becomes a row. Factored out so the indexed and
+/// direct scans above ([`partition_uncovered_and_paused`] /
+/// [`partition_uncovered_and_paused_direct`]) cannot drift on this logic.
+fn classify_pending_demand(
+    demand: PendingQueueDemand,
+    has_coverage: bool,
+    paused: &BTreeSet<String>,
+    paused_uncovered: &mut BTreeSet<String>,
+) -> Option<UncoveredQueueDemand> {
+    if paused.contains(&demand.queue_name) {
+        if !has_coverage {
+            paused_uncovered.insert(demand.queue_name);
+        }
+        return None;
+    }
+    if has_coverage {
+        return None;
+    }
+    Some(UncoveredQueueDemand {
+        queue_name: demand.queue_name,
+        pending_count: demand.pending_count,
+        sample_task_ids: demand.sample_task_ids,
+        sample_execution_ids: demand.sample_execution_ids,
+    })
 }
 
 fn build_report_from_observations(
@@ -1184,6 +1234,34 @@ mod tests {
         let (rows, paused_uncovered) =
             partition_uncovered_and_paused(pending, &[worker], &BTreeSet::new(), 0);
 
+        assert!(rows.is_empty());
+        assert!(paused_uncovered.is_empty());
+    }
+
+    #[test]
+    fn partition_single_pending_demand_uses_the_direct_scan_and_still_reports_uncovered() {
+        // `pending.len() == 1` (a `?queue_name=` filtered request) takes
+        // the direct-scan path, not the indexed one. Exercise it with a
+        // genuinely-uncovered result, not just the covered cases above.
+        let pending = vec![pending_demand("typo_queue", 7)];
+        let worker = worker_row(
+            WorkerStatus::Active,
+            WorkerHealth::Healthy,
+            &[0],
+            &["other_queue"],
+        );
+        let (rows, paused_uncovered) =
+            partition_uncovered_and_paused(pending, &[worker], &BTreeSet::new(), 0);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].queue_name, "typo_queue");
+        assert!(paused_uncovered.is_empty());
+    }
+
+    #[test]
+    fn partition_empty_pending_is_empty_on_either_path() {
+        let (rows, paused_uncovered) =
+            partition_uncovered_and_paused(Vec::new(), &[], &BTreeSet::new(), 0);
         assert!(rows.is_empty());
         assert!(paused_uncovered.is_empty());
     }
