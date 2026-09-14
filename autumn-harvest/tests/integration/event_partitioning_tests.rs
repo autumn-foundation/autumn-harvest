@@ -484,6 +484,34 @@ fn the_migration_plan_documents_a_non_blocking_window_for_large_live_tables() {
     }
 }
 
+#[test]
+fn the_scripted_plan_honours_allow_incompatible_publications() {
+    // Issue #1270 item 7: `enable_partitioning` checks this override in
+    // Rust and never calls `migration_plan_steps`, so the scripted path
+    // needs its own filter. Nothing exercised that filter before this test.
+    let now = day(2026, 8, 31);
+    let with_guard = partition::migration_plan_steps(&EnableOptions::default(), now);
+    assert!(
+        with_guard
+            .iter()
+            .any(|s| s.sql.contains("$harvest_pub_958$")),
+        "the publication guard must be present by default"
+    );
+
+    let opts = EnableOptions {
+        allow_incompatible_publications: true,
+        ..EnableOptions::default()
+    };
+    let without_guard = partition::migration_plan_steps(&opts, now);
+    assert!(
+        without_guard
+            .iter()
+            .all(|s| !s.sql.contains("$harvest_pub_958$")),
+        "allow_incompatible_publications must drop the publication guard step, \
+         mirroring enable_partitioning's own override"
+    );
+}
+
 // ══ AC2: byte-identical per-execution event semantics ══════════════════════
 
 #[tokio::test]
@@ -2428,7 +2456,9 @@ async fn list_partitions_is_correct_regardless_of_the_sessions_date_style() {
         .expect("list partitions under a non-ISO DateStyle");
 
     assert!(
-        partitions.iter().any(|p| !p.is_default && p.upper.is_some()),
+        partitions
+            .iter()
+            .any(|p| !p.is_default && p.upper.is_some()),
         "every cohort partition created by enable has a finite upper bound; a \
          DateStyle-sensitive parser would read every one of them as unbounded \
          instead. got {partitions:?}"
@@ -3594,6 +3624,12 @@ async fn a_partly_blocked_lookahead_catchup_reports_which_cohort_is_uncovered() 
     let now = Utc::now();
     let blocked_start = partition::cohort_start(now + chrono::Duration::seconds(width * 5), width);
     let colliding_name = partition::partition_name(blocked_start);
+    // Dropped first: a prior run within the same cohort window (or a
+    // FAILED prior run of this same test) can leave this name behind.
+    diesel::sql_query(format!("DROP TABLE IF EXISTS {colliding_name}"))
+        .execute(&mut conn)
+        .await
+        .ok();
     diesel::sql_query(format!("CREATE TABLE {colliding_name} (id bigint)"))
         .execute(&mut conn)
         .await
@@ -3747,10 +3783,12 @@ async fn enable_survives_two_indexes_colliding_at_the_identifier_limit() {
     .execute(&mut conn)
     .await
     .expect("plant the first 63-byte index name");
-    diesel::sql_query(format!("CREATE INDEX {name_b} ON harvest_events (event_id)"))
-        .execute(&mut conn)
-        .await
-        .expect("plant the second 63-byte index name");
+    diesel::sql_query(format!(
+        "CREATE INDEX {name_b} ON harvest_events (event_id)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("plant the second 63-byte index name");
 
     let report = partition::enable_partitioning(&mut conn, &EnableOptions::default())
         .await
@@ -3788,7 +3826,10 @@ async fn enable_survives_two_indexes_colliding_at_the_identifier_limit() {
     // it; long enough that no OTHER (pre-existing, unrelated) renamed index
     // could share it by chance.
     let short_prefix = &base[..40];
-    let survivors: Vec<&String> = names.iter().filter(|n| n.starts_with(short_prefix)).collect();
+    let survivors: Vec<&String> = names
+        .iter()
+        .filter(|n| n.starts_with(short_prefix))
+        .collect();
     assert_eq!(
         survivors.len(),
         2,
@@ -3900,6 +3941,14 @@ async fn enable_refuses_a_unique_index_without_cohort() {
     // Perfectly valid on the flat layout; Postgres will not allow it to be
     // replayed verbatim onto a partitioned parent, since it omits the
     // partition key.
+    //
+    // Dropped first: this test's expected failure path never reaches a
+    // successful conversion. A prior FAILED run of this same test leaves
+    // the index behind on a reused database.
+    diesel::sql_query("DROP INDEX IF EXISTS harvest_events_wf_only_uq")
+        .execute(&mut conn)
+        .await
+        .ok();
     diesel::sql_query(
         "CREATE UNIQUE INDEX harvest_events_wf_only_uq ON harvest_events (workflow_exec_id)",
     )
@@ -3939,6 +3988,14 @@ async fn enable_refuses_a_unique_index_with_cohort_only_as_an_include_column() {
     // `cohort` is present in the index, but only as an INCLUDE column.
     // Postgres's partition-key requirement is on the KEY columns, so this
     // must be refused exactly like an index that omits cohort entirely.
+    //
+    // Dropped first: this test's expected failure path never reaches a
+    // successful conversion. A prior FAILED run of this same test leaves
+    // the index behind on a reused database.
+    diesel::sql_query("DROP INDEX IF EXISTS harvest_events_wf_evt_uq")
+        .execute(&mut conn)
+        .await
+        .ok();
     diesel::sql_query(
         "CREATE UNIQUE INDEX harvest_events_wf_evt_uq ON harvest_events \
          (workflow_exec_id, event_id) INCLUDE (cohort)",
@@ -4012,6 +4069,13 @@ async fn enable_refuses_a_user_defined_trigger() {
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
 
+    // Dropped first: this test's expected failure path never reaches a
+    // successful conversion. A prior FAILED run of this same test leaves
+    // the trigger behind on a reused database.
+    diesel::sql_query("DROP TRIGGER IF EXISTS harvest_1270_audit_trg ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .ok();
     diesel::sql_query(
         "CREATE OR REPLACE FUNCTION harvest_1270_noop_trg() RETURNS trigger \
          LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$",
@@ -4076,6 +4140,196 @@ async fn disable_refuses_a_dependent_view() {
     );
 
     diesel::sql_query("DROP VIEW harvest_events_by_wf")
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn disable_survives_two_indexes_colliding_at_the_identifier_limit() {
+    #[derive(diesel::QueryableByName)]
+    struct IndexNameRow {
+        #[diesel(sql_type = Text)]
+        v: String,
+    }
+
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Issue #1270 item 9 applies on the way back out too.
+    // `disable_partitioning` renames the old parent's own indexes with the
+    // `__old` suffix (5 bytes) before reclaiming their bare names for the
+    // rebuilt flat table. Two names sharing their first `63 - 5` bytes
+    // collide on a naive rename exactly as on `enable`.
+    // Lowercase and digits only: an unquoted identifier is case-folded by
+    // Postgres, so an uppercase suffix here would never match what
+    // `pg_indexes` reports back.
+    let base = "b".repeat(58);
+    let name_a = format!("{base}11111");
+    let name_b = format!("{base}22222");
+    assert_eq!(name_a.len(), 63);
+    assert_eq!(name_b.len(), 63);
+    // Dropped first: a successful run of this test recreates both under
+    // their original bare names on the flat table. A prior run leaves
+    // them behind on a reused database.
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {name_a}"))
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {name_b}"))
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query(format!(
+        "CREATE INDEX {name_a} ON harvest_events (workflow_exec_id)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("plant the first 63-byte index name");
+    diesel::sql_query(format!(
+        "CREATE INDEX {name_b} ON harvest_events (event_id)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("plant the second 63-byte index name");
+
+    partition::disable_partitioning(&mut conn).await.expect(
+        "a naive rename would have renamed the first index to ITSELF and then \
+         collided renaming the second — this must succeed",
+    );
+
+    let names: Vec<String> = diesel::sql_query(
+        "SELECT indexname AS v FROM pg_indexes \
+          WHERE schemaname = current_schema() AND tablename = 'harvest_events' \
+          ORDER BY indexname",
+    )
+    .load::<IndexNameRow>(&mut conn)
+    .await
+    .expect("list the flat table's indexes")
+    .into_iter()
+    .map(|r| r.v)
+    .collect();
+    assert!(
+        names.contains(&name_a) && names.contains(&name_b),
+        "both indexes must survive the round trip under their ORIGINAL names — \
+         disable replays each captured index definition verbatim, once the old \
+         parent's own copies are safely renamed out of the way: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_scripted_plan_refuses_a_dependent_view() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // Issue #1270 item 14, for the scripted large-table path specifically.
+    // `migration_plan_steps` carries its own hand-written copy of the guard
+    // (`enable_partitioning` never calls it). A regression there is
+    // invisible to the tests that only exercise the Rust-side check.
+    diesel::sql_query("DROP VIEW IF EXISTS harvest_events_by_wf")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query(
+        "CREATE VIEW harvest_events_by_wf AS SELECT workflow_exec_id FROM harvest_events",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("plant a dependent view");
+
+    let mut hit_guard = false;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now()) {
+        if step.phase > 1 {
+            break;
+        }
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("harvest_events_by_wf"),
+                "the scripted plan's own guard must name the dependent view: {msg}"
+            );
+            hit_guard = true;
+            break;
+        }
+    }
+    assert!(
+        hit_guard,
+        "phase 1's dependent-view guard must fire before any of the later \
+         phases run, on the scripted path just as on the one-transaction path"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "refusing before mutating"
+    );
+
+    diesel::sql_query("DROP VIEW harvest_events_by_wf")
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn the_scripted_plan_refuses_a_user_defined_trigger() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // Issue #1270 item 16, for the scripted large-table path specifically.
+    // Same rationale as the dependent-view case above: this guard is a
+    // separate hand-written copy in `migration_plan_steps`, untested until
+    // now.
+    diesel::sql_query("DROP TRIGGER IF EXISTS harvest_1270_plan_trg ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query(
+        "CREATE OR REPLACE FUNCTION harvest_1270_plan_noop_trg() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("create trigger function");
+    diesel::sql_query(
+        "CREATE TRIGGER harvest_1270_plan_trg BEFORE INSERT ON harvest_events \
+         FOR EACH ROW EXECUTE FUNCTION harvest_1270_plan_noop_trg()",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("plant an operator trigger");
+
+    let mut hit_guard = false;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now()) {
+        if step.phase > 1 {
+            break;
+        }
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("harvest_1270_plan_trg"),
+                "the scripted plan's own guard must name the trigger: {msg}"
+            );
+            hit_guard = true;
+            break;
+        }
+    }
+    assert!(
+        hit_guard,
+        "phase 1's trigger guard must fire before any of the later phases run, \
+         on the scripted path just as on the one-transaction path"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "refusing before mutating"
+    );
+
+    diesel::sql_query("DROP TRIGGER harvest_1270_plan_trg ON harvest_events")
         .execute(&mut conn)
         .await
         .ok();

@@ -6056,8 +6056,14 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
             max_attempts,
             format,
         } => {
-            run_partition_maintain(shards, *lookahead_cohorts, *max_drops, *max_attempts, *format)
-                .await
+            run_partition_maintain(
+                shards,
+                *lookahead_cohorts,
+                *max_drops,
+                *max_attempts,
+                *format,
+            )
+            .await
         }
         PartitionCommand::Disable {
             shards,

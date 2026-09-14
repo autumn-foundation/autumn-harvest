@@ -1445,12 +1445,13 @@ pub async fn enable_partitioning(
     // created for the lookahead window. That happens immediately prior,
     // under this same lock.
     let parts = list_partitions(conn).await?;
-    let mode = parts
-        .iter()
-        .find(|p| p.name == LEGACY_PARTITION)
-        .map_or(EnableMode::Fresh, |legacy| EnableMode::AttachLegacy {
-            cutover: legacy.upper.unwrap_or(now),
-        });
+    let mode =
+        parts
+            .iter()
+            .find(|p| p.name == LEGACY_PARTITION)
+            .map_or(EnableMode::Fresh, |legacy| EnableMode::AttachLegacy {
+                cutover: legacy.upper.unwrap_or(now),
+            });
     let partitions_created = parts
         .into_iter()
         .filter(|p| !p.is_default && p.name != LEGACY_PARTITION)
@@ -1466,8 +1467,7 @@ pub async fn enable_partitioning(
 /// `DECLARE` fragment [`collision_safe_rename_stmts`] needs, beyond an
 /// already-declared `obj record;` — which every caller here already has, for
 /// the `FOR obj IN ...` loops themselves.
-const RENAME_HELPER_DECLARE: &str =
-    "    new_name text;\n    bump     int;\n    tail     text;";
+const RENAME_HELPER_DECLARE: &str = "    new_name text;\n    bump     int;\n    tail     text;";
 
 /// Rename every constraint and index on `table` that does not already carry
 /// `suffix`, freeing their names for the replacement parent. This is
@@ -2164,8 +2164,7 @@ pub async fn disable_partitioning(
             .await
             .map_err(database_error)?;
             for r in idx_rows {
-                let new_name =
-                    collision_safe_index_name(conn, &r.v, DISABLE_RENAME_SUFFIX).await?;
+                let new_name = collision_safe_index_name(conn, &r.v, DISABLE_RENAME_SUFFIX).await?;
                 exec(
                     conn,
                     &format!(
@@ -2405,15 +2404,14 @@ async fn sweep_inner(
                 && let Ok(grace) = chrono::Duration::from_std(grace)
                 && upper + grace <= now
             {
-                outcome.straggler_rows_deleted +=
-                    delete_orphan_rows(
-                        conn,
-                        part.lower,
-                        upper,
-                        opts.straggler_batch,
-                        opts.straggler_delete_timeout,
-                    )
-                    .await?;
+                outcome.straggler_rows_deleted += delete_orphan_rows(
+                    conn,
+                    part.lower,
+                    upper,
+                    opts.straggler_batch,
+                    opts.straggler_delete_timeout,
+                )
+                .await?;
             }
             continue;
         }
