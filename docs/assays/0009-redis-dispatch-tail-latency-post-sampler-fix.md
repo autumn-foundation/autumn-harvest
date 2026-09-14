@@ -71,10 +71,14 @@ Unchanged from ledger #8: the same
 `docs/assays/apparatus/0008-redis-dispatch-integrated/` binary, rebuilt in
 this session (`cargo build --release`, 5m26s, exit 0) against the current
 `autumn-harvest` / `autumn-harvest-redis` path dependencies, which carry PR
-#1468. No apparatus source changed. `Cargo.lock` needed a routine
-`hashbrown`/`lru` patch-version refresh to build against this container's
-local registry cache; no pinned major/minor version changed
-(committed separately, `c19003a`).
+#1468. No apparatus source changed. Building against this container's
+local registry cache did move `Cargo.lock` (committed separately,
+`c19003a`): `lru` 0.16.4 → 0.18.4 (a direct runtime dependency of
+`autumn-harvest`) and, pulled in with it, `hashbrown` 0.16.1 → 0.17.1 —
+both minor-version bumps, not a patch-only refresh as an earlier draft of
+this report claimed. That is an additional, uncontrolled confound in the
+measured binary relative to #8's, alongside the different host (below);
+this report does not attempt to separate its effect from either.
 
 Local services matched to the pre-registered conditions: Postgres 16
 (`ALTER SYSTEM SET fsync = off; synchronous_commit = off;`, restarted and
@@ -136,28 +140,36 @@ rep clears independently (worst rep 81.091 ms, still 3.1x under the line).
 The correctness precondition held in all six runs. L3, as re-chartered,
 passes.
 
-**One line the pre-registration flagged and the numbers confirm needs
-saying plainly: this run does not isolate the sampler fix as sole cause.**
-The control arm — which never touched the fixed samplers' code path in any
-meaningful way relevant to this specific defect, since its own p99 in #8
-was already the "clean" comparator — *also* dropped 4.1x (146.09 ms →
-35.21 ms). If the sampler guard were the entire story, the control arm's
-number should have moved little, since #1428's samplers run regardless of
-which dispatch arm is active but the correlated-subquery cost they added
-was shared connection-pool contention affecting both arms' claim/complete
-transactions, not a control-arm-specific cost. A same-magnitude drop on
-the arm that was never the reported bottleneck is the signature of a
-faster or less-contended host, not (or not only) of the code fix — exactly
-the confound the pre-registration's added stub anticipated. **The
-pre-registered line is about the Redis arm's absolute number, so the kill
-line still updates to a pass regardless of attribution** — but the
-decision this feeds (can #1429 item 1 close on the strength of the sampler
-fix alone) is not fully answered by a single before/after run across two
-different machines. A same-host, same-session ablation (paced sweep with
-the sampler guard reverted, immediately followed by the sweep with it
-restored, both on this container) would isolate the fix's own contribution
-and is a cheap follow-up if that specific attribution matters to the
-decider; it was out of this assay's time box.
+**A correction to an earlier draft of this report, caught in review: the
+control arm's improvement is not unexplained by the sampler fix, and this
+report should not have implied it pointed away from the fix.** Both arms
+of this apparatus start the same four-`Worker` pool under `NoOpMetrics`
+(`src/main.rs:342-353, 637-651`); the choice of arm only changes whether
+`RedisDispatch` is installed, not whether the four unguarded samplers ran.
+Ledger #8's own diagnostic already measured their cost on the *control*
+arm directly: quieting them (by decoupling the sampler cadence from
+`poll_interval`) took the Postgres-only control from completing zero task
+rows in 600 s to 26.09 tasks/s at the drain shape — a Postgres-arm-specific
+effect, not a Redis-arm one. So a large control-arm improvement here is
+exactly what fixing #1428 would predict, not a surprise that needs a host
+explanation instead.
+
+**What this run genuinely cannot separate is how much of *this specific
+paced-shape* result is the sampler fix versus the two confounds recorded
+above: a different physical/container host than #8's, and the `lru`/
+`hashbrown` minor-version bump `Cargo.lock` picked up on rebuild.** Both
+are real and both are un-isolated by a single before/after run across two
+machines and two lockfiles — but neither is evidenced by this run's
+numbers the way the control arm's own improvement is; they are
+acknowledged gaps, not competing explanations this report has weighed
+against the fix and found more likely. **The pre-registered line is about
+the Redis arm's absolute number regardless of attribution, so the pursue
+verdict does not depend on resolving this.** A same-host, same-lockfile,
+same-session ablation (paced sweep with the sampler guard reverted,
+immediately followed by the sweep with it restored, both on this
+container, `Cargo.lock` unchanged between the two) would isolate the fix's
+own contribution precisely and is a cheap follow-up if that specific
+attribution matters to the decider; it was out of this assay's time box.
 
 **What this does answer directly:** on this machine, with the current
 `trunk-dev` code, the Redis dispatch arm does not blow the 250 ms tail
