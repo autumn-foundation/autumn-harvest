@@ -2228,10 +2228,14 @@ pub async fn enqueue_completion_deliveries(
         // here skips just this one target rather than aborting the
         // terminal transaction.
         if let Err(rejection) = validate_target_url(&target.url, &config.ssrf_policy) {
+            // REDACTED to its origin, not logged whole (issue #1274). A
+            // completion-callback target often carries a bearer token in
+            // its path or query, and `tracing::warn!` output routinely
+            // reaches long-lived log storage.
             tracing::warn!(
                 execution_id = %exec_id,
                 callback_index,
-                target_url = %target.url,
+                target_url = %crate::audit_export::redact_webhook_url(&target.url),
                 ?rejection,
                 "completion callback target failed SSRF re-validation at enqueue time; skipping"
             );
@@ -2693,9 +2697,11 @@ async fn fire_due_on_conn(
         // operator gets a visible, actionable DLQ entry instead of a task
         // that appears to make no progress.
         if let Err(rejection) = validate_target_url(&row.target_url, &config.ssrf_policy) {
+            // REDACTED to its origin, not logged whole (issue #1274). See
+            // the matching note in `enqueue_completion_deliveries` above.
             tracing::warn!(
                 delivery_id = %row.id,
-                target_url = %row.target_url,
+                target_url = %crate::audit_export::redact_webhook_url(&row.target_url),
                 rejection = ?rejection,
                 "completion-callback target URL no longer allowed by the live SSRF policy; dead-lettering"
             );
