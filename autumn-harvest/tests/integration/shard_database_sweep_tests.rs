@@ -205,6 +205,59 @@ async fn an_unreachable_omitted_server_does_not_fail_a_partial_run() {
     }
 }
 
+/// A server that accepts a connection and then never answers is not the
+/// same failure as an unreachable one: it cannot fail fast. Bounded, so
+/// this best-effort sweep is delayed by such a server, never hung by it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_omitted_server_does_not_hang_a_partial_run() {
+    let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+        eprintln!(
+            "SKIP a_stalled_omitted_server_does_not_hang_a_partial_run: existing-server mode \
+             only (HARVEST_TEST_DATABASE_URL unset)"
+        );
+        return;
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind blackhole listener");
+    let addr = listener
+        .local_addr()
+        .expect("blackhole listener local addr");
+    // Accepts every connection, but never writes a byte back: the Postgres
+    // startup handshake never completes. Forgotten rather than dropped, so
+    // the socket stays open: a stalled peer, not a closed one.
+    tokio::spawn(async move {
+        loop {
+            if let Ok((socket, _)) = listener.accept().await {
+                std::mem::forget(socket);
+            }
+        }
+    });
+
+    let blackhole = format!("postgres://postgres:postgres@{addr}/postgres");
+    let urls = [admin_url.as_str(), blackhole.as_str()];
+
+    let started = std::time::Instant::now();
+    let cluster = db::provision_independent_servers(&urls, 1).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(25),
+        "a stalled omitted server must not hang this best-effort sweep past its own bound: \
+         took {elapsed:?}"
+    );
+    match cluster {
+        Ok(cluster) => {
+            let failures = cluster.teardown().await;
+            assert!(failures.is_empty(), "teardown failures: {failures:?}");
+        }
+        Err(e) => {
+            panic!("a stalled OMITTED server must not fail a run that never uses it: {e:?}")
+        }
+    }
+}
+
 /// A database that merely shares the harness prefix is never dropped.
 ///
 /// The sweep is the only destructive thing this harness does to a server it

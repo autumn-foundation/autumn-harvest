@@ -1051,6 +1051,16 @@ pub const CELL_HARD_TIMEOUT_SECS: u64 = SCENARIO_BUDGET_SECS + CELL_PROVISIONING
 /// sweep behind it is delayed, not hung, if that ever happens.
 pub const CENSUS_CLEAR_TIMEOUT_SECS: u64 = 30;
 
+/// Bound on sweeping one server this run does not select (see
+/// `provision_independent_servers`).
+///
+/// An unreachable server fails fast: nothing listens, so the connection is
+/// refused immediately. This instead guards a server that accepts the
+/// connection and then never answers. Without a bound, a single such
+/// server would stall this best-effort sweep for the whole outer cell
+/// ceiling, on every database-backed cell in the sweep.
+pub const OMITTED_SERVER_SWEEP_TIMEOUT_SECS: u64 = 15;
+
 /// How long to wait after every signal workflow's handler has reached
 /// `wait_for_signal` before the first signal is sent, so the suspension has
 /// committed.
@@ -2771,7 +2781,16 @@ pub mod db {
             )));
         }
         for admin in admin_urls.iter().skip(count) {
-            let _ = with_stale_sweep(admin, async { Ok::<(), SkipReason>(()) }).await;
+            // Bounded: a server this run does not use must delay this
+            // best-effort sweep, never hang it. An unreachable server
+            // fails fast on its own. One that accepts the connection and
+            // never answers would otherwise block until the outer cell
+            // ceiling.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(super::OMITTED_SERVER_SWEEP_TIMEOUT_SECS),
+                with_stale_sweep(admin, async { Ok::<(), SkipReason>(()) }),
+            )
+            .await;
         }
         let mut urls = BTreeMap::new();
         let mut leases = Vec::new();

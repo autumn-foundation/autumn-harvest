@@ -210,11 +210,12 @@ async fn run_cell(scenario: BenchScenario, shards: u32) -> Option<ScenarioReport
         std::time::Duration::from_secs(CELL_HARD_TIMEOUT_SECS),
     )
     .await;
-    if matches!(outcome, CellOutcome::TimedOut) {
+    if matches!(outcome, CellOutcome::TimedOut | CellOutcome::Panicked(_)) {
         // `await_cell` joining the scenario's own task proves that task's
-        // frame has dropped. It proves nothing about a worker or connection
-        // task that frame only asked to abort (`Fleet` and `SignalServer`'s
-        // `Drop` cannot `await`). So wait for those to actually stop too,
+        // frame has dropped, on a timeout or a panic alike. It proves
+        // nothing about a worker or connection task that frame only asked
+        // to abort (`Fleet` and `SignalServer`'s `Drop` cannot `await`,
+        // panic unwind included). So wait for those to actually stop too,
         // before the next cell's provisioning sweep can see their
         // still-open connections.
         wait_for_census_to_clear(
