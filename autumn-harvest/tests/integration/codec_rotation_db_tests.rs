@@ -76,7 +76,8 @@ use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::models::NewWorkflowExecution;
 use autumn_harvest::payload_codec::{
-    CODEC_ENVELOPE_KID_KEY, CODEC_LEGACY_KEY_ID, CodecError, PayloadCodec, PayloadCodecs,
+    CODEC_ENVELOPE_KEY, CODEC_ENVELOPE_KID_KEY, CODEC_LEGACY_KEY_ID, CodecError, IdentityCodec,
+    PayloadCodec, PayloadCodecs,
 };
 use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::store;
@@ -1870,7 +1871,7 @@ async fn activation_is_refused_while_a_live_worker_cannot_read_the_keyed_envelop
 
     let err = activate_codec_key(&sharded, &[ShardId::new(0)], &codecs, "k2", 60)
         .await
-        .expect_err("a live worker cannot read a nested (version-3) envelope");
+        .expect_err("a live worker cannot read a version-2 envelope");
     match err {
         HarvestError::CodecKeyActivationBlocked { key_id, blockers } => {
             assert_eq!(key_id, "k2");
@@ -1895,7 +1896,7 @@ async fn activation_succeeds_once_every_live_worker_advertises_the_keyed_envelop
         &mut conn,
         "worker-new",
         0,
-        &json!({"codec_envelope_version": 3, "codec_registered_key_ids": ["k2"]}),
+        &json!({"codec_envelope_version": 2, "codec_registered_key_ids": ["k2"]}),
     )
     .await;
 
@@ -1905,11 +1906,11 @@ async fn activation_succeeds_once_every_live_worker_advertises_the_keyed_envelop
 
     activate_codec_key(&sharded, &[ShardId::new(0)], &codecs, "k2", 60)
         .await
-        .expect("every live worker advertises version 3 and has k2 registered");
+        .expect("every live worker advertises version 2 and has k2 registered");
     assert_eq!(codecs.active_key_id(), "k2");
 }
 
-/// A worker's binary can support the nested envelope's syntax fleet-wide
+/// A worker's binary can support the version-2 envelope's syntax fleet-wide
 /// before the target key's material reaches every worker's config.
 /// Envelope support alone must not be read as proof this worker can decode
 /// payloads written under the specific key being activated.
@@ -1917,13 +1918,13 @@ async fn activation_succeeds_once_every_live_worker_advertises_the_keyed_envelop
 async fn activation_is_refused_while_a_live_worker_lacks_the_target_key() {
     let (url, _c) = setup_isolated_db().await;
     let mut conn = connect(&url).await;
-    // Envelope v3 capable, but only "k1" ever reached this worker's config --
+    // Envelope v2 capable, but only "k1" ever reached this worker's config --
     // "k2" is the key this test activates.
     insert_worker_row(
         &mut conn,
         "worker-partial",
         0,
-        &json!({"codec_envelope_version": 3, "codec_registered_key_ids": ["k1"]}),
+        &json!({"codec_envelope_version": 2, "codec_registered_key_ids": ["k1"]}),
     )
     .await;
 
@@ -2217,33 +2218,61 @@ async fn a_four_key_version_1_payload_is_not_counted_by_the_census() {
 }
 
 /// Issue #1253: the census SQL must recognize the current nested envelope
-/// shape too, not just the two legacy flat ones. `append_under_key` writes
-/// real rows through `PayloadCodecs::encode_event`. That now nests any row
-/// encoded under a genuinely active (non-legacy) key. So this exercises the
-/// SQL predicate's new branch end to end, against real ciphertext.
+/// shape too, not just the two legacy flat ones.
+///
+/// A genuinely rotated real codec stays flat — see
+/// `PayloadCodecs::encode_payload`'s doc for why. The only producer of a
+/// nested row is the collision-escape guard, which fires only when the
+/// active codec is identity.
+///
+/// Register identity under a named key to exercise the escape path WITH a
+/// `kid`. This mirrors an embedder using identity as a deliberate "store
+/// in the clear" rotation key — `codec_rotation`'s own doc on
+/// `active_key_would_decrypt` describes this as supported.
+///
+/// This proves the SQL predicate's new branch against a real row. It also
+/// proves an emergent property: a value the escape guard protected gets
+/// properly re-encrypted once real rotation converts it onto an actual key.
 #[tokio::test]
 async fn a_nested_envelope_is_counted_and_swept() {
     let (url, _c) = setup_isolated_db().await;
     let mut conn = connect(&url).await;
-    let codecs = two_key_registry();
+    let codecs = PayloadCodecs::default();
+    codecs
+        .register_key("k1", Arc::new(IdentityCodec))
+        .expect("register k1");
+    codecs
+        .register_key("k2", Arc::new(XorCodec(0x22)))
+        .expect("register k2");
+    codecs.set_active_key("k1").expect("activate k1");
+
     let exec_id = insert_execution(&mut conn, "nested").await;
-    append_under_key(
+    // Envelope-shaped business data: the exact collision this fix escapes.
+    let colliding = json!({
+        "_harvest_codec_envelope": 2,
+        "codec_id": "xor",
+        "data": "AAAA",
+        "kid": "k9",
+    });
+    store::append_events_with_codecs(
         &mut conn,
-        &codecs,
         exec_id,
-        "k1",
+        &[started(colliding.clone())],
         0,
-        &[started(json!({"a": 1}))],
+        &codecs,
     )
-    .await;
+    .await
+    .expect("append events");
 
     let rows = raw_event_data(&mut conn, exec_id).await;
     let field = &rows[0]["data"]["input"];
     assert_eq!(
         field.as_object().map(serde_json::Map::len),
         Some(1),
-        "the row this test just wrote is nested, one top-level key: {field}"
+        "the escaped row is nested, one top-level key: {field}"
     );
+    assert_eq!(field[CODEC_ENVELOPE_KEY]["codec_id"], "identity");
+    assert_eq!(field[CODEC_ENVELOPE_KEY][CODEC_ENVELOPE_KID_KEY], "k1");
 
     codecs.set_active_key("k2").expect("flip");
     let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)
@@ -2260,8 +2289,23 @@ async fn a_nested_envelope_is_counted_and_swept() {
             .await
             .expect("sweep"),
         1,
-        "and must be converted onto k2"
+        "and must be converted onto k2 -- the escaped plaintext is now genuinely encrypted"
     );
+
+    let converted = raw_event_data(&mut conn, exec_id).await;
+    match codecs
+        .decode_event(converted[0].clone())
+        .expect("decode after sweep")
+    {
+        WorkflowEvent::WorkflowStarted { input, .. } => {
+            assert_eq!(
+                input, colliding,
+                "the original business value survives escape, census, and re-encryption \
+                 byte-identical"
+            );
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
 }
 
 /// The nested-shape sibling of `a_near_envelope_is_neither_counted_nor_swept`.

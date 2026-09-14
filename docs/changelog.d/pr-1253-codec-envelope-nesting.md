@@ -30,42 +30,63 @@ written from here on.
 **Compatibility, no data rewrite.** `harvest_events` is append-only, so
 historical rows keep their shape — decode still recognizes both pre-#1253
 flat shapes (version 1, three keys; version 2, four keys with `kid`)
-alongside the new nested one. Encoding is scoped narrowly: a write nests only
-when a key is genuinely rotated active, or the collision-escape guard fires.
-The common case — a single non-identity codec, rotation never configured —
-keeps writing the pre-#948 flat bytes unchanged, so this fix changes nothing
-for the deployments that were never at risk.
+alongside the new nested one.
 
-**Rotation surface updated in step.** The SQL census predicate
+**Nesting is scoped to the escape case only — a keyed write stays flat.**
+Review caught a rollout hazard in an earlier version of this fix that also
+nested every keyed write: `codec_rotation::activate_codec_key`'s
+fleet-readiness gate only runs when an operator calls it, but
+`HarvestBuilder::payload_codec_key`/`active_payload_codec_key` register and
+activate a key entirely locally at startup, with no fleet check at all. A
+deployment already using that path would have started emitting envelopes
+older binaries cannot parse the moment one worker upgraded. Keyed writes
+now stay flat and byte-identical to pre-#1253 — nothing about their shape
+changes, so nothing new needs a rollout order. Only the escape case is new
+shape at all, and it is ungated by necessity (see below), not by oversight.
+The common case — a single non-identity codec, rotation never configured —
+also keeps writing the pre-#948 flat bytes unchanged.
+
+**Rotation surface updated for the nested shape.** The SQL census predicate
 (`codec_rotation::db::ENVELOPE_PREDICATE`) gained a third branch mirroring
 the nested shape, kept in step with `codec_envelope_parts` by
 `a_nested_envelope_is_counted_and_swept` /
-`a_nested_near_envelope_is_neither_counted_nor_swept`. The worker
-fleet-readiness gate (`activate_codec_key`) now requires
-`CODEC_ENVELOPE_VERSION_NESTED` support before a keyed codec may be
-activated, replacing the version-2 requirement #948 introduced — same
-rollout-ordering discipline, new version number.
+`a_nested_near_envelope_is_neither_counted_nor_swept` — the former exercises
+identity registered under a named rotation key (a supported "store in the
+clear" configuration `codec_rotation`'s own doc already describes), proving
+an escaped value gets genuinely encrypted once real rotation converts it.
+The worker fleet-readiness gate (`activate_codec_key`) is unchanged: it
+still requires version-2 (flat, keyed) support, because that is still the
+only shape a keyed write ever produces.
 
-**Residual, documented gap.** The collision-escape path is not fleet-gated
-the way key activation is — it can fire on a deployment that never rotates a
-key at all. A pre-#1253 reader hitting an escaped envelope during a
-mixed-binary rollout window sees the wrapped object as literal data (wrong,
-but not destructive) rather than an error. Accepted rather than gated:
-triggering it needs both the pre-existing collision (independently assessed
-as remote) and a live mixed-binary window. Flat-shaped rows already on disk
-before this fix keep their pre-existing, un-eliminated collision risk — there
-is no way to close that retroactively without rewriting stored history, which
-the append-only invariant forbids outside the two sanctioned exceptions in
-`CLAUDE.md` (unchanged by this fix — still exactly two).
+**Residual, documented gaps.** Two, both accepted rather than gated:
+
+1. The collision-escape path is not fleet-gated — it can fire on a
+   deployment that never rotates a key at all. A pre-#1253 reader hitting
+   an escaped envelope during a mixed-binary rollout window sees the
+   wrapped object as literal data (wrong, but not destructive), not an
+   error. Triggering it needs both the pre-existing collision
+   (independently assessed as remote) and a live mixed-binary window.
+2. Recognizing the nested shape at all is a new discriminator over an
+   already-populated log: a row written by identity before this fix
+   shipped, with no escape guard yet to apply, that happens to already
+   match the nested shape reads as ciphertext now — the same category of
+   risk the flat shapes already carried for rows written before #1253, not
+   a new one. Every reserved marker this crate has introduced carried this
+   exact risk once, at the moment it started being recognized.
+
+Neither is fixable without rewriting stored history, which the append-only
+invariant forbids outside the two sanctioned exceptions in `CLAUDE.md`
+(unchanged by this fix — still exactly two).
 
 No new `WorkflowEvent` variant, no migration, no change to the
 adjacently-tagged event JSON contract.
 
-Tests: 5 new `payload_codec.rs` unit tests (flat- and nested-shaped
+Tests: 6 new `payload_codec.rs` unit tests (flat- and nested-shaped
 collision escape and round-trip, ordinary-payload non-interference, nested
-shape strictness, un-rotated real-codec byte-identity); 8 existing
-`payload_codec.rs` tests and 4 existing `codec_rotation.rs` unit tests
-updated for the nested write shape; 2 new `codec_rotation_db_tests.rs`
-integration tests pinning the SQL predicate's new branch against a real
-sweep, plus 3 existing ones updated for the fleet-readiness gate's new
-required version.
+shape strictness including malformed nested `kid`, the lossy read path
+against a nested envelope, un-rotated real-codec byte-identity); 2 new
+`codec_rotation_db_tests.rs` integration tests pinning the SQL predicate's
+new nested branch against a real sweep — one exercising identity registered
+under a rotation key, proving an escaped value gets genuinely encrypted
+once real rotation converts it. Keyed-write tests are unchanged: nesting
+never reaches that path.

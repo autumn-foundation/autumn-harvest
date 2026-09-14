@@ -82,24 +82,50 @@ not merely making it less probable.
 append-only, so historical rows cannot be reshaped retroactively — decode
 keeps recognizing both legacy flat shapes (version 1, three keys; version 2,
 four keys with a `kid`) exactly as before, alongside the new nested shape.
-Only encoding changes: a write nests only when a key is genuinely rotated
-active, or when the collision-escape guard fires. The common case — a single
-non-identity codec, key rotation never configured — keeps writing the
-pre-#948 flat bytes unchanged, so this fix changes nothing for deployments
-that were never at risk. The residual collision risk for flat-shaped rows
-already on disk before this fix is unavoidable and stays; only new writes get
-the unconditional guarantee.
+
+**Nesting is scoped to the escape case only — a keyed write stays flat.**
+An earlier version of this fix nested every write under a genuinely active
+key too, reasoning that key activation was already fleet-gated by
+`codec_rotation::activate_codec_key`. That reasoning missed a real rollout
+hazard (caught in review): that gate only runs when an operator calls it —
+`HarvestBuilder::payload_codec_key`/`active_payload_codec_key` register and
+activate a key entirely locally, at process startup, with no fleet check at
+all. A deployment already using that path when this fix ships would have
+started emitting envelopes older binaries cannot parse the moment a single
+worker upgraded, with no way to enforce reader-first ordering at all. Keyed
+writes staying flat — byte-identical to every pre-#1253 envelope — avoids
+this: there is nothing new to roll out in order, because nothing about a
+keyed write's shape changes. Only the escape case is new, and it changes
+behavior (a previously-corrupted value is now protected), not a shape
+anything already depends on.
+
+The common case — a single non-identity codec, key rotation never
+configured — also keeps writing the pre-#948 flat bytes unchanged, so this
+fix changes nothing for the large majority of deployments that were never
+at risk. The residual collision risk for flat-shaped rows already on disk
+before this fix is unavoidable and stays; only new writes through
+`encode_payload` get the unconditional guarantee.
+
+**The nested shape carries the same residual, on day one.** Recognizing a
+new shape at all is itself a new discriminator over an already-populated
+log: a row written by identity before this fix shipped, with no escape
+guard yet to apply, that happens to already match the nested shape reads as
+ciphertext now. That is not a new category of risk — every reserved marker
+this crate has introduced (`_harvest_offload_envelope`, `_harvest_undecodable`)
+carried it once, at the moment it started being recognized — but it means
+"by construction" describes what this fix writes going forward, not
+history that already exists.
 
 **Rollout.** The fleet-readiness gate (`codec_rotation::activate_codec_key`)
-now requires nested-envelope support before a keyed codec may be activated,
-the same way it required version-2 support before #948's `kid` could be
-activated. The collision-escape path is not gated the same way — it can fire
-on a deployment that never rotates a key at all — so a pre-#1253 reader
-hitting an escaped envelope during a mixed-binary rollout window sees the
-wrapped object as literal data (wrong, but not destructive) rather than an
-error. Accepted and documented rather than gated: triggering it needs both
-the pre-existing collision (independently remote) and a live mixed-binary
-window.
+is unchanged by this fix: it still requires version-2 (flat, keyed) support
+before a keyed codec may be activated, because that is still the only shape
+a keyed write ever produces. The collision-escape path is not gated at
+all — it can fire on a deployment that never rotates a key — so a pre-#1253
+reader hitting an escaped envelope during a mixed-binary rollout window
+sees the wrapped object as literal data (wrong, but not destructive) rather
+than an error. Accepted and documented rather than gated: triggering it
+needs both the pre-existing collision (independently remote) and a live
+mixed-binary window.
 
 Test: `payload_codec.rs`'s
 `a_flat_envelope_shaped_plaintext_is_escaped_on_encode_and_round_trips` stores

@@ -1477,9 +1477,9 @@ mod db {
     ///
     /// Blocks on either of two independent conditions:
     ///
-    /// 1. The worker does not advertise support for the nested (version-3)
+    /// 1. The worker does not advertise support for the keyed (version-2)
     ///    codec envelope, so it cannot even parse a `kid`-bearing payload.
-    /// 2. The worker's binary does support version 3, but its own
+    /// 2. The worker's binary does support version 2, but its own
     ///    `PayloadCodecs` does not have `key_id` registered. It cannot
     ///    decode a payload some other worker encoded under it.
     ///
@@ -1506,7 +1506,7 @@ mod db {
                                       ELSE NULL END, \
                                  1 \
                                ) < $3 \
-                         THEN 'cannot read the nested (version 3) codec envelope' \
+                         THEN 'cannot read envelope version 2' \
                          ELSE 'codec key ' || $4 || ' is not registered on this worker' \
                     END AS reason \
                FROM harvest_workers \
@@ -1524,7 +1524,7 @@ mod db {
         )
         .bind::<Double, _>(worker_stale_secs as f64)
         .bind::<Text, _>(crate::payload_codec::CODEC_ENVELOPE_CAPABILITY_LABEL)
-        .bind::<BigInt, _>(crate::payload_codec::CODEC_ENVELOPE_VERSION_NESTED)
+        .bind::<BigInt, _>(crate::payload_codec::CODEC_ENVELOPE_VERSION_KEYED)
         .bind::<Text, _>(key_id)
         .bind::<Text, _>(crate::payload_codec::CODEC_REGISTERED_KEY_IDS_LABEL)
         .load(conn)
@@ -1971,21 +1971,23 @@ mod db {
     ///
     /// # Why the check exists
     ///
-    /// A pre-#1253 reader recognises an envelope only as one of the flat
-    /// shapes issue #948 introduced. A nested envelope (issue #1253, written
-    /// once a key is genuinely active) comes back unchanged from its
-    /// decoder — silent wrong data, not an error. See
-    /// [`PayloadCodecs::set_active_key`]'s rustdoc.
+    /// A pre-#948 reader recognises an envelope only as exactly three keys at
+    /// version 1. A version-2 envelope (four keys, a `kid`) comes back
+    /// unchanged from its decoder — silent wrong data, not an error. See
+    /// [`PayloadCodecs::set_active_key`]'s rustdoc. Issue #1253's nested
+    /// shape does not change this. A genuinely activated key still writes
+    /// the flat version-2 shape this check has always covered, never
+    /// nested — see [`PayloadCodecs::encode_payload`]'s doc for why.
     ///
     /// This function is the structural version of that rustdoc's manual
     /// rollout-ordering warning. Every live worker's `harvest_workers.labels`
-    /// row must advertise [`crate::payload_codec::CODEC_ENVELOPE_VERSION_NESTED`]
+    /// row must advertise [`crate::payload_codec::CODEC_ENVELOPE_VERSION_KEYED`]
     /// support, **and** carry `key_id` in
     /// [`crate::payload_codec::CODEC_REGISTERED_KEY_IDS_LABEL`], before
     /// activation is allowed to proceed at all.
     ///
     /// The second half matters separately from the first. A binary can
-    /// support the nested envelope's *syntax* fleet-wide before the
+    /// support the version-2 envelope's *syntax* fleet-wide before the
     /// target key's *material* reaches every worker's config. A worker
     /// missing the key cannot decode a payload some other worker encodes
     /// under it.
@@ -2236,7 +2238,7 @@ mod db {
 mod tests {
     use super::*;
     use crate::payload_codec::{
-        CODEC_ENVELOPE_KEY, CODEC_ENVELOPE_KID_KEY, CODEC_LEGACY_KEY_ID, CodecError, PayloadCodec,
+        CODEC_ENVELOPE_KID_KEY, CODEC_LEGACY_KEY_ID, CodecError, PayloadCodec,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -2292,19 +2294,13 @@ mod tests {
     fn reencrypts_a_field_carrying_a_non_active_key_id() {
         let codecs = rotated_registry();
         let mut event = event_under(&codecs, "k1", json!({"user": "alice"}));
-        assert_eq!(
-            event["data"]["input"][CODEC_ENVELOPE_KEY][CODEC_ENVELOPE_KID_KEY],
-            "k1"
-        );
+        assert_eq!(event["data"]["input"][CODEC_ENVELOPE_KID_KEY], "k1");
 
         let outcome = reencrypt_event_payload_fields(&codecs, &mut event).expect("reencrypt");
 
         assert_eq!(outcome.fields_reencrypted, 1);
         assert!(outcome.changed());
-        assert_eq!(
-            event["data"]["input"][CODEC_ENVELOPE_KEY][CODEC_ENVELOPE_KID_KEY],
-            "k2"
-        );
+        assert_eq!(event["data"]["input"][CODEC_ENVELOPE_KID_KEY], "k2");
     }
 
     #[test]
@@ -2323,8 +2319,7 @@ mod tests {
             "timestamps are never touched"
         );
         assert_ne!(
-            event["data"]["input"][CODEC_ENVELOPE_KEY]["data"],
-            before["data"]["input"][CODEC_ENVELOPE_KEY]["data"],
+            event["data"]["input"]["data"], before["data"]["input"]["data"],
             "the ciphertext bytes did change"
         );
         let decoded = codecs.decode_event(event).expect("decode after sweep");
@@ -2426,10 +2421,7 @@ mod tests {
         let outcome = reencrypt_event_payload_fields(&codecs, &mut event).expect("reencrypt");
 
         assert_eq!(outcome.fields_reencrypted, 1);
-        assert_eq!(
-            event["data"]["input"][CODEC_ENVELOPE_KEY][CODEC_ENVELOPE_KID_KEY],
-            "k2"
-        );
+        assert_eq!(event["data"]["input"][CODEC_ENVELOPE_KID_KEY], "k2");
     }
 
     #[test]
@@ -2518,7 +2510,7 @@ mod tests {
         assert_eq!(outcome.fields_reencrypted, PAYLOAD_FIELD_KEYS.len());
         for key in PAYLOAD_FIELD_KEYS {
             assert_eq!(
-                event["data"][key][CODEC_ENVELOPE_KEY][CODEC_ENVELOPE_KID_KEY], "k2",
+                event["data"][key][CODEC_ENVELOPE_KID_KEY], "k2",
                 "field {key}"
             );
         }
