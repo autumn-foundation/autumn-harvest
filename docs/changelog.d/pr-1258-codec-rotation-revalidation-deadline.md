@@ -29,14 +29,25 @@ adds the nullable column and backfills existing completed cursors to `NOW()`
 (due immediately — the safe direction). Column comments on both
 `updated_at` and `next_revalidation_at` state which is which.
 
-**Tests.** Two new integration tests in `codec_rotation_db_tests.rs`:
+**A second hazard, found in review.** The arm/clear `CASE` first checked only
+whether `completed_at` transitioned away from `NULL`. A key rotation
+followed by a rollback can complete a fresh pass while the *stored*
+`completed_at` is already non-`NULL` — belonging to a different key's prior
+pass — so that check alone inherited the other pass's stale deadline
+instead of arming a new one. The `CASE` also arms fresh when
+`active_key_id` changes, even if both the old and new `completed_at` are
+set.
+
+**Tests.** Three new integration tests in `codec_rotation_db_tests.rs`:
 `an_ordinary_advancing_write_does_not_reset_the_revalidation_deadline`
 pins the exact mechanism (an advancing write over an already-complete pass
-must move `updated_at` but not `next_revalidation_at`), and
+must move `updated_at` but not `next_revalidation_at`);
 `a_busy_shard_still_revalidates_once_the_deadline_is_due` reproduces the
-reported scenario end to end: a row committed below the cursor survives
+reported scenario end to end (a row committed below the cursor survives
 several busy ticks before the deadline, and is converted once the deadline
-comes due despite continuous traffic on either side of it.
+comes due despite continuous traffic on either side of it); and
+`a_fresh_pass_under_a_different_key_arms_its_own_deadline` covers the
+rollback hazard above.
 
 `docs/operations/codec-key-rotation.md` and the `GET /admin/codec/rotation`
 API contract document the two columns' separate meanings.

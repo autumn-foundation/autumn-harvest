@@ -1080,8 +1080,8 @@ mod db {
     /// - **The comparison happens on the database clock.** The deadline is
     ///   written with `NOW()`. Testing it against the worker's `Utc::now()`
     ///   would measure host clock skew as much as elapsed time. A worker
-    ///   running five minutes fast would find the cursor due immediately
-    ///   after every refresh, and census on every tick — precisely the
+    ///   running five minutes fast would find the cursor due right after
+    ///   every refresh, and census on every tick. That is precisely the
     ///   per-tick full scan the throttle exists to stop. A worker running
     ///   slow would silently stretch the recovery window instead. `NOW()` on
     ///   both sides of the predicate removes the host clock from the
@@ -1091,10 +1091,10 @@ mod db {
     ///   a timeout checker over the same shard. Reading the deadline,
     ///   deciding, then censusing, then writing would let every replica pass
     ///   the check before any of them writes. A large shard would then take
-    ///   one simultaneous sequential scan *per replica* every interval —
-    ///   worse than the unthrottled single-worker case this was meant to fix.
-    ///   `UPDATE ... WHERE next_revalidation_at <= NOW() RETURNING` makes
-    ///   exactly one replica win. The row lock serialises them, so the
+    ///   one simultaneous sequential scan *per replica* every interval. That
+    ///   is worse than the unthrottled single-worker case this was meant to
+    ///   fix. `UPDATE ... WHERE next_revalidation_at <= NOW() RETURNING`
+    ///   makes exactly one replica win. The row lock serialises them, so the
     ///   loser's predicate no longer holds.
     ///
     /// Rearming the deadline before the census, not after, is deliberate. The

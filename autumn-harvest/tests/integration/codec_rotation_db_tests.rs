@@ -45,8 +45,9 @@
 //!   fencing.
 //! - **Issue #1258** (the revalidation deadline is its own column, not
 //!   `updated_at`) —
-//!   [`an_ordinary_advancing_write_does_not_reset_the_revalidation_deadline`]
-//!   and [`a_busy_shard_still_revalidates_once_the_deadline_is_due`].
+//!   [`an_ordinary_advancing_write_does_not_reset_the_revalidation_deadline`],
+//!   [`a_busy_shard_still_revalidates_once_the_deadline_is_due`], and
+//!   [`a_fresh_pass_under_a_different_key_arms_its_own_deadline`].
 //!
 //! # Issue #1244: the two structural fleet-wide preconditions
 //!
@@ -3224,10 +3225,9 @@ async fn an_ordinary_advancing_write_does_not_reset_the_revalidation_deadline() 
 /// revalidate once the deadline comes due.
 ///
 /// This is the scenario issue #1258 reports. On the single-column design, an
-/// ordinary advancing write reset the same timestamp the claim throttled on,
-/// so a shard receiving traffic within every interval never saw the claim's
-/// predicate hold, and a row committed below the cursor was never found
-/// again.
+/// ordinary advancing write reset the same timestamp the claim throttled on.
+/// So a shard receiving traffic within every interval never saw the claim's
+/// predicate hold. A row committed below the cursor was never found again.
 #[tokio::test]
 async fn a_busy_shard_still_revalidates_once_the_deadline_is_due() {
     let (url, _c) = setup_isolated_db().await;
@@ -3259,8 +3259,8 @@ async fn a_busy_shard_still_revalidates_once_the_deadline_is_due() {
     insert_event_at_id(&mut conn, exec_id, 5_000, 1, &late).await;
 
     // Ordinary busy traffic, well before the deadline is due. Each row
-    // already carries the active key, so there is nothing to convert — but
-    // the batch is non-empty and the cursor advances over it every tick.
+    // already carries the active key, so there is nothing to convert. The
+    // batch is still non-empty, so the cursor advances over it every tick.
     for (i, row_id) in (10_001..10_004).enumerate() {
         let busy = encode_under(&codecs, "k2", &json!({"busy": i}));
         let event_id = 2 + i32::try_from(i).expect("small loop index");
@@ -3307,5 +3307,85 @@ async fn a_busy_shard_still_revalidates_once_the_deadline_is_due() {
         0,
         "once due, revalidation must still run and convert the stranded row, \
          even on a shard that never goes idle"
+    );
+}
+
+/// A fresh pass under a different key must arm its own deadline, not
+/// inherit the previous key's.
+///
+/// `write_cursor`'s `next_revalidation_at` CASE only checked whether
+/// `completed_at` transitioned away from `NULL`. A key rotation followed by
+/// a rollback can complete a fresh pass while the STORED `completed_at` is
+/// already non-`NULL`. That value belongs to the previous key's pass, not
+/// this one. So that check alone would carry the old deadline forward
+/// instead of arming a new one.
+#[tokio::test]
+async fn a_fresh_pass_under_a_different_key_arms_its_own_deadline() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "rollback_deadline").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+
+    // Forward: k1 -> k2, pass completes and arms a deadline.
+    codecs.set_active_key("k2").expect("flip to k2");
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("forward sweep");
+    assert!(
+        load_shard_rotation_progress(&mut conn, 0, &codecs)
+            .await
+            .expect("progress")
+            .cursor
+            .expect("cursor")
+            .completed_at
+            .is_some(),
+        "the forward pass must complete, or this test does not exercise the \
+         hazard"
+    );
+
+    // Push that deadline far into the past, so a stale inherited value is
+    // unmistakably different from a freshly armed one.
+    diesel::sql_query(
+        "UPDATE harvest_codec_rotation_cursor \
+         SET next_revalidation_at = now() - interval '1 hour' WHERE shard_id = 0",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("age the k2 deadline");
+
+    // Roll back to k1. The row converts back in one tick, so this pass
+    // completes immediately. The k2 row's stale `completed_at` and
+    // deadline are still sitting in the table when the write happens.
+    codecs.set_active_key("k1").expect("roll back to k1");
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("rollback sweep");
+
+    let cursor = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .cursor
+        .expect("k1's fresh pass wrote a cursor");
+    assert_eq!(cursor.active_key_id, "k1");
+    assert!(
+        cursor.completed_at.is_some(),
+        "the rollback pass must also complete"
+    );
+    let deadline = cursor
+        .next_revalidation_at
+        .expect("a completed pass must have an armed deadline");
+    assert!(
+        deadline > Utc::now(),
+        "a fresh pass under a different key must arm its own deadline, not \
+         inherit the previous key's stale one; got {deadline:?}"
     );
 }
