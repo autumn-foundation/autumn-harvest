@@ -1948,6 +1948,24 @@ mod builder_config_tests {
     }
 
     #[test]
+    fn validate_default_targets_strips_userinfo_from_a_rejected_target() {
+        // The allowlisted host means `UserinfoNotAllowed` is the rejection
+        // reason, not a host mismatch (issue #1274).
+        let config = CompletionCallbackBuilderConfig {
+            allowlist: HostAllowlist::new().with_pattern("api.example.com"),
+            default_targets: vec![CallbackTarget::new(
+                "https://user:s3cret@api.example.com/hook",
+                EventFilter::AnyTerminal,
+            )],
+            ..Default::default()
+        };
+        let (url, rejection) = config.validate_default_targets().unwrap_err();
+        assert_eq!(url, "https://api.example.com/<redacted>");
+        assert!(!url.contains("s3cret"));
+        assert_eq!(rejection, SsrfRejection::UserinfoNotAllowed);
+    }
+
+    #[test]
     fn ssrf_policy_reflects_configured_flags() {
         let config = CompletionCallbackBuilderConfig {
             allow_http: true,
