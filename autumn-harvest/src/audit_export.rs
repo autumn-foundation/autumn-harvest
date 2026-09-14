@@ -545,7 +545,12 @@ pub(crate) fn redact_webhook_url(url: &str) -> String {
     let Some(host) = parsed.host_str() else {
         return "<unparseable webhook url redacted>".to_string();
     };
-    format!("{}://{host}/<redacted>", parsed.scheme())
+    // A port is part of the origin, not the credential (issue #1274). Two
+    // targets at the same host on different ports are different
+    // endpoints. `Url::port()` already omits the scheme's default port,
+    // so this adds nothing for a bare `https://host/...` origin.
+    let port = parsed.port().map_or_else(String::new, |p| format!(":{p}"));
+    format!("{}://{host}{port}/<redacted>", parsed.scheme())
 }
 
 impl std::fmt::Debug for AuditExportBuilderConfig {
@@ -3829,6 +3834,24 @@ mod tests {
         assert_eq!(
             redact_webhook_url("https://user:s3cr3t/api"),
             "<unparseable webhook url redacted>"
+        );
+    }
+
+    #[test]
+    fn redact_webhook_url_keeps_a_non_default_port() {
+        // Issue #1274: a port is part of the origin, not the credential.
+        // Two targets on the same host at different ports are different
+        // endpoints. Dropping the port made them indistinguishable in a
+        // startup error or a runtime log line.
+        assert_eq!(
+            redact_webhook_url("https://siem.example.com:8443/token"),
+            "https://siem.example.com:8443/<redacted>"
+        );
+        // The default port for the scheme adds no information; omit it,
+        // matching the pre-existing behavior for a bare origin.
+        assert_eq!(
+            redact_webhook_url("https://siem.example.com:443/token"),
+            "https://siem.example.com/<redacted>"
         );
     }
 
