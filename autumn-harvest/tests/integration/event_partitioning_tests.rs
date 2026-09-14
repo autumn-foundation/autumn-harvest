@@ -5037,9 +5037,10 @@ async fn maintenance_outcome_reports_whether_the_shard_was_partitioned() {
     let outcome = partition::maintain(&mut conn, Utc::now(), 0, &SweepOptions::default(), None)
         .await
         .expect("maintain is a safe no-op on an unpartitioned shard");
-    assert!(
-        !outcome.partitioned,
-        "an unpartitioned shard must report partitioned: false; got {outcome:?}"
+    assert_eq!(
+        outcome.partitioned,
+        Some(false),
+        "an unpartitioned shard must report partitioned: Some(false); got {outcome:?}"
     );
 
     partition::enable_partitioning(&mut conn, &EnableOptions::default())
@@ -5049,9 +5050,10 @@ async fn maintenance_outcome_reports_whether_the_shard_was_partitioned() {
     let outcome = partition::maintain(&mut conn, Utc::now(), 0, &SweepOptions::default(), None)
         .await
         .expect("maintain on a partitioned shard");
-    assert!(
+    assert_eq!(
         outcome.partitioned,
-        "a partitioned shard must report partitioned: true, even on an \
+        Some(true),
+        "a partitioned shard must report partitioned: Some(true), even on an \
          otherwise-empty pass; got {outcome:?}"
     );
 }
@@ -5060,11 +5062,11 @@ async fn maintenance_outcome_reports_whether_the_shard_was_partitioned() {
 async fn partition_maintenance_reports_failed_when_the_layout_probe_errors() {
     // Test-coverage review finding on item 6: `maintain`'s own internal
     // layout probe has three outcomes. Unpartitioned (stamped empty
-    // outcome, `partitioned: false`), Partitioned (run maintain), and
-    // Err (propagated to the caller). Only the first two were exercised
-    // by a prior test. An Err must report `MaintenanceOutcome::failed`,
-    // not silently collapse into looking like a shard that never
-    // converted.
+    // outcome, `partitioned: Some(false)`), Partitioned (run maintain),
+    // and Err (propagated to the caller). Only the first two were
+    // exercised by a prior test. An Err must report
+    // `MaintenanceOutcome::failed`, not silently collapse into looking
+    // like a shard that never converted.
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
@@ -5118,6 +5120,11 @@ async fn partition_maintenance_reports_failed_when_the_layout_probe_errors() {
     assert!(
         outcome.created.is_empty() && outcome.sweep.dropped.is_empty(),
         "a probe failure must not report as if maintain() itself ran; got {outcome:?}"
+    );
+    assert_eq!(
+        outcome.partitioned, None,
+        "a probe failure must report the layout as unknown, not falsely claim \
+         Some(false); got {outcome:?}"
     );
 }
 

@@ -4990,6 +4990,7 @@ async fn maintain_inner(
         // hang forever on an unpartitioned shard, where there is nothing to do.
         return Ok(MaintenanceOutcome {
             at: Some(Utc::now()),
+            partitioned: Some(false),
             ..MaintenanceOutcome::default()
         });
     }
@@ -5068,7 +5069,7 @@ async fn maintain_inner(
     };
     Ok(MaintenanceOutcome {
         at: Some(Utc::now()),
-        partitioned: true,
+        partitioned: Some(true),
         created,
         lookahead_blocked,
         drained,
@@ -5099,11 +5100,21 @@ pub struct MaintenanceOutcome {
     /// Basing a report on that earlier, separate probe can then
     /// disagree with what this pass actually observed and acted on.
     /// This field lets a caller derive its report from the exact probe
-    /// that gated the work, so the two can never disagree. `true` only
-    /// on the return after the probe below finds the shard partitioned.
-    /// `false` on the unpartitioned early return, and on
-    /// [`Self::failed`], which never gets far enough to probe at all.
-    pub partitioned: bool,
+    /// that gated the work, so the two can never disagree. `Some(true)`
+    /// only on the return after the probe below finds the shard
+    /// partitioned; `Some(false)` on the unpartitioned early return.
+    ///
+    /// Review finding: the owner-gap check, `ensure_partitions`, and
+    /// `sweep` below can all still fail AFTER this probe already found
+    /// the shard partitioned. A caller that turns the resulting `Err`
+    /// into a [`Self::failed`] has no way to recover which layout this
+    /// pass saw. The error carries no memory of it. `None` on
+    /// [`Self::failed`] represents that honestly, as an unknown layout.
+    /// The alternative, falsely claiming `Some(false)` (unpartitioned),
+    /// would misreport a shard this very pass had already confirmed
+    /// partitioned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitioned: Option<bool>,
     /// Cohort partitions created to extend the lookahead window.
     pub created: Vec<String>,
     /// Cohorts in the lookahead window that could NOT be created this pass.
@@ -6322,6 +6333,25 @@ pub fn migration_plan(opts: &EnableOptions, now: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_reports_the_layout_as_unknown_not_unpartitioned() {
+        // Review finding: the owner-gap check, `ensure_partitions`, and
+        // `sweep` inside `maintain_inner` can all fail AFTER its own
+        // probe already confirmed the shard partitioned. The error that
+        // propagates out carries no memory of that. A caller wrapping
+        // it in `MaintenanceOutcome::failed` must not claim
+        // `Some(false)`: that would misreport a confirmed-partitioned
+        // shard as unpartitioned on any post-probe failure. `None` is
+        // the honest answer when the layout at the point of failure is
+        // not known.
+        let outcome = MaintenanceOutcome::failed("boom".to_string());
+        assert_eq!(
+            outcome.partitioned, None,
+            "a failure with no probe result of its own must report the layout \
+             as unknown, not falsely claim unpartitioned; got {outcome:?}"
+        );
+    }
 
     #[test]
     fn cohort_start_floors_to_the_width() {

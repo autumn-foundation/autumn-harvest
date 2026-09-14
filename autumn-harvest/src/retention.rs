@@ -1273,7 +1273,7 @@ async fn run_partition_maintenance_pass(
         )
         .await
         {
-            Ok(outcome) if !outcome.partitioned => {
+            Ok(outcome) if outcome.partitioned == Some(false) => {
                 // `outcome.partitioned` comes from `maintain`'s own
                 // probe, the same one that gated its (empty) pass below
                 // -- see the review finding above. A shard that reverted
@@ -1282,6 +1282,11 @@ async fn run_partition_maintenance_pass(
                 // that. Its resume cursor goes with it. A later `enable`
                 // starts a fresh partition set at fresh cohort instants,
                 // all later than anything this stale cursor could name.
+                //
+                // `Ok` only ever carries `Some(_)`. `None` is reserved
+                // for `MaintenanceOutcome::failed`, on the `Err` arm
+                // below. So this guard leaves no other case for the
+                // plain `Ok(outcome)` arm to handle but `Some(true)`.
                 monitor_task.clear_partitions(shard);
                 resume_cursors.remove(&shard);
             }
