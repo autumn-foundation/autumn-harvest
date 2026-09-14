@@ -8166,12 +8166,12 @@ const fn schedule_is_resumable(row: &HarvestSchedule) -> bool {
 /// engine's convention at every bound check (and is pinned by
 /// `backfill_max_runs_zero_is_treated_as_unlimited`).
 ///
-/// The `end_at` bound is judged on the jitter-adjusted pending fire time, not
-/// the raw slot (issue #1293). The scheduler's own secondary `end_at` guard in
-/// `scheduler.rs` rejects a fire whose `effective_fire_time` is at or past
-/// `end_at`. It rejects the fire even when the raw slot is still before
-/// `end_at`. Reading the raw slot here would call such a row healthy until a
-/// tick happens to stamp `exhausted_at`.
+/// This check judges the `end_at` bound against the jitter-adjusted pending
+/// fire time, not the raw slot (issue #1293). The scheduler's own secondary
+/// `end_at` guard in `scheduler.rs` rejects a fire whose `effective_fire_time`
+/// is at or past `end_at`. It rejects the fire even when the raw slot is
+/// still before `end_at`. Reading the raw slot here would call such a row
+/// healthy until a tick happens to stamp `exhausted_at`.
 fn schedule_is_bounded_out(row: &HarvestSchedule, now: DateTime<Utc>) -> bool {
     if row.exhausted_at.is_some() {
         return true;
@@ -17501,6 +17501,30 @@ mod tests {
             ..make_schedule(Some("plain_wf"), None, false)
         };
         assert!(!schedule_is_bounded_out(&unjittered, now));
+    }
+
+    /// A jittered schedule with no pending slot still falls back to the wall
+    /// clock. `effective_fire_time` returns `None` when `next_run_at` is
+    /// `None`, regardless of `jitter_secs`.
+    #[test]
+    fn end_at_exhaustion_falls_back_to_wall_clock_with_no_pending_slot() {
+        let now = chrono::Utc::now();
+
+        let no_slot_past_cutoff = HarvestSchedule {
+            next_run_at: None,
+            jitter_secs: 300,
+            end_at: Some(now - chrono::Duration::hours(1)),
+            ..make_schedule(Some("no_slot_jittered"), None, false)
+        };
+        assert!(schedule_is_bounded_out(&no_slot_past_cutoff, now));
+
+        let no_slot_before_cutoff = HarvestSchedule {
+            next_run_at: None,
+            jitter_secs: 300,
+            end_at: Some(now + chrono::Duration::hours(1)),
+            ..make_schedule(Some("no_slot_jittered_ok"), None, false)
+        };
+        assert!(!schedule_is_bounded_out(&no_slot_before_cutoff, now));
     }
 
     /// The backfill confirmation interpolates the schedule UUID into its
