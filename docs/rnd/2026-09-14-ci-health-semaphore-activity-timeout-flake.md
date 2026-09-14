@@ -1,23 +1,30 @@
 # 🚦 Semaphore CI health — a same-day "no race left to lose" fix that
-# still failed post-merge, a stale-branch echo of the bug it fixed, the
-# dashboard panel-id root-cause fix holding, and two single-occurrence
-# candidates not yet worth a rate claim
+# still failed post-merge, a stale-branch echo of the bug it fixed, an
+# unaudited cancelled-run gap in the dashboard panel-id fix's evidence,
+# and two single-occurrence candidates not yet worth a rate claim
 
 **Status:** health report / issue filed (#1558, corrected after review) — no
 PR opened against `ci.yml`, no test changed. Continues the series in
 `docs/rnd/2026-09-0[3-8]-ci-health-semaphore*.md` and
 `docs/rnd/2026-09-1[1-3]-ci-health-semaphore*.md`.
 
-**Correction (post-publication):** this report's first version grouped three
-occurrences of `worker_fails_workflow_when_activity_start_to_close_timeout_elapses`
-into one cluster with one candidate mechanism, and misreported the span
-between the two outer timestamps as 3h11m. A Codex review on PR #1559 caught
-both errors: the span is 3h20m38s (21:45:08 to 01:05:46, arithmetic error in
-the original), and — materially — two of the three occurrences ran a
-pre-hardening version of the test that a same-day fix (`7fbfebb`) had already
-addressed, while the third ran the **post-hardening** version and still
-failed the identical assertion about an hour after that fix merged. Verified
-directly against each commit's blob for `integration_e2e.rs` (below); section
+**Correction (post-publication, three review rounds):** this report's first
+version grouped three occurrences of
+`worker_fails_workflow_when_activity_start_to_close_timeout_elapses` into one
+cluster with one candidate mechanism, misreported the span between the two
+outer timestamps as 3h11m, proposed two candidate mechanisms (`ScheduleToStart`/
+`Heartbeat` timeouts) that are disabled for this activity by construction, had
+an internally inconsistent dashboard-collision run count (4 vs. 7 vs. 6), and
+claimed the dashboard fix "has not recurred" from a denominator that silently
+excluded 11 unaudited cancelled runs. A Codex review on PR #1559 caught all
+five; each was verified directly against source or this session's own raw
+data before fixing, not taken on faith. The span is 3h20m38s (21:45:08 to
+01:05:46, arithmetic error in the original); two of the three occurrences ran
+a pre-hardening version of the test that a same-day fix (`7fbfebb`) had
+already addressed, while the third ran the **post-hardening** version and
+still failed the identical assertion about an hour after that fix merged.
+Verified directly against each commit's blob for `integration_e2e.rs` (below);
+section
 1 is rewritten to reflect this. Issue #1558 has been corrected to match.
 
 ## 🎯 Verdict path
@@ -115,7 +122,7 @@ event sequence on failure, so the next occurrence should capture
 `history.events` before asserting, not just after it panics. One occurrence
 is not a rate. No same-commit rerun was run this session.
 
-### 2. Dashboard panel-id collision: the same-day "root cause" fix (#1550) has not recurred in ~7 hours of post-merge sample
+### 2. Dashboard panel-id collision: no recurrence among post-merge explicit failures, but 11 post-merge cancelled runs are unaudited
 
 6 of the 17 failures, plus one indirect case, were the already-known,
 already-being-actively-fixed Grafana panel-id collision
@@ -140,11 +147,21 @@ its own author as porting a fix that the base branch would soon carry
 anyway. Its CI failure was unrelated (see item 4 below), not a recurrence of
 the collision.
 
-**No occurrence of the collision signature after 02:29:41Z** in this sample.
-Given the sample only extends to 09:39:43Z (~7 hours post-fix) this is a
-short window, not a clean bill of health, but it is a positive signal that
-`next-panel-id.py` is holding rather than a fourth instance of "two PRs picked
-the same id 37 seconds apart."
+**No occurrence of the collision signature among the post-fix window's
+explicit failures** — but that is a narrower claim than "did not recur," and
+the gap matters here specifically. The post-fix window (02:29:41Z to this
+sample's 09:39:43Z cutoff) held 17 runs: 2 failure, 4 success, **11
+cancelled**. This series' own 09-11 report
+(`docs/rnd/2026-09-11-ci-health-semaphore-cancelled-run-census.md:74-79`)
+found hidden failed jobs in 15/54 (28%) of a cancelled-run sample — a
+cancelled run's overall conclusion can absorb a real failure underneath it.
+This session did not job-log any of the 11 post-fix cancelled runs (a
+Codex review catch on PR #1559), so the evidence here supports only "0/2
+explicit post-fix failures carried the collision signature," not "0
+occurrences in the post-fix window." **Routed forward, not audited**: job-log
+the 11 post-fix cancelled runs specifically for the `dashboard_pack_docs`
+signature before treating `next-panel-id.py` as confirmed-holding rather than
+merely not-yet-observed-to-fail.
 
 ### 3. Two single-occurrence candidates — not clustered, not claimed as rates
 
@@ -195,9 +212,12 @@ to refuse — doubly so here, since the obvious-looking fix (widen the margin
 further, or add another `sleep`) has already been tried once and did not
 hold.
 
-**Item 2** is not a new finding — it is confirmation that a same-day
-root-cause fix already shipped by this repo's own maintainers is (so far)
-holding.
+**Item 2** is not a new finding as far as it goes, but it goes less far than
+originally stated: the explicit post-fix failures don't show a recurrence,
+and that is *not* the same as confirming the fix is holding, since 11 of the
+17 post-fix runs were cancelled and unaudited (this role's own prior finding
+says 28% of cancelled runs can hide a real failure). Routed forward rather
+than claimed as confirmation.
 
 **Item 3** is explicitly not claimed as flakes — one occurrence each, no
 mechanism, no clustering. Recorded so a repeat is recognized as a repeat.
@@ -229,9 +249,12 @@ mechanism, no clustering. Recorded so a repeat is recognized as a repeat.
 - **Item 2:** of the 17 sampled failures, 2 (`34800863625`, `34799721202`)
   occurred after 2026-09-14T02:29:41Z (the root-cause fix's merge time);
   0 of those 2 carried the collision signature, against 6 direct occurrences
-  among the 15 failures before it in the same window. ~7h post-fix sample,
-  and a denominator of 2 is thin — not a clean bill of health, a short
-  window with no recurrence yet.
+  among the 15 failures before it in the same window. The post-fix window
+  held 17 runs total (2 failure, 4 success, **11 cancelled**); the 11
+  cancelled runs were **not** job-logged this session (a Codex review catch),
+  so this measurement covers only the 2 explicit post-fix failures, not the
+  full post-fix window. Routed forward: job-log the 11 cancelled runs for the
+  same signature before calling this confirmed.
 - **Item 3:** 1/1 for each of three distinct signatures — explicitly not a
   rate.
 - No revert check applies — no fix in this report to verify red-then-green
@@ -285,8 +308,22 @@ grep -n "pool acquisition exceeded the tick interval" \
 sed -n '4594,4650p' autumn-harvest/src/timeout.rs
 sed -n '3386,3557p' autumn-harvest/tests/integration/integration_e2e.rs
 
-# Item 2 fix-holding check:
+# Item 2 fix-holding check, and the cancelled-run gap:
 git log --oneline -- docs/dashboards/starter-pack-v0.1.0.json | head -8
+python3 -c "
+import json
+from datetime import datetime
+from collections import Counter
+with open('mcp-github-actions_list-<census-file>.txt') as f:
+    d = json.load(f)
+runs = d['workflow_runs']
+cutoff = datetime.fromisoformat('2026-09-14T02:29:41+00:00')
+post = [r for r in runs if datetime.fromisoformat(r['created_at'].replace('Z','+00:00')) > cutoff]
+print(Counter(r['conclusion'] for r in post))  # {'cancelled': 11, 'success': 4, 'failure': 2}
+"
+# The 11 cancelled runs above were NOT job-logged this session -- routed
+# forward per docs/rnd/2026-09-11-ci-health-semaphore-cancelled-run-census.md's
+# own 15/54 hidden-failure rate, rather than assumed clean.
 # e98a676's merge timestamp (2026-09-13T21:29:41-05:00 = 2026-09-14T02:29:41Z)
 # vs. the timestamps of the 17 sampled failures.
 
