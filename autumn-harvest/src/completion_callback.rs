@@ -1854,7 +1854,10 @@ impl CompletionCallbackBuilderConfig {
         let policy = self.ssrf_policy();
         for target in &self.default_targets {
             if let Err(rejection) = validate_target_url(&target.url, &policy) {
-                return Err((crate::audit_export::redact_webhook_url(&target.url), rejection));
+                return Err((
+                    crate::audit_export::redact_webhook_url(&target.url),
+                    rejection,
+                ));
             }
         }
         Ok(())
