@@ -3001,7 +3001,7 @@ mod tests {
         );
 
         let codecs = PayloadCodecs::default();
-        let stored = codecs
+        let mut stored = codecs
             .encode_payload(&business_data)
             .expect("encode must not error");
         assert_ne!(
@@ -3020,14 +3020,13 @@ mod tests {
 
         // The lossy decoder must agree: it decodes the escape wrapper once,
         // at the root, and never re-examines the recovered descendant.
-        let mut lossy = stored.clone();
-        let outcome = codecs.decode_value_lossy(&mut lossy);
+        let outcome = codecs.decode_value_lossy(&mut stored);
         assert_eq!(
             outcome.decoded, 1,
             "one envelope decoded, the escape wrapper"
         );
         assert_eq!(outcome.failed, 0);
-        assert_eq!(lossy, business_data);
+        assert_eq!(stored, business_data);
     }
 
     #[test]
