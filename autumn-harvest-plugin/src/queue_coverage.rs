@@ -241,12 +241,18 @@ pub struct QueueCoverageShardInspection {
 
 /// One shard's raw observation: a queue with pending work that has zero
 /// live pollers *on this shard*, before cross-shard aggregation.
+///
+/// `pub` (and its fields `pub`) solely so `queue_coverage_profile` — a
+/// separate-crate bench binary, see `benches/queue_coverage_profile.rs` and
+/// `docs/performance-queue-coverage.md` — can build fixtures and call
+/// [`partition_uncovered_and_paused`] directly, the same reason
+/// `dlq::group_dead_letter_rows`/`DlqRawGroup` are `pub`.
 #[derive(Debug, Clone)]
-struct UncoveredQueueDemand {
-    queue_name: String,
-    pending_count: i64,
-    sample_task_ids: Vec<Uuid>,
-    sample_execution_ids: Vec<Uuid>,
+pub struct UncoveredQueueDemand {
+    pub queue_name: String,
+    pub pending_count: i64,
+    pub sample_task_ids: Vec<Uuid>,
+    pub sample_execution_ids: Vec<Uuid>,
 }
 
 /// Per-queue accumulator: aggregates uncovered demand across shards.
@@ -519,10 +525,17 @@ async fn observe_shard(
     )
 }
 
-/// Partitions this shard's `pending` demand into the genuinely-uncovered
-/// rows and the set of queue names that were excluded solely because they
-/// are currently paused (see [`merge_excluded_paused_queues`]).
-fn partition_uncovered_and_paused(
+/// Partitions this shard's pending demand into uncovered rows and paused
+/// queue names.
+///
+/// The first element is the genuinely-uncovered rows; the second is the set
+/// of queue names excluded solely because they are currently paused (see
+/// [`merge_excluded_paused_queues`]).
+///
+/// `pub` solely for `queue_coverage_profile` (see [`UncoveredQueueDemand`]'s
+/// doc comment) — not part of the crate's HTTP-facing API surface.
+#[must_use]
+pub fn partition_uncovered_and_paused(
     pending: Vec<PendingQueueDemand>,
     workers: &[WorkerRow],
     paused: &BTreeSet<String>,
