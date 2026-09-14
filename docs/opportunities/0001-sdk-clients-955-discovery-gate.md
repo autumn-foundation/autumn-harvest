@@ -56,15 +56,29 @@ none are evidenced.
 **Tier 1 (behavioral record) — swept, not found.** Two searches, both
 reproducible:
 
-1. GitHub semantic issue/PR search, literal query: `non-Rust caller
-   hand-written HTTP client raw HTTP TypeScript Python integration
-   management API workaround`, scoped to
-   `autumn-foundation/autumn-harvest`, no state filter (so both open and
-   closed issues and PRs are in scope), default ranking, first 20 results
-   requested. Matched **0** issues or PRs beyond #955 itself — this tool
-   ranks by semantic relevance rather than exact substring matching, so it
-   would surface a loosely-worded complaint too, not only an exact phrase
-   match.
+1. GitHub issue/PR search, run as **four separate queries** rather than one
+   — the tool's own documentation says it does natural-language matching
+   rather than exact substring matching, but that claim is the tool
+   vendor's, not independently verified here, so this entry does not rest
+   the whole result on trusting one phrasing:
+   - `non-Rust caller hand-written HTTP client raw HTTP TypeScript Python
+     integration management API workaround`
+   - `TypeScript client wrapper axios fetch Node calling Harvest workflow
+     API`
+   - `Python client wrapper requests httpx calling Harvest workflow API
+     polling result`
+   - `no official SDK npm package PyPI package for management API`
+
+   All scoped to `autumn-foundation/autumn-harvest`, no state filter (open
+   and closed issues and PRs both in scope), default ranking, first 20
+   results requested. The first three matched **0** issues or PRs; the
+   fourth matched exactly **#955 itself** and nothing else. Four
+   differently-worded queries converging on the same zero (modulo #955)
+   is stronger than resting on one query's phrasing, but it is still not a
+   proof of absence — a fifth phrasing could in principle surface
+   something these four didn't. This is disclosed, not fixed, by adding
+   more queries; see the ledger's methodology note on this corpus's
+   inherent limits as a customer-behavior instrument.
 2. `git grep -c curl -- ':!docs/opportunities/*'` (the exhaustive form — an
    initial pass used GitHub's hosted code search, which returned only 40 of
    the corpus's actual matches and undercounted; git grep is the
@@ -89,10 +103,11 @@ covers every client library a workaround might use anyway. Search 2 is
 therefore reported for what it actually is: a spot-check that the code
 corpus's `curl` idiom is 100% first-party documentation, nothing more. The
 instrument that actually carries the "does anyone report this regardless
-of which library they used" weight is **search 1** — GitHub's semantic
-issue/PR search matches on concept, not literal substrings, so a complaint
-about a hand-rolled Axios or `requests` client would be expected to surface
-there the same way a curl-based one would. Search 1 found nothing; search 2
+of which library they used" weight is **search 1** — run as four
+differently-worded queries specifically so it does not depend on any one
+phrasing (or on the tool's own claim of semantic matching) to catch a
+complaint about a hand-rolled Axios or `requests` client the same way it
+would a curl-based one. Search 1 found nothing across all four; search 2
 independently confirms the code corpus has no case of the one raw-HTTP
 idiom checked directly.
 
@@ -206,23 +221,29 @@ can produce that traffic without a single non-Rust integrator ever reading
 the prompt, and scoring that as "we reached them and they didn't answer"
 would be a kill built on an uncontrolled sample, not evidence. The floor
 that actually qualifies: **at least 2 direct solicitations delivered to
-identifiable non-Rust-adjacent contacts** — e.g., GitHub accounts that have
-starred or forked this repository and whose public profile shows primarily
-TypeScript/Python work, or any team that has filed an issue referencing a
-non-Rust integration — individually pinged with the Discussion link, not
-merely exposed to whoever happens to open it. Live linkage from `README.md`
-and `docs/management-api.md` is necessary but not sufficient on its own.
+contacts with their own visible evidence of integrating or evaluating
+Harvest from a non-Rust environment** — e.g., an account that commented on
+#955 or #694, filed an issue describing a Harvest integration attempt, or
+authored a public repository (outside this one) that references
+`HarvestPlugin`, `harvest_api_router`, or the management API by name. A
+starred or forked repo plus a TypeScript/Python-heavy profile is **not**
+sufficient on its own — that account need not be integrating Harvest at
+all, and soliciting two unrelated people would let the floor pass on
+noise. Live linkage from `README.md` and `docs/management-api.md` is
+necessary but not sufficient either way.
 
-This repository's accessible record currently names no such contact list;
-identifying at least 2 concrete contacts is part of running this probe,
+This repository's accessible record currently names **zero** contacts
+meeting that bar — the same Tier 1 sweep that found no workaround evidence
+also found nobody visibly integrating Harvest from outside Rust. Finding
+at least 2 concrete, qualifying contacts is part of running this probe,
 not an afterthought, and should happen before the 60-day window opens. If
-none can be identified at all, that absence is itself the finding worth
-reporting — it would mean this job cannot yet be probed through any channel
-this process has access to, and closing that harness gap (finding or
-building a way to reach the named segment) becomes the next demand-report
-deliverable, ahead of any pursue/kill verdict on #955 itself. Short of
-clearing the 2-contact floor, the window's silence is **inconclusive**, not
-a kill.
+none can be found at all, that absence is itself the finding worth
+reporting — it would mean this job cannot yet be probed through any
+channel this process has access to, and closing that harness gap (finding
+or building a way to reach the named segment) becomes the next
+demand-report deliverable, ahead of any pursue/kill verdict on #955
+itself. Short of clearing the 2-contact floor, the window's silence is
+**inconclusive**, not a kill.
 
 **If it later ships anyway** (build criteria, for whoever runs this probe
 and clears the line): npm/PyPI download counts cannot answer "how many
@@ -267,8 +288,9 @@ formal kill of #955 with this entry as the citation, not silent archival.
 ## 🔬 Reproduce
 
 - Workaround-census sweep run for this entry: `search_issues` (GitHub) over
-  `autumn-foundation/autumn-harvest` for terms covering non-Rust integration
-  pain, hand-written HTTP clients, and SDK requests, plus
+  `autumn-foundation/autumn-harvest`, the four literal queries recorded in
+  Tier 1 above, no state filter, first 20 results each — three returned 0
+  hits, the fourth returned only #955 — plus
   `git grep -c curl -- ':!docs/opportunities/*'` (203 matches, 81 files,
   every one classified by path and spot-checked as docs/examples/tests/CI —
   use `git grep`, not GitHub's hosted code search, which undercounted this
