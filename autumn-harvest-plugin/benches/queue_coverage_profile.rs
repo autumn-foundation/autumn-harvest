@@ -1,49 +1,54 @@
 //! Deterministic (non-criterion) instruction/allocation-count profiling
-//! harness for `queue_coverage::partition_uncovered_and_paused` -- the pure,
-//! in-memory per-shard core of `GET /admin/queue-coverage` (issue #774), the
-//! fleet-wide "which queues have pending work but zero live pollers" deploy
-//! smoke-check. Wall-clock timing is not admissible evidence on this
-//! (shared-vCPU) machine -- every number this harness produces is evidence
-//! of a deterministic instruction count (`valgrind --tool=callgrind`) or an
-//! allocation count/bytes figure (`valgrind --tool=dhat`), both reproducible
-//! bit-for-bit on any machine (the workload below hashes only `&str`/`String`
-//! *keys* it looks up in a `HashSet`, but every key and every worker/queue
-//! name is a fixed, non-random string -- unlike `dlq_aggregate_profile.rs` /
-//! `run_chain_profile.rs`, there is no `Uuid`-keyed hash map on the measured
-//! path, so this harness has no run-to-run variance to document).
+//! harness for `queue_coverage::partition_uncovered_and_paused`. That is the
+//! pure, in-memory per-shard core of `GET /admin/queue-coverage` (issue
+//! #774): the fleet-wide "which queues have pending work but zero live
+//! pollers" deploy smoke-check.
+//!
+//! Wall-clock timing is not admissible evidence on this (shared-vCPU)
+//! machine. Every number this harness produces is evidence of a
+//! deterministic instruction count (`valgrind --tool=callgrind`) or an
+//! allocation count/bytes figure (`valgrind --tool=dhat`). Both are
+//! reproducible bit-for-bit on any machine. The workload below hashes only
+//! `&str`/`String` *keys* it looks up in a `HashSet`, and every key and
+//! every worker/queue name is a fixed, non-random string. So, unlike
+//! `dlq_aggregate_profile.rs` / `run_chain_profile.rs`, there is no
+//! `Uuid`-keyed hash map on the measured path, and this harness has no
+//! run-to-run variance to document.
 //!
 //! # Workload
 //!
-//! `observe_shard` calls this function once per inspected shard with: every
-//! `PENDING`-backlog queue name on that shard (`pending`), every worker whose
-//! heartbeat is fresh and status is `Active`/`Draining` on that shard's own
-//! connection (`workers`), and the shard's paused-queue set. For each pending
-//! queue, the pre-fix implementation asked `workers.iter().any(|w|
-//! worker_covers_queue(w, &demand.queue_name, shard_id))` -- and
-//! `worker_covers_queue` itself scans that worker's own `queues` JSON array
-//! looking for a match. That is an O(pending queues x workers x
-//! queues-per-worker) nested scan, run on every single request to this
-//! endpoint.
+//! `observe_shard` calls this function once per inspected shard. The first
+//! argument is every `PENDING`-backlog queue name on that shard
+//! (`pending`). The second is every worker whose heartbeat is fresh and
+//! status is `Active`/`Draining` on that shard's own connection
+//! (`workers`). The third is the shard's paused-queue set.
+//! For each pending queue, the pre-fix implementation asked
+//! `workers.iter().any(|w| worker_covers_queue(w, &demand.queue_name,
+//! shard_id))`. `worker_covers_queue` itself scans that worker's own
+//! `queues` JSON array looking for a match. That is an O(pending queues x
+//! workers x queues-per-worker) nested scan, run on every single request to
+//! this endpoint.
 //!
-//! A large multi-tenant deployment is exactly the shape that stresses this:
-//! many independently-named queues (one, or a few, per tenant) and a large
-//! worker fleet where each worker polls only a handful of them. This harness
-//! builds `QUEUE_COVERAGE_PROFILE_PENDING` (default 2 000) distinct pending
-//! queue names and `QUEUE_COVERAGE_PROFILE_WORKERS` (default 1 000) workers,
-//! each polling `QUEUE_COVERAGE_PROFILE_QUEUES_PER_WORKER` (default 10)
-//! queues drawn from a "covered" sub-range, deliberately leaving
-//! `QUEUE_COVERAGE_PROFILE_UNCOVERED` (default 150) queue names assigned to
-//! no worker at all -- the genuinely-uncovered (typo'd/undeployed queue)
-//! rows this endpoint exists to surface. A handful of queue names are also
-//! marked paused (some covered, some in the uncovered range) so the
-//! paused-exclusion branch is exercised too, matching a real mixed fleet
-//! rather than an all-covered or all-uncovered strawman.
+//! A large multi-tenant deployment is exactly the shape that stresses this.
+//! It has many independently-named queues, one or a few per tenant. It also
+//! has a large worker fleet, where each worker polls only a handful of
+//! queues. This
+//! harness builds `QUEUE_COVERAGE_PROFILE_PENDING` (default 2 000) distinct
+//! pending queue names, and `QUEUE_COVERAGE_PROFILE_WORKERS` (default
+//! 1 000) workers. Each worker polls `QUEUE_COVERAGE_PROFILE_QUEUES_PER_WORKER`
+//! (default 10) queues drawn from a "covered" sub-range. It deliberately
+//! leaves `QUEUE_COVERAGE_PROFILE_UNCOVERED` (default 150) queue names
+//! assigned to no worker at all: the genuinely-uncovered (typo'd/undeployed
+//! queue) rows this endpoint exists to surface. A handful of queue names
+//! are also marked paused (some covered, some in the uncovered range), so
+//! the paused-exclusion branch is exercised too. This matches a real mixed
+//! fleet rather than an all-covered or all-uncovered strawman.
 //!
 //! Every pending/uncovered queue forces the pre-fix `.any()` scan to run to
-//! completion over every worker (no covering worker exists to short-circuit
-//! on), which is the worst case for the O(n x m) shape -- and, per the
-//! module's own doc comment, the scenario this endpoint is specifically
-//! built to detect, not an adversarial edge case.
+//! completion over every worker: no covering worker exists to
+//! short-circuit on. That is the worst case for the O(n x m) shape. Per the
+//! module's own doc comment, it is also the scenario this endpoint is
+//! specifically built to detect, not an adversarial edge case.
 //!
 //! # Running
 //!
@@ -57,7 +62,7 @@
 //! ```
 //!
 //! `QUEUE_COVERAGE_PROFILE_REPS` (default 1) repeats the whole build+call
-//! cycle -- mirrors `dlq_aggregate_profile.rs`'s/`run_chain_profile.rs`'s
+//! cycle. It mirrors `dlq_aggregate_profile.rs`'s/`run_chain_profile.rs`'s
 //! default-1 pattern for a single already-sizeable input.
 
 use std::collections::BTreeSet;
@@ -106,8 +111,8 @@ fn build_pending(num_pending: usize) -> Vec<PendingQueueDemand> {
 /// `num_workers` workers, each polling `queues_per_worker` queue names drawn
 /// from `0..covered_pool` (never from the `[covered_pool, num_pending)`
 /// reserved-uncovered range). An empty `shard_assignments` array is the
-/// legacy single-shard registration, which covers whichever shard is
-/// inspected -- so this fixture is valid for the `shard_id = 0` call below
+/// legacy single-shard registration. It covers whichever shard is
+/// inspected, so this fixture is valid for the `shard_id = 0` call below,
 /// regardless of stride.
 fn build_workers(
     num_workers: usize,
@@ -116,12 +121,13 @@ fn build_workers(
 ) -> Vec<WorkerRow> {
     (0..num_workers)
         .map(|i| {
-            // Contiguous, non-overlapping `queues_per_worker`-wide blocks that
-            // exactly tile `0..covered_pool` (the caller asserts the pool
-            // divides evenly). As `i` ranges over `num_workers` >
-            // `covered_pool / queues_per_worker` blocks, every block gets at
-            // least one worker, so every covered-range queue name is
-            // genuinely covered -- not merely "probably, for these seeds".
+            // Contiguous, non-overlapping `queues_per_worker`-wide blocks
+            // that exactly tile `0..covered_pool` (the caller asserts the
+            // pool divides evenly). `num_workers` exceeds
+            // `covered_pool / queues_per_worker` blocks. So, as `i` ranges
+            // over `num_workers`, every block gets at least one worker.
+            // Every covered-range queue name is genuinely covered, not
+            // merely "probably, for these seeds".
             let start = (i * queues_per_worker) % covered_pool;
             let queues: Vec<String> = (0..queues_per_worker)
                 .map(|j| queue_name((start + j) % covered_pool))
@@ -191,9 +197,9 @@ fn main() {
     );
 
     // A handful of paused queue names: three from the covered range, two
-    // from the reserved-uncovered range -- so both the "paused and covered"
-    // (silently excluded, no special bookkeeping) and "paused and
-    // uncovered" (`paused_uncovered`) branches run on every rep.
+    // from the reserved-uncovered range. So both the "paused and covered"
+    // branch (silently excluded, no special bookkeeping) and the "paused
+    // and uncovered" branch (`paused_uncovered`) run on every rep.
     let paused_indices = [50usize, 500, 1_000, covered_pool + 10, covered_pool + 40];
     let paused: BTreeSet<String> = paused_indices
         .into_iter()

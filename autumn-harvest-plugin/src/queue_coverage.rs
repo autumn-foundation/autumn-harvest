@@ -63,7 +63,7 @@
 //! live pollers is not included there (nothing interesting to report — it
 //! would not have been uncovered anyway).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
 use autumn_harvest::error::HarvestResult;
@@ -242,11 +242,12 @@ pub struct QueueCoverageShardInspection {
 /// One shard's raw observation: a queue with pending work that has zero
 /// live pollers *on this shard*, before cross-shard aggregation.
 ///
-/// `pub` (and its fields `pub`) solely so `queue_coverage_profile` — a
-/// separate-crate bench binary, see `benches/queue_coverage_profile.rs` and
-/// `docs/performance-queue-coverage.md` — can build fixtures and call
-/// [`partition_uncovered_and_paused`] directly, the same reason
-/// `dlq::group_dead_letter_rows`/`DlqRawGroup` are `pub`.
+/// `pub` (and its fields `pub`) solely so `queue_coverage_profile` can build
+/// fixtures and call [`partition_uncovered_and_paused`] directly.
+/// `queue_coverage_profile` is a separate-crate bench binary; see
+/// `benches/queue_coverage_profile.rs` and
+/// `docs/performance-queue-coverage.md`.
+/// `dlq::group_dead_letter_rows`/`DlqRawGroup` are `pub` for the same reason.
 #[derive(Debug, Clone)]
 pub struct UncoveredQueueDemand {
     pub queue_name: String,
@@ -347,9 +348,14 @@ fn merge_excluded_paused_queues(sets: Vec<BTreeSet<String>>) -> Vec<String> {
         .collect()
 }
 
-/// Whether `worker` is a live poller of `queue_name` on `shard_id` for
-/// coverage purposes: assigned to the shard, has a fresh heartbeat, is
-/// `Active` or `Draining` (not `Stopped`), and lists the queue.
+/// Whether `worker` is live (fresh heartbeat, `Active`/`Draining`, not
+/// `Stopped`) **and** assigned to `shard_id`.
+///
+/// The two parts of coverage that depend only on the worker and the shard
+/// being inspected, never on which queue is being asked about. Factored out
+/// of [`worker_covers_queue`] so [`partition_uncovered_and_paused`] can
+/// compute it once per worker instead of once per (worker, pending-queue)
+/// pair.
 ///
 /// Shard-membership (including the empty-`shard_assignments` legacy-worker
 /// special case) is delegated to the shared
@@ -360,16 +366,23 @@ fn merge_excluded_paused_queues(sets: Vec<BTreeSet<String>>) -> Vec<String> {
 /// function's own bug while implementing #774) -- factoring the predicate
 /// into one shared function means the two consumers cannot drift apart
 /// again.
-pub(crate) fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> bool {
+fn worker_is_live_and_assigned(worker: &WorkerRow, shard_id: i32) -> bool {
     let is_live = worker.health == WorkerHealth::Healthy
         && (worker.worker.status == WorkerStatus::Active.as_str()
             || worker.worker.status == WorkerStatus::Draining.as_str());
+    is_live && shard_fanout::worker_covers_shard(worker, shard_id)
+}
+
+/// Whether `worker` is a live poller of `queue_name` on `shard_id` for
+/// coverage purposes: assigned to the shard, has a fresh heartbeat, is
+/// `Active` or `Draining` (not `Stopped`), and lists the queue.
+pub(crate) fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> bool {
     let has_queue = worker.worker.queues.as_array().is_some_and(|queues| {
         queues
             .iter()
             .any(|value| value.as_str() == Some(queue_name))
     });
-    is_live && shard_fanout::worker_covers_shard(worker, shard_id) && has_queue
+    worker_is_live_and_assigned(worker, shard_id) && has_queue
 }
 
 /// Load only the workers that can possibly count as coverage on this shard's
@@ -541,13 +554,24 @@ pub fn partition_uncovered_and_paused(
     paused: &BTreeSet<String>,
     shard_id: i32,
 ) -> (Vec<UncoveredQueueDemand>, BTreeSet<String>) {
+    // `shard_id` is fixed for the whole call. Which workers are live and
+    // assigned to it does not depend on `demand`. Precompute the union of
+    // their queue names once instead: O(workers x queues-per-worker). This
+    // replaces a re-scan of every worker, and every worker's own queues,
+    // for every pending queue. That scan was O(pending x workers x
+    // queues-per-worker). See `docs/performance-queue-coverage.md`.
+    let covered_queues: HashSet<&str> = workers
+        .iter()
+        .filter(|worker| worker_is_live_and_assigned(worker, shard_id))
+        .filter_map(|worker| worker.worker.queues.as_array())
+        .flat_map(|queues| queues.iter().filter_map(serde_json::Value::as_str))
+        .collect();
+
     let mut paused_uncovered = BTreeSet::new();
     let rows = pending
         .into_iter()
         .filter_map(|demand| {
-            let has_coverage = workers
-                .iter()
-                .any(|worker| worker_covers_queue(worker, &demand.queue_name, shard_id));
+            let has_coverage = covered_queues.contains(demand.queue_name.as_str());
             if paused.contains(&demand.queue_name) {
                 if !has_coverage {
                     paused_uncovered.insert(demand.queue_name);
