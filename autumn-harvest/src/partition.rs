@@ -1504,8 +1504,10 @@ async fn refuse_if_unique_index_without_cohort(
 }
 
 /// Operator-added constraint-backed unique indexes on the still-partitioned
-/// `harvest_events` parent that `capture_index_defs` cannot replay onto the
-/// flat table [`disable_partitioning`] rebuilds.
+/// `harvest_events` parent, or on one of its leaf partitions.
+///
+/// None of these survive: `capture_index_defs` cannot replay them onto
+/// the flat table [`disable_partitioning`] rebuilds.
 ///
 /// Review finding: [`unique_indexes_missing_cohort`] runs only from
 /// [`enable_partitioning`]'s preflight, against the still-flat table.
@@ -1524,6 +1526,15 @@ async fn refuse_if_unique_index_without_cohort(
 /// layout. The partitioned parent's own primary key and unique
 /// constraint always carry `cohort` too.
 ///
+/// Review finding: also checked on every leaf partition, not only the
+/// parent. Postgres lets an operator add a `UNIQUE` or primary-key
+/// constraint directly to one leaf, independent of the parent's own.
+/// The same exclusion, at leaf scope, would silently drop it. A leaf's
+/// own copy of the PARENT's harvest-owned constraint is different,
+/// though. It is `pg_constraint`-propagated, linked back to the parent
+/// row through `conparentid` -- a link an independently added leaf
+/// constraint never carries.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] if the catalog query fails.
@@ -1536,24 +1547,45 @@ pub async fn constraint_backed_unique_indexes_on_partitioned_parent(
            FROM pg_index i
            JOIN pg_class c ON c.oid = i.indrelid
            JOIN pg_namespace n ON n.oid = c.relnamespace
-          WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
+          WHERE n.nspname = current_schema()
+            AND (
+                c.relname = 'harvest_events'
+                OR c.oid IN (
+                    SELECT leaf.inhrelid
+                      FROM pg_inherits leaf
+                      JOIN pg_class parent ON parent.oid = leaf.inhparent
+                      JOIN pg_namespace pn ON pn.oid = parent.relnamespace
+                     WHERE parent.relname = 'harvest_events' AND pn.nspname = current_schema()
+                )
+            )
             AND i.indisunique
             AND EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)
             AND NOT EXISTS (
                 SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid
-                  AND NOT con.condeferrable
                   AND (
-                      (con.conname = 'harvest_events_pkey' AND con.contype = 'p'
-                       AND (SELECT array_agg(a.attname::text ORDER BY k)
-                              FROM generate_series(0, i.indnkeyatts - 1) k
-                              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
-                           ) = ARRAY['id', 'cohort'])
+                      -- On the parent itself: harvest's own two, by exact
+                      -- name and shape, never DEFERRABLE.
+                      (c.relname = 'harvest_events' AND NOT con.condeferrable
+                       AND (
+                           (con.conname = 'harvest_events_pkey' AND con.contype = 'p'
+                            AND (SELECT array_agg(a.attname::text ORDER BY k)
+                                   FROM generate_series(0, i.indnkeyatts - 1) k
+                                   JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
+                                ) = ARRAY['id', 'cohort'])
+                           OR
+                           (con.conname = 'harvest_events_workflow_exec_id_event_id_key' AND con.contype = 'u'
+                            AND (SELECT array_agg(a.attname::text ORDER BY k)
+                                   FROM generate_series(0, i.indnkeyatts - 1) k
+                                   JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
+                                ) = ARRAY['workflow_exec_id', 'event_id', 'cohort'])
+                       ))
                       OR
-                      (con.conname = 'harvest_events_workflow_exec_id_event_id_key' AND con.contype = 'u'
-                       AND (SELECT array_agg(a.attname::text ORDER BY k)
-                              FROM generate_series(0, i.indnkeyatts - 1) k
-                              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
-                           ) = ARRAY['workflow_exec_id', 'event_id', 'cohort'])
+                      -- On a leaf: Postgres itself propagates the parent's
+                      -- own constraint onto every partition, one
+                      -- `pg_constraint` row per leaf, linked back via
+                      -- `conparentid`. An operator's own leaf-only
+                      -- constraint is never so linked.
+                      (c.relname <> 'harvest_events' AND con.conparentid <> 0)
                   )
             )
           ORDER BY 1",

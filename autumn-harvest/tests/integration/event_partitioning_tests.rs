@@ -838,6 +838,80 @@ async fn a_compatible_constraint_backed_unique_index_still_refuses_the_revert() 
 }
 
 #[tokio::test]
+async fn a_unique_constraint_on_a_leaf_partition_directly_still_refuses_the_revert() {
+    // Review finding: the revert-side check matched only the PARENT name
+    // `harvest_events`. Postgres lets an operator add a `UNIQUE` or
+    // primary-key constraint directly to one leaf, independent of the
+    // parent's own. Unlike a parent-level unique constraint, it does not
+    // need to carry `cohort` at all, since it only constrains that one
+    // leaf's own rows. Such a constraint used to pass this check
+    // unnoticed. `disable_partitioning`'s `DROP ... CASCADE` then
+    // destroyed it along with the leaf, silently.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // A populated table takes the AttachLegacy path. That path renames
+    // the flat table to `LEGACY_PARTITION` rather than dropping it.
+    let exec = insert_execution(
+        &mut conn,
+        "leaf_uniq_wf",
+        "leaf-uniq-1",
+        day(2026, 2, 3),
+        None,
+    )
+    .await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    let leaf = partition::LEGACY_PARTITION;
+    diesel::sql_query(format!(
+        "ALTER TABLE {leaf} DROP CONSTRAINT IF EXISTS harvest_events_leaf_uniq_958"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray constraint from a previous run");
+    diesel::sql_query(format!(
+        "ALTER TABLE {leaf} ADD CONSTRAINT harvest_events_leaf_uniq_958 UNIQUE (event_type)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator's own unique constraint directly on the leaf");
+
+    let err = partition::disable_partitioning(&mut conn).await.expect_err(
+        "a unique constraint installed directly on a leaf partition must refuse the \
+         revert too, not only one on the parent",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_leaf_uniq_958"),
+        "the refusal must name the offending constraint; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "p",
+        "a refused revert must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query(format!(
+        "ALTER TABLE {leaf} DROP CONSTRAINT harvest_events_leaf_uniq_958"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the offending constraint");
+}
+
+#[tokio::test]
 async fn the_large_table_plans_phase_1_also_refuses_a_compatible_constraint_backed_index() {
     // Same guard, the scripted path.
     let (url, _c) = setup_db().await;
