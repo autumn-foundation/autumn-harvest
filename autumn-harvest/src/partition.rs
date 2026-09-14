@@ -185,6 +185,18 @@ const DISABLE_RENAME_SUFFIX: &str = "__old";
 /// ROW` trigger that changes a partitioned row's destination.
 const EXEC_FK_TRIGGER: &str = "harvest_events_exec_fk_trg";
 
+/// Comment `enable_sql`/`migration_plan_steps` stamp on
+/// `idx_harvest_we_created_at` when THEY are the ones that create it.
+///
+/// `CREATE INDEX IF NOT EXISTS` also succeeds, silently, against an
+/// operator's own pre-existing index of the same name — one created before
+/// ever running `partition enable`, say. `disable_partitioning` needs a
+/// way to tell "we made this" apart from "an operator already had one"
+/// before dropping it (issue #1270 item 13 follow-up). Without a marker
+/// recording which case happened, an unconditional drop destroys the
+/// latter.
+const DROP_GATE_INDEX_MARKER: &str = "harvest#958 drop-gate index; created by partition enable, safe for partition disable to remove";
+
 // ── Sweep "blocked" reasons ────────────────────────────────────────────────
 //
 // Constants, not inline literals, because `docs/partitioned-events.md` explains
@@ -1522,7 +1534,13 @@ pub async fn enable_partitioning(
 /// `DECLARE` fragment [`collision_safe_rename_stmts`] needs, beyond an
 /// already-declared `obj record;` — which every caller here already has, for
 /// the `FOR obj IN ...` loops themselves.
-const RENAME_HELPER_DECLARE: &str = "    new_name text;\n    bump     int;\n    tail     text;";
+///
+/// The three `legacy_*_new_name` variables are where the rename records the
+/// ACTUAL name it gave the three well-known legacy constraints. See
+/// [`collision_safe_rename_stmts`]'s doc and [`drop_tracked_constraint_stmt`]
+/// for why a later DROP must use these rather than guess the name.
+const RENAME_HELPER_DECLARE: &str = "    new_name text;\n    bump     int;\n    tail     text;\n    \
+     legacy_pk_new_name text;\n    legacy_fk_new_name text;\n    legacy_uq_new_name text;";
 
 /// Rename every constraint and index on `table` that does not already carry
 /// `suffix`, freeing their names for the replacement parent. This is
@@ -1563,6 +1581,22 @@ const RENAME_HELPER_DECLARE: &str = "    new_name text;\n    bump     int;\n    
 /// the candidate name looks free here. The `RENAME CONSTRAINT` then fails
 /// on the implicit index rename, with an error that does not point at the
 /// actual cause.
+///
+/// The constraint loop also records the ACTUAL new name it gave the three
+/// well-known legacy constraints, into `legacy_pk_new_name`,
+/// `legacy_fk_new_name` and `legacy_uq_new_name` (also declared by
+/// [`RENAME_HELPER_DECLARE`]). A caller that later drops them must read
+/// those variables rather than guess a name — see
+/// [`drop_tracked_constraint_stmt`] for why.
+///
+/// The index loop excludes any index backing a constraint. A PK/UNIQUE
+/// constraint's backing index shares its identity both ways: the
+/// constraint loop above already renamed it, as a side effect of renaming
+/// the constraint. Left in the index loop's own candidate set, its NEW
+/// name — already suffixed, with a bump — still does not equal the bare
+/// `suffix`. So the index loop would rename it AGAIN. For the same
+/// shared-identity reason, that quietly renames the constraint too, out
+/// from under whatever recorded its first new name.
 #[must_use]
 fn collision_safe_rename_stmts(table: &str, suffix: &str) -> String {
     format!(
@@ -1590,11 +1624,24 @@ fn collision_safe_rename_stmts(table: &str, suffix: &str) -> String {
          END LOOP;\n            \
          new_name := new_name || tail;\n        \
          END LOOP;\n        \
+         IF obj.n = 'harvest_events_pkey' THEN\n            \
+         legacy_pk_new_name := new_name;\n        \
+         ELSIF obj.n = 'harvest_events_workflow_exec_id_fkey' THEN\n            \
+         legacy_fk_new_name := new_name;\n        \
+         ELSIF obj.n = 'harvest_events_workflow_exec_id_event_id_key' THEN\n            \
+         legacy_uq_new_name := new_name;\n        \
+         END IF;\n        \
          EXECUTE format('ALTER TABLE {table} RENAME CONSTRAINT %I TO %I', obj.n, new_name);\n    \
          END LOOP;\n    \
          FOR obj IN SELECT indexname AS n FROM pg_indexes\n                \
          WHERE schemaname = current_schema() AND tablename = '{table}'\n                  \
-         AND right(indexname, length('{suffix}')) <> '{suffix}'\n    \
+         AND right(indexname, length('{suffix}')) <> '{suffix}'\n                  \
+         AND NOT EXISTS (\n                      \
+         SELECT 1 FROM pg_constraint con\n                        \
+         JOIN pg_class ic ON ic.oid = con.conindid\n                       \
+         WHERE ic.relname = indexname AND ic.relnamespace =\n                             \
+         (SELECT oid FROM pg_namespace WHERE nspname = current_schema())\n                  \
+         )\n    \
          LOOP\n        \
          bump := 0;\n        \
          tail := '{suffix}';\n        \
@@ -1619,25 +1666,27 @@ fn collision_safe_rename_stmts(table: &str, suffix: &str) -> String {
     )
 }
 
-/// Statement dropping a constraint [`collision_safe_rename_stmts`] renamed
-/// off `table`, found by prefix rather than by the un-bumped expected name.
+/// Statement dropping the constraint [`collision_safe_rename_stmts`] renamed
+/// off `table` and recorded into `var_name`, one of the three
+/// `legacy_*_new_name` variables [`RENAME_HELPER_DECLARE`] declares.
 ///
-/// That rename disambiguates with a numeric suffix on a collision — a
-/// leftover object already named `{base_name}{suffix}`, from a previous
-/// failed conversion, say. See that function's doc. Dropping by the fixed
-/// `{base_name}{suffix}` name then silently no-ops on the ACTUAL renamed
-/// constraint, now `{base_name}{suffix}_1`. Worse, if that literal name
-/// also happens to belong to something else, it drops the wrong object
-/// instead. The bump always lands strictly after `{suffix}`, so a `LIKE
-/// '{base_name}{suffix}%'` prefix match finds the real one either way.
-fn drop_renamed_constraint_stmt(table: &str, base_name: &str, suffix: &str) -> String {
+/// Earlier revisions matched the renamed constraint by `LIKE
+/// '{base_name}{suffix}%'` instead: a prefix match, since the rename's own
+/// numeric disambiguator on a collision lands strictly after `{suffix}`.
+///
+/// That is broken the other direction. Say the legacy table ALREADY
+/// carries an operator constraint literally named `{base_name}{suffix}`,
+/// from a previous failed conversion. The rename loop skips it — it
+/// already carries the suffix — and disambiguates the REAL legacy
+/// constraint to `{base_name}{suffix}_1` instead. Both names then match
+/// the `LIKE` pattern, so that drop removed the operator's own constraint
+/// too. Reading the exact name the rename loop recorded, rather than
+/// pattern-matching for it, has no such false positive.
+fn drop_tracked_constraint_stmt(table: &str, var_name: &str) -> String {
     format!(
-        "FOR obj IN SELECT conname FROM pg_constraint\n             \
-         WHERE conrelid = '{table}'::regclass\n               \
-         AND conname LIKE '{base_name}{suffix}%'\n        \
-         LOOP\n            \
-         EXECUTE format('ALTER TABLE {table} DROP CONSTRAINT %I', obj.conname);\n        \
-         END LOOP;"
+        "IF {var_name} IS NOT NULL THEN\n        \
+         EXECUTE format('ALTER TABLE {table} DROP CONSTRAINT %I', {var_name});\n    \
+         END IF;"
     )
 }
 
@@ -1677,21 +1726,12 @@ pub fn enable_sql(opts: &EnableOptions) -> String {
     // have to be read while it still exists.
     let copy_acl = copy_acl_body(LEGACY_PARTITION, "harvest_events");
     let rename_stmts = collision_safe_rename_stmts(LEGACY_PARTITION, LEGACY_RENAME_SUFFIX);
-    let drop_renamed_foreign_key = drop_renamed_constraint_stmt(
-        LEGACY_PARTITION,
-        "harvest_events_workflow_exec_id_fkey",
-        LEGACY_RENAME_SUFFIX,
-    );
-    let drop_renamed_primary_key = drop_renamed_constraint_stmt(
-        LEGACY_PARTITION,
-        "harvest_events_pkey",
-        LEGACY_RENAME_SUFFIX,
-    );
-    let drop_renamed_unique_constraint = drop_renamed_constraint_stmt(
-        LEGACY_PARTITION,
-        "harvest_events_workflow_exec_id_event_id_key",
-        LEGACY_RENAME_SUFFIX,
-    );
+    let drop_renamed_foreign_key =
+        drop_tracked_constraint_stmt(LEGACY_PARTITION, "legacy_fk_new_name");
+    let drop_renamed_primary_key =
+        drop_tracked_constraint_stmt(LEGACY_PARTITION, "legacy_pk_new_name");
+    let drop_renamed_unique_constraint =
+        drop_tracked_constraint_stmt(LEGACY_PARTITION, "legacy_uq_new_name");
     format!(
         r#"-- Issue #958: convert harvest_events to the partitioned layout.
 -- Generated by autumn_harvest::partition::enable_sql(); safe to re-run.
@@ -1842,8 +1882,18 @@ BEGIN
     -- ACCESS EXCLUSIVE on harvest_events; `migration_plan` builds the same
     -- index CONCURRENTLY, outside any lock window, for the large tables where
     -- the difference is felt.
-    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_harvest_we_created_at '
-         || 'ON harvest_workflow_executions (created_at)';
+    -- Commented only on a FRESH create, never on a pre-existing index of
+    -- this name: `disable_partitioning` reads that comment to tell whether
+    -- it owns removing this index. See `DROP_GATE_INDEX_MARKER`.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relname = 'idx_harvest_we_created_at' AND n.nspname = current_schema()
+    ) THEN
+        EXECUTE 'CREATE INDEX idx_harvest_we_created_at '
+             || 'ON harvest_workflow_executions (created_at)';
+        EXECUTE 'COMMENT ON INDEX idx_harvest_we_created_at IS '
+             || quote_literal('{DROP_GATE_INDEX_MARKER}');
+    END IF;
 
     -- The catch-all, created before any cohort partition so there is never an
     -- instant in which an append could find no partition at all.
@@ -2369,8 +2419,30 @@ pub async fn disable_partitioning(
             // migration cannot tell its own copy from an operator's
             // pre-existing index of the same name (issue #1270 item 13).
             // This, though, is the exact `enable` this index came from
-            // being undone.
-            exec(conn, "DROP INDEX IF EXISTS idx_harvest_we_created_at").await?;
+            // being undone — PROVIDED enable is the one that created it.
+            // `CREATE INDEX IF NOT EXISTS` no-ops, silently, against an
+            // operator's own pre-existing index of the same name, so an
+            // unconditional drop here would destroy that instead. Dropped
+            // only when it carries the marker comment `enable_sql` and
+            // `migration_plan_steps` stamp on a FRESH create — see
+            // `DROP_GATE_INDEX_MARKER`.
+            exec(
+                conn,
+                &format!(
+                    "DO $$\n\
+                     DECLARE marker text;\n\
+                     BEGIN\n    \
+                     SELECT description INTO marker\n      \
+                     FROM pg_class c\n      \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace\n      \
+                     LEFT JOIN pg_description d ON d.objoid = c.oid AND d.objsubid = 0\n     \
+                     WHERE c.relname = 'idx_harvest_we_created_at' AND n.nspname = current_schema();\n    \
+                     IF marker = '{DROP_GATE_INDEX_MARKER}' THEN\n        \
+                     EXECUTE 'DROP INDEX idx_harvest_we_created_at';\n    \
+                     END IF;\nEND $$;"
+                ),
+            )
+            .await?;
             Ok(DisableReport {
                 orphans_removed: orphans,
                 duplicates_removed: duplicates,
@@ -3542,6 +3614,12 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
     let lock_ms = opts.lock_timeout.as_millis().max(1);
     let cutover_lit = ts_literal(cohort_start(now, width));
     let rename_stmts = collision_safe_rename_stmts(LEGACY_PARTITION, LEGACY_RENAME_SUFFIX);
+    let drop_renamed_foreign_key =
+        drop_tracked_constraint_stmt(LEGACY_PARTITION, "legacy_fk_new_name");
+    let drop_renamed_primary_key =
+        drop_tracked_constraint_stmt(LEGACY_PARTITION, "legacy_pk_new_name");
+    let drop_renamed_unique_constraint =
+        drop_tracked_constraint_stmt(LEGACY_PARTITION, "legacy_uq_new_name");
 
     let step = |phase: u8, sql: String| PlanStep {
         phase,
@@ -3778,11 +3856,37 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // the busiest table in the schema, so the concurrent form is not
         // optional here: a plain build holds SHARE for its duration and every
         // insert, state update and retention delete waits behind it.
+        //
+        // Whether it already existed is stashed in a session GUC before the
+        // build. `CREATE INDEX CONCURRENTLY` cannot run inside a `DO` block
+        // or transaction, so this cannot check-and-mark atomically the way
+        // `enable_sql` does. `disable_partitioning` later reads a comment
+        // this only stamps when it was this step that created the index —
+        // see `DROP_GATE_INDEX_MARKER`.
+        step(
+            2,
+            "SELECT set_config('harvest_1270.drop_gate_idx_preexisted',\n    \
+             (EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace\n              \
+             WHERE c.relname = 'idx_harvest_we_created_at' AND n.nspname = current_schema()))::text,\n    \
+             false)"
+                .to_string(),
+        ),
         concurrent(
             2,
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvest_we_created_at\n    \
              ON harvest_workflow_executions (created_at)"
                 .to_string(),
+        ),
+        step(
+            2,
+            format!(
+                "DO $harvest_dropgate_mark_958$\nBEGIN\n    \
+                 IF current_setting('harvest_1270.drop_gate_idx_preexisted', true)\n           \
+                 IS DISTINCT FROM 'true' THEN\n        \
+                 EXECUTE 'COMMENT ON INDEX idx_harvest_we_created_at IS '\n             \
+                 || quote_literal('{DROP_GATE_INDEX_MARKER}');\n    \
+                 END IF;\nEND\n$harvest_dropgate_mark_958$"
+            ),
         ),
         // ── 3: pre-validate so ATTACH skips its own scan ──────────────────
         //
@@ -3935,43 +4039,23 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // without this the new parent cannot reclaim their schema-scoped names
         // — and `ADD CONSTRAINT harvest_events_pkey` below aborts.
         // Collision-safe at the 63-byte identifier limit (issue #1270 item 9).
+        //
+        // The FK's ON DELETE CASCADE is the delete storm being eliminated; its
+        // insert-time half lives on in the trigger below. The old PK and
+        // unique constraint must go too: ATTACH propagates the parent's, and
+        // a table may have only one primary key. Dropped by the name the
+        // rename above actually recorded for each, not a guessed one. See
+        // `drop_tracked_constraint_stmt` for why a guess, even a `LIKE`
+        // prefix match, can drop the wrong object. That name only survives
+        // to here because this is the SAME plpgsql block as the rename. A
+        // separate `DO` block would not see plpgsql variables another one
+        // set.
         step(
             4,
             format!(
                 "DO $harvest_rename_958$\nDECLARE obj record;\n{RENAME_HELPER_DECLARE}\nBEGIN\n    \
-                 {rename_stmts}\nEND\n$harvest_rename_958$"
-            ),
-        ),
-        // The FK's ON DELETE CASCADE is the delete storm being eliminated; its
-        // insert-time half lives on in the trigger below. The old PK and unique
-        // constraint must go too: ATTACH propagates the parent's, and a table
-        // may have only one primary key.
-        // Dropped by prefix match, not by the un-bumped expected name. The
-        // rename step above disambiguates with a numeric suffix on a
-        // collision — a leftover object already named `{base}{suffix}`,
-        // from a previous failed conversion, say. Dropping by the fixed
-        // name would then silently miss the actual renamed constraint. See
-        // `drop_renamed_constraint_stmt`.
-        step(
-            4,
-            format!(
-                "DO $harvest_drop_legacy_958$\nDECLARE obj record;\nBEGIN\n    {}\n    {}\n    \
-                 {}\nEND\n$harvest_drop_legacy_958$",
-                drop_renamed_constraint_stmt(
-                    LEGACY_PARTITION,
-                    "harvest_events_workflow_exec_id_fkey",
-                    LEGACY_RENAME_SUFFIX
-                ),
-                drop_renamed_constraint_stmt(
-                    LEGACY_PARTITION,
-                    "harvest_events_pkey",
-                    LEGACY_RENAME_SUFFIX
-                ),
-                drop_renamed_constraint_stmt(
-                    LEGACY_PARTITION,
-                    "harvest_events_workflow_exec_id_event_id_key",
-                    LEGACY_RENAME_SUFFIX
-                ),
+                 {rename_stmts}\n    {drop_renamed_foreign_key}\n    {drop_renamed_primary_key}\n    \
+                 {drop_renamed_unique_constraint}\nEND\n$harvest_rename_958$"
             ),
         ),
         step(
@@ -4418,11 +4502,14 @@ mod tests {
             // Without this the cohort DEFAULT never becomes the live
             // expression and every append lands in the legacy partition.
             "ALTER COLUMN cohort SET DEFAULT harvest_event_cohort(clock_timestamp())",
-            // ATTACH propagates the parent PK; the child may not keep its own.
-            "harvest_events_pkey__pre958",
-            "harvest_events_workflow_exec_id_event_id_key__pre958",
+            // ATTACH propagates the parent PK; the child may not keep its
+            // own. Checked by tracking variable, not a literal
+            // `..._pre958` string. See `drop_tracked_constraint_stmt` for
+            // why a fixed name is unsafe here.
+            "legacy_pk_new_name",
+            "legacy_uq_new_name",
             // The FK whose cascade is the delete storm being eliminated.
-            "harvest_events_workflow_exec_id_fkey__pre958",
+            "legacy_fk_new_name",
             // The partitioned shape itself.
             "PARTITION BY RANGE (cohort)",
             "PRIMARY KEY (id, cohort)",

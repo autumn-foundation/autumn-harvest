@@ -4346,6 +4346,124 @@ async fn disable_survives_two_indexes_colliding_at_the_identifier_limit() {
 }
 
 #[tokio::test]
+async fn disable_preserves_an_operators_pre_existing_drop_gate_index() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // A Codex review finding: `enable_sql`'s `CREATE INDEX IF NOT EXISTS
+    // idx_harvest_we_created_at` no-ops, silently, against an operator's
+    // own pre-existing index of that exact name. `enable` then never
+    // "owns" it. If `disable` dropped it unconditionally anyway, it would
+    // destroy an index it never created.
+    diesel::sql_query("DROP INDEX IF EXISTS idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query(
+        "CREATE INDEX idx_harvest_we_created_at \
+         ON harvest_workflow_executions (created_at)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("plant an operator's own pre-existing index of this name");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+    partition::disable_partitioning(&mut conn)
+        .await
+        .expect("disable");
+
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes \
+              WHERE schemaname = current_schema() \
+                AND indexname = 'idx_harvest_we_created_at') AS v",
+        )
+        .await,
+        "an index disable did not create must survive disable"
+    );
+
+    diesel::sql_query("DROP INDEX IF EXISTS idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn enable_preserves_an_operator_constraint_that_looks_like_a_renamed_legacy_one() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // A populated table takes the ATTACH-LEGACY path, which is the one
+    // that renames and drops the legacy table's own PK/FK/unique
+    // constraints.
+    let exec = insert_execution(
+        &mut conn,
+        "lookalike_wf",
+        "lookalike-1",
+        day(2026, 2, 3),
+        None,
+    )
+    .await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    // An operator constraint ALREADY carrying the rename suffix, on the
+    // ORIGINAL `harvest_events_pkey` name, makes the rename loop skip it
+    // — it already carries the suffix. The loop then disambiguates the
+    // REAL legacy primary key to `harvest_events_pkey__pre958_1` instead.
+    // Dropping by a `LIKE 'harvest_events_pkey__pre958%'` prefix match, an
+    // earlier revision of this fix, would then drop BOTH, destroying the
+    // operator's own
+    // constraint. The fix tracks the exact name the rename gave the real
+    // legacy key and drops only that one.
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS harvest_events_pkey__pre958",
+    )
+    .execute(&mut conn)
+    .await
+    .ok();
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_pkey__pre958 \
+         CHECK (id IS NOT NULL)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("plant an operator constraint under the exact renamed-legacy-PK name");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect(
+            "a prefix-match drop would have removed both the operator's own \
+             constraint and the real legacy key — this must succeed",
+        );
+
+    assert!(
+        scalar_bool(
+            &mut conn,
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM pg_constraint \
+                  WHERE conname = 'harvest_events_pkey__pre958' \
+                    AND conrelid = '{}'::regclass) AS v",
+                partition::LEGACY_PARTITION
+            ),
+        )
+        .await,
+        "the operator's own constraint, under its own exact name, must survive"
+    );
+}
+
+#[tokio::test]
 async fn the_scripted_plan_refuses_a_dependent_view() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
