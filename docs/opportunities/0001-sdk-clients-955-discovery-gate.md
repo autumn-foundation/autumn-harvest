@@ -78,6 +78,24 @@ reproducible:
    comment) — classified by file path and spot-checked by content; none is
    a user-authored workaround, complaint, or support artifact.
 
+**Search 2's actual scope, stated plainly:** `curl` is one common raw-HTTP
+idiom in a docs-heavy repo, not a stand-in for every hand-rolled client. A
+literal grep for `fetch(`, `axios`, or `requests\.(get|post)` returns zero
+hits too, but that is a weak result on its own — this is a Rust codebase
+that uses the English word "fetch" constantly for unrelated things (row
+fetches, git fetches in CI), so a bare `\bfetch\b` grep returns 257 hits
+across ~90 files that are almost entirely noise, and no finite keyword list
+covers every client library a workaround might use anyway. Search 2 is
+therefore reported for what it actually is: a spot-check that the code
+corpus's `curl` idiom is 100% first-party documentation, nothing more. The
+instrument that actually carries the "does anyone report this regardless
+of which library they used" weight is **search 1** — GitHub's semantic
+issue/PR search matches on concept, not literal substrings, so a complaint
+about a hand-rolled Axios or `requests` client would be expected to surface
+there the same way a curl-based one would. Search 1 found nothing; search 2
+independently confirms the code corpus has no case of the one raw-HTTP
+idiom checked directly.
+
 This repository is the engine's own issue tracker, not a support desk or
 sales-call archive — a `0` here is *absence of evidence in the only corpus
 available to this process*, not proof of absence; see the ledger's
@@ -181,17 +199,30 @@ this spec lists (long-poll result waiting, typed error branching,
 idempotency-key handling, signal-with-start/update-with-start semantics).
 
 **Line — kill:** fewer than 2 such reports in the 60-day window, **and** a
-minimum-exposure floor is separately met: the Discussion thread reaches at
-least 200 unique views (GitHub exposes a view counter to maintainers on
-Discussions) or at least 20 total reactions/participants across the
-thread, on top of live linkage from `README.md` and
-`docs/management-api.md`. Two links existing establishes availability, not
-that the target segment actually saw them — a reply count alone cannot
-tell "no demand" apart from "no exposure." If the 60-day window closes
-without clearing the exposure floor, the result is **inconclusive**, not a
-kill: re-run with wider distribution (e.g., a mention from the roadmap
-issue #968, or direct outreach to any known embedding teams) before
-scoring silence as evidence.
+minimum *segment-qualified* exposure floor is separately met. Raw thread
+traffic does not qualify: a Discussion hitting 200 views or 20 reactions
+proves nothing about who saw it — a repo's existing Rust-focused audience
+can produce that traffic without a single non-Rust integrator ever reading
+the prompt, and scoring that as "we reached them and they didn't answer"
+would be a kill built on an uncontrolled sample, not evidence. The floor
+that actually qualifies: **at least 2 direct solicitations delivered to
+identifiable non-Rust-adjacent contacts** — e.g., GitHub accounts that have
+starred or forked this repository and whose public profile shows primarily
+TypeScript/Python work, or any team that has filed an issue referencing a
+non-Rust integration — individually pinged with the Discussion link, not
+merely exposed to whoever happens to open it. Live linkage from `README.md`
+and `docs/management-api.md` is necessary but not sufficient on its own.
+
+This repository's accessible record currently names no such contact list;
+identifying at least 2 concrete contacts is part of running this probe,
+not an afterthought, and should happen before the 60-day window opens. If
+none can be identified at all, that absence is itself the finding worth
+reporting — it would mean this job cannot yet be probed through any channel
+this process has access to, and closing that harness gap (finding or
+building a way to reach the named segment) becomes the next demand-report
+deliverable, ahead of any pursue/kill verdict on #955 itself. Short of
+clearing the 2-contact floor, the window's silence is **inconclusive**, not
+a kill.
 
 **If it later ships anyway** (build criteria, for whoever runs this probe
 and clears the line): npm/PyPI download counts cannot answer "how many
