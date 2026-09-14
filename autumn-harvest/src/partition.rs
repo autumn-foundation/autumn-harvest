@@ -174,6 +174,10 @@ const LEGACY_RENAME_SUFFIX: &str = "__pre958";
 /// Suffix [`disable_partitioning`] appends to the partitioned parent's own
 /// indexes and constraints so the rebuilt flat table can reuse their
 /// original names.
+///
+/// `cfg`-gated with its only callers: without the `db` feature, nothing
+/// references it and an unused-const warning fails a `-D warnings` build.
+#[cfg(feature = "db")]
 const DISABLE_RENAME_SUFFIX: &str = "__old";
 
 /// The validate-only `BEFORE INSERT` trigger that replaces the FK's
@@ -395,8 +399,20 @@ pub struct PartitionInfo {
 }
 
 /// Tuning for one sweep pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepOptions {
+    /// Partition name to resume scanning at, from a prior pass's
+    /// [`SweepOutcome::resume_after`].
+    ///
+    /// A bounded pass (`max_attempts`) always starting from the oldest
+    /// partition means a permanently-blocked prefix consumes the same
+    /// budget on every tick. A long legal hold on old cohorts is one way
+    /// to get one. Any reclaimable partition past it is then never
+    /// reached. Setting this rotates the starting point instead of
+    /// restarting at the oldest every time, so budget eventually reaches
+    /// every partition across successive passes. `None`, or a name no
+    /// longer present, starts at the oldest as before.
+    pub resume_after: Option<String>,
     /// Maximum partitions to drop in one pass.
     ///
     /// Each drop takes a brief `ACCESS EXCLUSIVE` lock on the parent, so an
@@ -462,6 +478,7 @@ pub struct SweepOptions {
 impl Default for SweepOptions {
     fn default() -> Self {
         Self {
+            resume_after: None,
             max_drops: 32,
             max_attempts: 64,
             lock_timeout: Duration::from_secs(2),
@@ -491,6 +508,14 @@ pub struct SweepOutcome {
     /// up next tick. This is the operator's answer to "why does `blocked`
     /// not list every closed partition?" (issue #1270 item 1).
     pub truncated: bool,
+    /// When `truncated`, the partition name a caller should pass back as
+    /// [`SweepOptions::resume_after`] on the next pass. That pass then
+    /// starts past everything this one already attempted, rather than
+    /// re-spending its budget on the same blocked prefix. `None` when this
+    /// pass was not truncated. Also `None` when it ran out of eligible
+    /// partitions before its budget — either way there is nothing left to
+    /// skip past.
+    pub resume_after: Option<String>,
 }
 
 // ── Layout detection ───────────────────────────────────────────────────────
@@ -1173,7 +1198,8 @@ async fn refuse_if_row_security(conn: &mut AsyncPgConnection, verb: &str) -> Har
     )))
 }
 
-/// Views defined directly over `harvest_events`, schema-qualified.
+/// Views defined directly over `harvest_events` OR one of its leaf
+/// partitions, schema-qualified.
 ///
 /// Postgres tracks a view's dependency by relation **OID**, not name. Both
 /// conversion directions rename `harvest_events` out of the way and create
@@ -1182,6 +1208,12 @@ async fn refuse_if_row_security(conn: &mut AsyncPgConnection, verb: &str) -> Har
 /// that relation is only the pre-cutover slice. The view keeps returning
 /// rows and is now silently wrong, rather than obviously broken (issue
 /// #1270 item 14).
+///
+/// The leaf-partition half matters for `disable_partitioning` specifically.
+/// Its `harvest_events` IS already the partitioned parent, with real leaf
+/// tables under it. A view defined directly on one of THOSE would pass a
+/// check scoped to the parent's own name. It would then get silently
+/// destroyed by the revert's `DROP TABLE ... CASCADE`.
 #[cfg(feature = "db")]
 async fn dependent_views(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
     let rows = diesel::sql_query(
@@ -1192,8 +1224,16 @@ async fn dependent_views(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<Stri
            JOIN pg_class source_table ON pg_depend.refobjid = source_table.oid
            JOIN pg_namespace dependent_ns ON dependent_ns.oid = dependent_view.relnamespace
            JOIN pg_namespace source_ns ON source_ns.oid = source_table.relnamespace
-          WHERE source_table.relname = 'harvest_events'
-            AND source_ns.nspname = current_schema()
+          WHERE source_ns.nspname = current_schema()
+            AND (
+              source_table.relname = 'harvest_events'
+              OR source_table.oid IN (
+                   SELECT i.inhrelid FROM pg_inherits i
+                     JOIN pg_class p ON p.oid = i.inhparent
+                     JOIN pg_namespace pn ON pn.oid = p.relnamespace
+                    WHERE p.relname = 'harvest_events' AND pn.nspname = current_schema()
+                 )
+            )
             AND dependent_view.relkind IN ('v', 'm')
             AND dependent_view.oid <> source_table.oid
           ORDER BY 1",
@@ -1224,8 +1264,8 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
     )))
 }
 
-/// User-defined triggers on `harvest_events`, other than the engine's own
-/// insert-time integrity check.
+/// User-defined triggers on `harvest_events` or one of its leaf partitions,
+/// other than the engine's own insert-time integrity check.
 ///
 /// `CREATE TABLE ... (LIKE ...)` — what both conversion directions rebuild
 /// the table with — does not carry triggers, `INCLUDING` list or not; there
@@ -1233,6 +1273,12 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
 /// validation trigger is therefore silently dropped from the replacement
 /// (issue #1270 item 16). For an audit trigger, that is a compliance
 /// defect, not just a schema one.
+///
+/// The leaf-partition half matters for `disable_partitioning` specifically —
+/// see [`dependent_views`]'s doc for why. A trigger the engine itself
+/// propagated from a parent-level `CREATE TRIGGER` onto every leaf carries
+/// the SAME name there. So excluding [`EXEC_FK_TRIGGER`] by name still
+/// excludes its clones too.
 #[cfg(feature = "db")]
 async fn user_defined_triggers(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
     let rows = diesel::sql_query(
@@ -1240,7 +1286,16 @@ async fn user_defined_triggers(conn: &mut AsyncPgConnection) -> HarvestResult<Ve
            FROM pg_trigger t
            JOIN pg_class c ON c.oid = t.tgrelid
            JOIN pg_namespace n ON n.oid = c.relnamespace
-          WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
+          WHERE n.nspname = current_schema()
+            AND (
+              c.relname = 'harvest_events'
+              OR c.oid IN (
+                   SELECT i.inhrelid FROM pg_inherits i
+                     JOIN pg_class p ON p.oid = i.inhparent
+                     JOIN pg_namespace pn ON pn.oid = p.relnamespace
+                    WHERE p.relname = 'harvest_events' AND pn.nspname = current_schema()
+                 )
+            )
             AND NOT t.tgisinternal
             AND t.tgname <> $1
           ORDER BY 1",
@@ -1500,6 +1555,14 @@ const RENAME_HELPER_DECLARE: &str = "    new_name text;\n    bump     int;\n    
 /// declared. Constraint names are unique per-table, so their collision
 /// check is scoped to `table`; index names are relations, unique
 /// per-schema, so theirs is scoped to `current_schema()`.
+///
+/// A PRIMARY KEY or UNIQUE constraint's rename also renames its BACKING
+/// index, which Postgres allocates from the schema-wide relation namespace.
+/// So the constraint loop's own collision check covers `pg_indexes` too,
+/// not just `pg_constraint`. Otherwise an unrelated index already holding
+/// the candidate name looks free here. The `RENAME CONSTRAINT` then fails
+/// on the implicit index rename, with an error that does not point at the
+/// actual cause.
 #[must_use]
 fn collision_safe_rename_stmts(table: &str, suffix: &str) -> String {
     format!(
@@ -1515,7 +1578,9 @@ fn collision_safe_rename_stmts(table: &str, suffix: &str) -> String {
          END LOOP;\n        \
          new_name := new_name || tail;\n        \
          WHILE EXISTS (SELECT 1 FROM pg_constraint\n                       \
-         WHERE conname = new_name AND conrelid = '{table}'::regclass)\n        \
+         WHERE conname = new_name AND conrelid = '{table}'::regclass)\n           \
+         OR EXISTS (SELECT 1 FROM pg_indexes\n                       \
+         WHERE indexname = new_name AND schemaname = current_schema())\n        \
          LOOP\n            \
          bump := bump + 1;\n            \
          tail := '{suffix}' || '_' || bump::text;\n            \
@@ -1550,6 +1615,28 @@ fn collision_safe_rename_stmts(table: &str, suffix: &str) -> String {
          new_name := new_name || tail;\n        \
          END LOOP;\n        \
          EXECUTE format('ALTER INDEX %I RENAME TO %I', obj.n, new_name);\n    \
+         END LOOP;"
+    )
+}
+
+/// Statement dropping a constraint [`collision_safe_rename_stmts`] renamed
+/// off `table`, found by prefix rather than by the un-bumped expected name.
+///
+/// That rename disambiguates with a numeric suffix on a collision — a
+/// leftover object already named `{base_name}{suffix}`, from a previous
+/// failed conversion, say. See that function's doc. Dropping by the fixed
+/// `{base_name}{suffix}` name then silently no-ops on the ACTUAL renamed
+/// constraint, now `{base_name}{suffix}_1`. Worse, if that literal name
+/// also happens to belong to something else, it drops the wrong object
+/// instead. The bump always lands strictly after `{suffix}`, so a `LIKE
+/// '{base_name}{suffix}%'` prefix match finds the real one either way.
+fn drop_renamed_constraint_stmt(table: &str, base_name: &str, suffix: &str) -> String {
+    format!(
+        "FOR obj IN SELECT conname FROM pg_constraint\n             \
+         WHERE conrelid = '{table}'::regclass\n               \
+         AND conname LIKE '{base_name}{suffix}%'\n        \
+         LOOP\n            \
+         EXECUTE format('ALTER TABLE {table} DROP CONSTRAINT %I', obj.conname);\n        \
          END LOOP;"
     )
 }
@@ -1590,6 +1677,21 @@ pub fn enable_sql(opts: &EnableOptions) -> String {
     // have to be read while it still exists.
     let copy_acl = copy_acl_body(LEGACY_PARTITION, "harvest_events");
     let rename_stmts = collision_safe_rename_stmts(LEGACY_PARTITION, LEGACY_RENAME_SUFFIX);
+    let drop_renamed_foreign_key = drop_renamed_constraint_stmt(
+        LEGACY_PARTITION,
+        "harvest_events_workflow_exec_id_fkey",
+        LEGACY_RENAME_SUFFIX,
+    );
+    let drop_renamed_primary_key = drop_renamed_constraint_stmt(
+        LEGACY_PARTITION,
+        "harvest_events_pkey",
+        LEGACY_RENAME_SUFFIX,
+    );
+    let drop_renamed_unique_constraint = drop_renamed_constraint_stmt(
+        LEGACY_PARTITION,
+        "harvest_events_workflow_exec_id_event_id_key",
+        LEGACY_RENAME_SUFFIX,
+    );
     format!(
         r#"-- Issue #958: convert harvest_events to the partitioned layout.
 -- Generated by autumn_harvest::partition::enable_sql(); safe to re-run.
@@ -1753,12 +1855,9 @@ BEGIN
         -- alone can no longer be a key anyway: uniqueness on a partitioned
         -- table has to include the partition column. Global `id` uniqueness is
         -- not lost -- one sequence still feeds every partition.
-        EXECUTE 'ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT IF EXISTS '
-             || 'harvest_events_workflow_exec_id_fkey{LEGACY_RENAME_SUFFIX}';
-        EXECUTE 'ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT IF EXISTS '
-             || 'harvest_events_pkey{LEGACY_RENAME_SUFFIX}';
-        EXECUTE 'ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT IF EXISTS '
-             || 'harvest_events_workflow_exec_id_event_id_key{LEGACY_RENAME_SUFFIX}';
+        {drop_renamed_foreign_key}
+        {drop_renamed_primary_key}
+        {drop_renamed_unique_constraint}
         EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS {LEGACY_PARTITION}_pk_idx '
              || 'ON {LEGACY_PARTITION} (id, cohort)';
         EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS {LEGACY_PARTITION}_exec_event_idx '
@@ -1951,7 +2050,12 @@ fn truncate_ident(s: &str, max: usize) -> &str {
 /// [`disable_partitioning`], which drives its steps from Rust rather than a
 /// generated script. See that function's doc for why this is needed at all.
 ///
-/// Constraint names are unique per-table, so `table` scopes the check.
+/// Constraint names are unique per-table, so `table` scopes that half of the
+/// check. But a PRIMARY KEY or UNIQUE constraint's rename also renames its
+/// BACKING index, schema-wide. So the check covers `pg_indexes` too. An
+/// unrelated index already holding the candidate name would otherwise look
+/// free here, and the caller's `RENAME CONSTRAINT` would fail on the
+/// implicit index rename.
 #[cfg(feature = "db")]
 async fn collision_safe_constraint_name(
     conn: &mut AsyncPgConnection,
@@ -1970,7 +2074,9 @@ async fn collision_safe_constraint_name(
         let candidate = format!("{}{suffix}{tag}", truncate_ident(old_name, room));
         let taken = diesel::sql_query(
             "SELECT EXISTS (SELECT 1 FROM pg_constraint \
-              WHERE conname = $1 AND conrelid = $2::regclass) AS v",
+              WHERE conname = $1 AND conrelid = $2::regclass) \
+              OR EXISTS (SELECT 1 FROM pg_indexes \
+              WHERE indexname = $1 AND schemaname = current_schema()) AS v",
         )
         .bind::<Text, _>(&candidate)
         .bind::<Text, _>(table)
@@ -2256,6 +2362,15 @@ pub async fn disable_partitioning(
             )
             .await?;
             exec(conn, "DROP TABLE harvest_events_partitioned CASCADE").await?;
+            // `enable_sql`/`migration_plan_steps` create this to keep the
+            // sweeper's tier-1 drop-gate probe off a sequential scan of
+            // `harvest_workflow_executions`. Reverting is the one path that
+            // owns removing it. down.sql deliberately does not: an ordinary
+            // migration cannot tell its own copy from an operator's
+            // pre-existing index of the same name (issue #1270 item 13).
+            // This, though, is the exact `enable` this index came from
+            // being undone.
+            exec(conn, "DROP INDEX IF EXISTS idx_harvest_we_created_at").await?;
             Ok(DisableReport {
                 orphans_removed: orphans,
                 duplicates_removed: duplicates,
@@ -2355,19 +2470,47 @@ async fn sweep_inner(
         return Ok(outcome);
     }
 
+    // Oldest first, DEFAULT last — see `compare_partitions`. Rotated below so
+    // a bounded pass does not always start (and stall) at the same place.
+    let mut parts = list_partitions(conn).await?;
+    if let Some(resume_after) = &opts.resume_after
+        && let Some(idx) = parts.iter().position(|p| &p.name == resume_after)
+    {
+        // A name no longer present (dropped, or from a stale/foreign
+        // options value) leaves `parts` unrotated: start at the oldest,
+        // same as `resume_after: None`.
+        parts.rotate_left(idx);
+    }
+
     // Attempts counts partitions actually evaluated against the drop gate —
     // the expensive step — separately from `outcome.dropped.len()`, which
     // counts only successes. See `SweepOptions::max_attempts`.
     let mut attempts = 0usize;
-    for part in list_partitions(conn).await? {
+    for idx in 0..parts.len() {
+        let part = &parts[idx];
         if outcome.dropped.len() >= opts.max_drops || attempts >= opts.max_attempts {
-            // `max_drops == 0` means "never drop" (dry-run's way of
-            // suppressing the sweep while creation keeps running), not a
-            // budget genuinely exhausted after trying. That case trips this
-            // break on the very first partition, every tick. Reporting it
-            // as `truncated` would falsely read as a stuck backlog on every
-            // dry-run deployment.
-            outcome.truncated = opts.max_drops > 0 || attempts >= opts.max_attempts;
+            // A partition this pass has not yet looked at, and would have
+            // evaluated had the budget allowed — not DEFAULT, not still
+            // open. Without that check, two cases misreport `truncated`
+            // even though nothing reclaimable was left behind. One: a
+            // backlog that happens to end exactly on a budget boundary.
+            // Two: a `max_drops == 0` dry-run pass, which trips the check
+            // on the very first partition every tick.
+            let more_eligible = parts[idx..]
+                .iter()
+                .any(|p| !p.is_default && p.upper.is_some_and(|u| u <= now));
+            outcome.truncated =
+                more_eligible && (opts.max_drops > 0 || attempts >= opts.max_attempts);
+            if outcome.truncated {
+                // Issue #1270: without this, a permanently-blocked prefix
+                // (a long legal hold on the oldest cohorts) consumes the
+                // same `max_attempts` budget every pass. Nothing past it is
+                // ever reached. The caller feeding this back as the next
+                // pass's `resume_after` rotates the starting point instead.
+                // Budget then reaches every partition over successive
+                // passes, rather than stalling on the same prefix forever.
+                outcome.resume_after = Some(part.name.clone());
+            }
             break;
         }
         // The DEFAULT partition is structural: dropping it would make an
@@ -2419,11 +2562,11 @@ async fn sweep_inner(
         if !apply {
             // Read-only: report the partition as droppable without taking a
             // lock or issuing DDL.
-            outcome.dropped.push(part.name);
+            outcome.dropped.push(part.name.clone());
             continue;
         }
-        if drop_partition(conn, &part, upper, opts).await? {
-            outcome.dropped.push(part.name);
+        if drop_partition(conn, part, upper, opts).await? {
+            outcome.dropped.push(part.name.clone());
         } else {
             outcome
                 .blocked
@@ -2781,7 +2924,7 @@ async fn drop_partition(
         .unwrap_or(u64::MAX)
         .max(1);
     let name = part.name.clone();
-    let opts = *opts;
+    let opts = opts.clone();
     let result = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
         exec(conn, &format!("SET LOCAL lock_timeout = '{ms}ms'")).await?;
         // Taken explicitly, before the re-check, rather than relying on the
@@ -3803,15 +3946,32 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // insert-time half lives on in the trigger below. The old PK and unique
         // constraint must go too: ATTACH propagates the parent's, and a table
         // may have only one primary key.
+        // Dropped by prefix match, not by the un-bumped expected name. The
+        // rename step above disambiguates with a numeric suffix on a
+        // collision — a leftover object already named `{base}{suffix}`,
+        // from a previous failed conversion, say. Dropping by the fixed
+        // name would then silently miss the actual renamed constraint. See
+        // `drop_renamed_constraint_stmt`.
         step(
             4,
             format!(
-                "ALTER TABLE {LEGACY_PARTITION}\n    \
-                 DROP CONSTRAINT IF EXISTS \
-                 harvest_events_workflow_exec_id_fkey{LEGACY_RENAME_SUFFIX},\n    \
-                 DROP CONSTRAINT IF EXISTS harvest_events_pkey{LEGACY_RENAME_SUFFIX},\n    \
-                 DROP CONSTRAINT IF EXISTS \
-                 harvest_events_workflow_exec_id_event_id_key{LEGACY_RENAME_SUFFIX}"
+                "DO $harvest_drop_legacy_958$\nDECLARE obj record;\nBEGIN\n    {}\n    {}\n    \
+                 {}\nEND\n$harvest_drop_legacy_958$",
+                drop_renamed_constraint_stmt(
+                    LEGACY_PARTITION,
+                    "harvest_events_workflow_exec_id_fkey",
+                    LEGACY_RENAME_SUFFIX
+                ),
+                drop_renamed_constraint_stmt(
+                    LEGACY_PARTITION,
+                    "harvest_events_pkey",
+                    LEGACY_RENAME_SUFFIX
+                ),
+                drop_renamed_constraint_stmt(
+                    LEGACY_PARTITION,
+                    "harvest_events_workflow_exec_id_event_id_key",
+                    LEGACY_RENAME_SUFFIX
+                ),
             ),
         ),
         step(

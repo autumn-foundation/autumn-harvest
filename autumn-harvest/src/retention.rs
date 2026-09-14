@@ -441,6 +441,10 @@ impl PartitionMaintenanceConfig {
     #[must_use]
     pub fn sweep_options(&self) -> crate::partition::SweepOptions {
         crate::partition::SweepOptions {
+            // Set per-shard by `run_partition_maintenance`, from the prior
+            // pass's recorded outcome. Not known here — this only turns
+            // static config into tuning, with no notion of shards.
+            resume_after: None,
             max_drops: self.max_drops_per_tick,
             max_attempts: self.max_attempts_per_tick,
             lock_timeout: Duration::from_secs(self.drop_lock_timeout_secs.max(1)),
@@ -983,6 +987,26 @@ impl RetentionMonitor {
         }
     }
 
+    /// Clear a stale partition-maintenance outcome after `maintain` reports
+    /// this shard as no longer partitioned.
+    ///
+    /// Without this, an operator who disables partitioning on a running
+    /// engine, without restarting it, keeps seeing the LAST outcome from
+    /// before the revert forever. `Ok(None)` on its own leaves
+    /// `partition_maintenance` untouched. Only a shard that never opted in
+    /// gets the field's `None` default for free.
+    #[cfg(feature = "db")]
+    fn clear_partitions(&self, shard: ShardId) {
+        let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
+        if let Some(existing) = guard
+            .per_shard
+            .iter_mut()
+            .find(|x| x.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
+        {
+            existing.partition_maintenance = None;
+        }
+    }
+
     /// Record this shard's rate-limit bucket GC count (issue #1127) without
     /// disturbing the history-retention counters already reported this tick.
     ///
@@ -1063,6 +1087,15 @@ async fn run_partition_maintenance(
         sweep_opts.max_drops = 0;
         sweep_opts.straggler_grace = None;
     }
+    // Each shard's own rotation cursor, read from the outcome this same
+    // monitor recorded last pass. A bounded sweep always restarting at the
+    // oldest partition would spend its whole budget on the same prefix
+    // every tick. That happens when the prefix is permanently blocked — a
+    // long legal hold, say. It would never reach a reclaimable partition
+    // past it. The monitor is already the durable record of "what the
+    // last pass did". So it doubles as the cursor's home, with no extra
+    // state to plumb through.
+    let last_snapshot = monitor.snapshot();
     for (shard, pool) in pools.iter_shards() {
         let mut conn = match pool.get().await {
             Ok(conn) => conn,
@@ -1082,11 +1115,18 @@ async fn run_partition_maintenance(
                 continue;
             }
         };
+        let mut shard_opts = sweep_opts.clone();
+        shard_opts.resume_after = last_snapshot
+            .per_shard
+            .iter()
+            .find(|r| r.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
+            .and_then(|r| r.partition_maintenance.as_ref())
+            .and_then(|m| m.sweep.resume_after.clone());
         match crate::partition::maintain(
             &mut conn,
             now,
             config.partitions.lookahead_cohorts,
-            &sweep_opts,
+            &shard_opts,
         )
         .await
         {
@@ -1115,12 +1155,11 @@ async fn run_partition_maintenance(
                 monitor.update_partitions(shard, outcome);
             }
             // Issue #1270 item 6: `maintain` returns `Ok(None)` when this
-            // shard's `harvest_events` is not partitioned. Leave
-            // `partition_maintenance` at its default `None` rather than
-            // stamping a near-empty outcome. A permanently-unpartitioned
-            // shard must stay visibly distinct from one that opted in and is
-            // idle.
-            Ok(None) => {}
+            // shard's `harvest_events` is not partitioned. Cleared rather
+            // than left alone: an operator can disable partitioning on a
+            // running engine. Without this the field keeps reporting the
+            // last outcome from before the revert instead of `None`.
+            Ok(None) => monitor.clear_partitions(shard),
             Err(err) => {
                 tracing::warn!(
                     shard = %shard,

@@ -1528,6 +1528,130 @@ async fn a_zero_drop_budget_is_not_reported_as_a_truncated_pass() {
 }
 
 #[tokio::test]
+async fn a_backlog_exactly_matching_the_budget_is_not_reported_as_truncated() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Exactly `max_attempts` droppable cohorts, nothing eligible beyond
+    // them. Issue #1270: the budget check ran before the
+    // DEFAULT/future-lookahead partitions were filtered out. A backlog that
+    // happens to end precisely on a budget boundary still set `truncated`
+    // on the very next, ineligible, loop item.
+    for days in [10_i64, 11] {
+        let ts = Utc::now() - chrono::Duration::days(days);
+        partition::ensure_cohort(&mut conn, ts)
+            .await
+            .expect("materialize cohort");
+    }
+
+    let outcome = partition::sweep(
+        &mut conn,
+        Utc::now(),
+        &SweepOptions {
+            max_attempts: 2,
+            ..SweepOptions::default()
+        },
+    )
+    .await
+    .expect("sweep");
+
+    assert_eq!(
+        outcome.dropped.len(),
+        2,
+        "both cohorts must be dropped; got {outcome:?}"
+    );
+    assert!(
+        !outcome.truncated,
+        "nothing reclaimable was left behind, so this must not read as a \
+         pass that stopped early: {outcome:?}"
+    );
+    assert!(outcome.resume_after.is_none(), "got {outcome:?}");
+}
+
+#[tokio::test]
+async fn the_sweep_rotates_past_a_permanently_blocked_prefix_across_passes() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Issue #1270: a bounded sweep always restarting at the oldest
+    // partition can starve reclamation. Two long-running executions pin
+    // the two OLDEST cohorts here, a permanently blocked prefix. Every pass
+    // spends the same `max_attempts` budget on them, and a reclaimable
+    // partition past that prefix is never reached. `resume_after` exists to
+    // fix that. Fed back from one pass's outcome into the next pass's
+    // options, it rotates the starting point instead.
+    let width = partition::DEFAULT_COHORT_WIDTH_SECS;
+    let blocked_a = Utc::now() - chrono::Duration::days(20);
+    let blocked_b = Utc::now() - chrono::Duration::days(19);
+    let droppable = Utc::now() - chrono::Duration::days(18);
+    for (label, at) in [("rotate-a", blocked_a), ("rotate-b", blocked_b)] {
+        let exec = insert_execution(&mut conn, "rotate_wf", label, at, None).await;
+        autumn_harvest::store::append_events(
+            &mut conn,
+            ExecutionId::from_uuid(exec),
+            &sample_events(),
+            0,
+        )
+        .await
+        .expect("seed a running execution pinning this cohort");
+        backdate_events(&mut conn, exec, at).await;
+    }
+    partition::ensure_cohort(&mut conn, droppable)
+        .await
+        .expect("materialize the reclaimable cohort");
+    let droppable_partition = partition::partition_name(partition::cohort_start(droppable, width));
+
+    let opts = SweepOptions {
+        max_attempts: 2,
+        ..SweepOptions::default()
+    };
+    let first = partition::sweep(&mut conn, Utc::now(), &opts)
+        .await
+        .expect("first sweep");
+    assert!(
+        first.dropped.is_empty(),
+        "the budget must be entirely consumed by the two blocked cohorts, \
+         reaching neither the droppable one nor any drop; got {first:?}"
+    );
+    assert_eq!(first.blocked.len(), 2, "got {first:?}");
+    assert!(
+        first.truncated,
+        "the droppable cohort past the blocked prefix was never reached \
+         this pass, so this must read as truncated; got {first:?}"
+    );
+    let resume_after = first
+        .resume_after
+        .clone()
+        .expect("a truncated pass with more eligible partitions must report where to resume");
+
+    let second = partition::sweep(
+        &mut conn,
+        Utc::now(),
+        &SweepOptions {
+            resume_after: Some(resume_after),
+            ..opts
+        },
+    )
+    .await
+    .expect("second sweep, resumed past the blocked prefix");
+    assert_eq!(
+        second.dropped,
+        vec![droppable_partition],
+        "resuming past the two permanently blocked cohorts must reach and \
+         drop the reclaimable one that a same-budget pass restarting at the \
+         oldest partition would never get to; got {second:?}"
+    );
+}
+
+#[tokio::test]
 async fn the_straggler_delete_removes_orphan_rows_but_leaves_the_stragglers_own() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;

@@ -6365,6 +6365,13 @@ fn emit_partition_report(
                         sweep.dropped.len(),
                         sweep.blocked.len()
                     );
+                    // Same reporting gap as the `maintenance` branch above,
+                    // for `status`'s own read-only sweep preview. Without
+                    // this, a status report during a real backlog looks the
+                    // same as one where nothing else is left to evaluate.
+                    if sweep.truncated {
+                        println!("  sweep truncated: hit max-drops or max-attempts");
+                    }
                     for b in &sweep.blocked {
                         println!("  blocked: {b}");
                     }
