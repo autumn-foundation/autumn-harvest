@@ -2140,6 +2140,88 @@ async fn quoted_residual_index_name_with_whitespace_is_recognized_by_shape() {
 }
 
 #[tokio::test]
+async fn an_operator_index_squatting_a_reserved_legacy_name_still_refuses_the_revert() {
+    // Review finding: harvest's own two throwaway legacy indexes exist
+    // so `ATTACH PARTITION` can validate without a scan. Their
+    // reserved-name exemption matched by name and key columns alone.
+    // An operator's own index can occupy one of those exact names,
+    // over the same key columns, yet differ in shape. The shape
+    // difference can be a predicate, an expression, a non-default
+    // opclass, a descending column, `NULLS NOT DISTINCT`, or an
+    // INCLUDEd column. That still passed the same check.
+    // `disable_partitioning` would then proceed. The operator's
+    // index would vanish, unreplayed, when the reverted flat table's
+    // `DROP TABLE ... CASCADE` removes the legacy partition.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(
+        &mut conn,
+        "squat_pk_idx_wf",
+        "squat-pk-idx-1",
+        Utc::now(),
+        None,
+    )
+    .await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Replace harvest's own reserved-name index with a same-name,
+    // same-key-columns impostor. It differs only by a predicate --
+    // exactly the shape divergence the exemption must now catch.
+    diesel::sql_query("DROP INDEX harvest_events_legacy_pk_idx")
+        .execute(&mut conn)
+        .await
+        .expect("drop harvest's own reserved-name index");
+    diesel::sql_query(
+        "CREATE UNIQUE INDEX harvest_events_legacy_pk_idx \
+         ON harvest_events_legacy (id, cohort) WHERE id > 0",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator impostor squatting the reserved name, with a predicate");
+
+    let err = partition::disable_partitioning(&mut conn).await.expect_err(
+        "an operator's own index squatting a reserved legacy name, with a \
+         divergent shape, must refuse the revert rather than being silently \
+         dropped as harvest's own",
+    );
+    assert!(
+        err.to_string().contains("harvest_events_legacy_pk_idx"),
+        "the refusal must name the squatting index: {err}"
+    );
+
+    // Restore harvest's own reserved-name shape so the shard reverts
+    // cleanly, leaving the database unpartitioned for later tests.
+    diesel::sql_query("DROP INDEX harvest_events_legacy_pk_idx")
+        .execute(&mut conn)
+        .await
+        .expect("drop the impostor");
+    diesel::sql_query(
+        "CREATE UNIQUE INDEX harvest_events_legacy_pk_idx \
+         ON harvest_events_legacy (id, cohort)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("restore harvest's own reserved-name index");
+    partition::disable_partitioning(&mut conn)
+        .await
+        .expect("revert now that the impostor is gone")
+        .expect("the shard was partitioned");
+}
+
+#[tokio::test]
 async fn a_dependent_materialized_view_refuses_the_conversion_too() {
     // Review finding on item 14: Postgres records a materialized view's
     // dependency the same way as an ordinary view, by relation OID

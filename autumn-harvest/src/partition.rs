@@ -1670,10 +1670,38 @@ pub async fn constraint_backed_unique_indexes_on_partitioned_parent(
                 -- the suffix `{LEGACY_RENAME_SUFFIX}`. Both the plain
                 -- and the renamed form are exempt here, the same way the
                 -- cohort `CHECK` exemption treats its own reserved name.
+                --
+                -- Review finding: matched by name and key columns alone.
+                -- An operator's own index can occupy one of these two
+                -- reserved names with the same key columns, yet differ
+                -- in a way `ATTACH PARTITION` still cares about: a
+                -- predicate, an expression, a non-default opclass, a
+                -- descending column, `NULLS NOT DISTINCT`, or an
+                -- INCLUDEd column. Exempting it on name and columns
+                -- alone would let `disable_partitioning` proceed, and
+                -- the operator's index would vanish, unreplayed, when
+                -- the reverted flat table's `DROP TABLE ... CASCADE`
+                -- removes the legacy partition. The checks below match
+                -- the full shape rigor `index_shape_check_sql` and the
+                -- phase-2 invalid-index cleanup already apply before
+                -- trusting one of these reserved names.
                 c.relname = '{LEGACY_PARTITION}'
                 AND (
                     (i.indexrelid::regclass::text IN
                          ('{LEGACY_PARTITION}_pk_idx', '{LEGACY_PARTITION}_pk_idx{LEGACY_RENAME_SUFFIX}')
+                     AND i.indpred IS NULL AND i.indexprs IS NULL
+                     AND i.indnkeyatts = 2 AND i.indnatts = 2
+                     AND (SELECT relam FROM pg_class WHERE oid = i.indexrelid)
+                         = (SELECT oid FROM pg_am WHERE amname = 'btree')
+                     AND pg_get_indexdef(i.indexrelid) NOT ILIKE '%NULLS NOT DISTINCT%'
+                     AND NOT EXISTS (
+                             SELECT 1 FROM unnest(i.indclass) AS oc(opclass)
+                               JOIN pg_opclass op ON op.oid = oc.opclass
+                              WHERE NOT op.opcdefault
+                         )
+                     AND NOT EXISTS (
+                             SELECT 1 FROM unnest(i.indoption) AS o(bits) WHERE bits <> 0
+                         )
                      AND (SELECT array_agg(a.attname::text ORDER BY k)
                             FROM generate_series(0, i.indnkeyatts - 1) k
                             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
@@ -1681,6 +1709,19 @@ pub async fn constraint_backed_unique_indexes_on_partitioned_parent(
                     OR
                     (i.indexrelid::regclass::text IN
                          ('{LEGACY_PARTITION}_exec_event_idx', '{LEGACY_PARTITION}_exec_event_idx{LEGACY_RENAME_SUFFIX}')
+                     AND i.indpred IS NULL AND i.indexprs IS NULL
+                     AND i.indnkeyatts = 3 AND i.indnatts = 3
+                     AND (SELECT relam FROM pg_class WHERE oid = i.indexrelid)
+                         = (SELECT oid FROM pg_am WHERE amname = 'btree')
+                     AND pg_get_indexdef(i.indexrelid) NOT ILIKE '%NULLS NOT DISTINCT%'
+                     AND NOT EXISTS (
+                             SELECT 1 FROM unnest(i.indclass) AS oc(opclass)
+                               JOIN pg_opclass op ON op.oid = oc.opclass
+                              WHERE NOT op.opcdefault
+                         )
+                     AND NOT EXISTS (
+                             SELECT 1 FROM unnest(i.indoption) AS o(bits) WHERE bits <> 0
+                         )
                      AND (SELECT array_agg(a.attname::text ORDER BY k)
                             FROM generate_series(0, i.indnkeyatts - 1) k
                             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
