@@ -132,3 +132,20 @@ Test: `payload_codec.rs`'s
 the exact four-key version-2 collision shape (this issue's own reproduction)
 through `encode_payload` under the identity codec, and asserts it round-trips
 byte-identical instead of being stored verbatim.
+
+**The escape guard checks every depth, not only the field root.** The
+operator lossy-decode path (`decode_value_lossy`) recurses into every object
+and array looking for an envelope, so it can find a collision nested inside
+an otherwise ordinary payload. The escape guard originally checked only the
+payload root. A field like `{"child": {"_harvest_codec_envelope": {...}}}`
+has an ordinary root, so it passed the guard unescaped, then got decoded or
+marked undecodable by any reader that recursed — the same collision, one
+level deeper than the guard was looking. Fixed by checking the whole payload
+tree, root and every descendant, before the identity fast path bails out
+(`payload_or_a_descendant_is_a_codec_envelope`). A collision anywhere in the
+tree now escapes the whole field, matching how a recursive reader would
+otherwise misread it.
+
+Test: `a_descendant_envelope_shaped_field_is_also_escaped_on_encode` proves
+the escape, the round trip, and that `decode_value_lossy` decodes the
+escape wrapper once and never re-examines the recovered descendant.

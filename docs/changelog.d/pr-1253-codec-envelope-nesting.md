@@ -78,13 +78,24 @@ Neither is fixable without rewriting stored history, which the append-only
 invariant forbids outside the two sanctioned exceptions in `CLAUDE.md`
 (unchanged by this fix — still exactly two).
 
+**The escape guard checks every depth, not only the field root.** The
+operator lossy-decode path (`decode_value_lossy`) recurses into every
+object and array looking for an envelope. The escape guard originally
+checked only the payload root, so a field with an ordinary root but an
+envelope-shaped descendant passed unescaped, then got decoded or marked
+undecodable by any reader that recursed — the same collision, one level
+deeper. Fixed by checking the whole payload tree before the identity fast
+path bails out (`payload_or_a_descendant_is_a_codec_envelope`); a collision
+anywhere in the tree now escapes the whole field.
+
 No new `WorkflowEvent` variant, no migration, no change to the
 adjacently-tagged event JSON contract.
 
-Tests: 6 new `payload_codec.rs` unit tests (flat- and nested-shaped
-collision escape and round-trip, ordinary-payload non-interference, nested
-shape strictness including malformed nested `kid`, the lossy read path
-against a nested envelope, un-rotated real-codec byte-identity); 2 new
+Tests: 7 new `payload_codec.rs` unit tests (flat- and nested-shaped
+collision escape and round-trip, a descendant-shaped collision escape and
+round-trip, ordinary-payload non-interference, nested shape strictness
+including malformed nested `kid`, the lossy read path against a nested
+envelope, un-rotated real-codec byte-identity); 2 new
 `codec_rotation_db_tests.rs` integration tests pinning the SQL predicate's
 new nested branch against a real sweep — one exercising identity registered
 under a rotation key, proving an escaped value gets genuinely encrypted
