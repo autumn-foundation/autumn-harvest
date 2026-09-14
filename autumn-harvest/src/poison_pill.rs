@@ -356,12 +356,12 @@ mod scanner {
     /// way says nothing about the task itself. It means a reset attempt could
     /// not reach the database in time, not that the task is poisonous.
     ///
-    /// Leaving `crash_strikes` untouched matters beyond quarantine counting: a
-    /// re-claim of the row this frees still carries the same `crash_strikes`
-    /// value. `worker.rs`'s `reset_timed_out_workflow_task` also guards its own
-    /// write on `attempt`, not only `crash_strikes`, so a delayed reset from
-    /// this row's PRIOR attempt cannot match the fresh claim and undo it. See
-    /// that function's own doc comment.
+    /// Leaving `crash_strikes` untouched matters beyond quarantine counting.
+    /// A re-claim of the row this frees still carries the same `crash_strikes`
+    /// value. `worker.rs`'s `reset_timed_out_workflow_task` also guards its
+    /// own write on `attempt`, not only `crash_strikes`. A delayed reset from
+    /// this row's PRIOR attempt then cannot match the fresh claim and undo
+    /// it. See that function's own doc comment.
     ///
     /// Returns `true` if the row was actually transitioned (it was still the
     /// same stuck `RUNNING` attempt), `false` if a concurrent actor already

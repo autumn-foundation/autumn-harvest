@@ -28134,10 +28134,10 @@ impl Worker {
         // worker. `poison_pill::requeue_orphan` changes it.
         let claim_crash_strikes = task.crash_strikes;
         // The `attempt` this dispatch claimed the row at (issue #1459): the
-        // second claim epoch. `claim_task` bumps `attempt` on every claim, so
-        // it also catches a re-claim that `crash_strikes` alone would miss --
+        // second claim epoch. `claim_task` bumps `attempt` on every claim.
+        // It also catches a re-claim that `crash_strikes` alone would miss.
         // `poison_pill::requeue_stuck_task` deliberately leaves `crash_strikes`
-        // untouched (being stuck is not a crash), so it needs its own
+        // untouched, since being stuck is not a crash, so it needs its own
         // discriminator. See `reset_timed_out_workflow_task`'s doc comment.
         let claim_attempt = task.attempt;
         let worker_id = self.config.worker_id.clone();
@@ -29099,13 +29099,12 @@ pub async fn reset_timed_out_workflow_task(
             // already runs, and invite a second concurrent dispatch.
             //
             // Two discriminators, not one. `crash_strikes` alone is not
-            // enough: `poison_pill::requeue_stuck_task` (issue #1459's
+            // enough. `poison_pill::requeue_stuck_task` (issue #1459's
             // stuck-running backstop) also hands a row back to `PENDING` for
-            // re-claim, and it deliberately leaves `crash_strikes` untouched
-            // -- being stuck is not a crash. Its re-claim would then still
-            // match on `crash_strikes` alone, so this reset must also check
-            // `attempt`, which `claim_task` bumps on every claim without
-            // exception.
+            // re-claim. It deliberately leaves `crash_strikes` untouched --
+            // being stuck is not a crash. Its re-claim would then still match
+            // on `crash_strikes` alone. This reset must also check `attempt`,
+            // which `claim_task` bumps on every claim without exception.
             .filter(dsl::crash_strikes.eq(claim_crash_strikes))
             .filter(dsl::attempt.eq(claim_attempt)),
     )
