@@ -551,7 +551,13 @@ The sweeper reports every cohort it considered and left alone, with the reason:
   swept.
 
 The same information is on every retention tick's per-shard status
-(`partition_maintenance.sweep.blocked`).
+(`partition_maintenance.sweep.blocked`). `partition_maintenance.sweep.truncated`
+is `true` when a pass stopped before considering every partition, because it hit
+`max_drops_per_tick` or `max_attempts_per_tick`; the rest is picked up next
+tick. `partition_maintenance.uncovered_cohorts` names any lookahead cohort that
+could not be created this pass — `ensure_partitions` keeps creating the rest of
+the window when one cohort is blocked, so a partial failure here does not show
+up in `created` alone.
 
 ### Tuning
 
@@ -562,10 +568,12 @@ The same information is on every retention tick's per-shard status
 | `enabled` | `true` | For incident response, not tuning: disabling it stops both partition creation and reclamation. |
 | `lookahead_cohorts` | `7` | Cohorts kept pre-created ahead of now. |
 | `max_drops_per_tick` | `32` | Each drop ends in a brief `ACCESS EXCLUSIVE` catalog lock; a bounded budget keeps a backlog from holding the append path off. Successive ticks converge. |
+| `max_attempts_per_tick` | `64` | Partitions *evaluated* against the drop gate, not just dropped — a blocked partition still costs a gate evaluation, up to a tier-3 scan. Bounds that too, so a shard with many blocked cohorts cannot spend a whole tick proving none of them are droppable. |
 | `drop_lock_timeout_secs` | `2` | Fail fast and retry rather than making every append queue behind the sweep. |
 | `exact_scan_timeout_secs` | `15` | Budget for the exact ownership scan, reached only when more than `owner_probe_cap` old executions survive. |
 | `owner_probe_cap` | `1000` | How many surviving old executions the cheap narrow probe enumerates before falling back to the exact scan. |
 | `straggler_batch` | `1000` | Rows per straggler `DELETE` statement. |
+| `straggler_delete_timeout_secs` | `15` | Budget for one straggler-delete statement, so a partition with sparse orphans cannot hold a batch open indefinitely. A timeout keeps whatever earlier batches removed and retries the rest next tick. |
 | `straggler_grace_secs` | `None` | Opt-in orphan `DELETE` for cohorts pinned by long-running executions. Off means zero row-level deletes. |
 
 `dry_run` suppresses only the *sweep*. Partition creation and the `DEFAULT`

@@ -87,6 +87,29 @@ async fn reset_to_unpartitioned(conn: &mut AsyncPgConnection) {
     partition::disable_partitioning(conn)
         .await
         .expect("revert to unpartitioned layout");
+    // A test that runs the SCRIPTED plan's phases directly (rather than
+    // through `enable_partitioning`) can leave these fixed-name objects
+    // behind on a table that never reached phase 4 — `disable_partitioning`
+    // above no-ops on an already-unpartitioned shard, so it never sees them.
+    // Dropped defensively so every test starts from a genuinely clean slate
+    // on a reused database, matching this helper's own documented purpose.
+    for stmt in [
+        format!(
+            "DROP INDEX IF EXISTS {}_pk_idx",
+            partition::LEGACY_PARTITION
+        ),
+        format!(
+            "DROP INDEX IF EXISTS {}_exec_event_idx",
+            partition::LEGACY_PARTITION
+        ),
+        format!(
+            "ALTER TABLE IF EXISTS harvest_events DROP CONSTRAINT IF EXISTS {}_cohort_ck",
+            partition::LEGACY_PARTITION
+        ),
+        format!("DROP TABLE IF EXISTS {}", partition::LEGACY_PARTITION),
+    ] {
+        diesel::sql_query(&stmt).execute(conn).await.ok();
+    }
     for stmt in [
         "DELETE FROM harvest_completion_deliveries",
         "DELETE FROM harvest_dead_letters",
@@ -376,6 +399,14 @@ async fn enabling_on_an_empty_table_creates_the_partitioned_layout() {
             cohort_width_secs: partition::DEFAULT_COHORT_WIDTH_SECS
         },
         "AC1: detect_layout must report the enabled cohort width"
+    );
+    // Issue #1270 item 8: `enable_sql` creates the lookahead window inside
+    // its own transaction; the report must say so rather than reading back
+    // as an empty, un-noticed-broken zero.
+    assert!(
+        report.partitions_created.len() >= partition::DEFAULT_LOOKAHEAD_COHORTS as usize,
+        "the report must name the cohorts enable_sql itself just created, got {:?}",
+        report.partitions_created
     );
 
     let parts = partition::list_partitions(&mut conn).await.expect("list");
@@ -1381,6 +1412,124 @@ async fn the_sweep_is_bounded_and_reports_what_it_dropped_and_blocked() {
     );
 }
 
+#[tokio::test]
+async fn the_sweep_is_bounded_by_attempts_not_just_by_drops() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Three closed, fully-reclaimable cohorts. `max_drops` alone would not
+    // stop the pass here — every one of them is droppable — but each still
+    // costs a gate evaluation, and `max_attempts` must bound THAT (issue
+    // #1270 item 1).
+    for days in [10_i64, 11, 12] {
+        let ts = Utc::now() - chrono::Duration::days(days);
+        partition::ensure_cohort(&mut conn, ts)
+            .await
+            .expect("materialize cohort");
+    }
+
+    let outcome = partition::sweep(
+        &mut conn,
+        Utc::now(),
+        &SweepOptions {
+            max_drops: 32,
+            max_attempts: 1,
+            ..SweepOptions::default()
+        },
+    )
+    .await
+    .expect("sweep");
+
+    assert_eq!(
+        outcome.dropped.len() + outcome.blocked.len(),
+        1,
+        "a budget of one attempt must evaluate exactly one partition against \
+         the drop gate, leaving the other two untouched this tick; got {outcome:?}"
+    );
+    assert!(
+        outcome.truncated,
+        "and the outcome must say the pass stopped before covering every \
+         partition, so an operator does not read an untruncated three-partition \
+         pass as 'nothing else needed dropping'; got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_straggler_delete_removes_orphan_rows_but_leaves_the_stragglers_own() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    let old = Utc::now() - chrono::Duration::days(10);
+
+    // A long-running execution whose row still exists — it pins the cohort,
+    // so the ordinary drop gate leaves the partition in place.
+    let straggler = insert_execution(&mut conn, "straggler_wf", "st-1", old, None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(straggler),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed straggler history");
+    backdate_events(&mut conn, straggler, old).await;
+
+    // An orphan: its rows landed in the SAME cohort, but its execution row
+    // has since been deleted directly — exactly what retention's candidate
+    // loop does on the partitioned layout, which has no ON DELETE CASCADE.
+    let orphan = seed_expired(&mut conn, "orphan_wf", "or-1", old).await;
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(orphan)
+        .execute(&mut conn)
+        .await
+        .expect("delete the orphan's execution row directly");
+
+    // Issue #1270 item 2: the straggler DELETE now runs under its own
+    // `statement_timeout` (via `straggler_delete_timeout`). This is the
+    // regression check that wrapping it in a timeout did not change what a
+    // normal-budget pass actually deletes.
+    let outcome = partition::sweep(
+        &mut conn,
+        Utc::now(),
+        &SweepOptions {
+            straggler_grace: Some(Duration::from_secs(0)),
+            ..SweepOptions::default()
+        },
+    )
+    .await
+    .expect("sweep, with the straggler delete bounded by its own statement_timeout");
+
+    assert!(
+        outcome.dropped.is_empty(),
+        "the straggler still owns rows in this cohort, so the partition \
+         itself must stay in place; got {outcome:?}"
+    );
+    assert_eq!(
+        outcome.straggler_rows_deleted, 3,
+        "the orphan's 3 events must be removed; got {outcome:?}"
+    );
+    assert_eq!(
+        scalar_i64(
+            &mut conn,
+            &format!(
+                "SELECT COUNT(*)::bigint AS n FROM harvest_events \
+                  WHERE workflow_exec_id = '{straggler}'"
+            )
+        )
+        .await,
+        3,
+        "and the straggler's OWN rows must survive the same pass"
+    );
+}
+
 // ══ Pure unit coverage for the cohort algebra ══════════════════════════════
 
 #[test]
@@ -1998,6 +2147,67 @@ async fn the_large_table_migration_plan_actually_runs() {
 }
 
 #[tokio::test]
+async fn phase_4_rejects_a_structurally_incompatible_impostor_index() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // A valid index already holds the name phase 2 would use for the
+    // partition-key index — but with the WRONG shape (not unique, missing
+    // `cohort`). `CREATE ... IF NOT EXISTS` in phase 2 finds the name taken
+    // and silently skips building a real one; the old name-only guard would
+    // have counted this impostor as ready.
+    //
+    // Dropped first: this test's own expected failure path never reaches
+    // the rename that would otherwise reclaim this name, so a prior FAILED
+    // run of this same test can leave it behind on a reused database.
+    diesel::sql_query("DROP INDEX IF EXISTS harvest_events_legacy_pk_idx")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query("CREATE INDEX harvest_events_legacy_pk_idx ON harvest_events (id)")
+        .execute(&mut conn)
+        .await
+        .expect("plant the impostor");
+
+    let mut hit_guard = false;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now()) {
+        if step.phase > 4 {
+            break;
+        }
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("phase 2 left"),
+                "issue #1270 item 11: phase 4 must reject the impostor with its own \
+                 explanatory error naming the cause, not fail some other way: {msg}"
+            );
+            hit_guard = true;
+            break;
+        }
+    }
+    assert!(
+        hit_guard,
+        "phase 4's shape guard must fire on the structurally incompatible impostor, \
+         rather than letting ATTACH PARTITION build a real replacement inside the \
+         window this phase advertises as metadata-only"
+    );
+    // The failing statement ran inside phase 4's explicit `BEGIN` (an
+    // earlier step in this same loop), so the transaction is left aborted —
+    // exactly the state phase 4's own runbook expects an operator to clear
+    // with a plain `ROLLBACK` before retrying.
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut conn)
+        .await
+        .expect("clear the aborted transaction, as the runbook instructs");
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "the guard must fire before anything observable is mutated"
+    );
+}
+
+#[tokio::test]
 async fn an_append_racing_the_execution_delete_cannot_commit_an_orphan() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
@@ -2150,6 +2360,37 @@ async fn a_cohort_proved_droppable_by_the_exact_scan_is_actually_dropped() {
         .await,
         6,
         "and the survivors are untouched"
+    );
+}
+
+#[tokio::test]
+async fn list_partitions_is_correct_regardless_of_the_sessions_date_style() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Issue #1270 item 15: `pg_get_expr` renders a partition bound's
+    // timestamp literals in the SESSION's `DateStyle`, which an operator can
+    // set globally (`ALTER DATABASE ... SET DateStyle`) or a pooler can
+    // inherit. The bound parser only accepts ISO year-first forms, so a
+    // non-ISO style must not make every bounded partition look unbounded.
+    diesel::sql_query("SET DateStyle = 'SQL, DMY'")
+        .execute(&mut conn)
+        .await
+        .expect("set a non-ISO DateStyle on this connection");
+
+    let partitions = partition::list_partitions(&mut conn)
+        .await
+        .expect("list partitions under a non-ISO DateStyle");
+
+    assert!(
+        partitions.iter().any(|p| !p.is_default && p.upper.is_some()),
+        "every cohort partition created by enable has a finite upper bound; a \
+         DateStyle-sensitive parser would read every one of them as unbounded \
+         instead. got {partitions:?}"
     );
 }
 
@@ -2719,6 +2960,83 @@ async fn the_online_phase_is_resumable_after_its_validation_fails() {
 }
 
 #[test]
+fn reverting_the_partitioning_migration_does_not_drop_the_drop_gate_index() {
+    // Issue #1270 item 13: up.sql never creates `idx_harvest_we_created_at`
+    // (see the note there) — only `harvest partition enable`/`plan` do, at
+    // conversion time. down.sql must not drop it either, or it deletes an
+    // unrelated pre-upgrade index of the same name on a deployment that
+    // created its own before upgrading. Rollback of an inert migration must
+    // stay inert. The name is still allowed to appear in a COMMENT
+    // explaining why it is not dropped here — only an actual DROP is
+    // disallowed.
+    let down = include_str!("../../migrations/20260901115500_harvest_event_partitioning/down.sql");
+    let statements: String = down
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !statements.contains("idx_harvest_we_created_at"),
+        "down.sql must not DROP an index it never created: {statements}"
+    );
+}
+
+#[tokio::test]
+async fn reverting_the_partitioning_migration_does_not_drop_an_operators_own_index() {
+    let (url, _c) = setup_db().await;
+
+    // An isolated schema, not the shared test database: down.sql genuinely
+    // drops the cohort column, function and trigger, and the rest of this
+    // file's tests depend on those surviving.
+    diesel::sql_query("DROP SCHEMA IF EXISTS harvest_1270_item13 CASCADE")
+        .execute(&mut connect(&url).await)
+        .await
+        .expect("reset");
+    diesel::sql_query("CREATE SCHEMA harvest_1270_item13")
+        .execute(&mut connect(&url).await)
+        .await
+        .expect("create schema");
+
+    let mut conn = connect(&url).await;
+    diesel::sql_query("SET search_path = harvest_1270_item13")
+        .execute(&mut conn)
+        .await
+        .expect("pin the session to the isolated schema");
+    diesel_async::SimpleAsyncConnection::batch_execute(
+        &mut conn,
+        autumn_harvest::full_migrations_sql(),
+    )
+    .await
+    .expect("migrate a fresh schema");
+
+    // An operator's own, ordinary index that happens to share this
+    // migration-created object's name — a perfectly reasonable index to
+    // have created on `harvest_workflow_executions (created_at)` before
+    // upgrading, and unrelated to issue #958.
+    diesel::sql_query(
+        "CREATE INDEX idx_harvest_we_created_at ON harvest_workflow_executions (created_at)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("plant the operator's own pre-existing index");
+
+    let down = include_str!("../../migrations/20260901115500_harvest_event_partitioning/down.sql");
+    diesel_async::SimpleAsyncConnection::batch_execute(&mut conn, down)
+        .await
+        .expect("revert the partitioning migration");
+
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT to_regclass('idx_harvest_we_created_at') IS NOT NULL AS v",
+        )
+        .await,
+        "reverting an inert migration must be inert — it must not delete an \
+         unrelated pre-upgrade index this migration never created"
+    );
+}
+
+#[test]
 fn the_inert_migration_builds_no_index_on_the_executions_table() {
     // The migration is documented as inert on apply: a deployment that never
     // opts in keeps its ordinary table and its behaviour. A plain
@@ -2819,12 +3137,16 @@ async fn maintenance_says_what_is_wrong_when_the_runtime_role_cannot_own_partiti
     .await;
     let msg = match err {
         Err(e) => e.to_string(),
-        Ok(outcome) => outcome.last_error.clone().unwrap_or_else(|| {
-            panic!(
-                "maintenance cannot succeed as a role that does not own harvest_events \
-                 — every partition operation is DDL requiring ownership. It reported {outcome:?}"
-            )
-        }),
+        Ok(outcome) => {
+            let outcome = outcome.expect("harvest_events is partitioned in this test");
+            outcome.last_error.clone().unwrap_or_else(|| {
+                panic!(
+                    "maintenance cannot succeed as a role that does not own \
+                     harvest_events — every partition operation is DDL requiring \
+                     ownership. It reported {outcome:?}"
+                )
+            })
+        }
     };
     assert!(
         msg.contains("harvest_rt_maint_958") || msg.contains("own"),
@@ -2852,7 +3174,8 @@ async fn maintenance_says_what_is_wrong_when_the_runtime_role_cannot_own_partiti
         &SweepOptions::default(),
     )
     .await
-    .expect("maintenance must work once the runtime role owns the table");
+    .expect("maintenance must work once the runtime role owns the table")
+    .expect("harvest_events is partitioned in this test");
     assert_eq!(
         outcome.last_error, None,
         "and it must report clean: {outcome:?}"
@@ -3208,6 +3531,388 @@ async fn extending_the_write_window_never_queues_appends_indefinitely() {
 
     // Blocked, not an error: the cohort is retried next tick.
     ensurer.await.expect("ensure task").ok();
+}
+
+#[tokio::test]
+async fn a_partly_blocked_lookahead_catchup_reports_which_cohort_is_uncovered() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Issue #1270 item 4: `ensure_partitions` is deliberately resilient per
+    // cohort — one failing creation must not stop the rest of the window —
+    // but a caller that only reads `created` cannot tell a fully-covered
+    // pass from one with a hole in it. Force exactly one cohort to fail by
+    // planting an unrelated relation under the name it would need: `CREATE
+    // TABLE IF NOT EXISTS ... PARTITION OF` treats that name as already
+    // taken and no-ops, so the post-create attach check fails.
+    let width = partition::DEFAULT_COHORT_WIDTH_SECS;
+    let now = Utc::now();
+    let blocked_start = partition::cohort_start(now + chrono::Duration::seconds(width * 5), width);
+    let colliding_name = partition::partition_name(blocked_start);
+    diesel::sql_query(format!("CREATE TABLE {colliding_name} (id bigint)"))
+        .execute(&mut conn)
+        .await
+        .expect("plant a colliding, unrelated relation");
+
+    let ensured = partition::ensure_partitions(&mut conn, now, 6, Duration::from_secs(2))
+        .await
+        .expect("the rest of the window must still be created despite one collision");
+
+    assert!(
+        ensured.blocked.contains(&blocked_start.to_rfc3339()),
+        "the colliding cohort must be reported blocked, not silently dropped from a \
+         report that otherwise looks clean; got {ensured:?}"
+    );
+    assert!(
+        !ensured.created.is_empty(),
+        "cohorts other than the colliding one must still be created; got {ensured:?}"
+    );
+
+    diesel::sql_query(format!("DROP TABLE IF EXISTS {colliding_name}"))
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn maintain_on_an_unpartitioned_shard_reports_no_maintenance() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // Issue #1270 item 6: `RetentionTickResult.partition_maintenance` is
+    // documented `None` on a shard that never opted in. `maintain` is the
+    // single source of truth for that distinction, so it must say so
+    // directly — not return a near-empty outcome a caller has to guess
+    // apart from a genuinely idle, opted-in shard.
+    let outcome = partition::maintain(
+        &mut conn,
+        Utc::now(),
+        partition::DEFAULT_LOOKAHEAD_COHORTS,
+        &SweepOptions::default(),
+    )
+    .await
+    .expect("maintain is a no-op, not a failure, on an unpartitioned shard");
+
+    assert!(
+        outcome.is_none(),
+        "an unpartitioned shard must report no maintenance at all; got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn partition_maintenance_runs_at_startup_not_only_after_the_first_tick() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Issue #1270 item 5: a shard that restarted after being offline longer
+    // than its lookahead window must not wait a full `tick_interval` for its
+    // first coverage check. `tick_interval` here is far longer than this
+    // test's own patience, and `run_now()` is never called, so only a
+    // startup pass inside `spawn` itself can produce a result before the
+    // assertion loop gives up.
+    let mut config = RetentionConfig::with_max_age(Duration::from_secs(86_400));
+    config.tick_interval_secs = 3600;
+
+    let pool = build_pool(&url);
+    let pools = ShardedDbPool::single(pool);
+    let runtime = RetentionRuntime::spawn(pools, config, Arc::new(NoopMetrics), None, None)
+        .expect("retention runtime should spawn when enabled");
+
+    let mut saw_maintenance = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snap = runtime.monitor().snapshot();
+        if snap
+            .per_shard
+            .iter()
+            .any(|r| r.shard == 0 && r.partition_maintenance.is_some())
+        {
+            saw_maintenance = true;
+            break;
+        }
+    }
+    runtime.shutdown();
+
+    assert!(
+        saw_maintenance,
+        "partition maintenance must run at startup, before the first \
+         tick_interval sleep elapses — an hour, at this config"
+    );
+}
+
+#[tokio::test]
+async fn enable_survives_two_indexes_colliding_at_the_identifier_limit() {
+    #[derive(diesel::QueryableByName)]
+    struct IndexNameRow {
+        #[diesel(sql_type = Text)]
+        v: String,
+    }
+
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // Issue #1270 item 9: Postgres truncates identifiers at 63 bytes, so
+    // appending a fixed suffix to a name already at the limit renames it to
+    // ITSELF. Two names that agree on their first `63 - len(suffix)` bytes
+    // then collide on the SECOND rename. `enable_sql`'s own suffix is
+    // `__pre958` (8 bytes), so two 63-byte names sharing their first 55
+    // bytes reproduce it exactly.
+    // A row, so the conversion takes the ATTACH-LEGACY path — the one that
+    // actually renames the existing indexes rather than dropping the table
+    // outright, which is what an EMPTY table's fresh-create path does.
+    let exec = insert_execution(&mut conn, "collide_wf", "collide-1", day(2026, 2, 3), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    let base = "a".repeat(55);
+    let name_a = format!("{base}AAAAAAAA");
+    let name_b = format!("{base}BBBBBBBB");
+    assert_eq!(name_a.len(), 63);
+    assert_eq!(name_b.len(), 63);
+    // Dropped first: a successful run of this test carries these two
+    // indexes onto the new parent by name (the engine's own "replay every
+    // captured index definition" behaviour — intentional, and exercised by
+    // other tests), so on a reused database a prior run of this same test
+    // leaves them behind under their original bare names.
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {name_a}"))
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query(format!("DROP INDEX IF EXISTS {name_b}"))
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query(format!(
+        "CREATE INDEX {name_a} ON harvest_events (workflow_exec_id)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("plant the first 63-byte index name");
+    diesel::sql_query(format!("CREATE INDEX {name_b} ON harvest_events (event_id)"))
+        .execute(&mut conn)
+        .await
+        .expect("plant the second 63-byte index name");
+
+    let report = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect(
+            "a naive rename would have renamed the first index to ITSELF and then \
+             collided renaming the second — this must succeed",
+        );
+    assert!(
+        matches!(report.mode, EnableMode::AttachLegacy { .. }),
+        "precondition: a populated table must take the path that renames the \
+         indexes rather than dropping them, got {:?}",
+        report.mode
+    );
+
+    // The legacy partition carries forward every pre-existing index on
+    // `harvest_events` renamed with the `__pre958` suffix, not just the two
+    // planted here — so this checks for the two EXPECTED renamed forms
+    // specifically, not the total count.
+    let names: Vec<String> = diesel::sql_query(format!(
+        "SELECT indexname AS v FROM pg_indexes \
+          WHERE schemaname = current_schema() AND tablename = '{}' \
+          ORDER BY indexname",
+        partition::LEGACY_PARTITION
+    ))
+    .load::<IndexNameRow>(&mut conn)
+    .await
+    .expect("list the legacy partition's indexes")
+    .into_iter()
+    .map(|r| r.v)
+    .collect();
+    // Matched on a SHORT prefix of `base`, not the full 55 bytes: the
+    // disambiguated survivor is truncated further still, to make room for
+    // its own `_N` suffix, and this does not hardcode exactly how much room
+    // that leaves. Short enough that neither truncation can have eaten past
+    // it; long enough that no OTHER (pre-existing, unrelated) renamed index
+    // could share it by chance.
+    let short_prefix = &base[..40];
+    let survivors: Vec<&String> = names.iter().filter(|n| n.starts_with(short_prefix)).collect();
+    assert_eq!(
+        survivors.len(),
+        2,
+        "both indexes must survive the rename, under two names sharing the \
+         colliding prefix: {names:?}"
+    );
+    assert_ne!(
+        survivors[0], survivors[1],
+        "a collision would have aborted the whole conversion before either index \
+         could keep a distinct name"
+    );
+    assert!(
+        survivors.iter().all(|n| n.contains("__pre958")),
+        "both must carry the rename suffix — the one truncated furthest to make \
+         room for a disambiguator included: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn enable_refuses_a_unique_index_without_cohort() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // Perfectly valid on the flat layout; Postgres will not allow it to be
+    // replayed verbatim onto a partitioned parent, since it omits the
+    // partition key.
+    diesel::sql_query(
+        "CREATE UNIQUE INDEX harvest_events_wf_only_uq ON harvest_events (workflow_exec_id)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("plant a unique index missing the partition key");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "issue #1270 item 10: must refuse with a clear explanation, not a raw \
+             Postgres error from mid-conversion",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_wf_only_uq") && msg.contains("cohort"),
+        "the message must name the offending index and explain what is missing: {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "refusing before mutating: the table must still be the ordinary, unpartitioned one"
+    );
+
+    diesel::sql_query("DROP INDEX harvest_events_wf_only_uq")
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn enable_refuses_a_dependent_view() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query("DROP VIEW IF EXISTS harvest_events_by_wf")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query(
+        "CREATE VIEW harvest_events_by_wf AS SELECT workflow_exec_id FROM harvest_events",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("plant a dependent view");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err("issue #1270 item 14: must refuse rather than silently freeze the view");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_by_wf"),
+        "the message must name the dependent view: {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "refusing before mutating"
+    );
+
+    diesel::sql_query("DROP VIEW harvest_events_by_wf")
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn enable_refuses_a_user_defined_trigger() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query(
+        "CREATE OR REPLACE FUNCTION harvest_1270_noop_trg() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("create trigger function");
+    diesel::sql_query(
+        "CREATE TRIGGER harvest_1270_audit_trg BEFORE INSERT ON harvest_events \
+         FOR EACH ROW EXECUTE FUNCTION harvest_1270_noop_trg()",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("plant an operator trigger");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err("issue #1270 item 16: must refuse rather than silently drop the trigger");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_1270_audit_trg"),
+        "the message must name the trigger: {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "refusing before mutating"
+    );
+
+    diesel::sql_query("DROP TRIGGER harvest_1270_audit_trg ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn disable_refuses_a_dependent_view() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    diesel::sql_query("DROP VIEW IF EXISTS harvest_events_by_wf")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query(
+        "CREATE VIEW harvest_events_by_wf AS SELECT workflow_exec_id FROM harvest_events",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("plant a dependent view on the partitioned parent");
+
+    let err = partition::disable_partitioning(&mut conn)
+        .await
+        .expect_err("must refuse rather than silently freeze the view");
+    assert!(
+        err.to_string().contains("harvest_events_by_wf"),
+        "the message must name the dependent view: {err}"
+    );
+
+    diesel::sql_query("DROP VIEW harvest_events_by_wf")
+        .execute(&mut conn)
+        .await
+        .ok();
 }
 
 #[tokio::test]

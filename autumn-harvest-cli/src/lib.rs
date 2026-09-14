@@ -278,6 +278,17 @@ pub enum PartitionCommand {
         /// How many cohorts ahead of "now" the engine keeps pre-created.
         #[arg(long, value_name = "N", default_value_t = autumn_harvest::partition::DEFAULT_LOOKAHEAD_COHORTS)]
         lookahead_cohorts: u32,
+
+        /// Omit phase 1's logical-replication publication guard.
+        ///
+        /// `enable` honours this override; the plan did not (issue #1270 item
+        /// 7), leaving an operator who has already brought the subscriber
+        /// onto the partitioned layout — the supported path for a large
+        /// deployment — no way to proceed except hand-editing the generated
+        /// SQL. Set this only when the subscriber runs the partitioned
+        /// layout too, or the publication is not feeding a Harvest standby.
+        #[arg(long = "allow-incompatible-publications")]
+        allow_incompatible_publications: bool,
     },
 
     /// **Convert this shard to the partitioned layout.**
@@ -5978,10 +5989,12 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
         PartitionCommand::Plan {
             cohort_width_secs,
             lookahead_cohorts,
+            allow_incompatible_publications,
         } => {
             let opts = autumn_harvest::partition::EnableOptions {
                 cohort_width_secs: *cohort_width_secs,
                 lookahead_cohorts: *lookahead_cohorts,
+                allow_incompatible_publications: *allow_incompatible_publications,
                 ..autumn_harvest::partition::EnableOptions::default()
             };
             opts.validate()
@@ -6168,18 +6181,23 @@ async fn run_partition_maintain(
         )
         .await
         {
-            Ok(outcome) => {
+            Ok(Some(outcome)) => {
                 // A pass that ran but did not COMPLETE — a `drain_default` that
-                // lost its bounded lock attempt, say — comes back as `Ok` with
-                // `last_error` set, because maintenance is best-effort and must
-                // never fail a retention tick. The CLI is not a retention tick.
-                // Without this, `harvest partition maintain` would print an
-                // ordinary zero-drain report and exit 0 while the DEFAULT
-                // partition stayed undrained, and scheduled operator automation
-                // would never notice.
+                // lost its bounded lock attempt, or a cohort creation left
+                // blocked, say — comes back with `last_error` set, because
+                // maintenance is best-effort and must never fail a retention
+                // tick. The CLI is not a retention tick. Without this,
+                // `harvest partition maintain` would print an ordinary
+                // zero-drain report and exit 0 while the DEFAULT partition
+                // stayed undrained, and scheduled operator automation would
+                // never notice.
                 row.error.clone_from(&outcome.last_error);
                 row.maintenance = Some(outcome);
             }
+            // Detected unpartitioned: nothing ran, nothing to report — a
+            // deployment that has not opted in exits 0 with no maintenance
+            // row rather than a misleading empty one.
+            Ok(None) => {}
             Err(e) => row.error = Some(e.to_string()),
         }
         out.push(row);
@@ -6228,6 +6246,10 @@ async fn run_partition_disable(shards: &[String], format: DrFormat) -> Result<()
 /// The nonzero exit is the point: `harvest partition enable --shard a --shard b`
 /// that converted `a` and failed on `b` has left a half-converted cluster, and a
 /// zero exit would let a deployment script move on as though it had not.
+// One dispatch-and-print function covering every partition subcommand's
+// report shape. Splitting it would scatter one report's fields across
+// helpers that only ever concatenate print statements.
+#[allow(clippy::too_many_lines)]
 fn emit_partition_report(
     rows: &[PartitionShardReport],
     format: DrFormat,
@@ -6299,6 +6321,12 @@ fn emit_partition_report(
                     // something to explain.
                     for b in &m.sweep.blocked {
                         println!("  blocked: {b}");
+                    }
+                    // The answer to "which range is uncovered?" (issue #1270
+                    // item 4) — the write window has a gap here until a later
+                    // pass succeeds.
+                    for c in &m.uncovered_cohorts {
+                        println!("  uncovered cohort: {c}");
                     }
                 }
                 if let Some(sweep) = &r.would_sweep {
