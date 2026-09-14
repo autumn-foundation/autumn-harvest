@@ -11,9 +11,13 @@
 //! Modern browsers send `Sec-Fetch-Site` on every request. Only
 //! `same-origin` passes; `cross-site`, `same-site`, and `none` do not, since
 //! any of them can carry a forged form submission. A browser that omits
-//! `Sec-Fetch-Site` falls back to the `Origin` header, compared against the
-//! request's own `Host`. A request with neither header is rejected — it is
-//! never admitted by default.
+//! `Sec-Fetch-Site` falls back to the `Origin` header instead. That is
+//! compared against the request's own host, and against its scheme when a
+//! trusted reverse proxy reports one. `X-Forwarded-Host` and
+//! `X-Forwarded-Proto` take precedence over `Host` and a bare request's own
+//! scheme, respectively. A request with neither `Sec-Fetch-Site` nor
+//! `Origin` is rejected — it is never admitted by
+//! default.
 //!
 //! # Exemptions
 //!
@@ -105,14 +109,22 @@ fn is_same_origin(headers: &HeaderMap) -> bool {
             .is_ok_and(|s| s.eq_ignore_ascii_case("same-origin"));
     }
 
-    let (Some(origin), Some(host)) = (headers.get(header::ORIGIN), headers.get(header::HOST))
-    else {
+    let Some(origin) = headers.get(header::ORIGIN) else {
         return false;
     };
-    let (Ok(origin), Ok(host)) = (origin.to_str(), host.to_str()) else {
+    let Ok(origin) = origin.to_str() else {
         return false;
     };
     let Some((origin_scheme, origin_authority)) = split_origin(origin) else {
+        return false;
+    };
+    // A reverse proxy in front of this server rewrites `Host` to its own
+    // upstream authority and forwards the browser's public host via
+    // `X-Forwarded-Host`. Prefer that when present, falling back to `Host`
+    // otherwise — the same precedence autumn-web's own method-override
+    // same-origin check uses.
+    let Some(host) = forwarded_host(headers).or_else(|| headers.get(header::HOST)?.to_str().ok())
+    else {
         return false;
     };
     if !origin_authority.eq_ignore_ascii_case(host) {
@@ -124,6 +136,15 @@ fn is_same_origin(headers: &HeaderMap) -> bool {
     // autumn-web's own method-override same-origin check documents and
     // accepts.
     forwarded_scheme(headers).is_none_or(|expected| origin_scheme.eq_ignore_ascii_case(expected))
+}
+
+/// The public host a trusted reverse proxy reports via `X-Forwarded-Host`,
+/// or `None` when the header is absent. Takes the leftmost value of a
+/// comma-separated proxy chain, matching `X-Forwarded-For` convention.
+fn forwarded_host(headers: &HeaderMap) -> Option<&str> {
+    let raw = headers.get("x-forwarded-host")?.to_str().ok()?;
+    let host = raw.split(',').next().unwrap_or(raw).trim();
+    (!host.is_empty()).then_some(host)
 }
 
 /// Split an `Origin` header value into its scheme and authority
@@ -279,6 +300,41 @@ mod tests {
         ])
         .await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn forwarded_host_is_preferred_over_a_rewritten_host() {
+        // A reverse proxy can rewrite `Host` to its own internal upstream
+        // authority while still forwarding the browser's public host.
+        let status = post_with_headers(&[
+            ("origin", "https://dashboard.example"),
+            ("host", "harvest-upstream:3000"),
+            ("x-forwarded-host", "dashboard.example"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn forwarded_host_takes_the_leftmost_value_of_a_chain() {
+        let status = post_with_headers(&[
+            ("origin", "https://dashboard.example"),
+            ("host", "harvest-upstream:3000"),
+            ("x-forwarded-host", "dashboard.example, edge.internal"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mismatched_forwarded_host_is_rejected() {
+        let status = post_with_headers(&[
+            ("origin", "https://attacker.example"),
+            ("host", "harvest-upstream:3000"),
+            ("x-forwarded-host", "dashboard.example"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
