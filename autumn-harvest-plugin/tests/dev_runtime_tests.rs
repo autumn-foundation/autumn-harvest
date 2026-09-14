@@ -1652,6 +1652,15 @@ async fn starting_with_split_mode_from_autumn_toml_is_refused() {
     .expect("autumn.toml should be written");
     let _mode = EnvVarGuard::unset("AUTUMN_HARVEST__MODE");
     let _url = EnvVarGuard::unset("AUTUMN_HARVEST_DATABASE__URL");
+    // Unset, not just the manifest dir (Codex review, issue #1291).
+    //
+    // An inherited profile selector would resolve an ambient
+    // `autumn-<profile>.toml`. This temp dir holds no such file, so
+    // `find_config_file_named` falls back to the checkout for it. That
+    // file could override this test's root `autumn.toml` back to
+    // `embedded`.
+    let _profile = EnvVarGuard::unset("AUTUMN_PROFILE");
+    let _is_debug = EnvVarGuard::unset("AUTUMN_IS_DEBUG");
     let _manifest = EnvVarGuard::set("AUTUMN_MANIFEST_DIR", dir.path());
 
     let result = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
