@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use autumn_harvest::models::NewHarvestEvent;
 use autumn_harvest::payload_codec::{
     CodecError, PayloadCodec, PayloadCodecs, UNDECODABLE_MARKER_KEY,
     UNDECODABLE_REASON_UNKNOWN_CODEC,
@@ -359,9 +360,32 @@ async fn append_events(
     // Raw load: the seeded history may already carry non-identity envelopes,
     // which the strict identity-only `load_history` would refuse to load.
     let history = store::load_history_undecoded(conn, exec_id).await.unwrap();
-    store::append_events(conn, exec_id, events, history.next_event_id)
+    // Raw insert, not `store::append_events`: these fixtures hand-build an
+    // already-enveloped payload field (`envelope_for` et al.) to reproduce a
+    // codec deployment's on-disk shape (module doc above). `append_events`
+    // runs every field through the identity codec's `encode_payload`, which
+    // now escapes anything already shaped like an envelope by nesting it
+    // (issue #1253) — a second pass here would corrupt the fixture's
+    // hand-built shape instead of storing it verbatim.
+    let rows: Vec<NewHarvestEvent> = events
+        .iter()
+        .enumerate()
+        .map(|(i, event)| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let event_id = history.next_event_id + i as i32;
+            NewHarvestEvent {
+                workflow_exec_id: exec_id.as_uuid(),
+                event_id,
+                event_type: event.type_name(),
+                event_data: serde_json::to_value(event).expect("serialize seed event"),
+            }
+        })
+        .collect();
+    diesel::insert_into(harvest_events::table)
+        .values(&rows)
+        .execute(conn)
         .await
-        .expect("append events");
+        .expect("insert seed events");
 }
 
 /// Seeds a pending activity task-queue row (the row backing the `/stack`
