@@ -56,9 +56,15 @@ none are evidenced.
 **Tier 1 (behavioral record) — swept, not found.** Two searches, both
 reproducible:
 
-1. GitHub's issue/PR search for terms covering non-Rust integration pain,
-   hand-written clients, and SDK requests matched **0** issues or PRs beyond
-   #955 itself.
+1. GitHub semantic issue/PR search, literal query: `non-Rust caller
+   hand-written HTTP client raw HTTP TypeScript Python integration
+   management API workaround`, scoped to
+   `autumn-foundation/autumn-harvest`, no state filter (so both open and
+   closed issues and PRs are in scope), default ranking, first 20 results
+   requested. Matched **0** issues or PRs beyond #955 itself — this tool
+   ranks by semantic relevance rather than exact substring matching, so it
+   would surface a loosely-worded complaint too, not only an exact phrase
+   match.
 2. `git grep -c curl -- ':!docs/opportunities/*'` (the exhaustive form — an
    initial pass used GitHub's hosted code search, which returned only 40 of
    the corpus's actual matches and undercounted; git grep is the
@@ -72,12 +78,11 @@ reproducible:
    comment) — classified by file path and spot-checked by content; none is
    a user-authored workaround, complaint, or support artifact.
 
-Search terms covering non-Rust integration pain, hand-written clients, and
-SDK requests matched **0** issues beyond #955 itself. This repository is the
-engine's own issue tracker, not a support desk or sales-call archive — a `0`
-here is *absence of evidence in the only corpus available to this process*,
-not proof of absence; see the ledger's methodology note. It is nonetheless
-the totality of what this run could check, and it found nothing.
+This repository is the engine's own issue tracker, not a support desk or
+sales-call archive — a `0` here is *absence of evidence in the only corpus
+available to this process*, not proof of absence; see the ledger's
+methodology note. It is nonetheless the totality of what this run could
+check, and it found nothing.
 
 **Tier 2 (market record) — not gathered.** No switcher-to-Harvest interview
 exists citing SDK availability as a reason for adopting or rejecting
@@ -175,9 +180,18 @@ codegen and abandoned or struggled with it over a specifically named gap
 this spec lists (long-poll result waiting, typed error branching,
 idempotency-key handling, signal-with-start/update-with-start semantics).
 
-**Line — kill:** fewer than 2 such reports in the 60-day window despite live
-linkage from `README.md` and `docs/management-api.md` (i.e., real
-visibility, not a buried page).
+**Line — kill:** fewer than 2 such reports in the 60-day window, **and** a
+minimum-exposure floor is separately met: the Discussion thread reaches at
+least 200 unique views (GitHub exposes a view counter to maintainers on
+Discussions) or at least 20 total reactions/participants across the
+thread, on top of live linkage from `README.md` and
+`docs/management-api.md`. Two links existing establishes availability, not
+that the target segment actually saw them — a reply count alone cannot
+tell "no demand" apart from "no exposure." If the 60-day window closes
+without clearing the exposure floor, the result is **inconclusive**, not a
+kill: re-run with wider distribution (e.g., a mention from the roadmap
+issue #968, or direct outreach to any known embedding teams) before
+scoring silence as evidence.
 
 **If it later ships anyway** (build criteria, for whoever runs this probe
 and clears the line): npm/PyPI download counts cannot answer "how many
