@@ -3355,6 +3355,81 @@ async fn scalar_bool(conn: &mut AsyncPgConnection, sql: &str) -> HarvestResult<b
         .v)
 }
 
+/// Foreign keys on OTHER tables that reference `harvest_events` or one of
+/// its leaf partitions.
+///
+/// **Why this blocks the revert.** Every constraint guard elsewhere in this
+/// module filters `pg_constraint.conrelid` -- constraints defined ON
+/// `harvest_events` itself. An inbound foreign key is the mirror image: it
+/// is defined on some OTHER table, with `confrelid` naming `harvest_events`
+/// as what it references. None of those guards see it.
+///
+/// Review finding: `disable_partitioning` renames the partitioned parent
+/// aside, rebuilds a flat `harvest_events` with `CREATE TABLE ... (LIKE
+/// ...)`, then runs `DROP TABLE ... CASCADE` on the renamed original. An
+/// inbound foreign key still points at that original relation by OID, so
+/// `CASCADE` drops it as a dependent object right along with the table.
+/// The rebuilt flat table is a brand new relation. Nothing recreates the
+/// foreign key against it. The operator's referential-integrity check is
+/// gone, silently, with no replacement. This is exactly the failure mode
+/// [`dependent_views`] exists to catch for a view's dependency, but for a
+/// constraint instead.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] if the catalog query fails.
+#[cfg(feature = "db")]
+pub async fn inbound_foreign_keys(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
+    let rows = diesel::sql_query(
+        "SELECT DISTINCT (c_ns.nspname || '.' || con.conname) AS v
+           FROM pg_constraint con
+           JOIN pg_class c ON c.oid = con.conrelid
+           JOIN pg_namespace c_ns ON c_ns.oid = c.relnamespace
+           JOIN pg_class t ON t.oid = con.confrelid
+           JOIN pg_namespace t_ns ON t_ns.oid = t.relnamespace
+          WHERE con.contype = 'f'
+            AND t_ns.nspname = current_schema()
+            AND (
+                t.relname = 'harvest_events'
+                OR t.oid IN (
+                    SELECT i.inhrelid
+                      FROM pg_inherits i
+                      JOIN pg_class parent ON parent.oid = i.inhparent
+                      JOIN pg_namespace pn ON pn.oid = parent.relnamespace
+                     WHERE parent.relname = 'harvest_events' AND pn.nspname = current_schema()
+                )
+            )
+          ORDER BY 1",
+    )
+    .load::<TextRow>(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows.into_iter().map(|r| r.v).collect())
+}
+
+/// The refusal `disable_partitioning` raises over an inbound foreign key.
+#[cfg(feature = "db")]
+async fn refuse_if_inbound_foreign_keys(conn: &mut AsyncPgConnection) -> HarvestResult<()> {
+    let fks = inbound_foreign_keys(conn).await?;
+    if fks.is_empty() {
+        return Ok(());
+    }
+    Err(HarvestError::Config(format!(
+        "refusing to revert harvest_events: {} it from another table ({}). \
+         Reverting renames the partitioned parent aside, rebuilds a flat harvest_events \
+         table, then drops the renamed original with CASCADE -- which silently removes \
+         a foreign key still pointing at that original relation, with no replacement \
+         created against the rebuilt table. Drop the foreign key (and recreate it against \
+         harvest_events afterward) to proceed.",
+        if fks.len() == 1 {
+            "a foreign key references"
+        } else {
+            "foreign keys reference"
+        },
+        fks.join(", ")
+    )))
+}
+
 // ── Disabling the layout ───────────────────────────────────────────────────
 
 /// Revert this shard to the ordinary unpartitioned table.
@@ -3405,6 +3480,13 @@ pub async fn disable_partitioning(
     // It is excluded from `capture_index_defs` unconditionally all the
     // same, and nothing else replays it.
     refuse_if_constraint_backed_unique_index_on_revert(conn).await?;
+    // Review finding: every constraint guard above filters `conrelid` --
+    // constraints defined ON harvest_events. An inbound foreign key from
+    // another table is the mirror image, invisible to all of them. The
+    // `DROP TABLE ... CASCADE` below would silently take it out, along
+    // with the renamed original relation it still points at. No
+    // replacement is ever created against the rebuilt flat table.
+    refuse_if_inbound_foreign_keys(conn).await?;
     let report = Box::pin(
         conn.transaction::<DisableReport, HarvestError, _>(async |conn| {
             // Review finding: the dependent-view and operator-trigger checks
@@ -3509,6 +3591,25 @@ pub async fn disable_partitioning(
                         "it carries unique indexes"
                     },
                     bad_unique.join(", ")
+                )));
+            }
+            // Same reason again: an inbound foreign key from another
+            // table, added in that identical gap, is invisible to every
+            // `conrelid`-filtered guard above. It would be silently
+            // dropped by the `CASCADE` below.
+            let inbound_fks = inbound_foreign_keys(conn).await?;
+            if !inbound_fks.is_empty() {
+                return Err(HarvestError::Config(format!(
+                    "refusing to revert harvest_events: {} it from another table ({}), \
+                     added after the preflight check ran but before this transaction's \
+                     ACCESS EXCLUSIVE lock. Drop the foreign key (and recreate it against \
+                     harvest_events afterward), then re-run.",
+                    if inbound_fks.len() == 1 {
+                        "a foreign key references"
+                    } else {
+                        "foreign keys reference"
+                    },
+                    inbound_fks.join(", ")
                 )));
             }
 
@@ -5209,6 +5310,16 @@ impl MaintenanceOutcome {
 /// present. The same textual check works everywhere, then: it can never
 /// appear in the reconstructed definition on a version that has no way
 /// to create it.
+///
+/// Review finding: also checks `indcollation` for each key column. An
+/// operator's own index under one of the reserved names can match every
+/// other check here, including column position and sort order. It can
+/// still carry a non-default collation on a text-like column. `ATTACH
+/// PARTITION` requires a leaf index to match the parent's collation per
+/// column, so that impostor is unattachable too. This assertion would
+/// otherwise count phase 2 complete over it. Phase 4 would then build an
+/// unplanned replacement under `ACCESS EXCLUSIVE` -- the unbounded
+/// rebuild the online plan exists to avoid.
 #[must_use]
 fn index_shape_check_sql(index_name: &str, columns: &[&str]) -> String {
     let col_checks: String = columns
@@ -5218,7 +5329,9 @@ fn index_shape_check_sql(index_name: &str, columns: &[&str]) -> String {
             format!(
                 "i.indkey[{pos}] = (SELECT a.attnum FROM pg_attribute a \
                  WHERE a.attrelid = 'harvest_events'::regclass AND a.attname = '{col}') \
-                 AND i.indoption[{pos}] = 0"
+                 AND i.indoption[{pos}] = 0 \
+                 AND i.indcollation[{pos}] = (SELECT a.attcollation FROM pg_attribute a \
+                 WHERE a.attrelid = 'harvest_events'::regclass AND a.attname = '{col}')"
             )
         })
         .collect::<Vec<_>>()

@@ -3400,6 +3400,62 @@ async fn an_unreplayable_constraint_refuses_the_revert_too() {
 }
 
 #[tokio::test]
+async fn an_inbound_foreign_key_from_another_table_still_refuses_the_revert() {
+    // Review finding: every constraint guard in this module filters
+    // `pg_constraint.conrelid` -- constraints defined ON harvest_events.
+    // An inbound foreign key from another table is the mirror image:
+    // `confrelid` names harvest_events as what IT references, so none of
+    // those guards see it. `disable_partitioning` renames the
+    // partitioned parent aside, rebuilds a flat harvest_events, then
+    // runs `DROP TABLE ... CASCADE` on the renamed original. The inbound
+    // foreign key still points at that original relation by OID. CASCADE
+    // drops it right along with the table, silently, with no
+    // replacement ever created against the rebuilt flat table.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    diesel::sql_query("DROP TABLE IF EXISTS harvest_events_inbound_fk_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray table from a previous run");
+    diesel::sql_query(
+        "CREATE TABLE harvest_events_inbound_fk_958 (\
+         id serial PRIMARY KEY, \
+         workflow_exec_id uuid NOT NULL, \
+         event_id int NOT NULL, \
+         cohort timestamptz NOT NULL, \
+         FOREIGN KEY (workflow_exec_id, event_id, cohort) \
+         REFERENCES harvest_events (workflow_exec_id, event_id, cohort))",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an operator table with an inbound foreign key to the partitioned parent");
+
+    let err = partition::disable_partitioning(&mut conn).await.expect_err(
+        "an inbound foreign key must refuse the revert, not be silently dropped by CASCADE",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_inbound_fk_958"),
+        "the refusal must name the table (or constraint) the foreign key belongs to: {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "p",
+        "a refused revert must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP TABLE harvest_events_inbound_fk_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the operator table so a later reset_to_unpartitioned can proceed");
+}
+
+#[tokio::test]
 async fn an_impostor_cohort_check_on_the_legacy_partition_with_a_mismatched_cutoff_still_refuses() {
     // Review finding: `unreplayable_constraints`'s cohort-`CHECK`
     // exemption used to accept any same-shaped bound on
