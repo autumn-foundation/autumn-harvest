@@ -1594,7 +1594,6 @@ async fn refuse_if_unique_index_without_cohort(
 pub async fn constraint_backed_unique_indexes_on_partitioned_parent(
     conn: &mut AsyncPgConnection,
 ) -> HarvestResult<Vec<String>> {
-    let suffix_len = LEGACY_RENAME_SUFFIX.len();
     let rows = diesel::sql_query(format!(
         "SELECT DISTINCT i.indexrelid::regclass::text AS v
            FROM pg_index i
@@ -1689,38 +1688,58 @@ pub async fn constraint_backed_unique_indexes_on_partitioned_parent(
                 )
             )
             AND NOT (
-                -- A plain leaf index whose name still carries the rename
-                -- suffix is the residual of the rename-to-free-a-name step
-                -- above. `enable` renames every index still on the legacy
-                -- partition, indiscriminately -- not only harvest's own two
-                -- -- so it also catches every plain index an operator had
-                -- directly on the flat table before conversion. That
-                -- index's definition was captured and replayed onto the
-                -- new parent under its ORIGINAL, unsuffixed name before
-                -- the rename ran. An index by that same name and shape
-                -- already exists there. This one is its safely-superseded
-                -- old copy, not something independently added on the leaf.
+                -- A plain leaf index whose SHAPE already exists on the
+                -- parent is the residual of the rename-to-free-a-name
+                -- step above. `enable` renames every index still on the
+                -- legacy partition, indiscriminately -- not only
+                -- harvest's own two -- so it also catches every plain
+                -- index an operator had directly on the flat table
+                -- before conversion. That index's definition was
+                -- captured and replayed onto the new parent under its
+                -- ORIGINAL, unsuffixed name before the rename ran, so a
+                -- shape-identical index already exists there.
+                --
+                -- Review finding: matching by stripping
+                -- `{LEGACY_RENAME_SUFFIX}` off the renamed name and
+                -- looking for that exact name on the parent assumed the
+                -- rename was always `original || suffix`.
+                -- `bounded_rename_fn_sql` does not promise that: a name
+                -- near the 63-byte limit gets truncated first, and a
+                -- collision (with another renamed sibling sharing the
+                -- truncated prefix) gets a numeric disambiguator spliced
+                -- in before the suffix, so the renamed name need not
+                -- contain the original at all. Comparing the SHAPE
+                -- instead -- `pg_get_indexdef` with the leading
+                -- `CREATE [UNIQUE] INDEX <name> ON [ONLY] <table>`
+                -- stripped, so only `USING ... (columns) [INCLUDE (...)]
+                -- [WHERE ...]` remains -- sidesteps naming entirely.
+                -- `ONLY` is Postgres's own marker that a plain index
+                -- created directly on a partitioned parent does not
+                -- recurse to its partitions, and it is present only on
+                -- that parent-side rendering, never on the leaf's own,
+                -- so it has to be stripped too or an otherwise-identical
+                -- pair never matches. It is also strictly safe on its
+                -- own: if a shape-identical index
+                -- already survives on the parent, that index alone
+                -- already carries forward whatever invariant either one
+                -- enforced, so a leaf-only duplicate is never anything
+                -- to lose, residual or not.
                 c.relname = '{LEGACY_PARTITION}'
                 AND EXISTS (
-                    SELECT 1 FROM pg_class idxc WHERE idxc.oid = i.indexrelid
-                      AND right(idxc.relname, {suffix_len}) = '{LEGACY_RENAME_SUFFIX}'
-                      AND EXISTS (
-                          SELECT 1
-                            FROM pg_index i2
-                            JOIN pg_class c2 ON c2.oid = i2.indrelid
-                            JOIN pg_class idxc2 ON idxc2.oid = i2.indexrelid
-                            JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
-                           WHERE c2.relname = 'harvest_events'
-                             AND n2.nspname = current_schema()
-                             AND idxc2.relname = left(idxc.relname, length(idxc.relname) - {suffix_len})
-                             AND (SELECT array_agg(a.attname::text ORDER BY k)
-                                    FROM generate_series(0, i2.indnkeyatts - 1) k
-                                    JOIN pg_attribute a ON a.attrelid = i2.indrelid AND a.attnum = i2.indkey[k]
-                                 )
-                               = (SELECT array_agg(a.attname::text ORDER BY k)
-                                    FROM generate_series(0, i.indnkeyatts - 1) k
-                                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k])
-                      )
+                    SELECT 1
+                      FROM pg_index i2
+                      JOIN pg_class c2 ON c2.oid = i2.indrelid
+                      JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+                     WHERE c2.relname = 'harvest_events'
+                       AND n2.nspname = current_schema()
+                       AND regexp_replace(
+                               pg_get_indexdef(i2.indexrelid),
+                               '^CREATE (UNIQUE )?INDEX \\S+ ON (ONLY )?\\S+ ', '\\1'
+                           )
+                         = regexp_replace(
+                               pg_get_indexdef(i.indexrelid),
+                               '^CREATE (UNIQUE )?INDEX \\S+ ON (ONLY )?\\S+ ', '\\1'
+                           )
                 )
             )
           ORDER BY 1"

@@ -1954,6 +1954,106 @@ async fn a_plain_compatible_index_present_before_conversion_does_not_block_the_r
 }
 
 #[tokio::test]
+async fn a_disambiguated_residual_index_name_still_does_not_block_the_revert() {
+    // Review finding: the leaf-residual exemption used to strip
+    // `{LEGACY_RENAME_SUFFIX}` off the renamed name. It looked for that
+    // exact name on the parent. That assumed the rename was always
+    // `original || suffix`. `bounded_rename_fn_sql` does not promise
+    // that. A collision with another renamed sibling gets a numeric
+    // disambiguator spliced in before the suffix. The base can also get
+    // truncated first, near the 63-byte limit. Either way, the renamed
+    // name need not contain the original at all. Forcing a collision
+    // here proves the point directly. An unrelated decoy table squats
+    // the plain rename target. The shape-based correlation that
+    // replaced the old check does not depend on the renamed name at
+    // all.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(
+        &mut conn,
+        "disambig_residual_wf",
+        "disambig-residual-1",
+        Utc::now(),
+        None,
+    )
+    .await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    diesel::sql_query("DROP INDEX IF EXISTS uq_disambig_test_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query("CREATE UNIQUE INDEX uq_disambig_test_958 ON harvest_events (id, cohort)")
+        .execute(&mut conn)
+        .await
+        .expect("seed a plain unique index that already includes cohort");
+
+    // Squats the plain rename target, so `bounded_rename_fn_sql` must
+    // disambiguate the real index's rename with a numeric counter.
+    diesel::sql_query("DROP TABLE IF EXISTS uq_disambig_test_958__pre958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray decoy from a previous run");
+    diesel::sql_query("CREATE TABLE uq_disambig_test_958__pre958 (id bigint)")
+        .execute(&mut conn)
+        .await
+        .expect("seed a decoy occupying the plain rename target name");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    let disambiguated = scalar_bool(
+        &mut conn,
+        "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() \
+         AND tablename = 'harvest_events_legacy' \
+         AND indexname = 'uq_disambig_test_958_1__pre958') AS v",
+    )
+    .await;
+    assert!(
+        disambiguated,
+        "precondition: the decoy must have forced a numeric-disambiguated rename, \
+         not the plain uq_disambig_test_958__pre958"
+    );
+
+    partition::disable_partitioning(&mut conn)
+        .await
+        .expect(
+            "a residual index renamed with a numeric disambiguator, not the plain \
+             original || suffix form, must still not block the revert",
+        )
+        .expect("the shard was partitioned");
+
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() \
+             AND tablename = 'harvest_events' AND indexname = 'uq_disambig_test_958') AS v",
+        )
+        .await,
+        "the plain compatible index must be restored on the reverted flat table"
+    );
+
+    diesel::sql_query("DROP INDEX uq_disambig_test_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the index");
+    diesel::sql_query("DROP TABLE uq_disambig_test_958__pre958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the decoy table");
+}
+
+#[tokio::test]
 async fn a_dependent_materialized_view_refuses_the_conversion_too() {
     // Review finding on item 14: Postgres records a materialized view's
     // dependency the same way as an ordinary view, by relation OID
