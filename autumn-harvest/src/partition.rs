@@ -1276,12 +1276,17 @@ async fn refuse_if_user_triggers(conn: &mut AsyncPgConnection, verb: &str) -> Ha
     )))
 }
 
-/// A unique index on `harvest_events` that does not include `cohort`.
+/// A unique index on `harvest_events` that does not carry `cohort` as a KEY
+/// column.
 ///
-/// Postgres requires every partition-key column in a unique index on a
-/// partitioned table. `capture_index_defs` (and the scripted plan's own
-/// capture) replay every non-constraint index verbatim. A pre-existing
-/// unique index missing `cohort` is perfectly valid on the flat layout.
+/// Postgres requires every partition-key column among the KEY columns of a
+/// unique index on a partitioned table. An INCLUDE column does not count,
+/// so this checks only `indkey`'s first `indnkeyatts` entries, not all of
+/// `indkey` (which lists INCLUDE columns too).
+///
+/// `capture_index_defs` (and the scripted plan's own capture) replay every
+/// non-constraint index verbatim. A pre-existing unique index missing
+/// `cohort` as a key column is perfectly valid on the flat layout.
 /// Replaying it verbatim aborts the conversion with a raw `Postgres` error
 /// that does not say what is unsupported or why (issue #1270 item 10).
 #[cfg(feature = "db")]
@@ -1297,7 +1302,7 @@ async fn unique_indexes_without_cohort(conn: &mut AsyncPgConnection) -> HarvestR
                 SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid
             )
             AND NOT EXISTS (
-                SELECT 1 FROM unnest(i.indkey::int2[]) AS colnum
+                SELECT 1 FROM unnest(i.indkey[0:i.indnkeyatts - 1]::int2[]) AS colnum
                   JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = colnum
                  WHERE a.attname = 'cohort'
             )
@@ -1461,7 +1466,8 @@ pub async fn enable_partitioning(
 /// `DECLARE` fragment [`collision_safe_rename_stmts`] needs, beyond an
 /// already-declared `obj record;` — which every caller here already has, for
 /// the `FOR obj IN ...` loops themselves.
-const RENAME_HELPER_DECLARE: &str = "    new_name text;\n    bump     int;\n    room     int;";
+const RENAME_HELPER_DECLARE: &str =
+    "    new_name text;\n    bump     int;\n    tail     text;";
 
 /// Rename every constraint and index on `table` that does not already carry
 /// `suffix`, freeing their names for the replacement parent. This is
@@ -1477,6 +1483,17 @@ const RENAME_HELPER_DECLARE: &str = "    new_name text;\n    bump     int;\n    
 /// disambiguator on a collision. That handles two existing names agreeing
 /// on their first `63 - len(suffix)` bytes (issue #1270 item 9).
 ///
+/// The truncation shrinks the base ONE CHARACTER at a time, checking
+/// `octet_length` after each, rather than slicing straight to `63 -
+/// len(suffix)` characters. Postgres's limit is 63 BYTES, and `left()`
+/// counts characters. An existing name with multi-byte characters early in
+/// it can have fewer than `63 - len(suffix)` bytes in that many characters.
+/// So a straight character slice can still overflow 63 bytes once the
+/// (all-ASCII) suffix is appended. Postgres would then truncate the result
+/// again, silently, past the point this function verified was free.
+/// `left()` never splits a multi-byte character, so shrinking a character
+/// at a time keeps every intermediate candidate valid UTF-8.
+///
 /// Emitted as plpgsql statements, not a standalone `DO` block. That lets a
 /// caller splice this into a larger block that already declares `obj
 /// record;`. See [`RENAME_HELPER_DECLARE`] for the rest of what it needs
@@ -1485,35 +1502,52 @@ const RENAME_HELPER_DECLARE: &str = "    new_name text;\n    bump     int;\n    
 /// per-schema, so theirs is scoped to `current_schema()`.
 #[must_use]
 fn collision_safe_rename_stmts(table: &str, suffix: &str) -> String {
-    let suffix_len = suffix.len();
     format!(
         "FOR obj IN SELECT conname AS n FROM pg_constraint\n                \
          WHERE conrelid = '{table}'::regclass\n                  \
-         AND right(conname, {suffix_len}) <> '{suffix}'\n    \
+         AND right(conname, length('{suffix}')) <> '{suffix}'\n    \
          LOOP\n        \
-         new_name := left(obj.n, 63 - {suffix_len}) || '{suffix}';\n        \
          bump := 0;\n        \
+         tail := '{suffix}';\n        \
+         new_name := left(obj.n, greatest(63 - length(tail), 0));\n        \
+         WHILE octet_length(new_name || tail) > 63 LOOP\n            \
+         new_name := left(new_name, length(new_name) - 1);\n        \
+         END LOOP;\n        \
+         new_name := new_name || tail;\n        \
          WHILE EXISTS (SELECT 1 FROM pg_constraint\n                       \
          WHERE conname = new_name AND conrelid = '{table}'::regclass)\n        \
          LOOP\n            \
          bump := bump + 1;\n            \
-         room := 63 - {suffix_len} - length(bump::text) - 1;\n            \
-         new_name := left(obj.n, greatest(room, 0)) || '{suffix}' || '_' || bump::text;\n        \
+         tail := '{suffix}' || '_' || bump::text;\n            \
+         new_name := left(obj.n, greatest(63 - length(tail), 0));\n            \
+         WHILE octet_length(new_name || tail) > 63 LOOP\n                \
+         new_name := left(new_name, length(new_name) - 1);\n            \
+         END LOOP;\n            \
+         new_name := new_name || tail;\n        \
          END LOOP;\n        \
          EXECUTE format('ALTER TABLE {table} RENAME CONSTRAINT %I TO %I', obj.n, new_name);\n    \
          END LOOP;\n    \
          FOR obj IN SELECT indexname AS n FROM pg_indexes\n                \
          WHERE schemaname = current_schema() AND tablename = '{table}'\n                  \
-         AND right(indexname, {suffix_len}) <> '{suffix}'\n    \
+         AND right(indexname, length('{suffix}')) <> '{suffix}'\n    \
          LOOP\n        \
-         new_name := left(obj.n, 63 - {suffix_len}) || '{suffix}';\n        \
          bump := 0;\n        \
+         tail := '{suffix}';\n        \
+         new_name := left(obj.n, greatest(63 - length(tail), 0));\n        \
+         WHILE octet_length(new_name || tail) > 63 LOOP\n            \
+         new_name := left(new_name, length(new_name) - 1);\n        \
+         END LOOP;\n        \
+         new_name := new_name || tail;\n        \
          WHILE EXISTS (SELECT 1 FROM pg_indexes\n                       \
          WHERE indexname = new_name AND schemaname = current_schema())\n        \
          LOOP\n            \
          bump := bump + 1;\n            \
-         room := 63 - {suffix_len} - length(bump::text) - 1;\n            \
-         new_name := left(obj.n, greatest(room, 0)) || '{suffix}' || '_' || bump::text;\n        \
+         tail := '{suffix}' || '_' || bump::text;\n            \
+         new_name := left(obj.n, greatest(63 - length(tail), 0));\n            \
+         WHILE octet_length(new_name || tail) > 63 LOOP\n                \
+         new_name := left(new_name, length(new_name) - 1);\n            \
+         END LOOP;\n            \
+         new_name := new_name || tail;\n        \
          END LOOP;\n        \
          EXECUTE format('ALTER INDEX %I RENAME TO %I', obj.n, new_name);\n    \
          END LOOP;"
@@ -2328,7 +2362,13 @@ async fn sweep_inner(
     let mut attempts = 0usize;
     for part in list_partitions(conn).await? {
         if outcome.dropped.len() >= opts.max_drops || attempts >= opts.max_attempts {
-            outcome.truncated = true;
+            // `max_drops == 0` means "never drop" (dry-run's way of
+            // suppressing the sweep while creation keeps running), not a
+            // budget genuinely exhausted after trying. That case trips this
+            // break on the very first partition, every tick. Reporting it
+            // as `truncated` would falsely read as a stuck backlog on every
+            // dry-run deployment.
+            outcome.truncated = opts.max_drops > 0 || attempts >= opts.max_attempts;
             break;
         }
         // The DEFAULT partition is structural: dropping it would make an
@@ -3528,7 +3568,7 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
              AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = \
              i.indexrelid)\n       \
              AND NOT EXISTS (\n           \
-             SELECT 1 FROM unnest(i.indkey::int2[]) AS colnum\n             \
+             SELECT 1 FROM unnest(i.indkey[0:i.indnkeyatts - 1]::int2[]) AS colnum\n             \
              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = colnum\n            \
              WHERE a.attname = 'cohort'\n       \
              );\n    \

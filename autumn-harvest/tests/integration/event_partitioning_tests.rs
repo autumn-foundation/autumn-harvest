@@ -1460,6 +1460,46 @@ async fn the_sweep_is_bounded_by_attempts_not_just_by_drops() {
 }
 
 #[tokio::test]
+async fn a_zero_drop_budget_is_not_reported_as_a_truncated_pass() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    for days in [10_i64, 11] {
+        let ts = Utc::now() - chrono::Duration::days(days);
+        partition::ensure_cohort(&mut conn, ts)
+            .await
+            .expect("materialize cohort");
+    }
+
+    // `max_drops: 0` is how `dry_run` suppresses the sweep while letting
+    // partition creation keep running — deliberate, not a budget genuinely
+    // exhausted after trying. It stops the loop on the very first
+    // partition, every tick, on every partitioned shard: `truncated` must
+    // not read that as a stuck backlog.
+    let outcome = partition::sweep(
+        &mut conn,
+        Utc::now(),
+        &SweepOptions {
+            max_drops: 0,
+            ..SweepOptions::default()
+        },
+    )
+    .await
+    .expect("sweep");
+
+    assert!(outcome.dropped.is_empty(), "got {outcome:?}");
+    assert!(
+        !outcome.truncated,
+        "a deliberately zero drop budget must not be reported as a pass that \
+         hit a real budget; got {outcome:?}"
+    );
+}
+
+#[tokio::test]
 async fn the_straggler_delete_removes_orphan_rows_but_leaves_the_stragglers_own() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
@@ -3768,6 +3808,90 @@ async fn enable_survives_two_indexes_colliding_at_the_identifier_limit() {
 }
 
 #[tokio::test]
+async fn enable_truncates_a_multibyte_index_name_by_bytes_not_characters() {
+    #[derive(diesel::QueryableByName)]
+    struct IndexRow {
+        #[diesel(sql_type = Text)]
+        v: String,
+    }
+
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(&mut conn, "mb_wf", "mb-1", day(2026, 2, 3), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    // Issue #1270 item 9 follow-up: Postgres's 63-byte identifier limit is
+    // BYTES; plpgsql `left()` counts CHARACTERS. 41 ASCII 'a's plus 5
+    // three-byte CJK characters is 46 characters, comfortably under
+    // `63 - len("__pre958")` = 55, but 56 BYTES. A character-based
+    // truncation would take all 46 characters unchanged. Appending the
+    // 8-byte suffix would then push the result to 64 bytes, one over the
+    // limit. Postgres would silently truncate it further (suffix and all)
+    // at DDL time, past the point the rename verified a name was free.
+    let name = format!("{}{}", "a".repeat(41), "\u{4e2d}".repeat(5));
+    assert_eq!(name.chars().count(), 46);
+    assert_eq!(name.len(), 56, "56 UTF-8 bytes for 46 characters");
+    diesel::sql_query(format!("DROP INDEX IF EXISTS \"{name}\""))
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query(format!(
+        "CREATE INDEX \"{name}\" ON harvest_events (workflow_exec_id)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("plant the multi-byte index name");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Matched on the CJK character specifically, not an "aaaa..." prefix.
+    // A prefix match would also catch the all-ASCII 55-`a` names another
+    // test in this suite carries onto this same table. That is issue
+    // #1270 item 9's own "index defs replay across enable/disable" case.
+    let renamed: Vec<String> = diesel::sql_query(format!(
+        "SELECT indexname AS v FROM pg_indexes \
+          WHERE schemaname = current_schema() AND tablename = '{}' \
+            AND indexname LIKE '%\u{4e2d}%'",
+        partition::LEGACY_PARTITION
+    ))
+    .load::<IndexRow>(&mut conn)
+    .await
+    .expect("list the legacy partition's indexes")
+    .into_iter()
+    .map(|r| r.v)
+    .collect();
+    assert_eq!(
+        renamed.len(),
+        1,
+        "the multi-byte-named index must survive the rename: {renamed:?}"
+    );
+    assert!(
+        renamed[0].len() <= 63,
+        "the renamed identifier must fit Postgres's 63-BYTE limit, not just a \
+         63-character one: {:?} is {} bytes",
+        renamed[0],
+        renamed[0].len()
+    );
+    assert!(
+        renamed[0].ends_with("__pre958"),
+        "the rename suffix must survive intact, not be cut off by Postgres's own \
+         truncation of an over-length candidate: {:?}",
+        renamed[0]
+    );
+}
+
+#[tokio::test]
 async fn enable_refuses_a_unique_index_without_cohort() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
@@ -3801,6 +3925,45 @@ async fn enable_refuses_a_unique_index_without_cohort() {
     );
 
     diesel::sql_query("DROP INDEX harvest_events_wf_only_uq")
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn enable_refuses_a_unique_index_with_cohort_only_as_an_include_column() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // `cohort` is present in the index, but only as an INCLUDE column.
+    // Postgres's partition-key requirement is on the KEY columns, so this
+    // must be refused exactly like an index that omits cohort entirely.
+    diesel::sql_query(
+        "CREATE UNIQUE INDEX harvest_events_wf_evt_uq ON harvest_events \
+         (workflow_exec_id, event_id) INCLUDE (cohort)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("plant a unique index with cohort as an INCLUDE column");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "cohort as an INCLUDE column does not satisfy Postgres's partition-key \
+             requirement for a unique index on a partitioned table",
+        );
+    assert!(
+        err.to_string().contains("harvest_events_wf_evt_uq"),
+        "{err}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "refusing before mutating"
+    );
+
+    diesel::sql_query("DROP INDEX harvest_events_wf_evt_uq")
         .execute(&mut conn)
         .await
         .ok();

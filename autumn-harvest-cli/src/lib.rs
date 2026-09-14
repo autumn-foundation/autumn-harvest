@@ -362,6 +362,16 @@ pub enum PartitionCommand {
         #[arg(long, value_name = "N", default_value_t = 32)]
         max_drops: usize,
 
+        /// Maximum partitions to EVALUATE against the drop gate in this
+        /// pass, counting both drops and partitions left blocked.
+        ///
+        /// `--max-drops` alone bounds only successes: a blocked partition
+        /// still costs a gate evaluation, possibly a tier-3 scan, and does
+        /// not count against it. Raise this alongside `--max-drops` for a
+        /// manual catch-up pass on a shard with many blocked partitions.
+        #[arg(long, value_name = "N", default_value_t = autumn_harvest::partition::SweepOptions::default().max_attempts)]
+        max_attempts: usize,
+
         /// Output format.
         #[arg(long, short = 'o', value_enum, default_value = "text")]
         format: DrFormat,
@@ -6043,8 +6053,12 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
             shards,
             lookahead_cohorts,
             max_drops,
+            max_attempts,
             format,
-        } => run_partition_maintain(shards, *lookahead_cohorts, *max_drops, *format).await,
+        } => {
+            run_partition_maintain(shards, *lookahead_cohorts, *max_drops, *max_attempts, *format)
+                .await
+        }
         PartitionCommand::Disable {
             shards,
             confirm,
@@ -6152,11 +6166,13 @@ async fn run_partition_maintain(
     shards: &[String],
     lookahead_cohorts: u32,
     max_drops: usize,
+    max_attempts: usize,
     format: DrFormat,
 ) -> Result<(), CliError> {
     let targets = parse_shard_targets(shards)?;
     let sweep = autumn_harvest::partition::SweepOptions {
         max_drops,
+        max_attempts,
         ..autumn_harvest::partition::SweepOptions::default()
     };
     let mut out = Vec::with_capacity(targets.len());
@@ -6316,6 +6332,13 @@ fn emit_partition_report(
                     );
                     if let Some(e) = &m.last_error {
                         println!("  INCOMPLETE: {e}");
+                    }
+                    // The answer to "why does `blocked` not list every
+                    // closed partition?" (issue #1270 item 1). The sweep hit
+                    // its evaluation budget, and the rest is picked up next
+                    // tick.
+                    if m.sweep.truncated {
+                        println!("  sweep truncated: hit max-drops or max-attempts");
                     }
                     // The answer to "why has space not come back?". Printed
                     // even when empty is noise, so only when there is
