@@ -1724,6 +1724,21 @@ pub async fn constraint_backed_unique_indexes_on_partitioned_parent(
                 -- already carries forward whatever invariant either one
                 -- enforced, so a leaf-only duplicate is never anything
                 -- to lose, residual or not.
+                --
+                -- Review finding: the stripped name and table tokens must
+                -- be quote-aware, not a bare run of non-space characters.
+                -- A legal quoted identifier can contain whitespace, for
+                -- example a column named customer key, quoted.
+                -- pg_get_indexdef renders that quote intact. A bare non-space
+                -- run stops at the first space inside it, so the prefix
+                -- is stripped short and the leftover fragment differs
+                -- between the two sides even when the shapes match. The
+                -- comparison then reports a false mismatch, and
+                -- disable_partitioning refuses a revert that a
+                -- plain-named index would pass. The pattern instead
+                -- matches a whole quoted identifier, doubled internal
+                -- quotes included, or a whole run of non-quote
+                -- non-space characters.
                 c.relname = '{LEGACY_PARTITION}'
                 AND EXISTS (
                     SELECT 1
@@ -1734,11 +1749,11 @@ pub async fn constraint_backed_unique_indexes_on_partitioned_parent(
                        AND n2.nspname = current_schema()
                        AND regexp_replace(
                                pg_get_indexdef(i2.indexrelid),
-                               '^CREATE (UNIQUE )?INDEX \\S+ ON (ONLY )?\\S+ ', '\\1'
+                               '^CREATE (UNIQUE )?INDEX (?:\"(?:[^\"]|\"\")*\"|[^\\s\"]+) ON (ONLY )?(?:\"(?:[^\"]|\"\")*\"|[^\\s\"]+) ', '\\1'
                            )
                          = regexp_replace(
                                pg_get_indexdef(i.indexrelid),
-                               '^CREATE (UNIQUE )?INDEX \\S+ ON (ONLY )?\\S+ ', '\\1'
+                               '^CREATE (UNIQUE )?INDEX (?:\"(?:[^\"]|\"\")*\"|[^\\s\"]+) ON (ONLY )?(?:\"(?:[^\"]|\"\")*\"|[^\\s\"]+) ', '\\1'
                            )
                 )
             )

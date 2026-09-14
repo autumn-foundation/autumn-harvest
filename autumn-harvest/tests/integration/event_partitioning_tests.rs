@@ -2054,6 +2054,92 @@ async fn a_disambiguated_residual_index_name_still_does_not_block_the_revert() {
 }
 
 #[tokio::test]
+async fn quoted_residual_index_name_with_whitespace_is_recognized_by_shape() {
+    // Review finding: the leaf-residual shape comparison in
+    // `constraint_backed_unique_indexes_on_partitioned_parent` stripped
+    // the leading `CREATE [UNIQUE] INDEX <name> ON [ONLY] <table>` with a
+    // pattern that matched each token as a run of non-space characters.
+    // A legal quoted index name can itself contain whitespace.
+    // `pg_get_indexdef` renders that quote intact. The old pattern
+    // stopped short at the first internal space. It left a different
+    // leftover fragment on each side of the comparison, even though the
+    // two index shapes match. That false mismatch would make
+    // `disable_partitioning` refuse a revert a plain-named index would
+    // pass.
+    //
+    // `enable_partitioning`'s own rename-then-replay-then-attach sequence
+    // cannot exercise this clause directly. `ATTACH PARTITION` auto-links
+    // a leaf's locally built index to a shape-identical parent index by
+    // structure, regardless of name, before this clause is ever
+    // consulted. Building both indexes after a real conversion has
+    // already attached `{LEGACY_PARTITION}` sidesteps that. A plain
+    // index added straight to an already-attached leaf, with no matching
+    // action on the parent, gets no such link. `ON ONLY` on the parent
+    // side keeps its own copy equally unlinked. That matches how
+    // `capture_index_defs` itself replays a plain index; see its
+    // `pg_get_indexdef` output elsewhere in this file.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(
+        &mut conn,
+        "quoted_shape_wf",
+        "quoted-shape-1",
+        Utc::now(),
+        None,
+    )
+    .await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    diesel::sql_query("DROP INDEX IF EXISTS \"uq shape quoted 958\"")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query(
+        "CREATE UNIQUE INDEX \"uq shape quoted 958\" ON ONLY harvest_events (id, cohort)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed the parent's copy, quoted name containing whitespace");
+    diesel::sql_query(
+        "CREATE UNIQUE INDEX \"uq shape quoted 958__pre958\" ON harvest_events_legacy (id, cohort)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed the shape-identical residual, renamed with the usual suffix");
+
+    let bad = partition::constraint_backed_unique_indexes_on_partitioned_parent(&mut conn)
+        .await
+        .expect("query the leaf-residual candidates");
+    assert!(
+        bad.is_empty(),
+        "a quoted index name containing whitespace must not defeat the shape \
+         comparison and be flagged as an independent leaf index: {bad:?}"
+    );
+
+    diesel::sql_query("DROP INDEX \"uq shape quoted 958__pre958\"")
+        .execute(&mut conn)
+        .await
+        .expect("drop the leaf-side index");
+    diesel::sql_query("DROP INDEX \"uq shape quoted 958\"")
+        .execute(&mut conn)
+        .await
+        .expect("drop the parent-side index");
+}
+
+#[tokio::test]
 async fn a_dependent_materialized_view_refuses_the_conversion_too() {
     // Review finding on item 14: Postgres records a materialized view's
     // dependency the same way as an ordinary view, by relation OID
