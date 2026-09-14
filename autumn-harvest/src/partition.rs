@@ -4477,12 +4477,18 @@ async fn drain_default_bounded_inner(
         }
         let Some(cutoff) = cutoff else {
             // Nothing with a usable cohort: re-attach and report no progress
-            // rather than leaving `DEFAULT` detached.
-            exec(
-                conn,
-                &format!("ALTER TABLE harvest_events ATTACH PARTITION {DEFAULT_PARTITION} DEFAULT"),
-            )
-            .await?;
+            // rather than leaving `DEFAULT` detached. Heartbeat-guarded
+            // the same way as the main path's re-`ATTACH` below. This one
+            // scans a `DEFAULT` no rows were moved out of. It is at least
+            // as large a scan.
+            let query = diesel::sql_query(format!(
+                "ALTER TABLE harvest_events ATTACH PARTITION {DEFAULT_PARTITION} DEFAULT"
+            ))
+            .execute(conn);
+            tokio::pin!(query);
+            await_with_heartbeat(query, &mut progress)
+                .await
+                .map_err(database_error)?;
             return Ok(0);
         };
 
@@ -4574,11 +4580,23 @@ async fn drain_default_bounded_inner(
         // No TRUNCATE: the move above already removed exactly the rows it
         // copied, and anything still here belongs to a cohort this pass did not
         // take. Truncating would destroy it.
-        exec(
-            conn,
-            &format!("ALTER TABLE harvest_events ATTACH PARTITION {DEFAULT_PARTITION} DEFAULT"),
-        )
-        .await?;
+        //
+        // Review finding: this re-`ATTACH` makes Postgres prove no
+        // remaining row belongs to an existing partition. That is a full
+        // scan of whatever is left in `DEFAULT`, exactly as unbounded as
+        // the move above it. Left as a plain `exec`, nothing ticks
+        // `progress` while it runs. A large enough remainder ages the
+        // scanner past its staleness threshold. This statement is still
+        // the one holding the lock and making real progress.
+        // Heartbeat-guarded the same way the move is.
+        let query = diesel::sql_query(format!(
+            "ALTER TABLE harvest_events ATTACH PARTITION {DEFAULT_PARTITION} DEFAULT"
+        ))
+        .execute(conn);
+        tokio::pin!(query);
+        await_with_heartbeat(query, &mut progress)
+            .await
+            .map_err(database_error)?;
         Ok(moved)
     }))
     .await
