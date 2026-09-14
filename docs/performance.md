@@ -1862,3 +1862,9 @@ standalone note rather than part of the claim-path attribution table above:
   write that follows the row-lock statement, not the row lock itself
   (3-to-2 statement reduction; total statements -33% at every swept size;
   worker-liveness calls n → 0, PR #1545).
+* [`docs/performance-queue-coverage.md`](performance-queue-coverage.md) — the
+  O(pending queues x workers x queues-per-worker) nested scan in
+  `queue_coverage::partition_uncovered_and_paused`, the per-shard core of
+  `GET /admin/queue-coverage` (issue #774), indexed into an O(1)-average
+  `HashSet` lookup per pending queue (instructions -83.6%; falls back to
+  the original direct scan for a `?queue_name=`-filtered single-row call).
