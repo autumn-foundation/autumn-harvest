@@ -24,12 +24,24 @@
 //! `harvest_audit_log` and writes its own bookkeeping
 //! (`harvest_audit_log.export_seq`, `harvest_audit_export_cursor`).
 //!
-//! # Opt-in and zero-cost when unconfigured
+//! # Opt-in, but one cost is not zero
 //!
-//! With no sink registered, [`GLOBAL_AUDIT_EXPORT_CONFIG`] is `None`, the
-//! scanner returns `Ok(0)` before issuing a single query, no cursor row is
-//! ever created, and `export_seq` stays `NULL` on every audit row. Behavior
-//! is byte-identical to before this module existed.
+//! With no sink registered, [`GLOBAL_AUDIT_EXPORT_CONFIG`] is `None`. The
+//! scanner returns `Ok(0)` before it issues a single query. No cursor row is
+//! ever created, and `export_seq` stays `NULL` on every audit row. No new
+//! query runs and no new row exists: read behavior matches the code before
+//! this module existed.
+//!
+//! Write behavior does not. `harvest_audit_log_unexported_idx` is a partial
+//! index on `export_seq IS NULL`. An unconfigured deployment leaves every row
+//! `NULL` forever, so the index matches the whole audit table, and every
+//! audit insert pays its maintenance cost. That cost is bounded only while
+//! retention actually reclaims unexported rows. See `docs/audit-export.md`'s
+//! "Retention interaction" section for the exact conditions: they are more
+//! than one config flag. Tracked as issue #1272. Even then the bound is not
+//! total. Retention can never purge a decommission or reactivation record,
+//! exported or not. That holds no matter how many requests a shard has
+//! seen.
 //!
 //! # Where the monotonic sequence comes from (and why not `BIGSERIAL`)
 //!
@@ -474,7 +486,9 @@ pub const fn resolve_rewind(current_acked: i64, requested: i64) -> RewindOutcome
 /// startup.
 ///
 /// With `sink` and `webhook_url` both `None` — the default — audit export is
-/// never installed and the feature is entirely inert (AC8).
+/// never installed and the scanner is entirely inert (AC8). The partial
+/// index still costs insert-time maintenance; see the module-level caveat
+/// above (issue #1272).
 #[derive(Clone)]
 pub struct AuditExportBuilderConfig {
     /// Allowed sink hosts. Required (non-empty) for a `webhook_url` to
@@ -684,7 +698,7 @@ impl AuditExportBuilderConfig {
 }
 
 // ---------------------------------------------------------------------
-// M4: process-global runtime config (opt-in; `None` == fully inert)
+// M4: process-global runtime config (opt-in; `None` == scanner fully inert)
 // ---------------------------------------------------------------------
 
 /// Bound on acquiring a shard's connection inside the scanner (issue #953,
@@ -757,10 +771,12 @@ pub const DEFAULT_EXPORT_LEASE: std::time::Duration = std::time::Duration::from_
 
 /// Everything the exporter needs at runtime, installed once at startup.
 ///
-/// `None` (the default, before any builder wiring runs) means the feature is
-/// fully inert: [`fire_due_audit_exports`] returns `Ok(0)` before issuing a
-/// single query, so an embedder who never configures an audit sink sees zero
-/// behavior change and zero scanner work (AC8).
+/// `None` (the default, before any builder wiring runs) means the scanner is
+/// fully inert. [`fire_due_audit_exports`] returns `Ok(0)` before issuing a
+/// query, so an embedder who never configures a sink sees zero query
+/// behavior change and zero scanner work (AC8). The partial index is not
+/// part of that guarantee — see the module-level caveat above (issue
+/// #1272).
 #[derive(Clone)]
 pub struct AuditExportRuntimeConfig {
     /// Embedder-supplied (or plugin-default) transport.

@@ -27,6 +27,95 @@ use autumn_harvest_plugin::dev::{
     DevRuntimeConfig, EphemeralPostgres, PostgresBinaries, running_as_root,
 };
 
+/// Serializes every `DevRuntime::start` call in this file against env-var
+/// mutation (Codex review, issue #1291).
+///
+/// `DevRuntime::start`'s harvest-mode gate reads `AUTUMN_HARVEST__MODE` and
+/// friends from the real process environment. A developer environment might
+/// set `AUTUMN_HARVEST__MODE=split` or `external` ambiently. Without this
+/// guard, these tests would see that gate's refusal instead of the one each
+/// actually asserts, or fail to start at all.
+static DEV_RUNTIME_START_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Unsets one env var for the life of this guard. Restores exactly what was
+/// there before — present or absent — even if the test panics.
+///
+/// Every `DevRuntime::start` call in this file holds
+/// `DEV_RUNTIME_START_SERIAL` for as long as a guard like this is alive.
+/// This struct does no locking of its own. It assumes that lock is already
+/// held.
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn unset(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: the caller holds `DEV_RUNTIME_START_SERIAL` for this
+        // guard's whole life, so no concurrent test observes `key` mid-change.
+        unsafe { std::env::remove_var(key) };
+        Self { key, previous }
+    }
+
+    /// Set `key` to `value` for the life of this guard.
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: see `unset`.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `unset`.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+/// Every env var `resolve_harvest_mode_source` reads, forced to a known-safe
+/// state. A `DevRuntime::start` call in this file then sees the embedded
+/// default. This holds regardless of what the process inherited.
+///
+/// `AUTUMN_MANIFEST_DIR` is pointed at a fresh directory holding its own
+/// empty `autumn.toml`, not merely unset (Codex review, issue #1291).
+///
+/// `find_config_file_named` falls back to the process's current directory.
+/// It does this whenever the manifest directory has no matching file.
+/// Merely unsetting or emptying the directory still lets an ambient
+/// checkout-root config file leak in that way.
+///
+/// Pointing it at a real, empty file makes the lookup succeed there
+/// instead. That happens before the fallback ever runs.
+///
+/// `AUTUMN_PROFILE` is forced unset too, so no `autumn-<profile>.toml`
+/// lookup happens from that source. `resolve_profile` also falls back to
+/// `AUTUMN_IS_DEBUG` (Codex review, issue #1291), so this unsets that too.
+/// Otherwise an inherited `AUTUMN_IS_DEBUG=1`/`0` could still select a
+/// profile and reopen the same checkout-root fallback for its file.
+fn harvest_mode_env_cleared() -> [EnvVarGuard; 5] {
+    let manifest_dir = std::env::temp_dir().join(format!(
+        "autumn-harvest-plugin-embedded-manifest-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&manifest_dir).expect("manifest directory should be created");
+    std::fs::write(manifest_dir.join("autumn.toml"), "")
+        .expect("empty root config file should be written");
+    [
+        EnvVarGuard::unset("AUTUMN_HARVEST__MODE"),
+        EnvVarGuard::unset("AUTUMN_HARVEST_DATABASE__URL"),
+        EnvVarGuard::unset("AUTUMN_IS_DEBUG"),
+        EnvVarGuard::unset("AUTUMN_PROFILE"),
+        EnvVarGuard::set("AUTUMN_MANIFEST_DIR", &manifest_dir),
+    ]
+}
+
 /// The binaries to provision with, or `None` with a printed reason.
 ///
 /// Two environmental reasons to skip rather than fail: no Postgres server
@@ -51,9 +140,22 @@ fn binaries() -> Option<PostgresBinaries> {
 /// invisible to `ci_run_coverage.rs`. `HARVEST_DEV_REQUIRE_POSTGRES=1` makes a
 /// runner image that lost its `PostgreSQL` a red build rather than a green
 /// no-op.
+///
+/// Reads through `DEV_RUNTIME_START_SERIAL` (Codex review, issue #1291),
+/// the same lock every `EnvVarGuard` mutation in this file holds. A bare
+/// `std::env::var` here could run from an unguarded test in parallel with
+/// a guarded one's `set`/`remove`. That would race a live mutation of the
+/// process environment — undefined behavior on Unix, not merely a wrong
+/// answer.
 fn skip(reason: &str) -> Option<PostgresBinaries> {
+    let require_postgres = {
+        let _serial = DEV_RUNTIME_START_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::var("HARVEST_DEV_REQUIRE_POSTGRES")
+    };
     assert!(
-        std::env::var("HARVEST_DEV_REQUIRE_POSTGRES").as_deref() != Ok("1"),
+        require_postgres.as_deref() != Ok("1"),
         "HARVEST_DEV_REQUIRE_POSTGRES=1 but this suite would have skipped: {reason}"
     );
     eprintln!("SKIP: {reason}");
@@ -199,6 +301,7 @@ async fn the_reaper_reclaims_an_abandoned_session_directory() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_busy_http_port_is_refused_before_any_cluster_is_created() {
     let Some(_binaries) = binaries() else { return };
@@ -212,6 +315,10 @@ async fn a_busy_http_port_is_refused_before_any_cluster_is_created() {
     let base = std::env::temp_dir().join(format!("harvest-dev-portclash-{}", std::process::id()));
     std::fs::create_dir_all(&base).expect("base");
 
+    let _serial = DEV_RUNTIME_START_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = harvest_mode_env_cleared();
     let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         http_port: port,
         session_root: Some(base.clone()),
@@ -248,6 +355,7 @@ async fn a_busy_http_port_is_refused_before_any_cluster_is_created() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_port_taken_during_provisioning_is_refused_and_takes_the_cluster_with_it() {
     // Codex round 3 (P2). The reservation above cannot be *held* across
@@ -266,6 +374,17 @@ async fn a_port_taken_during_provisioning_is_refused_and_takes_the_cluster_with_
         let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
         probe.local_addr().expect("addr").port()
     };
+
+    // Acquired before the timed watcher below is spawned (Codex review, issue
+    // #1291). Another `DevRuntime::start` test can hold this mutex longer
+    // than the watcher's 10-second polling window. A watcher started first
+    // could then time out and return `None` before this test starts
+    // provisioning. That would fail the `held.is_some()` assertion below for
+    // an unrelated reason.
+    let _serial = DEV_RUNTIME_START_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = harvest_mode_env_cleared();
 
     // Event-driven, not timed: the session directory is created at the very
     // start of provisioning and `initdb` runs for seconds afterwards, so
@@ -359,19 +478,30 @@ async fn two_concurrent_dev_runtimes_do_not_collide() {
     second.shutdown().await.expect("second shutdown");
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_durable_workflow_executes_and_is_observable() {
     // The runtime provisions its own cluster; this only establishes that it
     // *can*, so the test skips rather than fails where nothing is installed.
     let Some(_binaries) = binaries() else { return };
 
-    let runtime = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
-        // Port 0: let the kernel pick, so the test never fights a real dev run.
-        http_port: 0,
-        ..DevRuntimeConfig::default()
-    })
-    .await
-    .expect("dev runtime should start");
+    // Scoped to release `DEV_RUNTIME_START_SERIAL` as soon as `start` returns.
+    // The workflow exercise below needs no env guard. Without this scope, it
+    // would serialize against the other `DevRuntime::start` tests here for no
+    // reason.
+    let runtime = {
+        let _serial = DEV_RUNTIME_START_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = harvest_mode_env_cleared();
+        autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
+            // Port 0: let the kernel pick, so the test never fights a real dev run.
+            http_port: 0,
+            ..DevRuntimeConfig::default()
+        })
+        .await
+        .expect("dev runtime should start")
+    };
 
     let base = runtime.api_url().to_owned();
     let client = reqwest::Client::new();

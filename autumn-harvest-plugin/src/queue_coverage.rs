@@ -63,7 +63,7 @@
 //! live pollers is not included there (nothing interesting to report — it
 //! would not have been uncovered anyway).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
 use autumn_harvest::error::HarvestResult;
@@ -241,12 +241,19 @@ pub struct QueueCoverageShardInspection {
 
 /// One shard's raw observation: a queue with pending work that has zero
 /// live pollers *on this shard*, before cross-shard aggregation.
+///
+/// `pub` (and its fields `pub`) solely so `queue_coverage_profile` can build
+/// fixtures and call [`partition_uncovered_and_paused`] directly.
+/// `queue_coverage_profile` is a separate-crate bench binary; see
+/// `benches/queue_coverage_profile.rs` and
+/// `docs/performance-queue-coverage.md`.
+/// `dlq::group_dead_letter_rows`/`DlqRawGroup` are `pub` for the same reason.
 #[derive(Debug, Clone)]
-struct UncoveredQueueDemand {
-    queue_name: String,
-    pending_count: i64,
-    sample_task_ids: Vec<Uuid>,
-    sample_execution_ids: Vec<Uuid>,
+pub struct UncoveredQueueDemand {
+    pub queue_name: String,
+    pub pending_count: i64,
+    pub sample_task_ids: Vec<Uuid>,
+    pub sample_execution_ids: Vec<Uuid>,
 }
 
 /// Per-queue accumulator: aggregates uncovered demand across shards.
@@ -341,9 +348,14 @@ fn merge_excluded_paused_queues(sets: Vec<BTreeSet<String>>) -> Vec<String> {
         .collect()
 }
 
-/// Whether `worker` is a live poller of `queue_name` on `shard_id` for
-/// coverage purposes: assigned to the shard, has a fresh heartbeat, is
-/// `Active` or `Draining` (not `Stopped`), and lists the queue.
+/// Whether `worker` is live (fresh heartbeat, `Active`/`Draining`, not
+/// `Stopped`) **and** assigned to `shard_id`.
+///
+/// The two parts of coverage that depend only on the worker and the shard
+/// being inspected, never on which queue is being asked about. Factored out
+/// of [`worker_covers_queue`] so [`partition_uncovered_and_paused`] can
+/// compute it once per worker instead of once per (worker, pending-queue)
+/// pair.
 ///
 /// Shard-membership (including the empty-`shard_assignments` legacy-worker
 /// special case) is delegated to the shared
@@ -354,16 +366,23 @@ fn merge_excluded_paused_queues(sets: Vec<BTreeSet<String>>) -> Vec<String> {
 /// function's own bug while implementing #774) -- factoring the predicate
 /// into one shared function means the two consumers cannot drift apart
 /// again.
-pub(crate) fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> bool {
+fn worker_is_live_and_assigned(worker: &WorkerRow, shard_id: i32) -> bool {
     let is_live = worker.health == WorkerHealth::Healthy
         && (worker.worker.status == WorkerStatus::Active.as_str()
             || worker.worker.status == WorkerStatus::Draining.as_str());
+    is_live && shard_fanout::worker_covers_shard(worker, shard_id)
+}
+
+/// Whether `worker` is a live poller of `queue_name` on `shard_id` for
+/// coverage purposes: assigned to the shard, has a fresh heartbeat, is
+/// `Active` or `Draining` (not `Stopped`), and lists the queue.
+pub(crate) fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> bool {
     let has_queue = worker.worker.queues.as_array().is_some_and(|queues| {
         queues
             .iter()
             .any(|value| value.as_str() == Some(queue_name))
     });
-    is_live && shard_fanout::worker_covers_shard(worker, shard_id) && has_queue
+    worker_is_live_and_assigned(worker, shard_id) && has_queue
 }
 
 /// Load only the workers that can possibly count as coverage on this shard's
@@ -519,10 +538,63 @@ async fn observe_shard(
     )
 }
 
-/// Partitions this shard's `pending` demand into the genuinely-uncovered
-/// rows and the set of queue names that were excluded solely because they
-/// are currently paused (see [`merge_excluded_paused_queues`]).
-fn partition_uncovered_and_paused(
+/// Partitions this shard's pending demand into uncovered rows and paused
+/// queue names.
+///
+/// The first element is the genuinely-uncovered rows; the second is the set
+/// of queue names excluded solely because they are currently paused (see
+/// [`merge_excluded_paused_queues`]).
+///
+/// `pub` solely for `queue_coverage_profile` (see [`UncoveredQueueDemand`]'s
+/// doc comment) — not part of the crate's HTTP-facing API surface.
+#[must_use]
+pub fn partition_uncovered_and_paused(
+    pending: Vec<PendingQueueDemand>,
+    workers: &[WorkerRow],
+    paused: &BTreeSet<String>,
+    shard_id: i32,
+) -> (Vec<UncoveredQueueDemand>, BTreeSet<String>) {
+    // Building the coverage index below costs O(workers x
+    // queues-per-worker), no matter how many pending queues it then serves.
+    // That cost is worth paying only when the index answers more than one
+    // question. A `?queue_name=` filtered request narrows `pending` to at
+    // most one row (issue #774 review). There, the pre-fix direct scan can
+    // short-circuit on the first covering worker. So indexing the entire
+    // fleet up front would make a cheap targeted check slower on a large
+    // fleet. Fall back to the direct per-demand scan for that case.
+    if pending.len() <= 1 {
+        return partition_uncovered_and_paused_direct(pending, workers, paused, shard_id);
+    }
+
+    // `shard_id` is fixed for the whole call. Which workers are live and
+    // assigned to it does not depend on `demand`. Precompute the union of
+    // their queue names once instead: O(workers x queues-per-worker). This
+    // replaces a re-scan of every worker, and every worker's own queues,
+    // for every pending queue. That scan was O(pending x workers x
+    // queues-per-worker). See `docs/performance-queue-coverage.md`.
+    let covered_queues: HashSet<&str> = workers
+        .iter()
+        .filter(|worker| worker_is_live_and_assigned(worker, shard_id))
+        .filter_map(|worker| worker.worker.queues.as_array())
+        .flat_map(|queues| queues.iter().filter_map(serde_json::Value::as_str))
+        .collect();
+
+    let mut paused_uncovered = BTreeSet::new();
+    let rows = pending
+        .into_iter()
+        .filter_map(|demand| {
+            let has_coverage = covered_queues.contains(demand.queue_name.as_str());
+            classify_pending_demand(demand, has_coverage, paused, &mut paused_uncovered)
+        })
+        .collect();
+    (rows, paused_uncovered)
+}
+
+/// The pre-fix per-demand scan, kept for the small-`pending` case. See
+/// [`partition_uncovered_and_paused`]'s doc comment. There is no upfront
+/// index here, so a single filtered demand costs at most one pass over
+/// `workers`, short-circuiting on the first covering one.
+fn partition_uncovered_and_paused_direct(
     pending: Vec<PendingQueueDemand>,
     workers: &[WorkerRow],
     paused: &BTreeSet<String>,
@@ -535,24 +607,39 @@ fn partition_uncovered_and_paused(
             let has_coverage = workers
                 .iter()
                 .any(|worker| worker_covers_queue(worker, &demand.queue_name, shard_id));
-            if paused.contains(&demand.queue_name) {
-                if !has_coverage {
-                    paused_uncovered.insert(demand.queue_name);
-                }
-                return None;
-            }
-            if has_coverage {
-                return None;
-            }
-            Some(UncoveredQueueDemand {
-                queue_name: demand.queue_name,
-                pending_count: demand.pending_count,
-                sample_task_ids: demand.sample_task_ids,
-                sample_execution_ids: demand.sample_execution_ids,
-            })
+            classify_pending_demand(demand, has_coverage, paused, &mut paused_uncovered)
         })
         .collect();
     (rows, paused_uncovered)
+}
+
+/// Shared classification step for one pending demand, given its already-
+/// computed coverage. Paused-and-uncovered goes into `paused_uncovered`.
+/// Paused-and-covered or unpaused-and-covered is reported nowhere.
+/// Unpaused-and-uncovered becomes a row. Factored out so the indexed and
+/// direct scans above ([`partition_uncovered_and_paused`] /
+/// [`partition_uncovered_and_paused_direct`]) cannot drift on this logic.
+fn classify_pending_demand(
+    demand: PendingQueueDemand,
+    has_coverage: bool,
+    paused: &BTreeSet<String>,
+    paused_uncovered: &mut BTreeSet<String>,
+) -> Option<UncoveredQueueDemand> {
+    if paused.contains(&demand.queue_name) {
+        if !has_coverage {
+            paused_uncovered.insert(demand.queue_name);
+        }
+        return None;
+    }
+    if has_coverage {
+        return None;
+    }
+    Some(UncoveredQueueDemand {
+        queue_name: demand.queue_name,
+        pending_count: demand.pending_count,
+        sample_task_ids: demand.sample_task_ids,
+        sample_execution_ids: demand.sample_execution_ids,
+    })
 }
 
 fn build_report_from_observations(
@@ -1147,6 +1234,34 @@ mod tests {
         let (rows, paused_uncovered) =
             partition_uncovered_and_paused(pending, &[worker], &BTreeSet::new(), 0);
 
+        assert!(rows.is_empty());
+        assert!(paused_uncovered.is_empty());
+    }
+
+    #[test]
+    fn partition_single_pending_demand_uses_the_direct_scan_and_still_reports_uncovered() {
+        // `pending.len() == 1` (a `?queue_name=` filtered request) takes
+        // the direct-scan path, not the indexed one. Exercise it with a
+        // genuinely-uncovered result, not just the covered cases above.
+        let pending = vec![pending_demand("typo_queue", 7)];
+        let worker = worker_row(
+            WorkerStatus::Active,
+            WorkerHealth::Healthy,
+            &[0],
+            &["other_queue"],
+        );
+        let (rows, paused_uncovered) =
+            partition_uncovered_and_paused(pending, &[worker], &BTreeSet::new(), 0);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].queue_name, "typo_queue");
+        assert!(paused_uncovered.is_empty());
+    }
+
+    #[test]
+    fn partition_empty_pending_is_empty_on_either_path() {
+        let (rows, paused_uncovered) =
+            partition_uncovered_and_paused(Vec::new(), &[], &BTreeSet::new(), 0);
         assert!(rows.is_empty());
         assert!(paused_uncovered.is_empty());
     }

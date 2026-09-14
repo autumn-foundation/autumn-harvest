@@ -15,6 +15,7 @@ mod activity_pause_tests;
 mod admission_gate_authoritative_tests;
 mod admission_gate_tests;
 mod alert_pack_docs;
+mod audit_export_docs;
 #[cfg(feature = "db")]
 mod audit_export_tests;
 mod audit_tests;
@@ -90,6 +91,7 @@ mod delayed_start_tests;
 mod det_check_tests;
 mod determinism_static_analysis_docs;
 mod dispatch_tests;
+mod e2e_bench_cell_timeout_tests;
 mod e2e_bench_support;
 mod event_batch_tests;
 mod event_partitioning_tests;
@@ -144,6 +146,8 @@ mod payload_offload_db_tests;
 #[cfg(feature = "testing")]
 mod payload_offload_replay_tests;
 mod performance_docs;
+#[cfg(feature = "db")]
+mod poison_pill_reclaim_perf;
 mod poison_pill_tests;
 mod priority_tests;
 #[cfg(feature = "testing")]
@@ -202,6 +206,8 @@ mod scheduler_overdue_tests;
 #[cfg(feature = "db")]
 mod scheduler_registration_tests;
 mod security;
+#[cfg(feature = "db")]
+mod shard_database_sweep_tests;
 #[cfg(feature = "db")]
 mod shard_placement_by_id_tests;
 #[cfg(all(feature = "db", feature = "testing"))]

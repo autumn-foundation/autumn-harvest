@@ -207,6 +207,25 @@ mandates `workflow`/`queue`/`shard` as the navigation dimensions) and the
 place). The linter validates the dashboard *model*; a manual import into a
 real Grafana ≥ 10 instance remains the final pre-merge verification step.
 
+## Adding a Panel
+
+Grafana panel `id` values must be unique across the whole file, including
+panels nested inside collapsed rows. Do not hand-pick the next integer:
+five separate PRs (ids 956, 957, 958, 959, 960) each picked the same
+"next" id as a PR merging around the same time. The JSON merges cleanly
+either way, so nothing conflicts until CI runs
+`panel_structure_is_grafana10_clean` (`dashboard_pack_docs.rs`) against
+the merged file — by which point both PRs are already in.
+
+Get a collision-resistant id instead:
+
+```sh
+python3 docs/dashboards/next-panel-id.py
+```
+
+It draws from a wide, mostly-empty range, so two branches picking one at
+the same time are unlikely to collide.
+
 ## Versioning
 
 The filename carries the pack version (`v0.1.0`); the dashboard `uid`
