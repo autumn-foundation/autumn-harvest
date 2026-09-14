@@ -1401,6 +1401,76 @@ async fn ui_workers_unknown_status_value_redisplays_form_instead_of_aborting_pag
     );
 }
 
+/// RED (was): `page`/`limit` were still typed `Option<i64>` directly on
+/// `WorkerListParams` — the two fields left over after status/stale/shard
+/// above got this fix. `?limit=not-a-number` failed axum's own query
+/// deserialization with a bare 400 before `list_workers_ui` ever ran,
+/// discarding the `build_id` filter the operator had already typed
+/// alongside it. Same mechanism as the Workflows page's
+/// `invalid_limit_redisplays_form_instead_of_aborting_page` (#1540).
+///
+/// GREEN (this commit): the request still renders the Workers page
+/// (`200`) and preserves the other filter. It surfaces a `role="alert"`
+/// message naming the bad value next to the "Per page" field.
+#[tokio::test]
+async fn ui_workers_invalid_limit_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/workers?limit=not-a-number&build_id=abc123").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid limit must not abort the whole Workers page: {html}"
+    );
+    assert!(
+        html.contains("value=\"abc123\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+}
+
+/// Same fix, the `page` field. No form field backs it; it drives the
+/// Previous/Next links instead, a distinct code path. Covered
+/// independently here rather than assumed symmetric with `limit`,
+/// matching the Workflows page's
+/// `invalid_page_redisplays_list_instead_of_aborting_page`.
+#[tokio::test]
+async fn ui_workers_invalid_page_redisplays_list_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/workers?page=not-a-number&build_id=abc123").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid page must not abort the whole Workers page: {html}"
+    );
+    assert!(
+        html.contains("value=\"abc123\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the pagination controls: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+    assert!(
+        html.contains("Page 1"),
+        "falls back to page 1 (zero-based page 0) instead of guessing: {html}"
+    );
+}
+
 /// Codex review on #1378 (P2): the first version of this fix parsed the
 /// invalid value down to `None` before it ever reached
 /// `render_workers_page`, so the pagination links and a plain form
