@@ -48,6 +48,37 @@ needing two sequential activity-backed decision cycles, started so it sorts
 after the broken execution in `ExecutionId` order. It asserts a single
 `run_until_idle()` call both still surfaces `SqliteError::Unsupported` AND
 drives the unrelated execution all the way to `Completed`. Confirmed RED
-(execution left `Running`) before the fix. Full `autumn-harvest-sqlite`
-suite (128 integration tests, 45 lib unit tests) is green with zero
-regressions.
+(execution left `Running`) before the fix.
+
+**Follow-up (multi-angle review, Codex P1): don't burn the panic budget
+across internal passes.** A first cut of the fix above re-drove EVERY
+still-running execution on EVERY internal pass, including one that had
+already errored on an earlier pass in the same call. That is harmless for
+most error kinds (an unsupported command rejects identically every time),
+but a `#[workflow]` handler panic is contained under a bounded consecutive-
+strike budget (`WORKFLOW_PANIC_MAX_ATTEMPTS`, `contain_workflow_panic`):
+re-driving a panicking execution on every internal pass burns through that
+budget and seals it terminally `FAILED` within ONE external
+`run_until_idle()` call, instead of one strike per call — denying the
+caller the chance to react to an early `WorkflowPanicked` error between
+calls (a hotfix/rollback). `poll_once_pass` now takes a `skip:
+&mut HashSet<ExecutionId>` set: a newly-erroring execution is added to it
+and left alone for the rest of that pass loop. `poll_once` passes a fresh,
+empty set every call (no behavior change — still one attempt per
+execution, per call). `run_until_idle` reuses ONE set across all its
+internal passes, so any erroring execution — panicking or not — is driven
+at most once per external call, while the rest of the fleet still
+converges fully. New test
+`run_until_idle_strikes_a_panicking_execution_at_most_once_per_call`
+(`fleet_fault_isolation.rs`) pairs an `always_panics_wf` with a `four_step_wf`
+needing more internal passes than the panic budget, and asserts the
+panicking execution stays `Running` (not sealed) after one call. Confirmed
+it fails without the skip set (the panicking execution gets sealed
+`Failed`), passes with it.
+
+Full `autumn-harvest-sqlite` suite (132 integration tests, 45 lib unit
+tests) is green with zero regressions. A pre-existing, low-frequency
+test-isolation flake in `fleet_fault_isolation.rs` (confirmed to reproduce
+identically on unmodified `trunk-dev`, unrelated to this change) can
+occasionally fail one test under full-suite parallelism; it passes
+reliably in isolation and on repeated full-suite runs.

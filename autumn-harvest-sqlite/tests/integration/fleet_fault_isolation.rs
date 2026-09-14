@@ -14,6 +14,14 @@
 //! internal pass whenever a broken execution was present, not the documented
 //! "repeat until quiescent". A multi-cycle execution then needed several
 //! external `run_until_idle()` calls to finish, instead of one.
+//!
+//! A follow-up review of the #1555 fix (Codex P1) found that a naive
+//! "keep looping" fix re-drives a broken execution on EVERY internal pass.
+//! For a WORKFLOW-handler panic, each re-drive strikes the bounded panic
+//! budget (`WORKFLOW_PANIC_MAX_ATTEMPTS`), so a persistently-panicking
+//! execution could exhaust its budget and get sealed `FAILED` within ONE
+//! external call, instead of one strike per call. The fix skips a
+//! newly-erroring execution for the rest of that `run_until_idle` call.
 
 // The `#[workflow]` macro references its input param through expansion.
 #![allow(clippy::used_underscore_binding)]
@@ -323,4 +331,80 @@ async fn run_until_idle_keeps_the_first_error_seen_across_passes_not_a_later_one
         }
         other => panic!("expected SqliteError::Unsupported, got {other:?}"),
     }
+}
+
+/// Panics on EVERY decision cycle. Distinct from `broken_wf`: a panic is
+/// contained under a bounded budget (`WORKFLOW_PANIC_MAX_ATTEMPTS`) rather
+/// than rejected outright, so re-driving it repeatedly has an observable
+/// side effect an unsupported command does not.
+#[workflow]
+async fn always_panics_wf(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    let _ = ctx;
+    panic!("workflow boom");
+}
+
+/// Needs FOUR sequential decision cycles, more than the default panic
+/// budget of three. It keeps `run_until_idle`'s internal loop running long
+/// enough to re-strike a co-located panicking execution, if the fix did not
+/// skip it after its first strike.
+#[workflow]
+async fn four_step_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    let a = ctx
+        .execute_activity_raw("increment", json!(n), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    let b = ctx
+        .execute_activity_raw("increment", a, "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    let c = ctx
+        .execute_activity_raw("increment", b, "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    let d = ctx
+        .execute_activity_raw("increment", c, "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(d.as_i64().unwrap_or_default())
+}
+
+/// Codex P1 follow-up on the #1555 fix. A single `run_until_idle()` call
+/// must strike a persistently-panicking execution AT MOST ONCE, even while
+/// an unrelated execution needs many more internal passes to converge.
+/// Re-striking it every pass would exhaust `WORKFLOW_PANIC_MAX_ATTEMPTS`
+/// and seal it `FAILED` within one call, denying the caller the chance to
+/// react to the first `WorkflowPanicked` error between calls.
+#[tokio::test]
+async fn run_until_idle_strikes_a_panicking_execution_at_most_once_per_call() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&always_panics_wf_info());
+    rt.register_workflow(&four_step_wf_info());
+    rt.register_activity_raw("increment", increment_activity());
+
+    let panicking = rt.start_workflow("always_panics_wf", json!(0)).unwrap();
+    let long_running = rt.start_workflow("four_step_wf", json!(0)).unwrap();
+
+    let err = rt
+        .run_until_idle()
+        .await
+        .expect_err("a persistently-panicking execution must still surface an error");
+    assert!(
+        matches!(err, SqliteError::WorkflowPanicked { .. }),
+        "expected SqliteError::WorkflowPanicked, got {err:?}"
+    );
+
+    assert!(
+        matches!(rt.outcome(panicking).unwrap(), ExecutionOutcome::Running),
+        "one run_until_idle() call must strike a panicking execution AT MOST \
+         ONCE and leave it RUNNING, not exhaust its whole panic budget while \
+         unrelated work keeps the call's internal loop going"
+    );
+    assert!(
+        matches!(
+            rt.outcome(long_running).unwrap(),
+            ExecutionOutcome::Completed(ref v) if v.as_i64() == Some(4)
+        ),
+        "the unrelated multi-cycle execution must still converge fully in \
+         the same call"
+    );
 }

@@ -1,7 +1,7 @@
 //! The embedded, single-writer runtime: registration, start/signal ingress, the
 //! decision loop, and the two atomic-persist sites (dispatch + terminal).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use autumn_harvest::builder::{
@@ -984,7 +984,8 @@ impl SqliteRuntime {
     /// dropped. See [`run_until_blocked`](Self::run_until_blocked) for the
     /// error variants a single execution can produce.
     pub async fn poll_once(&mut self) -> SqliteResult<bool> {
-        let (progress, first_error) = self.poll_once_pass().await?;
+        let mut skip = HashSet::new();
+        let (progress, first_error) = self.poll_once_pass(&mut skip).await?;
         first_error.map_or(Ok(progress), Err)
     }
 
@@ -997,7 +998,22 @@ impl SqliteRuntime {
     /// `run_until_idle` needs that separate signal. It keeps converging the
     /// rest of the fleet past a persistently-broken execution, instead of
     /// stopping after one pass.
-    async fn poll_once_pass(&mut self) -> SqliteResult<(bool, Option<SqliteError>)> {
+    ///
+    /// `skip` names executions to leave alone this pass. A NEWLY-erroring
+    /// execution is added to it before this call returns (issue #1555
+    /// follow-up review, Codex P1). `poll_once` passes a fresh, empty set
+    /// every call, so this is a no-op change for it: it still drives every
+    /// execution exactly once. `run_until_idle` reuses ONE set across all
+    /// its internal passes, so a broken execution is driven AT MOST ONCE
+    /// per external call, even across many internal passes. Re-driving it
+    /// on every pass would keep striking
+    /// [`contain_workflow_panic`](Self::contain_workflow_panic)'s bounded
+    /// panic budget, sealing a panicking workflow `FAILED` within one call
+    /// instead of leaving each strike visible to the caller between calls.
+    async fn poll_once_pass(
+        &mut self,
+        skip: &mut HashSet<ExecutionId>,
+    ) -> SqliteResult<(bool, Option<SqliteError>)> {
         // Re-read the wall clock per driven cycle (issue #1069 P2) — see the
         // rationale on `run_until_blocked`. The `_as_of` variant keeps a fixed
         // caller `now` for deterministic simulation.
@@ -1008,11 +1024,17 @@ impl SqliteRuntime {
         let mut progress = false;
         let mut first_error = None;
         for exec in store::running_executions(&self.conn)? {
+            if skip.contains(&exec) {
+                continue;
+            }
             let now = (self.now_fn)().timestamp_millis();
             match self.drive_one_cycle(exec, now, &failure_now).await {
                 Ok(RunState::WaitingSignal(_) | RunState::WaitingTimer) => {}
                 Ok(_) => progress = true,
-                Err(err) => record_fleet_error(exec, err, &mut first_error),
+                Err(err) => {
+                    skip.insert(exec);
+                    record_fleet_error(exec, err, &mut first_error);
+                }
             }
         }
         Ok((progress, first_error))
@@ -1060,6 +1082,13 @@ impl SqliteRuntime {
     /// external call now converges the whole fleet. It no longer stalls at
     /// one decision cycle per persistently-broken execution.
     ///
+    /// An execution that errors is driven AT MOST ONCE for the rest of this
+    /// call (Codex P1 follow-up review to issue #1555). Without that, a
+    /// long-running call could re-drive the SAME broken execution on every
+    /// internal pass — for a panicking workflow, that burns through its
+    /// bounded panic budget and seals it `FAILED` within one call, instead
+    /// of one strike per call. A fresh external call re-attempts it.
+    ///
     /// # Errors
     ///
     /// Returns [`SqliteError::Runaway`] if the fleet never quiesces within
@@ -1071,8 +1100,9 @@ impl SqliteRuntime {
     /// first per-execution error, once quiescent or at the safety bound.
     pub async fn run_until_idle(&mut self) -> SqliteResult<()> {
         let mut first_error = None;
+        let mut skip = HashSet::new();
         for _ in 0..MAX_ITERATIONS {
-            let (progress, err) = self.poll_once_pass().await?;
+            let (progress, err) = self.poll_once_pass(&mut skip).await?;
             if let Some(err) = err {
                 first_error.get_or_insert(err);
             }
