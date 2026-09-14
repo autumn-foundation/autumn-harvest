@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use super::e2e_bench_support::{CellOutcome, await_cell};
+use super::e2e_bench_support::{CellOutcome, TaskCensus, await_cell, wait_for_census_to_clear};
 
 async fn hang_forever(ticks: Arc<AtomicUsize>) -> Result<(), String> {
     loop {
@@ -113,4 +113,79 @@ async fn a_timed_out_cells_resources_are_released_before_await_cell_returns() {
         "await_cell returned before the timed-out task's resources were actually \
          released; the next cell could start while a stale shard lease is still open"
     );
+}
+
+#[test]
+fn a_fresh_census_has_nothing_outstanding() {
+    let census = TaskCensus::new();
+    assert_eq!(census.outstanding(), 0);
+}
+
+#[test]
+fn entering_and_dropping_the_guard_balances_the_count() {
+    let census = TaskCensus::new();
+    let guard = census.enter();
+    assert_eq!(census.outstanding(), 1);
+    drop(guard);
+    assert_eq!(census.outstanding(), 0);
+}
+
+/// The gap `await_cell` alone cannot close. Picture a task nested inside
+/// the cell's own task: a stand-in for a `Fleet` worker or a `SignalServer`
+/// connection. It is tracked only through `Drop`-based cancellation, not
+/// its own `JoinHandle`. `await_cell` proves the outer task's frame has
+/// dropped, but says nothing about a task that frame merely `abort()`ed.
+/// This proves `wait_for_census_to_clear` closes that gap on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn census_reaches_zero_once_a_nested_aborted_task_actually_stops() {
+    let census = TaskCensus::new();
+    let nested_guard = census.enter();
+    let nested = tokio::spawn(async move {
+        let _guard = nested_guard;
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let outer = tokio::spawn(async move {
+        // Stands in for the cell's own task. It does not own the nested
+        // task's handle, only a clone of the census. The nested task holds
+        // a guard against that same census -- exactly `Fleet`'s and
+        // `SignalServer`'s own relationship to their workers and
+        // connections.
+        std::future::pending::<()>().await;
+        Ok::<(), String>(())
+    });
+
+    let outcome = await_cell(outer, Duration::from_millis(20)).await;
+    assert!(matches!(outcome, CellOutcome::TimedOut));
+    assert_eq!(
+        census.outstanding(),
+        1,
+        "await_cell's own join must not by itself clear a task it never spawned"
+    );
+
+    nested.abort();
+    wait_for_census_to_clear(&census, Duration::from_secs(5)).await;
+    assert_eq!(
+        census.outstanding(),
+        0,
+        "wait_for_census_to_clear returned before the nested task's guard was dropped"
+    );
+}
+
+#[tokio::test]
+async fn wait_for_census_to_clear_gives_up_at_its_bound_rather_than_hanging() {
+    let census = TaskCensus::new();
+    let guard = census.enter();
+
+    let started = tokio::time::Instant::now();
+    wait_for_census_to_clear(&census, Duration::from_millis(50)).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a census that never clears must not hang the caller"
+    );
+    assert_eq!(census.outstanding(), 1, "the guard was never dropped");
+
+    drop(guard);
 }

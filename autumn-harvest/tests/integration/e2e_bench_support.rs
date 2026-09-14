@@ -1044,6 +1044,13 @@ pub const CELL_PROVISIONING_GRACE_SECS: u64 = 300;
 /// provisioning, the scenario's own cooperative deadline, and teardown.
 pub const CELL_HARD_TIMEOUT_SECS: u64 = SCENARIO_BUDGET_SECS + CELL_PROVISIONING_GRACE_SECS;
 
+/// Bound on [`wait_for_census_to_clear`] after a timed-out cell.
+///
+/// A worker or connection task normally notices its `abort()` within one
+/// scheduling tick. This only guards against one that never does, so the
+/// sweep behind it is delayed, not hung, if that ever happens.
+pub const CENSUS_CLEAR_TIMEOUT_SECS: u64 = 30;
+
 /// How long to wait after every signal workflow's handler has reached
 /// `wait_for_signal` before the first signal is sent, so the suspension has
 /// committed.
@@ -1553,6 +1560,68 @@ pub async fn await_cell<T, E>(
             let _ = handle.await;
             CellOutcome::TimedOut
         }
+    }
+}
+
+/// Counts nested tasks a cell has spawned beyond its own top-level task:
+/// worker fleets, a signal server's accept loop, its connection handlers.
+///
+/// `await_cell` joining a cell's own `JoinHandle` proves that task's frame
+/// has dropped. It proves nothing about tasks that frame itself spawned.
+/// `Fleet` and `SignalServer` only `abort()` those in `Drop`, since `Drop`
+/// cannot `await`. So aborting the outer task does not, by itself, prove an
+/// inner worker has actually stopped holding its pooled connection.
+/// `TaskCensus` closes that gap. Each nested task holds one [`CensusGuard`]
+/// for its whole body. The guard drops, and the count falls, only when the
+/// task actually stops, cancellation included.
+#[derive(Clone, Default)]
+pub struct TaskCensus(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl TaskCensus {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register one nested task's lifetime. Hold the returned guard for that
+    /// task's whole body, so it drops only when the task actually stops.
+    #[must_use]
+    pub fn enter(&self) -> CensusGuard {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        CensusGuard(std::sync::Arc::clone(&self.0))
+    }
+
+    /// How many registered tasks have not yet actually stopped.
+    #[must_use]
+    pub fn outstanding(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Decrements its [`TaskCensus`] on drop: by cooperative completion, by a
+/// panic unwinding through it, or by task cancellation dropping it.
+pub struct CensusGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for CensusGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Wait for every task registered against `census` to actually stop.
+///
+/// Bounded: a task that never releases its guard must not hang the sweep
+/// behind it. Call this after a timed-out cell, before the next cell's
+/// provisioning sweep runs. Otherwise the sweep can see a nested task's
+/// still-open connection, and correctly, but unhelpfully, treat the
+/// database as live.
+pub async fn wait_for_census_to_clear(census: &TaskCensus, bound: Duration) {
+    let deadline = tokio::time::Instant::now() + bound;
+    while census.outstanding() > 0 {
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -3123,11 +3192,17 @@ pub mod db {
 
     /// Start [`WORKERS_PER_SHARD`] workers per shard, each pinned to its shard
     /// and listening on that shard's own database.
+    ///
+    /// Each worker task holds one `census` guard for its whole life. After a
+    /// forced abort (a timed-out cell), the caller can poll `census`. It
+    /// learns once every worker this call started has actually stopped, not
+    /// merely been asked to.
     #[must_use]
     pub fn start_fleet(
         cluster: &ShardCluster,
         sharded: &ShardedDbPool,
         registry: &Arc<HandlerRegistry>,
+        census: &super::TaskCensus,
     ) -> Fleet {
         let notification_urls: Vec<(ShardId, String)> = cluster
             .urls
@@ -3157,7 +3232,9 @@ pub mod db {
                     .expect("shard pool present")
                     .clone();
                 let runner = Arc::clone(&worker);
+                let guard = census.enter();
                 handles.push(tokio::spawn(async move {
+                    let _guard = guard;
                     runner.run(&pool).await;
                 }));
                 workers.push(worker);
@@ -3384,13 +3461,23 @@ pub mod db {
 
     /// Bind the signal endpoint on loopback and start serving.
     ///
+    /// The accept loop, and every connection it spawns, holds one `census`
+    /// guard for its whole life. After a forced abort (a timed-out cell),
+    /// the caller can poll `census`. It learns once the loop and every
+    /// connection it started have actually stopped, not merely been asked
+    /// to.
+    ///
     /// # Errors
     ///
     /// Returns the bind/accept error if loopback is unavailable.
-    pub async fn spawn_signal_server(sharded: ShardedDbPool) -> std::io::Result<SignalServer> {
+    pub async fn spawn_signal_server(
+        sharded: ShardedDbPool,
+        census: super::TaskCensus,
+    ) -> std::io::Result<SignalServer> {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let addr = listener.local_addr()?;
         let handle = tokio::spawn(async move {
+            let _accept_loop_guard = census.enter();
             // Connection tasks are tracked rather than detached: `stop` must be
             // able to guarantee no task is still holding a pooled connection
             // when the caller drops the pool and drops the databases.
@@ -3411,7 +3498,9 @@ pub mod db {
                     continue;
                 };
                 let sharded = sharded.clone();
+                let connection_guard = census.enter();
                 connections.spawn(async move {
+                    let _connection_guard = connection_guard;
                     let _ = socket.set_nodelay(true);
                     let mut buf = Vec::with_capacity(512);
                     let request = loop {
@@ -3657,12 +3746,15 @@ pub mod db {
                   the ordering constraints between those phases -- which are the whole \
                   correctness argument -- harder to audit, not easier."
     )]
-    pub async fn run_throughput(shard_count: u32) -> Result<ScenarioReport, SkipReason> {
+    pub async fn run_throughput(
+        shard_count: u32,
+        census: super::TaskCensus,
+    ) -> Result<ScenarioReport, SkipReason> {
         let scenario_started = Instant::now();
         let cluster = Box::pin(setup_shards(shard_count)).await?;
         let sharded = cluster.sharded_pool();
         let (registry, _observations) = build_registry();
-        let fleet = start_fleet(&cluster, &sharded, &registry);
+        let fleet = start_fleet(&cluster, &sharded, &registry, &census);
         let deadline = scenario_deadline();
         let shards = cluster.shard_ids();
 
@@ -4002,12 +4094,15 @@ pub mod db {
                   the ordering constraints between those phases -- which are the whole \
                   correctness argument -- harder to audit, not easier."
     )]
-    pub async fn run_dispatch_latency(shard_count: u32) -> Result<ScenarioReport, SkipReason> {
+    pub async fn run_dispatch_latency(
+        shard_count: u32,
+        census: super::TaskCensus,
+    ) -> Result<ScenarioReport, SkipReason> {
         let scenario_started = Instant::now();
         let cluster = Box::pin(setup_shards(shard_count)).await?;
         let sharded = cluster.sharded_pool();
         let (registry, observations) = build_registry();
-        let fleet = start_fleet(&cluster, &sharded, &registry);
+        let fleet = start_fleet(&cluster, &sharded, &registry, &census);
         let deadline = scenario_deadline();
         let shards = cluster.shard_ids();
 
@@ -4282,16 +4377,19 @@ pub mod db {
                   the ordering constraints between those phases -- which are the whole \
                   correctness argument -- harder to audit, not easier."
     )]
-    pub async fn run_signal_roundtrip(shard_count: u32) -> Result<ScenarioReport, SkipReason> {
+    pub async fn run_signal_roundtrip(
+        shard_count: u32,
+        census: super::TaskCensus,
+    ) -> Result<ScenarioReport, SkipReason> {
         let scenario_started = Instant::now();
         let cluster = Box::pin(setup_shards(shard_count)).await?;
         let sharded = cluster.sharded_pool();
         let (registry, observations) = build_registry();
-        let fleet = start_fleet(&cluster, &sharded, &registry);
+        let fleet = start_fleet(&cluster, &sharded, &registry, &census);
         let deadline = scenario_deadline();
         let shards = cluster.shard_ids();
 
-        let server = match spawn_signal_server(sharded.clone()).await {
+        let server = match spawn_signal_server(sharded.clone(), census).await {
             Ok(server) => server,
             Err(e) => {
                 // Tear down before returning: `ShardCluster` has no `Drop`
