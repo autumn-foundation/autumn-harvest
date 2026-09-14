@@ -3518,8 +3518,14 @@ pub mod db {
     ) -> std::io::Result<SignalServer> {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let addr = listener.local_addr()?;
+        // Entered here, before `spawn`, not inside the spawned future. A task
+        // aborted before its first poll never runs its own body, so a guard
+        // entered there would never register at all. `census.outstanding()`
+        // must count this task for its entire life. That includes the
+        // sliver between `spawn` and that first poll.
+        let accept_loop_guard = census.enter();
         let handle = tokio::spawn(async move {
-            let _accept_loop_guard = census.enter();
+            let _accept_loop_guard = accept_loop_guard;
             // Connection tasks are tracked rather than detached: `stop` must be
             // able to guarantee no task is still holding a pooled connection
             // when the caller drops the pool and drops the databases.
