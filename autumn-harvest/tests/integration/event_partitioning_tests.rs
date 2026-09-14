@@ -1883,6 +1883,77 @@ async fn a_plain_compatible_unique_index_survives_the_direct_enable_path() {
 }
 
 #[tokio::test]
+async fn a_plain_compatible_index_present_before_conversion_does_not_block_the_revert() {
+    // Review finding: `enable_sql`'s rename loop frees every index name
+    // still on `{LEGACY_PARTITION}`, indiscriminately, not only
+    // harvest's own two. A plain, operator-owned index present on the
+    // flat table before conversion ends up with a leftover copy on the
+    // legacy leaf, suffixed `{LEGACY_RENAME_SUFFIX}`. Its own unsuffixed
+    // replay sits right alongside it, on the new parent.
+    // `constraint_backed_unique_indexes_on_partitioned_parent`'s
+    // leaf-candidacy fix must not mistake that harmless leftover for an
+    // independently added leaf index and refuse the revert over it.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(
+        &mut conn,
+        "plain_idx_revert_wf",
+        "plain-idx-revert-1",
+        Utc::now(),
+        None,
+    )
+    .await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    diesel::sql_query("DROP INDEX IF EXISTS uq_plain_compat_revert_958")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query(
+        "CREATE UNIQUE INDEX uq_plain_compat_revert_958 ON harvest_events (id, cohort)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a plain unique index that already includes cohort");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    partition::disable_partitioning(&mut conn)
+        .await
+        .expect(
+            "a plain index present before conversion, and its harmless renamed \
+                 leftover on the legacy leaf, must not block the revert",
+        )
+        .expect("the shard was partitioned");
+
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() \
+             AND tablename = 'harvest_events' AND indexname = 'uq_plain_compat_revert_958') AS v",
+        )
+        .await,
+        "the plain compatible index must be restored on the reverted flat table"
+    );
+
+    diesel::sql_query("DROP INDEX uq_plain_compat_revert_958")
+        .execute(&mut conn)
+        .await
+        .expect("drop the index");
+}
+
+#[tokio::test]
 async fn a_dependent_materialized_view_refuses_the_conversion_too() {
     // Review finding on item 14: Postgres records a materialized view's
     // dependency the same way as an ordinary view, by relation OID
@@ -2913,6 +2984,80 @@ async fn an_unreplayable_constraint_refuses_the_revert_too() {
     .execute(&mut conn)
     .await
     .expect("drop the offending constraint");
+}
+
+#[tokio::test]
+async fn an_impostor_cohort_check_on_the_legacy_partition_with_a_mismatched_cutoff_still_refuses() {
+    // Review finding: `unreplayable_constraints`'s cohort-`CHECK`
+    // exemption used to accept any same-shaped bound on
+    // `{LEGACY_PARTITION}` too, not only on `harvest_events`. Once
+    // enable has attached this partition, its own actual upper bound is
+    // already known and readable from the catalog. A same-named,
+    // same-shaped impostor bound to an unrelated date can be told apart
+    // from harvest's own exactly, instead of by shape alone.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // A populated table takes the AttachLegacy path, which is the only
+    // one that creates `{LEGACY_PARTITION}` at all.
+    let exec = insert_execution(
+        &mut conn,
+        "legacy_ck_cutoff_wf",
+        "legacy-ck-cutoff-1",
+        day(2026, 2, 3),
+        None,
+    )
+    .await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    let leaf = partition::LEGACY_PARTITION;
+    diesel::sql_query(format!(
+        "ALTER TABLE {leaf} DROP CONSTRAINT IF EXISTS {leaf}_cohort_ck"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the real cohort CHECK to make room for the impostor");
+    diesel::sql_query(format!(
+        "ALTER TABLE {leaf} ADD CONSTRAINT {leaf}_cohort_ck \
+         CHECK (cohort < '2020-01-01T00:00:00Z'::timestamptz)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed an impostor at harvest's reserved name and shape, bound to an unrelated date");
+
+    let err = partition::disable_partitioning(&mut conn).await.expect_err(
+        "a same-named, same-shaped CHECK on the legacy partition bound to a cutoff other \
+         than its own actual attached bound must still refuse",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&format!("{leaf}_cohort_ck")),
+        "the refusal must name the offending constraint; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "p",
+        "a refused revert must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query(format!(
+        "ALTER TABLE {leaf} DROP CONSTRAINT {leaf}_cohort_ck"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the impostor constraint");
 }
 
 #[tokio::test]

@@ -1594,6 +1594,7 @@ async fn refuse_if_unique_index_without_cohort(
 pub async fn constraint_backed_unique_indexes_on_partitioned_parent(
     conn: &mut AsyncPgConnection,
 ) -> HarvestResult<Vec<String>> {
+    let suffix_len = LEGACY_RENAME_SUFFIX.len();
     let rows = diesel::sql_query(format!(
         "SELECT DISTINCT i.indexrelid::regclass::text AS v
            FROM pg_index i
@@ -1685,6 +1686,41 @@ pub async fn constraint_backed_unique_indexes_on_partitioned_parent(
                             FROM generate_series(0, i.indnkeyatts - 1) k
                             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
                          ) = ARRAY['workflow_exec_id', 'event_id', 'cohort'])
+                )
+            )
+            AND NOT (
+                -- A plain leaf index whose name still carries the rename
+                -- suffix is the residual of the rename-to-free-a-name step
+                -- above. `enable` renames every index still on the legacy
+                -- partition, indiscriminately -- not only harvest's own two
+                -- -- so it also catches every plain index an operator had
+                -- directly on the flat table before conversion. That
+                -- index's definition was captured and replayed onto the
+                -- new parent under its ORIGINAL, unsuffixed name before
+                -- the rename ran. An index by that same name and shape
+                -- already exists there. This one is its safely-superseded
+                -- old copy, not something independently added on the leaf.
+                c.relname = '{LEGACY_PARTITION}'
+                AND EXISTS (
+                    SELECT 1 FROM pg_class idxc WHERE idxc.oid = i.indexrelid
+                      AND right(idxc.relname, {suffix_len}) = '{LEGACY_RENAME_SUFFIX}'
+                      AND EXISTS (
+                          SELECT 1
+                            FROM pg_index i2
+                            JOIN pg_class c2 ON c2.oid = i2.indrelid
+                            JOIN pg_class idxc2 ON idxc2.oid = i2.indexrelid
+                            JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+                           WHERE c2.relname = 'harvest_events'
+                             AND n2.nspname = current_schema()
+                             AND idxc2.relname = left(idxc.relname, length(idxc.relname) - {suffix_len})
+                             AND (SELECT array_agg(a.attname::text ORDER BY k)
+                                    FROM generate_series(0, i2.indnkeyatts - 1) k
+                                    JOIN pg_attribute a ON a.attrelid = i2.indrelid AND a.attnum = i2.indkey[k]
+                                 )
+                               = (SELECT array_agg(a.attname::text ORDER BY k)
+                                    FROM generate_series(0, i.indnkeyatts - 1) k
+                                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k])
+                      )
                 )
             )
           ORDER BY 1"
@@ -1866,6 +1902,36 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
 /// [`HarvestError::Database`] if the catalog query fails.
 #[cfg(feature = "db")]
 pub async fn unreplayable_constraints(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
+    // Review finding: the cohort-`CHECK` exemption below used to accept
+    // any same-shaped bound on `{LEGACY_PARTITION}` too, not only on
+    // `harvest_events`. The enable-side preflight cannot do this: the
+    // real cutover is not chosen yet there. This relation is different.
+    // It already carries its own attached upper bound once it exists as
+    // a partition. [`list_partitions`] already parses that bound
+    // robustly (issue
+    // #1270 item 15's `DateStyle` fix). Read here so the exemption can
+    // require an exact match against it, the same way
+    // [`expected_cohort_ck_def_sql`]'s other callers do once they know
+    // the real value. `None` when `harvest_events` is not yet
+    // partitioned. This relation cannot carry the constraint at all
+    // then. The `harvest_events`-named branch below, still shape-only,
+    // is the only one that can ever match.
+    let legacy_upper = list_partitions(conn)
+        .await?
+        .into_iter()
+        .find(|p| p.name == LEGACY_PARTITION)
+        .and_then(|p| p.upper);
+    let legacy_cohort_ck_clause = legacy_upper.map_or_else(
+        || "false".to_string(),
+        |upper| {
+            let expected =
+                expected_cohort_ck_def_sql(&format!("{}::timestamptz", ts_literal(upper)));
+            format!(
+                "(t.relname = '{LEGACY_PARTITION}'
+                  AND pg_get_constraintdef(con.oid) IN ({expected}, {expected} || ' NOT VALID'))"
+            )
+        },
+    );
     let rows = diesel::sql_query(format!(
         "SELECT DISTINCT con.conname AS v
            FROM pg_constraint con
@@ -1906,12 +1972,14 @@ pub async fn unreplayable_constraints(conn: &mut AsyncPgConnection) -> HarvestRe
                 )
                 AND con.contype = 'c'
                 AND NOT con.condeferrable
-                AND t.relname IN ('harvest_events', '{LEGACY_PARTITION}')
                 AND (SELECT array_agg(a.attname::text ORDER BY k)
                        FROM generate_subscripts(con.conkey, 1) k
                        JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]
                     ) = ARRAY['cohort']
-                AND pg_get_constraintdef(con.oid) ~ '{LEGACY_COHORT_CK_DEF_RE}'
+                AND (
+                    (t.relname = 'harvest_events' AND pg_get_constraintdef(con.oid) ~ '{LEGACY_COHORT_CK_DEF_RE}')
+                    OR {legacy_cohort_ck_clause}
+                )
             )
           ORDER BY 1"
     ))
