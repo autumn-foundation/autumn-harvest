@@ -13,7 +13,7 @@ and is out of scope for any entry to accept on its own say-so.
 
 | # | job / backlog item | verdict | report |
 |--:|:--|:--|:--|
-| 1 | Issue #955 (official TypeScript/Python management-API SDKs): does admissible behavioral evidence exist anywhere in the accessible record for the demand this spec asserts? | **hold** — 0 admissible signals found in a full-corpus workaround-census sweep (issues, PRs, code comments, docs); spec never named or measured the cheaper current hire (#694's already-shipped OpenAPI spec via self-serve codegen) it would need to beat. Probe registered, not yet run. | [0001-sdk-clients-955-discovery-gate.md](0001-sdk-clients-955-discovery-gate.md) |
+| 1 | Issue #955 (official TypeScript/Python management-API SDKs): does admissible behavioral evidence exist anywhere in the accessible record for the demand this spec asserts? | **hold** — no workaround evidence found in this repository's issues/PRs (an issue-search instrument later shown, by its own negative-control test, to be able to miss a differently-worded complaint) or in the code corpus's one checked raw-HTTP idiom (`curl`, exhaustively grepped); not a full-corpus sweep for every possible client library or wording. Spec also never named or measured the cheaper current hire (#694's since-shipped OpenAPI spec via self-serve codegen) it would need to beat. Probe registered, not yet run. | [0001-sdk-clients-955-discovery-gate.md](0001-sdk-clients-955-discovery-gate.md) |
 
 ## Methodology note
 
