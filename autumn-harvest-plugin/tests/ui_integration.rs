@@ -1409,9 +1409,9 @@ async fn ui_workers_unknown_status_value_redisplays_form_instead_of_aborting_pag
 /// alongside it. Same mechanism as the Workflows page's
 /// `invalid_limit_redisplays_form_instead_of_aborting_page` (#1540).
 ///
-/// GREEN (this commit): the request still renders the Workers page (`200`),
-/// preserves the other filter, and surfaces a `role="alert"` message naming
-/// the bad value next to the "Per page" field.
+/// GREEN (this commit): the request still renders the Workers page
+/// (`200`) and preserves the other filter. It surfaces a `role="alert"`
+/// message naming the bad value next to the "Per page" field.
 #[tokio::test]
 async fn ui_workers_invalid_limit_redisplays_form_instead_of_aborting_page() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -1438,9 +1438,10 @@ async fn ui_workers_invalid_limit_redisplays_form_instead_of_aborting_page() {
 }
 
 /// Same fix, the `page` field. No form field backs it; it drives the
-/// Previous/Next links instead, a distinct code path — covered
-/// independently here rather than assumed symmetric with `limit`, matching
-/// the Workflows page's `invalid_page_redisplays_list_instead_of_aborting_page`.
+/// Previous/Next links instead, a distinct code path. Covered
+/// independently here rather than assumed symmetric with `limit`,
+/// matching the Workflows page's
+/// `invalid_page_redisplays_list_instead_of_aborting_page`.
 #[tokio::test]
 async fn ui_workers_invalid_page_redisplays_list_instead_of_aborting_page() {
     let (database_url, _container) = setup_test_database_url().await;

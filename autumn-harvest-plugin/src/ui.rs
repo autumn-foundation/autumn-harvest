@@ -369,10 +369,11 @@ struct BlockedOnData {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct WorkerListParams {
-    // `page`/`limit` are `String`, not `i64` — see `list_workers_ui`'s
+    // `page`/`limit` are `String`, not `i64`. See `list_workers_ui`'s
     // handling for why: an `i64`-typed field fails axum's query
     // deserialization on non-numeric text with a bare 400 before this
-    // handler ever runs, discarding every other filter already on the URL.
+    // handler ever runs. That discards every other filter already on the
+    // URL.
     #[serde(default)]
     page: Option<String>,
     #[serde(default)]
@@ -2821,14 +2822,15 @@ async fn list_workers_ui(
 
     // Issue: `page`/`limit` were still typed `Option<i64>` directly on
     // `WorkerListParams` — the two fields left over after status/stale/shard
-    // above got this same fix. A non-numeric value on either — a
-    // hand-edited URL, a bookmarked link past the current worker count, a
-    // pasted "Per page" value — failed axum's own query deserialization
-    // with a bare 400 before the filter form or any worker row rendered,
-    // discarding every other filter the operator had already entered. Same
-    // fix as `parse_page_query_field`/`parse_limit_query_field` on the
-    // Workflows page (#1540): degrade to a default and report the bad
-    // value inline instead of aborting the page.
+    // above got this same fix. A non-numeric value on either reaches this
+    // struct through a hand-edited URL, a bookmarked link past the current
+    // worker count, or a pasted "Per page" value. Any of those failed
+    // axum's own query deserialization with a bare 400. That happened
+    // before the filter form or any worker row rendered, discarding every
+    // other filter the operator had already entered. Same fix as
+    // `parse_page_query_field`/`parse_limit_query_field` on the Workflows
+    // page (#1540): degrade to a default and report the bad value inline
+    // instead of aborting the page.
     let (limit, limit_raw, limit_error) = parse_limit_query_field(params.limit.as_deref());
     let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
     let offset = page.saturating_mul(limit);
@@ -4526,8 +4528,8 @@ fn render_worker_filters(
                 "Per page"
                 // `type="text"`, not `type="number"`. A number input
                 // sanitizes an invalid value (e.g. "not-a-number") to
-                // blank at render time, so the operator could never see or
-                // correct their own bad input — matches the Workflows
+                // blank at render time. The operator could then never see
+                // or correct their own bad input — matches the Workflows
                 // page's "Per page" field and this page's own `shard`
                 // filter.
                 input type="text" inputmode="numeric" pattern="[0-9]*" name="limit" value=(limit_value);
@@ -12859,8 +12861,8 @@ mod tests {
     }
 
     /// Same Codex finding as the Workflows page's
-    /// `build_query_string_preserves_invalid_limit_text_for_pagination`:
-    /// `limit_raw` is non-empty only on a genuine parse failure, and must
+    /// `build_query_string_preserves_invalid_limit_text_for_pagination`.
+    /// `limit_raw` is non-empty only on a genuine parse failure. It must
     /// override the resolved `limit` in the Next/Previous link rather than
     /// being silently dropped alongside it.
     #[test]
@@ -14228,8 +14230,8 @@ mod tests {
     }
 
     /// GREEN — the fix under test: an invalid `page` value renders a
-    /// `field-error` above the pagination controls (which have no backing
-    /// form field of their own), matching the Workflows page's
+    /// `field-error` above the pagination controls. Those controls have no
+    /// backing form field of their own, matching the Workflows page's
     /// `render_pagination`.
     #[test]
     fn render_worker_pagination_shows_page_error() {
