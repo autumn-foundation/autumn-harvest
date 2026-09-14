@@ -348,24 +348,24 @@ async fn always_panics_wf(ctx: &WorkflowContext, _n: i64) -> Result<i64, String>
 /// enough to re-strike a co-located panicking execution, if the fix did not
 /// skip it after its first strike.
 #[workflow]
-async fn four_step_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
-    let a = ctx
-        .execute_activity_raw("increment", json!(n), "default")
+async fn four_step_wf(ctx: &WorkflowContext, start: i64) -> Result<i64, String> {
+    let step1 = ctx
+        .execute_activity_raw("increment", json!(start), "default")
         .await
         .map_err(|e| e.to_string())?;
-    let b = ctx
-        .execute_activity_raw("increment", a, "default")
+    let step2 = ctx
+        .execute_activity_raw("increment", step1, "default")
         .await
         .map_err(|e| e.to_string())?;
-    let c = ctx
-        .execute_activity_raw("increment", b, "default")
+    let step3 = ctx
+        .execute_activity_raw("increment", step2, "default")
         .await
         .map_err(|e| e.to_string())?;
-    let d = ctx
-        .execute_activity_raw("increment", c, "default")
+    let step4 = ctx
+        .execute_activity_raw("increment", step3, "default")
         .await
         .map_err(|e| e.to_string())?;
-    Ok(d.as_i64().unwrap_or_default())
+    Ok(step4.as_i64().unwrap_or_default())
 }
 
 /// Codex P1 follow-up on the #1555 fix. A single `run_until_idle()` call
