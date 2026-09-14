@@ -25,9 +25,30 @@ set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+main_rs="examples/claude-agent-daemon/src/main.rs"
+protocol_rs="examples/claude-agent-daemon/src/protocol.rs"
+
+# Read the defaults from source rather than hard-coding them, so a renamed
+# default fails this check instead of leaving it checking stale names while
+# the daemon writes its runtime state to a new, unignored path.
+db_default="$(sed -n 's/.*env = "AGENTD_DB", default_value = "\([^"]*\)".*/\1/p' "$main_rs")"
+socket_default="$(sed -n 's/.*DEFAULT_SOCKET: &str = "\([^"]*\)";.*/\1/p' "$protocol_rs")"
+
+if [ -z "$db_default" ]; then
+  echo "$main_rs: could not find AGENTD_DB's default_value; has the --db" \
+    "argument been restructured? Update this guard to match." >&2
+  exit 1
+fi
+
+if [ -z "$socket_default" ]; then
+  echo "$protocol_rs: could not find DEFAULT_SOCKET; has it been renamed or" \
+    "moved? Update this guard to match." >&2
+  exit 1
+fi
+
 missing=""
 
-for name in agentd.db agentd.db-shm agentd.db-wal agentd.sock agentd.sock.lock; do
+for name in "$db_default" "$db_default-shm" "$db_default-wal" "$socket_default" "$socket_default.lock"; do
   if ! git check-ignore -q -- "$name"; then
     missing="${missing}${name}\n"
   fi
