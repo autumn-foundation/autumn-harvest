@@ -407,12 +407,12 @@ pub struct SweepOptions {
     /// counting both successful drops and partitions left blocked.
     ///
     /// `max_drops` alone bounds only successes. A partition that is blocked
-    /// still costs a gate evaluation — possibly a tier-3 scan up to
-    /// `exact_scan_timeout` — and does not count against that budget. A shard
-    /// with a long-lived execution pinning many old cohorts could otherwise
-    /// evaluate every closed partition, drop none, and spend `partitions *
-    /// exact_scan_timeout` doing it in one tick. This bounds the attempt, not
-    /// just the outcome (issue #1270 item 1).
+    /// still costs a gate evaluation, possibly a tier-3 scan up to
+    /// `exact_scan_timeout`. That cost does not count against the drop
+    /// budget. A shard with a long-lived execution pinning many old cohorts
+    /// could otherwise evaluate every closed partition, drop none. It would
+    /// spend `partitions * exact_scan_timeout` doing it in one tick. This
+    /// bounds the attempt, not just the outcome (issue #1270 item 1).
     pub max_attempts: usize,
     /// How long to wait for that lock before giving up on a partition.
     ///
@@ -435,10 +435,10 @@ pub struct SweepOptions {
     ///
     /// Enforced as a `statement_timeout`, the same fail-safe shape as
     /// `exact_scan_timeout`. Without it, a partition where orphans are sparse
-    /// can run an unbounded delete: the inner `SELECT` re-scans the leading
-    /// owned rows on every batch, so it is quadratic in the partition size,
-    /// and `max_batches` alone does not bound wall time (issue #1270 item 2).
-    /// A timeout here is "did what it could this batch, retry next tick", not
+    /// can run an unbounded delete. The inner `SELECT` re-scans the leading
+    /// owned rows on every batch, so it is quadratic in the partition size.
+    /// `max_batches` alone does not bound wall time (issue #1270 item 2). A
+    /// timeout here is "did what it could this batch, retry next tick", not
     /// an error.
     pub straggler_delete_timeout: Duration,
     /// How many surviving old executions the narrow ownership probe will
@@ -488,8 +488,8 @@ pub struct SweepOutcome {
     pub straggler_rows_deleted: usize,
     /// `true` when this pass stopped before considering every partition,
     /// because it hit `max_drops` or `max_attempts`. The remainder is picked
-    /// up next tick; this is the operator's answer to "why doesn't `blocked`
-    /// list every closed partition?" (issue #1270 item 1).
+    /// up next tick. This is the operator's answer to "why does `blocked`
+    /// not list every closed partition?" (issue #1270 item 1).
     pub truncated: bool,
 }
 
@@ -664,13 +664,14 @@ pub async fn list_partitions(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<
 
     // `pg_get_expr` renders the bound's timestamp literals in the SESSION's
     // `DateStyle`, not a fixed format. `parse_partition_bound` only accepts
-    // ISO year-first forms, so on a connection using e.g. `SQL, DMY` — set
+    // ISO year-first forms. On a connection using e.g. `SQL, DMY` — set
     // globally by an operator, or inherited from a pooler — every finite
-    // bound would parse as `None`: existing cohorts fail the exact-bound
-    // check, and the sweeper treats bounded partitions as unbounded rather
-    // than reclaiming them (issue #1270 item 15). Pinned here, inside its own
-    // transaction, rather than on the shared connection, so this never
-    // changes what any other statement on this connection sees.
+    // bound would parse as `None`. Existing cohorts would then fail the
+    // exact-bound check. The sweeper would treat bounded partitions as
+    // unbounded rather than reclaiming them (issue #1270 item 15). Pinned
+    // here, inside its own transaction, rather than on the shared
+    // connection, so this never changes what any other statement on this
+    // connection sees.
     let rows = Box::pin(conn.transaction::<Vec<Row>, HarvestError, _>(async |conn| {
         exec(conn, "SET LOCAL DateStyle = 'ISO, YMD'").await?;
         diesel::sql_query(
@@ -942,10 +943,10 @@ pub struct EnsurePartitionsOutcome {
     pub created: Vec<String>,
     /// Cohorts that could not be created this pass (each the cohort's start,
     /// RFC 3339), retried next tick. Non-empty here does not mean the pass
-    /// failed — [`ensure_partitions`] only errors when nothing at all could
-    /// be covered — but it does mean part of the write window is uncovered,
-    /// which a caller reporting only `created` would miss (issue #1270 item
-    /// 4).
+    /// failed. [`ensure_partitions`] only errors when nothing at all could
+    /// be covered. It does mean part of the write window is uncovered,
+    /// though. A caller reporting only `created` would miss that (issue
+    /// #1270 item 4).
     pub blocked: Vec<String>,
 }
 
@@ -1176,10 +1177,11 @@ async fn refuse_if_row_security(conn: &mut AsyncPgConnection, verb: &str) -> Har
 ///
 /// Postgres tracks a view's dependency by relation **OID**, not name. Both
 /// conversion directions rename `harvest_events` out of the way and create
-/// the replacement under the original name, so a dependent view keeps
-/// pointing at the RENAMED relation — which, from the moment of conversion,
-/// is only the pre-cutover slice. The view keeps returning rows and is now
-/// silently wrong, rather than obviously broken (issue #1270 item 14).
+/// the replacement under the original name. A dependent view therefore
+/// keeps pointing at the RENAMED relation. From the moment of conversion,
+/// that relation is only the pre-cutover slice. The view keeps returning
+/// rows and is now silently wrong, rather than obviously broken (issue
+/// #1270 item 14).
 #[cfg(feature = "db")]
 async fn dependent_views(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
     let rows = diesel::sql_query(
@@ -1229,8 +1231,8 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
 /// the table with — does not carry triggers, `INCLUDING` list or not; there
 /// is no `INCLUDING TRIGGERS` option. An operator-installed audit or
 /// validation trigger is therefore silently dropped from the replacement
-/// (issue #1270 item 16), which for an audit trigger is a compliance defect,
-/// not just a schema one.
+/// (issue #1270 item 16). For an audit trigger, that is a compliance
+/// defect, not just a schema one.
 #[cfg(feature = "db")]
 async fn user_defined_triggers(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
     let rows = diesel::sql_query(
@@ -1278,10 +1280,10 @@ async fn refuse_if_user_triggers(conn: &mut AsyncPgConnection, verb: &str) -> Ha
 ///
 /// Postgres requires every partition-key column in a unique index on a
 /// partitioned table. `capture_index_defs` (and the scripted plan's own
-/// capture) replay every non-constraint index verbatim, so a pre-existing
-/// unique index missing `cohort` — perfectly valid on the flat layout —
-/// aborts the conversion with a raw `Postgres` error that does not say what
-/// is unsupported or why (issue #1270 item 10).
+/// capture) replay every non-constraint index verbatim. A pre-existing
+/// unique index missing `cohort` is perfectly valid on the flat layout.
+/// Replaying it verbatim aborts the conversion with a raw `Postgres` error
+/// that does not say what is unsupported or why (issue #1270 item 10).
 #[cfg(feature = "db")]
 async fn unique_indexes_without_cohort(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
     let rows = diesel::sql_query(
@@ -1308,7 +1310,7 @@ async fn unique_indexes_without_cohort(conn: &mut AsyncPgConnection) -> HarvestR
 }
 
 /// The refusal only the enable direction needs: `cohort` cannot appear in an
-/// index the flat layout never had, so this cannot arise going the other way.
+/// index the flat layout never had. So this cannot arise going the other way.
 #[cfg(feature = "db")]
 async fn refuse_if_unique_index_without_cohort(conn: &mut AsyncPgConnection) -> HarvestResult<()> {
     let indexes = unique_indexes_without_cohort(conn).await?;
@@ -1419,24 +1421,24 @@ pub async fn enable_partitioning(
         .map_err(|e| HarvestError::Database(format!("partition enable script failed: {e}")))?;
 
     // Report which path the script took, and which cohorts it pre-created,
-    // by reading the catalog it produced — rather than by predicting either:
-    // whether the table had rows is the script's decision, made under the
-    // lock it holds, and so is exactly which cohorts its own lookahead loop
+    // by reading the catalog it produced, rather than by predicting either.
+    // Whether the table had rows is the script's decision, made under the
+    // lock it holds. So too is exactly which cohorts its own lookahead loop
     // (inside `enable_sql`, under the SAME lock) managed to create.
     //
     // Issue #1270 item 8: a SECOND `ensure_partitions` pass here used to
     // stand in for this read, and got two things wrong at once. It always
     // reported zero created, because `enable_sql` had already created them
     // and the second pass found nothing left to do. And on a conversion that
-    // crossed a cohort boundary mid-script, it could outright FAIL: `now` was
-    // captured before the script ran, so the second pass could ask for a
-    // cohort that now overlapped the just-attached legacy partition — a
+    // crossed a cohort boundary mid-script, it could outright FAIL. `now`
+    // was captured before the script ran, so the second pass could ask for
+    // a cohort that now overlapped the just-attached legacy partition. A
     // conversion that had already committed successfully would then report
     // an error. Reading the catalog instead of re-asking the question the
-    // script already answered fixes both: every partition here other than
+    // script already answered fixes both. Every partition here other than
     // `DEFAULT` and the legacy one can only be a cohort `enable_sql` itself
-    // created for the lookahead window, immediately prior, under this same
-    // lock.
+    // created for the lookahead window. That happens immediately prior,
+    // under this same lock.
     let parts = list_partitions(conn).await?;
     let mode = parts
         .iter()
@@ -1462,25 +1464,25 @@ pub async fn enable_partitioning(
 const RENAME_HELPER_DECLARE: &str = "    new_name text;\n    bump     int;\n    room     int;";
 
 /// Rename every constraint and index on `table` that does not already carry
-/// `suffix`, freeing their names for the replacement parent — collision-safe
-/// at Postgres's 63-byte identifier limit.
+/// `suffix`, freeing their names for the replacement parent. This is
+/// collision-safe at Postgres's 63-byte identifier limit.
 ///
-/// Naively appending `suffix` (`name || suffix`) truncates silently there: a
-/// name already at or near the limit renames to ITSELF, so its name is never
-/// actually freed — and a second object whose name shares the same
-/// leading 63 bytes then collides with it on ITS rename, aborting the whole
-/// conversion with a `duplicate_object` error that does not point at the
-/// cause. This truncates the base FIRST, leaving room for `suffix`, then
-/// verifies the result is actually free — appending a numeric disambiguator
-/// on a collision, which handles two existing names agreeing on their first
-/// `63 - len(suffix)` bytes (issue #1270 item 9).
+/// Naively appending `suffix` (`name || suffix`) truncates silently there.
+/// A name already at or near the limit renames to ITSELF, so its name is
+/// never actually freed. A second object whose name shares the same
+/// leading 63 bytes then collides with it on ITS rename. That aborts the
+/// whole conversion with a `duplicate_object` error that does not point at
+/// the cause. This truncates the base FIRST, leaving room for `suffix`,
+/// then verifies the result is actually free. It appends a numeric
+/// disambiguator on a collision. That handles two existing names agreeing
+/// on their first `63 - len(suffix)` bytes (issue #1270 item 9).
 ///
-/// Emitted as plpgsql statements (not a standalone `DO` block) so a caller
-/// can splice this into a larger block that already declares `obj record;`
-/// — see [`RENAME_HELPER_DECLARE`] for the rest of what it needs declared.
-/// Constraint names are unique per-table, so their collision check is scoped
-/// to `table`; index names are relations, unique per-schema, so theirs is
-/// scoped to `current_schema()`.
+/// Emitted as plpgsql statements, not a standalone `DO` block. That lets a
+/// caller splice this into a larger block that already declares `obj
+/// record;`. See [`RENAME_HELPER_DECLARE`] for the rest of what it needs
+/// declared. Constraint names are unique per-table, so their collision
+/// check is scoped to `table`; index names are relations, unique
+/// per-schema, so theirs is scoped to `current_schema()`.
 #[must_use]
 fn collision_safe_rename_stmts(table: &str, suffix: &str) -> String {
     let suffix_len = suffix.len();
@@ -1899,8 +1901,8 @@ fn quote_ident(ident: &str) -> String {
 
 /// Truncate `s` to at most `max` bytes without splitting a UTF-8 codepoint.
 ///
-/// Postgres truncates identifiers on BYTES (`NAMEDATALEN`), and every name
-/// this truncates is engine- or operator-generated ASCII, so byte truncation
+/// Postgres truncates identifiers on BYTES (`NAMEDATALEN`). Every name this
+/// truncates is engine- or operator-generated ASCII, so byte truncation
 /// agrees with Postgres's own limit in the case this exists for.
 #[cfg(any(feature = "db", test))]
 fn truncate_ident(s: &str, max: usize) -> &str {
@@ -2090,9 +2092,10 @@ pub async fn disable_partitioning(
             .await?;
             // Rename the parent's constraints/indexes so the flat table can
             // reclaim their names, exactly as the enable path does in
-            // reverse — collision-safe at the 63-byte identifier limit
-            // (issue #1270 item 9): naively appending a suffix truncates
-            // silently there, renaming a long-enough name to itself.
+            // reverse. This is collision-safe at the 63-byte identifier
+            // limit (issue #1270 item 9). Naively appending a suffix
+            // truncates silently there, renaming a long-enough name to
+            // itself.
             let con_rows = diesel::sql_query(
                 "SELECT conname AS v FROM pg_constraint \
                  WHERE conrelid = 'harvest_events_partitioned'::regclass",
@@ -2866,9 +2869,9 @@ async fn delete_orphan_rows(
             .bind::<BigInt, _>(batch);
         // Each batch runs in its own transaction under `statement_timeout` —
         // the same fail-safe shape as the tier-3 exact scan. Without a
-        // timeout, one batch's `DELETE` has no bound of its own: `max_batches`
-        // bounds the number of statements, not how long any one of them may
-        // run (issue #1270 item 2).
+        // timeout, one batch's `DELETE` has no bound of its own.
+        // `max_batches` bounds the number of statements, not how long any
+        // one of them may run (issue #1270 item 2).
         let result = Box::pin(conn.transaction::<i64, HarvestError, _>(async |conn| {
             exec(conn, &format!("SET LOCAL statement_timeout = '{ms}ms'")).await?;
             let n = if let Some(lower) = lower {
@@ -2883,7 +2886,7 @@ async fn delete_orphan_rows(
         let deleted = match result {
             Ok(n) => usize::try_from(n).unwrap_or(usize::MAX),
             // Fail safe: keep whatever earlier batches in this pass already
-            // removed, and retry the rest of this partition next tick, rather
+            // removed. Retry the rest of this partition next tick, rather
             // than treating an unfinished batch as a hard error.
             Err(HarvestError::Database(msg)) if is_statement_timeout(&msg) => break,
             Err(e) => return Err(e),
@@ -3177,10 +3180,10 @@ async fn maintenance_owner_gap(
 ///
 /// This is what AC8's "no operator cron required" means in practice — the
 /// retention runtime calls it every tick and at startup. Returns `Ok(None)`
-/// on an unpartitioned shard, so it is safe to call unconditionally: there is
-/// nothing to do, and nothing is reported (issue #1270 item 6) — distinct
-/// from `Ok(Some(outcome))` on a shard that opted in and ran cleanly, and
-/// from `Err` on one that could not run at all.
+/// on an unpartitioned shard, so it is safe to call unconditionally. There
+/// is nothing to do, and nothing is reported (issue #1270 item 6). That is
+/// distinct from `Ok(Some(outcome))` on a shard that opted in and ran
+/// cleanly, and from `Err` on one that could not run at all.
 ///
 /// Ordered deliberately: draining first, because rows parked in `DEFAULT` block
 /// creation of the partitions that would cover them; then creating, so a tick
@@ -3238,7 +3241,7 @@ pub async fn maintain(
     // Issue #1270 item 4: a partly-blocked lookahead catch-up must not report
     // as clean. `ensure_partitions` already keeps creating the rest of the
     // window when one cohort is blocked (deliberately, so one bad cohort
-    // cannot stall the others) — this is what makes the partial failure
+    // cannot stall the others). This is what makes the partial failure
     // visible instead of silently dropping the blocked half.
     let last_error = match (drain_error, ensured.blocked.is_empty()) {
         (Some(drain), true) => Some(drain),
@@ -3279,9 +3282,9 @@ pub struct MaintenanceOutcome {
     pub created: Vec<String>,
     /// Cohorts that could not be created this pass (each the cohort's start,
     /// RFC 3339). Non-empty here means part of the write window is
-    /// uncovered and appends for it are landing in the `DEFAULT` partition
-    /// — surfaced separately from `last_error` so a caller can name the
-    /// range, not just learn that something failed.
+    /// uncovered, and appends for it are landing in the `DEFAULT` partition.
+    /// That is surfaced separately from `last_error` so a caller can name
+    /// the range, not just learn that something failed.
     pub uncovered_cohorts: Vec<String>,
     /// Rows moved out of the `DEFAULT` partition.
     pub drained: usize,
@@ -3454,7 +3457,7 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         //
         // `enable_partitioning` makes this check in Rust (`dependent_views`);
         // the scripted path needs its own because it never calls it. Postgres
-        // tracks a view's dependency by relation OID, not name, so the rename
+        // tracks a view's dependency by relation OID, not name. The rename
         // below leaves any dependent view pointing at the pre-cutover slice
         // — still returning rows, silently wrong rather than broken.
         step(
@@ -3511,7 +3514,7 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // `enable_partitioning` makes this check in Rust
         // (`unique_indexes_without_cohort`); the scripted path needs its own.
         // Postgres requires the partition key in every unique index on a
-        // partitioned table, so replaying one verbatim in phase 4 aborts —
+        // partitioned table. Replaying one verbatim in phase 4 aborts —
         // with a raw Postgres error that does not say what is unsupported.
         step(
             1,
@@ -3660,23 +3663,24 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // phase-2 build aborts before it has renamed anything. Without it,
         // `ATTACH PARTITION` below discovers the missing index only once the
         // exclusive lock is held, and builds it there.
-        // Checks SHAPE, not just name and `indisvalid` (issue #1270 item 11):
-        // if either fixed name already belonged to a VALID but structurally
-        // incompatible index (wrong columns, not unique, partial), `CREATE
-        // ... IF NOT EXISTS` in phase 2 would have skipped building a real
-        // one, this guard would count the impostor as ready, and `ATTACH
-        // PARTITION` below would build a real replacement inside the window
-        // this phase promises is metadata-only — the exact outcome this
-        // guard exists to prevent.
+        // Checks SHAPE, not just name and `indisvalid` (issue #1270 item 11).
+        // Suppose either fixed name already belonged to a VALID but
+        // structurally incompatible index — wrong columns, not unique,
+        // partial. `CREATE ... IF NOT EXISTS` in phase 2 would then have
+        // skipped building a real one. This guard would then count the
+        // impostor as ready. And `ATTACH PARTITION` below would build a
+        // real replacement inside the window this phase promises is
+        // metadata-only. That is the exact outcome this guard exists to
+        // prevent.
         //
         // Column lists are compared as ARRAYS, not via `pg_get_indexdef`
-        // text: an earlier version compared the rendered `CREATE INDEX ...`
-        // string, which embeds the schema name and was therefore only ever
-        // tested against `current_schema() = 'public'` — the one case where
-        // authoring the expected string by hand happened to line up.
+        // text. An earlier version compared the rendered `CREATE INDEX ...`
+        // string, which embeds the schema name. That was therefore only
+        // ever tested against `current_schema() = 'public'` — the one case
+        // where authoring the expected string by hand happened to line up.
         // `i.indkey::int2[]` also cannot be compared to a plain
-        // `array_agg(...)` with `=` directly: the cast produces a
-        // ZERO-based array while `array_agg` produces a ONE-based one, and
+        // `array_agg(...)` with `=` directly. The cast produces a
+        // ZERO-based array while `array_agg` produces a ONE-based one.
         // Postgres array equality considers the bounds, not just the
         // elements — silently comparing unequal even when the columns
         // match. Both sides are re-aggregated through `unnest ...
@@ -3862,9 +3866,9 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
     ];
     // Same override [`enable_partitioning`] honours in Rust, for the scripted
     // path — see [`incompatible_publications`]. Filtered out by its unique
-    // dollar-quote tag rather than left in the `vec!` conditionally, so the
-    // literal above stays a single readable top-to-bottom runbook (issue
-    // #1270 item 7).
+    // dollar-quote tag rather than left in the `vec!` conditionally. That
+    // way the literal above stays a single readable top-to-bottom runbook
+    // (issue #1270 item 7).
     if opts.allow_incompatible_publications {
         steps.retain(|s| !s.sql.contains("$harvest_pub_958$"));
     }

@@ -1032,15 +1032,15 @@ pub struct RetentionRuntime {
 
 /// One partition-maintenance pass across every shard (issue #958, AC8).
 ///
-/// Called both once at [`RetentionRuntime::spawn`] and every tick after —
-/// one implementation, so a startup pass and a tick pass can never disagree
+/// Called both once at [`RetentionRuntime::spawn`] and every tick after.
+/// One implementation, so a startup pass and a tick pass can never disagree
 /// about what "maintenance ran" means.
 ///
 /// `maintain` probes the layout itself and returns `Ok(None)` on an
-/// unpartitioned shard, so a deployment that has not opted in pays one cheap
+/// unpartitioned shard. A deployment that has not opted in pays one cheap
 /// catalog query and nothing else. Best-effort and per-shard: a shard whose
 /// maintenance fails logs and is retried next tick, and never fails the
-/// caller — history retention and reclamation are independent.
+/// caller. History retention and reclamation are independent.
 #[cfg(feature = "db")]
 async fn run_partition_maintenance(
     pools: &ShardedDbPool,
@@ -1117,7 +1117,7 @@ async fn run_partition_maintenance(
             // Issue #1270 item 6: `maintain` returns `Ok(None)` when this
             // shard's `harvest_events` is not partitioned. Leave
             // `partition_maintenance` at its default `None` rather than
-            // stamping a near-empty outcome — a permanently-unpartitioned
+            // stamping a near-empty outcome. A permanently-unpartitioned
             // shard must stay visibly distinct from one that opted in and is
             // idle.
             Ok(None) => {}
@@ -1194,9 +1194,9 @@ impl RetentionRuntime {
             // Issue #1270 item 5: restore cohort coverage at startup, not
             // after the first `tick_interval` sleep. A partitioned shard that
             // restarted after being offline longer than its lookahead window
-            // has no covering partition until this runs — every append lands
-            // in DEFAULT until either this pass or the first tick creates the
-            // missing cohort, and `tick_interval` defaults to one hour.
+            // has no covering partition until this runs. Every append lands
+            // in DEFAULT until either this pass or the first tick creates
+            // the missing cohort. And `tick_interval` defaults to one hour.
             run_partition_maintenance(&pools, &config, &monitor_task).await;
             loop {
                 tokio::select! {
@@ -1324,9 +1324,10 @@ impl RetentionRuntime {
                 // in the SAME tick that frees the cohort rather than the next
                 // one.
                 //
-                // Shared with the startup pass before this loop begins, so a
-                // restart after an outage does not wait a full tick_interval
-                // for its first coverage check (issue #1270 item 5).
+                // Shared with the startup pass before this loop begins. That
+                // way a restart after an outage does not wait a full
+                // tick_interval for its first coverage check (issue #1270
+                // item 5).
                 run_partition_maintenance(&pools, &config, &monitor_task).await;
 
                 // Purge old audit records once per tick, best-effort.

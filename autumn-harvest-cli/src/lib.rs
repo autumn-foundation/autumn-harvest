@@ -281,12 +281,13 @@ pub enum PartitionCommand {
 
         /// Omit phase 1's logical-replication publication guard.
         ///
-        /// `enable` honours this override; the plan did not (issue #1270 item
-        /// 7), leaving an operator who has already brought the subscriber
-        /// onto the partitioned layout — the supported path for a large
-        /// deployment — no way to proceed except hand-editing the generated
-        /// SQL. Set this only when the subscriber runs the partitioned
-        /// layout too, or the publication is not feeding a Harvest standby.
+        /// `enable` honours this override. The plan did not (issue #1270
+        /// item 7). That leaves an operator who has already brought the
+        /// subscriber onto the partitioned layout with no way to proceed
+        /// except hand-editing the generated SQL. That layout is the
+        /// supported path for a large deployment. Set this only when the
+        /// subscriber runs the partitioned layout too, or the publication is
+        /// not feeding a Harvest standby.
         #[arg(long = "allow-incompatible-publications")]
         allow_incompatible_publications: bool,
     },
@@ -6182,19 +6183,19 @@ async fn run_partition_maintain(
         .await
         {
             Ok(Some(outcome)) => {
-                // A pass that ran but did not COMPLETE — a `drain_default` that
-                // lost its bounded lock attempt, or a cohort creation left
-                // blocked, say — comes back with `last_error` set, because
-                // maintenance is best-effort and must never fail a retention
-                // tick. The CLI is not a retention tick. Without this,
-                // `harvest partition maintain` would print an ordinary
-                // zero-drain report and exit 0 while the DEFAULT partition
-                // stayed undrained, and scheduled operator automation would
-                // never notice.
+                // A pass that ran but did not COMPLETE comes back with
+                // `last_error` set. That covers a `drain_default` that lost
+                // its bounded lock attempt, or a cohort creation left
+                // blocked, say. Maintenance is best-effort and must never
+                // fail a retention tick. The CLI is not a retention tick.
+                // Without this, `harvest partition maintain` would print an
+                // ordinary zero-drain report and exit 0 while the DEFAULT
+                // partition stayed undrained, and scheduled operator
+                // automation would never notice.
                 row.error.clone_from(&outcome.last_error);
                 row.maintenance = Some(outcome);
             }
-            // Detected unpartitioned: nothing ran, nothing to report — a
+            // Detected unpartitioned: nothing ran, nothing to report. A
             // deployment that has not opted in exits 0 with no maintenance
             // row rather than a misleading empty one.
             Ok(None) => {}
