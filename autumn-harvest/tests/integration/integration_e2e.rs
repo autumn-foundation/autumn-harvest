@@ -1614,7 +1614,13 @@ fn slow_activity<'a>(
     input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // 3s, not 250ms (issue #1291 CI investigation): the prior 250ms real
+        // sleep left only a 200ms margin over the 50ms start-to-close budget
+        // below. A loaded CI runner's timeout-sweep tick can itself skip a
+        // beat under pool contention. A delay in that range was enough to
+        // change which events the workflow recorded. A wider real-time
+        // margin absorbs that jitter without changing what this test proves.
+        tokio::time::sleep(Duration::from_secs(3)).await;
         Ok(input)
     })
 }
@@ -3472,7 +3478,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     name: "slow_activity",
                     module: "integration_e2e",
                     default_retry_policy: None,
-                    default_start_to_close: Some(Duration::from_millis(50)),
+                    default_start_to_close: Some(Duration::from_millis(300)),
                     default_heartbeat_timeout: None,
                     default_schedule_to_start: None,
                     default_schedule_to_close: None,
