@@ -92,26 +92,40 @@ sha=<commit>)` and compared blob SHAs against `7fbfebb`'s diff:
 consequential question.** Issue #1558 is corrected to ask specifically: given
 `874784b9`'s config makes the original race provably impossible, what
 produced the same wrong event-history shape anyway? Candidates not yet
-distinguished: a *different* timeout type firing first (`ScheduleToStart` or
-`Heartbeat`, both present in `timeout.rs` alongside `StartToClose`), the
-timeout-enforcement sweep firing more than once for the same task, or an
-interaction with this test's own 10-second `workflow_task_timeout` config
-(also 10s, the same bound the wait loop uses — worth checking whether that is
-coincidence or coupling). This session did not have the diagnostic dump
-needed to tell which; the `matches!` assertion does not print the actual
+distinguished: the timeout-enforcement sweep firing more than once for the
+same task (appending an extra event), or an interaction with this test's own
+10-second `workflow_task_timeout` config (also 10s, the same bound the wait
+loop uses — worth checking whether that is coincidence or coupling).
+
+**Ruled out, verified against source:** a different timeout type
+(`ScheduleToStart` or `Heartbeat`) firing first or in addition. Both are
+disabled for this activity by construction — the post-hardening `ActivityInfo`
+sets `default_heartbeat_timeout: None` and `default_schedule_to_start: None`
+(`integration_e2e.rs:3488-3489`), `worker.rs:9373-9406` only writes the
+`heartbeat_timeout`/`schedule_to_start` columns on the task row when a config
+value (or, for schedule-to-start, a per-call override this ordinary activity
+doesn't use) is `Some`, and both timeout queries (`timeout.rs:86-90`,
+`161-172`) require their respective column to be `NOT NULL`. With both
+columns `NULL` for this task, neither query can ever match it — a Codex
+review catch on PR #1559, verified directly rather than taken on faith.
+
+This session did not have the diagnostic dump needed to distinguish the
+remaining candidates; the `matches!` assertion does not print the actual
 event sequence on failure, so the next occurrence should capture
 `history.events` before asserting, not just after it panics. One occurrence
 is not a rate. No same-commit rerun was run this session.
 
 ### 2. Dashboard panel-id collision: the same-day "root cause" fix (#1550) has not recurred in ~7 hours of post-merge sample
 
-4 of the 17 failures, plus one indirect case, were the already-known,
+6 of the 17 failures, plus one indirect case, were the already-known,
 already-being-actively-fixed Grafana panel-id collision
 (`dashboard_pack_docs::panel_structure_is_grafana10_clean`, panel id
 duplicated) — trunk-dev's own tip had this bug repeatedly during this window
 (runs `34794754199`, `34791486024`, `34776014650`, `34773156359`,
-`34772990914`, `34772453914`, `34770812085`, all timestamped **before**
-2026-09-14T02:29:41Z). That is not a new finding: commits `b3f8e84`,
+`34772990914`, `34772453914`, all timestamped **before**
+2026-09-14T02:29:41Z; `34770812085`, in an earlier draft's list here, is a
+different run — a clippy `large_futures` compile error, item 4 below — and
+did not belong in this list). That is not a new finding: commits `b3f8e84`,
 `9fec854`, `e98a676` (merged at exactly that timestamp) already diagnosed and
 fixed the recurring pattern, the last one adding
 `docs/dashboards/next-panel-id.py` specifically so the collision stops
@@ -155,11 +169,16 @@ as an open item requiring action yet.
 The other failures in the 17 were each a deterministic gate correctly doing
 its job on that branch's own change, not suite nondeterminism: unused-import
 compile errors (`partition.rs`), a `seeded_corpus_is_clean_under_the_syntactic_layer`
-determinism-analysis failure, `cargo clippy`'s `large_futures` lint, and three
-separate comment-hygiene Tier B regressions (`dev_runtime_lifecycle.rs`,
-`poison_pill_reclaim_perf.rs`, `rate_limit_bucket_gc_tests.rs`) — each a real,
-correct red on a PR that added a violation, not something this role's rerun
-protocol or revert-check machinery applies to.
+determinism-analysis failure, `cargo clippy`'s `large_futures` lint (run
+`34770812085`), and three separate comment-hygiene Tier B regressions
+(`dev_runtime_lifecycle.rs`, `poison_pill_reclaim_perf.rs`,
+`rate_limit_bucket_gc_tests.rs`) — each a real, correct red on a PR that added
+a violation, not something this role's rerun protocol or revert-check
+machinery applies to. Run `34772453914` (item 2's list above) additionally
+failed `benchmarks_docs::no_ci_manifest_row_runs_the_end_to_end_benchmark`
+alongside the dashboard collision, on three `Test (<os>)` legs; not
+separately investigated this session — noted here rather than silently
+folded into the dashboard count, since it is a different assertion.
 
 ## 🔍 Diagnosis
 
@@ -207,10 +226,12 @@ mechanism, no clustering. Recorded so a repeat is recognized as a repeat.
   evidence per this role's own Tier distinctions, not a Tier-1 measured rate.
   1 occurrence of the post-hardening failure is offered as grounds to
   prioritize issue #1558's narrowed question, not as a rate claim.
-- **Item 2:** 0/17 sampled failures after 2026-09-14T02:29:41Z (the
-  root-cause fix's merge time) carried the collision signature, against 6
-  direct occurrences before it in the same 17-hour window. ~7h post-fix
-  sample only.
+- **Item 2:** of the 17 sampled failures, 2 (`34800863625`, `34799721202`)
+  occurred after 2026-09-14T02:29:41Z (the root-cause fix's merge time);
+  0 of those 2 carried the collision signature, against 6 direct occurrences
+  among the 15 failures before it in the same window. ~7h post-fix sample,
+  and a denominator of 2 is thin — not a clean bill of health, a short
+  window with no recurrence yet.
 - **Item 3:** 1/1 for each of three distinct signatures — explicitly not a
   rate.
 - No revert check applies — no fix in this report to verify red-then-green
