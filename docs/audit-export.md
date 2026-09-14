@@ -16,9 +16,18 @@ HTTP client, a `reqwest` signed-webhook implementation in the plugin, a
 two-transaction scanner that never holds a row lock across network I/O, and a
 per-shard cursor that advances only on acknowledgement.
 
-- **It is opt-in.** With no sink configured, nothing changes: no sequence is
-  assigned, no cursor row is created, the scanner returns before issuing a
-  single query.
+- **It is opt-in, but one cost is not zero.** With no sink configured, no
+  sequence is assigned, no cursor row is created, and the scanner returns
+  before issuing a single query. Insert behavior is the exception:
+  `harvest_audit_log_unexported_idx` is a partial index on `export_seq IS
+  NULL`. An unconfigured deployment leaves every row `NULL` forever, so the
+  index matches the whole audit table. Every audit insert then pays its
+  maintenance cost. That cost is bounded only while retention actually
+  reclaims unexported rows. See "Retention interaction" below for the exact
+  conditions, which are more than one config flag. Tracked as issue #1272.
+  Even then the bound is not total. Retention can never purge a
+  decommission or reactivation record, exported or not. That holds no
+  matter how many requests a shard has seen.
 - **It never touches workflow history.** No new `WorkflowEvent` variant, no
   replay-determinism impact. Audit rows are operational metadata; the exporter
   only reads them.
@@ -247,9 +256,15 @@ shipped, even one past the retention window. A sweep that removed an unexported
 row would be a silent compliance gap — gone from the database *and* absent from
 the SIEM, with nothing anywhere to show it was lost.
 
-The guard applies when either signal says an exporter still owes this shard
-records — but the two are not simply OR'd. **A shard's own cursor row, once
-it exists, is authoritative**, retired or not:
+That guard only matters once the purge actually runs at all. It needs
+`audit_retention_days > 0` and `dry_run` set to false; either one unmet
+means no sweep touches `harvest_audit_log`, unexported row or not (issue
+#1272).
+
+Given the purge runs, the guard applies when either signal says an
+exporter still owes this shard records — but the two are not simply OR'd.
+**A shard's own cursor row, once it exists, is authoritative**, retired or
+not:
 
 - **A live (non-retired) cursor row exists for the shard.** Durable, shared
   state, so it works when retention and export run in **different

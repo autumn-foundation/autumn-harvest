@@ -5,18 +5,23 @@
 -- `WorkflowEvent` variant, no change to `harvest_events`, no replay impact —
 -- the exporter only READS `harvest_audit_log` and writes its own bookkeeping.
 --
--- Nothing here is seeded and nothing runs on the hot path: with no sink
--- configured, `export_seq` stays NULL on every row forever and the cursor
--- table stays empty.
+-- Nothing here is seeded, and the exporter adds no hot-path work: with no
+-- sink configured, `export_seq` stays NULL on every row forever and the
+-- cursor table stays empty.
 --
 -- One cost is NOT zero, and saying otherwise would be wrong: the partial index
 -- below is predicated on `export_seq IS NULL`, which for an unconfigured
 -- deployment matches EVERY row. Such a deployment therefore pays a full index
 -- build at migration time and index maintenance on every subsequent audit
--- insert, for a feature it never turns on. Bounded by the audit retention
--- window rather than unbounded, but real. Tracked as
+-- insert, for a feature it never turns on. That cost is bounded only while
+-- retention actually reclaims unexported rows -- see
+-- docs/audit-export.md's "Retention interaction" section for the exact
+-- conditions, which are more than one config flag. Tracked as
 -- autumn-foundation/autumn-harvest#1272, which weighs creating the index
--- lazily on first opt-in against leaving it here.
+-- lazily on first opt-in against leaving it here. Even then the bound is
+-- not total. Retention can never purge a decommission or reactivation
+-- record, exported or not. That holds no matter how many requests a
+-- shard has seen.
 
 -- ── The per-shard monotonic sequence (AC4) ────────────────────────────────
 --
@@ -49,7 +54,8 @@ COMMENT ON COLUMN harvest_audit_log.export_seq IS
     'the cursor, not these values, which is what makes re-export byte-identical.';
 
 -- Claim scan: `WHERE export_seq IS NULL ORDER BY occurred_at, id LIMIT n`.
--- A partial index, so it stays empty (and free) when no sink is configured.
+-- A partial index, but it is NOT empty when no sink is configured: it then
+-- matches every row. See the header caveat above (issue #1272).
 CREATE INDEX IF NOT EXISTS harvest_audit_log_unexported_idx
     ON harvest_audit_log (occurred_at, id)
     WHERE export_seq IS NULL;
