@@ -2262,6 +2262,45 @@ fn an_unreadable_postmaster_pid_file_leaves_the_session_alone() {
     assert!(!session_dir.exists(), "{}", session_dir.display());
 }
 
+#[test]
+fn a_tokenless_but_live_postmaster_survives_the_full_reap_pipeline() {
+    // Issue #1295, end to end. Unit tests elsewhere pin `decide_reap` and
+    // `postmaster_identity` directly; this drives the same scenario through
+    // `reap_stale_sessions` itself. A session record with no postmaster
+    // start token, next to a genuinely live pid at that number, must be
+    // left alone: neither signaled nor removed.
+    let base = tempfile::tempdir().expect("temp dir");
+    let root = autumn_harvest_plugin::dev::session_root(base.path()).expect("session root");
+
+    let session_dir = root.join("session-4242-0000000b");
+    let data_dir = session_dir.join("data");
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+
+    // Our own test process stands in for the "postmaster": genuinely alive,
+    // and its pid is not fabricated.
+    let live_pid = std::process::id();
+    let mut stale = record(u32::MAX - 1, Some(live_pid));
+    stale.owner_start_token = None;
+    stale.postmaster_start_token = None;
+    stale.data_dir = data_dir.clone();
+    std::fs::write(
+        session_dir.join("session.json"),
+        stale.to_json().expect("json"),
+    )
+    .expect("write record");
+
+    assert_eq!(
+        autumn_harvest_plugin::dev::reap_stale_sessions(&root).expect("reap"),
+        0,
+        "unknown postmaster identity must not be reaped"
+    );
+    assert!(session_dir.exists(), "{}", session_dir.display());
+    assert!(
+        autumn_harvest_plugin::dev::process_is_alive(live_pid),
+        "the reaper must not have signaled the process it could not identify"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // AC7 — the docs present the zero-setup path as the default
 // ---------------------------------------------------------------------------
