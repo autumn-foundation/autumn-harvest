@@ -984,6 +984,20 @@ impl SqliteRuntime {
     /// dropped. See [`run_until_blocked`](Self::run_until_blocked) for the
     /// error variants a single execution can produce.
     pub async fn poll_once(&mut self) -> SqliteResult<bool> {
+        let (progress, first_error) = self.poll_once_pass().await?;
+        first_error.map_or(Ok(progress), Err)
+    }
+
+    /// One fleet-wide driving pass, shared by [`poll_once`](Self::poll_once)
+    /// and [`run_until_idle`](Self::run_until_idle).
+    ///
+    /// Returns progress and the first error SEPARATELY (issue #1555).
+    /// `poll_once` collapses both into its public `Result<bool>`, which
+    /// loses whether the pass still made progress on an `Err`.
+    /// `run_until_idle` needs that separate signal. It keeps converging the
+    /// rest of the fleet past a persistently-broken execution, instead of
+    /// stopping after one pass.
+    async fn poll_once_pass(&mut self) -> SqliteResult<(bool, Option<SqliteError>)> {
         // Re-read the wall clock per driven cycle (issue #1069 P2) — see the
         // rationale on `run_until_blocked`. The `_as_of` variant keeps a fixed
         // caller `now` for deterministic simulation.
@@ -1001,7 +1015,7 @@ impl SqliteRuntime {
                 Err(err) => record_fleet_error(exec, err, &mut first_error),
             }
         }
-        first_error.map_or_else(|| Ok(progress), Err)
+        Ok((progress, first_error))
     }
 
     /// Like [`poll_once`](Self::poll_once) but with an injected "as-of" time. A
@@ -1031,27 +1045,42 @@ impl SqliteRuntime {
         first_error.map_or_else(|| Ok(progress), Err)
     }
 
-    /// Repeatedly [`poll_once`](Self::poll_once) until the fleet is quiescent (no
-    /// execution makes progress — every remaining run is terminal or blocked on
-    /// an external input).
+    /// Repeatedly drive one fleet-wide pass until the fleet is quiescent.
+    /// Quiescent means no execution makes progress: every remaining run is
+    /// terminal or blocked on an external input.
+    ///
+    /// A pass with a per-execution error still counts as progress if any
+    /// OTHER execution advanced (issue #1555). This loop keeps calling
+    /// passes past such an error. One [`poll_once`](Self::poll_once) pass
+    /// already drives every other execution past a broken one, the same way
+    /// (issue #1530).
+    ///
+    /// The first error seen across ALL passes is deferred. It returns once
+    /// the fleet actually quiesces, not the first time any pass errors. One
+    /// external call now converges the whole fleet. It no longer stalls at
+    /// one decision cycle per persistently-broken execution.
     ///
     /// # Errors
     ///
-    /// Returns [`SqliteError::Runaway`] if the fleet never quiesces within the
-    /// [`MAX_ITERATIONS`] safety bound — surfaced honestly (mirroring
-    /// [`run_until_blocked`](Self::run_until_blocked)'s [`SqliteError::Stuck`])
-    /// rather than swallowed as a clean `Ok(())` a caller cannot distinguish from
-    /// genuine quiescence. Also propagates any per-execution error. That
-    /// happens only AFTER the pass's [`poll_once`](Self::poll_once) call
-    /// drives every other execution (issue #1530). A lone broken execution
-    /// stops the NEXT pass, not the current one.
+    /// Returns [`SqliteError::Runaway`] if the fleet never quiesces within
+    /// the [`MAX_ITERATIONS`] safety bound and no per-execution error ever
+    /// occurred. This is surfaced honestly, mirroring
+    /// [`run_until_blocked`](Self::run_until_blocked)'s
+    /// [`SqliteError::Stuck`]. A clean `Ok(())` here would be
+    /// indistinguishable from genuine quiescence. Otherwise this returns the
+    /// first per-execution error, once quiescent or at the safety bound.
     pub async fn run_until_idle(&mut self) -> SqliteResult<()> {
+        let mut first_error = None;
         for _ in 0..MAX_ITERATIONS {
-            if !self.poll_once().await? {
-                return Ok(());
+            let (progress, err) = self.poll_once_pass().await?;
+            if let Some(err) = err {
+                first_error.get_or_insert(err);
+            }
+            if !progress {
+                return first_error.map_or(Ok(()), Err);
             }
         }
-        Err(SqliteError::Runaway)
+        Err(first_error.unwrap_or(SqliteError::Runaway))
     }
 
     /// Run exactly one decision cycle at logical time `now` (epoch milliseconds):
