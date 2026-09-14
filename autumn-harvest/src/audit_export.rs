@@ -530,20 +530,22 @@ pub struct AuditExportBuilderConfig {
 ///
 /// Falls back to a marker rather than the input when the URL cannot be parsed:
 /// an unparseable string must not be echoed on the assumption it is harmless.
+///
+/// Reads the origin from a full [`url::Url::parse`], not a hand-rolled
+/// split (issue #1274). A manual split trusts the input's shape. It
+/// missed a backslash standing in for `/`. It also read a malformed
+/// `host:port` authority as valid — `s3cr3t` is not a port, so the real
+/// parser rejects the whole string. Either way, the secret rode along
+/// after it. Delegating to the parser closes the whole class: this
+/// function can only render a host the parser itself accepted.
 pub(crate) fn redact_webhook_url(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
+    let Ok(parsed) = url::Url::parse(url) else {
         return "<unparseable webhook url redacted>".to_string();
     };
-    // `url::Url::parse` treats `\` the same as `/` for `http`/`https` (issue
-    // #1274): it ends the authority just like `/`, `?`, and `#` do. Without
-    // it here, `https://evil.com\token` kept the whole tail as "authority".
-    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or_default();
-    // Strip any userinfo (`user:pass@host`), itself a credential.
-    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    if host.is_empty() {
+    let Some(host) = parsed.host_str() else {
         return "<unparseable webhook url redacted>".to_string();
-    }
-    format!("{scheme}://{host}/<redacted>")
+    };
+    format!("{}://{host}/<redacted>", parsed.scheme())
 }
 
 impl std::fmt::Debug for AuditExportBuilderConfig {
@@ -3815,6 +3817,18 @@ mod tests {
         assert_eq!(
             redact_webhook_url("https://evil.com\\bearer-secret"),
             "https://evil.com/<redacted>"
+        );
+    }
+
+    #[test]
+    fn redact_webhook_url_withholds_a_malformed_authority() {
+        // Issue #1274: `user:s3cr3t` with no `@` is `host:port`, not
+        // userinfo. `s3cr3t` is not a valid port, so `url::Url::parse`
+        // rejects the whole string. A naive split on `/` still finds an
+        // "authority" here and renders the secret through it.
+        assert_eq!(
+            redact_webhook_url("https://user:s3cr3t/api"),
+            "<unparseable webhook url redacted>"
         );
     }
 
