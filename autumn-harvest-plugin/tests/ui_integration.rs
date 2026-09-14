@@ -5582,6 +5582,43 @@ fn envelope_608(plain: &Value) -> Value {
     encoded["data"]["output"].clone()
 }
 
+/// Undo the identity codec's collision-escape nesting (issue #1253) on the
+/// `WorkflowStarted` event's `input`, restoring it to `encoded_input`
+/// exactly as given.
+///
+/// `start_or_load_workflow_execution` always encodes the `WorkflowStarted`
+/// event through identity codecs. Suppose a caller hands it an
+/// already-envelope-shaped `input`, to simulate a foreign codec-encrypting
+/// write. The escape guard then sees a collision and wraps it a second
+/// time. That is correct for a real caller, whose plaintext coincidentally
+/// looks like an envelope. Here it is a test artifact: this fixture wants
+/// the SINGLE codec-encoded shape a real deployment stores, not identity's
+/// defensive double wrap. This patches the stored event back to that
+/// shape.
+async fn reset_workflow_started_input(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    encoded_input: Value,
+) {
+    let mut event_data: Value = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_events::event_id.eq(0))
+        .select(harvest_events::event_data)
+        .first(&mut *conn)
+        .await
+        .expect("load WorkflowStarted row");
+    event_data["data"]["input"] = encoded_input;
+    diesel::update(
+        harvest_events::table
+            .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+            .filter(harvest_events::event_id.eq(0)),
+    )
+    .set(harvest_events::event_data.eq(event_data))
+    .execute(&mut *conn)
+    .await
+    .expect("restore WorkflowStarted input");
+}
+
 /// Single-shard API+UI app with read-path decoding enabled (issue #608):
 /// admin boundary + codec registry mirrored + the opt-in flag set.
 fn build_decode_enabled_api_with_ui_app(database_url: &str) -> axum::Router {
@@ -5758,6 +5795,7 @@ async fn workflow_detail_ui_renders_decoded_input() {
     )
     .await
     .expect("workflow insert should succeed");
+    reset_workflow_started_input(&mut conn, exec_id, input_envelope.clone()).await;
 
     // Blocked-on panel + timeline fixtures (issue #608, AC4): an
     // envelope-bearing timeline event, a pending activity whose stored
