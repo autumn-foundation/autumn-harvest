@@ -2823,14 +2823,14 @@ async fn list_workers_ui(
     // Issue: `page`/`limit` were still typed `Option<i64>` directly on
     // `WorkerListParams` — the two fields left over after status/stale/shard
     // above got this same fix. A non-numeric value on either reaches this
-    // struct through a hand-edited URL, a bookmarked link past the current
-    // worker count, or a pasted "Per page" value. Any of those failed
-    // axum's own query deserialization with a bare 400. That happened
-    // before the filter form or any worker row rendered, discarding every
-    // other filter the operator had already entered. Same fix as
-    // `parse_page_query_field`/`parse_limit_query_field` on the Workflows
-    // page (#1540): degrade to a default and report the bad value inline
-    // instead of aborting the page.
+    // struct through a hand-edited URL or a bookmarked link past the
+    // current worker count. A pasted "Per page" value reaches it too. Any
+    // of those failed axum's own query deserialization with a bare 400.
+    // That happened before the filter form or any worker row rendered. It
+    // discarded every other filter the operator had already entered. Same
+    // fix as `parse_page_query_field`/`parse_limit_query_field` on the
+    // Workflows page (#1540): degrade to a default and report the bad
+    // value inline instead of aborting the page.
     let (limit, limit_raw, limit_error) = parse_limit_query_field(params.limit.as_deref());
     let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
     let offset = page.saturating_mul(limit);
@@ -4529,7 +4529,7 @@ fn render_worker_filters(
                 // `type="text"`, not `type="number"`. A number input
                 // sanitizes an invalid value (e.g. "not-a-number") to
                 // blank at render time. The operator could then never see
-                // or correct their own bad input — matches the Workflows
+                // or correct their own bad input. Matches the Workflows
                 // page's "Per page" field and this page's own `shard`
                 // filter.
                 input type="text" inputmode="numeric" pattern="[0-9]*" name="limit" value=(limit_value);
@@ -14193,11 +14193,12 @@ mod tests {
         );
     }
 
-    /// GREEN — the fix under test: the Workers page's "Per page" field is a
-    /// text control, matching the Workflows page's own fix (Codex review on
-    /// #1540). A `type="number"` input sanitizes an invalid value to blank
-    /// at render time, so the operator could never see or correct their own
-    /// bad input even though the HTML source already carried it.
+    /// GREEN — the fix under test: the Workers page's "Per page" field is
+    /// a text control. This matches the Workflows page's own fix (Codex
+    /// review on #1540). A `type="number"` input sanitizes an invalid
+    /// value to blank at render time. The operator could then never see
+    /// or correct their own bad input, even though the HTML source
+    /// already carried it.
     #[test]
     fn worker_per_page_input_is_a_text_control_that_can_hold_invalid_text() {
         let html = render_worker_filters(
