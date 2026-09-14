@@ -330,6 +330,11 @@ pub fn reap_stale_sessions(root: &Path) -> Result<usize, std::io::Error> {
 ///
 /// Split out of [`reap_stale_sessions`] so that function stays a plain loop
 /// over directory entries; this is the per-entry decision and action.
+///
+/// `binaries` genuinely needs three states — not yet resolved, resolved to
+/// some binaries, resolved to none found — so the nested `Option` is
+/// intentional, not an oversight.
+#[allow(clippy::option_option)]
 fn reap_one_session(
     dir: &Path,
     self_pid: u32,
