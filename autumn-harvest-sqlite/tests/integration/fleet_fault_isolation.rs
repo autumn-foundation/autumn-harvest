@@ -18,7 +18,7 @@
 //! A follow-up review of the #1555 fix (Codex P1) found that a naive
 //! "keep looping" fix re-drives a broken execution on EVERY internal pass.
 //! For a WORKFLOW-handler panic, each re-drive strikes the bounded panic
-//! budget (`WORKFLOW_PANIC_MAX_ATTEMPTS`), so a persistently-panicking
+//! budget (`WORKFLOW_PANIC_MAX_ATTEMPTS`). A persistently-panicking
 //! execution could exhaust its budget and get sealed `FAILED` within ONE
 //! external call, instead of one strike per call. The fix skips a
 //! newly-erroring execution for the rest of that `run_until_idle` call.
@@ -334,9 +334,9 @@ async fn run_until_idle_keeps_the_first_error_seen_across_passes_not_a_later_one
 }
 
 /// Panics on EVERY decision cycle. Distinct from `broken_wf`: a panic is
-/// contained under a bounded budget (`WORKFLOW_PANIC_MAX_ATTEMPTS`) rather
-/// than rejected outright, so re-driving it repeatedly has an observable
-/// side effect an unsupported command does not.
+/// contained under a bounded budget (`WORKFLOW_PANIC_MAX_ATTEMPTS`), not
+/// rejected outright. Re-driving it repeatedly has an observable side
+/// effect an unsupported command does not.
 #[workflow]
 async fn always_panics_wf(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
     let _ = ctx;
@@ -371,9 +371,10 @@ async fn four_step_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
 /// Codex P1 follow-up on the #1555 fix. A single `run_until_idle()` call
 /// must strike a persistently-panicking execution AT MOST ONCE, even while
 /// an unrelated execution needs many more internal passes to converge.
-/// Re-striking it every pass would exhaust `WORKFLOW_PANIC_MAX_ATTEMPTS`
-/// and seal it `FAILED` within one call, denying the caller the chance to
-/// react to the first `WorkflowPanicked` error between calls.
+/// Re-striking it every pass would exhaust
+/// `WORKFLOW_PANIC_MAX_ATTEMPTS` and seal it `FAILED` within one call.
+/// That denies the caller a chance to react to the first
+/// `WorkflowPanicked` error between calls.
 #[tokio::test]
 async fn run_until_idle_strikes_a_panicking_execution_at_most_once_per_call() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();

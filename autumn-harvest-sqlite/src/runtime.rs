@@ -1001,15 +1001,18 @@ impl SqliteRuntime {
     ///
     /// `skip` names executions to leave alone this pass. A NEWLY-erroring
     /// execution is added to it before this call returns (issue #1555
-    /// follow-up review, Codex P1). `poll_once` passes a fresh, empty set
-    /// every call, so this is a no-op change for it: it still drives every
-    /// execution exactly once. `run_until_idle` reuses ONE set across all
-    /// its internal passes, so a broken execution is driven AT MOST ONCE
-    /// per external call, even across many internal passes. Re-driving it
-    /// on every pass would keep striking
+    /// follow-up review, Codex P1).
+    ///
+    /// `poll_once` passes a fresh, empty set every call. This is a no-op
+    /// change for it: it still drives every execution exactly once.
+    /// `run_until_idle` reuses ONE set across all its internal passes. A
+    /// broken execution is then driven AT MOST ONCE per external call, even
+    /// across many internal passes.
+    ///
+    /// Re-driving it on every pass would keep striking
     /// [`contain_workflow_panic`](Self::contain_workflow_panic)'s bounded
-    /// panic budget, sealing a panicking workflow `FAILED` within one call
-    /// instead of leaving each strike visible to the caller between calls.
+    /// panic budget. That seals a panicking workflow `FAILED` within one
+    /// call, instead of leaving each strike visible between calls.
     async fn poll_once_pass(
         &mut self,
         skip: &mut HashSet<ExecutionId>,
@@ -1085,9 +1088,9 @@ impl SqliteRuntime {
     /// An execution that errors is driven AT MOST ONCE for the rest of this
     /// call (Codex P1 follow-up review to issue #1555). Without that, a
     /// long-running call could re-drive the SAME broken execution on every
-    /// internal pass — for a panicking workflow, that burns through its
-    /// bounded panic budget and seals it `FAILED` within one call, instead
-    /// of one strike per call. A fresh external call re-attempts it.
+    /// internal pass. For a panicking workflow, that burns through its
+    /// bounded panic budget. It seals `FAILED` within one call, instead of
+    /// one strike per call. A fresh external call re-attempts it.
     ///
     /// # Errors
     ///
