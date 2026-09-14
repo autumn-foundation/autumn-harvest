@@ -8,21 +8,28 @@ PR opened against `ci.yml`, no test changed. Continues the series in
 `docs/rnd/2026-09-0[3-8]-ci-health-semaphore*.md` and
 `docs/rnd/2026-09-1[1-3]-ci-health-semaphore*.md`.
 
-**Correction (post-publication, three review rounds):** this report's first
+**Correction (post-publication, four review rounds):** this report's first
 version grouped three occurrences of
 `worker_fails_workflow_when_activity_start_to_close_timeout_elapses` into one
 cluster with one candidate mechanism, misreported the span between the two
-outer timestamps as 3h11m, proposed two candidate mechanisms (`ScheduleToStart`/
-`Heartbeat` timeouts) that are disabled for this activity by construction, had
-an internally inconsistent dashboard-collision run count (4 vs. 7 vs. 6), and
-claimed the dashboard fix "has not recurred" from a denominator that silently
-excluded 11 unaudited cancelled runs. A Codex review on PR #1559 caught all
-five; each was verified directly against source or this session's own raw
+outer timestamps as 3h11m, proposed four candidate mechanisms for the
+remaining occurrence that are each ruled out by source (`ScheduleToStart`/
+`Heartbeat` timeouts disabled by construction; the enforcement sweep's
+re-check-under-lock structurally prevents double enforcement; the effective
+`workflow_task_timeout` is 60s, not the 10s that looked coincidentally
+coupled to the test's wait loop), had an internally inconsistent
+dashboard-collision run count (4 vs. 7 vs. 6), and claimed the dashboard fix
+"has not recurred" from a partition that was both missing 11 unaudited
+cancelled runs and, separately, using run timestamp rather than tree content
+to decide which runs were "post-fix." A Codex review on PR #1559 caught all
+seven; each was verified directly against source or this session's own raw
 data before fixing, not taken on faith. The span is 3h20m38s (21:45:08 to
 01:05:46, arithmetic error in the original); two of the three occurrences ran
 a pre-hardening version of the test that a same-day fix (`7fbfebb`) had
 already addressed, while the third ran the **post-hardening** version and
-still failed the identical assertion about an hour after that fix merged.
+still failed the identical assertion about an hour after that fix merged —
+and this report now has no remaining mechanism candidate for that occurrence,
+which is the honest place to leave it rather than a fifth guess.
 Verified directly against each commit's blob for `integration_e2e.rs` (below);
 section
 1 is rewritten to reflect this. Issue #1558 has been corrected to match.
@@ -95,30 +102,49 @@ sha=<commit>)` and compared blob SHAs against `7fbfebb`'s diff:
   timeout sweep noticed" — that path is closed by construction. The
   mechanism is unknown.
 
-**Test-vs-product verdict: not rendered — and now for a narrower, more
-consequential question.** Issue #1558 is corrected to ask specifically: given
+**Test-vs-product verdict: not rendered, and this session has no viable
+mechanism candidate left to offer.** Issue #1558 asks specifically: given
 `874784b9`'s config makes the original race provably impossible, what
-produced the same wrong event-history shape anyway? Candidates not yet
-distinguished: the timeout-enforcement sweep firing more than once for the
-same task (appending an extra event), or an interaction with this test's own
-10-second `workflow_task_timeout` config (also 10s, the same bound the wait
-loop uses — worth checking whether that is coincidence or coupling).
+produced the same wrong event-history shape anyway? Four candidates were
+proposed across this report's revisions; all four are now ruled out, each
+verified directly against source rather than taken on faith (three of the
+four ruled out on Codex review catches on PR #1559):
 
-**Ruled out, verified against source:** a different timeout type
-(`ScheduleToStart` or `Heartbeat`) firing first or in addition. Both are
-disabled for this activity by construction — the post-hardening `ActivityInfo`
-sets `default_heartbeat_timeout: None` and `default_schedule_to_start: None`
-(`integration_e2e.rs:3488-3489`), `worker.rs:9373-9406` only writes the
-`heartbeat_timeout`/`schedule_to_start` columns on the task row when a config
-value (or, for schedule-to-start, a per-call override this ordinary activity
-doesn't use) is `Some`, and both timeout queries (`timeout.rs:86-90`,
-`161-172`) require their respective column to be `NOT NULL`. With both
-columns `NULL` for this task, neither query can ever match it — a Codex
-review catch on PR #1559, verified directly rather than taken on faith.
+- A different timeout type (`ScheduleToStart` or `Heartbeat`) firing first or
+  in addition — **ruled out**: both are disabled for this activity by
+  construction. The post-hardening `ActivityInfo` sets
+  `default_heartbeat_timeout: None` and `default_schedule_to_start: None`
+  (`integration_e2e.rs:3488-3489`), `worker.rs:9373-9406` only writes the
+  `heartbeat_timeout`/`schedule_to_start` columns on the task row when a
+  config value (or, for schedule-to-start, a per-call override this ordinary
+  activity doesn't use) is `Some`, and both timeout queries
+  (`timeout.rs:86-90`, `161-172`) require their respective column to be
+  `NOT NULL`. With both columns `NULL` for this task, neither query can ever
+  match it.
+- The timeout-enforcement sweep enforcing the same task twice, appending a
+  duplicate event — **ruled out**: `timeout.rs`'s enforcement transaction
+  (`~1301-1401`) re-reads the task's state under lock, proceeds only while it
+  is still in the state the timeout reason expects (`RUNNING` for
+  `StartToClose`), appends the timeout event, and marks the task `FAILED` in
+  the same transaction. A second sweep hitting the same task afterward finds
+  it no longer `RUNNING` and returns without appending anything — this is
+  structural, not merely unlikely.
+- Coupling with this test's `workflow_task_timeout: Duration::from_secs(10)`
+  config sharing the wait loop's own 10-second bound — **ruled out**: the
+  *effective* workflow-task timeout is not 10 seconds. `effective_workflow_task_timeout`
+  (`worker.rs:4023-4045`) raises the configured value to at least
+  `max_local_activity_start_to_close` when the configured value is smaller —
+  and this test sets `max_local_activity_start_to_close: Duration::from_secs(60)`
+  (`integration_e2e.rs:3433`), so the effective budget is 60 seconds, not 10.
+  It also bounds individual workflow decision-task dispatches, not the test's
+  own polling loop, so even at its configured value it would not have been
+  the right kind of bound to name.
 
-This session did not have the diagnostic dump needed to distinguish the
-remaining candidates; the `matches!` assertion does not print the actual
-event sequence on failure, so the next occurrence should capture
+With all four ruled out, **this report has no remaining mechanism candidate**
+for the post-hardening occurrence. That is the honest state to hand off in
+issue #1558, not a fifth guess. This session did not have the diagnostic dump
+needed to generate a new one; the `matches!` assertion does not print the
+actual event sequence on failure, so the next occurrence should capture
 `history.events` before asserting, not just after it panics. One occurrence
 is not a rate. No same-commit rerun was run this session.
 
@@ -149,19 +175,46 @@ the collision.
 
 **No occurrence of the collision signature among the post-fix window's
 explicit failures** — but that is a narrower claim than "did not recur," and
-the gap matters here specifically. The post-fix window (02:29:41Z to this
-sample's 09:39:43Z cutoff) held 17 runs: 2 failure, 4 success, **11
-cancelled**. This series' own 09-11 report
+two separate gaps mean it should not be read as more than that.
+
+**Gap 1 — an unaudited cancelled-run population.** The post-fix window
+(02:29:41Z to this sample's 09:39:43Z cutoff) held 17 runs: 2 failure, 4
+success, **11 cancelled**. This series' own 09-11 report
 (`docs/rnd/2026-09-11-ci-health-semaphore-cancelled-run-census.md:74-79`)
 found hidden failed jobs in 15/54 (28%) of a cancelled-run sample — a
 cancelled run's overall conclusion can absorb a real failure underneath it.
-This session did not job-log any of the 11 post-fix cancelled runs (a
-Codex review catch on PR #1559), so the evidence here supports only "0/2
-explicit post-fix failures carried the collision signature," not "0
-occurrences in the post-fix window." **Routed forward, not audited**: job-log
-the 11 post-fix cancelled runs specifically for the `dashboard_pack_docs`
-signature before treating `next-panel-id.py` as confirmed-holding rather than
-merely not-yet-observed-to-fail.
+This session did not job-log any of the 11 post-fix cancelled runs.
+
+**Gap 2 — a timestamp is not an ancestry check.** A run's `created_at` being
+after `e98a676`'s merge time does not mean that run's branch tree actually
+contains the fix — item 1 above found exactly this for one of the activity-
+timeout occurrences (a branch whose CI ran hours after a same-day fix merged,
+on a tree that still predated it). The same check applies here and was not
+originally done. Spot-checked the two explicit post-fix failures' own
+`docs/dashboards/starter-pack-v0.1.0.json` blobs against `e98a676`'s
+(`f825390`, via `get_file_contents(..., sha=<commit>)`):
+
+- `34800863625`'s commit `9de44b68` carries blob `f825390` — **matches**
+  `e98a676` exactly (the branch's own porting commit, see below, happens to
+  land on the identical fixed content).
+- `34799721202`'s commit `dd619f4c` carries blob `767bc5d` — **does not
+  match** `e98a676`; this branch's dashboard file is in some other state,
+  neither confirmed pre-fix nor post-fix from this check alone. Irrelevant to
+  whether `dashboard_pack_docs` failed in that specific run (it didn't — that
+  run failed on `retention_summary_tests`, item 3 below), but it demonstrates
+  the general problem: this run's timestamp says "post-fix," its tree says
+  otherwise, and nothing here can tell which of those tells you about panel
+  collisions.
+
+Given both gaps, **the evidence in this report supports only "0/2 explicit
+post-fix failures carried the collision signature,"** not "no occurrences in
+the post-fix window" and not "the fix is holding." **Routed forward, not
+audited**: before either of those broader claims, (a) job-log the 11 post-fix
+cancelled runs for the `dashboard_pack_docs` signature, and (b) for any run
+counted as "post-fix" either way, confirm its dashboard-file blob or commit
+ancestry against `e98a676` rather than trusting its timestamp — the same
+discipline item 1 above had to learn from a review catch, applied here
+proactively instead of waiting for a fourth one.
 
 ### 3. Two single-occurrence candidates — not clustered, not claimed as rates
 
@@ -213,11 +266,12 @@ further, or add another `sleep`) has already been tried once and did not
 hold.
 
 **Item 2** is not a new finding as far as it goes, but it goes less far than
-originally stated: the explicit post-fix failures don't show a recurrence,
-and that is *not* the same as confirming the fix is holding, since 11 of the
-17 post-fix runs were cancelled and unaudited (this role's own prior finding
-says 28% of cancelled runs can hide a real failure). Routed forward rather
-than claimed as confirmation.
+originally stated, on two independent axes: 11 of the 17 post-fix runs were
+cancelled and unaudited (this role's own prior finding says 28% of cancelled
+runs can hide a real failure), and "post-fix" was determined by run timestamp
+rather than by checking each run's actual tree against the fix commit — a
+methodological gap item 1 above hit first and this item then repeated.
+Routed forward on both axes rather than claimed as confirmation.
 
 **Item 3** is explicitly not claimed as flakes — one occurrence each, no
 mechanism, no clustering. Recorded so a repeat is recognized as a repeat.
@@ -226,11 +280,13 @@ mechanism, no clustering. Recorded so a repeat is recognized as a repeat.
 
 ## 🔧 Treatment
 
-- **Filed, then corrected:** issue #1558 — originally described a 3-occurrence
-  cluster with one candidate mechanism; edited after this PR's own review
-  caught that two occurrences were a stale-branch echo of an already-fixed
-  bug, to instead ask the narrower, more consequential question about the
-  one occurrence on the already-hardened test.
+- **Filed, then corrected twice:** issue #1558 — originally described a
+  3-occurrence cluster with one candidate mechanism; corrected to split the
+  stale-branch echo (2 occurrences) from the one occurrence on the
+  already-hardened test, then corrected again to drop all four candidate
+  mechanisms proposed for that occurrence in turn (each ruled out against
+  source), leaving no remaining hypothesis to hand off — an honest dead end
+  is what the issue now records, not a fifth guess.
 - **No PR opened against `ci.yml` or any test** — correct per the hard gate,
   since no rerun protocol has been run and no verdict has been rendered for
   item 1, and items 2-4 need no suite change.
@@ -247,14 +303,16 @@ mechanism, no clustering. Recorded so a repeat is recognized as a repeat.
   1 occurrence of the post-hardening failure is offered as grounds to
   prioritize issue #1558's narrowed question, not as a rate claim.
 - **Item 2:** of the 17 sampled failures, 2 (`34800863625`, `34799721202`)
-  occurred after 2026-09-14T02:29:41Z (the root-cause fix's merge time);
-  0 of those 2 carried the collision signature, against 6 direct occurrences
-  among the 15 failures before it in the same window. The post-fix window
-  held 17 runs total (2 failure, 4 success, **11 cancelled**); the 11
-  cancelled runs were **not** job-logged this session (a Codex review catch),
-  so this measurement covers only the 2 explicit post-fix failures, not the
-  full post-fix window. Routed forward: job-log the 11 cancelled runs for the
-  same signature before calling this confirmed.
+  occurred (by timestamp) after 2026-09-14T02:29:41Z (the root-cause fix's
+  merge time); 0 of those 2 carried the collision signature, against 6 direct
+  occurrences among the 15 failures before it in the same window. Two gaps
+  keep this from being a confirmation (both Codex review catches on PR
+  #1559): the post-fix window held 17 runs total (2 failure, 4 success, **11
+  cancelled**) and the 11 were not job-logged; and of the 2 explicit post-fix
+  failures, only 1 (`34800863625`, blob `f825390`) was confirmed by blob
+  comparison to actually carry `e98a676`'s fixed file — the other
+  (`34799721202`, blob `767bc5d`) does not match the fixed blob, so its
+  "post-fix" label is timestamp-only and unconfirmed by tree content.
 - **Item 3:** 1/1 for each of three distinct signatures — explicitly not a
   rate.
 - No revert check applies — no fix in this report to verify red-then-green
@@ -326,6 +384,22 @@ print(Counter(r['conclusion'] for r in post))  # {'cancelled': 11, 'success': 4,
 # own 15/54 hidden-failure rate, rather than assumed clean.
 # e98a676's merge timestamp (2026-09-13T21:29:41-05:00 = 2026-09-14T02:29:41Z)
 # vs. the timestamps of the 17 sampled failures.
+
+# Item 2's ancestry spot-check (timestamp is not a tree check):
+git show e98a676:docs/dashboards/starter-pack-v0.1.0.json | git hash-object --stdin
+# f82539072a7d0ce8ac0325a253cf35495d1fe28e
+# get_file_contents(path="docs/dashboards/starter-pack-v0.1.0.json", sha=9de44b68)
+#   -> blob f825390... (matches -- this run's tree carries the fix)
+# get_file_contents(path="docs/dashboards/starter-pack-v0.1.0.json", sha=dd619f4c)
+#   -> blob 767bc5d... (does not match -- timestamp said "post-fix", tree didn't)
+
+# Item 1's four ruled-out candidates, verified against source:
+sed -n '3480,3495p' autumn-harvest/tests/integration/integration_e2e.rs   # heartbeat/schedule_to_start: None
+sed -n '9365,9410p' autumn-harvest/src/worker.rs                          # columns only written when configured
+sed -n '86,172p' autumn-harvest/src/timeout.rs                            # both queries require IS NOT NULL
+sed -n '1290,1401p' autumn-harvest/src/timeout.rs                         # re-check-under-lock prevents double enforcement
+sed -n '4015,4045p' autumn-harvest/src/worker.rs                          # effective_workflow_task_timeout raises 10s to the 60s local cap
+sed -n '3425,3445p' autumn-harvest/tests/integration/integration_e2e.rs   # max_local_activity_start_to_close: 60s
 
 # search_issues("worker_fails_workflow_when_activity_start_to_close_timeout_elapses flaky")
 # on autumn-foundation/autumn-harvest before filing #1558 -- 5 hits, all
