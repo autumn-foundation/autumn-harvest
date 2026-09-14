@@ -25,10 +25,11 @@
 //!   `text/plain`. Anything else — `application/json`, most of all — needs a
 //!   CORS preflight the attacker's page cannot pass.
 //! - **A request carrying a [`TokenPrincipal`](crate::api_token::TokenPrincipal).**
-//!   A verified scoped API token is an explicit credential a browser never
-//!   attaches on its own, so it carries none of the ambient-cookie risk this
-//!   layer defends against. [`require_harvest_admin`](crate::api::require_harvest_admin)
-//!   draws the same line.
+//!   A verified scoped API token is an explicit credential. A browser never
+//!   attaches one on its own, so it carries none of the ambient-cookie risk
+//!   this layer defends against.
+//!   [`require_harvest_admin`](crate::api::require_harvest_admin) draws the
+//!   same line.
 
 use autumn_web::reexports::axum;
 use axum::extract::Request;
@@ -67,8 +68,8 @@ const fn is_safe_method(method: &Method) -> bool {
 }
 
 /// Whether `headers` carries one of the three content types a plain HTML
-/// `<form>` can send without a CORS preflight (or carries none at all — a
-/// bodyless form submission still counts as simple).
+/// `<form>` can send without a CORS preflight. A body-less form submission
+/// carries no `Content-Type` at all, and counts as simple too.
 fn is_cors_simple_content_type(headers: &HeaderMap) -> bool {
     let Some(raw) = headers.get(header::CONTENT_TYPE) else {
         return true;

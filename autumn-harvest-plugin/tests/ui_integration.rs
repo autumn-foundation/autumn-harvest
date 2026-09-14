@@ -7176,10 +7176,10 @@ async fn ui_timeline_200_steps_under_1s() {
 //
 // One representative route per family named in the issue's acceptance
 // criteria: workflow, DLQ, gate, build-routing, DAG, schedule. Every request
-// below carries neither `Origin` nor `Sec-Fetch-Site`, the exact shape a
-// hostile page's `<form>` submit arrives as — so this single test also
+// below carries neither `Origin` nor `Sec-Fetch-Site`. That is the exact
+// shape a hostile page's `<form>` submit arrives as, so this one test also
 // covers the "neither header present" acceptance criterion. The guard runs
-// ahead of routing and admin checks, so a placeholder UUID in each path is
+// ahead of routing and admin checks. A placeholder UUID in each path is
 // enough; no seeded row and no database are needed for a rejected request.
 #[tokio::test]
 async fn vantage_and_dlq_mutations_reject_cross_site_post() {
