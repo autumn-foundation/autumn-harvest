@@ -537,6 +537,29 @@ pub fn is_codec_envelope(payload: &Value) -> bool {
     codec_envelope_parts(payload).is_some()
 }
 
+/// True if `payload`, or anything nested inside it, is shaped like a
+/// recognized codec envelope (issue #1253).
+///
+/// [`PayloadCodecs::encode_payload`]'s escape guard must close the collision
+/// at every depth a lossy decoder can reach, not only the payload root.
+/// [`PayloadCodecs::decode_value_lossy`] recurses into every object and
+/// array looking for an envelope. This check mirrors that walk, so the two
+/// can never disagree about what counts as a collision.
+fn payload_or_a_descendant_is_a_codec_envelope(payload: &Value) -> bool {
+    if is_codec_envelope(payload) {
+        return true;
+    }
+    match payload {
+        Value::Object(map) => map
+            .values()
+            .any(payload_or_a_descendant_is_a_codec_envelope),
+        Value::Array(items) => items
+            .iter()
+            .any(payload_or_a_descendant_is_a_codec_envelope),
+        _ => false,
+    }
+}
+
 /// A trait for intercepting and transforming raw payload bytes.
 ///
 /// Implementations of this trait are used by the [`PayloadCodecs`] registry
@@ -1178,16 +1201,19 @@ impl PayloadCodecs {
     /// An identity-codec deployment stores payload fields verbatim, with no
     /// envelope at all. That is the whole point of the identity codec.
     ///
-    /// If `payload` happens to already be shaped like a codec envelope,
-    /// though, storing it verbatim is exactly the collision issue #1253
-    /// reports. A later read cannot tell that plaintext apart from real
-    /// ciphertext by shape alone.
+    /// Suppose `payload`, or anything nested inside it, happens to already
+    /// be shaped like a codec envelope. Storing it verbatim is then exactly
+    /// the collision issue #1253 reports. A later lossy read cannot tell
+    /// that plaintext apart from real ciphertext by shape alone.
+    /// [`decode_value_lossy`](Self::decode_value_lossy) looks for that shape
+    /// at every depth, not only the field root.
     ///
-    /// So this checks [`is_codec_envelope`] before the identity fast-path
-    /// bails out. When it matches, encoding falls through to the normal
-    /// flow instead. For the identity codec that means wrapping `payload`
-    /// byte-for-byte — via `IdentityCodec::encode`, the identity function —
-    /// in a nested envelope naming `codec_id: "identity"`.
+    /// So this checks the payload tree, root and every descendant, before
+    /// the identity fast-path bails out. When any node matches, encoding
+    /// falls through to the normal flow instead. For the
+    /// identity codec that means wrapping the WHOLE `payload` byte-for-byte
+    /// — via `IdentityCodec::encode`, the identity function — in a nested
+    /// envelope naming `codec_id: "identity"`.
     /// [`decode_payload`] reverses it the same way it reverses any other
     /// envelope, recovering `payload` unchanged, because `"identity"` is
     /// always registered.
@@ -1241,7 +1267,7 @@ impl PayloadCodecs {
     pub fn encode_payload(&self, payload: &Value) -> HarvestResult<Value> {
         let (key_id, codec) = self.active_codec();
         let is_identity = codec.codec_id() == "identity";
-        if is_identity && !is_codec_envelope(payload) {
+        if is_identity && !payload_or_a_descendant_is_a_codec_envelope(payload) {
             return Ok(payload.clone());
         }
         let raw = serde_json::to_vec(payload)?;
@@ -2938,6 +2964,55 @@ mod tests {
             .decode_payload(&stored)
             .expect("decode must not error");
         assert_eq!(read_back, business_data);
+    }
+
+    #[test]
+    fn a_descendant_envelope_shaped_field_is_also_escaped_on_encode() {
+        // Issue #1253: the escape guard must match every depth
+        // `decode_value_lossy` recurses into, not only the payload root.
+        // An ordinary object whose CHILD happens to be envelope-shaped is
+        // exactly as dangerous as the root being envelope-shaped. A lossy
+        // read would decode or mark that child as if it were real
+        // ciphertext.
+        let business_data = json!({
+            "note": "ordinary field",
+            "child": {
+                CODEC_ENVELOPE_KEY: {"codec_id": "evil", "data": "not really ciphertext"},
+            },
+        });
+        assert!(
+            !is_codec_envelope(&business_data),
+            "sanity: the ROOT is not envelope-shaped, only a descendant is"
+        );
+
+        let codecs = PayloadCodecs::default();
+        let stored = codecs
+            .encode_payload(&business_data)
+            .expect("encode must not error");
+        assert_ne!(
+            stored, business_data,
+            "a descendant collision must escape the whole field, not just its own subtree: \
+             {stored}"
+        );
+
+        let read_back = codecs
+            .decode_payload(&stored)
+            .expect("decode must not error");
+        assert_eq!(
+            read_back, business_data,
+            "the original business value, descendant and all, round-trips byte-identical"
+        );
+
+        // The lossy decoder must agree: it decodes the escape wrapper once,
+        // at the root, and never re-examines the recovered descendant.
+        let mut lossy = stored.clone();
+        let outcome = codecs.decode_value_lossy(&mut lossy);
+        assert_eq!(
+            outcome.decoded, 1,
+            "one envelope decoded, the escape wrapper"
+        );
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(lossy, business_data);
     }
 
     #[test]
