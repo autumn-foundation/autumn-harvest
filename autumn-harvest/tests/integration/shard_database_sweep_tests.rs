@@ -163,6 +163,48 @@ async fn a_live_clusters_databases_survive_a_concurrent_setup() {
     let _ = live.teardown().await;
 }
 
+/// A partial run must not fail because a server it does not use is
+/// unreachable. Sweeping every configured server, not only the ones a
+/// partial run selects, must stay best-effort for the ones it skips.
+///
+/// The *positive* claim needs a genuinely separate second server. That
+/// claim: an unreachable server's own stale databases get swept even when
+/// a partial run never selects it. That needs the compose topology
+/// (`HARVEST_BENCH_SHARD_URLS`), not available here.
+///
+/// This proves the negative claim instead. Reaching for that server must
+/// never turn into a hard failure for a run that does not need it.
+#[tokio::test]
+async fn an_unreachable_omitted_server_does_not_fail_a_partial_run() {
+    let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+        eprintln!(
+            "SKIP an_unreachable_omitted_server_does_not_fail_a_partial_run: existing-server \
+             mode only (HARVEST_TEST_DATABASE_URL unset)"
+        );
+        return;
+    };
+
+    // Nothing listens on port 1; refused fast rather than timing out.
+    let unreachable = "postgres://postgres:postgres@127.0.0.1:1/postgres";
+    let urls = [admin_url.as_str(), unreachable];
+
+    let cluster = db::provision_independent_servers(&urls, 1).await;
+    match cluster {
+        Ok(cluster) => {
+            assert_eq!(
+                cluster.urls.len(),
+                1,
+                "count=1 must provision exactly one shard, from the first URL"
+            );
+            let failures = cluster.teardown().await;
+            assert!(failures.is_empty(), "teardown failures: {failures:?}");
+        }
+        Err(e) => {
+            panic!("an unreachable OMITTED server must not fail a run that never uses it: {e:?}")
+        }
+    }
+}
+
 /// A database that merely shares the harness prefix is never dropped.
 ///
 /// The sweep is the only destructive thing this harness does to a server it

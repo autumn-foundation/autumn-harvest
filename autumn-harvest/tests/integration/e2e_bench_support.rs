@@ -2746,6 +2746,65 @@ pub mod db {
         Ok((url, name, conn))
     }
 
+    /// Provision the first `count` of `admin_urls`, one shard per server.
+    ///
+    /// Sweeps every configured server first, not only the ones this run
+    /// uses. `HARVEST_BENCH_SHARD_URLS` can list the whole compose topology
+    /// while a partial run (`HARVEST_BENCH_SHARDS`) asks for fewer of them.
+    /// A crashed larger run's databases on an omitted server would
+    /// otherwise sit unreclaimed until a later run happens to visit that
+    /// server again. A server this run cannot reach is only skipped, not
+    /// fatal, since it is not one this run needs.
+    ///
+    /// Pulled out of [`setup_shards`] so it can be exercised directly, with
+    /// a manually built URL list, instead of through the process-global
+    /// `HARVEST_BENCH_SHARD_URLS` environment variable.
+    pub async fn provision_independent_servers(
+        admin_urls: &[&str],
+        count: usize,
+    ) -> Result<ShardCluster, SkipReason> {
+        if admin_urls.len() < count {
+            return Err(SkipReason(format!(
+                "{SHARD_URLS_ENV_VAR} lists {} URL(s) but this scenario needs {count}; \
+                 start the whole compose topology (see benchmarks/docker-compose.yml)",
+                admin_urls.len()
+            )));
+        }
+        for admin in admin_urls.iter().skip(count) {
+            let _ = with_stale_sweep(admin, async { Ok::<(), SkipReason>(()) }).await;
+        }
+        let mut urls = BTreeMap::new();
+        let mut leases = Vec::new();
+        let mut created = Vec::new();
+        for (idx, admin) in admin_urls.iter().take(count).enumerate() {
+            let shard = ShardId::new(i32::try_from(idx).unwrap_or(0));
+            // Each admin URL is potentially a different server, so the
+            // stale-database sweep and its lock are per-shard here.
+            match provision_one_shard(admin, shard, true).await {
+                Ok((url, name, lease)) => {
+                    urls.insert(shard, url);
+                    created.push(((*admin).to_owned(), name));
+                    leases.push(lease);
+                }
+                // Shard 3 of 4 failing is the common case (one server slower
+                // to accept connections). Without this, shards 0-2 are
+                // already created and migrated and nothing ever drops them.
+                Err(e) => {
+                    drop(leases);
+                    drop_created(&created).await;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(ShardCluster {
+            urls,
+            topology: Topology::IndependentServers,
+            created,
+            _container: None,
+            leases,
+        })
+    }
+
     /// Provision `shard_count` shards.
     ///
     /// Resolution order, most faithful first:
@@ -2769,43 +2828,7 @@ pub mod db {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .collect();
-            if admin_urls.len() < count {
-                return Err(SkipReason(format!(
-                    "{SHARD_URLS_ENV_VAR} lists {} URL(s) but this scenario needs {count}; \
-                     start the whole compose topology (see benchmarks/docker-compose.yml)",
-                    admin_urls.len()
-                )));
-            }
-            let mut urls = BTreeMap::new();
-            let mut leases = Vec::new();
-            let mut created = Vec::new();
-            for (idx, admin) in admin_urls.iter().take(count).enumerate() {
-                let shard = ShardId::new(i32::try_from(idx).unwrap_or(0));
-                // Each admin URL is potentially a different server, so the
-                // stale-database sweep and its lock are per-shard here.
-                match provision_one_shard(admin, shard, true).await {
-                    Ok((url, name, lease)) => {
-                        urls.insert(shard, url);
-                        created.push(((*admin).to_owned(), name));
-                        leases.push(lease);
-                    }
-                    // Shard 3 of 4 failing is the common case (one server slower
-                    // to accept connections). Without this, shards 0-2 are
-                    // already created and migrated and nothing ever drops them.
-                    Err(e) => {
-                        drop(leases);
-                        drop_created(&created).await;
-                        return Err(e);
-                    }
-                }
-            }
-            return Ok(ShardCluster {
-                urls,
-                topology: Topology::IndependentServers,
-                created,
-                _container: None,
-                leases,
-            });
+            return provision_independent_servers(&admin_urls, count).await;
         }
 
         let (admin_url, container) = if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
