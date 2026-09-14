@@ -247,6 +247,10 @@ async fn post_form(
                 .method("POST")
                 .uri(uri)
                 .header("content-type", "application/x-www-form-urlencoded")
+                // issue #1278: the same-origin guard requires this evidence on
+                // every mutating request; a real browser sends it on every
+                // same-origin form submission.
+                .header("sec-fetch-site", "same-origin")
                 .body(Body::from(body.into()))
                 .expect("valid form request"),
         )
@@ -7166,4 +7170,54 @@ async fn ui_timeline_200_steps_under_1s() {
         elapsed < Duration::from_secs(1),
         "200-step timeline renders server-side in < 1s (took {elapsed:?})"
     );
+}
+
+// ── Cross-site mutation rejection (issue #1278) ─────────────────────────────
+//
+// One representative route per family named in the issue's acceptance
+// criteria: workflow, DLQ, gate, build-routing, DAG, schedule. Every request
+// below carries neither `Origin` nor `Sec-Fetch-Site`, the exact shape a
+// hostile page's `<form>` submit arrives as — so this single test also
+// covers the "neither header present" acceptance criterion. The guard runs
+// ahead of routing and admin checks, so a placeholder UUID in each path is
+// enough; no seeded row and no database are needed for a rejected request.
+#[tokio::test]
+async fn vantage_and_dlq_mutations_reject_cross_site_post() {
+    let api_state = HarvestApiState::new();
+    let app = autumn_harvest_plugin::harvest_api_router(api_state.clone())
+        .nest("/ui", harvest_ui_router(api_state))
+        .with_state(test_app_state_without_database());
+
+    let placeholder = uuid::Uuid::nil();
+    let targets: [(&str, String); 6] = [
+        ("workflow", format!("/ui/workflows/{placeholder}/cancel")),
+        ("dlq", "/dead-letters/replay".to_string()),
+        ("gate", format!("/ui/admin/gates/{placeholder}/lift")),
+        ("build-routing", "/ui/build-routing/set-policy".to_string()),
+        (
+            "dag",
+            format!("/ui/dags/echo_workflow/runs/{placeholder}/retry"),
+        ),
+        ("schedule", format!("/ui/schedules/{placeholder}/pause")),
+    ];
+
+    for (family, uri) in targets {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::empty())
+                    .expect("valid cross-site request"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{family} mutation ({uri}) must reject a request with no same-origin evidence"
+        );
+    }
 }

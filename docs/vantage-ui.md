@@ -274,6 +274,8 @@ Event fields are extracted from the inner `data` object of the adjacently-tagged
 - All user-controlled values are HTML-escaped by Maud before rendering.
 - The dashboard never emits `<script>` tags.
 - The `require_harvest_admin` middleware (configured via `HarvestBuilder`) can gate Vantage behind token authentication in production.
+- **Cross-site mutation rejection (#1278).** Every state-mutating route rejects a request with no same-origin evidence. This includes the dead-letter replay, discard, and redrive routes that the dashboard's own forms submit to. A modern browser sends `Sec-Fetch-Site`; only `same-origin` is admitted. A browser that omits it falls back to matching `Origin` against `Host`. A request with neither header is rejected. It is never admitted by default. Two exemptions apply. A request carrying a verified scoped API token is exempt, since a token is an explicit credential no browser attaches on its own. A request whose `Content-Type` cannot be sent by a bare cross-site `<form>` — `application/json`, most of all — is exempt too. Such a request needs a CORS preflight that a hostile page cannot pass.
+- **Embedder responsibility.** Set `SameSite=Lax` or stricter on the session cookie. Modern browsers already block a cross-site form `POST` under `Lax`. Treat this as a second, independent layer; the guard above does not depend on it.
 
 ---
 
