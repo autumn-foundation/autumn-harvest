@@ -194,8 +194,8 @@ first key — `retire_codec_key`'s default gate (below) needs a durable record
 of when a key became active, and `set_active_key` alone never writes one.
 
 It refuses with `HarvestError::CodecKeyActivationBlocked` while any live
-worker's `harvest_workers` row does not advertise support for the nested
-envelope (see "Upgrade every reader" below), and is fail-closed the same way
+worker's `harvest_workers` row does not advertise support for envelope
+version 2 (see "Upgrade every reader" below), and is fail-closed the same way
 retirement is: an unreachable shard, or a shard this process can see but
 omitted from `expected_shards`, blocks activation on its own.
 
@@ -297,22 +297,25 @@ still invisible to it and still require the fence.
 
 ### ⚠️ Upgrade every reader before activating a keyed codec
 
-Activating a non-legacy key switches new writes to the **nested envelope**
-(issue #1253: the field's only top-level key is `_harvest_codec_envelope`,
-mapping to an object with `codec_id`/`data`/`kid`). A reader built before
-issue #1253 recognises an envelope only as one of the flat shapes issue #948
-introduced, and its decoder returns anything else *unchanged* rather than
-rejecting it. Such a worker therefore hands the raw envelope object to
-workflow code as if it were the payload — silent wrong data, not a loud
-failure.
+Activating a non-legacy key switches new writes to **envelope version 2**
+(four keys, carrying `kid`). A reader built before issue #948 recognises an
+envelope only as exactly three keys with version 1, and its decoder returns
+anything else *unchanged* rather than rejecting it. A pre-#948 worker
+therefore hands the raw envelope object to workflow code as if it were the
+payload — silent wrong data, not a loud failure.
+
+Issue #1253 does not change this. A keyed write still emits this same flat,
+four-key shape — never the nested shape #1253 introduced, which only the
+identity-codec collision-escape path writes. See ADR-0003's "Nesting is
+scoped to the escape case only" addendum for why.
 
 `activate_codec_key` (issue #1244) enforces the deployment order
 structurally: it refuses while any worker that has heartbeated within
-`worker_stale_secs` does not advertise `codec_envelope_version >= 3` in its
-`harvest_workers.labels` row. Every current binary advertises this
+`worker_stale_secs` does not advertise `codec_envelope_version >= 2` in its
+`harvest_workers.labels` row. Every #1244-capable binary advertises this
 automatically, on registration and every heartbeat — there is nothing to
-configure. An older binary either never writes the label at all, or writes a
-lower version, so it blocks activation by default (fail closed).
+configure. A binary built before #1244 never writes the label at all, so it
+reads as version 1 and blocks activation by default (fail closed).
 
 So the deployment order remains the same, now enforced rather than merely
 documented:
