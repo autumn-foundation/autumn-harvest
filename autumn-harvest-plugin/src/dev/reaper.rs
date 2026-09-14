@@ -317,111 +317,129 @@ pub fn reap_stale_sessions(root: &Path) -> Result<usize, std::io::Error> {
         if !dir.is_dir() || !is_session_dir(&dir) {
             continue;
         }
-        let Ok(raw) = std::fs::read_to_string(dir.join(SESSION_RECORD_FILE)) else {
-            continue;
-        };
-        let mut record = match SessionRecord::from_json(&raw) {
-            Ok(record) => record,
-            Err(error) => {
-                tracing::debug!(
-                    error = %error,
-                    path = %dir.display(),
-                    "dev runtime: leaving an unreadable session record alone"
-                );
-                continue;
-            }
-        };
-        if !record_is_self_consistent(&record, &dir) {
-            tracing::warn!(
-                path = %dir.display(),
-                "dev runtime: leaving a session record whose data directory is not its own"
-            );
-            continue;
-        }
-
-        // Close the start window: a record written before `pg_ctl start`
-        // carries no pid, but the cluster it belongs to may well be running.
-        let pid_file = read_postmaster_pid_file(&record.data_dir);
-        if record.postmaster_pid.is_none() && matches!(pid_file, PidFile::Unreadable) {
-            // Absence of a pid is only evidence when it is *confirmed* absence.
-            // A transient read error, or the truncated file a crash mid-write
-            // leaves, would otherwise read as "no server" — and `decide_reap`
-            // would answer `Remove`, deleting the data directory out from under
-            // a postmaster that may well still be running, along with the only
-            // record that could ever stop it. Leave it for a run that can tell.
-            tracing::warn!(
-                path = %dir.display(),
-                "dev runtime: leaving a session whose postmaster.pid could not be read"
-            );
-            continue;
-        }
-        record.postmaster_pid = effective_postmaster_pid(&record, pid_file.contents());
-
-        let postmaster = record
-            .postmaster_pid
-            .map_or(PostmasterIdentity::NotRunning, |pid| {
-                postmaster_identity(&record, pid)
-            });
-        let decision = decide_reap(
-            &record,
-            owner_is_the_recorded_one(&record),
-            postmaster,
-            self_pid,
-        );
-        match decision {
-            ReapDecision::Skip(SkipReason::PostmasterIdentityUnknown) => {
-                tracing::warn!(
-                    path = %dir.display(),
-                    "dev runtime: leaving a session whose postmaster identity cannot be confirmed"
-                );
-                continue;
-            }
-            ReapDecision::Skip(_) => continue,
-            ReapDecision::StopThenRemove { postmaster_pid } => {
-                // The record's own `bin_dir` first: a cluster started from the
-                // downloaded cache lives where discovery does not look.
-                let recorded = record
-                    .bin_dir
-                    .clone()
-                    .filter(|dir| dir.is_dir())
-                    .map(PostgresBinaries::at);
-                let resolved = recorded.as_ref().or_else(|| {
-                    binaries
-                        .get_or_insert_with(|| PostgresBinaries::discover().ok())
-                        .as_ref()
-                });
-                if !stop_orphan(resolved, &record, postmaster_pid) {
-                    // Still running and we could not stop it. Removing the data
-                    // directory now would corrupt a live cluster, so leave both.
-                    tracing::warn!(
-                        path = %dir.display(),
-                        postmaster_pid,
-                        "dev runtime: could not stop an abandoned cluster; leaving it and its \
-                         data directory in place"
-                    );
-                    continue;
-                }
-            }
-            ReapDecision::Remove => {}
-        }
-
-        match std::fs::remove_dir_all(&dir) {
-            Ok(()) => {
-                reclaimed += 1;
-                tracing::info!(
-                    path = %dir.display(),
-                    "dev runtime: reclaimed an abandoned session"
-                );
-            }
-            Err(error) => tracing::warn!(
-                error = %error,
-                path = %dir.display(),
-                "dev runtime: could not reclaim an abandoned session directory"
-            ),
+        if reap_one_session(&dir, self_pid, &mut binaries) {
+            reclaimed += 1;
         }
     }
 
     Ok(reclaimed)
+}
+
+/// Reap one session directory if its record says to. Returns whether it was
+/// reclaimed.
+///
+/// Split out of [`reap_stale_sessions`] so that function stays a plain loop
+/// over directory entries; this is the per-entry decision and action.
+fn reap_one_session(
+    dir: &Path,
+    self_pid: u32,
+    binaries: &mut Option<Option<PostgresBinaries>>,
+) -> bool {
+    let Ok(raw) = std::fs::read_to_string(dir.join(SESSION_RECORD_FILE)) else {
+        return false;
+    };
+    let mut record = match SessionRecord::from_json(&raw) {
+        Ok(record) => record,
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                path = %dir.display(),
+                "dev runtime: leaving an unreadable session record alone"
+            );
+            return false;
+        }
+    };
+    if !record_is_self_consistent(&record, dir) {
+        tracing::warn!(
+            path = %dir.display(),
+            "dev runtime: leaving a session record whose data directory is not its own"
+        );
+        return false;
+    }
+
+    // Close the start window: a record written before `pg_ctl start` carries
+    // no pid, but the cluster it belongs to may well be running.
+    let pid_file = read_postmaster_pid_file(&record.data_dir);
+    if record.postmaster_pid.is_none() && matches!(pid_file, PidFile::Unreadable) {
+        // Absence of a pid is only evidence when it is *confirmed* absence. A
+        // transient read error, or the truncated file a crash mid-write
+        // leaves, would otherwise read as "no server" — and `decide_reap`
+        // would answer `Remove`, deleting the data directory out from under a
+        // postmaster that may well still be running, along with the only
+        // record that could ever stop it. Leave it for a run that can tell.
+        tracing::warn!(
+            path = %dir.display(),
+            "dev runtime: leaving a session whose postmaster.pid could not be read"
+        );
+        return false;
+    }
+    record.postmaster_pid = effective_postmaster_pid(&record, pid_file.contents());
+
+    let postmaster = record
+        .postmaster_pid
+        .map_or(PostmasterIdentity::NotRunning, |pid| {
+            postmaster_identity(&record, pid)
+        });
+    let decision = decide_reap(
+        &record,
+        owner_is_the_recorded_one(&record),
+        postmaster,
+        self_pid,
+    );
+    match decision {
+        ReapDecision::Skip(SkipReason::PostmasterIdentityUnknown) => {
+            tracing::warn!(
+                path = %dir.display(),
+                "dev runtime: leaving a session whose postmaster identity cannot be confirmed"
+            );
+            return false;
+        }
+        ReapDecision::Skip(_) => return false,
+        ReapDecision::StopThenRemove { postmaster_pid } => {
+            // The record's own `bin_dir` first: a cluster started from the
+            // downloaded cache lives where discovery does not look.
+            let recorded = record
+                .bin_dir
+                .clone()
+                .filter(|dir| dir.is_dir())
+                .map(PostgresBinaries::at);
+            let resolved = recorded.as_ref().or_else(|| {
+                binaries
+                    .get_or_insert_with(|| PostgresBinaries::discover().ok())
+                    .as_ref()
+            });
+            if !stop_orphan(resolved, &record, postmaster_pid) {
+                // Still running and we could not stop it. Removing the data
+                // directory now would corrupt a live cluster, so leave both.
+                tracing::warn!(
+                    path = %dir.display(),
+                    postmaster_pid,
+                    "dev runtime: could not stop an abandoned cluster; leaving it and its \
+                     data directory in place"
+                );
+                return false;
+            }
+        }
+        ReapDecision::Remove => {}
+    }
+
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {
+            tracing::info!(
+                path = %dir.display(),
+                "dev runtime: reclaimed an abandoned session"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                path = %dir.display(),
+                "dev runtime: could not reclaim an abandoned session directory"
+            );
+            false
+        }
+    }
 }
 
 /// Whether the process at the recorded owner pid is still the run that created
