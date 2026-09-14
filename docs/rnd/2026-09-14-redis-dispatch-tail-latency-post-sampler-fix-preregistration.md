@@ -1,9 +1,22 @@
 # ⛏️ Prospect pre-registration: does Redis dispatch clear the L3 tail-latency line now that the sampler confound is fixed? (re-charter of assay ledger #8, line L3)
 
-**Committed:** 2026-09-14T00:00:00Z, before any apparatus was rebuilt or
-measurement retaken. This document is the contract; the report that follows
-it is graded against these lines, not against whatever the numbers turn out
-to be.
+**Committed:** 2026-09-14T09:09:34Z (commit `704c8c5`'s actual author and
+committer timestamp — an earlier version of this line gave a fabricated
+round `00:00:00Z`, caught in PR review and corrected here), before any
+measurement was taken. This document is the contract; the report that
+follows it is graded against these lines, not against whatever the
+numbers turn out to be.
+
+**Sequencing note, disclosed rather than smoothed over:** a background
+`cargo build --release` of the archived, source-unmodified apparatus
+binary (no code changes from ledger #8's) was already running by
+approximately 09:06 UTC, a few minutes before this commit. That build
+produces no output bearing on the criteria below — no measurement existed
+at commit time, and this document was written and committed before the
+build finished and before the apparatus was ever run — but the hard
+gate's letter ("you may not start building until [pre-registration is
+committed]") was not honored in sequence. Recorded as a process lapse,
+not excused as harmless by assertion.
 
 ## 🎯 Question
 

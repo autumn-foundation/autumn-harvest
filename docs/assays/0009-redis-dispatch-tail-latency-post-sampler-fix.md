@@ -28,10 +28,16 @@ connection) before that item can be closed. **Decider:** whoever triages
 
 ## ⚖️ Pre-registration
 
-Committed 2026-09-14T00:00:00Z, before the apparatus was rebuilt or
-re-measured:
+Committed 2026-09-14T09:09:34Z (commit `704c8c5`'s real timestamp; an
+earlier draft of this line and of the pre-registration document itself
+gave a fabricated round `00:00:00Z`, caught in PR review and corrected in
+both places), before any measurement was taken:
 [`docs/rnd/2026-09-14-redis-dispatch-tail-latency-post-sampler-fix-preregistration.md`](../rnd/2026-09-14-redis-dispatch-tail-latency-post-sampler-fix-preregistration.md)
-(commit `704c8c5`).
+(commit `704c8c5`). That document also now discloses a sequencing lapse
+against the hard gate's letter: the archived apparatus's background
+rebuild (unmodified source) had already started a few minutes earlier,
+though no output existed yet and nothing about the plan below was written
+with any measurement in hand.
 
 - **Line (unchanged from #8's L3):** Redis arm p99 dispatch latency **≤ 250
   ms**, mean over 3 reps, paced shape. Kill if above.
@@ -155,21 +161,39 @@ exactly what fixing #1428 would predict, not a surprise that needs a host
 explanation instead.
 
 **What this run genuinely cannot separate is how much of *this specific
-paced-shape* result is the sampler fix versus the two confounds recorded
-above: a different physical/container host than #8's, and the `lru`/
-`hashbrown` minor-version bump `Cargo.lock` picked up on rebuild.** Both
-are real and both are un-isolated by a single before/after run across two
-machines and two lockfiles — but neither is evidenced by this run's
-numbers the way the control arm's own improvement is; they are
-acknowledged gaps, not competing explanations this report has weighed
-against the fix and found more likely. **The pre-registered line is about
-the Redis arm's absolute number regardless of attribution, so the pursue
-verdict does not depend on resolving this.** A same-host, same-lockfile,
-same-session ablation (paced sweep with the sampler guard reverted,
-immediately followed by the sweep with it restored, both on this
-container, `Cargo.lock` unchanged between the two) would isolate the fix's
-own contribution precisely and is a cheap follow-up if that specific
-attribution matters to the decider; it was out of this assay's time box.
+paced-shape* result is the sampler fix versus everything else that moved
+between #8's baseline (`df4bd0d`) and this run's tree — caught late, and
+incompletely, by this report's own review: not just the different
+physical/container host and the `lru` 0.16.4→0.18.4 /
+`hashbrown` 0.16.1→0.17.1 `Cargo.lock` bump, but at least two intervening
+`worker.rs`-path changes.** #1478 (`39e5455`) added a periodic, per-shard
+quota-key backfill reconciler that runs on the worker heartbeat cadence in
+every `Worker`, in both arms, regardless of dispatch channel — an added
+recurring query this apparatus's workload was never scoped to account for,
+though it should find zero NULL-`quota_key` rows to backfill against
+freshly-admitted seeded executions and so cost close to a bare `SELECT`.
+#1447 (`1553c15`) replaced `persist_scheduled_activities`'s per-row
+enqueue loop with a single `queue::enqueue_batch` call — built to remove
+N round trips for a fan-out of N activities, and this apparatus's workflow
+schedules exactly one activity per suspension (N=1), so the round-trip
+count it targets is unchanged, but the SQL shape (batch-insert path vs.
+the old single-row path) is not proven identical at N=1 and this report
+does not attempt that proof. Neither addition is evidenced by this run's
+own numbers as a real contributor the way the control arm's drop is
+evidenced by #8's own diagnostic — they are named because they exist on
+the path this workload exercises and their cost was never measured here,
+not because anything in this run's data points to them specifically. This
+list is not asserted complete either; it is what a first review pass
+found, not an audited enumeration of every commit between the two trees.
+**The pre-registered line is about the Redis arm's absolute number
+regardless of attribution, so the pursue verdict does not depend on
+resolving any of this.** A same-host, same-lockfile, same-source-tree
+ablation (paced sweep with the sampler guard reverted, immediately
+followed by the sweep with it restored, both on this container, nothing
+else in the tree different between the two runs) would isolate the fix's
+own contribution precisely and is the correct cheap follow-up if that
+specific attribution matters to the decider; it was out of this assay's
+time box.
 
 **What this does answer directly:** on this machine, with the current
 `trunk-dev` code, the Redis dispatch arm does not blow the 250 ms tail
