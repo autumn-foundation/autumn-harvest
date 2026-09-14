@@ -695,6 +695,13 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
             post(lift_gate_ui).route_layer(require_admin),
         )
         .layer(Extension(api_state))
+        // issue #1278: reject a cross-site POST before it reaches any
+        // handler or admin check. The guard then covers every mutation
+        // uniformly, admin-gated and ungated alike. The outermost `.layer()`
+        // call runs first, ahead of the per-route `require_admin` above.
+        .layer(axum::middleware::from_fn(
+            crate::same_origin::require_same_origin,
+        ))
 }
 
 async fn index() -> axum::response::Redirect {
