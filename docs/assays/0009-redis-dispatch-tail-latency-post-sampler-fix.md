@@ -168,10 +168,17 @@ physical/container host and the `lru` 0.16.4→0.18.4 /
 `hashbrown` 0.16.1→0.17.1 `Cargo.lock` bump, but at least two intervening
 `worker.rs`-path changes.** #1478 (`39e5455`) added a periodic, per-shard
 quota-key backfill reconciler that runs on the worker heartbeat cadence in
-every `Worker`, in both arms, regardless of dispatch channel — an added
-recurring query this apparatus's workload was never scoped to account for,
-though it should find zero NULL-`quota_key` rows to backfill against
-freshly-admitted seeded executions and so cost close to a bare `SELECT`.
+every `Worker`, in both arms, regardless of dispatch channel. Checked
+directly against `quota_reconcile.rs`: this apparatus's one workflow
+registers `quota: None` (`src/main.rs:289-292`), and
+`registered_quota_workflow_names()` returning empty makes
+`reconcile_quota_keys_from` return before issuing any SQL
+(`quota_reconcile.rs:374-440`) — so, corrected from an earlier draft of
+this paragraph that guessed "a near-bare `SELECT`," **the actual exposure
+is not a query at all: the spawned loop still checks out a pooled
+connection every heartbeat tick before that early return**
+(`quota_reconcile.rs:584-586`), so the added cost is heartbeat-cadence
+pool-checkout contention, not a recurring query.
 #1447 (`1553c15`) replaced `persist_scheduled_activities`'s per-row
 enqueue loop with a single `queue::enqueue_batch` call — built to remove
 N round trips for a fan-out of N activities, and this apparatus's workflow
