@@ -34,9 +34,11 @@ nothing about error *visibility*, only about how many internal passes one
 external call performs.
 
 **Zero unrelated engine impact:** no new `WorkflowEvent` variant, no
-migration, no schema change, no public API change. `poll_once`/
-`poll_once_as_of` are unchanged; `run_until_blocked`/`run_until_blocked_as_of`
-(the single-execution, fail-fast drivers) are untouched.
+migration, no schema change, no public API change. `poll_once`'s contract
+and behavior are unchanged, though its body now delegates to
+`poll_once_pass`; `poll_once_as_of` and `run_until_blocked`/
+`run_until_blocked_as_of` (the single-execution, fail-fast drivers) are
+untouched.
 
 Tests, red -> green: `autumn-harvest-sqlite/tests/integration/fleet_fault_isolation.rs`
 gained `run_until_idle_converges_a_multi_cycle_execution_in_one_call_past_a_broken_one`,

@@ -46,7 +46,7 @@ async fn healthy_wf(_ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
 /// Needs TWO sequential decision cycles, unlike `healthy_wf`'s one. One
 /// `run_until_idle()` pass is indistinguishable from full convergence for a
 /// one-cycle workflow. That is why #1536's own regression test missed the
-/// #1555 gap (issue repro).
+/// #1555 gap.
 #[workflow]
 async fn two_step_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     let a = ctx
@@ -64,6 +64,24 @@ fn increment_activity() -> autumn_harvest_sqlite::ActivitySpec {
     autumn_harvest_sqlite::ActivitySpec::new(1, |input: serde_json::Value| {
         Ok(json!(input.as_i64().unwrap_or_default() + 1))
     })
+}
+
+/// Errors on a LATER pass, not the first. Cycle 1 schedules a real activity
+/// (progress, no error). Only once that activity resolves does cycle 2 reach
+/// `RequestCancelExternalWorkflow`, a DIFFERENT unsupported command than
+/// `broken_wf`'s `SignalExternalWorkflow`.
+#[workflow]
+async fn broken_after_one_cycle_wf(
+    ctx: &WorkflowContext,
+    target: ExecutionId,
+) -> Result<(), String> {
+    let _ = ctx
+        .execute_activity_raw("increment", json!(0), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    ctx.request_cancel_external_workflow(target)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// A second, dedicated broken workflow with its own attempt counter. A
@@ -271,4 +289,38 @@ async fn run_until_idle_converges_a_multi_cycle_execution_in_one_call_past_a_bro
         "a single run_until_idle() call must drive a multi-cycle unrelated \
          execution to completion, not just one decision cycle"
     );
+}
+
+/// `run_until_idle`'s outer loop keeps only the FIRST error seen across ALL
+/// passes (`first_error.get_or_insert`), not the last pass's error. Pass 1
+/// has only `broken_wf`'s error. Pass 2 adds a SECOND, differently-named
+/// error once `broken_after_one_cycle_wf`'s activity resolves. The returned
+/// error must still be pass 1's.
+#[tokio::test]
+async fn run_until_idle_keeps_the_first_error_seen_across_passes_not_a_later_one() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&broken_wf_info());
+    rt.register_workflow(&broken_after_one_cycle_wf_info());
+    rt.register_activity_raw("increment", increment_activity());
+
+    rt.start_workflow("broken_wf", json!(ExecutionId::new()))
+        .unwrap();
+    rt.start_workflow("broken_after_one_cycle_wf", json!(ExecutionId::new()))
+        .unwrap();
+
+    let err = rt
+        .run_until_idle()
+        .await
+        .expect_err("a fleet with no progressable work left must still report an error");
+    match err {
+        SqliteError::Unsupported(msg) => {
+            assert!(
+                msg.contains("SignalExternalWorkflow"),
+                "run_until_idle must keep pass 1's error (broken_wf's), not \
+                 pass 2's different error (RequestCancelExternalWorkflow); \
+                 got: {msg}"
+            );
+        }
+        other => panic!("expected SqliteError::Unsupported, got {other:?}"),
+    }
 }
