@@ -1870,7 +1870,7 @@ async fn activation_is_refused_while_a_live_worker_cannot_read_the_keyed_envelop
 
     let err = activate_codec_key(&sharded, &[ShardId::new(0)], &codecs, "k2", 60)
         .await
-        .expect_err("a live worker cannot read a version-2 envelope");
+        .expect_err("a live worker cannot read a nested (version-3) envelope");
     match err {
         HarvestError::CodecKeyActivationBlocked { key_id, blockers } => {
             assert_eq!(key_id, "k2");
@@ -1895,7 +1895,7 @@ async fn activation_succeeds_once_every_live_worker_advertises_the_keyed_envelop
         &mut conn,
         "worker-new",
         0,
-        &json!({"codec_envelope_version": 2, "codec_registered_key_ids": ["k2"]}),
+        &json!({"codec_envelope_version": 3, "codec_registered_key_ids": ["k2"]}),
     )
     .await;
 
@@ -1905,11 +1905,11 @@ async fn activation_succeeds_once_every_live_worker_advertises_the_keyed_envelop
 
     activate_codec_key(&sharded, &[ShardId::new(0)], &codecs, "k2", 60)
         .await
-        .expect("every live worker advertises version 2 and has k2 registered");
+        .expect("every live worker advertises version 3 and has k2 registered");
     assert_eq!(codecs.active_key_id(), "k2");
 }
 
-/// A worker's binary can support the version-2 envelope's syntax fleet-wide
+/// A worker's binary can support the nested envelope's syntax fleet-wide
 /// before the target key's material reaches every worker's config.
 /// Envelope support alone must not be read as proof this worker can decode
 /// payloads written under the specific key being activated.
@@ -1917,13 +1917,13 @@ async fn activation_succeeds_once_every_live_worker_advertises_the_keyed_envelop
 async fn activation_is_refused_while_a_live_worker_lacks_the_target_key() {
     let (url, _c) = setup_isolated_db().await;
     let mut conn = connect(&url).await;
-    // Envelope v2 capable, but only "k1" ever reached this worker's config --
+    // Envelope v3 capable, but only "k1" ever reached this worker's config --
     // "k2" is the key this test activates.
     insert_worker_row(
         &mut conn,
         "worker-partial",
         0,
-        &json!({"codec_envelope_version": 2, "codec_registered_key_ids": ["k1"]}),
+        &json!({"codec_envelope_version": 3, "codec_registered_key_ids": ["k1"]}),
     )
     .await;
 
@@ -2213,6 +2213,119 @@ async fn a_four_key_version_1_payload_is_not_counted_by_the_census() {
             .expect("sweep"),
         0,
         "and must not be rewritten"
+    );
+}
+
+/// Issue #1253: the census SQL must recognize the current nested envelope
+/// shape too, not just the two legacy flat ones. `append_under_key` writes
+/// real rows through `PayloadCodecs::encode_event`, which now nests any row
+/// encoded under a genuinely active (non-legacy) key -- so this exercises the
+/// SQL predicate's new branch end to end, against real ciphertext.
+#[tokio::test]
+async fn a_nested_envelope_is_counted_and_swept() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "nested").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+
+    let rows = raw_event_data(&mut conn, exec_id).await;
+    let field = &rows[0]["data"]["input"];
+    assert_eq!(
+        field.as_object().map(serde_json::Map::len),
+        Some(1),
+        "the row this test just wrote is nested, one top-level key: {field}"
+    );
+
+    codecs.set_active_key("k2").expect("flip");
+    let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress");
+    assert_eq!(
+        progress.rows_remaining(),
+        1,
+        "the nested row under the now-outgoing key k1 must be counted: {:?}",
+        progress.rows_by_key_id
+    );
+    assert_eq!(
+        sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("sweep"),
+        1,
+        "and must be converted onto k2"
+    );
+}
+
+/// The nested-shape sibling of `a_near_envelope_is_neither_counted_nor_swept`:
+/// business data shaped almost, but not quite, like a nested envelope (a
+/// sibling key breaking the one-key guarantee) must not be counted.
+#[tokio::test]
+async fn a_nested_near_envelope_is_neither_counted_nor_swept() {
+    use autumn_harvest::schema::harvest_events;
+
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "nested_near").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+
+    let row_id: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .select(harvest_events::id)
+        .first(&mut conn)
+        .await
+        .expect("row id");
+    let mut data: Value = harvest_events::table
+        .find(row_id)
+        .select(harvest_events::event_data)
+        .first(&mut conn)
+        .await
+        .expect("row");
+    // Business data shaped almost like a nested envelope: a sibling key
+    // alongside the discriminator breaks the one-key guarantee the nested
+    // shape's safety depends on.
+    data["data"]["input"] = json!({
+        "_harvest_codec_envelope": {"codec_id": "xor", "data": "AAAA"},
+        "something_else": true,
+    });
+    diesel::update(harvest_events::table.find(row_id))
+        .set(harvest_events::event_data.eq(&data))
+        .execute(&mut conn)
+        .await
+        .expect("update");
+
+    codecs.set_active_key("k2").expect("flip");
+    let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress");
+    assert_eq!(
+        progress.rows_remaining(),
+        0,
+        "a nested near-envelope must not be counted: {:?}",
+        progress.rows_by_key_id
+    );
+    assert_eq!(
+        sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("sweep"),
+        0,
+        "and must not be swept either"
     );
 }
 
