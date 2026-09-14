@@ -43,6 +43,10 @@
 //!   `cross_region_dr_tests.rs`'s `a_fenced_worker_cannot_advance_the_rotation_cursor`
 //!   and `a_fenced_sweep_that_converts_nothing_still_fails_closed` cover the
 //!   fencing.
+//! - **Issue #1258** (the revalidation deadline is its own column, not
+//!   `updated_at`) —
+//!   [`an_ordinary_advancing_write_does_not_reset_the_revalidation_deadline`]
+//!   and [`a_busy_shard_still_revalidates_once_the_deadline_is_due`].
 //!
 //! # Issue #1244: the two structural fleet-wide preconditions
 //!
@@ -2813,11 +2817,12 @@ async fn a_row_committing_below_the_cursor_is_still_converted() {
          is 0 the throttle is gone and every tick is scanning the table"
     );
 
-    // Wind the cursor's clock back past the revalidation interval. That is the
-    // only thing standing between the stranded row and recovery.
+    // Wind the revalidation deadline back past the interval (issue #1258:
+    // this is its own column, not `updated_at`). That is the only thing
+    // standing between the stranded row and recovery.
     diesel::sql_query(
         "UPDATE harvest_codec_rotation_cursor \
-         SET updated_at = now() - interval '10 minutes' WHERE shard_id = 0",
+         SET next_revalidation_at = now() - interval '1 minute' WHERE shard_id = 0",
     )
     .execute(&mut conn)
     .await
@@ -3128,5 +3133,179 @@ async fn a_new_active_key_always_starts_a_fresh_pass() {
     assert_eq!(
         cursor.rows_reencrypted, 1,
         "the fresh pass's own count must land, not a value carried over"
+    );
+}
+
+// ── issue #1258: the revalidation deadline is its own column ────────────────
+
+/// An ordinary write to an already-completed cursor must not reset the
+/// revalidation deadline.
+///
+/// Before this fix, `updated_at` did two jobs: cursor liveness, and the
+/// revalidation throttle's deadline. A batch that converts nothing but still
+/// advances `last_event_id` — the steady state on a busy, already-converged
+/// shard — reset both at once. This pins the fix: the two jobs now live on
+/// separate columns, and only one of them moves here.
+#[tokio::test]
+async fn an_ordinary_advancing_write_does_not_reset_the_revalidation_deadline() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "deadline_survives_advance").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+
+    codecs.set_active_key("k2").expect("flip");
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("first pass");
+    let first = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .cursor
+        .expect("cursor written");
+    assert!(
+        first.completed_at.is_some(),
+        "the pass must converge, or this test does not exercise the hazard"
+    );
+    let armed_at = first
+        .next_revalidation_at
+        .expect("a completed pass must arm the revalidation deadline");
+
+    // Ordinary busy traffic: already under the active key, nothing to
+    // convert, but the batch is non-empty and the cursor advances over it.
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k2",
+        1,
+        &[completed(json!({"b": 2}))],
+    )
+    .await;
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("busy tick");
+    let second = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .cursor
+        .expect("cursor still there");
+
+    assert!(
+        second.last_event_id > first.last_event_id,
+        "the tick must be an ordinary advancing write, or this test proves \
+         nothing"
+    );
+    assert!(
+        second.completed_at.is_some(),
+        "advancing over already-converted rows must not un-complete the pass"
+    );
+    assert_eq!(
+        second.next_revalidation_at,
+        Some(armed_at),
+        "an ordinary advancing write must not move the revalidation deadline; \
+         a busy shard that never idles would starve revalidation forever"
+    );
+    assert!(
+        second.updated_at > first.updated_at,
+        "updated_at still means last write, so the advancing write must move it"
+    );
+}
+
+/// A converged shard that keeps receiving ordinary traffic must still
+/// revalidate once the deadline comes due.
+///
+/// This is the scenario issue #1258 reports. On the single-column design, an
+/// ordinary advancing write reset the same timestamp the claim throttled on,
+/// so a shard receiving traffic within every interval never saw the claim's
+/// predicate hold, and a row committed below the cursor was never found
+/// again.
+#[tokio::test]
+async fn a_busy_shard_still_revalidates_once_the_deadline_is_due() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "busy_revalidation").await;
+
+    // Push the cursor high with an explicit id, so an id well below it is
+    // guaranteed free for the late arrival.
+    let encoded = encode_under(&codecs, "k1", &json!({"early": true}));
+    insert_event_at_id(&mut conn, exec_id, 10_000, 0, &encoded).await;
+
+    codecs.set_active_key("k2").expect("flip");
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("first pass");
+    let first_pass = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .cursor
+        .expect("cursor exists");
+    assert!(
+        first_pass.completed_at.is_some(),
+        "the pass must converge, or this test does not exercise the hazard"
+    );
+
+    // The late arrival: below the cursor, still on the outgoing key.
+    let late = encode_under(&codecs, "k1", &json!({"late": true}));
+    insert_event_at_id(&mut conn, exec_id, 5_000, 1, &late).await;
+
+    // Ordinary busy traffic, well before the deadline is due. Each row
+    // already carries the active key, so there is nothing to convert — but
+    // the batch is non-empty and the cursor advances over it every tick.
+    for (i, row_id) in (10_001..10_004).enumerate() {
+        let busy = encode_under(&codecs, "k2", &json!({"busy": i}));
+        let event_id = 2 + i32::try_from(i).expect("small loop index");
+        insert_event_at_id(&mut conn, exec_id, row_id, event_id, &busy).await;
+        sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("busy tick before the deadline");
+    }
+    assert_eq!(
+        load_shard_rotation_progress(&mut conn, 0, &codecs)
+            .await
+            .expect("progress")
+            .rows_remaining(),
+        1,
+        "ordinary busy traffic before the deadline must not trigger an early \
+         re-census"
+    );
+
+    // Simulate the interval elapsing.
+    diesel::sql_query(
+        "UPDATE harvest_codec_rotation_cursor \
+         SET next_revalidation_at = now() - interval '1 minute' WHERE shard_id = 0",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("age the deadline");
+
+    // More busy traffic lands right at the due deadline. It must not stop
+    // the claim from firing.
+    for (i, row_id) in (10_004..10_007).enumerate() {
+        let busy = encode_under(&codecs, "k2", &json!({"busy": i}));
+        let event_id = 5 + i32::try_from(i).expect("small loop index");
+        insert_event_at_id(&mut conn, exec_id, row_id, event_id, &busy).await;
+        sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("busy tick at the due deadline");
+    }
+
+    assert_eq!(
+        load_shard_rotation_progress(&mut conn, 0, &codecs)
+            .await
+            .expect("progress")
+            .rows_remaining(),
+        0,
+        "once due, revalidation must still run and convert the stranded row, \
+         even on a shard that never goes idle"
     );
 }
