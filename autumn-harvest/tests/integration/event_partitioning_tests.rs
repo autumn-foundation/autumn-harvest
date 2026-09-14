@@ -912,6 +912,75 @@ async fn a_unique_constraint_on_a_leaf_partition_directly_still_refuses_the_reve
 }
 
 #[tokio::test]
+async fn a_plain_unique_index_on_a_leaf_partition_directly_still_refuses_the_revert() {
+    // Review finding: the revert-side check required a backing
+    // `pg_constraint` row before a leaf index was even a candidate. A
+    // plain `CREATE UNIQUE INDEX`, added directly on one leaf with no
+    // `ADD CONSTRAINT` involved, carries no such row. It used to pass
+    // this check unnoticed. `capture_index_defs` reads only the
+    // parent's own indexes. `disable_partitioning`'s `DROP ... CASCADE`
+    // destroys the leaf and the index together, silently.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let exec = insert_execution(
+        &mut conn,
+        "leaf_plain_uniq_wf",
+        "leaf-plain-uniq-1",
+        day(2026, 2, 3),
+        None,
+    )
+    .await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    let leaf = partition::LEGACY_PARTITION;
+    diesel::sql_query("DROP INDEX IF EXISTS harvest_events_leaf_plain_uniq_958_idx")
+        .execute(&mut conn)
+        .await
+        .expect("clear any stray index from a previous run");
+    diesel::sql_query(format!(
+        "CREATE UNIQUE INDEX harvest_events_leaf_plain_uniq_958_idx ON {leaf} (event_type)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect(
+        "seed an operator's own plain unique index directly on the leaf, no constraint involved",
+    );
+
+    let err = partition::disable_partitioning(&mut conn).await.expect_err(
+        "a plain unique index installed directly on a leaf partition, with no backing \
+         constraint at all, must refuse the revert too",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_leaf_plain_uniq_958_idx"),
+        "the refusal must name the offending index; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "p",
+        "a refused revert must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("DROP INDEX harvest_events_leaf_plain_uniq_958_idx")
+        .execute(&mut conn)
+        .await
+        .expect("drop the offending index");
+}
+
+#[tokio::test]
 async fn the_large_table_plans_phase_1_also_refuses_a_compatible_constraint_backed_index() {
     // Same guard, the scripted path.
     let (url, _c) = setup_db().await;
@@ -2751,6 +2820,54 @@ async fn the_large_table_plans_phase_1_also_refuses_an_unreplayable_constraint()
 }
 
 #[tokio::test]
+async fn the_large_table_plans_phase_1_refuses_a_cohort_check_bound_to_the_wrong_cutoff() {
+    // Same gap as `an_impostor_cohort_check_with_a_mismatched_cutoff_still_refuses`,
+    // the scripted path: `unreplayable_constraints_guard_sql` now compares
+    // against the plan's own attached cutover, not a shape-only regex that
+    // any timestamp satisfies.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS harvest_events_legacy_cohort_ck",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray decoy from a previous run");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_legacy_cohort_ck \
+         CHECK (cohort < '2020-01-01T00:00:00Z'::timestamptz)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an impostor at harvest's reserved name and shape, bound to an unrelated date");
+
+    let mut refusal: Option<String> = None;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 1)
+    {
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            refusal = Some(e.to_string());
+        }
+    }
+    let msg = refusal.expect(
+        "phase 1 must refuse a same-named, same-shaped CHECK bound to a cutoff other than \
+         this plan's own attached cutover",
+    );
+    assert!(
+        msg.contains("harvest_events_legacy_cohort_ck"),
+        "the refusal must name the offending constraint; got {msg}"
+    );
+
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT harvest_events_legacy_cohort_ck")
+        .execute(&mut conn)
+        .await
+        .expect("drop the impostor constraint");
+}
+
+#[tokio::test]
 async fn an_unreplayable_constraint_refuses_the_revert_too() {
     // The reverse direction: `disable_partitioning` renames the
     // partitioned parent out of the way exactly as `enable` renames the
@@ -2975,6 +3092,58 @@ async fn an_impostor_reusing_harvests_reserved_cohort_check_name_still_refuses()
             "an impostor reusing harvest's reserved cohort-check name but a different \
              expression must still refuse -- name, type and column alone must not \
              exempt it",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_legacy_cohort_ck"),
+        "the refusal must name the offending constraint; got {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a refused conversion must leave the shard exactly as it was"
+    );
+
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT harvest_events_legacy_cohort_ck")
+        .execute(&mut conn)
+        .await
+        .expect("drop the impostor constraint");
+}
+
+#[tokio::test]
+async fn an_impostor_cohort_check_with_a_mismatched_cutoff_still_refuses() {
+    // Review finding: matching harvest's own reserved `{LEGACY_PARTITION}_cohort_ck`
+    // by name, type, column and expression shape alone still accepts any
+    // timestamp bound. It does not require the cutover this conversion is
+    // about to attach.
+    // An operator's own `CHECK (cohort < <unrelated date>)` at the reserved
+    // name has the identical shape. It would have been treated as
+    // harvest-owned and renamed onto the legacy partition. Harvest's own
+    // check, bound to the real cutover, would then replace it -- silently
+    // discarding the operator's ceiling.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS harvest_events_legacy_cohort_ck",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("clear any stray decoy from a previous run");
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_legacy_cohort_ck \
+         CHECK (cohort < '2020-01-01T00:00:00Z'::timestamptz)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an impostor at harvest's reserved name and shape, bound to an unrelated date");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "a same-named, same-shaped CHECK bounded by a date unrelated to this \
+             conversion's actual cutover must still refuse",
         );
     let msg = err.to_string();
     assert!(

@@ -190,8 +190,37 @@ const LEGACY_RENAME_SUFFIX: &str = "__pre958";
 /// SQL-quoted for direct interpolation into a single-quoted string
 /// literal (`''` doubles each literal quote) -- every call site embeds
 /// it inside one via `format!`.
+///
+/// Its only remaining caller, [`unreplayable_constraints`], is gated
+/// the same way: an exact-cutover comparison replaced it everywhere a
+/// caller already knows the real value. See
+/// [`expected_cohort_ck_def_sql`] for that half.
+#[cfg(feature = "db")]
 const LEGACY_COHORT_CK_DEF_RE: &str =
     r"^CHECK \(\(cohort < ''[^'']+''::timestamp with time zone\)\)( NOT VALID)?$";
+
+/// A PL/pgSQL `format(...)` call.
+///
+/// It renders the exact `CHECK` text `pg_get_constraintdef` gives
+/// harvest's own `{LEGACY_PARTITION}_cohort_ck`. `ts_expr` supplies the
+/// bound, a `timestamptz` SQL expression. The result omits any
+/// `NOT VALID` suffix.
+///
+/// Review finding: [`LEGACY_COHORT_CK_DEF_RE`] matches a `CHECK` bounded
+/// by any timestamp, not the specific cutover this conversion actually
+/// planned or attached. A same-named, same-shaped constraint bounded by
+/// an unrelated date would pass that regex. It would then be treated as
+/// harvest's own and renamed onto the legacy partition. From there, the
+/// operator's own ceiling would stop applying to every partition
+/// created from then on. A caller that already knows the real cutover
+/// compares against this exact rendering instead of the regex. A caller
+/// that does not know it yet keeps using the regex instead. That covers
+/// two callers. The Rust-side preflight runs before the real cutover is
+/// chosen. Disable's revert checks have no expected future value to
+/// compare against either.
+fn expected_cohort_ck_def_sql(ts_expr: &str) -> String {
+    format!("format('CHECK ((cohort < %L::timestamp with time zone))', {ts_expr})")
+}
 
 /// The validate-only `BEFORE INSERT` trigger that replaces the FK's
 /// insert-time half. It must never modify `NEW`: Postgres rejects a `BEFORE
@@ -1503,8 +1532,10 @@ async fn refuse_if_unique_index_without_cohort(
     )))
 }
 
-/// Operator-added constraint-backed unique indexes on the still-partitioned
-/// `harvest_events` parent, or on one of its leaf partitions.
+/// Operator-added unique indexes on the still-partitioned
+/// `harvest_events` parent, or on one of its leaf partitions. Each is
+/// either constraint-backed, or a plain index independently created on
+/// one leaf.
 ///
 /// None of these survive: `capture_index_defs` cannot replay them onto
 /// the flat table [`disable_partitioning`] rebuilds.
@@ -1535,14 +1566,35 @@ async fn refuse_if_unique_index_without_cohort(
 /// row through `conparentid` -- a link an independently added leaf
 /// constraint never carries.
 ///
+/// Review finding: the leaf-scope exclusion above required a backing
+/// `pg_constraint` row before a leaf index was even a candidate. A
+/// plain `CREATE UNIQUE INDEX` an operator adds directly on one leaf
+/// carries no such row. No `ADD CONSTRAINT` is involved, so it was
+/// never examined at all. `capture_index_defs` reads only the parent's
+/// own indexes. Reverting drops every leaf outright. That index would
+/// vanish silently. Candidacy no longer requires a constraint.
+///
+/// What still needs excluding is a leaf index Postgres itself built,
+/// not one an operator added independently. Attaching a partition
+/// gives its matching local index its own `pg_inherits` row.
+/// `inhrelid` names the leaf index; `inhparent` names the parent's.
+/// This is the same mechanism `pg_inherits` uses for tables, one level
+/// down. It covers a constraint-backed propagated index and a plain
+/// propagated one alike. This is proven empirically: both carry that
+/// row. An independently-added leaf index carries neither it nor a
+/// `pg_constraint` row. A propagated index is already covered by the
+/// parent's own capture. Only an unlinked leaf index is this module's
+/// to refuse.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] if the catalog query fails.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 pub async fn constraint_backed_unique_indexes_on_partitioned_parent(
     conn: &mut AsyncPgConnection,
 ) -> HarvestResult<Vec<String>> {
-    let rows = diesel::sql_query(
+    let rows = diesel::sql_query(format!(
         "SELECT DISTINCT i.indexrelid::regclass::text AS v
            FROM pg_index i
            JOIN pg_class c ON c.oid = i.indrelid
@@ -1559,37 +1611,84 @@ pub async fn constraint_backed_unique_indexes_on_partitioned_parent(
                 )
             )
             AND i.indisunique
-            AND EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)
-            AND NOT EXISTS (
-                SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid
-                  AND (
-                      -- On the parent itself: harvest's own two, by exact
-                      -- name and shape, never DEFERRABLE.
-                      (c.relname = 'harvest_events' AND NOT con.condeferrable
-                       AND (
-                           (con.conname = 'harvest_events_pkey' AND con.contype = 'p'
-                            AND (SELECT array_agg(a.attname::text ORDER BY k)
-                                   FROM generate_series(0, i.indnkeyatts - 1) k
-                                   JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
-                                ) = ARRAY['id', 'cohort'])
-                           OR
-                           (con.conname = 'harvest_events_workflow_exec_id_event_id_key' AND con.contype = 'u'
-                            AND (SELECT array_agg(a.attname::text ORDER BY k)
-                                   FROM generate_series(0, i.indnkeyatts - 1) k
-                                   JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
-                                ) = ARRAY['workflow_exec_id', 'event_id', 'cohort'])
-                       ))
-                      OR
-                      -- On a leaf: Postgres itself propagates the parent's
-                      -- own constraint onto every partition, one
-                      -- `pg_constraint` row per leaf, linked back via
-                      -- `conparentid`. An operator's own leaf-only
-                      -- constraint is never so linked.
-                      (c.relname <> 'harvest_events' AND con.conparentid <> 0)
-                  )
+            AND (
+                -- A plain (non-constraint-backed) index on the PARENT
+                -- itself is not a candidate at all: `capture_index_defs`
+                -- reads and replays every one of those unconditionally,
+                -- unique or not, so it already survives a revert. Only a
+                -- constraint-backed one on the parent needs excluding
+                -- below. A leaf is different: `capture_index_defs` never
+                -- reads a leaf's indexes, constraint-backed or plain, so
+                -- every unique one there is a candidate.
+                c.relname <> 'harvest_events'
+                OR EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)
             )
-          ORDER BY 1",
-    )
+            AND NOT (
+                -- On the parent itself: harvest's own two, by exact name
+                -- and shape, backed by a never-DEFERRABLE table constraint.
+                c.relname = 'harvest_events'
+                AND EXISTS (
+                    SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid
+                      AND NOT con.condeferrable
+                      AND (
+                          (con.conname = 'harvest_events_pkey' AND con.contype = 'p'
+                           AND (SELECT array_agg(a.attname::text ORDER BY k)
+                                  FROM generate_series(0, i.indnkeyatts - 1) k
+                                  JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
+                               ) = ARRAY['id', 'cohort'])
+                          OR
+                          (con.conname = 'harvest_events_workflow_exec_id_event_id_key' AND con.contype = 'u'
+                           AND (SELECT array_agg(a.attname::text ORDER BY k)
+                                  FROM generate_series(0, i.indnkeyatts - 1) k
+                                  JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
+                               ) = ARRAY['workflow_exec_id', 'event_id', 'cohort'])
+                      )
+                )
+            )
+            AND NOT (
+                -- On a leaf: propagated from the parent's own index --
+                -- constraint-backed or plain alike -- rather than added
+                -- independently on the leaf itself.
+                c.relname <> 'harvest_events'
+                AND EXISTS (SELECT 1 FROM pg_inherits ii WHERE ii.inhrelid = i.indexrelid)
+            )
+            AND NOT (
+                -- Harvest's own two plain indexes on the legacy partition
+                -- itself, by exact name and shape: phase 2 (and
+                -- `enable_sql`'s direct-path equivalent) builds these so
+                -- `ATTACH PARTITION` can validate the parent's PK and
+                -- unique constraint against an existing index instead of
+                -- scanning. Neither backs a constraint on the legacy
+                -- table -- the constraint they once backed there was
+                -- dropped along with the rest of the flat layout -- and
+                -- neither is `pg_inherits`-linked, since they were never
+                -- attached to a parent-level partitioned index.
+                --
+                -- Re-running the plan over an already-converted shard
+                -- renames every index still occupying its original name
+                -- on the legacy partition, this pair included, gaining
+                -- the suffix `{LEGACY_RENAME_SUFFIX}`. Both the plain
+                -- and the renamed form are exempt here, the same way the
+                -- cohort `CHECK` exemption treats its own reserved name.
+                c.relname = '{LEGACY_PARTITION}'
+                AND (
+                    (i.indexrelid::regclass::text IN
+                         ('{LEGACY_PARTITION}_pk_idx', '{LEGACY_PARTITION}_pk_idx{LEGACY_RENAME_SUFFIX}')
+                     AND (SELECT array_agg(a.attname::text ORDER BY k)
+                            FROM generate_series(0, i.indnkeyatts - 1) k
+                            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
+                         ) = ARRAY['id', 'cohort'])
+                    OR
+                    (i.indexrelid::regclass::text IN
+                         ('{LEGACY_PARTITION}_exec_event_idx', '{LEGACY_PARTITION}_exec_event_idx{LEGACY_RENAME_SUFFIX}')
+                     AND (SELECT array_agg(a.attname::text ORDER BY k)
+                            FROM generate_series(0, i.indnkeyatts - 1) k
+                            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
+                         ) = ARRAY['workflow_exec_id', 'event_id', 'cohort'])
+                )
+            )
+          ORDER BY 1"
+    ))
     .load::<TextRow>(conn)
     .await
     .map_err(database_error)?;
@@ -1607,11 +1706,14 @@ async fn refuse_if_constraint_backed_unique_index_on_revert(
         return Ok(());
     }
     Err(HarvestError::Config(format!(
-        "refusing to revert harvest_events: {} backed by a table constraint other than \
-         harvest's own PRIMARY KEY and (workflow_exec_id, event_id) UNIQUE constraint ({}). \
-         The conversion has no way to replay an arbitrary constraint, so it would otherwise \
-         be dropped silently. Drop the constraint (and recreate it on the flat table \
-         yourself afterward, if it is still needed) to proceed.",
+        "refusing to revert harvest_events: {} that cannot survive conversion unchanged \
+         ({}). Each is either backed by a table constraint other than harvest's own \
+         PRIMARY KEY and (workflow_exec_id, event_id) UNIQUE constraint, or an \
+         independently created index on one leaf partition with no such constraint at \
+         all. Either way the conversion has no way to replay it, so it would otherwise be \
+         dropped silently along with the leaf it sits on. Drop the index or constraint \
+         (and recreate it on the flat table yourself afterward, if it is still needed) to \
+         proceed.",
         if bad.len() == 1 {
             "it carries a unique index"
         } else {
@@ -2111,6 +2213,7 @@ pub fn enable_sql(opts: &EnableOptions) -> String {
     // have to be read while it still exists.
     let copy_acl = copy_acl_body(LEGACY_PARTITION, "harvest_events");
     let bounded_rename_fn = bounded_rename_fn_sql();
+    let expected_cohort_ck_stmt = expected_cohort_ck_def_sql("cutover");
     // Review finding: the view, trigger and unique-index rechecks below
     // all close the same preflight-to-lock gap for a publication too.
     // See `incompatible_publications` for why a leaf-publishing
@@ -2156,6 +2259,7 @@ DECLARE
     bad_trg     text;
     bad_idx     text;
     bad_con     text;
+    expected_cohort_ck text;
     bad_rls     text;
     rls_flag    boolean;
     bad_pub     text;
@@ -2204,6 +2308,12 @@ BEGIN
     -- only advances, no later append can route back into legacy. The legacy
     -- partition is sealed from the moment it is attached.
     cutover := harvest_event_cohort(now());
+
+    -- Review finding: the cohort-CHECK exemption further down used to
+    -- match any same-named, same-shaped constraint regardless of its
+    -- bound. Computed here, once the real cutover is known, so that
+    -- exemption can require an exact match against it instead.
+    expected_cohort_ck := {expected_cohort_ck_stmt};
 
     -- Captured here, already holding ACCESS EXCLUSIVE via the explicit
     -- `LOCK TABLE` above, so no concurrent `CREATE UNIQUE INDEX ...
@@ -2368,7 +2478,7 @@ recreate it including `cohort` yourself, then re-run.', bad_idx;
                   FROM generate_subscripts(con.conkey, 1) k
                   JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]
                ) = ARRAY['cohort']
-           AND pg_get_constraintdef(con.oid) ~ '{LEGACY_COHORT_CK_DEF_RE}'
+           AND pg_get_constraintdef(con.oid) IN (expected_cohort_ck, expected_cohort_ck || ' NOT VALID')
        );
     IF bad_con IS NOT NULL THEN
         RAISE EXCEPTION 'harvest #958: harvest_events carries a constraint that cannot \
@@ -4934,10 +5044,19 @@ fn operator_triggers_guard_sql(tag: &str) -> String {
 /// view and trigger guards above. Phase 4 rechecks it again under the
 /// lock this phase converts under, for the identical hours-long-gap
 /// reason those guards do.
+///
+/// `cutover_lit` is the plan's own attached cutover. Phase 3 bakes the
+/// same literal into its `ADD CONSTRAINT ... CHECK (cohort < ...)`. So
+/// the cohort-`CHECK` exemption below can require an exact match
+/// against it. See [`expected_cohort_ck_def_sql`] for why that closes a
+/// gap [`LEGACY_COHORT_CK_DEF_RE`] leaves open.
 #[must_use]
-fn unreplayable_constraints_guard_sql(tag: &str) -> String {
+fn unreplayable_constraints_guard_sql(tag: &str, cutover_lit: &str) -> String {
+    let expected_cohort_ck_stmt =
+        expected_cohort_ck_def_sql(&format!("{cutover_lit}::timestamptz"));
     format!(
-        "DO ${tag}$\nDECLARE bad text;\nBEGIN\n    \
+        "DO ${tag}$\nDECLARE bad text; expected_cohort_ck text;\nBEGIN\n    \
+         expected_cohort_ck := {expected_cohort_ck_stmt};\n    \
          SELECT string_agg(DISTINCT con.conname, ', ' ORDER BY con.conname) INTO bad\n      \
          FROM pg_constraint con\n      \
          JOIN pg_class t ON t.oid = con.conrelid\n      \
@@ -4982,7 +5101,7 @@ fn unreplayable_constraints_guard_sql(tag: &str) -> String {
          FROM generate_subscripts(con.conkey, 1) k\n                  \
          JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]\n               \
          ) = ARRAY['cohort']\n           \
-         AND pg_get_constraintdef(con.oid) ~ '{LEGACY_COHORT_CK_DEF_RE}'\n       \
+         AND pg_get_constraintdef(con.oid) IN (expected_cohort_ck, expected_cohort_ck || ' NOT VALID')\n       \
          );\n    \
          IF bad IS NOT NULL THEN\n        \
          RAISE EXCEPTION 'harvest #958: constraint(s) on harvest_events not carried by \
@@ -5241,7 +5360,10 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // would stay enforced on the renamed legacy table after phase 4.
         // It would then silently stop applying to any row appended from
         // cutover onward.
-        step(1, unreplayable_constraints_guard_sql("harvest_constraint_958")),
+        step(
+            1,
+            unreplayable_constraints_guard_sql("harvest_constraint_958", &cutover_lit),
+        ),
         // ── 1: bake the chosen width into the cohort function ─────────────
         step(1, cohort_function_sql(width)),
         // ── 2: the partition-key indexes, built without blocking ──────────
@@ -5475,7 +5597,7 @@ rename it) by hand, then re-run this plan.', idx.n, idx.tbl;\n        \
         // under the same lock.
         step(
             4,
-            unreplayable_constraints_guard_sql("harvest_constraint_cutover_958"),
+            unreplayable_constraints_guard_sql("harvest_constraint_cutover_958", &cutover_lit),
         ),
         // Review finding: this in-lock block rechecked unique indexes,
         // views and triggers, but not row security or publications.
