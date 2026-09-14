@@ -26,6 +26,8 @@ mod awaitables_tests;
 mod backup_verify_tests;
 mod benchmarks_docs;
 #[cfg(feature = "db")]
+mod build_reachability_fanout_perf;
+#[cfg(feature = "db")]
 mod build_routing_tests;
 #[cfg(feature = "testing")]
 mod business_day_replay_tests;

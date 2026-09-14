@@ -1868,3 +1868,8 @@ standalone note rather than part of the claim-path attribution table above:
   `GET /admin/queue-coverage` (issue #774), indexed into an O(1)-average
   `HashSet` lookup per pending queue (instructions -83.6%; falls back to
   the original direct scan for a `?queue_name=`-filtered single-row call).
+* [`docs/performance-build-reachability-fanout.md`](performance-build-reachability-fanout.md)
+  — the per-build N+1 in `build_routing::all_build_reachability`, the
+  Vantage Builds page and `GET /admin/builds`'s counter query (issue #171),
+  batched into three grouped queries (one per source table) instead of one
+  combined query per distinct build id.
