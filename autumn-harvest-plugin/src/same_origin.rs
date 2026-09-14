@@ -22,8 +22,7 @@
 //! # Exemptions
 //!
 //! Four request shapes skip the check. None can be produced by a bare
-//! cross-site `<form>` submission or a cross-site `no-cors` fetch. None
-//! carries the ambient credential a forged request relies on, either:
+//! cross-site `<form>` submission or a cross-site `no-cors` fetch:
 //!
 //! - **A method other than `POST`.** A `<form>` can only ever submit `GET`
 //!   or `POST`. `PUT`, `PATCH`, and `DELETE` are not CORS-simple methods at
@@ -38,18 +37,19 @@
 //!   `application/x-www-form-urlencoded`, `multipart/form-data`, or
 //!   `text/plain`. Anything else — `application/json`, most of all — needs a
 //!   CORS preflight the attacker's page cannot pass.
-//! - **No `Cookie` header at all.** CSRF is specifically the forgery of a
-//!   request that rides on a cookie the browser attaches automatically. A
-//!   cross-site page cannot set a `Cookie` header itself; the browser
-//!   reserves it. So a forged request either carries the victim's real
-//!   session cookie, or this layer never sees it as a threat at all. A
-//!   non-browser caller — the `harvest` CLI among them — never sends a
-//!   cookie either. This keeps first-party tooling working no matter which
-//!   auth mechanism, if any, is configured.
+//! - **The `X-Harvest-Source: cli` header the `harvest` CLI sends on every
+//!   mutation** (`autumn-harvest-cli/src/lib.rs`). A custom header is not
+//!   CORS-safelisted. A bare cross-site `<form>` cannot add it at all, and a
+//!   cross-site `fetch`/XHR that tries needs a preflight this server does
+//!   not answer. This is deliberately narrower than "no session cookie".
+//!   An embedder may use browser-cached HTTP Basic or Digest auth instead
+//!   of a cookie. That credential rides along on a forged cross-site
+//!   request too, with no `Cookie` header in sight. So cookielessness
+//!   alone does not prove a request is not a browser.
 //! - **A request carrying a [`TokenPrincipal`](crate::api_token::TokenPrincipal).**
 //!   A verified scoped API token is an explicit credential. A browser never
-//!   attaches one on its own, so it carries none of the ambient-cookie risk
-//!   this layer defends against.
+//!   attaches one on its own, so it carries none of the ambient-credential
+//!   risk this layer defends against.
 //!   [`require_harvest_admin`](crate::api::require_harvest_admin) draws the
 //!   same line.
 
@@ -75,13 +75,23 @@ pub(crate) async fn require_same_origin(request: Request, next: Next) -> Respons
 }
 
 /// Requests this layer never inspects: non-`POST` methods, non-CORS-simple
-/// bodies, cookieless callers, and callers already holding an explicit
-/// bearer credential.
+/// bodies, the first-party CLI's own requests, and callers already holding
+/// an explicit bearer credential.
 fn is_exempt(request: &Request) -> bool {
     request.method() != Method::POST
         || !is_cors_simple_content_type(request.headers())
-        || !request.headers().contains_key(header::COOKIE)
+        || is_first_party_cli(request.headers())
         || request.extensions().get::<TokenPrincipal>().is_some()
+}
+
+/// Whether `headers` carries the `X-Harvest-Source: cli` header the
+/// `harvest` CLI sends on every mutating request. Not CORS-safelisted, so
+/// a cross-site forgery cannot add it.
+fn is_first_party_cli(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-harvest-source")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("cli"))
 }
 
 /// Whether `headers` carries one of the three content types a plain HTML
@@ -127,15 +137,38 @@ fn is_same_origin(headers: &HeaderMap) -> bool {
     else {
         return false;
     };
-    if !origin_authority.eq_ignore_ascii_case(host) {
+    // A TLS-terminating proxy is the only reliable source for the scheme
+    // the browser actually used; a plain request carries none. When it is
+    // absent, fall back to `origin_scheme` instead. Autumn-web's own
+    // method-override same-origin check documents and accepts that same
+    // trade-off. It is still enough to normalize a default port even with
+    // no proxy in front of this server.
+    let proxy_scheme = forwarded_scheme(headers);
+    if !proxy_scheme.is_none_or(|expected| origin_scheme.eq_ignore_ascii_case(expected)) {
         return false;
     }
-    // A TLS-terminating proxy is the only reliable source for the scheme the
-    // browser actually used; a plain request carries none. When it is
-    // absent, fall back to the authority match alone — the same trade-off
-    // autumn-web's own method-override same-origin check documents and
-    // accepts.
-    forwarded_scheme(headers).is_none_or(|expected| origin_scheme.eq_ignore_ascii_case(expected))
+    let effective_scheme = proxy_scheme.unwrap_or(origin_scheme);
+    // A browser never includes a default port in `Origin`. A `Host` /
+    // `X-Forwarded-Host` value that spells one out explicitly
+    // (`dashboard.example:443` over `https`) is still the same origin.
+    strip_default_port(origin_authority, effective_scheme)
+        .eq_ignore_ascii_case(strip_default_port(host, effective_scheme))
+}
+
+/// Strip a trailing `:80` (`http`) or `:443` (`https`) from `authority` when
+/// it matches `scheme`'s default port, so `"dashboard.example:443"` and
+/// `"dashboard.example"` compare equal under `https`.
+fn strip_default_port<'a>(authority: &'a str, scheme: &str) -> &'a str {
+    let default_port_suffix = if scheme.eq_ignore_ascii_case("https") {
+        ":443"
+    } else if scheme.eq_ignore_ascii_case("http") {
+        ":80"
+    } else {
+        return authority;
+    };
+    authority
+        .strip_suffix(default_port_suffix)
+        .unwrap_or(authority)
 }
 
 /// The public host a trusted reverse proxy reports via `X-Forwarded-Host`,
@@ -188,14 +221,8 @@ mod tests {
             .layer(axum::middleware::from_fn(require_same_origin))
     }
 
-    /// Every case below models a browser that already holds a session
-    /// cookie, so `Cookie` is always present here. The one exemption
-    /// covered separately is `cookieless_request_is_exempt`.
     async fn post_with_headers(headers: &[(&str, &str)]) -> StatusCode {
-        let mut builder = HttpRequest::builder()
-            .method("POST")
-            .uri("/mutate")
-            .header("cookie", "harvest_session=abc123");
+        let mut builder = HttpRequest::builder().method("POST").uri("/mutate");
         for (name, value) in headers {
             builder = builder.header(*name, *value);
         }
@@ -444,9 +471,6 @@ mod tests {
                 HttpRequest::builder()
                     .method("POST")
                     .uri("/mutate")
-                    // A cookie is present too, so this proves the token
-                    // bypass itself, not the separate cookieless exemption.
-                    .header("cookie", "harvest_session=abc123")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -456,20 +480,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cookieless_request_is_exempt() {
-        // The `harvest` CLI, and any other non-browser caller, never sends
-        // a `Cookie` header. With no ambient credential to ride on, this is
-        // not the threat this layer defends against.
-        let response = app()
-            .oneshot(
-                HttpRequest::builder()
-                    .method("POST")
-                    .uri("/mutate")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+    async fn first_party_cli_header_is_exempt() {
+        let status = post_with_headers(&[("x-harvest-source", "cli")]).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn first_party_cli_header_match_is_case_insensitive() {
+        let status = post_with_headers(&[("x-harvest-source", "CLI")]).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unrecognised_source_header_value_is_still_checked() {
+        let status = post_with_headers(&[("x-harvest-source", "browser")]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn cookieless_request_without_the_cli_header_is_still_checked() {
+        // A cross-site `<form>` submission to a target guarded by
+        // browser-cached HTTP Basic/Digest auth carries that ambient
+        // credential too, with no `Cookie` header at all. So cookielessness
+        // alone must never be enough to skip this check.
+        let status = post_with_headers(&[]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn origin_with_explicit_default_port_matches_host_without_one() {
+        let status = post_with_headers(&[
+            ("origin", "https://dashboard.example"),
+            ("host", "dashboard.example:443"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn origin_with_explicit_default_port_matches_forwarded_host() {
+        let status = post_with_headers(&[
+            ("origin", "https://dashboard.example"),
+            ("host", "harvest-upstream:3000"),
+            ("x-forwarded-host", "dashboard.example:443"),
+            ("x-forwarded-proto", "https"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn non_default_port_still_must_match() {
+        let status = post_with_headers(&[
+            ("origin", "https://dashboard.example"),
+            ("host", "dashboard.example:8443"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }

@@ -7214,11 +7214,6 @@ async fn vantage_and_dlq_mutations_reject_cross_site_post() {
                     .method("POST")
                     .uri(&uri)
                     .header("content-type", "application/x-www-form-urlencoded")
-                    // A `Cookie` header models the victim's browser, which
-                    // attaches it automatically. A cookieless request (a
-                    // non-browser caller, never the CSRF threat this guard
-                    // defends against) is exempt regardless of origin.
-                    .header("cookie", "harvest_session=victim-session")
                     .body(Body::empty())
                     .expect("valid cross-site request"),
             )
