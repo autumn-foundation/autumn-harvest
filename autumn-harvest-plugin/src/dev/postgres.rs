@@ -686,12 +686,14 @@ fn check_socket_path_fits(socket_dir: &Path) -> Result<(), DevError> {
 /// Escape a value for a single-quoted `postgresql.conf` string.
 ///
 /// Two rules, applied in this order. First, a literal backslash is written
-/// twice: Postgres's config lexer decodes backslash escapes inside a quoted
+/// twice. Postgres's config lexer decodes backslash escapes inside a quoted
 /// value, so a lone backslash there changes what the value decodes to.
 /// Second, a literal single quote is written twice, per Postgres's own
-/// quoting rule. Session paths live under the system temp directory and
-/// realistically never contain either character, but a config file we
-/// generate should not depend on that (issue #1299).
+/// quoting rule.
+///
+/// Session paths live under the system temp directory and realistically
+/// never contain either character. A config file we generate should not
+/// depend on that (issue #1299).
 fn escape_conf_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "''")
 }

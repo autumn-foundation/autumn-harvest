@@ -771,10 +771,9 @@ async fn resolve_binaries() -> Result<PostgresBinaries, DevError> {
 /// the classic deadlock shape, and the `on_shutdown` hook contends for this very
 /// lock. The error is passed through so callers read as `return Err(...)`.
 ///
-/// The start error stays the one returned — it is the cause — but a
-/// teardown failure on top of it must not be silent (issue #1299): the
-/// caller sees only `error`, so a lost cluster with no report of it would be
-/// invisible.
+/// The start error stays the one returned — it is the cause. But a teardown
+/// failure on top of it must not be silent (issue #1299). The caller sees
+/// only `error`, so a lost cluster with no report of it would be invisible.
 async fn abandon_cluster(
     postgres: &Arc<Mutex<Option<EphemeralPostgres>>>,
     error: DevError,
@@ -790,9 +789,9 @@ async fn abandon_cluster(
 
 /// Report a teardown failure so a leaked cluster is never silent.
 ///
-/// Shared by every path that gives up on an already-started cluster
-/// ([`abandon_cluster`] and the readiness-failure path in
-/// [`DevRuntime::start`]), so the two cannot drift back apart (issue #1299).
+/// Shared by every path that gives up on an already-started cluster:
+/// [`abandon_cluster`], and the readiness-failure path in
+/// [`DevRuntime::start`]. The two cannot drift apart again (issue #1299).
 fn report_leaked_teardown(error: &DevError) {
     tracing::error!(%error, "dev runtime: storage was left behind");
     eprintln!("{}", leaked_teardown_message(error));

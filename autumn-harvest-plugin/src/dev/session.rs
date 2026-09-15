@@ -179,23 +179,22 @@ pub fn record_is_self_consistent(record: &SessionRecord, session_dir: &Path) -> 
 /// `pg_ctl` can launch Postgres before the owner is killed, and
 /// `postmaster.pid` appears only once the postmaster itself writes it. A
 /// record this young cannot be told apart from one whose postmaster is
-/// mid-start; one old enough to clear this window can, because a real
+/// mid-start. One old enough to clear this window can, because a real
 /// postmaster writes its pid file within a small fraction of it.
 const POSTMASTER_STARTUP_GRACE: chrono::Duration = chrono::Duration::seconds(15);
 
 /// Decide what to do with one session record.
 ///
 /// Pure: liveness, identity and the current time are all supplied by the
-/// caller, so the whole table can be tested without processes or a real
-/// clock.
+/// caller. The whole table can be tested without processes or a real clock.
 ///
 /// `postmaster` decides between three outcomes, not two. `Confirmed` reaps
 /// through `StopThenRemove`. `NotRunning` removes the directory with no
-/// signal — nothing is there to signal, unless the record is still within its
-/// startup grace period (issue #1299), in which case absence is not yet
-/// proof and the session is skipped. `Unknown` skips reaping outright: the
-/// pid is alive, but identity is unproven, so neither stopping it nor
-/// deleting its directory is safe (issue #1295).
+/// signal — nothing is there to signal. The exception is a record still
+/// within its startup grace period (issue #1299): there, absence is not yet
+/// proof, so the session is skipped instead. `Unknown` skips reaping
+/// outright: the pid is alive, but identity is unproven. Neither stopping it
+/// nor deleting its directory is safe (issue #1295).
 #[must_use]
 pub fn decide_reap(
     record: &SessionRecord,

@@ -920,9 +920,9 @@ fn reap_stops_an_orphaned_postmaster_then_removes_the_directory() {
 
 #[test]
 fn reap_removes_the_directory_when_the_postmaster_is_already_gone() {
-    // A known postmaster pid confirmed not running is proof on its own — the
-    // startup grace period (issue #1299) only ever applies when no postmaster
-    // was ever known.
+    // A known postmaster pid confirmed not running is proof on its own. The
+    // startup grace period (issue #1299) only ever applies when no
+    // postmaster was ever known.
     let decision = decide_reap(
         &record(4242, Some(4243)),
         false,
@@ -935,7 +935,7 @@ fn reap_removes_the_directory_when_the_postmaster_is_already_gone() {
 
 #[test]
 fn reap_removes_a_session_that_died_before_recording_a_postmaster() {
-    // Old enough that the startup grace period (issue #1299) has passed: a
+    // Old enough that the startup grace period (issue #1299) has passed. A
     // record with no known postmaster this stale is confirmed dead, not
     // merely still starting.
     let mut aged = record(4242, None);
@@ -2302,9 +2302,9 @@ fn an_unreadable_postmaster_pid_file_leaves_the_session_alone() {
     let mut stale = record(u32::MAX - 1, None);
     stale.owner_start_token = None;
     stale.data_dir = data_dir.clone();
-    // Old enough that the startup grace period (issue #1299) has passed, so
-    // this test still exercises confirmed absence rather than the "might
-    // still be starting" skip a freshly created record now gets.
+    // Old enough that the startup grace period (issue #1299) has passed. So
+    // this test still exercises confirmed absence, not the "might still be
+    // starting" skip a freshly created record now gets.
     stale.created_at = chrono::Utc::now() - chrono::Duration::minutes(5);
     std::fs::write(
         session_dir.join("session.json"),
@@ -2336,9 +2336,10 @@ fn an_unreadable_postmaster_pid_file_leaves_the_session_alone() {
 fn a_freshly_created_session_with_no_pid_file_survives_the_full_reap_pipeline() {
     // Issue #1299, end to end. `decide_reap` is pinned directly above; this
     // drives the same scenario through `reap_stale_sessions` itself. `pg_ctl`
-    // can launch Postgres before the owner is killed, so a record written
-    // moments ago with no `postmaster.pid` yet is not proof the cluster never
-    // started — deleting its directory now could strand a live postmaster.
+    // can launch Postgres before the owner is killed. A record written
+    // moments ago with no `postmaster.pid` yet is not proof the cluster
+    // never started. Deleting its directory now could strand a live
+    // postmaster.
     let base = tempfile::tempdir().expect("temp dir");
     let root = autumn_harvest_plugin::dev::session_root(base.path()).expect("session root");
 
