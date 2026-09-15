@@ -113,18 +113,25 @@ document. Point a generator at either. See [`openapi.md`](openapi.md).
 
 ---
 
-## Content negotiation: send `Accept: application/json`
+## Content negotiation: match each route's declared content type
 
-Send `Accept: application/json` on every plain request (issue #1579).
-`curl` sends a bare `Accept: */*` by default. Autumn's error-page
-content negotiation treats that as browser navigation, and answers a
-validation error with a styled HTML page, not the JSON body this
-contract documents. The `harvest` CLI sends the explicit header on
-every plain request for this reason.
+Send `Accept: application/json` to a route whose contract
+`content_type` is JSON (issue #1579). `curl` sends a bare `Accept: */*`
+by default. Autumn's error-page content negotiation treats that as
+browser navigation, and answers a validation error with a styled HTML
+page, not the JSON body this contract documents. The `harvest` CLI
+sends the explicit header for this reason, on every request its own
+commands make.
 
-A streaming route is the exception: send `Accept: text/event-stream`
-to `.../events/stream` or `.../stream` instead. `docs/api-contract.json`
-marks each such route's `content_type` accordingly.
+Two route shapes are the exception, and want their own `Accept`
+instead of `application/json`. `docs/api-contract.json` marks each
+one's `content_type`:
+
+- A streaming route: send `Accept: text/event-stream` to
+  `.../events/stream` or `.../stream`.
+- A Prometheus-format route: `GET /admin/metrics` and
+  `GET /admin/queues/scaling?format=prometheus` return plain text, not
+  JSON.
 
 ---
 
