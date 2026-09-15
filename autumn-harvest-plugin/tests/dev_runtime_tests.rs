@@ -22,9 +22,9 @@ use autumn_harvest_plugin::dev::{
     BannerInputs, DatabaseSafety, DevRuntimeConfig, DiscoveryEnv, Platform, PostmasterIdentity,
     ReapDecision, RefusalReason, SessionRecord, SkipReason, StorageDescription, SuspicionReason,
     candidate_bin_dirs, classify_database_url, decide_reap, effective_postmaster_pid,
-    ephemeral_dsn, http_authority, parse_postmaster_pid, postgres_conf_lines, proc_stat_is_live,
-    proc_stat_start_time, record_is_self_consistent, redact_dsn, render_banner, resolve_bin_dir,
-    unix_socket_path_len, write_private_atomic,
+    ephemeral_dsn, escape_conf_string, http_authority, parse_postmaster_pid, postgres_conf_lines,
+    proc_stat_is_live, proc_stat_start_time, record_is_self_consistent, redact_dsn, render_banner,
+    resolve_bin_dir, unix_socket_path_len, write_private_atomic,
 };
 
 // ---------------------------------------------------------------------------
@@ -1314,11 +1314,15 @@ fn the_unix_socket_lives_inside_the_session_directory() {
     let conf = postgres_conf_lines(5432, &socket_dir).join("\n");
     // Built from the same path rather than spelled out: `Path::join` uses the
     // platform separator, so a hard-coded POSIX string asserts the separator
-    // instead of the containment this test is about.
+    // instead of the containment this test is about. Windows's separator is
+    // itself a backslash. So the expected value below goes through the same
+    // escaping the generated config does (issue #1299), not the raw path.
+    // Otherwise this fails on Windows, for the same reason the config now
+    // renders that separator doubled.
     assert!(
         conf.contains(&format!(
             "unix_socket_directories = '{}'",
-            socket_dir.display()
+            escape_conf_string(&socket_dir.to_string_lossy())
         )),
         "{conf}"
     );

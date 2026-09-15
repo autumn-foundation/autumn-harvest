@@ -65,8 +65,8 @@ pub use discovery::{
 };
 use postgres::refuse_to_run_as_root;
 pub use postgres::{
-    EphemeralPostgres, MAX_UNIX_SOCKET_PATH_LEN, ephemeral_dsn, postgres_conf_lines,
-    running_as_root, unix_socket_path_len, write_private_atomic,
+    EphemeralPostgres, MAX_UNIX_SOCKET_PATH_LEN, ephemeral_dsn, escape_conf_string,
+    postgres_conf_lines, running_as_root, unix_socket_path_len, write_private_atomic,
 };
 #[cfg(target_os = "linux")]
 pub use reaper::parse_proc_status_uid;

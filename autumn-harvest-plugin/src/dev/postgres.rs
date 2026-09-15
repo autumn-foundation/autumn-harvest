@@ -703,7 +703,8 @@ fn check_socket_path_fits(socket_dir: &Path) -> Result<(), DevError> {
 /// Session paths live under the system temp directory and realistically
 /// never contain either character. A config file we generate should not
 /// depend on that (issue #1299).
-fn escape_conf_string(value: &str) -> String {
+#[must_use]
+pub fn escape_conf_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "''")
 }
 
