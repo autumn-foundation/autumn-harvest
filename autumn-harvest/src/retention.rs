@@ -1,6 +1,7 @@
 //! Time-based retention janitor for completed workflow history.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(feature = "db")]
@@ -410,6 +411,15 @@ pub struct PartitionMaintenanceConfig {
     /// `ACCESS EXCLUSIVE` lock on the parent, so a bounded budget keeps a
     /// backlog from holding the append path off; successive ticks converge.
     pub max_drops_per_tick: usize,
+    /// Maximum partitions *evaluated* per tick, dropped or not.
+    ///
+    /// `max_drops_per_tick` bounds successful drops, not the cost of finding
+    /// them. A blocked partition can still cost a tier-3 scan up to
+    /// `exact_scan_timeout_secs`. Without its own budget, one long-lived
+    /// execution pinning many old cohorts can make a tick evaluate every
+    /// closed partition. It would drop none, and spend the whole tick
+    /// doing it.
+    pub max_attempts_per_tick: usize,
     /// Seconds to wait for that lock before deferring a partition to the next
     /// tick. Failing fast is what protects the concurrent-p99 budget.
     pub drop_lock_timeout_secs: u64,
@@ -441,6 +451,7 @@ impl Default for PartitionMaintenanceConfig {
             enabled: true,
             lookahead_cohorts: crate::partition::DEFAULT_LOOKAHEAD_COHORTS,
             max_drops_per_tick: crate::partition::SweepOptions::default().max_drops,
+            max_attempts_per_tick: crate::partition::SweepOptions::default().max_attempts,
             drop_lock_timeout_secs: 2,
             exact_scan_timeout_secs: crate::partition::SweepOptions::default()
                 .exact_scan_timeout
@@ -458,6 +469,7 @@ impl PartitionMaintenanceConfig {
     pub fn sweep_options(&self) -> crate::partition::SweepOptions {
         crate::partition::SweepOptions {
             max_drops: self.max_drops_per_tick,
+            max_attempts: self.max_attempts_per_tick,
             lock_timeout: Duration::from_secs(self.drop_lock_timeout_secs.max(1)),
             exact_scan_timeout: Duration::from_secs(self.exact_scan_timeout_secs.max(1)),
             owner_probe_cap: self.owner_probe_cap,
@@ -796,6 +808,18 @@ impl RetentionConfig {
                 MAX_MAX_AGE.as_secs()
             ));
         }
+        // `EnableOptions::validate` (issue #958) rejects a zero lookahead at
+        // enable time for exactly this reason: it leaves every append landing
+        // in the DEFAULT partition. `PartitionMaintenanceConfig` must refuse
+        // the same value at runtime, or a deployment could enable with a sane
+        // lookahead and then configure maintenance to pre-create nothing.
+        if self.partitions.enabled && self.partitions.lookahead_cohorts == 0 {
+            return Err(
+                "partitions.lookahead_cohorts must be at least 1; with no lookahead every \
+                 append lands in the DEFAULT partition and reclamation stalls"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -965,6 +989,23 @@ pub struct RetentionStatus {
 #[derive(Debug, Clone)]
 pub struct RetentionMonitor {
     inner: Arc<Mutex<RetentionStatus>>,
+    /// Count of full main-loop iterations completed.
+    ///
+    /// One iteration covers history retention, partition maintenance, and
+    /// the audit, schedule, summary, and rate-limit-bucket GC passes. This
+    /// counter advances once, at the same point as the unconditional
+    /// end-of-iteration liveness tick from issue #797.
+    ///
+    /// This counter is separate from that liveness tick's own counter,
+    /// `crate::scanner_health::record_scanner_tick`. That counter advances
+    /// more than once per iteration under partitioned layout. It advances
+    /// once per shard inside `run_partition_maintenance_pass`, and again
+    /// before the main loop even starts. Crossing a baseline on that
+    /// counter proves only that some scanner tick happened somewhere. It
+    /// does not prove the whole iteration, GC phases included, finished. A
+    /// caller that needs that stronger guarantee must watch this counter
+    /// instead.
+    iterations_completed: Arc<AtomicU64>,
 }
 
 impl RetentionMonitor {
@@ -979,7 +1020,25 @@ impl RetentionMonitor {
             .collect();
         Self {
             inner: Arc::new(Mutex::new(RetentionStatus { config, per_shard })),
+            iterations_completed: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Returns the count of full main-loop iterations completed so far.
+    /// See the `iterations_completed` field above for the exact guarantee.
+    #[must_use]
+    pub fn iterations_completed(&self) -> u64 {
+        // Fully qualified: `diesel_async::RunQueryDsl::load` is in scope
+        // and, resolved by receiver-type autoderef, wins over the inherent
+        // `AtomicU64::load` on plain `.load(...)` syntax.
+        AtomicU64::load(&self.iterations_completed, Ordering::Relaxed)
+    }
+
+    /// Marks one full main-loop iteration as finished. Call this once, at
+    /// the same point as the unconditional end-of-iteration liveness tick.
+    #[cfg(feature = "db")]
+    fn record_iteration_complete(&self) {
+        AtomicU64::fetch_add(&self.iterations_completed, 1, Ordering::Relaxed);
     }
 
     /// # Panics
@@ -1008,6 +1067,26 @@ impl RetentionMonitor {
             .find(|x| x.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
         {
             existing.partition_maintenance = Some(outcome);
+        }
+    }
+
+    /// Clear this shard's partition-maintenance outcome (review finding on
+    /// issue #1270 item 6).
+    ///
+    /// `update_partitions` only ever sets the field. A shard that reports a
+    /// real outcome and later reverts to unpartitioned (`harvest partition
+    /// disable`) would then keep showing its last outcome forever. Call
+    /// this when the layout probe finds a shard unpartitioned, so the field
+    /// returns to `None` instead of going stale.
+    #[cfg(feature = "db")]
+    fn clear_partitions(&self, shard: ShardId) {
+        let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
+        if let Some(existing) = guard
+            .per_shard
+            .iter_mut()
+            .find(|x| x.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
+        {
+            existing.partition_maintenance = None;
         }
     }
 
@@ -1040,6 +1119,242 @@ impl RetentionMonitor {
             .find(|x| x.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
         {
             *existing = result;
+        }
+    }
+}
+
+/// One shard's persisted sweep-resume state. Carried between ticks the
+/// same way `resume_cursors` itself is: local to the retention task,
+/// never read back from the monitor's reported snapshot.
+///
+/// Review finding: `resume_after` alone lets a backlog skip a blocked
+/// partition forever. That happens whenever the backlog grows at least
+/// as fast as the per-tick budget can attempt one -- see
+/// [`crate::partition::SweepOutcome::catch_up_target`]. `catch_up_target`,
+/// once a catch-up cycle starts, anchors it to the fixed instant that
+/// cycle must reach. It is threaded straight through to
+/// [`crate::partition::maintain_with_progress`] alongside `resume_after`.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, Default)]
+struct PartitionSweepCursor {
+    resume_after: Option<DateTime<Utc>>,
+    catch_up_target: Option<DateTime<Utc>>,
+}
+
+/// One pass of engine-automated partition maintenance (issue #958, AC8):
+/// `ensure_partitions`, the reclamation sweep, and the DEFAULT-partition
+/// drain, for every shard.
+///
+/// `maintain` probes the layout first. It is a no-op on the
+/// (overwhelmingly common) unpartitioned shard. A deployment that has not
+/// opted in pays one cheap catalog query per call and nothing else.
+///
+/// Best-effort and per-shard: a shard whose maintenance fails logs and is
+/// retried next call. It must never fail the caller's own work, because
+/// history retention and reclamation are independent.
+///
+/// Called from two places. One call happens directly, the moment
+/// [`RetentionRuntime::spawn`]'s background task starts — see the review
+/// finding at that call site for why. The other runs unconditionally on
+/// every iteration of that task's own tick loop, deliberately after the
+/// candidate loop there. A cohort only becomes droppable once that loop
+/// has archived, summarized and deleted its executions.
+#[cfg(feature = "db")]
+async fn run_partition_maintenance_pass(
+    pools: &ShardedDbPool,
+    config: &RetentionConfig,
+    monitor_task: &RetentionMonitor,
+    resume_cursors: &mut HashMap<ShardId, PartitionSweepCursor>,
+    metrics: &dyn MetricsRecorder,
+    owner: crate::scanner_health::ScannerOwner,
+    shutdown: &CancellationToken,
+) {
+    if !config.partitions.enabled {
+        return;
+    }
+    let mut sweep_opts = config.partitions.sweep_options();
+    // `dry_run` means "do not destroy data". It must NOT stop partition
+    // CREATION: `ensure_partitions` and `drain_default` delete nothing,
+    // and a deployment running retention in dry-run — a common posture
+    // during rollout — would otherwise stop extending the lookahead
+    // window and, after a few days, send every append to the DEFAULT
+    // partition indefinitely. Only the sweep is suppressed, by giving it
+    // a zero drop budget.
+    if config.dry_run {
+        sweep_opts.max_drops = 0;
+        sweep_opts.straggler_grace = None;
+    }
+    for (shard, pool) in pools.iter_shards() {
+        // Checked here, between shards, never inside one. No transaction
+        // is open at this point, so returning here can never abandon one
+        // mid-flight the way racing this whole pass with `select!` used
+        // to. The shard already in progress always finishes.
+        if shutdown.is_cancelled() {
+            return;
+        }
+        // Review finding: a single tick after this whole pass finishes
+        // is not enough. Enough shards hitting the 15-second exact-scan
+        // timeout on a blocked partition can make the whole pass run
+        // longer than the scanner's own staleness threshold. `/admin/
+        // preflight` would then see it as stale or wedged for the
+        // entire pass, not just before it starts.
+        //
+        // Ticking once per shard here is bounded progress. Proof of
+        // life, spaced no farther apart than one shard's worth of work,
+        // however long the whole pass takes.
+        crate::scanner_health::record_scanner_tick(metrics, owner);
+        // Review finding: a saturated pool can leave this `.await`
+        // waiting far longer than the shard-boundary check above
+        // accounts for. Deadpool applies no acquisition timeout here.
+        // No transaction is open yet, so racing it against `shutdown`
+        // is exactly as safe as the shard-boundary check: returning
+        // here can never abandon one mid-flight.
+        let mut conn = tokio::select! {
+            () = shutdown.cancelled() => return,
+            result = pool.get() => match result {
+                Ok(conn) => conn,
+                Err(error) => {
+                    // Never silent: a shard that cannot be reached gets no
+                    // lookahead partitions and no reclamation, and the
+                    // operator has to be able to tell that apart from
+                    // "nothing to do".
+                    tracing::warn!(
+                        shard = %shard,
+                        error = %error,
+                        "harvest event-partition maintenance could not acquire a connection"
+                    );
+                    monitor_task.update_partitions(
+                        shard,
+                        crate::partition::MaintenanceOutcome::failed(error.to_string()),
+                    );
+                    continue;
+                }
+            },
+        };
+        // Review finding: a standalone probe used to run here, before
+        // calling `maintain` below. That told an unpartitioned shard
+        // apart from one that ran and did nothing (issue #1270 item 6).
+        // It worked, but raced `maintain`'s OWN internal probe. A
+        // `disable_partitioning` (or `enable_partitioning`) commit
+        // landing between the two could make them disagree. This loop
+        // then reported whichever one ran here, not the one the
+        // maintenance pass below actually acted on. `outcome.partitioned`
+        // is sourced from `maintain`'s own probe, the one that actually
+        // gates its work, so branching on it below cannot disagree with
+        // what just ran. `maintain` is unconditionally safe to call on
+        // an unpartitioned shard: one cheap catalog query, nothing
+        // else. Removing this separate probe costs nothing.
+        //
+        // Review finding: a fixed oldest-first sweep, restarted from
+        // scratch every tick, cannot converge past a permanently blocked
+        // oldest run of partitions — see
+        // `crate::partition::SweepOutcome::next_resume`. Read back the
+        // cursor this shard's own last pass left. A truncated pass then
+        // picks up where it stopped, instead of re-spending its whole
+        // budget proving the same oldest partitions blocked, tick after
+        // tick.
+        //
+        // Review finding: kept in `resume_cursors`, a map local to this
+        // task, deliberately NOT read back from the monitor's stored
+        // outcome. The history-retention phase's own `monitor_task.update`
+        // (elsewhere in this loop) replaces a shard's whole
+        // `RetentionTickResult`. It does that with a fresh default
+        // whenever a history age is configured -- the common case. That
+        // wipes `partition_maintenance` back to `None` before this pass
+        // ever read it.
+        //
+        // `scan_cursors` above solves the identical problem for history
+        // retention the same way. Local state this task owns outright,
+        // untouched by anything that replaces the monitor's reported
+        // snapshot.
+        let cursor = resume_cursors.get(&shard).copied().unwrap_or_default();
+        // Review finding: a tick recorded once before this whole shard's
+        // maintenance pass is not bounded progress either. A single shard
+        // can spend `max_attempts` partitions at `exact_scan_timeout` each,
+        // long enough on its own to cross the staleness threshold. Ticking
+        // once per partition the sweep attempts closes that gap.
+        let mut tick_partition = || crate::scanner_health::record_scanner_tick(metrics, owner);
+        // Review finding: a single `now` shared across every shard in this
+        // pass goes stale under a slow earlier shard. A shard maintained
+        // late can then compute lookahead partitions against a clock that
+        // is already behind. Its true current cohort then stays uncovered
+        // until the next tick. Read the clock fresh, right before this
+        // shard's own call.
+        let now = Utc::now();
+        match crate::partition::maintain_with_progress(
+            &mut conn,
+            now,
+            config.partitions.lookahead_cohorts,
+            &sweep_opts,
+            cursor.resume_after,
+            cursor.catch_up_target,
+            &mut tick_partition,
+        )
+        .await
+        {
+            Ok(outcome) if outcome.partitioned == Some(false) => {
+                // `outcome.partitioned` comes from `maintain`'s own
+                // probe, the same one that gated its (empty) pass below
+                // -- see the review finding above. A shard that reverted
+                // via `harvest partition disable` (or never converted)
+                // must not keep showing its last outcome from before
+                // that. Its resume cursor goes with it. A later `enable`
+                // starts a fresh partition set at fresh cohort instants,
+                // all later than anything this stale cursor could name.
+                //
+                // `Ok` only ever carries `Some(_)`. `None` is reserved
+                // for `MaintenanceOutcome::failed`, on the `Err` arm
+                // below. So this guard leaves no other case for the
+                // plain `Ok(outcome)` arm to handle but `Some(true)`.
+                monitor_task.clear_partitions(shard);
+                resume_cursors.remove(&shard);
+            }
+            Ok(outcome) => {
+                // `blocked` is in the condition deliberately. The
+                // steady-state failure — nothing created (the window is
+                // already covered), nothing dropped, everything blocked —
+                // is exactly the state an operator needs to see, and
+                // logging only on progress would make it the one state
+                // that produces no output at all.
+                if !outcome.created.is_empty()
+                    || !outcome.sweep.dropped.is_empty()
+                    || !outcome.sweep.blocked.is_empty()
+                    || outcome.drained > 0
+                {
+                    tracing::info!(
+                        shard = %shard,
+                        created = outcome.created.len(),
+                        dropped = outcome.sweep.dropped.len(),
+                        blocked = outcome.sweep.blocked.len(),
+                        drained = outcome.drained,
+                        straggler_rows = outcome.sweep.straggler_rows_deleted,
+                        "harvest event-partition maintenance"
+                    );
+                }
+                resume_cursors.insert(
+                    shard,
+                    PartitionSweepCursor {
+                        resume_after: outcome.sweep.next_resume,
+                        catch_up_target: outcome.sweep.catch_up_target,
+                    },
+                );
+                monitor_task.update_partitions(shard, outcome);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    shard = %shard,
+                    error = %err,
+                    "harvest event-partition maintenance failed"
+                );
+                // Reported, not just logged: without this a
+                // permanently-failing shard is indistinguishable from one
+                // that never opted in, because both show
+                // `partition_maintenance: null`.
+                monitor_task.update_partitions(
+                    shard,
+                    crate::partition::MaintenanceOutcome::failed(err.to_string()),
+                );
+            }
         }
     }
 }
@@ -1109,6 +1424,81 @@ impl RetentionRuntime {
         );
         let handle = tokio::spawn(async move {
             let mut scan_cursors: HashMap<ShardId, Option<RetentionScanCursor>> = HashMap::new();
+            // See `run_partition_maintenance_pass`'s review finding on
+            // `resume_cursors`. Local state this task owns outright, for
+            // the identical reason `scan_cursors` above is local rather
+            // than read back from the monitor.
+            let mut partition_resume_cursors: HashMap<ShardId, PartitionSweepCursor> =
+                HashMap::new();
+            // Issue #1270 item 5: run partition maintenance immediately
+            // rather than waiting a full `tick_interval` (an hour, by
+            // default). A shard that restarts after being offline longer
+            // than its lookahead window has no covering partition until
+            // the first pass runs. Every append meanwhile lands in the
+            // DEFAULT partition, whose later drain is the disruptive path
+            // this module exists to avoid.
+            //
+            // Review finding: this used to be done by pre-loading the
+            // shared trigger channel before the loop started. The very
+            // first tick would then win the race against `sleep`. That
+            // ran the WHOLE janitor tick on every restart. That means
+            // history archival/deletion plus the audit, schedule, summary
+            // and rate-limit purges, across every shard. A fleet whose
+            // processes restart together turns that into a coordinated
+            // scan/delete stampede. It does this even when
+            // `tick_interval` was deliberately set long to avoid exactly
+            // that. Calling the maintenance pass directly here, before
+            // the loop and its channel even exist, gets the same
+            // immediacy without touching that channel at all. So it can
+            // never coalesce with, or crowd out, an operator's own
+            // `run_now()`, which still gets a full tick as documented.
+            //
+            // Review finding: checked cooperatively, not raced with
+            // `select!`. Racing this whole pass against cancellation used
+            // to abort it by dropping its future at an arbitrary await
+            // point. That point can land inside one of its own
+            // transactions, the DEFAULT-partition drain for one. A
+            // dropped future sends no ROLLBACK, so the checked-out
+            // connection could return to the pool with a transaction,
+            // and the locks it holds, still open.
+            // `run_partition_maintenance_pass` checks `shutdown` itself,
+            // between shards, where no transaction is ever open. A
+            // blocked partitioned shard can still spend up to
+            // `max_attempts` ownership probes at `exact_scan_timeout`
+            // each -- minutes, at the defaults. The shard already in
+            // progress always finishes clean. Shutdown takes effect at
+            // the next shard boundary rather than waiting out every
+            // remaining shard.
+            //
+            // Review finding: this early return must still deregister,
+            // same as the graceful-stop path at the loop's own exit
+            // below. Skipping it here would leave this owner in the
+            // process-global liveness registry forever, aging into
+            // `Wedged`. A replacement runtime could then start up
+            // healthy while this registry entry keeps `/admin/preflight`
+            // unhappy anyway.
+            run_partition_maintenance_pass(
+                &pools,
+                &config,
+                &monitor_task,
+                &mut partition_resume_cursors,
+                metrics.as_ref(),
+                owner,
+                &shutdown_task,
+            )
+            .await;
+            if shutdown_task.is_cancelled() {
+                crate::scanner_health::deregister_scanner(owner);
+                return;
+            }
+            // A trailing tick for the degenerate case the per-shard tick
+            // inside the pass does not cover: zero configured shards. The
+            // loop above never ran at all in that case. `register_scanner`
+            // seeds the liveness series at registration time, not at this
+            // instant. A shardless pass has no other chance to prove the
+            // process is alive before the main loop's own first
+            // iteration.
+            crate::scanner_health::record_scanner_tick(metrics.as_ref(), owner);
             loop {
                 tokio::select! {
                     () = shutdown_task.cancelled() => break,
@@ -1223,114 +1613,30 @@ impl RetentionRuntime {
                 }
 
                 // Engine-automated partition maintenance (issue #958, AC8).
+                // See `run_partition_maintenance_pass` — the startup call
+                // above this loop runs the identical pass immediately,
+                // outside the loop's own schedule entirely.
                 //
                 // Deliberately OUTSIDE the history-retention phase gate above:
                 // a partitioned deployment must keep its write window covered
                 // even with no history-retention age configured, or an append
-                // would eventually reach an uncovered cohort. `maintain` probes
-                // the layout first and is a no-op on the (overwhelmingly
-                // common) unpartitioned shard, so a deployment that has not
-                // opted in pays one cheap catalog query per tick and nothing
-                // else.
+                // would eventually reach an uncovered cohort.
                 //
                 // Deliberately AFTER the candidate loop: a cohort only becomes
                 // droppable once the loop has archived (#345), summarized
                 // (#752) and deleted its executions. Running it here reclaims
                 // in the SAME tick that frees the cohort rather than the next
                 // one.
-                //
-                // Best-effort and per-shard: a shard whose maintenance fails
-                // logs and is retried next tick. It must never fail the whole
-                // retention tick, because history retention and reclamation are
-                // independent — the executions are already safely archived and
-                // deleted by this point.
-                if config.partitions.enabled {
-                    let now = Utc::now();
-                    let mut sweep_opts = config.partitions.sweep_options();
-                    // `dry_run` means "do not destroy data". It must NOT stop
-                    // partition CREATION: `ensure_partitions` and
-                    // `drain_default` delete nothing, and a deployment running
-                    // retention in dry-run — a common posture during rollout —
-                    // would otherwise stop extending the lookahead window and,
-                    // after a few days, send every append to the DEFAULT
-                    // partition indefinitely. Only the sweep is suppressed, by
-                    // giving it a zero drop budget.
-                    if config.dry_run {
-                        sweep_opts.max_drops = 0;
-                        sweep_opts.straggler_grace = None;
-                    }
-                    for (shard, pool) in pools.iter_shards() {
-                        let mut conn = match pool.get().await {
-                            Ok(conn) => conn,
-                            Err(error) => {
-                                // Never silent: a shard that cannot be reached
-                                // gets no lookahead partitions and no
-                                // reclamation, and the operator has to be able
-                                // to tell that apart from "nothing to do".
-                                tracing::warn!(
-                                    shard = %shard,
-                                    error = %error,
-                                    "harvest event-partition maintenance could not \
-                                     acquire a connection"
-                                );
-                                monitor_task.update_partitions(
-                                    shard,
-                                    crate::partition::MaintenanceOutcome::failed(error.to_string()),
-                                );
-                                continue;
-                            }
-                        };
-                        match crate::partition::maintain(
-                            &mut conn,
-                            now,
-                            config.partitions.lookahead_cohorts,
-                            &sweep_opts,
-                        )
-                        .await
-                        {
-                            Ok(outcome) => {
-                                // `blocked` is in the condition deliberately.
-                                // The steady-state failure — nothing created
-                                // (the window is already covered), nothing
-                                // dropped, everything blocked — is exactly the
-                                // state an operator needs to see, and logging
-                                // only on progress would make it the one state
-                                // that produces no output at all.
-                                if !outcome.created.is_empty()
-                                    || !outcome.sweep.dropped.is_empty()
-                                    || !outcome.sweep.blocked.is_empty()
-                                    || outcome.drained > 0
-                                {
-                                    tracing::info!(
-                                        shard = %shard,
-                                        created = outcome.created.len(),
-                                        dropped = outcome.sweep.dropped.len(),
-                                        blocked = outcome.sweep.blocked.len(),
-                                        drained = outcome.drained,
-                                        straggler_rows = outcome.sweep.straggler_rows_deleted,
-                                        "harvest event-partition maintenance"
-                                    );
-                                }
-                                monitor_task.update_partitions(shard, outcome);
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    shard = %shard,
-                                    error = %err,
-                                    "harvest event-partition maintenance failed"
-                                );
-                                // Reported, not just logged: without this a
-                                // permanently-failing shard is indistinguishable
-                                // from one that never opted in, because both
-                                // show `partition_maintenance: null`.
-                                monitor_task.update_partitions(
-                                    shard,
-                                    crate::partition::MaintenanceOutcome::failed(err.to_string()),
-                                );
-                            }
-                        }
-                    }
-                }
+                run_partition_maintenance_pass(
+                    &pools,
+                    &config,
+                    &monitor_task,
+                    &mut partition_resume_cursors,
+                    metrics.as_ref(),
+                    owner,
+                    &shutdown_task,
+                )
+                .await;
 
                 // Purge old audit records once per tick, best-effort.
                 // Audit rows may live on any shard (workflow starts use shard-aware
@@ -1489,6 +1795,10 @@ impl RetentionRuntime {
                 // tick that deleted nothing still proves the janitor is alive —
                 // which `harvest.retention.deleted` (work-only) cannot.
                 crate::scanner_health::record_scanner_tick(metrics.as_ref(), owner);
+                // See `RetentionMonitor::iterations_completed`'s field doc:
+                // this is the one point in the loop that proves the whole
+                // iteration, GC phases included, actually finished.
+                monitor_task.record_iteration_complete();
             }
             // Issue #797: a graceful stop retires this loop from the expected
             // scanner set. A panic unwinds past here, so a panicked loop stays
@@ -3317,6 +3627,53 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_zero_lookahead_cohorts_is_rejected_when_partition_maintenance_is_enabled() {
+        // Issue #1270 item 3: `EnableOptions::validate` already rejects a zero
+        // lookahead at enable time, because it leaves every append landing in
+        // the DEFAULT partition. `PartitionMaintenanceConfig` must refuse the
+        // same value at runtime — the two paths must not disagree about what
+        // is a usable value.
+        let config = RetentionConfig {
+            partitions: PartitionMaintenanceConfig {
+                enabled: true,
+                lookahead_cohorts: 0,
+                ..PartitionMaintenanceConfig::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "a zero lookahead must be rejected while partition maintenance is enabled"
+        );
+
+        // Disabled maintenance never reads the field. A stale zero left
+        // over from a config that later turned maintenance off must not
+        // block startup for reasons unrelated to what is actually running.
+        let config = RetentionConfig {
+            partitions: PartitionMaintenanceConfig {
+                enabled: false,
+                lookahead_cohorts: 0,
+                ..PartitionMaintenanceConfig::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "lookahead_cohorts is inert while partition maintenance is disabled"
+        );
+
+        let config = RetentionConfig {
+            partitions: PartitionMaintenanceConfig {
+                enabled: true,
+                lookahead_cohorts: 1,
+                ..PartitionMaintenanceConfig::default()
+            },
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
     }
 
     // --- Issue #1266: per-shard protect_unexported_audit exemption ---
