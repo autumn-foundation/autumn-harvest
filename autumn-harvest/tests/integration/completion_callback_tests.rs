@@ -60,6 +60,7 @@ use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use tracing_subscriber::layer::SubscriberExt;
 
 /// `GLOBAL_CALLBACK_CONFIG` is a process-wide static (by design — it mirrors
 /// `GLOBAL_WORKFLOW_METADATA`'s "set once at startup" contract in
@@ -174,6 +175,42 @@ fn install_config(deliverer: Arc<dyn CompletionCallbackDeliverer>, retry_policy:
     }));
 }
 
+/// Records every `tracing::warn!` field as `"name=value"`, for asserting on
+/// log content (issue #1274: a completion-callback URL must never reach a
+/// log line un-redacted). Field values use `Debug`, matching how `%value`
+/// and `?value` both render through `tracing`'s recorder.
+///
+/// Attached with [`tracing::subscriber::set_default`], a thread-scoped
+/// override — the same mechanism `worker::tests::DebugTracingOn` uses — so
+/// it captures only events from the test that installs it.
+#[derive(Clone, Default)]
+struct FieldCapture(Arc<Mutex<Vec<String>>>);
+
+impl FieldCapture {
+    fn contains(&self, needle: &str) -> bool {
+        self.0.lock().unwrap().iter().any(|f| f.contains(needle))
+    }
+}
+
+impl tracing::field::Visit for FieldCapture {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("{}={value:?}", field.name()));
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FieldCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        event.record(&mut self.clone());
+    }
+}
+
 async fn insert_terminal_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -259,6 +296,60 @@ async fn enqueue_on_completion_creates_one_row_per_matching_target() {
     assert_eq!(rows[0].target_url, "https://api.example.com/hook");
     assert_eq!(rows[1].state, "PENDING");
     assert_eq!(rows[1].target_url, "https://api.example.com/other");
+}
+
+// Regression (issue #1274): a target that fails the live SSRF re-check at
+// enqueue time used to log its full URL, credential included. The skip
+// warning must carry only the redacted origin.
+#[tokio::test]
+async fn enqueue_redacts_a_credential_bearing_target_that_fails_live_ssrf_revalidation() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    // Empty allowlist: every host fails the live SSRF check, so the target
+    // below is rejected at enqueue time rather than delivered.
+    *GLOBAL_CALLBACK_CONFIG.write().unwrap() = Some(Arc::new(CallbackRuntimeConfig {
+        deliverer: Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(200)])),
+        secret: CallbackSecret::new(b"test-secret".to_vec()),
+        ssrf_policy: SsrfPolicy::new(HostAllowlist::new()),
+        default_targets: Vec::new(),
+        retry_policy: RetryPolicy::exponential(3, Duration::from_secs(1)),
+    }));
+
+    let captured = FieldCapture::default();
+    let subscriber = tracing_subscriber::registry().with(captured.clone());
+    let _tracing_guard = tracing::subscriber::set_default(subscriber);
+
+    let exec_id = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_id,
+        "wf-1",
+        "COMPLETED",
+        Some(r#"{"refunded":true}"#),
+        None,
+        Some(r#"[{"url":"https://evil.com/hook?token=s3cr3t","filter":{"type":"AnyTerminal"}}]"#),
+    )
+    .await;
+
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Completed, None)
+        .await
+        .expect("evaluate triggers");
+
+    let rows = load_deliveries(&mut conn, exec_id).await;
+    assert!(
+        rows.is_empty(),
+        "a live-SSRF-rejected target must not enqueue a delivery row"
+    );
+
+    assert!(
+        captured.contains("evil.com"),
+        "the skip warning must still name the rejected host"
+    );
+    assert!(
+        !captured.contains("s3cr3t"),
+        "the skip warning must not carry the credential-bearing query string"
+    );
 }
 
 #[tokio::test]
@@ -900,6 +991,64 @@ async fn scanner_rejects_dispatch_when_target_is_no_longer_allowlisted() {
             .contains("SSRF policy"),
         "last_error must explain the rejection: {:?}",
         rows_after[0].last_error
+    );
+}
+
+// Regression (issue #1274): the dead-letter warning above used to log the
+// full target URL, credential included. A tightened allowlist can trigger
+// this at dispatch time. The warning must carry only the redacted origin.
+#[tokio::test]
+async fn scanner_redacts_a_credential_bearing_target_url_when_dead_lettering() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    let deliverer = Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(200)]));
+    install_config(
+        deliverer.clone(),
+        RetryPolicy::exponential(3, Duration::from_secs(60)),
+    );
+
+    let exec_id = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_id,
+        "wf-1",
+        "COMPLETED",
+        Some(r#"{"refunded":true}"#),
+        None,
+        Some(
+            r#"[{"url":"https://api.example.com/hook?token=s3cr3t","filter":{"type":"AnyTerminal"}}]"#,
+        ),
+    )
+    .await;
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Completed, None)
+        .await
+        .expect("evaluate triggers");
+
+    // Tighten the allowlist after enqueue, same as the sibling test above.
+    *GLOBAL_CALLBACK_CONFIG.write().unwrap() = Some(Arc::new(CallbackRuntimeConfig {
+        deliverer: deliverer.clone(),
+        secret: CallbackSecret::new(b"test-secret".to_vec()),
+        ssrf_policy: SsrfPolicy::new(HostAllowlist::new()),
+        default_targets: Vec::new(),
+        retry_policy: RetryPolicy::exponential(3, Duration::from_secs(60)),
+    }));
+
+    let captured = FieldCapture::default();
+    let subscriber = tracing_subscriber::registry().with(captured.clone());
+    let _tracing_guard = tracing::subscriber::set_default(subscriber);
+
+    fire_due_completion_deliveries(&mut conn, &None, &[])
+        .await
+        .expect("scanner tick");
+
+    assert!(
+        captured.contains("api.example.com"),
+        "the dead-letter warning must still name the rejected host"
+    );
+    assert!(
+        !captured.contains("s3cr3t"),
+        "the dead-letter warning must not carry the credential-bearing query string"
     );
 }
 

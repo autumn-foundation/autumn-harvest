@@ -1839,12 +1839,25 @@ impl CompletionCallbackBuilderConfig {
     /// SSRF policy. Called at `HarvestBuilder::try_build()` time.
     ///
     /// # Errors
-    /// Returns the first `(url, rejection)` pair that fails validation.
+    /// Returns the first `(url, rejection)` pair that fails validation. The
+    /// `url` is REDACTED to its origin (`scheme://host/<redacted>`), not the
+    /// full target (issue #1274). This pair becomes
+    /// [`crate::builder::HarvestBuilderError::CallbackTargetRejected`], whose
+    /// `Display` a startup failure writes straight to the logs.
+    ///
+    /// A completion-callback target often carries a bearer token or signing
+    /// key in its path or query, like a SIEM ingest URL (issue #953). Every
+    /// [`SsrfRejection`] variant discriminates on an origin property, so the
+    /// origin explains the rejection, and the redacted remainder is exactly
+    /// the secret.
     pub fn validate_default_targets(&self) -> Result<(), (String, SsrfRejection)> {
         let policy = self.ssrf_policy();
         for target in &self.default_targets {
             if let Err(rejection) = validate_target_url(&target.url, &policy) {
-                return Err((target.url.clone(), rejection));
+                return Err((
+                    crate::audit_export::redact_webhook_url(&target.url),
+                    rejection,
+                ));
             }
         }
         Ok(())
@@ -1909,11 +1922,47 @@ mod builder_config_tests {
             ..Default::default()
         };
         let (url, rejection) = config.validate_default_targets().unwrap_err();
-        assert_eq!(url, "https://evil.com/hook");
+        // REDACTED to its origin, not the full target (issue #1274).
+        // A completion-callback URL often carries a bearer token in its
+        // path or query. This pair feeds a startup error's `Display`.
+        assert_eq!(url, "https://evil.com/<redacted>");
         assert!(matches!(
             rejection,
             SsrfRejection::HostNotAllowlisted { .. }
         ));
+    }
+
+    #[test]
+    fn validate_default_targets_redacts_a_credential_bearing_target() {
+        let config = CompletionCallbackBuilderConfig {
+            allowlist: HostAllowlist::new().with_pattern("api.example.com"),
+            default_targets: vec![CallbackTarget::new(
+                "https://evil.com/hook?token=s3cr3t",
+                EventFilter::AnyTerminal,
+            )],
+            ..Default::default()
+        };
+        let (url, _rejection) = config.validate_default_targets().unwrap_err();
+        assert_eq!(url, "https://evil.com/<redacted>");
+        assert!(!url.contains("s3cr3t"));
+    }
+
+    #[test]
+    fn validate_default_targets_strips_userinfo_from_a_rejected_target() {
+        // The allowlisted host means `UserinfoNotAllowed` is the rejection
+        // reason, not a host mismatch (issue #1274).
+        let config = CompletionCallbackBuilderConfig {
+            allowlist: HostAllowlist::new().with_pattern("api.example.com"),
+            default_targets: vec![CallbackTarget::new(
+                "https://user:s3cret@api.example.com/hook",
+                EventFilter::AnyTerminal,
+            )],
+            ..Default::default()
+        };
+        let (url, rejection) = config.validate_default_targets().unwrap_err();
+        assert_eq!(url, "https://api.example.com/<redacted>");
+        assert!(!url.contains("s3cret"));
+        assert_eq!(rejection, SsrfRejection::UserinfoNotAllowed);
     }
 
     #[test]
@@ -2197,10 +2246,14 @@ pub async fn enqueue_completion_deliveries(
         // here skips just this one target rather than aborting the
         // terminal transaction.
         if let Err(rejection) = validate_target_url(&target.url, &config.ssrf_policy) {
+            // REDACTED to its origin, not logged whole (issue #1274). A
+            // completion-callback target often carries a bearer token in
+            // its path or query, and `tracing::warn!` output routinely
+            // reaches long-lived log storage.
             tracing::warn!(
                 execution_id = %exec_id,
                 callback_index,
-                target_url = %target.url,
+                target_url = %crate::audit_export::redact_webhook_url(&target.url),
                 ?rejection,
                 "completion callback target failed SSRF re-validation at enqueue time; skipping"
             );
@@ -2662,9 +2715,11 @@ async fn fire_due_on_conn(
         // operator gets a visible, actionable DLQ entry instead of a task
         // that appears to make no progress.
         if let Err(rejection) = validate_target_url(&row.target_url, &config.ssrf_policy) {
+            // REDACTED to its origin, not logged whole (issue #1274). See
+            // the matching note in `enqueue_completion_deliveries` above.
             tracing::warn!(
                 delivery_id = %row.id,
-                target_url = %row.target_url,
+                target_url = %crate::audit_export::redact_webhook_url(&row.target_url),
                 rejection = ?rejection,
                 "completion-callback target URL no longer allowed by the live SSRF policy; dead-lettering"
             );
