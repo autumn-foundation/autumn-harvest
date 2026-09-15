@@ -2825,7 +2825,11 @@ async fn set_rate_limit_pacing_override_audits_every_rejection_branch() {
         json!({ "refill_rate": 5.0, "ttl_secs": 999_999_999 }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "ttl_secs above cap: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "ttl_secs above cap: {body}"
+    );
 
     let (status, body) = post_json(
         &app,
@@ -3041,7 +3045,11 @@ async fn set_start_throttle_pacing_override_audits_every_rejection_branch() {
         json!({ "refill_per_sec": 5.0, "ttl_secs": 999_999_999 }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "ttl_secs above cap: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "ttl_secs above cap: {body}"
+    );
 
     let (status, body) = post_json(
         &app,
