@@ -1553,7 +1553,7 @@ pub async fn enable_partitioning(
     // where a multi-statement string runs as ONE implicit transaction, so the
     // atomicity the conversion needs is preserved: a failure anywhere rolls the
     // whole script back and leaves the deployment exactly as it was.
-    diesel_async::SimpleAsyncConnection::batch_execute(conn, &enable_sql(opts))
+    diesel_async::SimpleAsyncConnection::batch_execute(conn, &enable_sql(opts, now))
         .await
         .map_err(|e| HarvestError::Database(format!("partition enable script failed: {e}")))?;
 
@@ -1814,11 +1814,20 @@ fn drop_tracked_constraint_stmt(table: &str, var_name: &str) -> String {
 // scatter a single readable runbook across helpers that only ever concatenate.
 #[allow(clippy::too_many_lines)]
 #[must_use]
-pub fn enable_sql(opts: &EnableOptions) -> String {
+pub fn enable_sql(opts: &EnableOptions, now: DateTime<Utc>) -> String {
     let width = opts.cohort_width_secs.max(1);
     let lookahead = opts.lookahead_cohorts;
     let lock_ms = opts.lock_timeout.as_millis().max(1);
     let cohort_fn = cohort_function_sql(width);
+    // Bound as a literal, the same way `migration_plan_steps` already binds
+    // its own `cutover_lit` — not read back from the database's `now()`.
+    // `enable_partitioning` derives its post-conversion report from the SAME
+    // `now`, by comparing the catalog against the lookahead window this
+    // value produces. A database-clock `now()` here could disagree with
+    // that Rust-side clock across a cohort boundary. It would then wrongly
+    // report a cohort as missing when the conversion actually covered it,
+    // under a boundary the check never knew about.
+    let cutover_lit = ts_literal(cohort_start(now, width));
     // Inlined rather than run as a following statement: on a shard that was
     // empty the legacy table is dropped before this block ends, so the ACLs
     // have to be read while it still exists.
@@ -1915,7 +1924,7 @@ BEGIN
     -- ranges meet exactly, with no gap and no overlap -- and because wall clock
     -- only advances, no later append can route back into legacy. The legacy
     -- partition is sealed from the moment it is attached.
-    cutover := harvest_event_cohort(now());
+    cutover := {cutover_lit};
 
     -- Taken explicitly, first, and re-checked immediately after. The
     -- pre-flight calls in `enable_partitioning` (`refuse_if_row_security`
@@ -2129,8 +2138,15 @@ re-run this.', bad;
 
     -- Pre-create the lookahead window so the engine starts covered. Retention
     -- maintenance extends it every tick from here; no operator cron is needed.
+    --
+    -- `cutover + step * width`, not `harvest_event_cohort(now() + step *
+    -- width)`. `step * width_secs` is already an exact multiple of the
+    -- cohort width, and `cutover` is already floored to it, so the two are
+    -- mathematically identical — but this form needs neither `now()` nor a
+    -- second call into the cohort function, and it keeps every cohort
+    -- boundary in this loop anchored to the SAME instant as `cutover`.
     FOR step IN 0..lookahead LOOP
-        lo := harvest_event_cohort(now() + (step * width_secs) * interval '1 second');
+        lo := cutover + (step * width_secs) * interval '1 second';
         hi := lo + (width_secs * interval '1 second');
         EXECUTE format(
             'CREATE TABLE IF NOT EXISTS %I PARTITION OF harvest_events '
@@ -5115,8 +5131,9 @@ mod tests {
     #[test]
     fn the_operator_plan_performs_the_same_conversion_as_the_executed_script() {
         let opts = EnableOptions::default();
-        let plan = migration_plan(&opts, Utc::now());
-        let script = enable_sql(&opts);
+        let now = Utc::now();
+        let plan = migration_plan(&opts, now);
+        let script = enable_sql(&opts, now);
 
         for needle in [
             // The trigger must name the function that actually exists.

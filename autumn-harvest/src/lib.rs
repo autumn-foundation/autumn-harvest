@@ -174,6 +174,7 @@ pub fn test_init_sql() -> String {
         sql.push_str("\n\n");
         sql.push_str(&crate::partition::enable_sql(
             &crate::partition::EnableOptions::default(),
+            chrono::Utc::now(),
         ));
     }
     sql
