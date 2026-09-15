@@ -1733,3 +1733,54 @@ async fn a_shard_whose_sweep_fails_reports_the_failure_instead_of_a_silent_zero(
     // ...and one shard's failure never stops another shard's collection.
     assert!(!bucket_exists(&mut conn, "dyn-rate:t:healthy").await);
 }
+
+#[tokio::test]
+async fn a_failed_dry_run_pass_still_reports_dry_run_true() {
+    // Issue #1316: `RateLimitBucketGcOutcome::failed` filled every field but
+    // `error` from `Default`, so a failed DRY-RUN preview reported
+    // `dry_run: false` — indistinguishable from a failed REAL pass. An
+    // operator would read that as "a destructive pass errored partway",
+    // when in fact the tick was a preview and deleted nothing.
+    //
+    // The sibling test above provokes the connection-acquisition `failed()`
+    // call site. This one provokes the OTHER call site: the sweep/preview
+    // query itself, on an otherwise-healthy connection.
+    //
+    // Renamed away rather than dropped, and renamed BACK before any
+    // assertion runs. This shared test database has no per-test transaction
+    // isolation. A panicking assertion must never leave the table missing
+    // for every test that runs after this one.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_rate_limit_buckets RENAME TO harvest_rate_limit_buckets_1316_hidden",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("hide the table to provoke the sweep query's own failure");
+
+    let pools = ShardedDbPool::single(build_pool(&url));
+    let config = RetentionConfig {
+        dry_run: true,
+        ..gc_only(WINDOW)
+    };
+    let result = run_one_tick_on(pools, config, Arc::new(CapturingMetrics::default())).await;
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_rate_limit_buckets_1316_hidden RENAME TO harvest_rate_limit_buckets",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("restore the table before any assertion below can panic");
+
+    assert!(
+        gc(&result).error.is_some(),
+        "the hidden table must surface as a failure"
+    );
+    assert!(
+        gc(&result).dry_run,
+        "a failed dry-run preview must still report dry_run: true"
+    );
+}
