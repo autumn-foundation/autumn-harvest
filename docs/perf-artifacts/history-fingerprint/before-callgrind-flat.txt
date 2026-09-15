@@ -1,0 +1,78 @@
+--------------------------------------------------------------------------------
+Profile data file '/tmp/cg_before.out' (creator: callgrind-3.22.0)
+--------------------------------------------------------------------------------
+I1 cache: 
+D1 cache: 
+LL cache: 
+Timerange: Basic block 0 - 61935556
+Trigger: Program termination
+Profiled target:  /home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461 (PID 7729, part 1)
+Events recorded:  Ir
+Events shown:     Ir
+Event sort order: Ir
+Thresholds:       98
+Include dirs:     
+User annotated:   
+Auto-annotation:  on
+
+--------------------------------------------------------------------------------
+Ir                   
+--------------------------------------------------------------------------------
+461,455,374 (100.0%)  PROGRAM TOTALS
+
+--------------------------------------------------------------------------------
+Ir                    file:function
+--------------------------------------------------------------------------------
+175,397,730 (38.01%)  ???:sha2::sha256::compress256 [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+ 61,305,728 (13.29%)  ./malloc/./malloc/malloc.c:_int_malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 32,952,131 ( 7.14%)  ./malloc/./malloc/malloc.c:_int_free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 28,994,362 ( 6.28%)  ???:serde_json::ser::format_escaped_str_contents [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+ 20,205,581 ( 4.38%)  ./malloc/./malloc/malloc.c:malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 13,680,052 ( 2.96%)  ???:alloc::collections::btree::map::IntoIter<K,V,A>::dying_next [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+ 13,020,380 ( 2.82%)  ./malloc/./malloc/malloc.c:free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 11,037,767 ( 2.39%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__memcpy_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  8,745,000 ( 1.90%)  ???:<alloc::string::String as core::clone::Clone>::clone [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  8,319,473 ( 1.80%)  ???:serde_json::value::ser::<impl serde_core::ser::Serialize for serde_json::value::Value>::serialize'2 [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  7,400,000 ( 1.60%)  ???:core::ptr::drop_in_place<serde_json::value::Value>'2 [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  6,530,000 ( 1.42%)  ???:alloc::collections::btree::map::BTreeMap<K,V,A>::insert [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  4,650,000 ( 1.01%)  ???:<alloc::collections::btree::map::BTreeMap<K,V,A> as core::clone::Clone>::clone::clone_subtree'2 [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  4,209,507 ( 0.91%)  ./malloc/./malloc/malloc.c:_int_free_merge_chunk [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  4,185,072 ( 0.91%)  ???:__rustc::__rdl_alloc [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  4,090,000 ( 0.89%)  ???:<alloc::collections::btree::map::BTreeMap<K,V,A> as core::clone::Clone>::clone::clone_subtree [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  3,730,562 ( 0.81%)  ???:serde_json::value::ser::<impl serde_core::ser::Serialize for serde_json::value::Value>::serialize [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  3,610,036 ( 0.78%)  ???:core::ptr::drop_in_place<serde_json::value::Value> [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  3,030,000 ( 0.66%)  ???:alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Leaf>,alloc::collections::btree::node::marker::Edge>::insert_recursing [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  2,815,082 ( 0.61%)  ???:history_fingerprint_profile::support::build_history [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  2,649,158 ( 0.57%)  ???:autumn_harvest::shard_rebalance::history_fingerprint [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  2,141,479 ( 0.46%)  ./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S:__memcmp_avx2_movbe [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  2,040,064 ( 0.44%)  ???:<serde_json::number::Number as serde_core::ser::Serialize>::serialize [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  1,960,083 ( 0.42%)  ???:alloc::fmt::format::format_inner [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  1,809,669 ( 0.39%)  ./malloc/./malloc/malloc.c:_int_free_maybe_consolidate [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  1,799,952 ( 0.39%)  ./malloc/./malloc/malloc.c:alloc_perturb [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  1,750,104 ( 0.38%)  ???:serde_core::ser::SerializeMap::serialize_entry'2 [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  1,670,125 ( 0.36%)  ./malloc/./malloc/malloc.c:realloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  1,600,297 ( 0.35%)  ???:core::fmt::write [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  1,532,150 ( 0.33%)  ???:<u64 as itoa::Unsigned>::fmt [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  1,395,033 ( 0.30%)  ./malloc/./malloc/arena.c:free
+  1,390,000 ( 0.30%)  ???:<alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Dying,K,V,NodeType>,alloc::collections::btree::node::marker::KV>::drop_key_val::Dropper<T> as core::ops::drop::Drop>::drop [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  1,350,000 ( 0.29%)  ???:uuid::fmt::encode_hyphenated [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  1,307,982 ( 0.28%)  ???:core::fmt::Formatter::pad_integral [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  1,300,072 ( 0.28%)  ./malloc/./malloc/malloc.c:_int_realloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  1,200,120 ( 0.26%)  ???:serde_core::ser::SerializeMap::serialize_entry [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  1,160,000 ( 0.25%)  ???:<T as alloc::slice::<impl [T]>::to_vec_in::ConvertVec>::to_vec [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  1,158,197 ( 0.25%)  ???:core::fmt::num::imp::<impl u64>::_fmt_inner [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  1,079,954 ( 0.23%)  ???:<alloc::string::String as core::fmt::Write>::write_str [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  1,040,000 ( 0.23%)  ???:<alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Dying,K,V,NodeType>,alloc::collections::btree::node::marker::KV>::drop_key_val::Dropper<T> as core::ops::drop::Drop>::drop'2 [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+  1,030,032 ( 0.22%)  ???:alloc::raw_vec::RawVecInner<A>::finish_grow [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+    900,015 ( 0.20%)  ./malloc/./malloc/arena.c:malloc
+    870,030 ( 0.19%)  ???:alloc::raw_vec::RawVecInner<A>::reserve::do_reserve_and_handle [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+    645,000 ( 0.14%)  ???:<alloc::vec::Vec<T,A> as core::clone::Clone>::clone [/home/user/autumn-harvest/target/release/deps/history_fingerprint_profile-f2622933bbd73461]
+
+--------------------------------------------------------------------------------
+The following files chosen for auto-annotation could not be found:
+--------------------------------------------------------------------------------
+  ./malloc/./malloc/arena.c
+  ./malloc/./malloc/malloc.c
+  ./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S
+  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S
+

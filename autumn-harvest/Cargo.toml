@@ -305,6 +305,14 @@ name = "replay_profile"
 required-features = ["testing"]
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `shard_rebalance::history_fingerprint` -- the replay-determinism check
+# `verify_target_copy` runs on both sides of a shard migration.
+[[bench]]
+name = "history_fingerprint_profile"
+required-features = ["testing"]
+harness = false
+
 # Task-claim / enqueue throughput benchmark (issue #786). `harness = false` +
 # its own `main()`: `claim_task` is destructive (PENDING -> RUNNING), so
 # criterion's repeat-the-closure model would drain the seeded backlog and time
