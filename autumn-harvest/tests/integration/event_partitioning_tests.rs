@@ -5090,9 +5090,16 @@ async fn maintenance_outcome_reports_whether_the_shard_was_partitioned() {
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
 
-    let outcome = partition::maintain(&mut conn, Utc::now(), 0, &SweepOptions::default(), None)
-        .await
-        .expect("maintain is a safe no-op on an unpartitioned shard");
+    let outcome = partition::maintain(
+        &mut conn,
+        Utc::now(),
+        0,
+        &SweepOptions::default(),
+        None,
+        None,
+    )
+    .await
+    .expect("maintain is a safe no-op on an unpartitioned shard");
     assert_eq!(
         outcome.partitioned,
         Some(false),
@@ -5103,9 +5110,16 @@ async fn maintenance_outcome_reports_whether_the_shard_was_partitioned() {
         .await
         .expect("enable");
 
-    let outcome = partition::maintain(&mut conn, Utc::now(), 0, &SweepOptions::default(), None)
-        .await
-        .expect("maintain on a partitioned shard");
+    let outcome = partition::maintain(
+        &mut conn,
+        Utc::now(),
+        0,
+        &SweepOptions::default(),
+        None,
+        None,
+    )
+    .await
+    .expect("maintain on a partitioned shard");
     assert_eq!(
         outcome.partitioned,
         Some(true),
@@ -8805,6 +8819,7 @@ async fn maintenance_says_what_is_wrong_when_the_runtime_role_cannot_own_partiti
         partition::DEFAULT_LOOKAHEAD_COHORTS,
         &SweepOptions::default(),
         None,
+        None,
     )
     .await;
     let msg = match err {
@@ -8840,6 +8855,7 @@ async fn maintenance_says_what_is_wrong_when_the_runtime_role_cannot_own_partiti
         Utc::now(),
         partition::DEFAULT_LOOKAHEAD_COHORTS,
         &SweepOptions::default(),
+        None,
         None,
     )
     .await
@@ -9300,9 +9316,16 @@ async fn a_partly_blocked_lookahead_catch_up_is_not_reported_as_a_healthy_pass()
         .await
         .expect("seed a colliding relation");
 
-    let outcome = partition::maintain(&mut conn, Utc::now(), 6, &SweepOptions::default(), None)
-        .await
-        .expect("maintain must not hard-fail on a partial lookahead gap");
+    let outcome = partition::maintain(
+        &mut conn,
+        Utc::now(),
+        6,
+        &SweepOptions::default(),
+        None,
+        None,
+    )
+    .await
+    .expect("maintain must not hard-fail on a partial lookahead gap");
 
     assert!(
         !outcome.created.is_empty(),
@@ -9379,6 +9402,7 @@ async fn maintain_with_progress_ticks_once_per_partition_the_sweep_attempts() {
         Utc::now(),
         0,
         &SweepOptions::default(),
+        None,
         None,
         &mut || ticks += 1,
     )
@@ -9466,6 +9490,7 @@ async fn maintain_with_progress_ticks_during_the_default_partition_drain_too() {
         0,
         &SweepOptions::default(),
         None,
+        None,
         &mut || ticks += 1,
     )
     .await
@@ -9514,6 +9539,7 @@ async fn maintain_with_progress_ticks_while_extending_the_lookahead_window() {
         lookahead_cohorts,
         &SweepOptions::default(),
         None,
+        None,
         &mut || ticks += 1,
     )
     .await
@@ -9536,6 +9562,156 @@ async fn maintain_with_progress_ticks_while_extending_the_lookahead_window() {
         "the progress callback must fire once per cohort ensure_partitions \
          attempts, not once for the whole shard; got {ticks} ticks for \
          {outcome:?}"
+    );
+}
+
+#[tokio::test]
+// One scenario, driven pass by pass. Splitting it would scatter the
+// multi-pass cycle this test proves converges, across helpers that run
+// in this order once each.
+#[allow(clippy::too_many_lines)]
+async fn catch_up_target_bounds_the_resume_cycle_when_the_backlog_outgrows_the_budget() {
+    // Review finding: a backlog can gain an eligible partition at
+    // least as fast as `max_attempts` attempts one. That alone never
+    // lets the resume cursor reset on its own. Each pass's own fresh
+    // query has a new eligible partition at the tail. That happens at
+    // the same rate the cursor advances toward it. So "nothing left
+    // after the cursor" never becomes true. A partition the cursor has
+    // already passed -- found blocked when it was reached, say -- is
+    // then skipped forever. That holds even after whatever blocked it
+    // clears. `catch_up_target` anchors a multi-pass cycle to the
+    // backlog size AT THE MOMENT it started. It must stay fixed while
+    // a later pass's own live backlog keeps growing. The cycle must
+    // still converge once every blocker clears.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Three cohorts, all already past, each pinned by its own
+    // still-RUNNING execution: droppable once that execution completes,
+    // blocked until then.
+    let mut execs = Vec::new();
+    for (n, days_ago) in [4_i64, 3, 2].into_iter().enumerate() {
+        let ts = Utc::now() - chrono::Duration::days(days_ago);
+        let exec =
+            insert_execution(&mut conn, "catchup_wf", &format!("catchup-{n}"), ts, None).await;
+        autumn_harvest::store::append_events(
+            &mut conn,
+            ExecutionId::from_uuid(exec),
+            &sample_events(),
+            0,
+        )
+        .await
+        .expect("seed");
+        backdate_events(&mut conn, exec, ts).await;
+        execs.push(exec);
+    }
+
+    let opts = SweepOptions {
+        max_attempts: 1,
+        ..SweepOptions::default()
+    };
+
+    // Pass 1: attempts only the oldest (day -4), finds it blocked. It
+    // truncates on budget with two more already-eligible partitions
+    // (day -3, day -2) still unvisited. This is the first pass of a
+    // catch-up cycle: it must snapshot a target and return it.
+    let now_1 = Utc::now();
+    let outcome_1 = partition::maintain(&mut conn, now_1, 0, &opts, None, None)
+        .await
+        .expect("pass 1");
+    assert!(
+        outcome_1.sweep.truncated,
+        "pass 1 must truncate: two more eligible partitions remain past budget; \
+         got {outcome_1:?}"
+    );
+    let target = outcome_1
+        .sweep
+        .catch_up_target
+        .expect("a truncated pass must snapshot a catch-up target");
+
+    // Simulate the backlog growing at least as fast as the budget can
+    // attempt a partition. A FOURTH cohort becomes eligible before pass
+    // 2 runs: the exact race the finding describes.
+    let ts4 = Utc::now() - chrono::Duration::days(1);
+    let late_exec = insert_execution(&mut conn, "catchup_wf", "catchup-3", ts4, None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(late_exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed");
+    backdate_events(&mut conn, late_exec, ts4).await;
+    execs.push(late_exec);
+
+    // Pass 2: a later `now`, with the freshly grown backlog. Old code
+    // would recompute this pass's own target as ITS OWN `now`, every
+    // time. The fix must keep the ORIGINAL target from pass 1 instead.
+    let now_2 = Utc::now();
+    assert!(now_2 > now_1, "precondition: real time advanced");
+    let outcome_2 = partition::maintain(
+        &mut conn,
+        now_2,
+        0,
+        &opts,
+        outcome_1.sweep.next_resume,
+        outcome_1.sweep.catch_up_target,
+    )
+    .await
+    .expect("pass 2");
+    assert!(
+        outcome_2.sweep.truncated,
+        "pass 2 must still truncate: two more eligible partitions (day -2, the new \
+         one) remain past budget; got {outcome_2:?}"
+    );
+    assert_eq!(
+        outcome_2.sweep.catch_up_target,
+        Some(target),
+        "the catch-up target must stay anchored to pass 1's `now`, not shift to \
+         pass 2's later one, even though the live backlog grew in between; \
+         got {outcome_2:?}"
+    );
+
+    // Unblock everything, then drive the cycle to completion. A bounded
+    // sequence of further passes -- each still only one attempt, the
+    // same budget as before -- must eventually drop all four partitions.
+    // None may be skipped forever, including the two the cursor has
+    // already passed once while they were still blocked.
+    for exec in &execs {
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+             WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(*exec)
+        .execute(&mut conn)
+        .await
+        .expect("complete the pinned execution");
+    }
+
+    let mut resume_after = outcome_2.sweep.next_resume;
+    let mut catch_up_target = outcome_2.sweep.catch_up_target;
+    let mut dropped_total = 0usize;
+    for _ in 0..20 {
+        if dropped_total == 4 {
+            break;
+        }
+        let now = Utc::now();
+        let outcome = partition::maintain(&mut conn, now, 0, &opts, resume_after, catch_up_target)
+            .await
+            .expect("catch-up pass");
+        dropped_total += outcome.sweep.dropped.len();
+        resume_after = outcome.sweep.next_resume;
+        catch_up_target = outcome.sweep.catch_up_target;
+    }
+    assert_eq!(
+        dropped_total, 4,
+        "every partition in the original backlog, plus the one that arrived mid-cycle, \
+         must eventually be dropped once unblocked, within a bounded number of passes"
     );
 }
 

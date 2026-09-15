@@ -612,6 +612,7 @@ pub async fn measure_pass(
             autumn_harvest::partition::DEFAULT_LOOKAHEAD_COHORTS,
             &autumn_harvest::partition::SweepOptions::default(),
             None,
+            None,
         )
         .await
         .expect("partition maintenance");

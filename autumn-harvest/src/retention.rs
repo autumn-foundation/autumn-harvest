@@ -1123,6 +1123,24 @@ impl RetentionMonitor {
     }
 }
 
+/// One shard's persisted sweep-resume state. Carried between ticks the
+/// same way `resume_cursors` itself is: local to the retention task,
+/// never read back from the monitor's reported snapshot.
+///
+/// Review finding: `resume_after` alone lets a backlog skip a blocked
+/// partition forever. That happens whenever the backlog grows at least
+/// as fast as the per-tick budget can attempt one -- see
+/// [`crate::partition::SweepOutcome::catch_up_target`]. `catch_up_target`,
+/// once a catch-up cycle starts, anchors it to the fixed instant that
+/// cycle must reach. It is threaded straight through to
+/// [`crate::partition::maintain_with_progress`] alongside `resume_after`.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, Default)]
+struct PartitionSweepCursor {
+    resume_after: Option<DateTime<Utc>>,
+    catch_up_target: Option<DateTime<Utc>>,
+}
+
 /// One pass of engine-automated partition maintenance (issue #958, AC8):
 /// `ensure_partitions`, the reclamation sweep, and the DEFAULT-partition
 /// drain, for every shard.
@@ -1146,7 +1164,7 @@ async fn run_partition_maintenance_pass(
     pools: &ShardedDbPool,
     config: &RetentionConfig,
     monitor_task: &RetentionMonitor,
-    resume_cursors: &mut HashMap<ShardId, Option<DateTime<Utc>>>,
+    resume_cursors: &mut HashMap<ShardId, PartitionSweepCursor>,
     metrics: &dyn MetricsRecorder,
     owner: crate::scanner_health::ScannerOwner,
     shutdown: &CancellationToken,
@@ -1249,7 +1267,7 @@ async fn run_partition_maintenance_pass(
         // retention the same way. Local state this task owns outright,
         // untouched by anything that replaces the monitor's reported
         // snapshot.
-        let resume_after = resume_cursors.get(&shard).copied().flatten();
+        let cursor = resume_cursors.get(&shard).copied().unwrap_or_default();
         // Review finding: a tick recorded once before this whole shard's
         // maintenance pass is not bounded progress either. A single shard
         // can spend `max_attempts` partitions at `exact_scan_timeout` each,
@@ -1268,7 +1286,8 @@ async fn run_partition_maintenance_pass(
             now,
             config.partitions.lookahead_cohorts,
             &sweep_opts,
-            resume_after,
+            cursor.resume_after,
+            cursor.catch_up_target,
             &mut tick_partition,
         )
         .await
@@ -1312,7 +1331,13 @@ async fn run_partition_maintenance_pass(
                         "harvest event-partition maintenance"
                     );
                 }
-                resume_cursors.insert(shard, outcome.sweep.next_resume);
+                resume_cursors.insert(
+                    shard,
+                    PartitionSweepCursor {
+                        resume_after: outcome.sweep.next_resume,
+                        catch_up_target: outcome.sweep.catch_up_target,
+                    },
+                );
                 monitor_task.update_partitions(shard, outcome);
             }
             Err(err) => {
@@ -1403,7 +1428,7 @@ impl RetentionRuntime {
             // `resume_cursors`. Local state this task owns outright, for
             // the identical reason `scan_cursors` above is local rather
             // than read back from the monitor.
-            let mut partition_resume_cursors: HashMap<ShardId, Option<DateTime<Utc>>> =
+            let mut partition_resume_cursors: HashMap<ShardId, PartitionSweepCursor> =
                 HashMap::new();
             // Issue #1270 item 5: run partition maintenance immediately
             // rather than waiting a full `tick_interval` (an hour, by

@@ -650,6 +650,33 @@ pub struct SweepOutcome {
     /// sweep already relies on (oldest first, by cohort upper bound).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_resume: Option<DateTime<Utc>>,
+    /// The fixed horizon a multi-pass catch-up cycle must reach before
+    /// [`Self::next_resume`] is allowed to reset to `None`.
+    ///
+    /// Review finding: a backlog can gain an eligible partition at
+    /// least as fast as the per-tick budget attempts one. That alone
+    /// never lets `next_resume` reset on its own. Each pass's own fresh
+    /// partition query grows a new eligible partition onto the tail.
+    /// That happens at the same rate the cursor advances toward it. So
+    /// "no partition left after the cursor, in THIS pass's own list"
+    /// never becomes true. A partition left behind once the cursor
+    /// passes it -- blocked by a transient owner-role gap or lock, say
+    /// -- is then skipped forever. That holds even after whatever
+    /// blocked it clears.
+    ///
+    /// The first pass of a catch-up cycle snapshots `now` as a FIXED
+    /// target and returns it here. The caller persists it the same way
+    /// it persists `next_resume`. It passes the target back as this
+    /// pass's own `catch_up_target` argument. Every later pass in the
+    /// cycle compares progress against that fixed instant, not its own
+    /// moving tail. The cycle is then guaranteed to finish in a bounded
+    /// number of ticks. That bound is proportional to the backlog size
+    /// AT THE MOMENT the cycle started, not however large the live
+    /// backlog grows meanwhile. `None` once the cursor reaches it, or
+    /// the pass reaches the true end of its own list first. The next
+    /// cycle, if one starts, snapshots a fresh target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catch_up_target: Option<DateTime<Utc>>,
 }
 
 // ── Layout detection ───────────────────────────────────────────────────────
@@ -3851,7 +3878,7 @@ pub async fn evaluate(
     opts: &SweepOptions,
     resume_after: Option<DateTime<Utc>>,
 ) -> HarvestResult<SweepOutcome> {
-    sweep_inner(conn, now, opts, false, resume_after, None).await
+    sweep_inner(conn, now, opts, false, resume_after, None, None).await
 }
 
 /// Drop every fully-reclaimable cohort partition, oldest first.
@@ -3895,7 +3922,7 @@ pub async fn sweep(
     opts: &SweepOptions,
     resume_after: Option<DateTime<Utc>>,
 ) -> HarvestResult<SweepOutcome> {
-    sweep_inner(conn, now, opts, true, resume_after, None).await
+    sweep_inner(conn, now, opts, true, resume_after, None, None).await
 }
 
 /// The shared body of [`sweep`] and [`evaluate`].
@@ -3907,6 +3934,12 @@ pub async fn sweep(
 /// every partition up to and including the named one before evaluation
 /// starts. A name no longer present (already dropped, or from a stale
 /// caller) is treated the same as `None`: start from the oldest.
+///
+/// `catch_up_target` — see [`SweepOutcome::catch_up_target`] — is the fixed
+/// horizon this pass's own progress is measured against. That applies when
+/// it is part of a multi-pass catch-up cycle already in flight. `None`
+/// starts (or continues, if this pass does not truncate) with no cycle
+/// active.
 #[cfg(feature = "db")]
 async fn sweep_inner(
     conn: &mut AsyncPgConnection,
@@ -3914,6 +3947,7 @@ async fn sweep_inner(
     opts: &SweepOptions,
     apply: bool,
     resume_after: Option<DateTime<Utc>>,
+    catch_up_target: Option<DateTime<Utc>>,
     mut progress: Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<SweepOutcome> {
     let mut outcome = SweepOutcome::default();
@@ -4037,10 +4071,26 @@ async fn sweep_inner(
     }
     // `reached_end` is true whenever the loop ran out of partitions
     // before it ran out of budget, truncated or not. Either way there is
-    // no later partition this pass left unvisited. The next pass should
-    // restart from the oldest, rather than resuming forever closer to
-    // the end.
-    outcome.next_resume = if reached_end { None } else { last_attempted };
+    // no later partition this pass left unvisited, in THIS pass's own
+    // fresh query. The next pass should restart from the oldest, rather
+    // than resuming forever closer to the end.
+    //
+    // Review finding: that alone is not enough when the backlog itself
+    // grows at least as fast as the budget can attempt a partition.
+    // Every pass's own query then has a fresh, later partition at the
+    // tail. So `reached_end` never becomes true on its own, and a
+    // partition the cursor has already passed is skipped forever, even
+    // once whatever blocked it clears. `target` anchors this cycle to a
+    // FIXED point instead of that moving tail. The first pass to
+    // truncate snapshots its own `now`. Every later pass in the same
+    // cycle (the caller passes `catch_up_target` back unchanged)
+    // measures against that same instant. Reaching or passing it is
+    // "caught up," regardless of how much further the live backlog has
+    // grown since.
+    let target = catch_up_target.unwrap_or(now);
+    let caught_up = reached_end || last_attempted.is_some_and(|last| last >= target);
+    outcome.next_resume = if caught_up { None } else { last_attempted };
+    outcome.catch_up_target = if caught_up { None } else { Some(target) };
     Ok(outcome)
 }
 
@@ -4989,9 +5039,10 @@ async fn maintenance_owner_gap(
 /// so a cohort freed earlier in the same tick is reclaimed now rather than
 /// next time.
 ///
-/// `resume_after` is threaded straight through to [`sweep`] — see
-/// [`SweepOutcome::next_resume`] for what it does and who should persist it
-/// across calls.
+/// `resume_after` and `catch_up_target` are threaded straight through to the
+/// sweep step. See [`SweepOutcome::next_resume`] and
+/// [`SweepOutcome::catch_up_target`] for what they do and who should persist
+/// them across calls.
 ///
 /// # Errors
 ///
@@ -5003,6 +5054,7 @@ pub async fn maintain(
     lookahead_cohorts: u32,
     sweep_opts: &SweepOptions,
     resume_after: Option<DateTime<Utc>>,
+    catch_up_target: Option<DateTime<Utc>>,
 ) -> HarvestResult<MaintenanceOutcome> {
     let mut progress: Option<&mut (dyn FnMut() + Send)> = None;
     maintain_inner(
@@ -5011,6 +5063,7 @@ pub async fn maintain(
         lookahead_cohorts,
         sweep_opts,
         resume_after,
+        catch_up_target,
         &mut progress,
     )
     .await
@@ -5038,6 +5091,7 @@ pub async fn maintain_with_progress(
     lookahead_cohorts: u32,
     sweep_opts: &SweepOptions,
     resume_after: Option<DateTime<Utc>>,
+    catch_up_target: Option<DateTime<Utc>>,
     progress: &mut (dyn FnMut() + Send),
 ) -> HarvestResult<MaintenanceOutcome> {
     let mut progress: Option<&mut (dyn FnMut() + Send)> = Some(progress);
@@ -5047,6 +5101,7 @@ pub async fn maintain_with_progress(
         lookahead_cohorts,
         sweep_opts,
         resume_after,
+        catch_up_target,
         &mut progress,
     )
     .await
@@ -5084,6 +5139,7 @@ async fn maintain_inner(
     lookahead_cohorts: u32,
     sweep_opts: &SweepOptions,
     resume_after: Option<DateTime<Utc>>,
+    catch_up_target: Option<DateTime<Utc>>,
     progress: &mut Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<MaintenanceOutcome> {
     if !detect_layout(conn).await?.is_partitioned() {
@@ -5147,6 +5203,7 @@ async fn maintain_inner(
         sweep_opts,
         true,
         resume_after,
+        catch_up_target,
         reborrow_progress(progress),
     )
     .await?;

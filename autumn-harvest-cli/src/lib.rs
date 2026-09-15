@@ -6180,6 +6180,7 @@ async fn run_partition_maintain(
             lookahead_cohorts,
             &sweep,
             None,
+            None,
         )
         .await
         {
