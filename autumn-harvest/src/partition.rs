@@ -1584,56 +1584,23 @@ pub async fn enable_partitioning(
             .map_or(EnableMode::Fresh, |legacy| EnableMode::AttachLegacy {
                 cutover: legacy.upper.unwrap_or(now),
             });
+    // Issue #1270: `CREATE TABLE IF NOT EXISTS ... PARTITION OF` inside
+    // `enable_sql`'s lookahead loop silently skips a cohort whose
+    // deterministic name is already taken by an unrelated relation.
+    // `enable_sql` itself now counts its own lookahead partitions before
+    // this transaction commits. It raises rather than let the script
+    // succeed with an uncovered write window — see the comment on that
+    // count in `enable_sql`. Every partition read back here, other than
+    // `DEFAULT` and the legacy one, is therefore guaranteed a genuine
+    // cohort of the completed window. No collision check is needed on
+    // the Rust side. This reads the catalog `enable_sql` already
+    // verified, rather than re-verifying a question its own transaction
+    // just answered.
     let mut cohorts: Vec<PartitionInfo> = parts
         .into_iter()
         .filter(|p| !p.is_default && p.name != LEGACY_PARTITION)
         .collect();
     cohorts.sort_by_key(|p| p.lower);
-
-    // Issue #1270: `CREATE TABLE IF NOT EXISTS ... PARTITION OF` inside
-    // `enable_sql` silently skips a cohort whose deterministic name is
-    // already taken by an unrelated relation. Reading the catalog back, as
-    // above, then just omits that name — a caller sees a report that looks
-    // complete.
-    //
-    // Verified against the catalog `enable_sql` itself produced, not against
-    // a predicted clock reading. An earlier version of this check compared
-    // the read to cohort names derived from a Rust-side `now`. That is a
-    // different clock than the database `now()` the script uses to pick its
-    // own window. It is also a different INSTANT than whenever the script
-    // actually ran. A caller might have saved the generated SQL and run it
-    // later, or the conversion might have waited on a contended lock.
-    // Checking count, contiguity and width instead needs no clock reading
-    // at all, on either side. The catalog is the only source of truth for
-    // what the script actually created.
-    let expected_count = usize::try_from(opts.lookahead_cohorts).unwrap_or(usize::MAX) + 1;
-    let gap = cohorts
-        .windows(2)
-        .find(|pair| pair[0].upper != pair[1].lower)
-        .map(|pair| format!("a gap between {} and {}", pair[0].name, pair[1].name));
-    let bad_width = cohorts.iter().find_map(|p| match (p.lower, p.upper) {
-        (Some(lo), Some(hi)) if (hi - lo).num_seconds() == width => None,
-        _ => Some(format!(
-            "{} does not span the configured cohort width",
-            p.name
-        )),
-    });
-    let problem = if cohorts.len() == expected_count {
-        gap.or(bad_width)
-    } else {
-        Some(format!(
-            "{expected_count} lookahead cohort partition(s) expected, {} found",
-            cohorts.len()
-        ))
-    };
-    if let Some(reason) = problem {
-        return Err(HarvestError::Database(format!(
-            "harvest_events was converted, but its lookahead window is incomplete ({reason}). \
-             An existing relation likely already occupies a cohort partition's deterministic \
-             name and is not this engine's partition. Writes for that cohort will land in \
-             {DEFAULT_PARTITION} until the collision is resolved."
-        )));
-    }
 
     Ok(EnableReport {
         mode,
@@ -1890,6 +1857,7 @@ DECLARE
     bad         text;
     rls         boolean;
     pols        text;
+    created_count int;
 {RENAME_HELPER_DECLARE}
 {COPY_ACL_DECLARE}
 BEGIN
@@ -2163,6 +2131,32 @@ re-run this.', bad;
             '{PARTITION_PREFIX}' || to_char(lo AT TIME ZONE 'UTC', 'YYYYMMDDHH24MISS'),
             lo, hi);
     END LOOP;
+
+    -- Verified before this transaction ever commits, not read back
+    -- afterward. `CREATE TABLE IF NOT EXISTS` above silently skips a cohort
+    -- whose deterministic name collides with an unrelated relation, and a
+    -- caller that only checked the catalog AFTER this script committed
+    -- would already own an uncovered write window with no way back except
+    -- another conversion. A conversion that fails here rolls the whole
+    -- transaction back instead, so `harvest_events` stays exactly as it
+    -- was and the SAME `enable` call can simply be retried once the
+    -- collision is resolved — including the idempotency guard at the top
+    -- of this block, which a retry would otherwise skip past believing
+    -- the shard was already correctly converted.
+    SELECT count(*) INTO created_count
+      FROM pg_inherits i
+      JOIN pg_class child ON child.oid = i.inhrelid
+      JOIN pg_class parent ON parent.oid = i.inhparent
+      JOIN pg_namespace n ON n.oid = parent.relnamespace
+     WHERE parent.relname = 'harvest_events'
+       AND n.nspname = current_schema()
+       AND child.relname LIKE '{PARTITION_PREFIX}%'
+       AND child.relname <> '{DEFAULT_PARTITION}';
+    IF created_count <> lookahead + 1 THEN
+        RAISE EXCEPTION 'harvest #1270: only % of % lookahead cohort partitions could be \
+created; an existing relation likely occupies one of the deterministic names. Drop or rename \
+it, then retry.', created_count, lookahead + 1;
+    END IF;
 END
 $harvest_enable_958$;
 "#

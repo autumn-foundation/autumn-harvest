@@ -4328,12 +4328,13 @@ async fn enabling_refuses_when_a_lookahead_cohort_name_collides() {
 
     // Plant an unrelated relation under the name `enable_sql`'s lookahead
     // loop needs for one cohort in its window. `CREATE TABLE IF NOT EXISTS
-    // ... PARTITION OF` treats that name as taken and silently skips it, so
-    // the script itself reports no error. `enable_partitioning` must still
-    // catch the gap by reading the catalog back: fewer cohort partitions
-    // exist than the configured lookahead window calls for. It must not
-    // report a conversion complete when one cohort of its write window is
-    // missing.
+    // ... PARTITION OF` treats that name as taken and silently skips it.
+    // `enable_sql` counts its own lookahead partitions before its
+    // transaction commits, and raises when the count comes up short. The
+    // WHOLE conversion — not just the missing cohort — rolls back.
+    // `enable_partitioning` must report that failure, not a conversion
+    // that looks complete but leaves one cohort of its write window
+    // uncovered.
     let width = partition::DEFAULT_COHORT_WIDTH_SECS;
     let now = Utc::now();
     let colliding_start =
@@ -4354,18 +4355,42 @@ async fn enabling_refuses_when_a_lookahead_cohort_name_collides() {
             "a missing lookahead cohort must fail the conversion report, not pass silently",
         );
     assert!(
-        err.to_string().contains("lookahead window is incomplete")
-            && err
-                .to_string()
-                .contains("4 lookahead cohort partition(s) expected, 3 found"),
-        "the refusal must say the window came up short, verified against the catalog rather \
-         than a predicted cohort name: {err}"
+        err.to_string().contains("only 3 of 4"),
+        "the refusal must say the window came up short: {err}"
     );
+
+    // The whole conversion rolled back, atomically, along with the failed
+    // lookahead check — not a partially converted shard a retry cannot
+    // see past. Retrying while the collision persists must hit the SAME
+    // check again. It must not hit the idempotency guard at the top of
+    // `enable_sql`, which only a genuinely completed conversion earns.
+    assert_eq!(
+        partition::detect_layout(&mut conn)
+            .await
+            .expect("detect layout"),
+        EventLayout::Unpartitioned,
+        "a failed lookahead check must leave harvest_events exactly as it was, not \
+         partially converted"
+    );
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err("retrying while the collision persists must fail again, not silently pass");
 
     diesel::sql_query(format!("DROP TABLE IF EXISTS {colliding_name}"))
         .execute(&mut conn)
         .await
         .ok();
+
+    // Once the collision is gone, the same call must now succeed and
+    // cover the full window.
+    let report = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enabling must succeed once the collision is resolved");
+    assert_eq!(
+        report.partitions_created.len(),
+        4,
+        "the retry must cover the full lookahead window: {report:?}"
+    );
 }
 
 #[tokio::test]
