@@ -3,7 +3,7 @@
 //! determinism check `shard_rebalance::db::verify_target_copy` runs on both
 //! sides of a shard migration (see `docs/performance-history-fingerprint.md`
 //! and `docs/sharding.md`). Wall-clock timing is not admissible evidence on
-//! this shared-vCPU machine; every number this harness produces is either a
+//! this shared-vCPU machine. Every number this harness produces is either a
 //! deterministic instruction count (`valgrind --tool=callgrind`) or an
 //! allocation count/bytes figure (`valgrind --tool=dhat`).
 //!
@@ -13,10 +13,10 @@
 //! #135 history shape (`ActivityScheduled`/`ActivityCompleted` pairs, each
 //! carrying a ~230-byte realistic JSON payload) `replay_profile.rs` already
 //! profiles `WorkflowReplayer` against. `verify_target_copy` fingerprints
-//! whatever history a migrated execution actually has, and a long-lived
+//! whatever history a migrated execution actually has. A long-lived
 //! continue-as-new chain (see `run_chain_profile.rs`'s doc comment) or a
-//! wide fan-out workflow can carry thousands of events, so this is not a
-//! toy input size.
+//! wide fan-out workflow can carry thousands of events. This is not a toy
+//! input size.
 //!
 //! `HFP_PROFILE_N` (default `5_000`, matching `replay_profile.rs`) sets the
 //! activity count -- `5_000` activities build the same `10_001`-event
