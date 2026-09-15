@@ -77,9 +77,9 @@ pub use reaper::{
 pub use safety::{DatabaseSafety, RefusalReason, SuspicionReason, classify_database_url};
 pub use sample::SAMPLE_WORKFLOW;
 pub use session::{
-    ReapDecision, SESSION_DIR_PREFIX, SESSION_RECORD_FILE, SESSION_ROOT_PREFIX, SessionRecord,
-    SkipReason, decide_reap, effective_postmaster_pid, is_session_dir, parse_postmaster_pid,
-    record_is_self_consistent,
+    PostmasterIdentity, ReapDecision, SESSION_DIR_PREFIX, SESSION_RECORD_FILE, SESSION_ROOT_PREFIX,
+    SessionRecord, SkipReason, decide_reap, effective_postmaster_pid, is_session_dir,
+    parse_postmaster_pid, record_is_self_consistent,
 };
 
 /// Environment variable naming a database to use instead of provisioning one.

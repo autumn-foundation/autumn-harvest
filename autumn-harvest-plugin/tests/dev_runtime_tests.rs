@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 
 use autumn_harvest_plugin::dev::MAX_UNIX_SOCKET_PATH_LEN;
 use autumn_harvest_plugin::dev::{
-    BannerInputs, DatabaseSafety, DevRuntimeConfig, DiscoveryEnv, Platform, ReapDecision,
-    RefusalReason, SessionRecord, SkipReason, StorageDescription, SuspicionReason,
+    BannerInputs, DatabaseSafety, DevRuntimeConfig, DiscoveryEnv, Platform, PostmasterIdentity,
+    ReapDecision, RefusalReason, SessionRecord, SkipReason, StorageDescription, SuspicionReason,
     candidate_bin_dirs, classify_database_url, decide_reap, effective_postmaster_pid,
     ephemeral_dsn, http_authority, parse_postmaster_pid, postgres_conf_lines, proc_stat_is_live,
     proc_stat_start_time, record_is_self_consistent, redact_dsn, render_banner, resolve_bin_dir,
@@ -866,7 +866,12 @@ fn record(owner_pid: u32, postmaster_pid: Option<u32>) -> SessionRecord {
 
 #[test]
 fn reap_leaves_a_live_session_alone() {
-    let decision = decide_reap(&record(4242, Some(4243)), true, true, 99);
+    let decision = decide_reap(
+        &record(4242, Some(4243)),
+        true,
+        PostmasterIdentity::Confirmed,
+        99,
+    );
     assert!(
         matches!(decision, ReapDecision::Skip { .. }),
         "{decision:?}"
@@ -877,7 +882,12 @@ fn reap_leaves_a_live_session_alone() {
 fn reap_never_touches_our_own_session() {
     // The reaper runs at startup, after our own record could already exist from
     // a same-pid predecessor; identity beats liveness.
-    let decision = decide_reap(&record(4242, Some(4243)), true, true, 4242);
+    let decision = decide_reap(
+        &record(4242, Some(4243)),
+        true,
+        PostmasterIdentity::Confirmed,
+        4242,
+    );
     assert!(
         matches!(decision, ReapDecision::Skip { .. }),
         "{decision:?}"
@@ -886,7 +896,14 @@ fn reap_never_touches_our_own_session() {
 
 #[test]
 fn reap_stops_an_orphaned_postmaster_then_removes_the_directory() {
-    let decision = decide_reap(&record(4242, Some(4243)), false, true, 99);
+    // Steady state, token matched: the fix for issue #1295 must not regress
+    // the ordinary reap path.
+    let decision = decide_reap(
+        &record(4242, Some(4243)),
+        false,
+        PostmasterIdentity::Confirmed,
+        99,
+    );
     assert!(
         matches!(
             decision,
@@ -900,14 +917,44 @@ fn reap_stops_an_orphaned_postmaster_then_removes_the_directory() {
 
 #[test]
 fn reap_removes_the_directory_when_the_postmaster_is_already_gone() {
-    let decision = decide_reap(&record(4242, Some(4243)), false, false, 99);
+    let decision = decide_reap(
+        &record(4242, Some(4243)),
+        false,
+        PostmasterIdentity::NotRunning,
+        99,
+    );
     assert!(matches!(decision, ReapDecision::Remove), "{decision:?}");
 }
 
 #[test]
 fn reap_removes_a_session_that_died_before_recording_a_postmaster() {
-    let decision = decide_reap(&record(4242, None), false, false, 99);
+    let decision = decide_reap(
+        &record(4242, None),
+        false,
+        PostmasterIdentity::NotRunning,
+        99,
+    );
     assert!(matches!(decision, ReapDecision::Remove), "{decision:?}");
+}
+
+#[test]
+fn a_tokenless_but_live_postmaster_is_skipped_not_stopped() {
+    // Issue #1295. A tokenless record used to fall back to plain liveness.
+    // A live pid at the recorded number was treated as a match. That held
+    // even when the OS had long reused that pid for something else.
+    // `decide_reap` must now skip, never `StopThenRemove`, on unknown
+    // identity: the pid could be ours, or could be a stranger.
+    let decision = decide_reap(
+        &record(4242, Some(4243)),
+        false,
+        PostmasterIdentity::Unknown,
+        99,
+    );
+    assert_eq!(
+        decision,
+        ReapDecision::Skip(SkipReason::PostmasterIdentityUnknown),
+        "{decision:?}"
+    );
 }
 
 #[test]
@@ -2096,7 +2143,7 @@ fn a_reused_owner_pid_does_not_strand_a_session_forever() {
 
     // Same pid as ours, but the owner is *not* the recorded one: reap it.
     assert_eq!(
-        decide_reap(&record, false, true, 4242),
+        decide_reap(&record, false, PostmasterIdentity::Confirmed, 4242),
         ReapDecision::StopThenRemove {
             postmaster_pid: 4243
         },
@@ -2105,13 +2152,13 @@ fn a_reused_owner_pid_does_not_strand_a_session_forever() {
 
     // Genuinely ours: still skipped, and still says so.
     assert_eq!(
-        decide_reap(&record, true, true, 4242),
+        decide_reap(&record, true, PostmasterIdentity::Confirmed, 4242),
         ReapDecision::Skip(SkipReason::OwnedByThisProcess)
     );
 
     // Someone else's live session: skipped for the other reason.
     assert_eq!(
-        decide_reap(&record, true, true, 99),
+        decide_reap(&record, true, PostmasterIdentity::Confirmed, 99),
         ReapDecision::Skip(SkipReason::OwnerAlive)
     );
 }
@@ -2213,6 +2260,45 @@ fn an_unreadable_postmaster_pid_file_leaves_the_session_alone() {
         "with no pid file at all the session is a corpse and must be reclaimed"
     );
     assert!(!session_dir.exists(), "{}", session_dir.display());
+}
+
+#[test]
+fn a_tokenless_but_live_postmaster_survives_the_full_reap_pipeline() {
+    // Issue #1295, end to end. Unit tests elsewhere pin `decide_reap` and
+    // `postmaster_identity` directly; this drives the same scenario through
+    // `reap_stale_sessions` itself. A session record with no postmaster
+    // start token, next to a genuinely live pid at that number, must be
+    // left alone: neither signaled nor removed.
+    let base = tempfile::tempdir().expect("temp dir");
+    let root = autumn_harvest_plugin::dev::session_root(base.path()).expect("session root");
+
+    let session_dir = root.join("session-4242-0000000b");
+    let data_dir = session_dir.join("data");
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+
+    // Our own test process stands in for the "postmaster": genuinely alive,
+    // and its pid is not fabricated.
+    let live_pid = std::process::id();
+    let mut stale = record(u32::MAX - 1, Some(live_pid));
+    stale.owner_start_token = None;
+    stale.postmaster_start_token = None;
+    stale.data_dir = data_dir;
+    std::fs::write(
+        session_dir.join("session.json"),
+        stale.to_json().expect("json"),
+    )
+    .expect("write record");
+
+    assert_eq!(
+        autumn_harvest_plugin::dev::reap_stale_sessions(&root).expect("reap"),
+        0,
+        "unknown postmaster identity must not be reaped"
+    );
+    assert!(session_dir.exists(), "{}", session_dir.display());
+    assert!(
+        autumn_harvest_plugin::dev::process_is_alive(live_pid),
+        "the reaper must not have signaled the process it could not identify"
+    );
 }
 
 // ---------------------------------------------------------------------------
