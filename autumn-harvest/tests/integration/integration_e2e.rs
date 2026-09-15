@@ -3537,12 +3537,26 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
         error.contains("StartToClose") && error.contains("slow_activity")
     }));
 
+    // Issue #1558: `started_at` (the StartToClose deadline anchor) is stamped
+    // at task claim, before the dispatch pipeline appends `ActivityStarted`.
+    // A short `default_start_to_close` can let enforcement win that race and
+    // fail the task first, so `ActivityStarted` never appends. Both shapes
+    // are correct engine behavior; accept either.
     let history = load_history_from_url(&database_url, exec_id).await;
     match history.events.as_slice() {
         [
             WorkflowEvent::WorkflowStarted { .. },
             WorkflowEvent::ActivityScheduled { .. },
             WorkflowEvent::ActivityStarted { .. },
+            WorkflowEvent::ActivityTimedOut {
+                timeout_type: TimeoutType::StartToClose,
+                ..
+            },
+            WorkflowEvent::WorkflowFailed { .. },
+        ]
+        | [
+            WorkflowEvent::WorkflowStarted { .. },
+            WorkflowEvent::ActivityScheduled { .. },
             WorkflowEvent::ActivityTimedOut {
                 timeout_type: TimeoutType::StartToClose,
                 ..
