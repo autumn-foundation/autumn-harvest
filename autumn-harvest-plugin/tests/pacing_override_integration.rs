@@ -276,6 +276,21 @@ fn build_sharded_app(
     harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
+/// An app whose storage pool is installed but whose runtime is not.
+///
+/// Reproduces the plugin-startup window: `install_storage_pool` has run,
+/// `install(runtime)` has not. `api_state.runtime()` then fails with
+/// `HarvestError::Config("harvest runtime is not started")`, mapped to a
+/// `400`. Every pacing-override mutation handler resolves `pool` and the
+/// audit context before this call. The rejection therefore has everything
+/// it needs to reach `reject_pacing_override!` too (issue #1229 review).
+fn build_app_with_storage_pool_but_no_runtime(pool: &DbPool) -> HarvestApiApp {
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+}
+
 // ── HTTP helpers ─────────────────────────────────────────────────────────────
 
 async fn json_request(
@@ -3028,6 +3043,14 @@ async fn set_start_throttle_pacing_override_audits_every_rejection_branch() {
 
     let (status, body) = post_json(
         &app,
+        &path,
+        json!({ "refill_per_sec": 5.0, "brust": 1.0, "ttl_secs": 60 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown field: {body}");
+
+    let (status, body) = post_json(
+        &app,
         &format!("/admin/start-throttle/{undeclared_name}/override"),
         json!({ "refill_per_sec": 5.0, "ttl_secs": 60 }),
     )
@@ -3081,6 +3104,19 @@ async fn set_start_throttle_pacing_override_audits_every_rejection_branch() {
              {expected_substring:?}, got: {declared_failures:?}"
         );
     }
+    // axum's `JsonRejection` catches this before the handler parses the
+    // body. The audit row is still keyed by the path's `workflow_name`,
+    // same as every other pre-parse rejection.
+    assert!(
+        records
+            .iter()
+            .any(|r| r["target_id"] == json!(declared_name)
+                && r["status"] == json!("failed")
+                && r["error_summary"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("brust") || s.to_lowercase().contains("unknown"))),
+        "the unknown-field rejection must also be audited: {records:?}"
+    );
 
     for (name, expected_substring) in [
         (undeclared_name, "is not registered"),
@@ -3165,4 +3201,145 @@ async fn clear_start_throttle_pacing_override_audits_every_rejection_branch() {
             "expected a failed audit row for {name} containing {expected_substring:?}: {records:?}"
         );
     }
+}
+
+// ── Runtime-unavailable rejection is audited too (issue #1229 review) ──────
+//
+// `api_state.runtime()` fails independently of `api_state.storage_pool()`
+// during the plugin-startup window (two separate `Mutex<Option<_>>` fields).
+// Every mutation handler resolves `pool` and the audit context BEFORE this
+// call. The four tests below prove the rejection reaches
+// `reject_pacing_override!` too, not just the six-plus semantic-validation
+// branches already covered above.
+
+#[tokio::test]
+async fn set_rate_limit_pacing_override_audits_runtime_unavailable_rejection() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let activity_name = leaked_name("send_email");
+    let app = build_app_with_storage_pool_but_no_runtime(&pool);
+    let path = format!("/admin/rate-limits/{activity_name}/override");
+
+    let (status, body) =
+        post_json(&app, &path, json!({ "refill_rate": 5.0, "ttl_secs": 60 })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = get_json(
+        &app,
+        "/admin/audit?operation=rate_limit.pacing_override.set",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let records = body.as_array().expect("audit response is a raw array");
+    assert!(
+        records
+            .iter()
+            .any(|r| r["target_id"] == json!(activity_name)
+                && r["status"] == json!("failed")
+                && r["error_summary"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("harvest runtime is not started"))),
+        "the runtime-unavailable rejection must also be audited: {records:?}"
+    );
+}
+
+#[tokio::test]
+async fn clear_rate_limit_pacing_override_audits_runtime_unavailable_rejection() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let activity_name = leaked_name("send_email");
+    let app = build_app_with_storage_pool_but_no_runtime(&pool);
+
+    let (status, body) = delete_json(
+        &app,
+        &format!("/admin/rate-limits/{activity_name}/override"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = get_json(
+        &app,
+        "/admin/audit?operation=rate_limit.pacing_override.clear",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let records = body.as_array().expect("audit response is a raw array");
+    assert!(
+        records
+            .iter()
+            .any(|r| r["target_id"] == json!(activity_name)
+                && r["status"] == json!("failed")
+                && r["error_summary"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("harvest runtime is not started"))),
+        "the runtime-unavailable rejection must also be audited: {records:?}"
+    );
+}
+
+#[tokio::test]
+async fn set_start_throttle_pacing_override_audits_runtime_unavailable_rejection() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let workflow_name = leaked_name("onboard_user");
+    let app = build_app_with_storage_pool_but_no_runtime(&pool);
+    let path = format!("/admin/start-throttle/{workflow_name}/override");
+
+    let (status, body) = post_json(
+        &app,
+        &path,
+        json!({ "refill_per_sec": 5.0, "ttl_secs": 60 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = get_json(
+        &app,
+        "/admin/audit?operation=start_throttle.pacing_override.set",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let records = body.as_array().expect("audit response is a raw array");
+    assert!(
+        records
+            .iter()
+            .any(|r| r["target_id"] == json!(workflow_name)
+                && r["status"] == json!("failed")
+                && r["error_summary"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("harvest runtime is not started"))),
+        "the runtime-unavailable rejection must also be audited: {records:?}"
+    );
+}
+
+#[tokio::test]
+async fn clear_start_throttle_pacing_override_audits_runtime_unavailable_rejection() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let workflow_name = leaked_name("onboard_user");
+    let app = build_app_with_storage_pool_but_no_runtime(&pool);
+
+    let (status, body) = delete_json(
+        &app,
+        &format!("/admin/start-throttle/{workflow_name}/override"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = get_json(
+        &app,
+        "/admin/audit?operation=start_throttle.pacing_override.clear",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let records = body.as_array().expect("audit response is a raw array");
+    assert!(
+        records
+            .iter()
+            .any(|r| r["target_id"] == json!(workflow_name)
+                && r["status"] == json!("failed")
+                && r["error_summary"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("harvest runtime is not started"))),
+        "the runtime-unavailable rejection must also be audited: {records:?}"
+    );
 }

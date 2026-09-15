@@ -78,18 +78,20 @@ pub fn pools_by_shard(api_state: &HarvestApiState) -> BTreeMap<i32, DbPool> {
     )
 }
 
-/// Build the full set of shard ids a fan-out read should attempt to inspect:
-/// every shard with a live connection pool, plus every shard the router
-/// already knows about (`readable_shards`/`default_shard`).
+/// Build the full set of shard ids a fan-out read should attempt to inspect.
 ///
-/// A shard the router knows about but for which this process has no pool yet
-/// (e.g. mid a shard-add rollout — the router's `readable_shards` is widened
-/// before every process has the new shard's pool wired up, see the workspace
-/// `docs/architecture.md` "add a shard" procedure) must still appear in the
-/// returned set so
-/// callers report it `unavailable` rather than silently omitting it from the
-/// fan-out — an omitted shard would let a completeness `status` read
-/// `complete` even though that shard was never queried.
+/// The set is every shard with a live connection pool, plus every shard the
+/// router already knows about (`readable_shards`/`default_shard`).
+///
+/// A shard-add rollout widens the router's `readable_shards` before every
+/// process gets the new shard's pool wired up. See the workspace
+/// `docs/architecture.md` "add a shard" procedure. During that window the
+/// router knows about a shard this process has no pool for yet.
+///
+/// That shard must still appear in the returned set. A caller then reports
+/// it `unavailable` instead of silently omitting it from the fan-out. An
+/// omitted shard would let a completeness `status` read `complete` even
+/// though the caller never queried that shard.
 #[must_use]
 pub fn expected_shards(
     api_state: &HarvestApiState,
