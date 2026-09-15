@@ -5570,8 +5570,11 @@ pub fn capability_miss_fleet_stale_secs(heartbeat_interval: Duration) -> i64 {
 /// real shard reads as flatlined (which the dashboard panel shows as
 /// *starvation*). Debug builds assert; release builds keep the pre-existing
 /// `unwrap_or(0)` convention rather than panicking a live poll loop.
+///
+/// `pub(crate)` so every metric-emitting module shares one shard-label
+/// convention rather than growing its own fallback (issue #1307).
 #[must_use]
-fn shard_metric_label(shard: crate::types::ShardId) -> u16 {
+pub(crate) fn shard_metric_label(shard: crate::types::ShardId) -> u16 {
     let raw = shard.as_i32();
     debug_assert!(
         u16::try_from(raw).is_ok(),

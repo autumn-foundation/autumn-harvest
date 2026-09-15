@@ -2598,12 +2598,6 @@ async fn execution_id_residence(
     }
 }
 
-/// A shard id as a metric label value (issue #1307). Saturates rather than
-/// panics: a metric label must never crash the sweep it is observing.
-fn shard_metric_label(shard: crate::types::ShardId) -> u16 {
-    u16::try_from(shard.as_i32()).unwrap_or(u16::MAX)
-}
-
 #[allow(clippy::too_many_lines)]
 async fn resolve_delivery_route(
     conn: &mut AsyncPgConnection,
@@ -2688,7 +2682,7 @@ async fn resolve_delivery_route(
                         // condition it counts. This is the metric twin.
                         if !uninspected.is_empty() {
                             metrics.record_external_by_id_found_over_incomplete_fanout(
-                                shard_metric_label(shard),
+                                crate::worker::shard_metric_label(shard),
                             );
                         }
                         (
@@ -3231,7 +3225,7 @@ pub async fn enforce_external_signals_outbox(
                         );
                         for shard in &uninspected {
                             metrics.record_external_by_id_indeterminate_shard(
-                                shard_metric_label(shard.shard),
+                                crate::worker::shard_metric_label(shard.shard),
                                 shard.kind.as_label(),
                             );
                         }
@@ -3668,7 +3662,7 @@ pub async fn enforce_external_cancels_outbox(
                         );
                         for shard in &uninspected {
                             metrics.record_external_by_id_indeterminate_shard(
-                                shard_metric_label(shard.shard),
+                                crate::worker::shard_metric_label(shard.shard),
                                 shard.kind.as_label(),
                             );
                         }
@@ -3772,6 +3766,14 @@ pub async fn enforce_external_cancels_outbox(
                              authoritative for the key (a shard was uninspected, or another \
                              live run exists); withholding the terminal and retrying"
                         );
+                        // This row is also left pending (issue #1307), so the
+                        // "oldest stuck row" gauge must see its age too. It is
+                        // NOT counted in `by_id_indeterminate_shard`: that
+                        // counter is specifically about a `Retry` from an
+                        // uninspected shard. The uninspected-shard case here
+                        // was already counted at resolution time, by
+                        // `record_external_by_id_found_over_incomplete_fanout`.
+                        oldest_indeterminate.observe(age);
                         None
                     }
                     other => other,

@@ -214,6 +214,13 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_concurrency_deferred",
     "harvest_mutex_contention_depth",
     "harvest_connector_lag",
+    // Issue #1307 — by-id fan-out observability, plus the adjacent
+    // external-cancel-sent bridge gap it fixed.
+    "harvest_workflow_external_cancel_sent_total",
+    "harvest_external_signal_by_id_indeterminate_shard_total",
+    "harvest_external_signal_by_id_oldest_pending_indeterminate_age",
+    "harvest_external_cancel_by_id_oldest_pending_indeterminate_age",
+    "harvest_external_signal_by_id_found_over_incomplete_fanout_total",
 ];
 
 /// Per-series label ground truth (Prometheus-normalized label names),
@@ -388,6 +395,22 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_connector_dispatched", &["source", "outcome"]),
     ("harvest_connector_poisoned", &["source", "reason"]),
     ("harvest_connector_lag", &["source"]),
+    // Issue #1307 — by-id fan-out observability, plus the adjacent
+    // external-cancel-sent bridge gap it fixed.
+    (
+        "harvest_workflow_external_cancel_sent",
+        &["outcome", "reason_code"],
+    ),
+    (
+        "harvest_external_signal_by_id_indeterminate_shard",
+        &["shard", "kind"],
+    ),
+    ("harvest_external_signal_by_id_oldest_pending_indeterminate_age", &[]),
+    ("harvest_external_cancel_by_id_oldest_pending_indeterminate_age", &[]),
+    (
+        "harvest_external_signal_by_id_found_over_incomplete_fanout",
+        &["shard"],
+    ),
 ];
 
 /// Unbounded / dotted label forms that must never appear in an expression or

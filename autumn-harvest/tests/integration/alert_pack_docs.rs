@@ -119,6 +119,9 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     "harvest_external_signal_by_id_oldest_pending_indeterminate_age",
     "harvest_external_cancel_by_id_oldest_pending_indeterminate_age",
     "harvest_external_signal_by_id_found_over_incomplete_fanout_total",
+    // The adjacent bridge fix issue #1307 made: `record_external_cancel_sent`
+    // had no `MetricsRsRecorder` implementation and silently no-opped.
+    "harvest_workflow_external_cancel_sent_total",
 ];
 
 #[test]

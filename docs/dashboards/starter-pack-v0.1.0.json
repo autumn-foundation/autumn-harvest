@@ -6286,6 +6286,251 @@
         }
       ],
       "description": "Alert: harvest_replication_rpo_unknown (docs/runbooks/harvest-alerts.md#harvest_replication_rpo_unknown) Whether this shard's measured RPO has a source at all. 0 means the replication views are readable and a standby is connected, but no DR slot has confirmed a position and the standby has not reported a replay_lag either \u2014 the RPO gauge is withheld rather than published as a stale or fabricated number."
+    },
+    {
+      "id": 962,
+      "type": "timeseries",
+      "title": "By-id indeterminate resolutions (shard fan-out incomplete)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 175
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (shard, kind) (rate(harvest_external_signal_by_id_indeterminate_shard_total{shard=~\"$shard\"}[$__rate_interval]))",
+          "legendFormat": "shard {{shard}} ({{kind}})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Alert: none shipped yet (issue #1307, deferred pending operational threshold data). Rate of uninspected shards named by a by-id signal/cancel outbox retry, by shard and reason kind (no_pool/acquire_timeout/query_error). A steadily rising rate against one shard means that shard is the repeat offender; pair with the oldest-pending-age panels to tell \"retrying, will resolve\" from \"stuck since Tuesday\"."
+    },
+    {
+      "id": 963,
+      "type": "timeseries",
+      "title": "By-id signal outbox: oldest pending indeterminate row",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 175
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "harvest_external_signal_by_id_oldest_pending_indeterminate_age",
+          "legendFormat": "signal outbox",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Age in seconds of the oldest pending by-id signal outbox row a sweep left retrying because its target shard fan-out was incomplete (issue #1307). 0 means nothing is stuck. This is the number to alert on: it distinguishes a backlog that will resolve on its own from a shard that has been unreachable for a long time, without reasoning about shard topology."
+    },
+    {
+      "id": 964,
+      "type": "timeseries",
+      "title": "By-id cancel outbox: oldest pending indeterminate row",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 183
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "harvest_external_cancel_by_id_oldest_pending_indeterminate_age",
+          "legendFormat": "cancel outbox",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "harvest_external_signal_by_id_oldest_pending_indeterminate_age's cancel-outbox twin (issue #1307). Also covers a cancel whose terminal was withheld because the resolution was not authoritative for the key, not only a plain retry."
+    },
+    {
+      "id": 965,
+      "type": "timeseries",
+      "title": "By-id delivered over an incomplete shard fan-out",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 183
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (shard) (rate(harvest_external_signal_by_id_found_over_incomplete_fanout_total{shard=~\"$shard\"}[$__rate_interval]))",
+          "legendFormat": "shard {{shard}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "A by-id fan-out found a live/terminal run and delivered, but one or more expected shards could not be inspected (issue #1307) -- a silently ambiguous success, never surfaced before this counter. Distinct from the indeterminate-resolutions panel: that one is a stall (the row stays pending); this one is a delivery that went ahead on a partial view."
+    },
+    {
+      "id": 966,
+      "type": "timeseries",
+      "title": "External cancel dispatch outcomes",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 191
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome, reason_code) (rate(harvest_workflow_external_cancel_sent_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}} {{reason_code}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Cross-workflow cancel dispatch outcomes (issue #1307's adjacent fix: this counter previously had no MetricsRsRecorder bridge and silently no-opped). Mirrors the \"External signals sent\" panel."
     }
   ]
 }
