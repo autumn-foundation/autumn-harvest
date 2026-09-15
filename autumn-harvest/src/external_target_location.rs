@@ -400,10 +400,19 @@ pub fn fanout_shards_from_parts(
 ///   (`not_running` failure vs. delivery).
 /// * **No candidates at all with a shard missed is `Indeterminate`**, never
 ///   `NotFound`.
+/// * **A `keyed` request with a shard missed is always `Indeterminate`**,
+///   live winner or not (issue #1318, code review on PR #1593). The
+///   idempotency-key check this fan-out runs alongside run resolution only
+///   covers the shards it actually reached. A shard it could not reach might
+///   hold the prior delivery the key names. Delivering fresh to a live
+///   winner found elsewhere would then double-deliver. `keyed` is `false` for
+///   a cancel (no idempotency-key concept) and for an unkeyed signal, so
+///   neither loses the live-winner-wins rule above.
 #[must_use]
 pub fn merge_locations(
     candidates: Vec<(ShardId, ResolvedRun)>,
     uninspected: Vec<UninspectedShard>,
+    keyed: bool,
 ) -> TargetLocation {
     let runs: Vec<ResolvedRun> = candidates.iter().map(|(_, run)| run.clone()).collect();
     let Some(winner) = select_resolved_run(runs) else {
@@ -414,7 +423,7 @@ pub fn merge_locations(
         };
     };
 
-    if !uninspected.is_empty() && crate::erase::is_terminal_state(&winner.state) {
+    if !uninspected.is_empty() && (keyed || crate::erase::is_terminal_state(&winner.state)) {
         return TargetLocation::Indeterminate { uninspected };
     }
 
@@ -816,7 +825,7 @@ pub async fn resolve_location_by_workflow_id_with(
         }
     }
 
-    let placement = merge_locations(candidates, uninspected.clone());
+    let placement = merge_locations(candidates, uninspected.clone(), idempotency_key.is_some());
 
     // A `Found` reached over an incomplete fan-out is an answer with a caveat:
     // shard-local uniqueness means the shard we could not read might hold a
@@ -1144,7 +1153,7 @@ mod tests {
     #[test]
     fn a_complete_fanout_that_finds_nothing_is_not_found() {
         assert_eq!(
-            merge_locations(Vec::new(), Vec::new()),
+            merge_locations(Vec::new(), Vec::new(), false),
             TargetLocation::NotFound
         );
     }
@@ -1152,7 +1161,7 @@ mod tests {
     #[test]
     fn an_incomplete_fanout_that_finds_nothing_is_indeterminate() {
         assert_eq!(
-            merge_locations(Vec::new(), vec![uninspected(2)]),
+            merge_locations(Vec::new(), vec![uninspected(2)], false),
             TargetLocation::Indeterminate {
                 uninspected: vec![uninspected(2)]
             }
@@ -1163,7 +1172,11 @@ mod tests {
     fn a_terminal_winner_with_an_uninspected_shard_is_indeterminate() {
         let terminal = run(0, "COMPLETED", 1);
         assert_eq!(
-            merge_locations(vec![(ShardId::new(0), terminal)], vec![uninspected(1)]),
+            merge_locations(
+                vec![(ShardId::new(0), terminal)],
+                vec![uninspected(1)],
+                false
+            ),
             TargetLocation::Indeterminate {
                 uninspected: vec![uninspected(1)]
             }
@@ -1174,22 +1187,22 @@ mod tests {
     fn an_answer_reports_whether_it_is_authoritative_for_the_whole_key() {
         let live = run(0, "RUNNING", 1);
         assert!(
-            merge_locations(vec![(ShardId::new(0), live.clone())], Vec::new())
+            merge_locations(vec![(ShardId::new(0), live.clone())], Vec::new(), false)
                 .is_authoritative_for_key(),
             "every shard answered and exactly one live run exists"
         );
         assert!(
-            !merge_locations(vec![(ShardId::new(0), live)], vec![uninspected(1)])
+            !merge_locations(vec![(ShardId::new(0), live)], vec![uninspected(1)], false)
                 .is_authoritative_for_key(),
             "a live run found over a PARTIAL view — the un-inspected shard MAY hold \
              another live run of the same key, since uniqueness is shard-local"
         );
         assert!(
-            merge_locations(Vec::new(), Vec::new()).is_authoritative_for_key(),
+            merge_locations(Vec::new(), Vec::new(), false).is_authoritative_for_key(),
             "`NotFound` is only ever reached from a complete fan-out"
         );
         assert!(
-            !merge_locations(Vec::new(), vec![uninspected(1)]).is_authoritative_for_key(),
+            !merge_locations(Vec::new(), vec![uninspected(1)], false).is_authoritative_for_key(),
             "`Indeterminate` never is"
         );
     }
@@ -1208,6 +1221,7 @@ mod tests {
         let merged = merge_locations(
             vec![(ShardId::new(0), older), (ShardId::new(1), newer)],
             Vec::new(),
+            false,
         );
         assert_eq!(
             merged.found_shard(),
@@ -1238,7 +1252,8 @@ mod tests {
         assert!(
             merge_locations(
                 vec![(ShardId::new(0), dead), (ShardId::new(1), live)],
-                Vec::new()
+                Vec::new(),
+                false
             )
             .is_authoritative_for_key()
         );
@@ -1248,13 +1263,38 @@ mod tests {
     fn a_live_winner_settles_the_question_despite_an_uninspected_shard() {
         let live = run(0, "RUNNING", 1);
         assert_eq!(
-            merge_locations(vec![(ShardId::new(0), live.clone())], vec![uninspected(1)]),
+            merge_locations(
+                vec![(ShardId::new(0), live.clone())],
+                vec![uninspected(1)],
+                false
+            ),
             TargetLocation::Found {
                 shard: ShardId::new(0),
                 run: live,
                 uninspected: vec![uninspected(1)],
                 other_live: Vec::new()
             }
+        );
+    }
+
+    #[test]
+    fn a_keyed_request_never_trusts_a_live_winner_over_an_uninspected_shard() {
+        // Code review finding (PR #1593, issue #1318). The uninspected
+        // shard's idempotency-key check never ran. It might hold the prior
+        // delivery the key names. Delivering fresh to the live winner found
+        // elsewhere would then double-deliver. So `keyed = true` must NOT
+        // take the "live winner settles it" shortcut. The sibling test
+        // above proves that shortcut for an unkeyed signal and for a
+        // cancel.
+        let live = run(0, "RUNNING", 1);
+        assert_eq!(
+            merge_locations(vec![(ShardId::new(0), live)], vec![uninspected(1)], true),
+            TargetLocation::Indeterminate {
+                uninspected: vec![uninspected(1)]
+            },
+            "a keyed request must retry rather than risk delivering fresh to a \
+             winner found while another shard -- possibly the one already \
+             holding this key -- went uninspected"
         );
     }
 
@@ -1268,7 +1308,8 @@ mod tests {
                     (ShardId::new(0), recent_terminal),
                     (ShardId::new(1), live.clone()),
                 ],
-                Vec::new()
+                Vec::new(),
+                false
             ),
             TargetLocation::Found {
                 shard: ShardId::new(1),
@@ -1290,7 +1331,7 @@ mod tests {
             started_at: chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("valid"),
         };
         assert_eq!(
-            merge_locations(vec![(ShardId::new(3), unencoded)], Vec::new()).found_shard(),
+            merge_locations(vec![(ShardId::new(3), unencoded)], Vec::new(), false).found_shard(),
             Some(ShardId::new(3))
         );
     }
@@ -1442,6 +1483,7 @@ mod tests {
         let merged = merge_locations(
             vec![(ShardId::new(0), only.clone()), (ShardId::new(1), only)],
             Vec::new(),
+            false,
         );
         assert!(
             merged.is_authoritative_for_key(),
