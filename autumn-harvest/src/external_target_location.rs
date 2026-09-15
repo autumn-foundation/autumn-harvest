@@ -513,8 +513,9 @@ pub const FANOUT_PEER_BOUND: std::time::Duration = std::time::Duration::from_sec
 /// very next sweep.
 #[derive(Clone, Debug, Default)]
 pub struct UninspectableShards {
-    shards:
-        std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<ShardId, (String, UninspectedReasonKind)>>>,
+    shards: std::sync::Arc<
+        std::sync::Mutex<std::collections::BTreeMap<ShardId, (String, UninspectedReasonKind)>>,
+    >,
 }
 
 impl UninspectableShards {
@@ -692,7 +693,11 @@ pub async fn resolve_location_by_workflow_id_with(
         // 2. Already known bad this sweep: report it without paying the bound
         //    a second time. (Recorded already, so it does not re-memoize.)
         if let Some((reason, kind)) = memo.and_then(|m| m.recorded(shard)) {
-            uninspected.push(UninspectedShard { shard, reason, kind });
+            uninspected.push(UninspectedShard {
+                shard,
+                reason,
+                kind,
+            });
             continue;
         }
 
@@ -886,7 +891,11 @@ fn mark_uninspected(
     if let Some(memo) = memo {
         memo.record(shard, reason.clone(), kind);
     }
-    uninspected.push(UninspectedShard { shard, reason, kind });
+    uninspected.push(UninspectedShard {
+        shard,
+        reason,
+        kind,
+    });
 }
 
 /// May a delivery to `target` be attempted **inline** (issue #1146)?

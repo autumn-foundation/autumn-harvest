@@ -405,8 +405,14 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
         "harvest_external_signal_by_id_indeterminate_shard",
         &["shard", "kind"],
     ),
-    ("harvest_external_signal_by_id_oldest_pending_indeterminate_age", &[]),
-    ("harvest_external_cancel_by_id_oldest_pending_indeterminate_age", &[]),
+    (
+        "harvest_external_signal_by_id_oldest_pending_indeterminate_age",
+        &[],
+    ),
+    (
+        "harvest_external_cancel_by_id_oldest_pending_indeterminate_age",
+        &[],
+    ),
     (
         "harvest_external_signal_by_id_found_over_incomplete_fanout",
         &["shard"],

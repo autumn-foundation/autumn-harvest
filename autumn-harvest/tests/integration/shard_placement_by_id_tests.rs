@@ -770,7 +770,10 @@ impl autumn_harvest::telemetry::MetricsRecorder for SpyMetrics {
     }
 
     fn record_external_signal_by_id_oldest_pending_indeterminate_age(&self, age_secs: f64) {
-        self.signal_oldest_pending_age.lock().unwrap().push(age_secs);
+        self.signal_oldest_pending_age
+            .lock()
+            .unwrap()
+            .push(age_secs);
     }
 }
 
