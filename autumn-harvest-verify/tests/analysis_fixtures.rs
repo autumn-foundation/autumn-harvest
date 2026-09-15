@@ -1344,7 +1344,7 @@ fn a_value_read_after_the_sanitizer_is_clean() {
     );
 }
 
-/// One function. A plain statement copies the HashMap keys into `_4`.
+/// One function. A plain statement copies the `HashMap` keys into `_4`.
 /// Then `sort()` runs as that same block's terminator. A later block
 /// feeds `_4` to the sink. The copy and the sort share a block. A method
 /// call is always a MIR block terminator, so the copy always runs first.
