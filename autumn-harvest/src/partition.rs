@@ -4159,6 +4159,33 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
                  END\n$harvest_dropgate_probe_958$"
             ),
         ),
+        // A residual race lives in this gap, between the probe above and
+        // this build. It is accepted, not closed. Postgres refuses
+        // `CREATE INDEX CONCURRENTLY` inside a transaction or `DO` block.
+        // So this step cannot itself tell "I built it" apart from "it
+        // already existed". Plain `IF NOT EXISTS` normally lets a caller
+        // stay silent either way.
+        //
+        // That distinction needs a bare `CREATE INDEX CONCURRENTLY`, with
+        // no `IF NOT EXISTS`. Its duplicate-table error would need a
+        // CALLER outside SQL to catch, and treat as not-mine rather than
+        // fatal. Every consumer of this script runs each step uniformly
+        // fail-fast instead: the documented runbook, the CI corpus, and
+        // this codebase's own test harness alike. Reinterpreting one
+        // specific error here would need a second, divergent execution
+        // contract just for this one step.
+        //
+        // The exposure this leaves: a third party could create an index
+        // literally named `idx_harvest_we_created_at`. The window is
+        // between the probe recording `existed=false` and this statement
+        // starting. The mark step below would then stamp their index as
+        // engine-owned, and a later `disable_partitioning` removes it.
+        // That needs an unrelated process independently choosing this
+        // engine-reserved name during a live migration. It is not
+        // something a same-schema operator does by accident.
+        // `disable_partitioning`'s own guard (`refuse_if_row_security` and
+        // friends) still bounds the damage to this one index. It does not
+        // touch the caller's actual tables, views or data.
         concurrent(
             2,
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvest_we_created_at\n    \
