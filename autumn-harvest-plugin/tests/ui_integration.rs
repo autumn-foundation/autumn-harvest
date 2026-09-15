@@ -1100,8 +1100,8 @@ async fn ui_dead_letters_invalid_shard_id_redisplays_form_instead_of_aborting_pa
 }
 
 /// RED (was): `page`/`limit` were still typed `Option<i64>` directly on
-/// `DeadLetterListParams` — the same mechanism #1540/#1560 already fixed
-/// on the Workflows and Workers pages, and the one this page's own
+/// `DeadLetterListParams`. That is the same mechanism #1540/#1560 already
+/// fixed on the Workflows and Workers pages, and the one this page's own
 /// `shard_id`/`task_kind`/`failed_after`/`failed_before` fixes left over.
 /// `?limit=not-a-number` failed axum's own query deserialization with a
 /// bare 400 before `list_dead_letters_ui` ever ran, discarding the

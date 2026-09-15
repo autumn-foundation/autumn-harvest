@@ -426,11 +426,11 @@ struct BuildRoutingRetireForm {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct DeadLetterListParams {
-    // `page`/`limit` are `String`, not `i64` — same fix as `WorkerListParams`
-    // and `WorkflowListParams` (#1540/#1560): an `i64`-typed field fails
-    // axum's query deserialization on non-numeric text with a bare 400
-    // before this handler ever runs, discarding every other filter already
-    // on the URL.
+    // `page`/`limit` are `String`, not `i64` — same fix as
+    // `WorkerListParams` and `WorkflowListParams` (#1540/#1560). An
+    // `i64`-typed field fails axum's query deserialization on non-numeric
+    // text with a bare 400 before this handler ever runs. That discards
+    // every other filter already on the URL.
     #[serde(default)]
     page: Option<String>,
     #[serde(default)]
@@ -1274,8 +1274,9 @@ fn parse_page_query_field(raw: Option<&str>) -> (i64, String, Option<String>) {
 ///
 /// Same contract as [`parse_page_query_field`], falling back to `default`
 /// instead of aborting the page. `default` lets callers keep their own
-/// per-page default (the DLQ page's is 50, not the Workflows/Workers pages'
-/// 25) without this shared helper silently overriding it on a parse failure.
+/// per-page default on a parse failure. The DLQ page's default is 50, not
+/// the Workflows/Workers pages' 25, and this shared helper must not
+/// silently override that.
 fn parse_limit_query_field(raw: Option<&str>, default: i64) -> (i64, String, Option<String>) {
     let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
         return (default, String::new(), None);
@@ -2341,16 +2342,18 @@ async fn list_dead_letters_ui(
     // arriving request passes the same predicate the decoder re-checks.
     let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
     // Issue: `page`/`limit` were still typed `Option<i64>` directly on
-    // `DeadLetterListParams`, the same page-abort mechanism #1540/#1560
-    // already fixed on the Workflows and Workers pages. A non-numeric value
-    // on either — a hand-edited URL, a bookmarked link, a mistyped "Per
-    // page" — failed axum's own query deserialization with a bare 400
-    // before this handler, or the filter form, ever ran. That discarded
-    // every filter (`workflow_name`, `task_kind`, `failed_after`,
-    // `failed_before`, `shard_id`) the operator had already entered — the
-    // DLQ page an operator is mid-incident-triage on, per
-    // docs/runbooks/harvest-alerts.md and seven other runbooks that point
-    // here. Degrade to a default and report the bad value inline instead.
+    // `DeadLetterListParams`. That is the same page-abort mechanism
+    // #1540/#1560 already fixed on the Workflows and Workers pages. A
+    // non-numeric value on either reaches this struct through a
+    // hand-edited URL, a bookmarked link, or a mistyped "Per page".
+    // Any of those failed axum's own query deserialization with a bare
+    // 400. That 400 landed before this handler, or the filter form, ever
+    // ran. It discarded every filter (`workflow_name`, `task_kind`,
+    // `failed_after`, `failed_before`, `shard_id`) the operator had
+    // already entered. This is the DLQ page an operator is
+    // mid-incident-triage on, per docs/runbooks/harvest-alerts.md and
+    // seven other runbooks that point here. Degrade to a default and
+    // report the bad value inline instead.
     let (limit, limit_raw, limit_error) =
         parse_limit_query_field(params.limit.as_deref(), DEFAULT_DLQ_PAGE_SIZE);
     let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
@@ -3669,8 +3672,8 @@ fn render_dlq_summary_group_by_form(
             input type="hidden" name="view" value="summary";
             (render_dead_letter_hidden_filters_raw(filters, filter_raw))
             // Prefer `limit_raw` (non-empty only on a genuine parse
-            // failure) so an unresolved invalid limit survives this
-            // resubmission instead of silently reverting — same reasoning
+            // failure). An unresolved invalid limit then survives this
+            // resubmission instead of silently reverting. Same reasoning
             // as `build_dead_letter_query_string`.
             @if !limit_raw.is_empty() {
                 input type="hidden" name="limit" value=(limit_raw);
@@ -4246,7 +4249,7 @@ fn build_dead_letter_query_string(
     // `limit_raw` is non-empty only on a genuine parse failure (see
     // `parse_limit_query_field`), never for a valid-but-clamped value. An
     // invalid limit the operator has not yet corrected must not silently
-    // vanish from a Next/Previous link — same as the Workflows/Workers
+    // vanish from a Next/Previous link. Same as the Workflows/Workers
     // pages' own query-string builders.
     if !limit_raw.is_empty() {
         let _ = write!(out, "&limit={}", url_encode(limit_raw));
@@ -12770,9 +12773,9 @@ mod tests {
     }
 
     /// Same fix as the Workers page's own
-    /// `render_worker_pagination_shows_page_error`: an invalid `page` value
-    /// must render its error inline, above the Previous/Next controls this
-    /// page has no backing form field for.
+    /// `render_worker_pagination_shows_page_error`. An invalid `page` value
+    /// must render its error inline, above the Previous/Next controls.
+    /// This page has no backing form field for `page`.
     #[test]
     fn render_dead_letter_pagination_shows_page_error() {
         let filters = DeadLetterUiFilters::default();
