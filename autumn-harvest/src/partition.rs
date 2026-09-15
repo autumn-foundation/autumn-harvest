@@ -4499,6 +4499,15 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // index on `ATTACH PARTITION`. It builds a real replacement
         // inside the window this phase promises is metadata-only instead —
         // the exact failure this guard exists to catch.
+        //
+        // Access method and operator classes are checked the same way.
+        // Phase 2's `CREATE UNIQUE INDEX` names neither, so a correctly
+        // built index is always btree with the default operator class per
+        // column. An operator's own index on the same columns, built
+        // with a non-default operator class or a different access
+        // method, would otherwise pass every check above. Postgres still
+        // cannot attach it as the parent's default unique index, for the
+        // same reason a wrong sort order defeats it.
         step(
             4,
             format!(
@@ -4510,6 +4519,9 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
                  AND i.indrelid = 'harvest_events'::regclass\n       \
                  AND i.indisunique AND i.indpred IS NULL\n       \
                  AND (SELECT bool_and(opt = 0) FROM unnest(i.indoption::int2[]) AS u(opt))\n       \
+                 AND c.relam = (SELECT oid FROM pg_am WHERE amname = 'btree')\n       \
+                 AND (SELECT bool_and(oc.opcdefault) FROM unnest(i.indclass::oid[]) \
+                 AS u(opcoid) JOIN pg_opclass oc ON oc.oid = u.opcoid)\n       \
                  AND (\n           \
                  (c.relname = '{LEGACY_PARTITION}_pk_idx'\n            \
                  AND (SELECT array_agg(x ORDER BY o) FROM unnest(i.indkey::int2[]) \
