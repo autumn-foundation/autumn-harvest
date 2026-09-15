@@ -4533,11 +4533,11 @@ async fn the_probe_step_refuses_a_same_named_table_it_did_not_create() {
 }
 
 #[tokio::test]
-async fn the_probe_step_writes_no_row_data_so_a_publication_never_sees_it() {
+async fn the_probe_step_is_a_sequence_so_no_publication_can_ever_admit_it() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
-    diesel::sql_query("DROP TABLE IF EXISTS harvest_1270_drop_gate_probe")
+    diesel::sql_query("DROP SEQUENCE IF EXISTS harvest_1270_drop_gate_probe")
         .execute(&mut conn)
         .await
         .ok();
@@ -4552,33 +4552,49 @@ async fn the_probe_step_writes_no_row_data_so_a_publication_never_sees_it() {
         .await
         .expect("probe");
 
-    // A `FOR ALL TABLES` publication automatically covers every ordinary
-    // table, including this one, and only ever replicates DML on a
-    // member table — never DDL or `COMMENT`. A table this step never
-    // writes a row to has nothing for such a publication to carry,
-    // regardless of scope. And it needs no `UNLOGGED` trick to get that,
-    // which would lose its state on crash recovery instead.
+    // `relkind = 'S'` alone proves the point: `CREATE PUBLICATION` only
+    // ever admits ordinary and partitioned tables. A zero-column TABLE
+    // would still be crash-durable and DML-free. It would still pass
+    // that filter, though — discoverable as a sync target by a `CREATE
+    // SUBSCRIPTION` or `REFRESH PUBLICATION` landing while it existed. A
+    // sequence cannot be, structurally, regardless of when a subscriber
+    // looks.
     assert!(
         scalar_bool(
             &mut conn,
-            "SELECT relpersistence = 'p' AS v FROM pg_class \
+            "SELECT relkind = 'S' AS v FROM pg_class \
               WHERE oid = 'harvest_1270_drop_gate_probe'::regclass",
         )
         .await,
-        "the probe table must be an ordinary, crash-durable table"
-    );
-    assert!(
-        scalar_bool(
-            &mut conn,
-            "SELECT count(*) = 0 AS v FROM pg_attribute \
-              WHERE attrelid = 'harvest_1270_drop_gate_probe'::regclass \
-                AND attnum > 0 AND NOT attisdropped",
-        )
-        .await,
-        "the probe table must carry no columns, and so no row data at all"
+        "the probe must be a sequence, not a table"
     );
 
-    diesel::sql_query("DROP TABLE IF EXISTS harvest_1270_drop_gate_probe")
+    // Directly against a `FOR ALL TABLES` publication, not just the
+    // catalog relkind: proves the exclusion end to end.
+    diesel::sql_query("DROP PUBLICATION IF EXISTS harvest_1270_probe_pub_test")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query("CREATE PUBLICATION harvest_1270_probe_pub_test FOR ALL TABLES")
+        .execute(&mut conn)
+        .await
+        .expect("create a FOR ALL TABLES publication");
+    assert!(
+        !scalar_bool(
+            &mut conn,
+            "SELECT EXISTS (SELECT 1 FROM pg_publication_tables \
+               WHERE pubname = 'harvest_1270_probe_pub_test' \
+                 AND tablename = 'harvest_1270_drop_gate_probe') AS v",
+        )
+        .await,
+        "a FOR ALL TABLES publication must never admit the probe sequence"
+    );
+
+    diesel::sql_query("DROP PUBLICATION IF EXISTS harvest_1270_probe_pub_test")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query("DROP SEQUENCE IF EXISTS harvest_1270_drop_gate_probe")
         .execute(&mut conn)
         .await
         .ok();
@@ -4589,7 +4605,7 @@ async fn a_retried_probe_step_does_not_overwrite_the_original_reading() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
-    diesel::sql_query("DROP TABLE IF EXISTS harvest_1270_drop_gate_probe")
+    diesel::sql_query("DROP SEQUENCE IF EXISTS harvest_1270_drop_gate_probe")
         .execute(&mut conn)
         .await
         .ok();
@@ -4638,7 +4654,7 @@ async fn a_retried_probe_step_does_not_overwrite_the_original_reading() {
         "a retried probe must not overwrite the original reading"
     );
 
-    diesel::sql_query("DROP TABLE IF EXISTS harvest_1270_drop_gate_probe")
+    diesel::sql_query("DROP SEQUENCE IF EXISTS harvest_1270_drop_gate_probe")
         .execute(&mut conn)
         .await
         .ok();
