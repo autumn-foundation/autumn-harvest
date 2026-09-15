@@ -3479,25 +3479,67 @@ async fn the_online_phase_is_resumable_after_its_validation_fails() {
     );
 }
 
-#[test]
-fn reverting_the_partitioning_migration_does_not_drop_the_drop_gate_index() {
-    // Issue #1270 item 13: up.sql never creates `idx_harvest_we_created_at`
-    // (see the note there) — only `harvest partition enable`/`plan` do, at
-    // conversion time. down.sql must not drop it either. Otherwise it
-    // deletes an unrelated pre-upgrade index of the same name on a
-    // deployment that created its own before upgrading. Rollback of an
-    // inert migration must stay inert. The name is still allowed to appear
-    // in a COMMENT explaining why it is not dropped here — only an actual
-    // DROP is disallowed.
+#[tokio::test]
+async fn reverting_the_partitioning_migration_removes_an_abandoned_drop_gate_index() {
+    let (url, _c) = setup_db().await;
+
+    // An isolated schema, not the shared test database, for the same
+    // reason as the operator-index test below. down.sql genuinely drops
+    // the cohort column, function and trigger.
+    diesel::sql_query("DROP SCHEMA IF EXISTS harvest_1270_item13b CASCADE")
+        .execute(&mut connect(&url).await)
+        .await
+        .expect("reset");
+    diesel::sql_query("CREATE SCHEMA harvest_1270_item13b")
+        .execute(&mut connect(&url).await)
+        .await
+        .expect("create schema");
+
+    let mut conn = connect(&url).await;
+    diesel::sql_query("SET search_path = harvest_1270_item13b")
+        .execute(&mut conn)
+        .await
+        .expect("pin the session to the isolated schema");
+    diesel_async::SimpleAsyncConnection::batch_execute(
+        &mut conn,
+        autumn_harvest::full_migrations_sql(),
+    )
+    .await
+    .expect("migrate a fresh schema");
+
+    // Reproduces a conversion plan that finished phase 2 (the index is
+    // built and marked engine-owned) but was abandoned before phase 3/4.
+    // The same happens if an operator never ran `harvest partition
+    // disable`. The layout stays unpartitioned, so `disable` has nothing
+    // to revert and never removes this index; only `down.sql` still can.
+    diesel::sql_query(
+        "CREATE INDEX idx_harvest_we_created_at ON harvest_workflow_executions (created_at)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("build the index the way partition enable/plan would");
+    diesel::sql_query(
+        "COMMENT ON INDEX idx_harvest_we_created_at IS \
+         'harvest#958 drop-gate index; created by partition enable, safe for partition disable to remove'",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("stamp the same ownership marker partition enable/plan would");
+
     let down = include_str!("../../migrations/20260901115500_harvest_event_partitioning/down.sql");
-    let statements: String = down
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("--"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    diesel_async::SimpleAsyncConnection::batch_execute(&mut conn, down)
+        .await
+        .expect("revert the partitioning migration");
+
     assert!(
-        !statements.contains("idx_harvest_we_created_at"),
-        "down.sql must not DROP an index it never created: {statements}"
+        !scalar_bool(
+            &mut conn,
+            "SELECT to_regclass('idx_harvest_we_created_at') IS NOT NULL AS v",
+        )
+        .await,
+        "reverting must clean up an index it marked as engine-owned, even \
+         when the plan that created it was never carried through to \
+         `partition disable`"
     );
 }
 
@@ -4288,8 +4330,10 @@ async fn enabling_refuses_when_a_lookahead_cohort_name_collides() {
     // loop needs for one cohort in its window. `CREATE TABLE IF NOT EXISTS
     // ... PARTITION OF` treats that name as taken and silently skips it, so
     // the script itself reports no error. `enable_partitioning` must still
-    // catch the gap by reading the catalog back. It must not report a
-    // conversion complete when one cohort of its write window is missing.
+    // catch the gap by reading the catalog back: fewer cohort partitions
+    // exist than the configured lookahead window calls for. It must not
+    // report a conversion complete when one cohort of its write window is
+    // missing.
     let width = partition::DEFAULT_COHORT_WIDTH_SECS;
     let now = Utc::now();
     let colliding_start =
@@ -4310,8 +4354,12 @@ async fn enabling_refuses_when_a_lookahead_cohort_name_collides() {
             "a missing lookahead cohort must fail the conversion report, not pass silently",
         );
     assert!(
-        err.to_string().contains(&colliding_name),
-        "the refusal must name the missing cohort: {err}"
+        err.to_string().contains("lookahead window is incomplete")
+            && err
+                .to_string()
+                .contains("4 lookahead cohort partition(s) expected, 3 found"),
+        "the refusal must say the window came up short, verified against the catalog rather \
+         than a predicted cohort name: {err}"
     );
 
     diesel::sql_query(format!("DROP TABLE IF EXISTS {colliding_name}"))

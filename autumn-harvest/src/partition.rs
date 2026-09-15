@@ -1553,7 +1553,7 @@ pub async fn enable_partitioning(
     // where a multi-statement string runs as ONE implicit transaction, so the
     // atomicity the conversion needs is preserved: a failure anywhere rolls the
     // whole script back and leaves the deployment exactly as it was.
-    diesel_async::SimpleAsyncConnection::batch_execute(conn, &enable_sql(opts, now))
+    diesel_async::SimpleAsyncConnection::batch_execute(conn, &enable_sql(opts))
         .await
         .map_err(|e| HarvestError::Database(format!("partition enable script failed: {e}")))?;
 
@@ -1584,42 +1584,60 @@ pub async fn enable_partitioning(
             .map_or(EnableMode::Fresh, |legacy| EnableMode::AttachLegacy {
                 cutover: legacy.upper.unwrap_or(now),
             });
-    let partitions_created: Vec<String> = parts
+    let mut cohorts: Vec<PartitionInfo> = parts
         .into_iter()
         .filter(|p| !p.is_default && p.name != LEGACY_PARTITION)
-        .map(|p| p.name)
         .collect();
+    cohorts.sort_by_key(|p| p.lower);
 
     // Issue #1270: `CREATE TABLE IF NOT EXISTS ... PARTITION OF` inside
-    // `enable_sql` silently skips a cohort whose deterministic name is already
-    // taken by an unrelated relation. Reading the catalog back, as above, then
-    // just omits that name — a caller sees a report that looks complete. Check
-    // the read against the same step-by-step name derivation `enable_sql`'s own
-    // lookahead loop uses, so a collision is reported instead of swallowed.
-    let expected_cohorts: Vec<String> = (0..=i64::from(opts.lookahead_cohorts))
-        .filter_map(|step| {
-            now.checked_add_signed(chrono::Duration::seconds(width * step))
-                .map(|at| partition_name(cohort_start(at, width)))
-        })
-        .collect();
-    let missing: Vec<&str> = expected_cohorts
-        .iter()
-        .filter(|name| !partitions_created.contains(name))
-        .map(String::as_str)
-        .collect();
-    if !missing.is_empty() {
+    // `enable_sql` silently skips a cohort whose deterministic name is
+    // already taken by an unrelated relation. Reading the catalog back, as
+    // above, then just omits that name — a caller sees a report that looks
+    // complete.
+    //
+    // Verified against the catalog `enable_sql` itself produced, not against
+    // a predicted clock reading. An earlier version of this check compared
+    // the read to cohort names derived from a Rust-side `now`. That is a
+    // different clock than the database `now()` the script uses to pick its
+    // own window. It is also a different INSTANT than whenever the script
+    // actually ran. A caller might have saved the generated SQL and run it
+    // later, or the conversion might have waited on a contended lock.
+    // Checking count, contiguity and width instead needs no clock reading
+    // at all, on either side. The catalog is the only source of truth for
+    // what the script actually created.
+    let expected_count = usize::try_from(opts.lookahead_cohorts).unwrap_or(usize::MAX) + 1;
+    let gap = cohorts
+        .windows(2)
+        .find(|pair| pair[0].upper != pair[1].lower)
+        .map(|pair| format!("a gap between {} and {}", pair[0].name, pair[1].name));
+    let bad_width = cohorts.iter().find_map(|p| match (p.lower, p.upper) {
+        (Some(lo), Some(hi)) if (hi - lo).num_seconds() == width => None,
+        _ => Some(format!(
+            "{} does not span the configured cohort width",
+            p.name
+        )),
+    });
+    let problem = if cohorts.len() == expected_count {
+        gap.or(bad_width)
+    } else {
+        Some(format!(
+            "{expected_count} lookahead cohort partition(s) expected, {} found",
+            cohorts.len()
+        ))
+    };
+    if let Some(reason) = problem {
         return Err(HarvestError::Database(format!(
-            "harvest_events was converted, but the lookahead cohort partition(s) {} were \
-             not created. An existing relation already occupies that name and is not this \
-             engine's partition. Writes for that cohort will land in {DEFAULT_PARTITION} \
-             until the collision is resolved.",
-            missing.join(", ")
+            "harvest_events was converted, but its lookahead window is incomplete ({reason}). \
+             An existing relation likely already occupies a cohort partition's deterministic \
+             name and is not this engine's partition. Writes for that cohort will land in \
+             {DEFAULT_PARTITION} until the collision is resolved."
         )));
     }
 
     Ok(EnableReport {
         mode,
-        partitions_created,
+        partitions_created: cohorts.into_iter().map(|p| p.name).collect(),
         cohort_width_secs: width,
     })
 }
@@ -1814,20 +1832,11 @@ fn drop_tracked_constraint_stmt(table: &str, var_name: &str) -> String {
 // scatter a single readable runbook across helpers that only ever concatenate.
 #[allow(clippy::too_many_lines)]
 #[must_use]
-pub fn enable_sql(opts: &EnableOptions, now: DateTime<Utc>) -> String {
+pub fn enable_sql(opts: &EnableOptions) -> String {
     let width = opts.cohort_width_secs.max(1);
     let lookahead = opts.lookahead_cohorts;
     let lock_ms = opts.lock_timeout.as_millis().max(1);
     let cohort_fn = cohort_function_sql(width);
-    // Bound as a literal, the same way `migration_plan_steps` already binds
-    // its own `cutover_lit` — not read back from the database's `now()`.
-    // `enable_partitioning` derives its post-conversion report from the SAME
-    // `now`, by comparing the catalog against the lookahead window this
-    // value produces. A database-clock `now()` here could disagree with
-    // that Rust-side clock across a cohort boundary. It would then wrongly
-    // report a cohort as missing when the conversion actually covered it,
-    // under a boundary the check never knew about.
-    let cutover_lit = ts_literal(cohort_start(now, width));
     // Inlined rather than run as a following statement: on a shard that was
     // empty the legacy table is dropped before this block ends, so the ACLs
     // have to be read while it still exists.
@@ -1924,7 +1933,7 @@ BEGIN
     -- ranges meet exactly, with no gap and no overlap -- and because wall clock
     -- only advances, no later append can route back into legacy. The legacy
     -- partition is sealed from the moment it is attached.
-    cutover := {cutover_lit};
+    cutover := harvest_event_cohort(now());
 
     -- Taken explicitly, first, and re-checked immediately after. The
     -- pre-flight calls in `enable_partitioning` (`refuse_if_row_security`
@@ -5131,9 +5140,8 @@ mod tests {
     #[test]
     fn the_operator_plan_performs_the_same_conversion_as_the_executed_script() {
         let opts = EnableOptions::default();
-        let now = Utc::now();
-        let plan = migration_plan(&opts, now);
-        let script = enable_sql(&opts, now);
+        let plan = migration_plan(&opts, Utc::now());
+        let script = enable_sql(&opts);
 
         for needle in [
             // The trigger must name the function that actually exists.

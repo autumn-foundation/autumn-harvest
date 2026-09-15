@@ -6238,16 +6238,29 @@ async fn run_partition_maintain(
                 // partition stayed undrained, and scheduled operator
                 // automation would never notice.
                 //
-                // Best-effort here too: persisting the cursor is what
-                // lets the NEXT invocation get past a blocked prefix. A
-                // write failure must not turn a completed pass into a
-                // reported error.
-                let _ = autumn_harvest::partition::write_durable_sweep_cursor(
+                // Persisting the cursor is what lets the NEXT invocation get
+                // past a blocked prefix. A transient write failure (a lock
+                // timeout, say) must not turn a completed pass into a
+                // reported error. It is folded into `row.error` instead of
+                // aborting the loop. But it must not be silently discarded
+                // either. An ownership conflict here is a persistent,
+                // operator-actionable misconfiguration, not a transient
+                // one. Every future invocation would keep restarting from
+                // the oldest partition without ever learning why.
+                let cursor_write_error = autumn_harvest::partition::write_durable_sweep_cursor(
                     &mut conn,
                     outcome.sweep.resume_after.as_deref(),
                 )
-                .await;
-                row.error.clone_from(&outcome.last_error);
+                .await
+                .err();
+                row.error = match (outcome.last_error.clone(), cursor_write_error) {
+                    (Some(a), Some(b)) => Some(format!(
+                        "{a}; also failed to persist the rotation cursor: {b}"
+                    )),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(format!("failed to persist the rotation cursor: {b}")),
+                    (None, None) => None,
+                };
                 row.maintenance = Some(outcome);
             }
             // Detected unpartitioned: nothing ran, nothing to report. A
