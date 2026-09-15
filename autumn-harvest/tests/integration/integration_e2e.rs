@@ -826,8 +826,8 @@ pub(crate) async fn load_child_executions_from_url(
 /// Issue #1298: `insert_workflow_execution()` must be safe to call more than
 /// once against the same database. A fixed `workflow_id` collided with the
 /// partial `UNIQUE(workflow_name, workflow_id)` active index on the second
-/// call, because that index also covers a fresh `RUNNING` row -- not only a
-/// sealed one. This is exactly what happens when the documented
+/// call. That index also covers a fresh `RUNNING` row, not only a sealed
+/// one. This is exactly what happens when the documented
 /// `HARVEST_TEST_DATABASE_URL` fallback runs more than one test in a process.
 #[tokio::test]
 async fn insert_workflow_execution_helper_is_safe_to_call_more_than_once() {
