@@ -247,6 +247,10 @@ async fn post_form(
                 .method("POST")
                 .uri(uri)
                 .header("content-type", "application/x-www-form-urlencoded")
+                // issue #1278: the same-origin guard requires this evidence on
+                // every mutating request; a real browser sends it on every
+                // same-origin form submission.
+                .header("sec-fetch-site", "same-origin")
                 .body(Body::from(body.into()))
                 .expect("valid form request"),
         )
@@ -1398,6 +1402,76 @@ async fn ui_workers_unknown_status_value_redisplays_form_instead_of_aborting_pag
         html.contains("option value=\"zombie\" selected"),
         "the Status select must echo the invalid value back as its selected \
          option, not silently revert to 'All' (Codex review, #1378 P2): {html}"
+    );
+}
+
+/// RED (was): `page`/`limit` were still typed `Option<i64>` directly on
+/// `WorkerListParams` — the two fields left over after status/stale/shard
+/// above got this fix. `?limit=not-a-number` failed axum's own query
+/// deserialization with a bare 400 before `list_workers_ui` ever ran,
+/// discarding the `build_id` filter the operator had already typed
+/// alongside it. Same mechanism as the Workflows page's
+/// `invalid_limit_redisplays_form_instead_of_aborting_page` (#1540).
+///
+/// GREEN (this commit): the request still renders the Workers page
+/// (`200`) and preserves the other filter. It surfaces a `role="alert"`
+/// message naming the bad value next to the "Per page" field.
+#[tokio::test]
+async fn ui_workers_invalid_limit_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/workers?limit=not-a-number&build_id=abc123").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid limit must not abort the whole Workers page: {html}"
+    );
+    assert!(
+        html.contains("value=\"abc123\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+}
+
+/// Same fix, the `page` field. No form field backs it; it drives the
+/// Previous/Next links instead, a distinct code path. Covered
+/// independently here rather than assumed symmetric with `limit`,
+/// matching the Workflows page's
+/// `invalid_page_redisplays_list_instead_of_aborting_page`.
+#[tokio::test]
+async fn ui_workers_invalid_page_redisplays_list_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/workers?page=not-a-number&build_id=abc123").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid page must not abort the whole Workers page: {html}"
+    );
+    assert!(
+        html.contains("value=\"abc123\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the pagination controls: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+    assert!(
+        html.contains("Page 1"),
+        "falls back to page 1 (zero-based page 0) instead of guessing: {html}"
     );
 }
 
@@ -4551,6 +4625,81 @@ async fn invalid_started_before_redisplays_form_instead_of_aborting_page() {
     );
 }
 
+/// Wayfinder error-path fix: `page`/`limit` were the two `WorkflowListParams`
+/// fields #1333 left behind. Both were still typed `Option<i64>` directly on
+/// the `Query<..>` extractor, unlike every other filter on this struct. A
+/// non-numeric value on either aborted the whole `/workflows` response with
+/// a bare, unstyled 400. That 400 landed before the filter form, or any
+/// already-typed filter, ever rendered.
+///
+/// RED baseline (pre-fix, reproduced by checking out the parent commit and
+/// running this test): `GET /workflows?limit=not-a-number&workflow_name=billing`
+/// returned `400 Bad Request`. The body did not contain the filters form, so
+/// it discarded `workflow_name=billing` along with the page.
+///
+/// GREEN (this commit): the request still renders the list page (`200`) and
+/// preserves the other filter. It falls back to `DEFAULT_PAGE_SIZE` and
+/// surfaces a `role="alert"` message naming the bad value next to the
+/// "Per page" field.
+#[tokio::test]
+async fn invalid_limit_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) =
+        fetch_html(&app, "/workflows?limit=not-a-number&workflow_name=billing").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid limit must not abort the whole list page: {html}"
+    );
+    assert!(
+        html.contains("value=\"billing\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+}
+
+/// Same fix, the `page` field. No form field backs it; it drives the
+/// Previous/Next links instead, a distinct code path. Covered independently
+/// here rather than assumed symmetric with `limit`.
+#[tokio::test]
+async fn invalid_page_redisplays_list_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) =
+        fetch_html(&app, "/workflows?page=not-a-number&workflow_name=billing").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid page must not abort the whole list page: {html}"
+    );
+    assert!(
+        html.contains("value=\"billing\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the pagination controls: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+    assert!(
+        html.contains("Page 1"),
+        "falls back to page 1 (zero-based page 0) instead of guessing: {html}"
+    );
+}
+
 /// Detail page event timestamps are displayed (not "—" for every row).
 #[tokio::test]
 async fn detail_page_event_timestamps_display() {
@@ -7091,4 +7240,54 @@ async fn ui_timeline_200_steps_under_1s() {
         elapsed < Duration::from_secs(1),
         "200-step timeline renders server-side in < 1s (took {elapsed:?})"
     );
+}
+
+// ── Cross-site mutation rejection (issue #1278) ─────────────────────────────
+//
+// One representative route per family named in the issue's acceptance
+// criteria: workflow, DLQ, gate, build-routing, DAG, schedule. Every request
+// below carries neither `Origin` nor `Sec-Fetch-Site`. That is the exact
+// shape a hostile page's `<form>` submit arrives as, so this one test also
+// covers the "neither header present" acceptance criterion. The guard runs
+// ahead of routing and admin checks. A placeholder UUID in each path is
+// enough; no seeded row and no database are needed for a rejected request.
+#[tokio::test]
+async fn vantage_and_dlq_mutations_reject_cross_site_post() {
+    let api_state = HarvestApiState::new();
+    let app = autumn_harvest_plugin::harvest_api_router(api_state.clone())
+        .nest("/ui", harvest_ui_router(api_state))
+        .with_state(test_app_state_without_database());
+
+    let placeholder = uuid::Uuid::nil();
+    let targets: [(&str, String); 6] = [
+        ("workflow", format!("/ui/workflows/{placeholder}/cancel")),
+        ("dlq", "/dead-letters/replay".to_string()),
+        ("gate", format!("/ui/admin/gates/{placeholder}/lift")),
+        ("build-routing", "/ui/build-routing/set-policy".to_string()),
+        (
+            "dag",
+            format!("/ui/dags/echo_workflow/runs/{placeholder}/retry"),
+        ),
+        ("schedule", format!("/ui/schedules/{placeholder}/pause")),
+    ];
+
+    for (family, uri) in targets {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::empty())
+                    .expect("valid cross-site request"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{family} mutation ({uri}) must reject a request with no same-origin evidence"
+        );
+    }
 }

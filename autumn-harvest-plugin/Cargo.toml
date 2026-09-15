@@ -211,6 +211,16 @@ harness = false
 name = "lineage_profile"
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling
+# harness for `queue_coverage::partition_uncovered_and_paused` -- the
+# pure, per-shard, in-memory core of `GET /admin/queue-coverage` (issue
+# #774). No feature requirement: `queue_coverage` is an unconditional
+# module. See `benches/queue_coverage_profile.rs` and
+# `docs/performance-queue-coverage.md`.
+[[bench]]
+name = "queue_coverage_profile"
+harness = false
+
 [lints]
 workspace = true
 

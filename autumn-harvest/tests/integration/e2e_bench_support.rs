@@ -157,6 +157,56 @@ pub const BENCH_ACTIVITIES: [&str; 3] = [
     "harvest_e2e_bench_step_3",
 ];
 
+/// Prefix of every shard database this harness creates against an admin URL.
+///
+/// See [`sweep_step`], which owns the rest of the name shape.
+pub const E2E_DB_PREFIX: &str = "harvest_e2e_";
+
+/// What the stale-database sweep should do with one candidate (issue #1288).
+///
+/// A shard database is named `{E2E_DB_PREFIX}{token}_{seq}_s{shard}`:
+///
+/// * `token` — 16 lowercase hex digits, from the claim harness's `db::run_token`.
+///   The e2e harness shares that token function with the claim harness. A
+///   single process therefore mints one token for the life of its run,
+///   regardless of which harness asks.
+/// * `seq` — decimal digits in `u64` range, from an `AtomicU64` counter.
+/// * `shard` — decimal digits in `u32` range. `ShardId::as_i32` is signed.
+///   Every shard this harness ever mints is `idx as i32` for `idx in
+///   0..shard_count`. It is therefore never negative. Checking `u32` here,
+///   rather than `i32`, is what keeps a decoy such as `..._s-1` from
+///   round-tripping as canonical and being handed to the sweep.
+///
+/// Same asymmetry as the claim harness's own `sweep_step`. This mirrors that
+/// check for a different name shape rather than extending it. Refusing to
+/// reclaim one of ours leaks a database. Reclaiming one of theirs destroys
+/// data. Every ambiguous case resolves to `SweepStep::Skip`.
+#[must_use]
+pub fn sweep_step(datname: &str) -> super::claim_bench_support::SweepStep {
+    use super::claim_bench_support::{SweepStep, is_canonical_decimal, is_run_token};
+
+    let Some(rest) = datname.strip_prefix(E2E_DB_PREFIX) else {
+        return SweepStep::Skip;
+    };
+    // Exactly three components. The trailing `None` rejects a longer name.
+    let mut parts = rest.split('_');
+    let (Some(token), Some(seq), Some(shard), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return SweepStep::Skip;
+    };
+    if !is_run_token(token) || !is_canonical_decimal::<u64>(seq) {
+        return SweepStep::Skip;
+    }
+    let Some(shard_digits) = shard.strip_prefix('s') else {
+        return SweepStep::Skip;
+    };
+    if !is_canonical_decimal::<u32>(shard_digits) {
+        return SweepStep::Skip;
+    }
+    SweepStep::AskServer
+}
+
 /// Task dispatches per completed `bench_workflow` run.
 ///
 /// A dispatch is a claim: a worker picks up a `harvest_task_queue` row and
@@ -971,7 +1021,45 @@ pub fn measured_workflows_per_shard() -> usize {
 /// Wall-clock ceiling for one scenario at one shard count. A scenario that
 /// hits it reports what it collected and is marked unsound rather than
 /// parking the whole suite.
+///
+/// This is a *cooperative* deadline: a scenario runner starts its own clock
+/// against it only after `setup_shards` returns, and checks it between its
+/// own awaits. [`CELL_HARD_TIMEOUT_SECS`] is the outer, uncooperative ceiling
+/// on top of it.
 pub const SCENARIO_BUDGET_SECS: u64 = 900;
+
+/// Extra wall-clock room [`CELL_HARD_TIMEOUT_SECS`] gives a cell beyond
+/// [`SCENARIO_BUDGET_SECS`], to cover provisioning and teardown -- both of
+/// which run outside the scenario's own cooperative deadline.
+///
+/// Provisioning is normally seconds, not minutes. This margin is generous on
+/// purpose. It exists so a merely slow provisioning step can never make the
+/// hard outer timeout fire early. An early fire would cut short a
+/// partial-but-sound report and skip its teardown for no reason. A
+/// connect or query that is genuinely wedged is still caught -- just within
+/// this wider ceiling rather than exactly [`SCENARIO_BUDGET_SECS`].
+pub const CELL_PROVISIONING_GRACE_SECS: u64 = 300;
+
+/// The hard wall-clock ceiling `await_cell` enforces on one whole cell:
+/// provisioning, the scenario's own cooperative deadline, and teardown.
+pub const CELL_HARD_TIMEOUT_SECS: u64 = SCENARIO_BUDGET_SECS + CELL_PROVISIONING_GRACE_SECS;
+
+/// Bound on [`wait_for_census_to_clear`] after a timed-out cell.
+///
+/// A worker or connection task normally notices its `abort()` within one
+/// scheduling tick. This only guards against one that never does, so the
+/// sweep behind it is delayed, not hung, if that ever happens.
+pub const CENSUS_CLEAR_TIMEOUT_SECS: u64 = 30;
+
+/// Bound on sweeping one server this run does not select (see
+/// `provision_independent_servers`).
+///
+/// An unreachable server fails fast: nothing listens, so the connection is
+/// refused immediately. This instead guards a server that accepts the
+/// connection and then never answers. Without a bound, a single such
+/// server would stall this best-effort sweep for the whole outer cell
+/// ceiling, on every database-backed cell in the sweep.
+pub const OMITTED_SERVER_SWEEP_TIMEOUT_SECS: u64 = 15;
 
 /// How long to wait after every signal workflow's handler has reached
 /// `wait_for_signal` before the first signal is sent, so the suspension has
@@ -1433,6 +1521,117 @@ pub async fn run_replay_throughput(shards: u32) -> ScenarioReport {
             "the same history `benches/replay_bench.rs` budgets at 200 ms (issue #135)".to_owned(),
         ],
         unsound,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cell timeout (issue #1288). Generic over the scenario's own result types, so
+// this carries no dependency on the `db` feature or a live database.
+// ---------------------------------------------------------------------------
+
+/// Outcome of one benchmark cell after its hard wall-clock ceiling.
+#[derive(Debug)]
+pub enum CellOutcome<T, E> {
+    /// The scenario finished within budget.
+    Report(T),
+    /// The scenario could not run here. Never a failure.
+    Skipped(E),
+    /// The scenario's task panicked.
+    Panicked(String),
+    /// The task did not finish within budget and was aborted.
+    TimedOut,
+}
+
+/// Await one cell's spawned task under a hard wall-clock ceiling.
+///
+/// The scenario budget is a *cooperative* deadline: every scenario runner
+/// checks it between awaits, but nothing bounds a single await. A wedged
+/// database can therefore park a cell forever, with nothing above it to
+/// notice (issue #1288). This is the outer stop. Past `budget`, the task is
+/// aborted and the cell reports [`CellOutcome::TimedOut`] instead of hanging
+/// the whole sweep.
+///
+/// Aborting does not run the task's remaining code, so a timed-out cell's
+/// `ShardCluster::teardown` never runs and its databases are not dropped
+/// here. The next run's stale-database sweep reclaims them instead.
+pub async fn await_cell<T, E>(
+    mut handle: tokio::task::JoinHandle<Result<T, E>>,
+    budget: Duration,
+) -> CellOutcome<T, E> {
+    match tokio::time::timeout(budget, Pin::new(&mut handle)).await {
+        Ok(Ok(Ok(report))) => CellOutcome::Report(report),
+        Ok(Ok(Err(reason))) => CellOutcome::Skipped(reason),
+        Ok(Err(join_err)) => CellOutcome::Panicked(join_err.to_string()),
+        Err(_elapsed) => {
+            handle.abort();
+            // `abort()` only requests cancellation. Join the handle so this
+            // function does not return until the task's resources (shard
+            // leases, pools) are actually released, not merely asked to be.
+            let _ = handle.await;
+            CellOutcome::TimedOut
+        }
+    }
+}
+
+/// Counts nested tasks a cell has spawned beyond its own top-level task:
+/// worker fleets, a signal server's accept loop, its connection handlers.
+///
+/// `await_cell` joining a cell's own `JoinHandle` proves that task's frame
+/// has dropped. It proves nothing about tasks that frame itself spawned.
+/// `Fleet` and `SignalServer` only `abort()` those in `Drop`, since `Drop`
+/// cannot `await`. So aborting the outer task does not, by itself, prove an
+/// inner worker has actually stopped holding its pooled connection.
+/// `TaskCensus` closes that gap. Each nested task holds one [`CensusGuard`]
+/// for its whole body. The guard drops, and the count falls, only when the
+/// task actually stops, cancellation included.
+#[derive(Clone, Default)]
+pub struct TaskCensus(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl TaskCensus {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register one nested task's lifetime. Hold the returned guard for that
+    /// task's whole body, so it drops only when the task actually stops.
+    #[must_use]
+    pub fn enter(&self) -> CensusGuard {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        CensusGuard(std::sync::Arc::clone(&self.0))
+    }
+
+    /// How many registered tasks have not yet actually stopped.
+    #[must_use]
+    pub fn outstanding(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Decrements its [`TaskCensus`] on drop: by cooperative completion, by a
+/// panic unwinding through it, or by task cancellation dropping it.
+pub struct CensusGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for CensusGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Wait for every task registered against `census` to actually stop.
+///
+/// Bounded: a task that never releases its guard must not hang the sweep
+/// behind it. Call this after a timed-out cell, before the next cell's
+/// provisioning sweep runs. Otherwise the sweep can see a nested task's
+/// still-open connection, and correctly, but unhelpfully, treat the
+/// database as live.
+pub async fn wait_for_census_to_clear(census: &TaskCensus, bound: Duration) {
+    let deadline = tokio::time::Instant::now() + bound;
+    while census.outstanding() > 0 {
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -2194,6 +2393,34 @@ mod tests {
             );
         }
     }
+
+    // ── Stale-database sweep name shape (issue #1288) ──────────────────────
+
+    use super::super::claim_bench_support::SweepStep;
+
+    #[test]
+    fn e2e_sweep_step_accepts_a_freshly_minted_name() {
+        let minted = format!("{E2E_DB_PREFIX}0123456789abcdef_7_s2");
+        assert_eq!(sweep_step(&minted), SweepStep::AskServer, "{minted}");
+    }
+
+    #[test]
+    fn e2e_sweep_step_leaves_names_we_did_not_mint_alone() {
+        for name in [
+            "harvest_claim_bench_1_0123456789abcdef_0",
+            "harvest_e2e_0123456789ABCDEF_7_s2",
+            "harvest_e2e_0123456789abcdef_7",
+            "harvest_e2e_0123456789abcdef_7_2",
+            "harvest_e2e_0123456789abcdef_7_s2_extra",
+            "harvest_e2e_0123456789abcdef_-1_s2",
+            "harvest_e2e_0123456789abcdef_7_s-1",
+            "harvest_e2e_short_7_s2",
+            "postgres",
+            "",
+        ] {
+            assert_eq!(sweep_step(name), SweepStep::Skip, "{name}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2243,8 +2470,8 @@ pub mod db {
         SIGNAL_WORKFLOWS_PER_SHARD, ScenarioReport, WORKERS_PER_SHARD, clock_offset_soundness,
         dispatch_population_soundness, latency_soundness, mean_inflight, measured_samples,
         pacing_verdict, per_shard_inflight_soundness, per_shard_pacing_verdict, steady_state_slice,
-        steady_state_throughput, steady_state_window, throughput_soundness, warmup_batch_for,
-        warmup_soundness,
+        steady_state_throughput, steady_state_window, sweep_step, throughput_soundness,
+        warmup_batch_for, warmup_soundness,
     };
 
     // ── Skip / provisioning ───────────────────────────────────────────────
@@ -2356,7 +2583,109 @@ pub mod db {
         failures
     }
 
-    async fn create_shard_database(
+    /// Drop e2e shard databases left behind by an earlier run.
+    ///
+    /// `ShardCluster::teardown` drops what a run created on every ordinary and
+    /// error return. A **panic** or a Ctrl-C skips it. Dropping a database is
+    /// async, so `ShardCluster` cannot have a useful `Drop` (issue #1288).
+    /// Sweeping at provisioning time, not at teardown, is what reclaims those
+    /// databases. A run that panicked mid-sweep never reaches its own
+    /// teardown. The next run's setup still passes through here.
+    ///
+    /// Mirrors `claim_bench_support::db::drop_stale_bench_databases` for the
+    /// e2e name shape. A database belonging to a **live** run is skipped, so
+    /// concurrent runs cannot delete each other's working set. Every failure
+    /// here is ignored: a leaked database is untidy, but failing to reclaim
+    /// one must never fail a benchmark.
+    async fn drop_stale_e2e_databases(admin: &mut AsyncPgConnection) {
+        #[derive(QueryableByName)]
+        struct NameRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            datname: String,
+        }
+
+        // This reuses `E2E_DB_PREFIX` rather than a second copy of it. It is
+        // only a loose prefilter, since `_` is a single-character wildcard in
+        // `LIKE`. `sweep_step` below re-checks every candidate against the
+        // full minted shape before anything destructive runs.
+        let Ok(rows) = diesel::sql_query(format!(
+            "SELECT datname FROM pg_database WHERE datname LIKE '{}%'",
+            super::E2E_DB_PREFIX
+        ))
+        .load::<NameRow>(admin)
+        .await
+        else {
+            return;
+        };
+
+        for row in rows {
+            // The `LIKE` above is only a loose prefilter; every candidate is
+            // re-checked here against the full minted shape before anything
+            // destructive runs.
+            if sweep_step(&row.datname) == super::super::claim_bench_support::SweepStep::Skip {
+                continue;
+            }
+            // The server is the one party that sees every client, regardless
+            // of host or PID namespace. A live run holds a lease connection
+            // for its database's whole lifetime (see `ShardCluster::leases`).
+            // Any backend at all therefore means the database is in use.
+            if super::super::claim_bench_support::db::database_has_connections(admin, &row.datname)
+                .await
+            {
+                continue;
+            }
+            super::super::claim_bench_support::db::drop_database_version_neutral(
+                admin,
+                &row.datname,
+            )
+            .await;
+        }
+    }
+
+    /// Sweep stale e2e databases on `admin_url`'s server, then run `provision`
+    /// while still holding the stale-database sweep lock.
+    ///
+    /// The lock must span `provision`, not just the sweep. A fresh database
+    /// has no lease connection until [`create_shard_database_lease`] finishes
+    /// connecting to it. A foreign sweep between `CREATE DATABASE` and that
+    /// connect would otherwise see zero backends. It would then wrongly
+    /// conclude the database is abandoned.
+    ///
+    /// Callers pass only the lease-acquisition step here, never the slower
+    /// migration that follows it. `claim_bench_support::db::setup_bench_db`
+    /// uses the same reasoning: it releases its own lock before its own
+    /// migration. Holding this lock across a migration would serialize every
+    /// other client's sweep-and-create against it, for no benefit. It also
+    /// risks a peer's [`claim_bench_support::db::take_sweep_lock`] hitting its
+    /// own wait ceiling.
+    ///
+    /// Skipped entirely against a testcontainer: nothing outside this process
+    /// can reach that server, so there is nothing to sweep and no peer to
+    /// serialize against.
+    async fn with_stale_sweep<T>(
+        admin_url: &str,
+        provision: impl std::future::Future<Output = Result<T, SkipReason>>,
+    ) -> Result<T, SkipReason> {
+        let lock = super::super::claim_bench_support::db::take_sweep_lock(admin_url)
+            .await
+            .map_err(|e| SkipReason(e.0))?;
+        let admin_db_url = super::super::claim_bench_support::db::admin_connection_url(admin_url)
+            .map_err(|e| SkipReason(e.0))?;
+        let mut admin = <AsyncPgConnection as AsyncConnection>::establish(&admin_db_url)
+            .await
+            .map_err(|e| SkipReason(format!("connect for the stale-database sweep: {e}")))?;
+        drop_stale_e2e_databases(&mut admin).await;
+        let result = provision.await;
+        super::super::claim_bench_support::db::release_sweep_lock(lock).await;
+        result
+    }
+
+    /// `CREATE DATABASE` plus the lease connect, with no migration.
+    ///
+    /// Kept separate from migration so [`with_stale_sweep`]'s lock can cover
+    /// this step alone: the fast part that actually needs it. See
+    /// [`provision_one_shard`], the only caller.
+    async fn create_shard_database_lease(
         admin_url: &str,
         shard: ShardId,
     ) -> Result<(String, String, AsyncPgConnection), SkipReason> {
@@ -2369,14 +2698,22 @@ pub mod db {
                 ))
             })?;
         let seq = DB_SEQ.fetch_add(1, Ordering::Relaxed);
-        let name = format!("harvest_e2e_{}_{seq}_s{}", run_token(), shard.as_i32());
+        // Shape: `{super::E2E_DB_PREFIX}{token}_{seq}_s{shard}`. See
+        // `super::sweep_step`, which owns the rest of this shape and is the
+        // authority a stale-database sweep checks a name against.
+        let name = format!(
+            "{}{}_{seq}_s{}",
+            super::E2E_DB_PREFIX,
+            run_token(),
+            shard.as_i32()
+        );
         diesel::sql_query(format!("CREATE DATABASE {name}"))
             .execute(&mut admin)
             .await
             .map_err(|e| SkipReason(format!("create database {name}: {e}")))?;
         let url = replace_database(admin_url, &name)?;
         // Every failure from here on must drop the database this function just
-        // created, or a connect/migrate error orphans it.
+        // created, or a connect error orphans it.
         let created = [(admin_url.to_owned(), name.clone())];
         let mut conn = match <AsyncPgConnection as AsyncConnection>::establish(&url).await {
             Ok(conn) => conn,
@@ -2385,13 +2722,106 @@ pub mod db {
                 return Err(SkipReason(format!("connect to fresh shard database: {e}")));
             }
         };
+        // This connection is the lease `ShardCluster` holds for the shard
+        // database's whole lifetime (see `ShardCluster::leases`). On a server
+        // with `idle_session_timeout` set, an unarmed lease could be reaped
+        // between scenarios. A sweep would then see zero backends and drop a
+        // database this run still needs. Same defense as
+        // `claim_bench_support::db::BenchDb`'s own lease.
+        super::super::claim_bench_support::db::arm_lease_session(&mut conn).await;
         record_server_version(&mut conn).await;
+        Ok((url, name, conn))
+    }
+
+    /// Provision one shard database: sweep and create it under the
+    /// stale-database sweep lock, then migrate it after releasing that lock.
+    ///
+    /// `sweep` is false only for the testcontainer path, where nothing
+    /// outside this process can reach the server.
+    async fn provision_one_shard(
+        admin_url: &str,
+        shard: ShardId,
+        sweep: bool,
+    ) -> Result<(String, String, AsyncPgConnection), SkipReason> {
+        let (url, name, mut conn) = if sweep {
+            with_stale_sweep(admin_url, create_shard_database_lease(admin_url, shard)).await?
+        } else {
+            create_shard_database_lease(admin_url, shard).await?
+        };
         if let Err(e) = conn.batch_execute(&autumn_harvest::test_init_sql()).await {
             drop(conn);
-            drop_created(&created).await;
+            drop_created(&[(admin_url.to_owned(), name)]).await;
             return Err(SkipReason(format!("migrate shard database: {e}")));
         }
         Ok((url, name, conn))
+    }
+
+    /// Provision the first `count` of `admin_urls`, one shard per server.
+    ///
+    /// Sweeps every configured server first, not only the ones this run
+    /// uses. `HARVEST_BENCH_SHARD_URLS` can list the whole compose topology
+    /// while a partial run (`HARVEST_BENCH_SHARDS`) asks for fewer of them.
+    /// A crashed larger run's databases on an omitted server would
+    /// otherwise sit unreclaimed until a later run happens to visit that
+    /// server again. A server this run cannot reach is only skipped, not
+    /// fatal, since it is not one this run needs.
+    ///
+    /// Pulled out of [`setup_shards`] so it can be exercised directly, with
+    /// a manually built URL list, instead of through the process-global
+    /// `HARVEST_BENCH_SHARD_URLS` environment variable.
+    pub async fn provision_independent_servers(
+        admin_urls: &[&str],
+        count: usize,
+    ) -> Result<ShardCluster, SkipReason> {
+        if admin_urls.len() < count {
+            return Err(SkipReason(format!(
+                "{SHARD_URLS_ENV_VAR} lists {} URL(s) but this scenario needs {count}; \
+                 start the whole compose topology (see benchmarks/docker-compose.yml)",
+                admin_urls.len()
+            )));
+        }
+        for admin in admin_urls.iter().skip(count) {
+            // Bounded: a server this run does not use must delay this
+            // best-effort sweep, never hang it. An unreachable server
+            // fails fast on its own. One that accepts the connection and
+            // never answers would otherwise block until the outer cell
+            // ceiling.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(super::OMITTED_SERVER_SWEEP_TIMEOUT_SECS),
+                with_stale_sweep(admin, async { Ok::<(), SkipReason>(()) }),
+            )
+            .await;
+        }
+        let mut urls = BTreeMap::new();
+        let mut leases = Vec::new();
+        let mut created = Vec::new();
+        for (idx, admin) in admin_urls.iter().take(count).enumerate() {
+            let shard = ShardId::new(i32::try_from(idx).unwrap_or(0));
+            // Each admin URL is potentially a different server, so the
+            // stale-database sweep and its lock are per-shard here.
+            match provision_one_shard(admin, shard, true).await {
+                Ok((url, name, lease)) => {
+                    urls.insert(shard, url);
+                    created.push(((*admin).to_owned(), name));
+                    leases.push(lease);
+                }
+                // Shard 3 of 4 failing is the common case (one server slower
+                // to accept connections). Without this, shards 0-2 are
+                // already created and migrated and nothing ever drops them.
+                Err(e) => {
+                    drop(leases);
+                    drop_created(&created).await;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(ShardCluster {
+            urls,
+            topology: Topology::IndependentServers,
+            created,
+            _container: None,
+            leases,
+        })
     }
 
     /// Provision `shard_count` shards.
@@ -2417,41 +2847,7 @@ pub mod db {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .collect();
-            if admin_urls.len() < count {
-                return Err(SkipReason(format!(
-                    "{SHARD_URLS_ENV_VAR} lists {} URL(s) but this scenario needs {count}; \
-                     start the whole compose topology (see benchmarks/docker-compose.yml)",
-                    admin_urls.len()
-                )));
-            }
-            let mut urls = BTreeMap::new();
-            let mut leases = Vec::new();
-            let mut created = Vec::new();
-            for (idx, admin) in admin_urls.iter().take(count).enumerate() {
-                let shard = ShardId::new(i32::try_from(idx).unwrap_or(0));
-                match create_shard_database(admin, shard).await {
-                    Ok((url, name, lease)) => {
-                        urls.insert(shard, url);
-                        created.push(((*admin).to_owned(), name));
-                        leases.push(lease);
-                    }
-                    // Shard 3 of 4 failing is the common case (one server slower
-                    // to accept connections). Without this, shards 0-2 are
-                    // already created and migrated and nothing ever drops them.
-                    Err(e) => {
-                        drop(leases);
-                        drop_created(&created).await;
-                        return Err(e);
-                    }
-                }
-            }
-            return Ok(ShardCluster {
-                urls,
-                topology: Topology::IndependentServers,
-                created,
-                _container: None,
-                leases,
-            });
+            return provision_independent_servers(&admin_urls, count).await;
         }
 
         let (admin_url, container) = if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
@@ -2484,9 +2880,13 @@ pub mod db {
         let mut urls = BTreeMap::new();
         let mut leases = Vec::new();
         let mut created = Vec::new();
+        // Every shard shares this one server, so each gets its own sweep and
+        // lock hold. This is skipped only on the testcontainer path. Nothing
+        // outside this process can reach that server at all.
+        let sweep = container.is_none();
         for idx in 0..count {
             let shard = ShardId::new(i32::try_from(idx).unwrap_or(0));
-            match create_shard_database(&admin_url, shard).await {
+            match provision_one_shard(&admin_url, shard, sweep).await {
                 Ok((url, name, lease)) => {
                     urls.insert(shard, url);
                     created.push((admin_url.clone(), name));
@@ -2834,11 +3234,17 @@ pub mod db {
 
     /// Start [`WORKERS_PER_SHARD`] workers per shard, each pinned to its shard
     /// and listening on that shard's own database.
+    ///
+    /// Each worker task holds one `census` guard for its whole life. After a
+    /// forced abort (a timed-out cell), the caller can poll `census`. It
+    /// learns once every worker this call started has actually stopped, not
+    /// merely been asked to.
     #[must_use]
     pub fn start_fleet(
         cluster: &ShardCluster,
         sharded: &ShardedDbPool,
         registry: &Arc<HandlerRegistry>,
+        census: &super::TaskCensus,
     ) -> Fleet {
         let notification_urls: Vec<(ShardId, String)> = cluster
             .urls
@@ -2868,7 +3274,9 @@ pub mod db {
                     .expect("shard pool present")
                     .clone();
                 let runner = Arc::clone(&worker);
+                let guard = census.enter();
                 handles.push(tokio::spawn(async move {
+                    let _guard = guard;
                     runner.run(&pool).await;
                 }));
                 workers.push(worker);
@@ -3095,13 +3503,29 @@ pub mod db {
 
     /// Bind the signal endpoint on loopback and start serving.
     ///
+    /// The accept loop, and every connection it spawns, holds one `census`
+    /// guard for its whole life. After a forced abort (a timed-out cell),
+    /// the caller can poll `census`. It learns once the loop and every
+    /// connection it started have actually stopped, not merely been asked
+    /// to.
+    ///
     /// # Errors
     ///
     /// Returns the bind/accept error if loopback is unavailable.
-    pub async fn spawn_signal_server(sharded: ShardedDbPool) -> std::io::Result<SignalServer> {
+    pub async fn spawn_signal_server(
+        sharded: ShardedDbPool,
+        census: super::TaskCensus,
+    ) -> std::io::Result<SignalServer> {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let addr = listener.local_addr()?;
+        // Entered here, before `spawn`, not inside the spawned future. A task
+        // aborted before its first poll never runs its own body, so a guard
+        // entered there would never register at all. `census.outstanding()`
+        // must count this task for its entire life. That includes the
+        // sliver between `spawn` and that first poll.
+        let accept_loop_guard = census.enter();
         let handle = tokio::spawn(async move {
+            let _accept_loop_guard = accept_loop_guard;
             // Connection tasks are tracked rather than detached: `stop` must be
             // able to guarantee no task is still holding a pooled connection
             // when the caller drops the pool and drops the databases.
@@ -3122,7 +3546,9 @@ pub mod db {
                     continue;
                 };
                 let sharded = sharded.clone();
+                let connection_guard = census.enter();
                 connections.spawn(async move {
+                    let _connection_guard = connection_guard;
                     let _ = socket.set_nodelay(true);
                     let mut buf = Vec::with_capacity(512);
                     let request = loop {
@@ -3368,12 +3794,15 @@ pub mod db {
                   the ordering constraints between those phases -- which are the whole \
                   correctness argument -- harder to audit, not easier."
     )]
-    pub async fn run_throughput(shard_count: u32) -> Result<ScenarioReport, SkipReason> {
+    pub async fn run_throughput(
+        shard_count: u32,
+        census: super::TaskCensus,
+    ) -> Result<ScenarioReport, SkipReason> {
         let scenario_started = Instant::now();
-        let cluster = setup_shards(shard_count).await?;
+        let cluster = Box::pin(setup_shards(shard_count)).await?;
         let sharded = cluster.sharded_pool();
         let (registry, _observations) = build_registry();
-        let fleet = start_fleet(&cluster, &sharded, &registry);
+        let fleet = start_fleet(&cluster, &sharded, &registry, &census);
         let deadline = scenario_deadline();
         let shards = cluster.shard_ids();
 
@@ -3383,14 +3812,29 @@ pub mod db {
         let inflight = super::inflight_target();
         let per_shard_total = super::measured_workflows_per_shard();
         let warm_per_shard = warmup_batch_for(per_shard_total);
-        let warm_loops =
-            run_closed_loop(&cluster, "warm", warm_per_shard, inflight, deadline).await;
+        let warm_loops = run_closed_loop(
+            &cluster,
+            "warm",
+            warm_per_shard,
+            inflight,
+            deadline,
+            &census,
+        )
+        .await;
         let warm_drained: Vec<u64> = warm_loops
             .iter()
             .map(|l| u64::try_from(l.completed).unwrap_or(0))
             .collect();
 
-        let loops = run_closed_loop(&cluster, "meas", per_shard_total, inflight, deadline).await;
+        let loops = run_closed_loop(
+            &cluster,
+            "meas",
+            per_shard_total,
+            inflight,
+            deadline,
+            &census,
+        )
+        .await;
         let requested = per_shard_total * shards.len();
 
         // Completion instants come from the database clock (`completed_at`), so
@@ -3529,6 +3973,7 @@ pub mod db {
         per_shard: usize,
         inflight: usize,
         deadline: Instant,
+        census: &super::TaskCensus,
     ) -> Vec<LoopOutcome> {
         // A `JoinSet`, not loose `JoinHandle`s: if one shard's loop panics, the
         // `expect` below unwinds and dropping loose handles would DETACH the
@@ -3537,6 +3982,11 @@ pub mod db {
         // (Codex review round 3, PR #1282). Dropping a `JoinSet` aborts what it
         // owns, so the containment in `benches/e2e_bench.rs` actually contains.
         //
+        // Each task also holds a `census` guard. Dropping the `JoinSet` on a
+        // forced abort only requests cancellation, same as `Fleet`'s
+        // handles. The caller needs the same way to learn once the feeder
+        // connections these tasks own have actually closed.
+        //
         // Results come back in completion order, so each task carries its shard
         // index and the outcomes are restored to shard order before returning --
         // every per-shard verdict downstream is reported against a shard number.
@@ -3544,7 +3994,9 @@ pub mod db {
         for (idx, shard) in cluster.shard_ids().into_iter().enumerate() {
             let url = cluster.urls[&shard].clone();
             let cohort = cohort.to_owned();
+            let guard = census.enter();
             tasks.spawn(async move {
+                let _guard = guard;
                 (
                     idx,
                     closed_loop_on_shard(&url, shard, &cohort, per_shard, inflight, deadline).await,
@@ -3650,17 +4102,24 @@ pub mod db {
         count: usize,
         per_shard_rate: f64,
         deadline: Instant,
+        census: &super::TaskCensus,
     ) -> (Vec<ExecutionId>, std::time::Duration) {
         let period = std::time::Duration::from_secs_f64(1.0 / per_shard_rate);
         let started = Instant::now();
         // `JoinSet` for the same reason as `run_closed_loop`: a panic in one
         // shard's seeder must not detach its siblings onto the rest of the sweep.
+        // Each task also holds a `census` guard, for the same reason
+        // `run_closed_loop`'s does. A forced abort only requests the
+        // `JoinSet`'s cancellation. The caller needs a way to learn once
+        // this task's own connection has actually closed.
         let mut tasks = tokio::task::JoinSet::new();
         for shard in cluster.shard_ids() {
             let url = cluster.urls[&shard].clone();
             let workflow_name = workflow_name.to_owned();
             let cohort = cohort.to_owned();
+            let guard = census.enter();
             tasks.spawn(async move {
+                let _guard = guard;
                 let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
                     .await
                     .expect("connect for paced seeding");
@@ -3713,12 +4172,15 @@ pub mod db {
                   the ordering constraints between those phases -- which are the whole \
                   correctness argument -- harder to audit, not easier."
     )]
-    pub async fn run_dispatch_latency(shard_count: u32) -> Result<ScenarioReport, SkipReason> {
+    pub async fn run_dispatch_latency(
+        shard_count: u32,
+        census: super::TaskCensus,
+    ) -> Result<ScenarioReport, SkipReason> {
         let scenario_started = Instant::now();
-        let cluster = setup_shards(shard_count).await?;
+        let cluster = Box::pin(setup_shards(shard_count)).await?;
         let sharded = cluster.sharded_pool();
         let (registry, observations) = build_registry();
-        let fleet = start_fleet(&cluster, &sharded, &registry);
+        let fleet = start_fleet(&cluster, &sharded, &registry, &census);
         let deadline = scenario_deadline();
         let shards = cluster.shard_ids();
 
@@ -3745,6 +4207,7 @@ pub mod db {
             DISPATCH_WORKFLOWS_PER_SHARD,
             PACED_STARTS_PER_SEC_PER_SHARD,
             deadline,
+            &census,
         )
         .await;
         let requested = paced_ids.len();
@@ -3993,16 +4456,19 @@ pub mod db {
                   the ordering constraints between those phases -- which are the whole \
                   correctness argument -- harder to audit, not easier."
     )]
-    pub async fn run_signal_roundtrip(shard_count: u32) -> Result<ScenarioReport, SkipReason> {
+    pub async fn run_signal_roundtrip(
+        shard_count: u32,
+        census: super::TaskCensus,
+    ) -> Result<ScenarioReport, SkipReason> {
         let scenario_started = Instant::now();
-        let cluster = setup_shards(shard_count).await?;
+        let cluster = Box::pin(setup_shards(shard_count)).await?;
         let sharded = cluster.sharded_pool();
         let (registry, observations) = build_registry();
-        let fleet = start_fleet(&cluster, &sharded, &registry);
+        let fleet = start_fleet(&cluster, &sharded, &registry, &census);
         let deadline = scenario_deadline();
         let shards = cluster.shard_ids();
 
-        let server = match spawn_signal_server(sharded.clone()).await {
+        let server = match spawn_signal_server(sharded.clone(), census).await {
             Ok(server) => server,
             Err(e) => {
                 // Tear down before returning: `ShardCluster` has no `Drop`
