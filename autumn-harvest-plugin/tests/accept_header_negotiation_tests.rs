@@ -1,16 +1,18 @@
 //! Regression test for issue #1579.
 //!
 //! `autumn-web` renders a styled HTML error page for a request whose
-//! `Accept` header prefers HTML — including a missing header, since
-//! autumn-web's default resolution favors browser navigation. The
-//! `harvest` CLI sent no `Accept` header at all, so a validation error
-//! (e.g. an unknown `--state` filter) came back as an HTML page instead
-//! of the documented `application/problem+json` body.
+//! `Accept` header prefers HTML. A missing header counts too: the
+//! default resolution favors browser navigation. The `harvest` CLI
+//! sent no `Accept` header at all. A validation error, an unknown
+//! `--state` filter for example, then came back as an HTML page. It
+//! did not come back as the documented `application/problem+json`
+//! body.
 //!
-//! These tests pin the real, documented behavior an explicit
-//! `Accept: application/json` header now buys the CLI (and any other
-//! direct API client): the same route, only the request header differs.
-//! No database is needed; the route below never touches storage.
+//! These tests pin the real, documented behavior. An explicit
+//! `Accept: application/json` header now buys this for the CLI, and
+//! for any other direct API client: the same route, only the request
+//! header differs. No database is needed; the route below never
+//! touches storage.
 
 use autumn_web::error::AutumnError;
 use autumn_web::prelude::*;
