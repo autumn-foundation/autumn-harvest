@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use autumn_harvest::models::NewHarvestEvent;
 use autumn_harvest::payload_codec::{
     CodecError, PayloadCodec, PayloadCodecs, UNDECODABLE_MARKER_KEY,
     UNDECODABLE_REASON_UNKNOWN_CODEC,
@@ -270,6 +271,44 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
 
 // ── Seeding helpers ──────────────────────────────────────────────────────────
 
+/// Undo the identity codec's collision-escape nesting (issue #1253) on the
+/// `WorkflowStarted` event's `input`, restoring it to `encoded_input`
+/// exactly as given.
+///
+/// `seed_running` starts the workflow through `start_or_load_workflow_execution`,
+/// the real engine path. It always encodes the `WorkflowStarted` event
+/// through identity codecs. Suppose a caller hands `seed_running` an
+/// already-envelope-shaped `input`, to simulate a foreign codec-encrypting
+/// write (as `describe_and_history_pages_emit_decoded_payloads` does). The
+/// escape guard then sees a collision and wraps it a second time. That is
+/// correct for a real caller, whose plaintext coincidentally looks like an
+/// envelope. Here it is a test artifact: this fixture wants the SINGLE
+/// codec-encoded shape a real deployment stores, not identity's defensive
+/// double wrap. This patches the stored event back to that shape.
+async fn reset_workflow_started_input(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    encoded_input: Value,
+) {
+    let mut event_data: Value = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_events::event_id.eq(0))
+        .select(harvest_events::event_data)
+        .first(conn)
+        .await
+        .expect("load WorkflowStarted row");
+    event_data["data"]["input"] = encoded_input;
+    diesel::update(
+        harvest_events::table
+            .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+            .filter(harvest_events::event_id.eq(0)),
+    )
+    .set(harvest_events::event_data.eq(event_data))
+    .execute(conn)
+    .await
+    .expect("restore WorkflowStarted input");
+}
+
 async fn seed_running(
     conn: &mut AsyncPgConnection,
     workflow_id: &str,
@@ -359,9 +398,32 @@ async fn append_events(
     // Raw load: the seeded history may already carry non-identity envelopes,
     // which the strict identity-only `load_history` would refuse to load.
     let history = store::load_history_undecoded(conn, exec_id).await.unwrap();
-    store::append_events(conn, exec_id, events, history.next_event_id)
+    // Raw insert, not `store::append_events`: these fixtures hand-build an
+    // already-enveloped payload field (`envelope_for` et al.) to reproduce a
+    // codec deployment's on-disk shape (module doc above). `append_events`
+    // runs every field through the identity codec's `encode_payload`. That
+    // now escapes anything already shaped like an envelope, by nesting it
+    // (issue #1253). A second pass here would corrupt the fixture's
+    // hand-built shape instead of storing it verbatim.
+    let rows: Vec<NewHarvestEvent> = events
+        .iter()
+        .enumerate()
+        .map(|(i, event)| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let event_id = history.next_event_id + i as i32;
+            NewHarvestEvent {
+                workflow_exec_id: exec_id.as_uuid(),
+                event_id,
+                event_type: event.type_name(),
+                event_data: serde_json::to_value(event).expect("serialize seed event"),
+            }
+        })
+        .collect();
+    diesel::insert_into(harvest_events::table)
+        .values(&rows)
+        .execute(conn)
         .await
-        .expect("append events");
+        .expect("insert seed events");
 }
 
 /// Seeds a pending activity task-queue row (the row backing the `/stack`
@@ -842,12 +904,9 @@ async fn describe_and_history_pages_emit_decoded_payloads() {
 
     // The workflow input itself is an envelope (identity persistence stores
     // it verbatim), plus an envelope-bearing activity event.
-    let exec_id = seed_running(
-        &mut conn,
-        "describe-decoded",
-        envelope_for(&json!({"user": "pii-alpha"})),
-    )
-    .await;
+    let started_input = envelope_for(&json!({"user": "pii-alpha"}));
+    let exec_id = seed_running(&mut conn, "describe-decoded", started_input.clone()).await;
+    reset_workflow_started_input(&mut conn, exec_id, started_input).await;
     append_events(
         &mut conn,
         exec_id,
@@ -1547,12 +1606,9 @@ async fn audit_row_written_once_per_request_and_contains_no_payload_content() {
         .expect("envelope data is base64 text")
         .to_string();
 
-    let exec_id = seed_running(
-        &mut conn,
-        "audit-once",
-        envelope_for(&json!({"pii": "pii-alpha"})),
-    )
-    .await;
+    let started_input = envelope_for(&json!({"pii": "pii-alpha"}));
+    let exec_id = seed_running(&mut conn, "audit-once", started_input.clone()).await;
+    reset_workflow_started_input(&mut conn, exec_id, started_input).await;
     append_events(
         &mut conn,
         exec_id,

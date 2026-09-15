@@ -530,17 +530,27 @@ pub struct AuditExportBuilderConfig {
 ///
 /// Falls back to a marker rather than the input when the URL cannot be parsed:
 /// an unparseable string must not be echoed on the assumption it is harmless.
+///
+/// Reads the origin from a full [`url::Url::parse`], not a hand-rolled
+/// split (issue #1274). A manual split trusts the input's shape. It
+/// missed a backslash standing in for `/`. It also read a malformed
+/// `host:port` authority as valid — `s3cr3t` is not a port, so the real
+/// parser rejects the whole string. Either way, the secret rode along
+/// after it. Delegating to the parser closes the whole class: this
+/// function can only render a host the parser itself accepted.
 pub(crate) fn redact_webhook_url(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
+    let Ok(parsed) = url::Url::parse(url) else {
         return "<unparseable webhook url redacted>".to_string();
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    // Strip any userinfo (`user:pass@host`), itself a credential.
-    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    if host.is_empty() {
+    let Some(host) = parsed.host_str() else {
         return "<unparseable webhook url redacted>".to_string();
-    }
-    format!("{scheme}://{host}/<redacted>")
+    };
+    // A port is part of the origin, not the credential (issue #1274). Two
+    // targets at the same host on different ports are different
+    // endpoints. `Url::port()` already omits the scheme's default port,
+    // so this adds nothing for a bare `https://host/...` origin.
+    let port = parsed.port().map_or_else(String::new, |p| format!(":{p}"));
+    format!("{}://{host}{port}/<redacted>", parsed.scheme())
 }
 
 impl std::fmt::Debug for AuditExportBuilderConfig {
@@ -3801,6 +3811,48 @@ mod tests {
             let rendered = redact_webhook_url(junk);
             assert_eq!(rendered, "<unparseable webhook url redacted>");
         }
+    }
+
+    #[test]
+    fn redact_webhook_url_stops_the_authority_at_a_backslash() {
+        // Issue #1274: `url::Url::parse` treats a backslash as a path
+        // separator for `https`/`http`, the same as a forward slash.
+        // `redact_webhook_url` split only on `/`, `?`, and `#`, so a
+        // backslash-delimited secret rode along as part of the authority.
+        assert_eq!(
+            redact_webhook_url("https://evil.com\\bearer-secret"),
+            "https://evil.com/<redacted>"
+        );
+    }
+
+    #[test]
+    fn redact_webhook_url_withholds_a_malformed_authority() {
+        // Issue #1274: `user:s3cr3t` with no `@` is `host:port`, not
+        // userinfo. `s3cr3t` is not a valid port, so `url::Url::parse`
+        // rejects the whole string. A naive split on `/` still finds an
+        // "authority" here and renders the secret through it.
+        assert_eq!(
+            redact_webhook_url("https://user:s3cr3t/api"),
+            "<unparseable webhook url redacted>"
+        );
+    }
+
+    #[test]
+    fn redact_webhook_url_keeps_a_non_default_port() {
+        // Issue #1274: a port is part of the origin, not the credential.
+        // Two targets on the same host at different ports are different
+        // endpoints. Dropping the port made them indistinguishable in a
+        // startup error or a runtime log line.
+        assert_eq!(
+            redact_webhook_url("https://siem.example.com:8443/token"),
+            "https://siem.example.com:8443/<redacted>"
+        );
+        // The default port for the scheme adds no information; omit it,
+        // matching the pre-existing behavior for a bare origin.
+        assert_eq!(
+            redact_webhook_url("https://siem.example.com:443/token"),
+            "https://siem.example.com/<redacted>"
+        );
     }
 
     /// A delivery whose sink was swapped mid-flight must not advance the

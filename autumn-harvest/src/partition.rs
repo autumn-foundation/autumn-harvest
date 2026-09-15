@@ -105,6 +105,10 @@
 //! byte-identical") therefore holds *by construction* rather than by testing
 //! luck.
 
+#[cfg(feature = "db")]
+use std::future::Future;
+#[cfg(feature = "db")]
+use std::pin::Pin;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -171,10 +175,135 @@ pub const PARTITION_PREFIX: &str = "harvest_events_p_";
 /// new parent can reuse their original names.
 const LEGACY_RENAME_SUFFIX: &str = "__pre958";
 
+/// A POSIX regex matching `pg_get_constraintdef`'s rendering of harvest's own
+/// `{LEGACY_PARTITION}_cohort_ck` (`CHECK (cohort < cutover) NOT VALID`).
+///
+/// Review finding: name, type, table and column alone do not identify
+/// harvest's own generated check. An operator's own `CHECK` on `cohort`
+/// could reuse the exact reserved name with a different expression --
+/// enforcing, say, a floor rather than a ceiling. Matching the rendered
+/// definition itself closes that gap. The cutover literal varies per
+/// conversion, so only its shape is pinned. `NOT VALID` is optional: it
+/// disappears once [`enable_sql`] validates the constraint, in the same
+/// transaction that adds it.
+///
+/// SQL-quoted for direct interpolation into a single-quoted string
+/// literal (`''` doubles each literal quote) -- every call site embeds
+/// it inside one via `format!`.
+///
+/// Its only remaining caller, [`unreplayable_constraints`], is gated
+/// the same way: an exact-cutover comparison replaced it everywhere a
+/// caller already knows the real value. See
+/// [`expected_cohort_ck_def_sql`] for that half.
+#[cfg(feature = "db")]
+const LEGACY_COHORT_CK_DEF_RE: &str =
+    r"^CHECK \(\(cohort < ''[^'']+''::timestamp with time zone\)\)( NOT VALID)?$";
+
+/// A PL/pgSQL `format(...)` call.
+///
+/// It renders the exact `CHECK` text `pg_get_constraintdef` gives
+/// harvest's own `{LEGACY_PARTITION}_cohort_ck`. `ts_expr` supplies the
+/// bound, a `timestamptz` SQL expression. The result omits any
+/// `NOT VALID` suffix.
+///
+/// Review finding: [`LEGACY_COHORT_CK_DEF_RE`] matches a `CHECK` bounded
+/// by any timestamp, not the specific cutover this conversion actually
+/// planned or attached. A same-named, same-shaped constraint bounded by
+/// an unrelated date would pass that regex. It would then be treated as
+/// harvest's own and renamed onto the legacy partition. From there, the
+/// operator's own ceiling would stop applying to every partition
+/// created from then on. A caller that already knows the real cutover
+/// compares against this exact rendering instead of the regex. A caller
+/// that does not know it yet keeps using the regex instead. That covers
+/// two callers. The Rust-side preflight runs before the real cutover is
+/// chosen. Disable's revert checks have no expected future value to
+/// compare against either.
+fn expected_cohort_ck_def_sql(ts_expr: &str) -> String {
+    format!("format('CHECK ((cohort < %L::timestamp with time zone))', {ts_expr})")
+}
+
 /// The validate-only `BEFORE INSERT` trigger that replaces the FK's
 /// insert-time half. It must never modify `NEW`: Postgres rejects a `BEFORE
 /// ROW` trigger that changes a partitioned row's destination.
 const EXEC_FK_TRIGGER: &str = "harvest_events_exec_fk_trg";
+
+/// [`EXEC_FK_TRIGGER`]'s own `pg_trigger.tgtype` bitmask: `TRIGGER_TYPE_ROW`
+/// (1) | `TRIGGER_TYPE_BEFORE` (2) | `TRIGGER_TYPE_INSERT` (4), Postgres's
+/// encoding of `BEFORE INSERT FOR EACH ROW`.
+///
+/// Part of the operator-trigger exemption's identity check, alongside
+/// the reserved name and function. A trigger matching both of those,
+/// but installed as `BEFORE UPDATE`, is still an operator's own, not
+/// harvest's.
+const EXEC_FK_TRIGGER_TGTYPE: i16 = 7;
+
+/// The `COMMENT` `enable` stamps on `idx_harvest_we_created_at`.
+///
+/// Stamped the moment `enable` actually creates that index. Never stamped
+/// when `CREATE INDEX IF NOT EXISTS` finds an operator's own index already
+/// at that name.
+///
+/// A shape check alone cannot tell harvest's index apart from an
+/// operator's own index of the identical shape. Building an index on
+/// `harvest_workflow_executions (created_at)` independently is an
+/// ordinary thing to do. Recording ownership at creation time removes the
+/// ambiguity instead of guessing from the result.
+const WE_CREATED_AT_IDX_OWNERSHIP_TAG: &str =
+    "harvest #958: created by partition enable, safe to drop on disable";
+
+/// A boolean SQL expression, evaluating to exactly one row.
+///
+/// Checks that `idx_harvest_we_created_at` exists and carries
+/// [`WE_CREATED_AT_IDX_OWNERSHIP_TAG`]. Also checks it has the shape
+/// `enable` creates: a plain (non-unique) single-column btree on
+/// `harvest_workflow_executions (created_at)`, with default opclass and no
+/// predicate or expression. `false` (not an error) when the index does not
+/// exist at all.
+///
+/// [`disable_partitioning`] uses this. It drops the index only when BOTH
+/// signals agree. The tag alone could in principle survive some
+/// hypothetical future `ALTER INDEX`. The shape alone cannot distinguish
+/// harvest's index from an operator's identically shaped one. Requiring
+/// both is the conservative choice: an index missing either signal is
+/// left alone.
+#[cfg(feature = "db")]
+fn we_created_at_idx_owned_check_sql() -> String {
+    format!(
+        "SELECT COALESCE((
+       SELECT i.indrelid = 'harvest_workflow_executions'::regclass
+              AND NOT i.indisunique AND i.indpred IS NULL AND i.indexprs IS NULL
+              AND i.indnkeyatts = 1 AND i.indnatts = 1
+              AND i.indkey[0] = (SELECT a.attnum FROM pg_attribute a
+                                  WHERE a.attrelid = 'harvest_workflow_executions'::regclass
+                                    AND a.attname = 'created_at')
+              AND NOT EXISTS (
+                  SELECT 1 FROM unnest(i.indclass) AS oc(opclass)
+                  JOIN pg_opclass op ON op.oid = oc.opclass
+                 WHERE NOT op.opcdefault)
+              AND obj_description(c.oid, 'pg_class') = \
+                  $harvest_we_idx_tag_958${WE_CREATED_AT_IDX_OWNERSHIP_TAG}$harvest_we_idx_tag_958$
+         FROM pg_class c
+         JOIN pg_index i ON i.indexrelid = c.oid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relname = 'idx_harvest_we_created_at' AND n.nspname = current_schema()
+     ), false) AS v"
+    )
+}
+
+/// Name of the transient function [`bounded_rename_fn_sql`] defines,
+/// schema-qualified into `pg_temp`.
+///
+/// Review finding: a bare, fixed name in the application schema is not
+/// guaranteed free. An operator's own schema could already hold a function
+/// of this exact name and signature. The plain `CREATE FUNCTION` below
+/// would then abort the conversion. For the large-table plan, that abort
+/// lands inside phase 4, after phases 2 and 3 already paid for the
+/// expensive online preparation. `pg_temp` is each session's private,
+/// connection-scoped schema. No persistent object can ever occupy a name
+/// there ahead of time, so this can never collide. Nothing is left behind
+/// either, even if the session ends before the trailing `DROP FUNCTION`
+/// runs.
+const BOUNDED_RENAME_FN: &str = "pg_temp.harvest_bounded_rename_958";
 
 // ── Sweep "blocked" reasons ────────────────────────────────────────────────
 //
@@ -298,6 +427,14 @@ pub struct EnableOptions {
     /// and why `publish_via_partition_root` alone is not enough. Set this only
     /// when the subscriber runs the partitioned layout too, or when the
     /// publication is not feeding a Harvest standby at all.
+    ///
+    /// Does not cover a publication that EXPLICITLY lists `harvest_events`
+    /// (`FOR TABLE harvest_events`, or `ADD TABLE harvest_events`), as
+    /// opposed to one covering it via `FOR ALL TABLES` or
+    /// `FOR TABLES IN SCHEMA`. See [`explicitly_published_by`]. An
+    /// explicit membership is pinned to the relation's OID. It does not
+    /// follow the rename-and-recreate this conversion performs, so the
+    /// conversion still refuses on that case regardless of this flag.
     pub allow_incompatible_publications: bool,
 }
 
@@ -398,6 +535,18 @@ pub struct SweepOptions {
     /// unbounded pass could hold the append path off for as long as it takes to
     /// drop a backlog. Bounded passes converge over successive ticks instead.
     pub max_drops: usize,
+    /// Maximum partitions to *evaluate* in one pass, dropped or not.
+    ///
+    /// `max_drops` bounds successful drops, not the work of finding them. A
+    /// blocked partition still costs a full gate evaluation — up to a tier-3
+    /// scan under `exact_scan_timeout`. It does not count against
+    /// `max_drops`. A shard with one long-lived execution pinning many old
+    /// cohorts can then spend an entire tick evaluating every closed
+    /// partition. It drops none, at up to `partitions × exact_scan_timeout`.
+    /// This field bounds that cost directly. [`SweepOutcome::truncated`]
+    /// reports when the budget was reached before every partition was
+    /// considered.
+    pub max_attempts: usize,
     /// How long to wait for that lock before giving up on a partition.
     ///
     /// Failing fast and retrying next tick is what keeps the concurrent-p99
@@ -437,6 +586,7 @@ impl Default for SweepOptions {
     fn default() -> Self {
         Self {
             max_drops: 32,
+            max_attempts: 128,
             lock_timeout: Duration::from_secs(2),
             straggler_grace: None,
             straggler_batch: 1_000,
@@ -451,6 +601,17 @@ impl Default for SweepOptions {
 pub struct SweepOutcome {
     /// Partitions dropped, oldest first.
     pub dropped: Vec<String>,
+    /// Whether this pass stopped before every partition was considered,
+    /// because it hit [`SweepOptions::max_drops`] or
+    /// [`SweepOptions::max_attempts`].
+    ///
+    /// Not itself a problem — bounded passes that converge over successive
+    /// ticks are the design. An operator reading a pass that dropped and
+    /// blocked nothing needs to know which state that is. Either "the shard
+    /// is clean", or "the pass ran out of budget before it looked at the
+    /// rest".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
     /// Partitions considered but left in place, each with the reason — a live
     /// execution still owns rows there, or the lock could not be taken in time.
     /// Reported rather than silently skipped so an operator can see *why*
@@ -458,6 +619,64 @@ pub struct SweepOutcome {
     pub blocked: Vec<String>,
     /// Orphan rows removed by the opt-in straggler fallback.
     pub straggler_rows_deleted: usize,
+    /// Where the NEXT pass should resume its evaluation: the cohort upper
+    /// bound of the last partition this pass actually evaluated (dropped
+    /// or blocked).
+    ///
+    /// Review finding: a fixed oldest-first scan, restarted from the very
+    /// beginning every call, cannot converge when the oldest
+    /// [`SweepOptions::max_attempts`] partitions are permanently blocked.
+    /// Say, by a legal hold, or a long-running execution spanning many
+    /// old cohorts. Every pass would then re-spend its whole budget
+    /// proving the same oldest partitions blocked. A droppable partition
+    /// further along would never be reached.
+    ///
+    /// `None` when this pass reached the end of the partition list. That
+    /// holds whether or not it was `truncated` on the way, as long as it
+    /// got all the way there. The caller should pass `None` back next
+    /// time, restarting from the oldest.
+    ///
+    /// `Some(instant)` when this pass stopped on budget before reaching
+    /// the end. The caller should pass it back as `resume_after`. The
+    /// next pass then skips straight past every partition at or before
+    /// `instant`, instead of re-attempting the same blocked prefix.
+    ///
+    /// Review finding: an instant, not a partition name. A name would go
+    /// stale the moment the partition it names is dropped. That is the
+    /// common case for the LAST attempted partition in a truncated pass,
+    /// which is exactly the boundary this field exists to preserve.
+    /// Comparing by boundary instant instead survives that. It needs no
+    /// partition to still exist at that name, only the ordering the
+    /// sweep already relies on (oldest first, by cohort upper bound).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_resume: Option<DateTime<Utc>>,
+    /// The fixed horizon a multi-pass catch-up cycle must reach before
+    /// [`Self::next_resume`] is allowed to reset to `None`.
+    ///
+    /// Review finding: a backlog can gain an eligible partition at
+    /// least as fast as the per-tick budget attempts one. That alone
+    /// never lets `next_resume` reset on its own. Each pass's own fresh
+    /// partition query grows a new eligible partition onto the tail.
+    /// That happens at the same rate the cursor advances toward it. So
+    /// "no partition left after the cursor, in THIS pass's own list"
+    /// never becomes true. A partition left behind once the cursor
+    /// passes it -- blocked by a transient owner-role gap or lock, say
+    /// -- is then skipped forever. That holds even after whatever
+    /// blocked it clears.
+    ///
+    /// The first pass of a catch-up cycle snapshots `now` as a FIXED
+    /// target and returns it here. The caller persists it the same way
+    /// it persists `next_resume`. It passes the target back as this
+    /// pass's own `catch_up_target` argument. Every later pass in the
+    /// cycle compares progress against that fixed instant, not its own
+    /// moving tail. The cycle is then guaranteed to finish in a bounded
+    /// number of ticks. That bound is proportional to the backlog size
+    /// AT THE MOMENT the cycle started, not however large the live
+    /// backlog grows meanwhile. `None` once the cursor reaches it, or
+    /// the pass reaches the true end of its own list first. The next
+    /// cycle, if one starts, snapshots a fresh target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catch_up_target: Option<DateTime<Utc>>,
 }
 
 // ── Layout detection ───────────────────────────────────────────────────────
@@ -629,18 +848,52 @@ pub async fn list_partitions(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<
         bound: String,
     }
 
-    let rows = diesel::sql_query(
-        "SELECT child.relname AS name,
-                pg_get_expr(child.relpartbound, child.oid) AS bound
-           FROM pg_inherits i
-           JOIN pg_class parent ON parent.oid = i.inhparent
-           JOIN pg_class child  ON child.oid  = i.inhrelid
-           JOIN pg_namespace n  ON n.oid = parent.relnamespace
-          WHERE parent.relname = 'harvest_events' AND n.nspname = current_schema()",
-    )
-    .load::<Row>(conn)
-    .await
-    .map_err(database_error)?;
+    // `pg_get_expr` renders a bound's timestamp literals in the session's
+    // `DateStyle`, not a fixed format — issue #1270 item 15. The parser
+    // below accepts only ISO year-first forms. A connection (or a pooler
+    // that inherited a non-default setting) using, say, `SQL, DMY` would
+    // parse every finite bound as `None`. Existing cohorts would then fail
+    // the exact-bound check. `ensure_partitions` would error on every tick,
+    // and the sweeper would treat bounded partitions as unbounded rather
+    // than reclaiming them. `SET LOCAL` inside an explicit transaction
+    // scopes the override to this one query, so it never leaks onto a
+    // pooled connection reused for something else afterward.
+    //
+    // Review finding: that scoping argument holds only when this call opens
+    // the outer transaction itself. Diesel implements a nested
+    // `.transaction()` as a `SAVEPOINT`, and `RELEASE SAVEPOINT` does not
+    // undo a `SET LOCAL` made inside it — only `ROLLBACK TO SAVEPOINT`
+    // does. A caller that already had `conn` inside a transaction would see
+    // `DateStyle` silently pinned to `ISO, MDY` for the rest of it. Capture
+    // the prior value first and restore it, inside this same savepoint,
+    // before returning.
+    let rows = Box::pin(conn.transaction::<Vec<Row>, HarvestError, _>(async |conn| {
+        let prior = diesel::sql_query("SELECT current_setting('DateStyle') AS v")
+            .get_result::<TextRow>(conn)
+            .await
+            .map_err(database_error)?
+            .v;
+        exec(conn, "SET LOCAL DateStyle = 'ISO, MDY'").await?;
+        let rows = diesel::sql_query(
+            "SELECT child.relname AS name,
+                    pg_get_expr(child.relpartbound, child.oid) AS bound
+               FROM pg_inherits i
+               JOIN pg_class parent ON parent.oid = i.inhparent
+               JOIN pg_class child  ON child.oid  = i.inhrelid
+               JOIN pg_namespace n  ON n.oid = parent.relnamespace
+              WHERE parent.relname = 'harvest_events' AND n.nspname = current_schema()",
+        )
+        .load::<Row>(conn)
+        .await
+        .map_err(database_error)?;
+        exec(
+            conn,
+            &format!("SET LOCAL DateStyle = '{}'", prior.replace('\'', "''")),
+        )
+        .await?;
+        Ok(rows)
+    }))
+    .await?;
 
     let mut out: Vec<PartitionInfo> = rows
         .into_iter()
@@ -894,26 +1147,62 @@ async fn cohort_partition_is_attached(
 /// This is what makes AC8's "no operator cron required" true: the retention
 /// runtime calls it every tick and at startup.
 ///
+/// Returns `(created, blocked)`. `blocked` names each cohort in the window
+/// that could not be carved out this pass. Causes include a generated name
+/// colliding with an unrelated relation, or a bounded lock attempt that ran
+/// out of time. This can happen even when the rest of the window was
+/// created successfully. A caller that only looks at `created` cannot tell
+/// "the window is fully covered" from "part of it is not". That is exactly
+/// the distinction an uncovered write range needs reported.
+///
 /// # Errors
 ///
-/// [`HarvestError::Database`] on a catalog or DDL failure.
+/// [`HarvestError::Database`] on a catalog or DDL failure, or when NONE of the
+/// window could be covered (every step blocked).
 #[cfg(feature = "db")]
 pub async fn ensure_partitions(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
     lookahead_cohorts: u32,
     lock_timeout: Duration,
-) -> HarvestResult<Vec<String>> {
+) -> HarvestResult<(Vec<String>, Vec<String>)> {
+    ensure_partitions_inner(conn, now, lookahead_cohorts, lock_timeout, None).await
+}
+
+/// Same as [`ensure_partitions`], but calls `progress` once per cohort this
+/// loop attempts.
+///
+/// Review finding: with `lookahead_cohorts` configured high and a long
+/// reader blocking every attempt, this loop can spend
+/// `lookahead_cohorts × lock_timeout` sequentially. That is long enough on
+/// its own to cross the liveness scanner's staleness threshold.
+/// `maintain_inner` uses this entry point, alongside the same pattern
+/// already used by [`drain_default_bounded_inner`] and [`sweep_inner`]. No
+/// phase of a maintenance pass then runs unbounded stretches with zero
+/// proof of life.
+#[cfg(feature = "db")]
+async fn ensure_partitions_inner(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+    lookahead_cohorts: u32,
+    lock_timeout: Duration,
+    mut progress: Option<&mut (dyn FnMut() + Send)>,
+) -> HarvestResult<(Vec<String>, Vec<String>)> {
     let width = match detect_layout(conn).await? {
-        EventLayout::Unpartitioned => return Ok(Vec::new()),
+        EventLayout::Unpartitioned => return Ok((Vec::new(), Vec::new())),
         EventLayout::Partitioned { cohort_width_secs } => cohort_width_secs,
     };
     let mut created = Vec::new();
     let mut blocked: Vec<String> = Vec::new();
+    let mut attempted = 0usize;
     for step in 0..=i64::from(lookahead_cohorts) {
         let Some(at) = now.checked_add_signed(chrono::Duration::seconds(width * step)) else {
             break;
         };
+        attempted += 1;
+        if let Some(cb) = &mut progress {
+            cb();
+        }
         match ensure_cohort_with_width(conn, at, width, lock_timeout).await {
             Ok((name, true)) => created.push(name),
             Ok((_, false)) => {}
@@ -943,17 +1232,21 @@ pub async fn ensure_partitions(
             }
         }
     }
-    if created.is_empty() && !blocked.is_empty() {
-        // Nothing at all could be covered — that is not a partial success, and
-        // the caller must record it rather than report an empty, healthy-looking
-        // maintenance pass.
+    if attempted > 0 && blocked.len() == attempted {
+        // EVERY cohort in this window was blocked. Not merely
+        // `created.is_empty()`. A prior pass's already-attached cohorts
+        // (`Ok((_, false))`) are tracked in neither `created` nor
+        // `blocked`. `created` can stay empty even when the window is
+        // nearly fully covered and only the newest cohort is blocked.
+        // That is a partial success, not the total failure this error
+        // reports.
         return Err(HarvestError::Database(format!(
             "no cohort partition could be created; appends will land in \
              {DEFAULT_PARTITION}. blocked cohorts: {}",
             blocked.join(", ")
         )));
     }
-    Ok(created)
+    Ok((created, blocked))
 }
 
 // ── Enabling the layout ────────────────────────────────────────────────────
@@ -1022,6 +1315,45 @@ pub async fn incompatible_publications(conn: &mut AsyncPgConnection) -> HarvestR
     Ok(rows.into_iter().map(|r| r.v).collect())
 }
 
+/// Publications that EXPLICITLY list `harvest_events` as a member, rather
+/// than covering it via `FOR ALL TABLES` or `FOR TABLES IN SCHEMA`.
+///
+/// Review finding: [`EnableOptions::allow_incompatible_publications`]
+/// documents its supported configuration as a `FOR ALL TABLES` publication,
+/// with the standby already running the partitioned layout. That
+/// publication resolves membership by name, at apply time, so it
+/// automatically covers the new parent the conversion creates. An explicit
+/// `FOR TABLE harvest_events` membership does not work the same way.
+/// Postgres pins it to the listed relation's OID. The conversion renames
+/// that relation to `harvest_events_legacy` and creates a brand new
+/// relation named `harvest_events`; the publication stays attached to the
+/// old one. The new parent, and every cohort partition created under it
+/// afterward, publish nothing, even with
+/// `publish_via_partition_root = true`. `allow_incompatible_publications`
+/// cannot cover this case, so callers must keep refusing on an explicit
+/// membership even when the operator has set that flag.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] on a catalog failure.
+#[cfg(feature = "db")]
+pub async fn explicitly_published_by(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
+    let rows = diesel::sql_query(
+        "SELECT DISTINCT p.pubname AS v
+           FROM pg_publication p
+           JOIN pg_publication_rel pr ON pr.prpubid = p.oid
+           JOIN pg_class c ON c.oid = pr.prrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = current_schema()
+            AND c.relname = 'harvest_events'
+          ORDER BY 1",
+    )
+    .load::<TextRow>(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows.into_iter().map(|r| r.v).collect())
+}
+
 /// Row-level security configured on the events table, if any.
 ///
 /// Returns the policy names, plus whether row security is enabled at all — a
@@ -1048,6 +1380,15 @@ pub async fn incompatible_publications(conn: &mut AsyncPgConnection) -> HarvestR
 /// is itself an exposure, so this reports what it found and leaves the decision
 /// with the operator, exactly as the publication guard does.
 ///
+/// Review finding: on a partitioned shard, `harvest_events` names only the
+/// parent. Postgres lets an operator enable row security or attach a
+/// policy directly on a LEAF partition instead. That configuration used
+/// to pass this check unnoticed, then `disable_partitioning`'s copy-and-
+/// `DROP ... CASCADE` silently dropped the protection along with the
+/// leaf it was attached to. Matching the parent's direct children too
+/// closes that gap, the same way [`dependent_views`] and
+/// [`operator_triggers`] already do.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] if either catalog query fails.
@@ -1060,7 +1401,17 @@ pub async fn row_security_config(
         "SELECT COALESCE(bool_or(c.relrowsecurity OR c.relforcerowsecurity), false) AS v
            FROM pg_class c
            JOIN pg_namespace n ON n.oid = c.relnamespace
-          WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()",
+          WHERE n.nspname = current_schema()
+            AND (
+                c.relname = 'harvest_events'
+                OR c.oid IN (
+                    SELECT i.inhrelid
+                      FROM pg_inherits i
+                      JOIN pg_class parent ON parent.oid = i.inhparent
+                      JOIN pg_namespace pn ON pn.oid = parent.relnamespace
+                     WHERE parent.relname = 'harvest_events' AND pn.nspname = current_schema()
+                )
+            )",
     )
     .await?;
     let policies = diesel::sql_query(
@@ -1068,7 +1419,17 @@ pub async fn row_security_config(
            FROM pg_policy p
            JOIN pg_class c ON c.oid = p.polrelid
            JOIN pg_namespace n ON n.oid = c.relnamespace
-          WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
+          WHERE n.nspname = current_schema()
+            AND (
+                c.relname = 'harvest_events'
+                OR c.oid IN (
+                    SELECT i.inhrelid
+                      FROM pg_inherits i
+                      JOIN pg_class parent ON parent.oid = i.inhparent
+                      JOIN pg_namespace pn ON pn.oid = parent.relnamespace
+                     WHERE parent.relname = 'harvest_events' AND pn.nspname = current_schema()
+                )
+            )
           ORDER BY 1",
     )
     .load::<TextRow>(conn)
@@ -1108,6 +1469,864 @@ async fn refuse_if_row_security(conn: &mut AsyncPgConnection, verb: &str) -> Har
          automatically is not offered because replaying one wrongly is the same exposure by \
          another route. Drop the policies (and DISABLE ROW LEVEL SECURITY) if they are \
          obsolete, or reproduce them on the converted layout by hand afterwards."
+    )))
+}
+
+/// The `NOT EXISTS (...)` fragment that exempts harvest's own two
+/// constraints from the unique-index refusal below. The direct path, the
+/// scripted plan, and their respective in-lock rechecks all share it, so
+/// the four copies of that refusal cannot drift apart.
+///
+/// Review finding: naming these two constraints was not enough on its
+/// own. An operator's own constraint could reuse one of these two
+/// conventional names. Say, a replacement for
+/// `harvest_events_workflow_exec_id_event_id_key` defined as `UNIQUE
+/// (event_type)`. Name-only matching treated that as harvest-owned. Its
+/// real index would then be excluded from replay. The hard-coded `ADD
+/// CONSTRAINT` step would recreate HARVEST's shape under that name
+/// instead, silently discarding the operator's own uniqueness guarantee.
+/// Verifying `contype` and the exact ordered key columns closes that
+/// gap. Only a constraint shaped exactly like harvest's own pkey
+/// (`(id)`) or unique key (`(workflow_exec_id, event_id)`) is exempt
+/// now. An impostor of the same name no longer qualifies.
+///
+/// Review finding: `contype` and the key columns are not the whole
+/// shape. Harvest's own two constraints are plain, immediate ones — the
+/// migration that creates them names neither `DEFERRABLE` nor `INITIALLY
+/// DEFERRED`. A `DEFERRABLE` replacement of the same name, type and
+/// columns still passed this check. Conversion then silently swapped it
+/// for an immediate constraint, breaking any transaction that relied on
+/// deferring the uniqueness check. `con.condeferrable` is checked
+/// directly now, closing that gap the same way `contype` closed the
+/// name-only one.
+///
+/// Review finding: key columns are still not the whole backing-index
+/// shape. An operator can build `harvest_events_pkey PRIMARY KEY (id)
+/// INCLUDE (workflow_exec_id)` -- key columns, type and deferrability
+/// all match harvest's own. The `INCLUDEd` column does not. That index
+/// still qualified. `capture_index_defs` then excludes it from replay,
+/// same as any other constraint-backed index. Conversion recreates
+/// only harvest's plain constraint in its place. That silently
+/// discards the `INCLUDEd` column and the index-only-scan behavior it
+/// existed for. `i.indnatts = i.indnkeyatts` requires zero `INCLUDEd`
+/// columns.
+///
+/// Harvest's own two constraints also never specify a non-default
+/// opclass or a descending key column. A table constraint's `UNIQUE`
+/// or `PRIMARY KEY` clause cannot name one directly. Either can only
+/// arise via `ADD CONSTRAINT ... USING INDEX` against a hand-built
+/// index. The opclass and sort-order checks close that route too.
+const HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL: &str = "NOT EXISTS (\n                SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid\n                  AND NOT con.condeferrable\n                  AND i.indnatts = i.indnkeyatts\n                  AND NOT EXISTS (\n                          SELECT 1 FROM unnest(i.indclass) AS oc(opclass)\n                            JOIN pg_opclass op ON op.oid = oc.opclass\n                           WHERE NOT op.opcdefault\n                      )\n                  AND NOT EXISTS (\n                          SELECT 1 FROM unnest(i.indoption) AS o(bits) WHERE bits <> 0\n                      )\n                  AND (\n                      (con.conname = 'harvest_events_pkey' AND con.contype = 'p'\n                       AND (SELECT array_agg(a.attname::text ORDER BY k)\n                              FROM generate_series(0, i.indnkeyatts - 1) k\n                              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]\n                           ) = ARRAY['id'])\n                      OR\n                      (con.conname = 'harvest_events_workflow_exec_id_event_id_key' AND con.contype = 'u'\n                       AND (SELECT array_agg(a.attname::text ORDER BY k)\n                              FROM generate_series(0, i.indnkeyatts - 1) k\n                              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]\n                           ) = ARRAY['workflow_exec_id', 'event_id'])\n                  )\n            )";
+
+/// User-defined unique indexes on `harvest_events` that cannot survive
+/// conversion unchanged: either missing `cohort`, or backed by a
+/// constraint the replay step cannot carry forward.
+///
+/// Excludes only the two constraint-backed indexes the enable script itself
+/// owns and replaces: `harvest_events_pkey` and
+/// `harvest_events_workflow_exec_id_event_id_key`, both of which add
+/// `cohort` explicitly.
+///
+/// Review finding: naming harvest's own two constraints explicitly (rather
+/// than exempting every constraint-backed index) closed one gap, but left
+/// another. `capture_index_defs` skips every constraint-backed index
+/// unconditionally. It does this regardless of whether the index carries
+/// `cohort`. An operator's own compatible constraint, say `UNIQUE
+/// (external_id, cohort)`, now passes THIS check, since cohort is
+/// present. It is still silently dropped by that replay step. No code
+/// path recreates any constraint but harvest's own two. Flagging every
+/// non-harvest constraint-backed index here, regardless of `cohort`,
+/// closes that gap. There is no support for replaying an arbitrary
+/// constraint, so any operator constraint refuses the conversion rather
+/// than being silently lost.
+///
+/// **Why an ordinary index without `cohort` blocks the conversion.**
+/// Postgres requires the partition key in every unique index on a
+/// partitioned table. `capture_index_defs` replays every non-constraint
+/// index verbatim onto the new parent. A unique index that predates
+/// partitioning and does not carry `cohort` is a perfectly ordinary index
+/// on the flat layout. It makes `CREATE UNIQUE INDEX` fail once the parent
+/// is partitioned.
+///
+/// Checked against only the first `indnkeyatts` entries of `indkey` — the
+/// true key columns. An `INCLUDE`d column does not participate in
+/// uniqueness. `cohort` sitting there does not satisfy the requirement,
+/// even though it is present in the wider `indkey` array.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] if the catalog query fails.
+#[cfg(feature = "db")]
+pub async fn unique_indexes_missing_cohort(
+    conn: &mut AsyncPgConnection,
+) -> HarvestResult<Vec<String>> {
+    let rows = diesel::sql_query(format!(
+        "SELECT i.indexrelid::regclass::text AS v
+           FROM pg_index i
+           JOIN pg_class c ON c.oid = i.indrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+           JOIN pg_attribute cohort_attr
+             ON cohort_attr.attrelid = c.oid AND cohort_attr.attname = 'cohort'
+          WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
+            AND i.indisunique
+            AND {HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL}
+            AND (
+                EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)
+                OR NOT EXISTS (
+                    SELECT 1 FROM generate_series(0, i.indnkeyatts - 1) k
+                     WHERE i.indkey[k] = cohort_attr.attnum
+                )
+            )
+          ORDER BY 1"
+    ))
+    .load::<TextRow>(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows.into_iter().map(|r| r.v).collect())
+}
+
+/// The refusal [`enable_partitioning`] and the scripted plan share.
+///
+/// Detected before anything mutates, exactly like the row-security and
+/// publication guards. A mid-conversion `duplicate_object` /
+/// `insufficient columns in UNIQUE constraint definition` from Postgres
+/// names neither the index nor why it is unsupported.
+#[cfg(feature = "db")]
+async fn refuse_if_unique_index_without_cohort(
+    conn: &mut AsyncPgConnection,
+    verb: &str,
+) -> HarvestResult<()> {
+    let bad = unique_indexes_missing_cohort(conn).await?;
+    if bad.is_empty() {
+        return Ok(());
+    }
+    Err(HarvestError::Config(format!(
+        "refusing to {verb} harvest_events: {} that cannot survive conversion unchanged \
+         ({}). Either it does not include `cohort` — Postgres requires the partition key \
+         in every unique index on a partitioned table, so replaying it onto the \
+         partitioned parent would fail — or it is backed by a table constraint other \
+         than harvest's own PRIMARY KEY and (workflow_exec_id, event_id) UNIQUE \
+         constraint, which the conversion has no way to replay and would otherwise drop \
+         silently. Adding `cohort` to a plain index is not offered automatically: \
+         `cohort` is the row's append instant, so a unique index that spans it is weaker \
+         than the index is today — exactly the reason the engine's own (workflow_exec_id, \
+         event_id) uniqueness moved into the insert trigger rather than a wider \
+         constraint. Drop the index or constraint if it is obsolete, or recreate it \
+         including `cohort` yourself if that weaker guarantee is acceptable for your use \
+         of it.",
+        if bad.len() == 1 {
+            "it carries a unique index"
+        } else {
+            "it carries unique indexes"
+        },
+        bad.join(", ")
+    )))
+}
+
+/// Operator-added unique indexes on the still-partitioned
+/// `harvest_events` parent, or on one of its leaf partitions. Each is
+/// either constraint-backed, or a plain index independently created on
+/// one leaf.
+///
+/// None of these survive: `capture_index_defs` cannot replay them onto
+/// the flat table [`disable_partitioning`] rebuilds.
+///
+/// Review finding: [`unique_indexes_missing_cohort`] runs only from
+/// [`enable_partitioning`]'s preflight, against the still-flat table.
+/// `disable_partitioning` had no equivalent check at all. Take an
+/// operator's own compatible constraint-backed unique index --
+/// `UNIQUE (external_id, cohort)`, say. It silently disappears the same
+/// way on the way back. `capture_index_defs` excludes every
+/// constraint-backed index unconditionally, and no replay step recreates
+/// any constraint but harvest's own two.
+///
+/// The "missing `cohort`" half of that sibling check does not apply here.
+/// Postgres itself already requires the partition key in every unique
+/// index on a partitioned table. Every candidate this query could find
+/// already carries it. What still needs excluding is harvest's own two
+/// constraints. Both are shaped one column wider here than on the flat
+/// layout. The partitioned parent's own primary key and unique
+/// constraint always carry `cohort` too.
+///
+/// Review finding: also checked on every leaf partition, not only the
+/// parent. Postgres lets an operator add a `UNIQUE` or primary-key
+/// constraint directly to one leaf, independent of the parent's own.
+/// The same exclusion, at leaf scope, would silently drop it. A leaf's
+/// own copy of the PARENT's harvest-owned constraint is different,
+/// though. It is `pg_constraint`-propagated, linked back to the parent
+/// row through `conparentid` -- a link an independently added leaf
+/// constraint never carries.
+///
+/// Review finding: the leaf-scope exclusion above required a backing
+/// `pg_constraint` row before a leaf index was even a candidate. A
+/// plain `CREATE UNIQUE INDEX` an operator adds directly on one leaf
+/// carries no such row. No `ADD CONSTRAINT` is involved, so it was
+/// never examined at all. `capture_index_defs` reads only the parent's
+/// own indexes. Reverting drops every leaf outright. That index would
+/// vanish silently. Candidacy no longer requires a constraint.
+///
+/// What still needs excluding is a leaf index Postgres itself built,
+/// not one an operator added independently. Attaching a partition
+/// gives its matching local index its own `pg_inherits` row.
+/// `inhrelid` names the leaf index; `inhparent` names the parent's.
+/// This is the same mechanism `pg_inherits` uses for tables, one level
+/// down. It covers a constraint-backed propagated index and a plain
+/// propagated one alike. This is proven empirically: both carry that
+/// row. An independently-added leaf index carries neither it nor a
+/// `pg_constraint` row. A propagated index is already covered by the
+/// parent's own capture. Only an unlinked leaf index is this module's
+/// to refuse.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] if the catalog query fails.
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
+pub async fn constraint_backed_unique_indexes_on_partitioned_parent(
+    conn: &mut AsyncPgConnection,
+) -> HarvestResult<Vec<String>> {
+    let rows = diesel::sql_query(format!(
+        "SELECT DISTINCT i.indexrelid::regclass::text AS v
+           FROM pg_index i
+           JOIN pg_class c ON c.oid = i.indrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = current_schema()
+            AND (
+                c.relname = 'harvest_events'
+                OR c.oid IN (
+                    SELECT leaf.inhrelid
+                      FROM pg_inherits leaf
+                      JOIN pg_class parent ON parent.oid = leaf.inhparent
+                      JOIN pg_namespace pn ON pn.oid = parent.relnamespace
+                     WHERE parent.relname = 'harvest_events' AND pn.nspname = current_schema()
+                )
+            )
+            AND i.indisunique
+            AND (
+                -- A plain (non-constraint-backed) index on the PARENT
+                -- itself is not a candidate at all: `capture_index_defs`
+                -- reads and replays every one of those unconditionally,
+                -- unique or not, so it already survives a revert. Only a
+                -- constraint-backed one on the parent needs excluding
+                -- below. A leaf is different: `capture_index_defs` never
+                -- reads a leaf's indexes, constraint-backed or plain, so
+                -- every unique one there is a candidate.
+                c.relname <> 'harvest_events'
+                OR EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)
+            )
+            AND NOT (
+                -- On the parent itself: harvest's own two, by exact name
+                -- and shape, backed by a never-DEFERRABLE table constraint.
+                --
+                -- Review finding: this revert-path predicate is separate
+                -- from [`HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL`]. It
+                -- checked only name, type and key columns. An operator
+                -- can recreate either reserved constraint with an
+                -- INCLUDEd column, a non-default opclass, or a
+                -- descending column, and still pass. `capture_index_defs`
+                -- excludes a constraint-backed index, so
+                -- `disable_partitioning` would then recreate only the
+                -- plain built-in constraint, discarding the operator's
+                -- extra index properties. The checks added below match
+                -- the same rigor [`HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL`]
+                -- already applies.
+                c.relname = 'harvest_events'
+                AND EXISTS (
+                    SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid
+                      AND NOT con.condeferrable
+                      AND i.indnatts = i.indnkeyatts
+                      AND NOT EXISTS (
+                              SELECT 1 FROM unnest(i.indclass) AS oc(opclass)
+                                JOIN pg_opclass op ON op.oid = oc.opclass
+                               WHERE NOT op.opcdefault
+                          )
+                      AND NOT EXISTS (
+                              SELECT 1 FROM unnest(i.indoption) AS o(bits) WHERE bits <> 0
+                          )
+                      AND (
+                          (con.conname = 'harvest_events_pkey' AND con.contype = 'p'
+                           AND (SELECT array_agg(a.attname::text ORDER BY k)
+                                  FROM generate_series(0, i.indnkeyatts - 1) k
+                                  JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
+                               ) = ARRAY['id', 'cohort'])
+                          OR
+                          (con.conname = 'harvest_events_workflow_exec_id_event_id_key' AND con.contype = 'u'
+                           AND (SELECT array_agg(a.attname::text ORDER BY k)
+                                  FROM generate_series(0, i.indnkeyatts - 1) k
+                                  JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
+                               ) = ARRAY['workflow_exec_id', 'event_id', 'cohort'])
+                      )
+                )
+            )
+            AND NOT (
+                -- On a leaf: propagated from the parent's own index --
+                -- constraint-backed or plain alike -- rather than added
+                -- independently on the leaf itself.
+                c.relname <> 'harvest_events'
+                AND EXISTS (SELECT 1 FROM pg_inherits ii WHERE ii.inhrelid = i.indexrelid)
+            )
+            AND NOT (
+                -- Harvest's own two plain indexes on the legacy partition
+                -- itself, by exact name and shape: phase 2 (and
+                -- `enable_sql`'s direct-path equivalent) builds these so
+                -- `ATTACH PARTITION` can validate the parent's PK and
+                -- unique constraint against an existing index instead of
+                -- scanning. Neither backs a constraint on the legacy
+                -- table -- the constraint they once backed there was
+                -- dropped along with the rest of the flat layout -- and
+                -- neither is `pg_inherits`-linked, since they were never
+                -- attached to a parent-level partitioned index.
+                --
+                -- Re-running the plan over an already-converted shard
+                -- renames every index still occupying its original name
+                -- on the legacy partition, this pair included, gaining
+                -- the suffix `{LEGACY_RENAME_SUFFIX}`. Both the plain
+                -- and the renamed form are exempt here, the same way the
+                -- cohort `CHECK` exemption treats its own reserved name.
+                --
+                -- Review finding: matched by name and key columns alone.
+                -- An operator's own index can occupy one of these two
+                -- reserved names with the same key columns, yet differ
+                -- in a way `ATTACH PARTITION` still cares about: a
+                -- predicate, an expression, a non-default opclass, a
+                -- descending column, `NULLS NOT DISTINCT`, or an
+                -- INCLUDEd column. Exempting it on name and columns
+                -- alone would let `disable_partitioning` proceed, and
+                -- the operator's index would vanish, unreplayed, when
+                -- the reverted flat table's `DROP TABLE ... CASCADE`
+                -- removes the legacy partition. The checks below match
+                -- the full shape rigor `index_shape_check_sql` and the
+                -- phase-2 invalid-index cleanup already apply before
+                -- trusting one of these reserved names.
+                c.relname = '{LEGACY_PARTITION}'
+                AND (
+                    (i.indexrelid::regclass::text IN
+                         ('{LEGACY_PARTITION}_pk_idx', '{LEGACY_PARTITION}_pk_idx{LEGACY_RENAME_SUFFIX}')
+                     AND i.indpred IS NULL AND i.indexprs IS NULL
+                     AND i.indnkeyatts = 2 AND i.indnatts = 2
+                     AND (SELECT relam FROM pg_class WHERE oid = i.indexrelid)
+                         = (SELECT oid FROM pg_am WHERE amname = 'btree')
+                     AND pg_get_indexdef(i.indexrelid) NOT ILIKE '%NULLS NOT DISTINCT%'
+                     AND NOT EXISTS (
+                             SELECT 1 FROM unnest(i.indclass) AS oc(opclass)
+                               JOIN pg_opclass op ON op.oid = oc.opclass
+                              WHERE NOT op.opcdefault
+                         )
+                     AND NOT EXISTS (
+                             SELECT 1 FROM unnest(i.indoption) AS o(bits) WHERE bits <> 0
+                         )
+                     AND (SELECT array_agg(a.attname::text ORDER BY k)
+                            FROM generate_series(0, i.indnkeyatts - 1) k
+                            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
+                         ) = ARRAY['id', 'cohort'])
+                    OR
+                    (i.indexrelid::regclass::text IN
+                         ('{LEGACY_PARTITION}_exec_event_idx', '{LEGACY_PARTITION}_exec_event_idx{LEGACY_RENAME_SUFFIX}')
+                     AND i.indpred IS NULL AND i.indexprs IS NULL
+                     AND i.indnkeyatts = 3 AND i.indnatts = 3
+                     AND (SELECT relam FROM pg_class WHERE oid = i.indexrelid)
+                         = (SELECT oid FROM pg_am WHERE amname = 'btree')
+                     AND pg_get_indexdef(i.indexrelid) NOT ILIKE '%NULLS NOT DISTINCT%'
+                     AND NOT EXISTS (
+                             SELECT 1 FROM unnest(i.indclass) AS oc(opclass)
+                               JOIN pg_opclass op ON op.oid = oc.opclass
+                              WHERE NOT op.opcdefault
+                         )
+                     AND NOT EXISTS (
+                             SELECT 1 FROM unnest(i.indoption) AS o(bits) WHERE bits <> 0
+                         )
+                     AND (SELECT array_agg(a.attname::text ORDER BY k)
+                            FROM generate_series(0, i.indnkeyatts - 1) k
+                            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k]
+                         ) = ARRAY['workflow_exec_id', 'event_id', 'cohort'])
+                )
+            )
+            AND NOT (
+                -- A plain leaf index whose SHAPE already exists on the
+                -- parent is the residual of the rename-to-free-a-name
+                -- step above. `enable` renames every index still on the
+                -- legacy partition, indiscriminately -- not only
+                -- harvest's own two -- so it also catches every plain
+                -- index an operator had directly on the flat table
+                -- before conversion. That index's definition was
+                -- captured and replayed onto the new parent under its
+                -- ORIGINAL, unsuffixed name before the rename ran, so a
+                -- shape-identical index already exists there.
+                --
+                -- Review finding: matching by stripping
+                -- `{LEGACY_RENAME_SUFFIX}` off the renamed name and
+                -- looking for that exact name on the parent assumed the
+                -- rename was always `original || suffix`.
+                -- `bounded_rename_fn_sql` does not promise that: a name
+                -- near the 63-byte limit gets truncated first, and a
+                -- collision (with another renamed sibling sharing the
+                -- truncated prefix) gets a numeric disambiguator spliced
+                -- in before the suffix, so the renamed name need not
+                -- contain the original at all. Comparing the SHAPE
+                -- instead -- `pg_get_indexdef` with the leading
+                -- `CREATE [UNIQUE] INDEX <name> ON [ONLY] <table>`
+                -- stripped, so only `USING ... (columns) [INCLUDE (...)]
+                -- [WHERE ...]` remains -- sidesteps naming entirely.
+                -- `ONLY` is Postgres's own marker that a plain index
+                -- created directly on a partitioned parent does not
+                -- recurse to its partitions, and it is present only on
+                -- that parent-side rendering, never on the leaf's own,
+                -- so it has to be stripped too or an otherwise-identical
+                -- pair never matches. It is also strictly safe on its
+                -- own: if a shape-identical index
+                -- already survives on the parent, that index alone
+                -- already carries forward whatever invariant either one
+                -- enforced, so a leaf-only duplicate is never anything
+                -- to lose, residual or not.
+                --
+                -- Review finding: the stripped name and table tokens must
+                -- be quote-aware, not a bare run of non-space characters.
+                -- A legal quoted identifier can contain whitespace, for
+                -- example a column named customer key, quoted.
+                -- pg_get_indexdef renders that quote intact. A bare non-space
+                -- run stops at the first space inside it, so the prefix
+                -- is stripped short and the leftover fragment differs
+                -- between the two sides even when the shapes match. The
+                -- comparison then reports a false mismatch, and
+                -- disable_partitioning refuses a revert that a
+                -- plain-named index would pass. The pattern instead
+                -- matches a whole quoted identifier, doubled internal
+                -- quotes included, or a whole run of non-quote
+                -- non-space characters.
+                --
+                -- Review finding: this branch never checked that the
+                -- candidate leaf index itself carries no constraint.
+                -- An operator can add a real `UNIQUE` constraint
+                -- directly to `{LEGACY_PARTITION}`. Its backing index
+                -- can coincidentally share its shape with a plain
+                -- index harvest already replayed onto the parent for
+                -- an unrelated reason. That coincidence is not the
+                -- rename residual this branch exists to recognize.
+                -- The candidate is a real constraint the operator
+                -- still wants, and exempting it here means
+                -- `capture_index_defs` -- which only ever replays
+                -- plain indexes -- drops both the index and the
+                -- constraint behind it when the legacy partition is
+                -- later dropped. `NOT EXISTS (pg_constraint)` limits
+                -- this branch to genuinely constraint-free candidates,
+                -- the only shape a rename residual can ever have.
+                c.relname = '{LEGACY_PARTITION}'
+                AND NOT EXISTS (
+                    SELECT 1 FROM pg_constraint con2 WHERE con2.conindid = i.indexrelid
+                )
+                AND EXISTS (
+                    SELECT 1
+                      FROM pg_index i2
+                      JOIN pg_class c2 ON c2.oid = i2.indrelid
+                      JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+                     WHERE c2.relname = 'harvest_events'
+                       AND n2.nspname = current_schema()
+                       AND regexp_replace(
+                               pg_get_indexdef(i2.indexrelid),
+                               '^CREATE (UNIQUE )?INDEX (?:\"(?:[^\"]|\"\")*\"|[^\\s\"]+) ON (ONLY )?(?:\"(?:[^\"]|\"\")*\"|[^\\s\"]+) ', '\\1'
+                           )
+                         = regexp_replace(
+                               pg_get_indexdef(i.indexrelid),
+                               '^CREATE (UNIQUE )?INDEX (?:\"(?:[^\"]|\"\")*\"|[^\\s\"]+) ON (ONLY )?(?:\"(?:[^\"]|\"\")*\"|[^\\s\"]+) ', '\\1'
+                           )
+                )
+            )
+          ORDER BY 1"
+    ))
+    .load::<TextRow>(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows.into_iter().map(|r| r.v).collect())
+}
+
+/// The refusal [`disable_partitioning`] makes, both before its transaction
+/// opens and again once it holds the revert lock.
+#[cfg(feature = "db")]
+async fn refuse_if_constraint_backed_unique_index_on_revert(
+    conn: &mut AsyncPgConnection,
+) -> HarvestResult<()> {
+    let bad = constraint_backed_unique_indexes_on_partitioned_parent(conn).await?;
+    if bad.is_empty() {
+        return Ok(());
+    }
+    Err(HarvestError::Config(format!(
+        "refusing to revert harvest_events: {} that cannot survive conversion unchanged \
+         ({}). Each is either backed by a table constraint other than harvest's own \
+         PRIMARY KEY and (workflow_exec_id, event_id) UNIQUE constraint, or an \
+         independently created index on one leaf partition with no such constraint at \
+         all. Either way the conversion has no way to replay it, so it would otherwise be \
+         dropped silently along with the leaf it sits on. Drop the index or constraint \
+         (and recreate it on the flat table yourself afterward, if it is still needed) to \
+         proceed.",
+        if bad.len() == 1 {
+            "it carries a unique index"
+        } else {
+            "it carries unique indexes"
+        },
+        bad.join(", ")
+    )))
+}
+
+/// Views, including materialized views, that depend on `harvest_events` or
+/// on one of its leaf partitions.
+///
+/// **Why this blocks the conversion.** Postgres records a view's dependency
+/// by relation OID, not by name — a materialized view the same way as an
+/// ordinary one. Both conversion directions rename `harvest_events` out of
+/// the way, then create the replacement under the original name. A
+/// dependent view keeps pointing at the RENAMED relation. On the populated
+/// path, that relation is thereafter only the pre-cutover partition. The
+/// view keeps returning rows. It silently stops returning any row appended
+/// after the conversion. On the empty-table path the rename target is
+/// dropped outright. The dependency makes that `DROP` fail instead —
+/// safer, but still not loud about the cause.
+///
+/// Review finding: on a partitioned shard, `harvest_events` names only the
+/// parent. A view can depend directly on a LEAF partition instead — Postgres
+/// allows querying one by name like any other table. That view used to pass
+/// this check unnoticed, then `disable_partitioning`'s `DROP ... CASCADE`
+/// took the leaf, and the view with it. Matching the parent's direct
+/// children too closes that gap.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] if the catalog query fails.
+#[cfg(feature = "db")]
+pub async fn dependent_views(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
+    let rows = diesel::sql_query(
+        "SELECT DISTINCT (v_ns.nspname || '.' || v.relname) AS v
+           FROM pg_depend d
+           JOIN pg_rewrite r ON r.oid = d.objid
+           JOIN pg_class v ON v.oid = r.ev_class
+           JOIN pg_namespace v_ns ON v_ns.oid = v.relnamespace
+           JOIN pg_class t ON t.oid = d.refobjid
+           JOIN pg_namespace t_ns ON t_ns.oid = t.relnamespace
+          WHERE t_ns.nspname = current_schema()
+            AND (
+                t.relname = 'harvest_events'
+                OR t.oid IN (
+                    SELECT i.inhrelid
+                      FROM pg_inherits i
+                      JOIN pg_class parent ON parent.oid = i.inhparent
+                      JOIN pg_namespace pn ON pn.oid = parent.relnamespace
+                     WHERE parent.relname = 'harvest_events' AND pn.nspname = current_schema()
+                )
+            )
+            AND v.relkind IN ('v', 'm')
+          ORDER BY 1",
+    )
+    .load::<TextRow>(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows.into_iter().map(|r| r.v).collect())
+}
+
+/// The refusal both conversion directions share.
+#[cfg(feature = "db")]
+async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> HarvestResult<()> {
+    let views = dependent_views(conn).await?;
+    if views.is_empty() {
+        return Ok(());
+    }
+    Err(HarvestError::Config(format!(
+        "refusing to {verb} harvest_events: {} depend on it ({}). Postgres tracks a view's \
+         dependency by relation OID, not by name, and the conversion renames harvest_events \
+         out of the way and creates the replacement under the original name — so a dependent \
+         view would keep pointing at the OLD relation, silently returning fewer rows than it \
+         should from the moment this commits, rather than failing loudly. Recreating the \
+         view automatically is not offered: `CREATE OR REPLACE VIEW` cannot change its \
+         column list, and this module cannot know whether that is safe for yours. Drop the \
+         view first (and recreate it against harvest_events afterward) to proceed.",
+        if views.len() == 1 { "a view" } else { "views" },
+        views.join(", ")
+    )))
+}
+
+/// Operator-installed `CHECK`, foreign-key and exclusion constraints on
+/// `harvest_events` or on one of its leaf partitions.
+///
+/// Harvest itself creates exactly one foreign key on `harvest_events` --
+/// `harvest_events_workflow_exec_id_fkey`, `(workflow_exec_id)` referencing
+/// `harvest_workflow_executions(id)` `ON DELETE CASCADE` -- alongside the
+/// primary key and the `workflow_exec_id, event_id` unique constraint. All
+/// three are handled and replayed by name elsewhere in this module, and are
+/// excluded here by name, type and exact shape.
+///
+/// Harvest also creates exactly one `CHECK` constraint of its own:
+/// `{LEGACY_PARTITION}_cohort_ck` (`CHECK (cohort < cutover)`), added
+/// `NOT VALID` then validated so `ATTACH PARTITION` can skip its own
+/// full-table scan. It stays behind afterward, on whichever relation
+/// carries the pre-cutover rows at the time. That is `harvest_events`
+/// itself during the online path's phase 3, [`LEGACY_PARTITION`] from
+/// phase 4 onward.
+///
+/// A re-run of the plan over an already-converted shard renames every
+/// constraint the bounded-rename loop finds still occupying its
+/// original name. This one is included, and gains the suffix
+/// `{LEGACY_RENAME_SUFFIX}`. Unlike the primary key, unique and
+/// foreign-key constraints, it is never explicitly dropped afterward
+/// under that renamed name. It can persist that way indefinitely. Both
+/// the plain and the renamed form
+/// are excluded here, by name, type and column.
+///
+/// Every other constraint this query finds is an operator's own.
+///
+/// **Why this blocks the conversion.** `CREATE TABLE ... (LIKE ...)`
+/// carries none of the three, and both conversion directions build the
+/// replacement relation that way. A `CHECK`, foreign-key or exclusion
+/// invariant an operator added would silently stop applying to every row
+/// appended after cutover, with nothing reporting the loss. Recreating it
+/// automatically is not offered. A foreign key's target table, a `CHECK`
+/// expression's intended semantics, and an exclusion constraint's operator
+/// class and predicate are not this module's to guess.
+///
+/// Review finding: an exclusion constraint is index-backed like a unique
+/// or primary-key constraint, but `indisunique` is false for one, so
+/// [`refuse_if_unique_index_without_cohort`] never sees it. It is exactly
+/// as unreplayable as a `CHECK` or foreign key, though: `capture_index_defs`
+/// excludes every constraint-backed index unconditionally, this one
+/// included.
+///
+/// Unique and primary-key constraints are deliberately excluded here: every
+/// one is backed by an index, so [`refuse_if_unique_index_without_cohort`]
+/// already covers them.
+///
+/// Review finding: name alone does not identify harvest's own foreign key.
+/// An operator's own foreign key could reuse the reserved name
+/// `harvest_events_workflow_exec_id_fkey` on different columns, a different
+/// target, or a different `ON DELETE`/`ON UPDATE` action. Name-only
+/// matching would exempt it as harvest-owned, and it would then be
+/// silently dropped just like an unnamed one. The exemption below also
+/// verifies the local column (`workflow_exec_id`) and the referenced
+/// table and column (`harvest_workflow_executions(id)`). It verifies
+/// `ON DELETE CASCADE` (`confdeltype = 'c'`), the built-in `ON UPDATE NO
+/// ACTION` (`confupdtype = 'a'`), and that it is not `DEFERRABLE`, too.
+/// That is the same shape-over-name-alone rigor
+/// [`HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL`] already applies to the
+/// primary key and unique constraint.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] if the catalog query fails.
+#[cfg(feature = "db")]
+pub async fn unreplayable_constraints(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
+    // Review finding: the cohort-`CHECK` exemption below used to accept
+    // any same-shaped bound on `{LEGACY_PARTITION}` too, not only on
+    // `harvest_events`. The enable-side preflight cannot do this: the
+    // real cutover is not chosen yet there. This relation is different.
+    // It already carries its own attached upper bound once it exists as
+    // a partition. [`list_partitions`] already parses that bound
+    // robustly (issue
+    // #1270 item 15's `DateStyle` fix). Read here so the exemption can
+    // require an exact match against it, the same way
+    // [`expected_cohort_ck_def_sql`]'s other callers do once they know
+    // the real value. `None` when `harvest_events` is not yet
+    // partitioned. This relation cannot carry the constraint at all
+    // then. The `harvest_events`-named branch below, still shape-only,
+    // is the only one that can ever match.
+    let legacy_upper = list_partitions(conn)
+        .await?
+        .into_iter()
+        .find(|p| p.name == LEGACY_PARTITION)
+        .and_then(|p| p.upper);
+    let legacy_cohort_ck_clause = legacy_upper.map_or_else(
+        || "false".to_string(),
+        |upper| {
+            let expected =
+                expected_cohort_ck_def_sql(&format!("{}::timestamptz", ts_literal(upper)));
+            format!(
+                "(t.relname = '{LEGACY_PARTITION}'
+                  AND pg_get_constraintdef(con.oid) IN ({expected}, {expected} || ' NOT VALID'))"
+            )
+        },
+    );
+    let rows = diesel::sql_query(format!(
+        "SELECT DISTINCT con.conname AS v
+           FROM pg_constraint con
+           JOIN pg_class t ON t.oid = con.conrelid
+           JOIN pg_namespace n ON n.oid = t.relnamespace
+          WHERE n.nspname = current_schema()
+            AND (
+                t.relname = 'harvest_events'
+                OR t.oid IN (
+                    SELECT i.inhrelid
+                      FROM pg_inherits i
+                      JOIN pg_class parent ON parent.oid = i.inhparent
+                      JOIN pg_namespace pn ON pn.oid = parent.relnamespace
+                     WHERE parent.relname = 'harvest_events' AND pn.nspname = current_schema()
+                )
+            )
+            AND con.contype IN ('c', 'f', 'x')
+            AND NOT (
+                con.conname = 'harvest_events_workflow_exec_id_fkey'
+                AND con.contype = 'f'
+                AND NOT con.condeferrable
+                AND con.confdeltype = 'c'
+                AND con.confupdtype = 'a'
+                AND con.confrelid = 'harvest_workflow_executions'::regclass
+                AND (SELECT array_agg(a.attname::text ORDER BY k)
+                       FROM generate_subscripts(con.conkey, 1) k
+                       JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]
+                    ) = ARRAY['workflow_exec_id']
+                AND (SELECT array_agg(a.attname::text ORDER BY k)
+                       FROM generate_subscripts(con.confkey, 1) k
+                       JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = con.confkey[k]
+                    ) = ARRAY['id']
+            )
+            AND NOT (
+                con.conname IN (
+                    '{LEGACY_PARTITION}_cohort_ck',
+                    '{LEGACY_PARTITION}_cohort_ck{LEGACY_RENAME_SUFFIX}'
+                )
+                AND con.contype = 'c'
+                AND NOT con.condeferrable
+                AND (SELECT array_agg(a.attname::text ORDER BY k)
+                       FROM generate_subscripts(con.conkey, 1) k
+                       JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]
+                    ) = ARRAY['cohort']
+                AND (
+                    (t.relname = 'harvest_events' AND pg_get_constraintdef(con.oid) ~ '{LEGACY_COHORT_CK_DEF_RE}')
+                    OR {legacy_cohort_ck_clause}
+                )
+            )
+          ORDER BY 1"
+    ))
+    .load::<TextRow>(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows.into_iter().map(|r| r.v).collect())
+}
+
+/// The refusal both conversion directions share.
+#[cfg(feature = "db")]
+async fn refuse_if_unreplayable_constraints(
+    conn: &mut AsyncPgConnection,
+    verb: &str,
+) -> HarvestResult<()> {
+    let constraints = unreplayable_constraints(conn).await?;
+    if constraints.is_empty() {
+        return Ok(());
+    }
+    Err(HarvestError::Config(format!(
+        "refusing to {verb} harvest_events: {} not carried by CREATE TABLE ... (LIKE ...) ({}). \
+         An operator CHECK, foreign-key or exclusion constraint would stop applying to every \
+         row appended after cutover, while still existing on the relation this leaves behind. \
+         Drop the constraint (and recreate it against harvest_events afterward, if it is still \
+         needed) to proceed.",
+        if constraints.len() == 1 {
+            "a constraint is"
+        } else {
+            "constraints are"
+        },
+        constraints.join(", ")
+    )))
+}
+
+/// Operator-installed triggers on `harvest_events` or on one of its leaf
+/// partitions.
+///
+/// **Why this blocks the conversion.** `CREATE TABLE ... (LIKE ...)` does not
+/// carry triggers, and both conversion directions build the replacement
+/// relation that way. On the populated path an operator trigger (an audit or
+/// validation trigger, say) stays on the renamed legacy table. That table
+/// receives no new rows after cutover. The trigger then stops firing for
+/// every event, while it still exists — nothing reports the loss. On the
+/// empty path the trigger is destroyed with the table it was on.
+///
+/// [`EXEC_FK_TRIGGER`] is excluded by its FUNCTION
+/// (`harvest_events_require_execution`), not by name alone. That function
+/// is harvest's own, part of the base migration. On an unpartitioned
+/// shard, `EXEC_FK_TRIGGER` cannot yet be harvest's, since only a
+/// conversion creates it.
+///
+/// Review finding: on a partitioned shard, `harvest_events` names only the
+/// parent. Postgres lets an operator install a trigger directly on a LEAF
+/// partition instead. That trigger used to pass this check unnoticed, then
+/// `disable_partitioning`'s `DROP ... CASCADE` destroyed it along with the
+/// leaf. Matching the parent's direct children too closes that gap.
+///
+/// Review finding: the function check alone has a gap in the OTHER
+/// direction from the name-only check it replaced. An operator's own
+/// trigger, under its own name, could call the same function -- reusing
+/// harvest's validation for a purpose of its own. The exemption now also
+/// requires the reserved trigger's own name, so only harvest's actual
+/// trigger, matching both, is ever exempted.
+///
+/// Review finding: name and function still are not the whole identity.
+/// An operator's trigger could carry both but a different definition.
+/// It could run `BEFORE UPDATE` in place of `BEFORE INSERT FOR EACH
+/// ROW`. It could carry a `WHEN` clause, or arguments harvest's own
+/// trigger never takes. The exemption now also requires
+/// [`EXEC_FK_TRIGGER_TGTYPE`], no arguments, and no `WHEN` clause --
+/// harvest's trigger's exact, whole shape.
+///
+/// Review finding: shape alone still omits `tgenabled`. Harvest's own
+/// trigger is always the plain enabled state (`O`). An operator's
+/// trigger matching every other check but marked `DISABLED`, `ENABLE
+/// REPLICA`, or `ENABLE ALWAYS` behaves differently after conversion
+/// silently changed its enable mode. The exemption now requires that
+/// too.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] if the catalog query fails.
+#[cfg(feature = "db")]
+pub async fn operator_triggers(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
+    let rows = diesel::sql_query(format!(
+        "SELECT tg.tgname AS v
+           FROM pg_trigger tg
+           JOIN pg_class c ON c.oid = tg.tgrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+           JOIN pg_proc p ON p.oid = tg.tgfoid
+          WHERE n.nspname = current_schema()
+            AND (
+                c.relname = 'harvest_events'
+                OR c.oid IN (
+                    SELECT i.inhrelid
+                      FROM pg_inherits i
+                      JOIN pg_class parent ON parent.oid = i.inhparent
+                      JOIN pg_namespace pn ON pn.oid = parent.relnamespace
+                     WHERE parent.relname = 'harvest_events' AND pn.nspname = current_schema()
+                )
+            )
+            AND NOT tg.tgisinternal
+            AND NOT (tg.tgname = '{EXEC_FK_TRIGGER}'
+                     AND p.proname = 'harvest_events_require_execution'
+                     AND p.pronamespace = c.relnamespace
+                     AND tg.tgtype = {EXEC_FK_TRIGGER_TGTYPE}
+                     AND tg.tgnargs = 0
+                     AND tg.tgqual IS NULL
+                     AND tg.tgenabled = 'O')
+          ORDER BY 1"
+    ))
+    .load::<TextRow>(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows.into_iter().map(|r| r.v).collect())
+}
+
+/// The refusal both conversion directions share.
+#[cfg(feature = "db")]
+async fn refuse_if_operator_triggers(
+    conn: &mut AsyncPgConnection,
+    verb: &str,
+) -> HarvestResult<()> {
+    let triggers = operator_triggers(conn).await?;
+    if triggers.is_empty() {
+        return Ok(());
+    }
+    Err(HarvestError::Config(format!(
+        "refusing to {verb} harvest_events: {} not carried by CREATE TABLE ... (LIKE ...) \
+         ({}). An operator trigger stays on the renamed table, where it stops firing for \
+         every new row from cutover onward while still existing — silent for an audit or \
+         validation trigger, since nothing reports the loss. Drop the trigger first (and \
+         recreate it against harvest_events afterward) to proceed.",
+        if triggers.len() == 1 {
+            "a trigger is"
+        } else {
+            "triggers are"
+        },
+        triggers.join(", ")
     )))
 }
 
@@ -1153,7 +2372,30 @@ pub async fn enable_partitioning(
         });
     }
 
-    if !opts.allow_incompatible_publications {
+    if opts.allow_incompatible_publications {
+        // Review finding: the override above is documented for a FOR ALL
+        // TABLES publication. It resolves membership by name, so it
+        // covers the new parent this call creates automatically. An
+        // EXPLICIT membership does not: it stays pinned to the OID of the
+        // relation this call renames away. See `explicitly_published_by`.
+        // The override cannot cover that case, so this check still
+        // refuses even though the broad one below was skipped.
+        let explicit = explicitly_published_by(conn).await?;
+        if !explicit.is_empty() {
+            return Err(HarvestError::Config(format!(
+                "harvest_events is explicitly listed in {}, not merely covered by a FOR \
+                 ALL TABLES or FOR TABLES IN SCHEMA publication. allow_incompatible_publications \
+                 does not cover this case: explicit membership is pinned to this \
+                 relation's OID. This conversion renames it to harvest_events_legacy and \
+                 creates a new relation named harvest_events, so the publication stays \
+                 attached to the old one and the new parent publishes nothing, even with \
+                 publish_via_partition_root = true. Switch {} to a FOR ALL TABLES or FOR \
+                 TABLES IN SCHEMA publication, or drop this membership, before converting.",
+                explicit.join(", "),
+                explicit.join(", ")
+            )));
+        }
+    } else {
         let pubs = incompatible_publications(conn).await?;
         if !pubs.is_empty() {
             return Err(HarvestError::Config(format!(
@@ -1175,6 +2417,10 @@ pub async fn enable_partitioning(
     }
 
     refuse_if_row_security(conn, "convert").await?;
+    refuse_if_unique_index_without_cohort(conn, "convert").await?;
+    refuse_if_dependent_views(conn, "convert").await?;
+    refuse_if_operator_triggers(conn, "convert").await?;
+    refuse_if_unreplayable_constraints(conn, "convert").await?;
 
     let width = opts.cohort_width_secs;
     let now = Utc::now();
@@ -1208,8 +2454,20 @@ pub async fn enable_partitioning(
         None => EnableMode::Fresh,
     };
 
-    let partitions_created =
+    let (partitions_created, lookahead_blocked) =
         ensure_partitions(conn, now, opts.lookahead_cohorts, opts.lock_timeout).await?;
+    if !lookahead_blocked.is_empty() {
+        // Not an error: the conversion itself already committed, and
+        // `created` is non-empty (the all-blocked case errors inside
+        // `ensure_partitions` above). So this is a partial catch-up gap, not
+        // a failed enable. Left for the next maintenance tick to close, same
+        // as any other tick.
+        tracing::warn!(
+            blocked = %lookahead_blocked.join(", "),
+            "harvest partition enable: the lookahead window is not fully covered; \
+             the next maintenance tick will retry the rest"
+        );
+    }
     Ok(EnableReport {
         mode,
         partitions_created,
@@ -1253,6 +2511,52 @@ pub fn enable_sql(opts: &EnableOptions) -> String {
     // empty the legacy table is dropped before this block ends, so the ACLs
     // have to be read while it still exists.
     let copy_acl = copy_acl_body(LEGACY_PARTITION, "harvest_events");
+    let bounded_rename_fn = bounded_rename_fn_sql();
+    let expected_cohort_ck_stmt = expected_cohort_ck_def_sql("cutover");
+    // Review finding: the view, trigger and unique-index rechecks below
+    // all close the same preflight-to-lock gap for a publication too.
+    // See `incompatible_publications` for why a leaf-publishing
+    // publication silently stops a logical-replication standby.
+    //
+    // Narrowed, not omitted, under the override -- mirroring how the Rust
+    // preflight above narrows its own publication check. See
+    // `explicitly_published_by` for why the override cannot cover an
+    // EXPLICIT membership. It stays pinned to the OID of the relation
+    // this block is about to rename. So this recheck must still catch
+    // one added in the preflight-to-lock gap.
+    let publication_recheck = if opts.allow_incompatible_publications {
+        format!(
+            "    SELECT string_agg(DISTINCT p.pubname, ', ') INTO bad_pub\n      \
+             FROM pg_publication p\n     \
+             JOIN pg_publication_rel pr ON pr.prpubid = p.oid\n     \
+             JOIN pg_class c ON c.oid = pr.prrelid\n     \
+             JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
+             WHERE n.nspname = current_schema()\n       \
+             AND c.relname = '{LEGACY_PARTITION}';\n    \
+             IF bad_pub IS NOT NULL THEN\n        \
+             RAISE EXCEPTION 'harvest #958: harvest_events is explicitly listed in %, \
+             added after the preflight check ran. allow_incompatible_publications does \
+             not cover this: explicit membership is pinned to this relation''s OID, so \
+             the rename below leaves the publication attached to harvest_events_legacy, \
+             and the new partitioned parent publishes nothing. Switch % to a FOR ALL \
+             TABLES or FOR TABLES IN SCHEMA publication, or drop this membership, \
+             before re-running.', bad_pub, bad_pub;\n    \
+             END IF;\n"
+        )
+    } else {
+        format!(
+            "    SELECT string_agg(DISTINCT t.pubname, ', ') INTO bad_pub\n      \
+             FROM pg_publication_tables t\n     \
+             WHERE t.schemaname = current_schema()\n       \
+             AND t.tablename = '{LEGACY_PARTITION}';\n    \
+             IF bad_pub IS NOT NULL THEN\n        \
+             RAISE EXCEPTION 'harvest #958: harvest_events is published by %, added \
+             after the preflight check ran but before this transaction''s ACCESS \
+             EXCLUSIVE lock. Run the partitioned layout on the subscriber too, or \
+             drop the publication, then re-run.', bad_pub;\n    \
+             END IF;\n"
+        )
+    };
     format!(
         r#"-- Issue #958: convert harvest_events to the partitioned layout.
 -- Generated by autumn_harvest::partition::enable_sql(); safe to re-run.
@@ -1268,6 +2572,19 @@ DECLARE
     hi          timestamptz;
     step        int;
     had_rows    boolean;
+    we_idx_existed boolean;
+    bad_view    text;
+    bad_trg     text;
+    bad_idx     text;
+    bad_con     text;
+    expected_cohort_ck text;
+    bad_rls     text;
+    rls_flag    boolean;
+    bad_pub     text;
+    renamed_fkey text;
+    renamed_pkey text;
+    renamed_uniq text;
+    renamed      text;
 {COPY_ACL_DECLARE}
 BEGIN
     -- Idempotent: already partitioned, nothing to do.
@@ -1282,6 +2599,16 @@ BEGIN
     -- not leave every append waiting behind it.
     EXECUTE 'SET LOCAL lock_timeout = ' || quote_literal('{lock_ms}ms');
 
+    -- Review finding: `idx_defs` below used to be captured by a plain read
+    -- with no lock at all, which does not conflict with a concurrent
+    -- `CREATE UNIQUE INDEX ... (cohort, ...)`. Such an index could commit
+    -- in the gap between that read and the rename further down, and would
+    -- then be absent from every new partition regardless. An explicit lock
+    -- here, mirroring the large-table plan's own `LOCK TABLE` step, closes
+    -- the gap without moving the capture past the rename: see the comment
+    -- on `idx_defs` below for why the capture must stay on this side of it.
+    EXECUTE 'LOCK TABLE harvest_events IN ACCESS EXCLUSIVE MODE';
+
     -- Deliberately INSIDE the idempotency guard above. Replacing the cohort
     -- function is what changes the partition grid, so running it before the
     -- guard would let `enable --cohort-width-secs X` on an ALREADY-partitioned
@@ -1290,18 +2617,6 @@ BEGIN
     -- next `ensure_partitions` would get `would overlap` on every cohort --
     -- swallowed as a benign race, so nothing created and nothing reported.
     EXECUTE $harvest_cohort_def${cohort_fn}$harvest_cohort_def$;
-
-    -- Captured BEFORE the rename, so each definition still names
-    -- `harvest_events` and replays verbatim onto the new parent, where Postgres
-    -- propagates it to every partition. Constraint-backed indexes are excluded:
-    -- their replacements must include the partition key and are added below.
-    SELECT coalesce(array_agg(pg_get_indexdef(i.indexrelid)), ARRAY[]::text[])
-      INTO idx_defs
-      FROM pg_index i
-      JOIN pg_class c ON c.oid = i.indrelid
-      JOIN pg_namespace n ON n.oid = c.relnamespace
-     WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
-       AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid);
 
     -- The legacy partition covers everything below the current cohort. Every
     -- pre-conversion row carries the migration's `-infinity` sentinel, so all
@@ -1312,6 +2627,34 @@ BEGIN
     -- partition is sealed from the moment it is attached.
     cutover := harvest_event_cohort(now());
 
+    -- Review finding: the cohort-CHECK exemption further down used to
+    -- match any same-named, same-shaped constraint regardless of its
+    -- bound. Computed here, once the real cutover is known, so that
+    -- exemption can require an exact match against it instead.
+    expected_cohort_ck := {expected_cohort_ck_stmt};
+
+    -- Captured here, already holding ACCESS EXCLUSIVE via the explicit
+    -- `LOCK TABLE` above, so no concurrent `CREATE UNIQUE INDEX ...
+    -- (cohort, ...)` can commit in the gap between this read and the
+    -- rename below. Deliberately still captured BEFORE the rename,
+    -- though, and not from `{LEGACY_PARTITION}` after it: every
+    -- definition `pg_get_indexdef` returns here names `harvest_events`
+    -- verbatim, and it is exactly that name -- freed by the rename below,
+    -- then reclaimed by the new parent -- that makes the FOREACH replay
+    -- further down land on the new table. Querying by the post-rename
+    -- name would bake `{LEGACY_PARTITION}` into every captured
+    -- definition instead, and replaying those verbatim recreates each
+    -- index on the LEGACY table, not the new parent. Constraint-backed
+    -- indexes are excluded: their replacements must include the
+    -- partition key and are added explicitly further down.
+    SELECT coalesce(array_agg(pg_get_indexdef(i.indexrelid)), ARRAY[]::text[])
+      INTO idx_defs
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
+       AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid);
+
     -- Detached so the sequence survives a DROP of an empty legacy table and can
     -- be re-owned by the new parent. The BIGSERIAL cursor must stay continuous
     -- across the conversion: reusing an id already present in the legacy
@@ -1319,30 +2662,206 @@ BEGIN
     EXECUTE 'ALTER SEQUENCE harvest_events_id_seq OWNED BY NONE';
     EXECUTE 'ALTER TABLE harvest_events RENAME TO {LEGACY_PARTITION}';
 
-    -- Probed only AFTER the rename, which is the first statement to take
-    -- ACCESS EXCLUSIVE. A `SELECT EXISTS` before it takes only ACCESS SHARE,
-    -- which does not conflict with a concurrent INSERT: a workflow that started
-    -- and wrote its first events in the gap would commit before the rename,
-    -- `had_rows` would still be false, and the ELSE branch below would DROP the
-    -- table containing them. Enabling on a live-but-currently-empty shard is
-    -- exactly the recommended rollout, so that window is the common case.
+    -- Review finding: the dependent-view and operator-trigger checks run
+    -- in Rust, a separate round-trip before this script starts. A session
+    -- that created either kind of object in that gap could commit before
+    -- the rename above took its lock, and the object would then be
+    -- silently stranded on the table the rename just moved out from under
+    -- it. Repeat both checks now, holding the ACCESS EXCLUSIVE lock this
+    -- rename just acquired. Postgres tracks both dependencies by OID, so
+    -- the rename does not hide either one — querying by the new name,
+    -- {LEGACY_PARTITION}, still finds them.
+    SELECT string_agg(DISTINCT (v_ns.nspname || '.' || v.relname), ', '
+                      ORDER BY (v_ns.nspname || '.' || v.relname))
+      INTO bad_view
+      FROM pg_depend d
+      JOIN pg_rewrite r ON r.oid = d.objid
+      JOIN pg_class v ON v.oid = r.ev_class
+      JOIN pg_namespace v_ns ON v_ns.oid = v.relnamespace
+      JOIN pg_class t ON t.oid = d.refobjid
+      JOIN pg_namespace t_ns ON t_ns.oid = t.relnamespace
+     WHERE t.relname = '{LEGACY_PARTITION}' AND t_ns.nspname = current_schema()
+       AND v.relkind IN ('v', 'm');
+    IF bad_view IS NOT NULL THEN
+        RAISE EXCEPTION 'harvest #958: view(s) depend on harvest_events (%), created after \
+the preflight check ran but before this transaction''s ACCESS EXCLUSIVE lock. Drop the view \
+(and recreate it against harvest_events afterward), then re-run.', bad_view;
+    END IF;
+
+    SELECT string_agg(DISTINCT tg.tgname, ', ' ORDER BY tg.tgname) INTO bad_trg
+      FROM pg_trigger tg
+      JOIN pg_class c ON c.oid = tg.tgrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_proc p ON p.oid = tg.tgfoid
+     WHERE c.relname = '{LEGACY_PARTITION}' AND n.nspname = current_schema()
+       AND NOT tg.tgisinternal
+       AND NOT (tg.tgname = '{EXEC_FK_TRIGGER}'
+                AND p.proname = 'harvest_events_require_execution'
+                AND p.pronamespace = c.relnamespace
+                AND tg.tgtype = {EXEC_FK_TRIGGER_TGTYPE}
+                AND tg.tgnargs = 0
+                AND tg.tgqual IS NULL
+                AND tg.tgenabled = 'O');
+    IF bad_trg IS NOT NULL THEN
+        RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not carried by CREATE \
+TABLE ... (LIKE ...) (%), installed after the preflight check ran but before this \
+transaction''s ACCESS EXCLUSIVE lock. Drop the trigger (and recreate it against \
+harvest_events afterward), then re-run.', bad_trg;
+    END IF;
+
+    -- Review finding: the view and trigger rechecks above closed the
+    -- identical preflight-to-lock gap for those two guards, but not for
+    -- row security -- `CREATE TABLE ... (LIKE ...)` copies neither
+    -- `relrowsecurity`/`relforcerowsecurity` nor any `pg_policy` row.
+    SELECT COALESCE(bool_or(c.relrowsecurity OR c.relforcerowsecurity), false) INTO rls_flag
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relname = '{LEGACY_PARTITION}' AND n.nspname = current_schema();
+    SELECT string_agg(p.polname, ', ' ORDER BY p.polname) INTO bad_rls
+      FROM pg_policy p
+      JOIN pg_class c ON c.oid = p.polrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relname = '{LEGACY_PARTITION}' AND n.nspname = current_schema();
+    IF rls_flag OR bad_rls IS NOT NULL THEN
+        RAISE EXCEPTION 'harvest #958: harvest_events has row level security configured \
+(policies: %), configured after the preflight check ran but before this transaction''s \
+ACCESS EXCLUSIVE lock. Drop the policy (and DISABLE ROW LEVEL SECURITY) if obsolete, or \
+reproduce it on the converted layout by hand, then re-run.',
+            COALESCE(bad_rls, 'none, but row security is enabled');
+    END IF;
+{publication_recheck}
+    -- Review finding: a constraint-backed unique index -- one an operator
+    -- adds with `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE` -- is excluded
+    -- from `idx_defs` unconditionally, and nothing replays it. Added
+    -- between the Rust-side preflight (a separate round-trip before this
+    -- script starts) and the explicit lock this script itself took above,
+    -- it would silently vanish from every new partition. Recheck now,
+    -- holding that same lock, the same way the view and trigger checks
+    -- just did.
+    SELECT string_agg(i.indexrelid::regclass::text, ', ' ORDER BY 1) INTO bad_idx
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_attribute ca
+        ON ca.attrelid = c.oid AND ca.attname = 'cohort'
+     WHERE c.relname = '{LEGACY_PARTITION}' AND n.nspname = current_schema()
+       AND i.indisunique
+       AND {HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL}
+       AND (
+           EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)
+           OR NOT EXISTS (
+               SELECT 1 FROM generate_series(0, i.indnkeyatts - 1) k
+                WHERE i.indkey[k] = ca.attnum
+           )
+       );
+    IF bad_idx IS NOT NULL THEN
+        RAISE EXCEPTION 'harvest #958: harvest_events carries a unique index that cannot \
+survive conversion unchanged (%), added after the preflight check ran but before this \
+transaction''s ACCESS EXCLUSIVE lock. Drop the index or constraint if it is obsolete, or \
+recreate it including `cohort` yourself, then re-run.', bad_idx;
+    END IF;
+
+    -- Review finding: the view, trigger, row-security, publication and
+    -- unique-index rechecks above all close the same preflight-to-lock
+    -- gap for a CHECK or foreign-key constraint too -- see
+    -- `unreplayable_constraints` for why `CREATE TABLE ... (LIKE ...)`
+    -- cannot carry either kind forward.
+    SELECT string_agg(DISTINCT con.conname, ', ' ORDER BY con.conname) INTO bad_con
+      FROM pg_constraint con
+      JOIN pg_class c ON c.oid = con.conrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relname = '{LEGACY_PARTITION}' AND n.nspname = current_schema()
+       AND con.contype IN ('c', 'f', 'x')
+       AND NOT (
+           con.conname = 'harvest_events_workflow_exec_id_fkey'
+           AND con.contype = 'f'
+           AND NOT con.condeferrable
+           AND con.confdeltype = 'c'
+           AND con.confupdtype = 'a'
+           AND con.confrelid = 'harvest_workflow_executions'::regclass
+           AND (SELECT array_agg(a.attname::text ORDER BY k)
+                  FROM generate_subscripts(con.conkey, 1) k
+                  JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]
+               ) = ARRAY['workflow_exec_id']
+           AND (SELECT array_agg(a.attname::text ORDER BY k)
+                  FROM generate_subscripts(con.confkey, 1) k
+                  JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = con.confkey[k]
+               ) = ARRAY['id']
+       )
+       AND NOT (
+           con.conname IN ('{LEGACY_PARTITION}_cohort_ck', '{LEGACY_PARTITION}_cohort_ck{LEGACY_RENAME_SUFFIX}')
+           AND con.contype = 'c'
+           AND NOT con.condeferrable
+           AND (SELECT array_agg(a.attname::text ORDER BY k)
+                  FROM generate_subscripts(con.conkey, 1) k
+                  JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]
+               ) = ARRAY['cohort']
+           AND pg_get_constraintdef(con.oid) IN (expected_cohort_ck, expected_cohort_ck || ' NOT VALID')
+       );
+    IF bad_con IS NOT NULL THEN
+        RAISE EXCEPTION 'harvest #958: harvest_events carries a constraint that cannot \
+survive conversion unchanged (%), added after the preflight check ran but before this \
+transaction''s ACCESS EXCLUSIVE lock. Drop the constraint (and recreate it against \
+harvest_events afterward, if it is still needed), then re-run.', bad_con;
+    END IF;
+
+    -- Safe only because the explicit `LOCK TABLE` above already holds
+    -- ACCESS EXCLUSIVE by this point. Without it, a plain `SELECT EXISTS`
+    -- takes only ACCESS SHARE, which does not conflict with a concurrent
+    -- INSERT: a workflow that started and wrote its first events in that
+    -- gap could commit unseen, `had_rows` would read false, and the ELSE
+    -- branch below would DROP the table containing them. Enabling on a
+    -- live-but-currently-empty shard is exactly the recommended rollout,
+    -- so that window is the common case.
     EXECUTE 'SELECT EXISTS (SELECT 1 FROM {LEGACY_PARTITION})' INTO had_rows;
 
     -- Renaming a table renames neither its indexes nor its constraints, so
     -- without this the new parent could not reclaim their schema-scoped names.
+    --
+    -- The rename target is never a bare `obj.n || suffix`. At the 63-byte
+    -- identifier limit that renames a name to itself. It never frees it.
+    -- See `bounded_rename_fn_sql` for why, and how the safe name is
+    -- computed.
+    --
+    -- `CREATE FUNCTION` is DDL, so it must run through EXECUTE like every
+    -- other statement in this block; wrapped in its OWN dollar-quote tag,
+    -- distinct from the one the function body uses internally.
+    EXECUTE $harvest_br_958_wrap${bounded_rename_fn}$harvest_br_958_wrap$;
     FOR obj IN SELECT conname AS n FROM pg_constraint
                 WHERE conrelid = '{LEGACY_PARTITION}'::regclass
                   AND right(conname, {suffix_len}) <> '{LEGACY_RENAME_SUFFIX}'
     LOOP
+        renamed := {BOUNDED_RENAME_FN}('constraint', '{LEGACY_PARTITION}'::regclass, obj.n,
+                                       '{LEGACY_RENAME_SUFFIX}');
+        -- Review finding: the three DROPs below used to assume this
+        -- always returns `obj.n || '{LEGACY_RENAME_SUFFIX}'`. It does
+        -- not when that name is already taken -- an operator's own
+        -- constraint could happen to be named
+        -- `harvest_events_pkey{LEGACY_RENAME_SUFFIX}`, for one -- in
+        -- which case the function disambiguates to a different name.
+        -- A hard-coded DROP would then remove that unrelated operator
+        -- constraint and leave the actual renamed original in place,
+        -- so `ATTACH PARTITION` later fails on more than one primary
+        -- key. Capturing the real returned name here, per built-in
+        -- constraint, is what the later DROPs actually target.
+        IF obj.n = 'harvest_events_workflow_exec_id_fkey' THEN
+            renamed_fkey := renamed;
+        ELSIF obj.n = 'harvest_events_pkey' THEN
+            renamed_pkey := renamed;
+        ELSIF obj.n = 'harvest_events_workflow_exec_id_event_id_key' THEN
+            renamed_uniq := renamed;
+        END IF;
         EXECUTE format('ALTER TABLE {LEGACY_PARTITION} RENAME CONSTRAINT %I TO %I',
-                       obj.n, obj.n || '{LEGACY_RENAME_SUFFIX}');
+                       obj.n, renamed);
     END LOOP;
     FOR obj IN SELECT indexname AS n FROM pg_indexes
                 WHERE schemaname = current_schema() AND tablename = '{LEGACY_PARTITION}'
                   AND right(indexname, {suffix_len}) <> '{LEGACY_RENAME_SUFFIX}'
     LOOP
-        EXECUTE format('ALTER INDEX %I RENAME TO %I', obj.n, obj.n || '{LEGACY_RENAME_SUFFIX}');
+        EXECUTE format('ALTER INDEX %I RENAME TO %I', obj.n,
+                       {BOUNDED_RENAME_FN}('index', NULL, obj.n, '{LEGACY_RENAME_SUFFIX}'));
     END LOOP;
+    EXECUTE 'DROP FUNCTION {BOUNDED_RENAME_FN}(text, oid, text, text)';
 
     -- `LIKE ... INCLUDING DEFAULTS` copies the columns, their NOT NULLs and the
     -- `nextval(...)` id default -- and keeps working when a later migration
@@ -1413,8 +2932,34 @@ BEGIN
     -- ACCESS EXCLUSIVE on harvest_events; `migration_plan` builds the same
     -- index CONCURRENTLY, outside any lock window, for the large tables where
     -- the difference is felt.
+    --
+    -- Tagged only when this statement is the one that actually creates the
+    -- index -- never when IF NOT EXISTS finds an operator's own index
+    -- already at that name. `disable_partitioning` reads the tag back to
+    -- decide whether it may drop the index.
+    --
+    -- Review finding: the existence probe and the CREATE INDEX below are
+    -- two separate statements. Without a lock spanning both, a concurrent
+    -- session could commit an identically-shaped index between them. This
+    -- statement's own IF NOT EXISTS would then skip creation silently, but
+    -- `we_idx_existed` was already captured as false, so the index gets
+    -- tagged as harvest-owned anyway -- and a later `disable_partitioning`
+    -- would drop the OTHER session's index. SHARE UPDATE EXCLUSIVE
+    -- conflicts with itself, so it serializes this whole probe-create-tag
+    -- sequence against any other session doing the same thing, while still
+    -- allowing ordinary reads and writes on the table.
+    LOCK TABLE harvest_workflow_executions IN SHARE UPDATE EXCLUSIVE MODE;
+    SELECT EXISTS (
+        SELECT 1 FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relname = 'idx_harvest_we_created_at' AND n.nspname = current_schema()
+    ) INTO we_idx_existed;
     EXECUTE 'CREATE INDEX IF NOT EXISTS idx_harvest_we_created_at '
          || 'ON harvest_workflow_executions (created_at)';
+    IF NOT we_idx_existed THEN
+        EXECUTE 'COMMENT ON INDEX idx_harvest_we_created_at IS '
+             || quote_literal('{WE_CREATED_AT_IDX_OWNERSHIP_TAG}');
+    END IF;
 
     -- The catch-all, created before any cohort partition so there is never an
     -- instant in which an append could find no partition at all.
@@ -1426,12 +2971,21 @@ BEGIN
         -- alone can no longer be a key anyway: uniqueness on a partitioned
         -- table has to include the partition column. Global `id` uniqueness is
         -- not lost -- one sequence still feeds every partition.
-        EXECUTE 'ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT IF EXISTS '
-             || 'harvest_events_workflow_exec_id_fkey{LEGACY_RENAME_SUFFIX}';
-        EXECUTE 'ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT IF EXISTS '
-             || 'harvest_events_pkey{LEGACY_RENAME_SUFFIX}';
-        EXECUTE 'ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT IF EXISTS '
-             || 'harvest_events_workflow_exec_id_event_id_key{LEGACY_RENAME_SUFFIX}';
+        --
+        -- Dropped by the captured `renamed_*` name, not a hard-coded
+        -- `name || suffix`: see the review finding on the rename loop
+        -- above for why that guess can target the wrong object. `NULL`
+        -- means the original never existed (an operator's own schema
+        -- already lacked it), so there is nothing to drop.
+        IF renamed_fkey IS NOT NULL THEN
+            EXECUTE format('ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT %I', renamed_fkey);
+        END IF;
+        IF renamed_pkey IS NOT NULL THEN
+            EXECUTE format('ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT %I', renamed_pkey);
+        END IF;
+        IF renamed_uniq IS NOT NULL THEN
+            EXECUTE format('ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT %I', renamed_uniq);
+        END IF;
         EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS {LEGACY_PARTITION}_pk_idx '
              || 'ON {LEGACY_PARTITION} (id, cohort)';
         EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS {LEGACY_PARTITION}_exec_event_idx '
@@ -1491,6 +3045,111 @@ $harvest_enable_958$;
 /// engine grants at column granularity, and a table-level `GRANT` is what the
 /// preflight probes.
 ///
+/// SQL defining [`BOUNDED_RENAME_FN`], a transient helper both rename loops
+/// (in [`enable_sql`] and [`migration_plan_steps`]) call to compute a
+/// collision-safe temporary name.
+///
+/// # The bug this closes
+///
+/// Postgres silently truncates an identifier over 63 bytes. The rename loops
+/// append a fixed suffix (`__pre958`, `__old`) to reclaim an original name
+/// for the replacement relation. But appending a suffix to a name
+/// **already** at the 63-byte limit renames it to itself. The
+/// schema-scoped name is never freed. Replaying the captured
+/// `pg_get_indexdef` / `ADD CONSTRAINT` for the real name onto the
+/// replacement then fails with `duplicate_relation` / `duplicate_object`.
+/// The conversion is transactional, so this fails safely and loudly. But
+/// not at a line that names the cause.
+///
+/// # The fix
+///
+/// Truncate the base *before* appending the suffix, so the result always
+/// fits. A truncated base can (rarely) collide with another renamed sibling
+/// that happens to share the same 63-byte prefix. So the result is
+/// verified against the catalog. It is disambiguated with a numeric
+/// counter if needed:
+/// "generate, then verify the result is actually free", not "generate and
+/// hope".
+///
+/// Scoped correctly per kind. An index, or any other relation, name has to
+/// be unique across the whole schema (`pg_class`). A constraint name only
+/// has to be unique among the constraints of `p_relid`
+/// (`pg_constraint.conrelid`). A constraint's rename can also rename a
+/// backing index, though, so the `'constraint'` case checks `pg_class`
+/// too. That is why the function takes a `p_relid`, used only for the
+/// `'constraint'` case.
+///
+/// Created immediately before the rename loops that use it and dropped right
+/// after — schema debris a re-run should not leave behind.
+#[must_use]
+fn bounded_rename_fn_sql() -> String {
+    format!(
+        "CREATE FUNCTION {BOUNDED_RENAME_FN}(p_kind text, p_relid oid, p_base text, p_suffix text)
+RETURNS text LANGUAGE plpgsql AS $harvest_bounded_rename_958_fn$
+DECLARE
+    budget    int;
+    keep      int;
+    candidate text;
+    disambig  int := 0;
+    taken     boolean;
+BEGIN
+    LOOP
+        IF disambig = 0 THEN
+            budget := 63 - octet_length(p_suffix);
+        ELSE
+            budget := greatest(63 - octet_length('_' || disambig || p_suffix), 1);
+        END IF;
+        -- `left()` counts characters, but Postgres's 63 limit is BYTES.
+        -- Shrinking one character at a time, checking `octet_length` each
+        -- time, never splits a multibyte character mid-codepoint --
+        -- `left()` itself only ever cuts on a character boundary.
+        keep := length(p_base);
+        WHILE keep > 0 AND octet_length(left(p_base, keep)) > budget LOOP
+            keep := keep - 1;
+        END LOOP;
+        IF disambig = 0 THEN
+            candidate := left(p_base, keep) || p_suffix;
+        ELSE
+            candidate := left(p_base, keep) || '_' || disambig || p_suffix;
+        END IF;
+        IF p_kind = 'constraint' THEN
+            -- Review finding: a primary-key or unique constraint's rename
+            -- also renames its backing index, per `pg_class`, not just
+            -- its `pg_constraint` row. A candidate free among this
+            -- table's constraints can still collide with an unrelated
+            -- relation's name, and `RENAME CONSTRAINT` then aborts on
+            -- that second, implicit rename. Checking both catalogs for
+            -- every constraint, indexed or not, costs nothing extra in
+            -- the common case. It only adds an occasional disambiguation
+            -- round for a plain constraint that shares a name with some
+            -- unrelated relation.
+            SELECT EXISTS (
+                SELECT 1 FROM pg_constraint WHERE conrelid = p_relid AND conname = candidate
+            ) OR EXISTS (
+                SELECT 1 FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = current_schema() AND c.relname = candidate
+            ) INTO taken;
+        ELSE
+            SELECT EXISTS (
+                SELECT 1 FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = current_schema() AND c.relname = candidate
+            ) INTO taken;
+        END IF;
+        EXIT WHEN NOT taken;
+        disambig := disambig + 1;
+        IF disambig > 1000 THEN
+            RAISE EXCEPTION 'harvest #1270: could not find a free % name for % after 1000 \
+attempts', p_kind, p_base;
+        END IF;
+    END LOOP;
+    RETURN candidate;
+END;
+$harvest_bounded_rename_958_fn$;"
+    )
+}
+
 /// [`copy_acl_body`] is the same thing as bare plpgsql statements, for the
 /// conversion paths that already run inside a `DO` block; it needs
 /// [`COPY_ACL_DECLARE`] in that block's `DECLARE` section.
@@ -1606,6 +3265,105 @@ fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+/// Truncate `s` to at most `max_bytes` bytes, on a `char` boundary.
+///
+/// Postgres identifiers are conventionally ASCII. But truncating blindly at
+/// a byte offset could still split a multi-byte `char` in a quoted
+/// identifier and produce invalid UTF-8. Used only by
+/// [`bounded_rename_name`]'s Rust-side truncation. The PL/pgSQL path's
+/// `left()` is Postgres's own encoding-aware truncation and needs no
+/// equivalent.
+#[cfg(any(feature = "db", test))]
+fn truncate_ident(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Rust-side equivalent of [`bounded_rename_fn_sql`] for
+/// [`disable_partitioning`], which renames via individual `exec()` calls
+/// rather than embedded PL/pgSQL.
+///
+/// `table` is `None` for an index/relation name. That case checks
+/// schema-scoped uniqueness against `pg_class`. `table` is
+/// `Some(table_name)` for a constraint name, checked against
+/// `pg_constraint.conrelid` and scoped to that one table. See
+/// [`bounded_rename_fn_sql`] for why a bare `base || suffix` is unsafe at
+/// Postgres's 63-byte identifier limit.
+///
+/// Review finding: a constraint candidate free in `pg_constraint` is not
+/// necessarily free to rename to. `ALTER TABLE ... RENAME CONSTRAINT`
+/// also renames the constraint's backing index, scoped schema-wide in
+/// `pg_class`, not per-table. An unrelated relation already holding that
+/// name would then make the rename fail on a collision this check never
+/// saw. Checked against both catalogs now, matching
+/// [`bounded_rename_fn_sql`]'s identical fix for the same gap.
+#[cfg(feature = "db")]
+async fn bounded_rename_name(
+    conn: &mut AsyncPgConnection,
+    table: Option<&str>,
+    base: &str,
+    suffix: &str,
+) -> HarvestResult<String> {
+    let max_base = 63usize.saturating_sub(suffix.len());
+    let mut disambig: u32 = 0;
+    loop {
+        let candidate = if disambig == 0 {
+            format!("{}{suffix}", truncate_ident(base, max_base))
+        } else {
+            let tag = disambig.to_string();
+            let room = max_base.saturating_sub(tag.len() + 1).max(1);
+            format!("{}_{tag}{suffix}", truncate_ident(base, room))
+        };
+        let taken = match table {
+            Some(table) => {
+                diesel::sql_query(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM pg_constraint
+                          WHERE conrelid = ($1::text)::regclass AND conname = $2
+                     ) OR EXISTS (
+                         SELECT 1 FROM pg_class c
+                           JOIN pg_namespace n ON n.oid = c.relnamespace
+                          WHERE n.nspname = current_schema() AND c.relname = $2
+                     ) AS v",
+                )
+                .bind::<Text, _>(table)
+                .bind::<Text, _>(&candidate)
+                .get_result::<BoolRow>(conn)
+                .await
+            }
+            None => {
+                diesel::sql_query(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM pg_class c
+                           JOIN pg_namespace n ON n.oid = c.relnamespace
+                          WHERE n.nspname = current_schema() AND c.relname = $1
+                     ) AS v",
+                )
+                .bind::<Text, _>(&candidate)
+                .get_result::<BoolRow>(conn)
+                .await
+            }
+        }
+        .map_err(database_error)?
+        .v;
+        if !taken {
+            return Ok(candidate);
+        }
+        disambig += 1;
+        if disambig > 1000 {
+            return Err(HarvestError::Database(format!(
+                "could not find a free name for {base} after 1000 attempts"
+            )));
+        }
+    }
+}
+
 #[cfg(feature = "db")]
 async fn exec(conn: &mut AsyncPgConnection, sql: &str) -> HarvestResult<()> {
     diesel::sql_query(sql)
@@ -1622,6 +3380,81 @@ async fn scalar_bool(conn: &mut AsyncPgConnection, sql: &str) -> HarvestResult<b
         .await
         .map_err(database_error)?
         .v)
+}
+
+/// Foreign keys on OTHER tables that reference `harvest_events` or one of
+/// its leaf partitions.
+///
+/// **Why this blocks the revert.** Every constraint guard elsewhere in this
+/// module filters `pg_constraint.conrelid` -- constraints defined ON
+/// `harvest_events` itself. An inbound foreign key is the mirror image: it
+/// is defined on some OTHER table, with `confrelid` naming `harvest_events`
+/// as what it references. None of those guards see it.
+///
+/// Review finding: `disable_partitioning` renames the partitioned parent
+/// aside, rebuilds a flat `harvest_events` with `CREATE TABLE ... (LIKE
+/// ...)`, then runs `DROP TABLE ... CASCADE` on the renamed original. An
+/// inbound foreign key still points at that original relation by OID, so
+/// `CASCADE` drops it as a dependent object right along with the table.
+/// The rebuilt flat table is a brand new relation. Nothing recreates the
+/// foreign key against it. The operator's referential-integrity check is
+/// gone, silently, with no replacement. This is exactly the failure mode
+/// [`dependent_views`] exists to catch for a view's dependency, but for a
+/// constraint instead.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] if the catalog query fails.
+#[cfg(feature = "db")]
+pub async fn inbound_foreign_keys(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
+    let rows = diesel::sql_query(
+        "SELECT DISTINCT (c_ns.nspname || '.' || con.conname) AS v
+           FROM pg_constraint con
+           JOIN pg_class c ON c.oid = con.conrelid
+           JOIN pg_namespace c_ns ON c_ns.oid = c.relnamespace
+           JOIN pg_class t ON t.oid = con.confrelid
+           JOIN pg_namespace t_ns ON t_ns.oid = t.relnamespace
+          WHERE con.contype = 'f'
+            AND t_ns.nspname = current_schema()
+            AND (
+                t.relname = 'harvest_events'
+                OR t.oid IN (
+                    SELECT i.inhrelid
+                      FROM pg_inherits i
+                      JOIN pg_class parent ON parent.oid = i.inhparent
+                      JOIN pg_namespace pn ON pn.oid = parent.relnamespace
+                     WHERE parent.relname = 'harvest_events' AND pn.nspname = current_schema()
+                )
+            )
+          ORDER BY 1",
+    )
+    .load::<TextRow>(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows.into_iter().map(|r| r.v).collect())
+}
+
+/// The refusal `disable_partitioning` raises over an inbound foreign key.
+#[cfg(feature = "db")]
+async fn refuse_if_inbound_foreign_keys(conn: &mut AsyncPgConnection) -> HarvestResult<()> {
+    let fks = inbound_foreign_keys(conn).await?;
+    if fks.is_empty() {
+        return Ok(());
+    }
+    Err(HarvestError::Config(format!(
+        "refusing to revert harvest_events: {} it from another table ({}). \
+         Reverting renames the partitioned parent aside, rebuilds a flat harvest_events \
+         table, then drops the renamed original with CASCADE -- which silently removes \
+         a foreign key still pointing at that original relation, with no replacement \
+         created against the rebuilt table. Drop the foreign key (and recreate it against \
+         harvest_events afterward) to proceed.",
+        if fks.len() == 1 {
+            "a foreign key references"
+        } else {
+            "foreign keys reference"
+        },
+        fks.join(", ")
+    )))
 }
 
 // ── Disabling the layout ───────────────────────────────────────────────────
@@ -1654,8 +3487,159 @@ pub async fn disable_partitioning(
     // table with `LIKE` and replays the grants onto it, so a policy added after
     // the conversion would be dropped while access is restored.
     refuse_if_row_security(conn, "revert").await?;
+    // Same reason as `enable`'s check: a view depending on the partitioned
+    // parent would keep pointing at the renamed relation, not the reclaimed
+    // flat table.
+    refuse_if_dependent_views(conn, "revert").await?;
+    // Same reason again: a trigger `CREATE TABLE ... (LIKE ...)` did not
+    // carry stays on the partitioned parent being reclaimed, not the flat
+    // table `disable` builds in its place.
+    refuse_if_operator_triggers(conn, "revert").await?;
+    // Same reason once more. A CHECK, foreign-key or exclusion constraint
+    // `CREATE TABLE ... (LIKE ...)` did not carry stays on the partitioned
+    // parent being reclaimed. It does not follow to the flat table
+    // `disable` builds in its place.
+    refuse_if_unreplayable_constraints(conn, "revert").await?;
+    // Same reason as `enable_partitioning`'s own check, the reverse
+    // direction. An operator's own constraint-backed unique index is
+    // shaped one column wider here than on the flat layout. The
+    // partitioned parent's own constraints always carry `cohort` too.
+    // It is excluded from `capture_index_defs` unconditionally all the
+    // same, and nothing else replays it.
+    refuse_if_constraint_backed_unique_index_on_revert(conn).await?;
+    // Review finding: every constraint guard above filters `conrelid` --
+    // constraints defined ON harvest_events. An inbound foreign key from
+    // another table is the mirror image, invisible to all of them. The
+    // `DROP TABLE ... CASCADE` below would silently take it out, along
+    // with the renamed original relation it still points at. No
+    // replacement is ever created against the rebuilt flat table.
+    refuse_if_inbound_foreign_keys(conn).await?;
     let report = Box::pin(
         conn.transaction::<DisableReport, HarvestError, _>(async |conn| {
+            // Review finding: the dependent-view and operator-trigger checks
+            // above ran in a separate round-trip, before this transaction
+            // even opened. That is well before anything here takes a lock
+            // stronger than ACCESS SHARE. A view or trigger created in that
+            // gap could commit before the rename further down. So could
+            // one created during the row deletes below, which lock only
+            // the rows they touch. Either way it would then be destroyed
+            // when the reclaimed parent is dropped. `LOCK TABLE` on a
+            // partitioned parent recurses onto every partition by
+            // default, so this also covers a view or trigger attached
+            // directly to a leaf. Recheck both now, under the lock this
+            // revert holds for the rest of the transaction.
+            exec(conn, "LOCK TABLE harvest_events IN ACCESS EXCLUSIVE MODE").await?;
+            let views = dependent_views(conn).await?;
+            if !views.is_empty() {
+                return Err(HarvestError::Config(format!(
+                    "refusing to revert harvest_events: {} depend on it ({}), created \
+                     after the preflight check ran but before this transaction's ACCESS \
+                     EXCLUSIVE lock. Drop the view (and recreate it against \
+                     harvest_events afterward), then re-run.",
+                    if views.len() == 1 { "a view" } else { "views" },
+                    views.join(", ")
+                )));
+            }
+            let triggers = operator_triggers(conn).await?;
+            if !triggers.is_empty() {
+                return Err(HarvestError::Config(format!(
+                    "refusing to revert harvest_events: {} not carried by CREATE TABLE \
+                     ... (LIKE ...) ({}), installed after the preflight check ran but \
+                     before this transaction's ACCESS EXCLUSIVE lock. Drop the trigger \
+                     (and recreate it against harvest_events afterward), then re-run.",
+                    if triggers.len() == 1 {
+                        "a trigger is"
+                    } else {
+                        "triggers are"
+                    },
+                    triggers.join(", ")
+                )));
+            }
+            // Review finding: the view and trigger rechecks above closed
+            // the gap between the pre-lock preflight and this lock, for
+            // those two guards. Not for row security, though. The swap
+            // keeps the grants and loses `relrowsecurity` and every
+            // `pg_policy` row, exactly like the original preflight
+            // documents. An operator enabling RLS or adding a policy in
+            // that same gap would have it silently dropped by the
+            // `LIKE`-built replacement below.
+            let (rls_enabled, policies) = row_security_config(conn).await?;
+            if rls_enabled || !policies.is_empty() {
+                return Err(HarvestError::Config(format!(
+                    "refusing to revert harvest_events: it carries row security ({}), \
+                     configured after the preflight check ran but before this \
+                     transaction's ACCESS EXCLUSIVE lock. Drop the policy (and \
+                     DISABLE ROW LEVEL SECURITY) if obsolete, or reproduce it on the \
+                     flat layout by hand afterward, then re-run.",
+                    if policies.is_empty() {
+                        "row level security is enabled, with no policy".to_string()
+                    } else {
+                        policies.join(", ")
+                    }
+                )));
+            }
+            // Review finding: the view, trigger and row-security rechecks
+            // above closed the identical preflight-to-lock gap for a
+            // CHECK, foreign-key or exclusion constraint too. Same reason
+            // as `refuse_if_unreplayable_constraints` above, under the
+            // same lock this revert holds for the rest of the
+            // transaction.
+            let constraints = unreplayable_constraints(conn).await?;
+            if !constraints.is_empty() {
+                return Err(HarvestError::Config(format!(
+                    "refusing to revert harvest_events: {} not carried by CREATE TABLE \
+                     ... (LIKE ...) ({}), added after the preflight check ran but before \
+                     this transaction's ACCESS EXCLUSIVE lock. Drop the constraint (and \
+                     recreate it against harvest_events afterward, if it is still \
+                     needed), then re-run.",
+                    if constraints.len() == 1 {
+                        "a constraint is"
+                    } else {
+                        "constraints are"
+                    },
+                    constraints.join(", ")
+                )));
+            }
+            // Same reason again: an operator's own constraint-backed
+            // unique index, added in that identical gap, is excluded from
+            // `capture_index_defs` below unconditionally either way.
+            let bad_unique = constraint_backed_unique_indexes_on_partitioned_parent(conn).await?;
+            if !bad_unique.is_empty() {
+                return Err(HarvestError::Config(format!(
+                    "refusing to revert harvest_events: {} backed by a table constraint \
+                     other than harvest's own PRIMARY KEY and (workflow_exec_id, event_id) \
+                     UNIQUE constraint ({}), added after the preflight check ran but before \
+                     this transaction's ACCESS EXCLUSIVE lock. Drop the constraint (and \
+                     recreate it on the flat table afterward, if it is still needed), then \
+                     re-run.",
+                    if bad_unique.len() == 1 {
+                        "it carries a unique index"
+                    } else {
+                        "it carries unique indexes"
+                    },
+                    bad_unique.join(", ")
+                )));
+            }
+            // Same reason again: an inbound foreign key from another
+            // table, added in that identical gap, is invisible to every
+            // `conrelid`-filtered guard above. It would be silently
+            // dropped by the `CASCADE` below.
+            let inbound_fks = inbound_foreign_keys(conn).await?;
+            if !inbound_fks.is_empty() {
+                return Err(HarvestError::Config(format!(
+                    "refusing to revert harvest_events: {} it from another table ({}), \
+                     added after the preflight check ran but before this transaction's \
+                     ACCESS EXCLUSIVE lock. Drop the foreign key (and recreate it against \
+                     harvest_events afterward), then re-run.",
+                    if inbound_fks.len() == 1 {
+                        "a foreign key references"
+                    } else {
+                        "foreign keys reference"
+                    },
+                    inbound_fks.join(", ")
+                )));
+            }
+
             let index_defs = capture_index_defs(conn).await?;
 
             // The flat layout restores `UNIQUE (workflow_exec_id, event_id)` and
@@ -1710,17 +3694,23 @@ pub async fn disable_partitioning(
             .await?;
             // Rename the parent's constraints/indexes so the flat table can reclaim
             // their names, exactly as the enable path does in reverse.
-            for (list_sql, rename_tmpl) in [
+            //
+            // The target is never a bare `{r.v}__old`: see
+            // `bounded_rename_fn_sql` for why that silently fails to free a
+            // name already at Postgres's 63-byte identifier limit.
+            for (list_sql, rename_tmpl, table_scope) in [
                 (
                     "SELECT conname AS v FROM pg_constraint \
                  WHERE conrelid = 'harvest_events_partitioned'::regclass",
                     "ALTER TABLE harvest_events_partitioned RENAME CONSTRAINT {q} TO {t}",
+                    Some("harvest_events_partitioned"),
                 ),
                 (
                     "SELECT indexname AS v FROM pg_indexes \
                  WHERE schemaname = current_schema() \
                    AND tablename = 'harvest_events_partitioned'",
                     "ALTER INDEX {q} RENAME TO {t}",
+                    None,
                 ),
             ] {
                 let rows = diesel::sql_query(list_sql)
@@ -1728,6 +3718,7 @@ pub async fn disable_partitioning(
                     .await
                     .map_err(database_error)?;
                 for r in rows {
+                    let target = bounded_rename_name(conn, table_scope, &r.v, "__old").await?;
                     exec(
                         conn,
                         // Both sides quoted: a mixed-case or special-character
@@ -1735,7 +3726,7 @@ pub async fn disable_partitioning(
                         // otherwise be case-folded or produce invalid syntax.
                         &rename_tmpl
                             .replace("{q}", &quote_ident(&r.v))
-                            .replace("{t}", &quote_ident(&format!("{}__old", r.v))),
+                            .replace("{t}", &quote_ident(&target)),
                     )
                     .await?;
                 }
@@ -1821,6 +3812,24 @@ pub async fn disable_partitioning(
             )
             .await?;
             exec(conn, "DROP TABLE harvest_events_partitioned CASCADE").await?;
+            // Issue #1270 item 13: `harvest partition enable` (and `plan`)
+            // creates this index as part of opting in. The migration itself
+            // is inert and never builds it, precisely so a deployment that
+            // never opts in never pays for it. `disable` is the reverse of
+            // `enable`, so it is the path that removes it again,
+            // symmetrically. The FK restored above makes the partitioned
+            // drop gate's index moot on the flat layout anyway.
+            //
+            // Review finding: `enable`'s `CREATE INDEX IF NOT EXISTS` leaves
+            // an operator's own pre-existing index of this exact name
+            // untouched, so it never becomes harvest's to remove. Dropping
+            // by name alone would delete that unrelated index. A shape
+            // check alone is not enough either — an operator's own index
+            // can happen to have the identical shape. Drop it only when
+            // `enable` tagged it AND its shape still matches.
+            if scalar_bool(conn, &we_created_at_idx_owned_check_sql()).await? {
+                exec(conn, "DROP INDEX idx_harvest_we_created_at").await?;
+            }
             Ok(DisableReport {
                 orphans_removed: orphans,
                 duplicates_removed: duplicates,
@@ -1856,6 +3865,9 @@ pub struct DisableReport {
 /// has space not come back?" — the reasons live in the sweep, so a status
 /// command that did not evaluate them could only ever list partitions.
 ///
+/// `resume_after` — see [`SweepOutcome::next_resume`] — is normally `None`
+/// for a one-shot status check. Pass `None` here too.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] on a catalog failure.
@@ -1864,8 +3876,9 @@ pub async fn evaluate(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
     opts: &SweepOptions,
+    resume_after: Option<DateTime<Utc>>,
 ) -> HarvestResult<SweepOutcome> {
-    sweep_inner(conn, now, opts, false).await
+    sweep_inner(conn, now, opts, false, resume_after, None, None).await
 }
 
 /// Drop every fully-reclaimable cohort partition, oldest first.
@@ -1890,6 +3903,13 @@ pub async fn evaluate(
 /// retried next tick, rather than making the append path queue behind the
 /// sweep.
 ///
+/// `resume_after` continues a bounded pass where a previous one left off —
+/// see [`SweepOutcome::next_resume`]. A one-shot caller (a manual `harvest
+/// partition sweep`) passes `None`. A caller ticking automatically (the
+/// retention runtime) persists the last outcome's `next_resume` and feeds
+/// it back in. That way a permanently blocked oldest run cannot starve
+/// every later partition of ever being attempted.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] on a catalog failure. A per-partition lock
@@ -1900,30 +3920,56 @@ pub async fn sweep(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
     opts: &SweepOptions,
+    resume_after: Option<DateTime<Utc>>,
 ) -> HarvestResult<SweepOutcome> {
-    sweep_inner(conn, now, opts, true).await
+    sweep_inner(conn, now, opts, true, resume_after, None, None).await
 }
 
 /// The shared body of [`sweep`] and [`evaluate`].
 ///
 /// One implementation so a read-only status report and the pass it predicts can
 /// never disagree about which partitions are droppable or why.
+///
+/// `resume_after` — see [`SweepOutcome::next_resume`] — skips straight past
+/// every partition up to and including the named one before evaluation
+/// starts. A name no longer present (already dropped, or from a stale
+/// caller) is treated the same as `None`: start from the oldest.
+///
+/// `catch_up_target` — see [`SweepOutcome::catch_up_target`] — is the fixed
+/// horizon this pass's own progress is measured against. That applies when
+/// it is part of a multi-pass catch-up cycle already in flight. `None`
+/// starts (or continues, if this pass does not truncate) with no cycle
+/// active.
 #[cfg(feature = "db")]
 async fn sweep_inner(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
     opts: &SweepOptions,
     apply: bool,
+    resume_after: Option<DateTime<Utc>>,
+    catch_up_target: Option<DateTime<Utc>>,
+    mut progress: Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<SweepOutcome> {
     let mut outcome = SweepOutcome::default();
     if !detect_layout(conn).await?.is_partitioned() {
         return Ok(outcome);
     }
 
-    for part in list_partitions(conn).await? {
-        if outcome.dropped.len() >= opts.max_drops {
-            break;
-        }
+    let parts = list_partitions(conn).await?;
+    // Review finding: skipping was keyed on `resume_after` matching a
+    // partition NAME. A truncated pass's own last attempted partition is
+    // exactly as likely to have been DROPPED as blocked, though. A
+    // dropped partition's name matches nothing next time, silently
+    // falling back to the oldest and reopening the very starvation this
+    // exists to close. Comparing by cohort upper bound instead needs no
+    // partition to still exist at that instant, only the ordering the
+    // sweep already relies on.
+    let mut skipping = resume_after.is_some();
+
+    let mut attempts = 0usize;
+    let mut last_attempted: Option<DateTime<Utc>> = None;
+    let mut reached_end = true;
+    for part in parts {
         // The DEFAULT partition is structural: dropping it would make an
         // append for an uncovered cohort fail outright. It is drained, never
         // dropped.
@@ -1939,10 +3985,49 @@ async fn sweep_inner(
                 .push(format!("{} ({UNBOUNDED_REASON})", part.name));
             continue;
         };
+        if skipping {
+            if resume_after.is_some_and(|cursor| upper <= cursor) {
+                continue;
+            }
+            skipping = false;
+        }
         if upper > now {
             continue;
         }
 
+        // Checked here, after the cheap skips above, not at the top of the
+        // loop. A tick can exhaust its budget on exactly the last eligible
+        // partition. It must not then report `truncated` just because the
+        // remaining partitions in the list are DEFAULT or still open.
+        // Those cost nothing and were never going to be attempted anyway.
+        if outcome.dropped.len() >= opts.max_drops || attempts >= opts.max_attempts {
+            outcome.truncated = true;
+            reached_end = false;
+            break;
+        }
+
+        // Counted here, not at the top of the loop. This is the gate
+        // evaluation the budget exists to bound, up to a tier-3 scan under
+        // `exact_scan_timeout`. A blocked partition costs exactly as much as
+        // a dropped one. The cheap skips above (DEFAULT, still open,
+        // unbounded) reach no such scan and do not spend the budget.
+        attempts += 1;
+        // Review finding: a per-shard tick before this whole pass starts
+        // is not bounded progress. Up to `max_attempts` partitions at
+        // `exact_scan_timeout` each can still run past the liveness
+        // scanner's staleness threshold before the pass returns. Ticking
+        // once per attempted partition here bounds the gap between proofs
+        // of life to one gate evaluation, not one whole pass.
+        if let Some(cb) = &mut progress {
+            cb();
+        }
+        // Review finding: a fixed oldest-first restart every pass cannot
+        // converge past a permanently blocked oldest run — see
+        // `SweepOutcome::next_resume`. Recorded before the outcome of
+        // THIS partition is known. A pass that ends by hitting budget on
+        // the very next iteration then still resumes after this one,
+        // rather than re-attempting it.
+        last_attempted = Some(upper);
         if let Some(reason) =
             cohort_occupancy(conn, &EventScope::cohort(part.lower, upper), upper, opts).await?
         {
@@ -1957,8 +4042,15 @@ async fn sweep_inner(
                 && let Ok(grace) = chrono::Duration::from_std(grace)
                 && upper + grace <= now
             {
-                outcome.straggler_rows_deleted +=
-                    delete_orphan_rows(conn, part.lower, upper, opts.straggler_batch).await?;
+                outcome.straggler_rows_deleted += delete_orphan_rows(
+                    conn,
+                    part.lower,
+                    upper,
+                    opts.straggler_batch,
+                    opts.exact_scan_timeout,
+                    reborrow_progress(&mut progress),
+                )
+                .await?;
             }
             continue;
         }
@@ -1977,6 +4069,28 @@ async fn sweep_inner(
                 .push(format!("{} ({RECHECK_REASON})", part.name));
         }
     }
+    // `reached_end` is true whenever the loop ran out of partitions
+    // before it ran out of budget, truncated or not. Either way there is
+    // no later partition this pass left unvisited, in THIS pass's own
+    // fresh query. The next pass should restart from the oldest, rather
+    // than resuming forever closer to the end.
+    //
+    // Review finding: that alone is not enough when the backlog itself
+    // grows at least as fast as the budget can attempt a partition.
+    // Every pass's own query then has a fresh, later partition at the
+    // tail. So `reached_end` never becomes true on its own, and a
+    // partition the cursor has already passed is skipped forever, even
+    // once whatever blocked it clears. `target` anchors this cycle to a
+    // FIXED point instead of that moving tail. The first pass to
+    // truncate snapshots its own `now`. Every later pass in the same
+    // cycle (the caller passes `catch_up_target` back unchanged)
+    // measures against that same instant. Reaching or passing it is
+    // "caught up," regardless of how much further the live backlog has
+    // grown since.
+    let target = catch_up_target.unwrap_or(now);
+    let caught_up = reached_end || last_attempted.is_some_and(|last| last >= target);
+    outcome.next_resume = if caught_up { None } else { last_attempted };
+    outcome.catch_up_target = if caught_up { None } else { Some(target) };
     Ok(outcome)
 }
 
@@ -2234,6 +4348,58 @@ const DRAIN_MAX_ROWS: usize = 50_000;
 #[doc(hidden)]
 pub const DRAIN_MAX_COHORTS: usize = 32;
 
+/// How often the drain's single-statement steps tick liveness while they
+/// run: the oversized-cohort census and the oversized-cohort move.
+///
+/// Each is one SQL statement, so nothing can tick between its rows.
+/// Racing it against a repeating timer, instead, ticks liveness on the
+/// clock without touching the statement itself. Well under
+/// [`crate::scanner_health::MIN_SCANNER_STALENESS_THRESHOLD`], so this
+/// alone cannot make an active step look stale.
+#[cfg(feature = "db")]
+const DRAIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long [`await_with_heartbeat`] keeps granting liveness credit to a
+/// step it has no other way to measure progress on.
+///
+/// Review finding: an unconditional timer-driven tick has no notion of
+/// progress at all. A step that hangs -- stuck on something the absent
+/// `statement_timeout` cannot catch, for instance -- would then tick
+/// forever. The scanner could never age into `Stale` or `Wedged`. Ten
+/// minutes is generous enough for a legitimately huge cohort or
+/// backlog. Past it, [`await_with_heartbeat`] stops ticking and simply
+/// waits. A step still running normally finishes on its own. A step
+/// truly stuck starts aging normally again, exactly as it did before
+/// this whole heartbeat existed.
+#[cfg(feature = "db")]
+const DRAIN_HEARTBEAT_GRACE: Duration = Duration::from_secs(600);
+
+/// Awaits `query`, ticking `progress` on [`DRAIN_HEARTBEAT_INTERVAL`]
+/// while it runs, for up to [`DRAIN_HEARTBEAT_GRACE`] total.
+///
+/// Never touches the connection the query itself is using. It only
+/// races a timer against the caller's own future, so the statement
+/// this awaits stays exactly one round trip.
+#[cfg(feature = "db")]
+async fn await_with_heartbeat<F: Future>(
+    mut query: Pin<&mut F>,
+    progress: &mut Option<&mut (dyn FnMut() + Send)>,
+) -> F::Output {
+    let deadline = tokio::time::Instant::now() + DRAIN_HEARTBEAT_GRACE;
+    loop {
+        tokio::select! {
+            result = &mut query => return result,
+            () = tokio::time::sleep(DRAIN_HEARTBEAT_INTERVAL) => {
+                if tokio::time::Instant::now() <= deadline
+                    && let Some(cb) = progress
+                {
+                    cb();
+                }
+            }
+        }
+    }
+}
+
 // A `statement_timeout` inside the drain's window is DELIBERATELY absent, and
 // this is the second thing to know about the pass after the budgets.
 //
@@ -2396,14 +4562,28 @@ async fn drop_partition(
 /// Deletes only rows whose owning execution no longer exists, in bounded
 /// batches, so a straggler pass can neither touch a live execution's history
 /// nor open an unbounded transaction.
+///
+/// Each batch runs under `statement_timeout`, exactly like the exact
+/// ownership scan this fallback runs alongside — see [`cohort_occupancy`].
+/// Without it, a batch on a partition where orphans are SPARSE re-scans the
+/// leading owned rows every iteration before finding one to delete. That is
+/// quadratic in the partition size, and otherwise runs for as long as that
+/// scan takes, inside the retention tick. A timeout is "did what it could
+/// this tick, retry next" — not an error. That matches every other budget
+/// in this module: what was deleted before the timeout stays deleted.
 #[cfg(feature = "db")]
 async fn delete_orphan_rows(
     conn: &mut AsyncPgConnection,
     lower: Option<DateTime<Utc>>,
     upper: DateTime<Utc>,
     batch: usize,
+    timeout: Duration,
+    mut progress: Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<usize> {
     let batch = i64::try_from(batch).unwrap_or(i64::MAX).max(1);
+    let ms = u64::try_from(timeout.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
     // Total work per partition per tick is capped, not just per statement. The
     // inner SELECT restarts from the top of the range each iteration, so on a
     // partition where orphans are SPARSE — the common shape for one pinned by a
@@ -2413,6 +4593,14 @@ async fn delete_orphan_rows(
     let max_batches = 16;
     let mut total = 0usize;
     for _ in 0..max_batches {
+        // Review finding: each batch here can run nearly `exact_scan_timeout`
+        // on its own. Sixteen of them can then run past the liveness
+        // scanner's staleness threshold even though this call is itself
+        // bounded progress. Ticking once per batch closes that gap the same
+        // way the caller already ticks once per attempted partition.
+        if let Some(cb) = &mut progress {
+            cb();
+        }
         // Keyed on `(id, cohort)` — the partitioned table's PRIMARY KEY — and
         // NOT on `ctid`.
         //
@@ -2445,15 +4633,52 @@ async fn delete_orphan_rows(
               )",
             lower.map_or(String::new(), |_| "e.cohort >= $3 AND".to_string())
         );
-        let query = diesel::sql_query(sql)
-            .bind::<Timestamptz, _>(upper)
-            .bind::<BigInt, _>(batch);
-        let deleted = if let Some(lower) = lower {
-            query.bind::<Timestamptz, _>(lower).execute(conn).await
-        } else {
-            query.execute(conn).await
-        }
-        .map_err(database_error)?;
+        // Review finding: `SET LOCAL` here scopes cleanly only when this
+        // call opens the outer transaction itself. Diesel implements a
+        // nested `.transaction()` as a `SAVEPOINT`. `RELEASE SAVEPOINT`
+        // does not undo a `SET LOCAL` made inside it. Only `ROLLBACK TO
+        // SAVEPOINT` does, which the error path below gets for free
+        // since the closure returns `Err` there. A caller that already
+        // had `conn` inside a transaction would see `statement_timeout`
+        // stay pinned to `{ms}ms` for the rest of it on the success
+        // path. Capture the prior value first and restore it, inside
+        // this same savepoint, before returning.
+        let result = Box::pin(conn.transaction::<usize, HarvestError, _>(async |conn| {
+            let prior = diesel::sql_query("SELECT current_setting('statement_timeout') AS v")
+                .get_result::<TextRow>(conn)
+                .await
+                .map_err(database_error)?
+                .v;
+            exec(conn, &format!("SET LOCAL statement_timeout = '{ms}ms'")).await?;
+            let query = diesel::sql_query(sql)
+                .bind::<Timestamptz, _>(upper)
+                .bind::<BigInt, _>(batch);
+            let deleted = if let Some(lower) = lower {
+                query.bind::<Timestamptz, _>(lower).execute(conn).await
+            } else {
+                query.execute(conn).await
+            }
+            .map_err(database_error)?;
+            exec(
+                conn,
+                &format!(
+                    "SET LOCAL statement_timeout = '{}'",
+                    prior.replace('\'', "''")
+                ),
+            )
+            .await?;
+            Ok(deleted)
+        }))
+        .await;
+        let deleted = match result {
+            Ok(n) => n,
+            // Fail safe toward "stop here". The rows this pass already
+            // deleted in earlier batches stay deleted. The rest of this
+            // partition is retried next tick — the same direction every
+            // other budget in this module fails in.
+            Err(HarvestError::Database(msg)) if is_statement_timeout(&msg) => break,
+            Err(e) => return Err(e),
+        };
         total += deleted;
         if deleted == 0 || i64::try_from(deleted).unwrap_or(i64::MAX) < batch {
             break;
@@ -2484,7 +4709,7 @@ async fn delete_orphan_rows(
 /// transaction, so a failure leaves every row where it was.
 #[cfg(feature = "db")]
 pub async fn drain_default(conn: &mut AsyncPgConnection) -> HarvestResult<usize> {
-    drain_default_bounded(conn, DRAIN_MAX_ROWS).await
+    drain_default_bounded_inner(conn, DRAIN_MAX_ROWS, None).await
 }
 
 /// [`drain_default`] with an explicit per-pass row budget.
@@ -2496,16 +4721,34 @@ pub async fn drain_default(conn: &mut AsyncPgConnection) -> HarvestResult<usize>
 ///
 /// [`HarvestError::Database`] if any step fails; the pass is one transaction,
 /// so a failure leaves every row where it was.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub async fn drain_default_bounded(
+    conn: &mut AsyncPgConnection,
+    max_rows: usize,
+) -> HarvestResult<usize> {
+    drain_default_bounded_inner(conn, max_rows, None).await
+}
+
+/// Same as [`drain_default_bounded`], but calls `progress` at each point
+/// this otherwise-unbounded pass can plausibly run long. That means
+/// before the census, once per cohort prepared, and before the final
+/// move. See [`maintain_with_progress`] for why a caller needs this.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] if any step fails; the pass is one transaction,
+/// so a failure leaves every row where it was.
 // A census, then one transaction whose steps must be read in order — detach,
 // create, move, re-enable, re-attach. Splitting it to satisfy a line budget
 // would scatter that sequence across helpers that only ever call each other
 // once, and the order is the whole correctness argument.
 #[allow(clippy::too_many_lines)]
 #[cfg(feature = "db")]
-#[doc(hidden)]
-pub async fn drain_default_bounded(
+async fn drain_default_bounded_inner(
     conn: &mut AsyncPgConnection,
     max_rows: usize,
+    mut progress: Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<usize> {
     let width = match detect_layout(conn).await? {
         EventLayout::Unpartitioned => return Ok(0),
@@ -2520,6 +4763,13 @@ pub async fn drain_default_bounded(
         return Ok(0);
     }
 
+    // Review finding: the census below is unbounded by any statement
+    // timeout. It is a full scan of the DEFAULT partition, exactly the
+    // expensive case this whole function exists for. Nothing can tick
+    // between its rows, so a single tick before it starts is not enough
+    // on its own for a large backlog. Race it against a repeating timer,
+    // the same way the oversized-cohort move below does.
+    //
     // Census BEFORE the lock. This `GROUP BY` scans every row in the DEFAULT
     // partition, and `cohort` carries no index — on the large backlog a
     // maintenance gap leaves, exactly the case this budget exists for, it is
@@ -2527,13 +4777,17 @@ pub async fn drain_default_bounded(
     // unbounded work under the parent's ACCESS EXCLUSIVE, so the row budget
     // bounded only what was MOVED while the shard stayed stopped for the whole
     // scan. Here it takes ACCESS SHARE and costs bystanders nothing.
-    let census = diesel::sql_query(format!(
-        "SELECT cohort AS v, count(*)::bigint AS n
-           FROM {DEFAULT_PARTITION} GROUP BY 1 ORDER BY 1"
-    ))
-    .load::<CohortCountRow>(&mut *conn)
-    .await
-    .map_err(database_error)?;
+    let census = {
+        let query = diesel::sql_query(format!(
+            "SELECT cohort AS v, count(*)::bigint AS n
+               FROM {DEFAULT_PARTITION} GROUP BY 1 ORDER BY 1"
+        ))
+        .load::<CohortCountRow>(&mut *conn);
+        tokio::pin!(query);
+        await_with_heartbeat(query, &mut progress)
+            .await
+            .map_err(database_error)?
+    };
 
     // Take whole cohorts, oldest first, up to BOTH budgets — and always at
     // least one, so a cohort larger than the row budget still makes progress
@@ -2570,6 +4824,9 @@ pub async fn drain_default_bounded(
         .await?;
 
         for cohort in &work {
+            if let Some(cb) = &mut progress {
+                cb();
+            }
             ensure_cohort_with_width(conn, *cohort, width, Duration::from_secs(2)).await?;
         }
         // The work list was read before the lock, so a row could have landed in
@@ -2594,12 +4851,18 @@ pub async fn drain_default_bounded(
         }
         let Some(cutoff) = cutoff else {
             // Nothing with a usable cohort: re-attach and report no progress
-            // rather than leaving `DEFAULT` detached.
-            exec(
-                conn,
-                &format!("ALTER TABLE harvest_events ATTACH PARTITION {DEFAULT_PARTITION} DEFAULT"),
-            )
-            .await?;
+            // rather than leaving `DEFAULT` detached. Heartbeat-guarded
+            // the same way as the main path's re-`ATTACH` below. This one
+            // scans a `DEFAULT` no rows were moved out of. It is at least
+            // as large a scan.
+            let query = diesel::sql_query(format!(
+                "ALTER TABLE harvest_events ATTACH PARTITION {DEFAULT_PARTITION} DEFAULT"
+            ))
+            .execute(conn);
+            tokio::pin!(query);
+            await_with_heartbeat(query, &mut progress)
+                .await
+                .map_err(database_error)?;
             return Ok(0);
         };
 
@@ -2644,20 +4907,33 @@ pub async fn drain_default_bounded(
             .ok();
         }
 
-        // One statement, so the rows leave `DEFAULT` exactly as they arrive in
-        // their cohort partitions — there is no window in which a row exists in
-        // both, and no `TRUNCATE` that could discard a row this pass did not
-        // move.
-        let moved = diesel::sql_query(format!(
-            "WITH moved AS (
-                 DELETE FROM {DEFAULT_PARTITION} WHERE cohort <= {} RETURNING *
-             )
-             INSERT INTO harvest_events SELECT * FROM moved",
-            ts_literal(cutoff)
-        ))
-        .execute(conn)
-        .await
-        .map_err(database_error)?;
+        // Review finding: an oversized single cohort can still make this
+        // move itself run long. The row budget bounds the pass overall,
+        // but "always at least one" above means a cohort larger than
+        // `max_rows` is still taken whole.
+        //
+        // One statement, so the rows leave `DEFAULT` exactly as they arrive
+        // in their cohort partitions — there is no window in which a row
+        // exists in both, and no `TRUNCATE` that could discard a row this
+        // pass did not move. Nothing can tick between rows of one
+        // statement, so a tick right before it starts is not enough on its
+        // own for an oversized cohort. Race it against a repeating timer
+        // instead. The timer ticks liveness on the clock without ever
+        // touching `conn`. The statement stays exactly one round trip.
+        let moved = {
+            let query = diesel::sql_query(format!(
+                "WITH moved AS (
+                     DELETE FROM {DEFAULT_PARTITION} WHERE cohort <= {} RETURNING *
+                 )
+                 INSERT INTO harvest_events SELECT * FROM moved",
+                ts_literal(cutoff)
+            ))
+            .execute(conn);
+            tokio::pin!(query);
+            await_with_heartbeat(query, &mut progress)
+                .await
+                .map_err(database_error)?
+        };
 
         for t in &targets {
             exec(
@@ -2678,11 +4954,23 @@ pub async fn drain_default_bounded(
         // No TRUNCATE: the move above already removed exactly the rows it
         // copied, and anything still here belongs to a cohort this pass did not
         // take. Truncating would destroy it.
-        exec(
-            conn,
-            &format!("ALTER TABLE harvest_events ATTACH PARTITION {DEFAULT_PARTITION} DEFAULT"),
-        )
-        .await?;
+        //
+        // Review finding: this re-`ATTACH` makes Postgres prove no
+        // remaining row belongs to an existing partition. That is a full
+        // scan of whatever is left in `DEFAULT`, exactly as unbounded as
+        // the move above it. Left as a plain `exec`, nothing ticks
+        // `progress` while it runs. A large enough remainder ages the
+        // scanner past its staleness threshold. This statement is still
+        // the one holding the lock and making real progress.
+        // Heartbeat-guarded the same way the move is.
+        let query = diesel::sql_query(format!(
+            "ALTER TABLE harvest_events ATTACH PARTITION {DEFAULT_PARTITION} DEFAULT"
+        ))
+        .execute(conn);
+        tokio::pin!(query);
+        await_with_heartbeat(query, &mut progress)
+            .await
+            .map_err(database_error)?;
         Ok(moved)
     }))
     .await
@@ -2751,6 +5039,11 @@ async fn maintenance_owner_gap(
 /// so a cohort freed earlier in the same tick is reclaimed now rather than
 /// next time.
 ///
+/// `resume_after` and `catch_up_target` are threaded straight through to the
+/// sweep step. See [`SweepOutcome::next_resume`] and
+/// [`SweepOutcome::catch_up_target`] for what they do and who should persist
+/// them across calls.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] on a catalog or DDL failure.
@@ -2760,12 +5053,101 @@ pub async fn maintain(
     now: DateTime<Utc>,
     lookahead_cohorts: u32,
     sweep_opts: &SweepOptions,
+    resume_after: Option<DateTime<Utc>>,
+    catch_up_target: Option<DateTime<Utc>>,
+) -> HarvestResult<MaintenanceOutcome> {
+    let mut progress: Option<&mut (dyn FnMut() + Send)> = None;
+    maintain_inner(
+        conn,
+        now,
+        lookahead_cohorts,
+        sweep_opts,
+        resume_after,
+        catch_up_target,
+        &mut progress,
+    )
+    .await
+}
+
+/// Same as [`maintain`], but calls `progress` once per partition the sweep
+/// step attempts.
+///
+/// Review finding: a tick recorded once before a shard's whole maintenance
+/// pass is not bounded progress. A single shard can spend
+/// `max_attempts × exact_scan_timeout` evaluating blocked partitions, long
+/// enough to cross the liveness scanner's own staleness threshold before
+/// this call returns anything. The retention runtime uses this entry point
+/// instead of [`maintain`] for that reason. A caller that reports liveness
+/// can then space its proofs of life by one partition attempt, not one
+/// whole pass.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] on a catalog or DDL failure.
+#[cfg(feature = "db")]
+pub async fn maintain_with_progress(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+    lookahead_cohorts: u32,
+    sweep_opts: &SweepOptions,
+    resume_after: Option<DateTime<Utc>>,
+    catch_up_target: Option<DateTime<Utc>>,
+    progress: &mut (dyn FnMut() + Send),
+) -> HarvestResult<MaintenanceOutcome> {
+    let mut progress: Option<&mut (dyn FnMut() + Send)> = Some(progress);
+    maintain_inner(
+        conn,
+        now,
+        lookahead_cohorts,
+        sweep_opts,
+        resume_after,
+        catch_up_target,
+        &mut progress,
+    )
+    .await
+}
+
+/// `progress` is `&mut Option<...>`, not `Option<&mut ...>`. Both
+/// [`drain_default_bounded_inner`] and [`sweep_inner`] below need their own
+/// reborrow of the same callback. Reborrowing an `&mut Option` twice in
+/// sequence is a short, independent borrow each time. Moving the `Option`
+/// itself into the first call would leave nothing for the second.
+///
+/// `&mut Option<&mut dyn Trait>` is invariant over the inner reference's
+/// lifetime, so `Option::as_deref_mut` cannot shorten it. Two sequential
+/// calls through it then conflict, even though neither outlives the
+/// other. A plain match reborrows explicitly instead, which does not hit
+/// that invariance.
+#[cfg(feature = "db")]
+// `Option::map`/`map_or` unify the outer and inner lifetimes, which brings
+// back the exact invariance conflict this function exists to avoid. The
+// plain match keeps them independent.
+#[allow(clippy::option_if_let_else)]
+fn reborrow_progress<'a>(
+    progress: &'a mut Option<&mut (dyn FnMut() + Send)>,
+) -> Option<&'a mut (dyn FnMut() + Send)> {
+    match progress {
+        Some(cb) => Some(&mut **cb),
+        None => None,
+    }
+}
+
+#[cfg(feature = "db")]
+async fn maintain_inner(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+    lookahead_cohorts: u32,
+    sweep_opts: &SweepOptions,
+    resume_after: Option<DateTime<Utc>>,
+    catch_up_target: Option<DateTime<Utc>>,
+    progress: &mut Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<MaintenanceOutcome> {
     if !detect_layout(conn).await?.is_partitioned() {
         // Still stamped: a caller polling for "maintenance has run" must not
         // hang forever on an unpartitioned shard, where there is nothing to do.
         return Ok(MaintenanceOutcome {
             at: Some(Utc::now()),
+            partitioned: Some(false),
             ..MaintenanceOutcome::default()
         });
     }
@@ -2797,18 +5179,60 @@ pub async fn maintain(
     // it — and extending the write window is the one thing that must never
     // stop, because an uncovered cohort is what fills the DEFAULT partition in
     // the first place. A failed drain is recorded and retried next tick.
-    let (drained, drain_error) = match drain_default(conn).await {
+    let (drained, drain_error) = match drain_default_bounded_inner(
+        conn,
+        DRAIN_MAX_ROWS,
+        reborrow_progress(progress),
+    )
+    .await
+    {
         Ok(n) => (n, None),
         Err(e) => (0, Some(e.to_string())),
     };
-    let created = ensure_partitions(conn, now, lookahead_cohorts, sweep_opts.lock_timeout).await?;
-    let sweep = sweep(conn, now, sweep_opts).await?;
+    let (created, lookahead_blocked) = ensure_partitions_inner(
+        conn,
+        now,
+        lookahead_cohorts,
+        sweep_opts.lock_timeout,
+        reborrow_progress(progress),
+    )
+    .await?;
+    let sweep = sweep_inner(
+        conn,
+        now,
+        sweep_opts,
+        true,
+        resume_after,
+        catch_up_target,
+        reborrow_progress(progress),
+    )
+    .await?;
+    // A partial catch-up must not report as a healthy, empty-`last_error`
+    // pass. `ensure_partitions` keeps creating the rest of the window when
+    // one cohort is blocked (deliberately — see its doc). So `created` can
+    // be non-empty even though the write window is still not fully covered.
+    // This never overwrites `drain_error`. Both are real, independent
+    // failures this tick, and neither may hide the other.
+    let last_error = if lookahead_blocked.is_empty() {
+        drain_error
+    } else {
+        let msg = format!(
+            "the lookahead window is not fully covered: {} of {} cohort(s) blocked ({}); \
+             appends for those cohorts land in {DEFAULT_PARTITION} until a later pass succeeds",
+            lookahead_blocked.len(),
+            lookahead_cohorts + 1,
+            lookahead_blocked.join(", ")
+        );
+        Some(drain_error.map_or_else(|| msg.clone(), |prev| format!("{prev}; {msg}")))
+    };
     Ok(MaintenanceOutcome {
         at: Some(Utc::now()),
+        partitioned: Some(true),
         created,
+        lookahead_blocked,
         drained,
         sweep,
-        last_error: drain_error,
+        last_error,
     })
 }
 
@@ -2824,8 +5248,44 @@ pub struct MaintenanceOutcome {
     /// different instants — and an operator diagnosing "why is space not coming
     /// back?" needs to know which one they are looking at.
     pub at: Option<DateTime<Utc>>,
+    /// Whether the shard was on the partitioned layout, per this pass's own
+    /// probe -- the same probe that gates every step below.
+    ///
+    /// Review finding: a caller that probes the layout separately before
+    /// calling [`maintain`] or [`maintain_with_progress`] can race a
+    /// concurrent `enable`/`disable_partitioning`. That race lands
+    /// between the caller's own probe and this call's internal one.
+    /// Basing a report on that earlier, separate probe can then
+    /// disagree with what this pass actually observed and acted on.
+    /// This field lets a caller derive its report from the exact probe
+    /// that gated the work, so the two can never disagree. `Some(true)`
+    /// only on the return after the probe below finds the shard
+    /// partitioned; `Some(false)` on the unpartitioned early return.
+    ///
+    /// Review finding: the owner-gap check, `ensure_partitions`, and
+    /// `sweep` below can all still fail AFTER this probe already found
+    /// the shard partitioned. A caller that turns the resulting `Err`
+    /// into a [`Self::failed`] has no way to recover which layout this
+    /// pass saw. The error carries no memory of it. `None` on
+    /// [`Self::failed`] represents that honestly, as an unknown layout.
+    /// The alternative, falsely claiming `Some(false)` (unpartitioned),
+    /// would misreport a shard this very pass had already confirmed
+    /// partitioned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitioned: Option<bool>,
     /// Cohort partitions created to extend the lookahead window.
     pub created: Vec<String>,
+    /// Cohorts in the lookahead window that could NOT be created this pass.
+    /// Causes include a generated name colliding with an unrelated relation,
+    /// or a bounded lock attempt that ran out of time.
+    ///
+    /// Non-empty here means the write window is not fully covered, even
+    /// though `created` may also be non-empty. `ensure_partitions` keeps
+    /// creating the rest of the window when one cohort is blocked. A partial
+    /// catch-up must not be mistaken for a healthy pass. Retried
+    /// automatically next tick.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lookahead_blocked: Vec<String>,
     /// Rows moved out of the `DEFAULT` partition.
     pub drained: usize,
     /// The sweep result.
@@ -2854,6 +5314,411 @@ impl MaintenanceOutcome {
 }
 
 // ── The large-live-table migration plan ────────────────────────────────────
+
+/// A boolean SQL expression checking that `c`/`i` name a **correctly
+/// shaped** unique index on exactly `columns`, in order. `c`/`i` are
+/// aliases for `pg_class` and `pg_index`, already joined and filtered to
+/// `indrelid = 'harvest_events'`.
+///
+/// Used by the phase-4 assertion below to close a narrow but real hole. An
+/// operator's own pre-existing, valid index can happen to hold one of the
+/// two fixed names (`{LEGACY_PARTITION}_pk_idx`,
+/// `{LEGACY_PARTITION}_exec_event_idx`). That makes phase 2's `CREATE ...
+/// IF NOT EXISTS` skip building the real one. Checking only the name and
+/// `indisvalid` — the assertion's original form — counts that impostor as
+/// ready. `ATTACH PARTITION` then builds the real index inside the window
+/// this plan advertises as metadata-only.
+///
+/// Checks uniqueness, and the exact key column list (position included —
+/// `(a, b)` is not `(b, a)`). Also checks that there is no partial-index
+/// predicate or expression column, and that every key column uses its
+/// type's default
+/// operator class. `indkey` is an `int2vector`, whose Postgres-defined
+/// array lower bound is `0`, so `indkey[0]` is the first key column.
+///
+/// Review finding: also checks `indoption` for each key column. Harvest's
+/// own phase-2 indexes sort every key column in plain ascending order. An
+/// operator's own index under one of the reserved names can share every
+/// key column and position with Harvest's own index. One column merely
+/// sorted `DESC` still passed every check above it. `ATTACH PARTITION`
+/// requires matching sort direction per column, so that impostor was
+/// unattachable too. Phase 4 then built an unplanned replacement over the
+/// legacy table under `ACCESS EXCLUSIVE`. `indoption` packs one flag byte
+/// per key column at the same position as `indkey`. `0` means ascending
+/// with nulls last, the only shape Harvest's own indexes ever take.
+///
+/// Review finding: also checks for `NULLS NOT DISTINCT`. Harvest's own
+/// phase-2 indexes are ordinary ones — `NULLS DISTINCT`, the default. An
+/// operator's own `UNIQUE NULLS NOT DISTINCT` index under one of these
+/// reserved names, with otherwise matching columns, still passed every
+/// check above. `ATTACH PARTITION` requires that property to match the
+/// parent's index. Phase 4 would then find this impostor unattachable.
+/// It would build a replacement over the legacy table instead, under
+/// `ACCESS EXCLUSIVE` — exactly the unplanned rebuild this assertion
+/// exists to catch in advance.
+///
+/// Review finding: checked through `pg_get_indexdef`, not
+/// `pg_index.indnullsnotdistinct` directly. That column does not exist
+/// before `PostgreSQL` 15. `docs/partitioned-events.md` still supports 14,
+/// and a literal reference to it fails every phase-4 run there with
+/// "column does not exist", potentially hours into phases 1–3.
+/// `pg_get_indexdef` exists on every supported version. It renders
+/// `NULLS NOT DISTINCT` in its output exactly when the feature is
+/// present. The same textual check works everywhere, then: it can never
+/// appear in the reconstructed definition on a version that has no way
+/// to create it.
+///
+/// Review finding: also checks `indcollation` for each key column. An
+/// operator's own index under one of the reserved names can match every
+/// other check here, including column position and sort order. It can
+/// still carry a non-default collation on a text-like column. `ATTACH
+/// PARTITION` requires a leaf index to match the parent's collation per
+/// column, so that impostor is unattachable too. This assertion would
+/// otherwise count phase 2 complete over it. Phase 4 would then build an
+/// unplanned replacement under `ACCESS EXCLUSIVE` -- the unbounded
+/// rebuild the online plan exists to avoid.
+#[must_use]
+fn index_shape_check_sql(index_name: &str, columns: &[&str]) -> String {
+    let col_checks: String = columns
+        .iter()
+        .enumerate()
+        .map(|(pos, col)| {
+            format!(
+                "i.indkey[{pos}] = (SELECT a.attnum FROM pg_attribute a \
+                 WHERE a.attrelid = 'harvest_events'::regclass AND a.attname = '{col}') \
+                 AND i.indoption[{pos}] = 0 \
+                 AND i.indcollation[{pos}] = (SELECT a.attcollation FROM pg_attribute a \
+                 WHERE a.attrelid = 'harvest_events'::regclass AND a.attname = '{col}')"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let n = columns.len();
+    format!(
+        "(c.relname = '{index_name}' AND i.indisunique \
+         AND pg_get_indexdef(i.indexrelid) NOT ILIKE '%NULLS NOT DISTINCT%' \
+         AND i.indpred IS NULL \
+         AND i.indexprs IS NULL AND i.indnkeyatts = {n} AND i.indnatts = {n} \
+         AND {col_checks} \
+         AND NOT EXISTS (\
+             SELECT 1 FROM unnest(i.indclass) AS oc(opclass) \
+             JOIN pg_opclass op ON op.oid = oc.opclass \
+             WHERE NOT op.opcdefault\
+         ))"
+    )
+}
+
+/// A `DO` block refusing over a unique index that cannot survive conversion
+/// unchanged. Tagged with `tag`, so it can appear more than once in the same
+/// generated script.
+///
+/// Review finding: phase 1's copy of this check runs hours before phase 4's
+/// rename, under `migration_plan`'s online path. An operator could add a
+/// compatible-looking constraint-backed unique index in that window and
+/// pass phase 1 clean. `capture_index_defs` would still drop it silently
+/// at phase 4, exactly like [`unique_indexes_missing_cohort`]'s own
+/// docstring explains. Recheck it under phase 4's lock too, alongside the
+/// view and trigger rechecks.
+#[must_use]
+fn unique_index_guard_sql(tag: &str) -> String {
+    format!(
+        "DO ${tag}$\nDECLARE bad text;\nBEGIN\n    \
+         SELECT string_agg(i.indexrelid::regclass::text, ', ' ORDER BY 1) INTO bad\n      \
+         FROM pg_index i\n      \
+         JOIN pg_class c ON c.oid = i.indrelid\n      \
+         JOIN pg_namespace n ON n.oid = c.relnamespace\n      \
+         JOIN pg_attribute ca\n        \
+         ON ca.attrelid = c.oid AND ca.attname = 'cohort'\n     \
+         WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
+         AND i.indisunique\n       \
+         AND {HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL}\n       \
+         AND (\n           \
+         EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)\n           \
+         OR NOT EXISTS (\n               \
+         SELECT 1 FROM generate_series(0, i.indnkeyatts - 1) k\n                \
+         WHERE i.indkey[k] = ca.attnum\n           \
+         )\n       \
+         );\n    \
+         IF bad IS NOT NULL THEN\n        \
+         RAISE EXCEPTION 'harvest #958: harvest_events carries a unique index that \
+         cannot survive conversion unchanged (%). Either it does not include \
+         `cohort` -- Postgres requires the partition key in every unique index on a \
+         partitioned table, so phase 4 replaying it would fail -- or it is backed by \
+         a table constraint other than harvest''s own two, which phase 4 has no way \
+         to replay and would otherwise drop silently. Drop the index or constraint if \
+         it is obsolete, or recreate it including `cohort` yourself, before running \
+         this plan.', bad;\n    \
+         END IF;\nEND\n${tag}$;"
+    )
+}
+
+/// A `DO` block refusing when a view depends on `harvest_events`, tagged
+/// with `tag` so it can appear more than once in the same generated script.
+///
+/// Review finding: phase 1's copy of this check runs hours before phase 4's
+/// rename, under `migration_plan`'s online path. A view created (or
+/// repointed) at `harvest_events` in that window would pass phase 1 clean.
+/// It would then end up silently stale after phase 4 anyway.
+/// [`migration_plan_steps`] runs this same check again as the first thing
+/// inside phase 4's lock. The catalog state being validated is then the
+/// state actually being converted.
+#[must_use]
+fn dependent_views_guard_sql(tag: &str) -> String {
+    format!(
+        "DO ${tag}$\nDECLARE bad text;\nBEGIN\n    \
+         SELECT string_agg(DISTINCT (v_ns.nspname || '.' || v.relname), ', ') INTO bad\n      \
+         FROM pg_depend d\n      \
+         JOIN pg_rewrite r ON r.oid = d.objid\n      \
+         JOIN pg_class v ON v.oid = r.ev_class\n      \
+         JOIN pg_namespace v_ns ON v_ns.oid = v.relnamespace\n      \
+         JOIN pg_class t ON t.oid = d.refobjid\n      \
+         JOIN pg_namespace t_ns ON t_ns.oid = t.relnamespace\n     \
+         WHERE t.relname = 'harvest_events' AND t_ns.nspname = current_schema()\n       \
+         AND v.relkind IN ('v', 'm');\n    \
+         IF bad IS NOT NULL THEN\n        \
+         RAISE EXCEPTION 'harvest #958: view(s) depend on harvest_events (%). Postgres \
+         tracks a view''s dependency by relation OID, not by name, and phase 4 renames \
+         harvest_events out of the way — so the view would keep pointing at the OLD \
+         relation, silently returning fewer rows than it should. Drop the view (and \
+         recreate it against harvest_events afterward) before running this plan.', bad;\n    \
+         END IF;\nEND\n${tag}$;"
+    )
+}
+
+/// A `DO` block refusing when an operator trigger sits on `harvest_events`.
+/// Tagged with `tag`, so it can appear more than once in the same
+/// generated script.
+///
+/// Review finding: phase 1's copy of this check has the identical gap
+/// [`dependent_views_guard_sql`] closes. Phase 4 recheck it too, right
+/// alongside the view recheck, under the same lock.
+///
+/// Review finding: the exemption for harvest's own trigger checked its
+/// FUNCTION alone. An operator trigger invoking that same function under
+/// its own name would then also be exempted and stay unnoticed. The
+/// check now also requires the reserved trigger's own name, matching
+/// [`operator_triggers`]'s fix for the identical gap.
+///
+/// Review finding: name and function still are not the whole identity --
+/// see [`operator_triggers`]'s identical follow-up fix. The check now
+/// also requires harvest's exact trigger shape: [`EXEC_FK_TRIGGER_TGTYPE`],
+/// no arguments, no `WHEN` clause, and `tgenabled = 'O'` -- see
+/// [`operator_triggers`]'s identical enabled-state fix too.
+#[must_use]
+fn operator_triggers_guard_sql(tag: &str) -> String {
+    format!(
+        "DO ${tag}$\nDECLARE bad text;\nBEGIN\n    \
+         SELECT string_agg(tg.tgname, ', ' ORDER BY 1) INTO bad\n      \
+         FROM pg_trigger tg\n      \
+         JOIN pg_class c ON c.oid = tg.tgrelid\n      \
+         JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
+         JOIN pg_proc p ON p.oid = tg.tgfoid\n     \
+         WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
+         AND NOT tg.tgisinternal\n       \
+         AND NOT (tg.tgname = '{EXEC_FK_TRIGGER}'\n                      \
+         AND p.proname = 'harvest_events_require_execution'\n                      \
+         AND p.pronamespace = c.relnamespace\n                      \
+         AND tg.tgtype = {EXEC_FK_TRIGGER_TGTYPE}\n                      \
+         AND tg.tgnargs = 0\n                      \
+         AND tg.tgqual IS NULL\n                      \
+         AND tg.tgenabled = 'O');\n    \
+         IF bad IS NOT NULL THEN\n        \
+         RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not carried by \
+         CREATE TABLE ... (LIKE ...) (%). An operator trigger would stay on the \
+         renamed legacy table after phase 4, where it stops firing for every new row \
+         from cutover onward while still existing. Drop the trigger (and recreate it \
+         against harvest_events afterward) before running this plan.', bad;\n    \
+         END IF;\nEND\n${tag}$;"
+    )
+}
+
+/// A `DO` block refusing when a `CHECK`, foreign-key or exclusion
+/// constraint sits on `harvest_events` or on one of its leaf partitions.
+/// Tagged with `tag`, so it can appear more than once in the same
+/// generated script.
+///
+/// Mirrors [`unreplayable_constraints`]'s query exactly. Primary-key and
+/// unique constraints are excluded, since every one is backed by an
+/// index. [`unique_index_guard_sql`] already covers them. Harvest's own
+/// foreign key (`harvest_events_workflow_exec_id_fkey`) and its own
+/// `{LEGACY_PARTITION}_cohort_ck` `CHECK` are excluded too. Both are
+/// matched by name, type and shape, the same way harvest's own primary
+/// key and unique constraint are.
+///
+/// Review finding: `enable_partitioning` makes this check in Rust. The
+/// scripted path needs its own because it never calls it, same as the
+/// view and trigger guards above. Phase 4 rechecks it again under the
+/// lock this phase converts under, for the identical hours-long-gap
+/// reason those guards do.
+///
+/// `cutover_lit` is the plan's own attached cutover. Phase 3 bakes the
+/// same literal into its `ADD CONSTRAINT ... CHECK (cohort < ...)`. So
+/// the cohort-`CHECK` exemption below can require an exact match
+/// against it. See [`expected_cohort_ck_def_sql`] for why that closes a
+/// gap [`LEGACY_COHORT_CK_DEF_RE`] leaves open.
+#[must_use]
+fn unreplayable_constraints_guard_sql(tag: &str, cutover_lit: &str) -> String {
+    let expected_cohort_ck_stmt =
+        expected_cohort_ck_def_sql(&format!("{cutover_lit}::timestamptz"));
+    format!(
+        "DO ${tag}$\nDECLARE bad text; expected_cohort_ck text;\nBEGIN\n    \
+         expected_cohort_ck := {expected_cohort_ck_stmt};\n    \
+         SELECT string_agg(DISTINCT con.conname, ', ' ORDER BY con.conname) INTO bad\n      \
+         FROM pg_constraint con\n      \
+         JOIN pg_class t ON t.oid = con.conrelid\n      \
+         JOIN pg_namespace n ON n.oid = t.relnamespace\n     \
+         WHERE n.nspname = current_schema()\n       \
+         AND (\n           \
+         t.relname = 'harvest_events'\n           \
+         OR t.oid IN (\n               \
+         SELECT i.inhrelid\n                 \
+         FROM pg_inherits i\n                 \
+         JOIN pg_class parent ON parent.oid = i.inhparent\n                 \
+         JOIN pg_namespace pn ON pn.oid = parent.relnamespace\n                \
+         WHERE parent.relname = 'harvest_events' AND pn.nspname = current_schema()\n           \
+         )\n       \
+         )\n       \
+         AND con.contype IN ('c', 'f', 'x')\n       \
+         AND NOT (\n           \
+         con.conname = 'harvest_events_workflow_exec_id_fkey'\n           \
+         AND con.contype = 'f'\n           \
+         AND NOT con.condeferrable\n           \
+         AND con.confdeltype = 'c'\n           \
+         AND con.confupdtype = 'a'\n           \
+         AND con.confrelid = 'harvest_workflow_executions'::regclass\n           \
+         AND (SELECT array_agg(a.attname::text ORDER BY k)\n                  \
+         FROM generate_subscripts(con.conkey, 1) k\n                  \
+         JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]\n               \
+         ) = ARRAY['workflow_exec_id']\n           \
+         AND (SELECT array_agg(a.attname::text ORDER BY k)\n                  \
+         FROM generate_subscripts(con.confkey, 1) k\n                  \
+         JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = con.confkey[k]\n               \
+         ) = ARRAY['id']\n       \
+         )\n       \
+         AND NOT (\n           \
+         con.conname IN (\n               \
+         '{LEGACY_PARTITION}_cohort_ck',\n               \
+         '{LEGACY_PARTITION}_cohort_ck{LEGACY_RENAME_SUFFIX}'\n           \
+         )\n           \
+         AND con.contype = 'c'\n           \
+         AND NOT con.condeferrable\n           \
+         AND t.relname IN ('harvest_events', '{LEGACY_PARTITION}')\n           \
+         AND (SELECT array_agg(a.attname::text ORDER BY k)\n                  \
+         FROM generate_subscripts(con.conkey, 1) k\n                  \
+         JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]\n               \
+         ) = ARRAY['cohort']\n           \
+         AND pg_get_constraintdef(con.oid) IN (expected_cohort_ck, expected_cohort_ck || ' NOT VALID')\n       \
+         );\n    \
+         IF bad IS NOT NULL THEN\n        \
+         RAISE EXCEPTION 'harvest #958: constraint(s) on harvest_events not carried by \
+         CREATE TABLE ... (LIKE ...) (%). An operator CHECK, foreign-key or exclusion \
+         constraint would stop applying to every row appended after cutover, while still existing \
+         on the relation this leaves behind. Drop the constraint (and recreate it \
+         against harvest_events afterward, if it is still needed) before running this \
+         plan.', bad;\n    \
+         END IF;\nEND\n${tag}$;"
+    )
+}
+
+/// A `DO` block refusing when `harvest_events` carries row security. Tagged
+/// with `tag`, so it can appear more than once in the same generated
+/// script.
+///
+/// Review finding: the phase-4 in-lock recheck block rechecked unique
+/// indexes, views and triggers, but not row security. `CREATE TABLE ...
+/// (LIKE ...)` copies neither `relrowsecurity`/`relforcerowsecurity` nor
+/// any `pg_policy` row. That is the same gap [`refuse_if_row_security`]
+/// exists to close before phase 1. An operator enabling RLS or adding
+/// a policy in the hours-long gap before this lock would have it
+/// silently dropped. That is exactly what would happen to an unchecked
+/// dependent view or trigger.
+#[must_use]
+fn row_security_guard_sql(tag: &str) -> String {
+    format!(
+        "DO ${tag}$\nDECLARE pols text; rls bool;\nBEGIN\n    \
+         SELECT COALESCE(bool_or(c.relrowsecurity OR c.relforcerowsecurity), false)\n      \
+         INTO rls\n      \
+         FROM pg_class c\n      \
+         JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
+         WHERE c.relname = 'harvest_events' AND n.nspname = current_schema();\n    \
+         SELECT string_agg(p.polname, ', ' ORDER BY p.polname) INTO pols\n      \
+         FROM pg_policy p\n      \
+         JOIN pg_class c ON c.oid = p.polrelid\n      \
+         JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
+         WHERE c.relname = 'harvest_events' AND n.nspname = current_schema();\n    \
+         IF rls OR pols IS NOT NULL THEN\n        \
+         RAISE EXCEPTION 'harvest #958: harvest_events has row level security \
+         configured (policies: %), added after phase 1''s check ran. Phase 4 replaces \
+         it with a table built by CREATE TABLE ... (LIKE ...), which copies neither \
+         the row-security flags nor any policy. Drop the policy (and DISABLE ROW \
+         LEVEL SECURITY) if obsolete, or reproduce it on the converted layout by \
+         hand, before re-running this plan.', COALESCE(pols, 'none, but row security \
+         is enabled');\n    \
+         END IF;\nEND\n${tag}$;"
+    )
+}
+
+/// A `DO` block refusing when a publication covers `harvest_events`. Tagged
+/// with `tag`, so it can appear more than once in the same generated
+/// script.
+///
+/// Review finding: the phase-4 in-lock recheck block had no publication
+/// check at all, unlike phase 1's. See the comment on that step for why
+/// a leaf-publishing publication silently stops a logical-replication
+/// standby. A publication created (or repointed with `ALTER PUBLICATION
+/// ... ADD TABLE`) in the hours-long gap before this lock would pass
+/// phase 1 clean. It would still break the standby after phase 4.
+#[must_use]
+fn publications_guard_sql(tag: &str) -> String {
+    format!(
+        "DO ${tag}$\nDECLARE bad text;\nBEGIN\n    \
+         SELECT string_agg(DISTINCT t.pubname, ', ') INTO bad\n      \
+         FROM pg_publication_tables t\n     \
+         WHERE t.schemaname = current_schema()\n       \
+         AND t.tablename = 'harvest_events';\n    \
+         IF bad IS NOT NULL THEN\n        \
+         RAISE EXCEPTION 'harvest #958: harvest_events is published by %, added after \
+         phase 1''s check ran. The partitioned layout is not compatible with a flat \
+         logical-replication subscriber. Run the partitioned layout on the subscriber \
+         too, or drop the publication, before re-running this plan.', bad;\n    \
+         END IF;\nEND\n${tag}$;"
+    )
+}
+
+/// A `DO` block refusing only when a publication EXPLICITLY lists
+/// `harvest_events` as a member. Tagged with `tag`, so it can appear more
+/// than once in the same generated script.
+///
+/// Used in place of [`publications_guard_sql`] under
+/// [`EnableOptions::allow_incompatible_publications`]. See
+/// `explicitly_published_by` for why that override cannot cover this
+/// narrower case. An explicit membership is pinned to the relation's OID.
+/// Phase 4's rename-and-recreate step leaves the publication attached
+/// to `harvest_events_legacy`, not the new parent. A `FOR ALL TABLES` or
+/// `FOR TABLES IN SCHEMA` publication resolves by name instead, so it
+/// automatically covers the new parent and stays exempt under the
+/// override, same as before.
+#[must_use]
+fn explicit_publications_guard_sql(tag: &str) -> String {
+    format!(
+        "DO ${tag}$\nDECLARE bad text;\nBEGIN\n    \
+         SELECT string_agg(DISTINCT p.pubname, ', ') INTO bad\n      \
+         FROM pg_publication p\n     \
+         JOIN pg_publication_rel pr ON pr.prpubid = p.oid\n     \
+         JOIN pg_class c ON c.oid = pr.prrelid\n     \
+         JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
+         WHERE n.nspname = current_schema()\n       \
+         AND c.relname = 'harvest_events';\n    \
+         IF bad IS NOT NULL THEN\n        \
+         RAISE EXCEPTION 'harvest #958: harvest_events is explicitly listed in %. \
+         allow_incompatible_publications does not cover this: explicit membership is \
+         pinned to this relation''s OID, so this plan''s rename leaves the publication \
+         attached to harvest_events_legacy, and the new partitioned parent publishes \
+         nothing. Switch % to a FOR ALL TABLES or FOR TABLES IN SCHEMA publication, or \
+         drop this membership, before re-running this plan.', bad, bad;\n    \
+         END IF;\nEND\n${tag}$;"
+    )
+}
 
 /// One statement of the large-live-table conversion plan.
 ///
@@ -2901,6 +5766,12 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
     let lock_ms = opts.lock_timeout.as_millis().max(1);
     let suffix_len = LEGACY_RENAME_SUFFIX.len();
     let cutover_lit = ts_literal(cohort_start(now, width));
+    let pk_idx_check =
+        index_shape_check_sql(&format!("{LEGACY_PARTITION}_pk_idx"), &["id", "cohort"]);
+    let exec_event_idx_check = index_shape_check_sql(
+        &format!("{LEGACY_PARTITION}_exec_event_idx"),
+        &["workflow_exec_id", "event_id", "cohort"],
+    );
 
     let step = |phase: u8, sql: String| PlanStep {
         phase,
@@ -2913,7 +5784,7 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         concurrent: true,
     };
 
-    vec![
+    let mut steps = vec![
         // ── 1: refuse outright if the table is already partitioned ────────
         //
         // Re-running the plan after a completed step 4 is not a no-op, it is
@@ -2993,6 +5864,47 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
              END IF;\nEND\n$harvest_rls_958$;"
                 .to_string(),
         ),
+        // ── 1: refuse early over a unique index missing `cohort` ──────────
+        //
+        // Same reason and same phase as the guards above.
+        // `enable_partitioning` makes this check in Rust; the scripted path
+        // needs its own because it never calls it. See
+        // `refuse_if_unique_index_without_cohort` — Postgres requires the
+        // partition key in every unique index on a partitioned table, and
+        // phase 4 replays every captured index verbatim.
+        step(1, unique_index_guard_sql("harvest_uniq_958")),
+        // ── 1: refuse early over a view depending on harvest_events ───────
+        //
+        // Same reason and same phase as the guards above.
+        // `enable_partitioning` makes this check in Rust; the scripted path
+        // needs its own because it never calls it. See `dependent_views`.
+        // Postgres tracks a view's dependency by OID, not by name. A
+        // dependent view would keep pointing at the renamed relation after
+        // phase 4, silently returning fewer rows than it should.
+        step(1, dependent_views_guard_sql("harvest_view_958")),
+        // ── 1: refuse early over an operator trigger on harvest_events ────
+        //
+        // Same reason and same phase as the guards above.
+        // `enable_partitioning` makes this check in Rust; the scripted path
+        // needs its own because it never calls it. See `operator_triggers`.
+        // `CREATE TABLE ... (LIKE ...)` does not carry triggers. An operator
+        // trigger would stay on the renamed legacy table after phase 4. It
+        // would then stop firing for every new row from cutover onward.
+        step(1, operator_triggers_guard_sql("harvest_trg_958")),
+        // ── 1: refuse early over a constraint not carried by CREATE TABLE
+        // ... (LIKE ...) ──────────────────────────────────────────────────
+        //
+        // Same reason and same phase as the guards above.
+        // `enable_partitioning` makes this check in Rust; the scripted path
+        // needs its own because it never calls it. See
+        // `unreplayable_constraints`. A `CHECK` or foreign-key constraint
+        // would stay enforced on the renamed legacy table after phase 4.
+        // It would then silently stop applying to any row appended from
+        // cutover onward.
+        step(
+            1,
+            unreplayable_constraints_guard_sql("harvest_constraint_958", &cutover_lit),
+        ),
         // ── 1: bake the chosen width into the cohort function ─────────────
         step(1, cohort_function_sql(width)),
         // ── 2: the partition-key indexes, built without blocking ──────────
@@ -3010,21 +5922,99 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // Dropped, not reindexed: a plain `DROP INDEX` on an invalid index is a
         // catalog change with no readers to wait for, and the `CONCURRENTLY`
         // build below then rebuilds it without blocking.
+        //
+        // Review finding: matching by schema and name alone selected any
+        // invalid index anywhere bearing one of these three reserved
+        // names, on any table. An operator's own cancelled concurrent
+        // build could coincidentally share a name. It could sit on an
+        // unrelated table. It could sit on the right table with
+        // different columns. It could even sit on the right table and
+        // columns with different semantics -- non-unique, partial,
+        // expression-based, a non-default opclass, descending order, or
+        // `NULLS NOT DISTINCT`. The loop below checks all of that per
+        // name, the same full shape rigor
+        // `we_created_at_idx_owned_check_sql` already applies before
+        // `disable_partitioning` drops that index. A mismatch refuses
+        // instead of either silently destroying the unrelated object or
+        // silently leaving it squatting on the name this plan needs to
+        // (re)build under.
+        //
+        // Review finding: `NULLS NOT DISTINCT` is checked through
+        // `pg_get_indexdef`, not `pg_index.indnullsnotdistinct` directly.
+        // See `index_shape_check_sql`'s identical fix -- that column
+        // does not exist before `PostgreSQL` 15, and
+        // `docs/partitioned-events.md` still supports 14. A literal
+        // reference there would fail this `DO` block to parse on every
+        // supported-14 deployment, even one with no invalid index at all.
+        //
+        // Review finding: the shape checks never looked at the access
+        // method. Every reserved name here is built as a btree. Take an
+        // operator's own failed `CREATE INDEX CONCURRENTLY ... USING
+        // hash` at the same reserved name, over the same columns. It
+        // can still pass every other check. A hash opclass can be the
+        // default one too, and hash carries no sort options, so
+        // `indoption` is all zero regardless. Left unchecked, this loop
+        // would drop that operator's index and replace it with
+        // harvest's own btree. That is exactly the "destroy the
+        // unrelated object" outcome the rest of this shape rigor exists
+        // to refuse instead of doing.
         step(2, "BEGIN".to_string()),
         step(2, format!("SET LOCAL lock_timeout = '{lock_ms}ms'")),
         step(
             2,
             format!(
-                "DO $harvest_reindex_958$\nDECLARE idx text;\nBEGIN\n    \
-                 FOR idx IN SELECT c.relname FROM pg_class c\n                \
+                "DO $harvest_reindex_958$\nDECLARE idx record; ok boolean;\nBEGIN\n    \
+                 FOR idx IN SELECT c.oid AS idxoid, c.relname AS n, t.relname AS tbl,\n                            \
+                 i.indrelid AS reloid, i.indkey AS indkey, i.indnkeyatts AS nkeyatts,\n                            \
+                 i.indnatts AS natts, i.indisunique AS uniq,\n                            \
+                 i.indpred AS pred, i.indexprs AS exprs, i.indclass AS opclasses,\n                            \
+                 i.indoption AS opts, c.relam AS relam\n                       \
+                 FROM pg_class c\n                \
                  JOIN pg_index i ON i.indexrelid = c.oid\n                \
-                 JOIN pg_namespace n ON n.oid = c.relnamespace\n               \
-                 WHERE n.nspname = current_schema() AND NOT i.indisvalid\n                 \
+                 JOIN pg_namespace n2 ON n2.oid = c.relnamespace\n               \
+                 JOIN pg_class t ON t.oid = i.indrelid\n               \
+                 WHERE n2.nspname = current_schema() AND NOT i.indisvalid\n                 \
                  AND c.relname IN ('{LEGACY_PARTITION}_pk_idx',\n                                   \
                  '{LEGACY_PARTITION}_exec_event_idx',\n                                   \
                  'idx_harvest_we_created_at')\n    \
                  LOOP\n        \
-                 EXECUTE format('DROP INDEX %I', idx);\n    \
+                 ok := idx.pred IS NULL AND idx.exprs IS NULL\n              \
+                 AND idx.relam = (SELECT oid FROM pg_am WHERE amname = 'btree')\n              \
+                 AND NOT EXISTS (SELECT 1 FROM unnest(idx.opclasses) AS oc(opclass)\n                             \
+                 JOIN pg_opclass op ON op.oid = oc.opclass WHERE NOT op.opcdefault)\n              \
+                 AND NOT EXISTS (SELECT 1 FROM unnest(idx.opts) AS o(bits) WHERE bits <> 0);\n        \
+                 IF idx.n = '{LEGACY_PARTITION}_pk_idx' THEN\n            \
+                 ok := ok AND idx.tbl = 'harvest_events' AND idx.uniq\n                  \
+                 AND pg_get_indexdef(idx.idxoid) NOT ILIKE '%NULLS NOT DISTINCT%'\n                  \
+                 AND idx.nkeyatts = 2 AND idx.natts = 2\n                  \
+                 AND (SELECT array_agg(a.attname::text ORDER BY k)\n                         \
+                 FROM generate_series(0, 1) k\n                         \
+                 JOIN pg_attribute a ON a.attrelid = idx.reloid AND a.attnum = idx.indkey[k]\n                      \
+                 ) = ARRAY['id', 'cohort'];\n        \
+                 ELSIF idx.n = '{LEGACY_PARTITION}_exec_event_idx' THEN\n            \
+                 ok := ok AND idx.tbl = 'harvest_events' AND idx.uniq\n                  \
+                 AND pg_get_indexdef(idx.idxoid) NOT ILIKE '%NULLS NOT DISTINCT%'\n                  \
+                 AND idx.nkeyatts = 3 AND idx.natts = 3\n                  \
+                 AND (SELECT array_agg(a.attname::text ORDER BY k)\n                         \
+                 FROM generate_series(0, 2) k\n                         \
+                 JOIN pg_attribute a ON a.attrelid = idx.reloid AND a.attnum = idx.indkey[k]\n                      \
+                 ) = ARRAY['workflow_exec_id', 'event_id', 'cohort'];\n        \
+                 ELSIF idx.n = 'idx_harvest_we_created_at' THEN\n            \
+                 ok := ok AND idx.tbl = 'harvest_workflow_executions' AND NOT idx.uniq\n                  \
+                 AND idx.nkeyatts = 1 AND idx.natts = 1\n                  \
+                 AND idx.indkey[0] = (SELECT a.attnum FROM pg_attribute a\n                                        \
+                 WHERE a.attrelid = 'harvest_workflow_executions'::regclass\n                                          \
+                 AND a.attname = 'created_at');\n        \
+                 ELSE\n            \
+                 ok := false;\n        \
+                 END IF;\n        \
+                 IF ok THEN\n            \
+                 EXECUTE format('DROP INDEX %I', idx.n);\n        \
+                 ELSE\n            \
+                 RAISE EXCEPTION 'harvest #958: an invalid index named % exists on %, not \
+the table or shape this plan expects to (re)build under that reserved name. Drop it (or \
+rename it) by hand, then re-run this plan.', idx.n, idx.tbl;\n        \
+                 END IF;\n    \
                  END LOOP;\nEND\n$harvest_reindex_958$;"
             ),
         ),
@@ -3048,6 +6038,17 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // the busiest table in the schema, so the concurrent form is not
         // optional here: a plain build holds SHARE for its duration and every
         // insert, state update and retention delete waits behind it.
+        //
+        // Unlike `enable_sql`, this step does not stamp
+        // `WE_CREATED_AT_IDX_OWNERSHIP_TAG`. `CREATE INDEX CONCURRENTLY`
+        // must run alone, outside any transaction. It cannot also check
+        // pre-existence and conditionally tag in one atomic step the way
+        // `enable_sql`'s single transaction does. An index this plan
+        // builds is therefore never dropped by `disable_partitioning`,
+        // which requires the tag. That is the safe default. Leaving the
+        // index behind costs an operator one manual `DROP INDEX`.
+        // Dropping an untagged index on a guess could destroy one of
+        // theirs instead.
         concurrent(
             2,
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvest_we_created_at\n    \
@@ -3110,10 +6111,64 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // ── 4: THE WINDOW — one transaction, metadata only ────────────────
         step(4, "BEGIN".to_string()),
         step(4, format!("SET LOCAL lock_timeout = '{lock_ms}ms'")),
-        // The first thing inside the window, so a plan resumed over a lost
+        // Review finding: the recheck below is only as good as the lock it
+        // runs under. `BEGIN` and `SET LOCAL` take no lock on
+        // `harvest_events` at all. Every statement up to this point is a
+        // plain catalog read, ACCESS SHARE at most. Without this explicit
+        // `LOCK TABLE`, a concurrent `CREATE VIEW` could still commit
+        // after the recheck. It could still commit before the actual
+        // rename several steps below. That is exactly the race being
+        // closed. Taking ACCESS EXCLUSIVE here, once, makes every
+        // catalog read for the rest of this transaction see a state
+        // that cannot change before the rename commits. That covers the
+        // recheck, the phase-2 completeness assertion, and the
+        // index-definition capture alike.
+        step(
+            4,
+            "LOCK TABLE harvest_events IN ACCESS EXCLUSIVE MODE".to_string(),
+        ),
+        // Review finding: phase 1's unique-index check has the identical
+        // hours-long gap to phase 4's rename. An operator could add a
+        // compatible-looking constraint-backed unique index in that gap.
+        // It would pass phase 1 clean, and still have it silently dropped
+        // by `capture_index_defs` at phase 4. Recheck it too, under the
+        // same lock.
+        step(4, unique_index_guard_sql("harvest_uniq_cutover_958")),
+        // Review finding: phase 1's dependent-view check ran hours before
+        // this window, under this plan's online path. A view created (or
+        // repointed) at `harvest_events` in that gap would pass phase 1
+        // clean, then silently go stale after the rename below anyway.
+        // Re-run the identical check now, holding the lock this phase
+        // actually converts under, so the state being checked is the
+        // state being converted.
+        step(4, dependent_views_guard_sql("harvest_view_cutover_958")),
+        // Review finding: phase 1's trigger check has the identical gap
+        // the view recheck above just closed. Recheck it too, under the
+        // same lock.
+        step(4, operator_triggers_guard_sql("harvest_trg_cutover_958")),
+        // Review finding: phase 1's constraint check has the identical gap
+        // the view and trigger rechecks above just closed. Recheck it too,
+        // under the same lock.
+        step(
+            4,
+            unreplayable_constraints_guard_sql("harvest_constraint_cutover_958", &cutover_lit),
+        ),
+        // Review finding: this in-lock block rechecked unique indexes,
+        // views and triggers, but not row security or publications.
+        // Those are phase 1's other two guards, with the identical
+        // hours-long gap. Recheck both too, under the same lock.
+        step(4, row_security_guard_sql("harvest_rls_cutover_958")),
+        step(4, publications_guard_sql("harvest_pub_cutover_958")),
+        // Still before anything renames, so a plan resumed over a lost
         // phase-2 build aborts before it has renamed anything. Without it,
         // `ATTACH PARTITION` below discovers the missing index only once the
         // exclusive lock is held, and builds it there.
+        //
+        // Checks SHAPE, not just name and `indisvalid` (issue #1270 item
+        // 11). An operator's own pre-existing, valid index can happen to
+        // hold one of these two fixed names. That makes phase 2's
+        // `IF NOT EXISTS` skip building the real one. This assertion must
+        // not count that impostor as ready.
         step(
             4,
             format!(
@@ -3123,12 +6178,11 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
                  JOIN pg_namespace ns ON ns.oid = c.relnamespace\n     \
                  WHERE ns.nspname = current_schema() AND i.indisvalid\n       \
                  AND i.indrelid = 'harvest_events'::regclass\n       \
-                 AND c.relname IN ('{LEGACY_PARTITION}_pk_idx',\n                         \
-                 '{LEGACY_PARTITION}_exec_event_idx');\n    \
+                 AND ({pk_idx_check} OR {exec_event_idx_check});\n    \
                  IF n <> 2 THEN\n        \
-                 RAISE EXCEPTION 'harvest #958: phase 2 left % of 2 valid indexes on \
-                 harvest_events. ATTACH PARTITION would build the missing one while \
-                 holding ACCESS EXCLUSIVE. Re-run phase 2, then this window.', n;\n    \
+                 RAISE EXCEPTION 'harvest #958: phase 2 left % of 2 valid, correctly-shaped \
+                 indexes on harvest_events. ATTACH PARTITION would build the missing one \
+                 while holding ACCESS EXCLUSIVE. Re-run phase 2, then this window.', n;\n    \
                  END IF;\nEND\n$harvest_assert_958$;"
             ),
         ),
@@ -3163,40 +6217,85 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // Renaming a table renames neither its indexes nor its constraints, so
         // without this the new parent cannot reclaim their schema-scoped names
         // — and `ADD CONSTRAINT harvest_events_pkey` below aborts.
+        //
+        // The rename target is never a bare `obj.n || suffix`. See
+        // `bounded_rename_fn_sql` for why that silently fails to free a name
+        // already at Postgres's 63-byte identifier limit. It also explains
+        // how the safe name is computed instead. `CREATE FUNCTION` is valid
+        // as its own top-level statement here, unlike in `enable_sql`'s
+        // single `DO` block. So it is its own step here, dropped again once
+        // the rename loop is done.
+        step(4, bounded_rename_fn_sql()),
         step(
             4,
             format!(
-                "DO $harvest_rename_958$\nDECLARE obj record;\nBEGIN\n    \
+                "DO $harvest_rename_958$\nDECLARE\n    \
+                 obj record;\n    \
+                 renamed text;\n    \
+                 renamed_fkey text;\n    \
+                 renamed_pkey text;\n    \
+                 renamed_uniq text;\n\
+                 BEGIN\n    \
                  FOR obj IN SELECT conname AS n FROM pg_constraint\n                \
                  WHERE conrelid = '{LEGACY_PARTITION}'::regclass\n                  \
                  AND right(conname, {suffix_len}) <> '{LEGACY_RENAME_SUFFIX}'\n    \
                  LOOP\n        \
+                 renamed := {BOUNDED_RENAME_FN}('constraint', '{LEGACY_PARTITION}'::regclass,\n                            \
+                 obj.n, '{LEGACY_RENAME_SUFFIX}');\n        \
+                 -- Review finding: the DROPs below used to assume this\n        \
+                 -- always returns `obj.n || '{LEGACY_RENAME_SUFFIX}'`. It does\n        \
+                 -- not when that name is already taken -- an operator's own\n        \
+                 -- constraint could happen to be named\n        \
+                 -- `harvest_events_pkey{LEGACY_RENAME_SUFFIX}`, for one -- in\n        \
+                 -- which case the function disambiguates to a different\n        \
+                 -- name. A hard-coded DROP would then remove that unrelated\n        \
+                 -- operator constraint and leave the actual renamed original\n        \
+                 -- in place, so ATTACH PARTITION later fails on more than one\n        \
+                 -- primary key. Capturing the real returned name here, per\n        \
+                 -- built-in constraint, is what the DROPs below actually\n        \
+                 -- target.\n        \
+                 IF obj.n = 'harvest_events_workflow_exec_id_fkey' THEN\n            \
+                 renamed_fkey := renamed;\n        \
+                 ELSIF obj.n = 'harvest_events_pkey' THEN\n            \
+                 renamed_pkey := renamed;\n        \
+                 ELSIF obj.n = 'harvest_events_workflow_exec_id_event_id_key' THEN\n            \
+                 renamed_uniq := renamed;\n        \
+                 END IF;\n        \
                  EXECUTE format('ALTER TABLE {LEGACY_PARTITION} RENAME CONSTRAINT %I TO %I',\n                       \
-                 obj.n, obj.n || '{LEGACY_RENAME_SUFFIX}');\n    \
+                 obj.n, renamed);\n    \
                  END LOOP;\n    \
                  FOR obj IN SELECT indexname AS n FROM pg_indexes\n                \
                  WHERE schemaname = current_schema() AND tablename = '{LEGACY_PARTITION}'\n                  \
                  AND right(indexname, {suffix_len}) <> '{LEGACY_RENAME_SUFFIX}'\n    \
                  LOOP\n        \
                  EXECUTE format('ALTER INDEX %I RENAME TO %I', obj.n,\n                       \
-                 obj.n || '{LEGACY_RENAME_SUFFIX}');\n    \
-                 END LOOP;\nEND\n$harvest_rename_958$"
+                 {BOUNDED_RENAME_FN}('index', NULL, obj.n, '{LEGACY_RENAME_SUFFIX}'));\n    \
+                 END LOOP;\n    \
+                 -- The FK's ON DELETE CASCADE is the delete storm being\n    \
+                 -- eliminated; its insert-time half lives on in the trigger\n    \
+                 -- below. The old PK and unique constraint must go too:\n    \
+                 -- ATTACH propagates the parent's, and a table may have only\n    \
+                 -- one primary key. Dropped by the captured name, not a\n    \
+                 -- hard-coded guess -- see the review finding above. `NULL`\n    \
+                 -- means the original never existed, so there is nothing to\n    \
+                 -- drop.\n    \
+                 IF renamed_fkey IS NOT NULL THEN\n        \
+                 EXECUTE format('ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT %I',\n                       \
+                 renamed_fkey);\n    \
+                 END IF;\n    \
+                 IF renamed_pkey IS NOT NULL THEN\n        \
+                 EXECUTE format('ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT %I',\n                       \
+                 renamed_pkey);\n    \
+                 END IF;\n    \
+                 IF renamed_uniq IS NOT NULL THEN\n        \
+                 EXECUTE format('ALTER TABLE {LEGACY_PARTITION} DROP CONSTRAINT %I',\n                       \
+                 renamed_uniq);\n    \
+                 END IF;\nEND\n$harvest_rename_958$"
             ),
         ),
-        // The FK's ON DELETE CASCADE is the delete storm being eliminated; its
-        // insert-time half lives on in the trigger below. The old PK and unique
-        // constraint must go too: ATTACH propagates the parent's, and a table
-        // may have only one primary key.
         step(
             4,
-            format!(
-                "ALTER TABLE {LEGACY_PARTITION}\n    \
-                 DROP CONSTRAINT IF EXISTS \
-                 harvest_events_workflow_exec_id_fkey{LEGACY_RENAME_SUFFIX},\n    \
-                 DROP CONSTRAINT IF EXISTS harvest_events_pkey{LEGACY_RENAME_SUFFIX},\n    \
-                 DROP CONSTRAINT IF EXISTS \
-                 harvest_events_workflow_exec_id_event_id_key{LEGACY_RENAME_SUFFIX}"
-            ),
+            format!("DROP FUNCTION {BOUNDED_RENAME_FN}(text, oid, text, text)"),
         ),
         step(
             4,
@@ -3285,7 +6384,42 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
             ),
         ),
         step(4, "COMMIT".to_string()),
-    ]
+    ];
+
+    // Issue #1270 item 7: `enable_partitioning` honours
+    // `allow_incompatible_publications` for the same guard. This scripted
+    // path must too. Otherwise an operator could use the override on a
+    // small table (`enable`) but not on a large one (`plan`). That operator
+    // has done the supported thing: brought the subscriber onto the
+    // partitioned layout with `publish_via_partition_root = true`. `plan`
+    // is the only path large deployments are told to use. The tag is
+    // unique to this one `DO` block, so matching on it cannot touch any
+    // other step.
+    //
+    // The phase-4 cutover recheck of the same guard needs the identical
+    // override. An operator who has already accepted the risk at phase
+    // 1 would otherwise still have the plan refuse hours later. That
+    // refusal would land at the lock window, over the same publication.
+    //
+    // Review finding: narrowed to `explicit_publications_guard_sql`, not
+    // removed. An explicit `FOR TABLE harvest_events` publication is
+    // pinned to that relation's OID, so it does not follow the rename
+    // phase 4 performs. `allow_incompatible_publications` documents a
+    // `FOR ALL TABLES` publication -- which resolves by name, and so
+    // covers the new parent automatically -- as the supported
+    // configuration. It cannot cover the explicit-membership case, so
+    // this guard still has to fire for that case even with the override
+    // set.
+    if opts.allow_incompatible_publications {
+        for s in &mut steps {
+            if s.sql.contains("$harvest_pub_958$") {
+                s.sql = explicit_publications_guard_sql("harvest_pub_958");
+            } else if s.sql.contains("$harvest_pub_cutover_958$") {
+                s.sql = explicit_publications_guard_sql("harvest_pub_cutover_958");
+            }
+        }
+    }
+    steps
 }
 
 /// Render the operator-run conversion script for a **large live**
@@ -3369,6 +6503,25 @@ pub fn migration_plan(opts: &EnableOptions, now: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_reports_the_layout_as_unknown_not_unpartitioned() {
+        // Review finding: the owner-gap check, `ensure_partitions`, and
+        // `sweep` inside `maintain_inner` can all fail AFTER its own
+        // probe already confirmed the shard partitioned. The error that
+        // propagates out carries no memory of that. A caller wrapping
+        // it in `MaintenanceOutcome::failed` must not claim
+        // `Some(false)`: that would misreport a confirmed-partitioned
+        // shard as unpartitioned on any post-probe failure. `None` is
+        // the honest answer when the layout at the point of failure is
+        // not known.
+        let outcome = MaintenanceOutcome::failed("boom".to_string());
+        assert_eq!(
+            outcome.partitioned, None,
+            "a failure with no probe result of its own must report the layout \
+             as unknown, not falsely claim unpartitioned; got {outcome:?}"
+        );
+    }
 
     #[test]
     fn cohort_start_floors_to_the_width() {
@@ -3603,6 +6756,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn allow_incompatible_publications_narrows_the_phase_1_publication_guard() {
+        // Issue #1270 item 7: `enable_partitioning` already honours the
+        // override for this guard. The scripted large-table plan must too.
+        // Otherwise an operator could use the override on `enable` but not
+        // on `plan`, the only path large deployments are told to use. That
+        // operator has done the supported thing: run the partitioned
+        // layout on the subscriber too.
+        let now = Utc::now();
+        let default_steps = migration_plan_steps(&EnableOptions::default(), now);
+        assert!(
+            default_steps
+                .iter()
+                .any(|s| s.sql.contains("$harvest_pub_958$")
+                    && s.sql.contains("pg_publication_tables")),
+            "the broad guard, covering every publication mechanism, must be \
+             present by default"
+        );
+        // Review finding: the phase-4 cutover recheck of the same guard
+        // needs the identical override. Otherwise an operator who
+        // already accepted the risk at phase 1 would still have the
+        // plan refuse hours later. That refusal would land at the lock
+        // window, over the same publication.
+        assert!(
+            default_steps
+                .iter()
+                .any(|s| s.sql.contains("$harvest_pub_cutover_958$")
+                    && s.sql.contains("pg_publication_tables")),
+            "the phase-4 cutover recheck of the same broad guard must be \
+             present by default"
+        );
+
+        let overridden_steps = migration_plan_steps(
+            &EnableOptions {
+                allow_incompatible_publications: true,
+                ..EnableOptions::default()
+            },
+            now,
+        );
+        // Review finding: an explicit `FOR TABLE harvest_events`
+        // publication is pinned to that relation's OID, so it does not
+        // follow the rename this plan performs at cutover. The override
+        // is documented for a `FOR ALL TABLES` publication, which
+        // resolves by name and so needs no such check. So the tag must
+        // survive -- narrowed to `pg_publication_rel`, the catalog that
+        // records only an EXPLICIT membership -- rather than vanish.
+        assert!(
+            overridden_steps
+                .iter()
+                .any(|s| s.sql.contains("$harvest_pub_958$")
+                    && s.sql.contains("pg_publication_rel")
+                    && !s.sql.contains("pg_publication_tables")),
+            "the override must narrow the guard to an explicit-membership \
+             check, not omit it: an explicit publication does not follow \
+             the rename this plan performs, so it cannot be waved through"
+        );
+        assert!(
+            overridden_steps
+                .iter()
+                .any(|s| s.sql.contains("$harvest_pub_cutover_958$")
+                    && s.sql.contains("pg_publication_rel")
+                    && !s.sql.contains("pg_publication_tables")),
+            "the override must also narrow the phase-4 cutover recheck of \
+             the same guard, not just phase 1's copy"
+        );
+
+        // Every other phase-1 guard (already-partitioned, row security) must
+        // survive unchanged — the override is specific to the publication
+        // check.
+        assert!(
+            overridden_steps
+                .iter()
+                .any(|s| s.sql.contains("$harvest_relkind_958$")),
+            "the already-partitioned guard is unrelated and must remain"
+        );
+        assert!(
+            overridden_steps
+                .iter()
+                .any(|s| s.sql.contains("$harvest_rls_958$")),
+            "the row-security guard is unrelated and must remain"
+        );
+    }
+
     /// The operator-run plan and the executed script must perform the same
     /// conversion.
     ///
@@ -3634,10 +6870,14 @@ mod tests {
             // expression and every append lands in the legacy partition.
             "ALTER COLUMN cohort SET DEFAULT harvest_event_cohort(clock_timestamp())",
             // ATTACH propagates the parent PK; the child may not keep its own.
+            // The suffixed name below is a comment's illustrative example,
+            // not a literal rename target. `bounded_rename_fn` computes and
+            // disambiguates the real one at runtime. Only the bare,
+            // built-in name it looks for is literal text in either plan.
             "harvest_events_pkey__pre958",
-            "harvest_events_workflow_exec_id_event_id_key__pre958",
+            "harvest_events_workflow_exec_id_event_id_key",
             // The FK whose cascade is the delete storm being eliminated.
-            "harvest_events_workflow_exec_id_fkey__pre958",
+            "harvest_events_workflow_exec_id_fkey",
             // The partitioned shape itself.
             "PARTITION BY RANGE (cohort)",
             "PRIMARY KEY (id, cohort)",
@@ -3697,6 +6937,29 @@ mod tests {
     }
 
     #[test]
+    fn truncate_ident_is_a_no_op_under_the_limit() {
+        assert_eq!(truncate_ident("harvest_events", 63), "harvest_events");
+        assert_eq!(truncate_ident("short", 5), "short");
+    }
+
+    #[test]
+    fn truncate_ident_shortens_at_a_char_boundary() {
+        // Issue #1270 item 9: a name already at or near the 63-byte
+        // identifier limit must be truncated. Otherwise Postgres silently
+        // truncates it again (to the same value) once a suffix is appended.
+        let long = "a".repeat(70);
+        let truncated = truncate_ident(&long, 63);
+        assert_eq!(truncated.len(), 63);
+
+        // A multi-byte character must never be split — the result would not
+        // be valid UTF-8, and quoting it would produce broken SQL.
+        let multibyte = format!("{}{}", "a".repeat(62), 'é');
+        let truncated = truncate_ident(&multibyte, 63);
+        assert!(truncated.len() <= 63);
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    #[test]
     fn timestamp_literals_cannot_contain_a_quote() {
         let lit = ts_literal(Utc.with_ymd_and_hms(2026, 8, 31, 0, 0, 0).unwrap());
         assert_eq!(
@@ -3741,5 +7004,47 @@ mod tests {
         parts.sort_by(compare_partitions);
         assert_eq!(parts[0].name, "harvest_events_p_20260901000000");
         assert!(parts[2].is_default, "DEFAULT sorts last");
+    }
+
+    // Review finding: an unconditional timer tick has no notion of
+    // progress. A step that never returns would then tick forever, and
+    // the scanner could never age into `Stale`/`Wedged`. `start_paused`
+    // makes the tick count deterministic: under paused time, tokio
+    // fast-forwards through each sleep in turn rather than this test
+    // waiting out ten real minutes.
+    #[cfg(feature = "db")]
+    #[tokio::test(start_paused = true)]
+    async fn await_with_heartbeat_stops_ticking_past_the_grace_period() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let ticks = AtomicU32::new(0);
+        let mut tick = || {
+            ticks.fetch_add(1, Ordering::Relaxed);
+        };
+        let mut progress: Option<&mut (dyn FnMut() + Send)> = Some(&mut tick);
+
+        // Resolves well past the grace period, so every tick observed is
+        // the heartbeat's own doing, not the query's.
+        let query = async {
+            tokio::time::sleep(DRAIN_HEARTBEAT_GRACE + DRAIN_HEARTBEAT_INTERVAL * 3).await;
+            42
+        };
+        tokio::pin!(query);
+        let result = await_with_heartbeat(query, &mut progress).await;
+
+        assert_eq!(
+            result, 42,
+            "the underlying future's own result must still be returned"
+        );
+        let expected_ticks = DRAIN_HEARTBEAT_GRACE.as_secs() / DRAIN_HEARTBEAT_INTERVAL.as_secs();
+        // `AtomicU32::load`, never `ticks.load(..)`: diesel's blanket
+        // `RunQueryDsl` impl (see `.iter().find(...)`, above) shadows it in
+        // this diesel-importing scope too.
+        assert_eq!(
+            u64::from(AtomicU32::load(&ticks, Ordering::Relaxed)),
+            expected_ticks,
+            "ticking must stop at the grace deadline, not continue for the \
+             three-interval overrun"
+        );
     }
 }

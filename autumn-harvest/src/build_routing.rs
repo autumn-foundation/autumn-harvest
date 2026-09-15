@@ -681,12 +681,83 @@ pub async fn list_build_compat(
         .collect())
 }
 
+/// SQL for the distinct build-id catalog inside [`all_build_reachability`],
+/// exposed for shape tests.
+#[must_use]
+pub const fn all_build_ids_query() -> &'static str {
+    "SELECT DISTINCT build_id FROM ( \
+         SELECT assigned_build_id AS build_id \
+         FROM harvest_workflow_executions \
+         WHERE assigned_build_id IS NOT NULL AND assigned_build_id <> '' \
+         UNION \
+         SELECT required_build_id AS build_id \
+         FROM harvest_task_queue \
+         WHERE required_build_id IS NOT NULL AND required_build_id <> '' \
+         UNION \
+         SELECT build_id \
+         FROM harvest_workers \
+         WHERE build_id IS NOT NULL AND build_id <> '' \
+     ) sub \
+     ORDER BY build_id"
+}
+
+/// SQL for per-build open-execution counts, grouped in one pass rather than
+/// counted once per build (see [`all_build_reachability`]'s doc comment).
+/// Exposed for shape/EXPLAIN tests.
+#[must_use]
+pub const fn all_build_open_executions_query() -> &'static str {
+    "SELECT assigned_build_id AS build_id, COUNT(*) AS n \
+     FROM harvest_workflow_executions \
+     WHERE assigned_build_id IS NOT NULL AND assigned_build_id <> '' \
+       AND state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TERMINATED', 'TIMED_OUT', 'CONTINUED_AS_NEW') \
+     GROUP BY assigned_build_id"
+}
+
+/// SQL for per-build pending-task counts, grouped in one pass. Exposed for
+/// shape/EXPLAIN tests.
+#[must_use]
+pub const fn all_build_pending_tasks_query() -> &'static str {
+    "SELECT required_build_id AS build_id, COUNT(*) AS n \
+     FROM harvest_task_queue \
+     WHERE required_build_id IS NOT NULL AND required_build_id <> '' AND state = 'PENDING' \
+     GROUP BY required_build_id"
+}
+
+/// SQL for per-build active/stale worker counts.
+///
+/// One conditional-aggregation pass over `harvest_workers` replaces the two
+/// `COUNT(*) WHERE build_id = $1` subqueries [`build_reachability`] issues
+/// per build. Exposed for shape/EXPLAIN tests.
+#[must_use]
+pub const fn all_build_worker_counts_query() -> &'static str {
+    "SELECT build_id, \
+         COUNT(*) FILTER ( \
+             WHERE status = 'Active' \
+               AND NOW() - last_heartbeat_at <= make_interval(secs => $1::float8) \
+         ) AS active_workers, \
+         COUNT(*) FILTER ( \
+             WHERE NOW() - last_heartbeat_at > make_interval(secs => $1::float8) \
+         ) AS stale_workers \
+     FROM harvest_workers \
+     WHERE build_id <> '' \
+     GROUP BY build_id"
+}
+
 /// Return reachability snapshots for all distinct build IDs present across
 /// `harvest_workflow_executions`, `harvest_task_queue`, and `harvest_workers`
 /// on a **single shard**.
 ///
 /// For multi-shard deployments prefer [`all_build_reachability_sharded`], which
 /// fans out to every shard and merges the per-build counters.
+///
+/// Computes every build's counters in **three** grouped passes total -- one
+/// per source table -- rather than by calling [`build_reachability`] once per
+/// build id. The per-build helper stays a correct, simple building block for
+/// its own single-build callers. Looping it here re-scanned all three tables
+/// once per distinct build: `N` round trips and `N` scans for `N` builds.
+/// `harvest_workers` carries no index on `build_id` at all, so its two
+/// per-build subqueries were a full sequential scan every single time. See
+/// `docs/performance-build-reachability-fanout.md` for measurements.
 ///
 /// # Errors
 ///
@@ -701,33 +772,104 @@ pub async fn all_build_reachability(
         #[diesel(sql_type = diesel::sql_types::Text)]
         build_id: String,
     }
-
-    // Collect all distinct non-empty build IDs from the three tables.
-    let id_rows: Vec<IdRow> = diesel::sql_query(
-        "SELECT DISTINCT build_id FROM ( \
-             SELECT assigned_build_id AS build_id \
-             FROM harvest_workflow_executions \
-             WHERE assigned_build_id IS NOT NULL AND assigned_build_id <> '' \
-             UNION \
-             SELECT required_build_id AS build_id \
-             FROM harvest_task_queue \
-             WHERE required_build_id IS NOT NULL AND required_build_id <> '' \
-             UNION \
-             SELECT build_id \
-             FROM harvest_workers \
-             WHERE build_id IS NOT NULL AND build_id <> '' \
-         ) sub \
-         ORDER BY build_id",
-    )
-    .load(conn)
-    .await
-    .map_err(database_error)?;
-
-    let mut result = Vec::with_capacity(id_rows.len());
-    for row in id_rows {
-        result.push(build_reachability(conn, &row.build_id, stale_threshold).await?);
+    #[derive(diesel::QueryableByName, Debug)]
+    struct CountRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        build_id: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
     }
-    Ok(result)
+    #[derive(diesel::QueryableByName, Debug)]
+    struct WorkerCountRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        build_id: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        active_workers: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        stale_workers: i64,
+    }
+
+    type ReachabilityQueryResults = (
+        Vec<IdRow>,
+        HashMap<String, i64>,
+        HashMap<String, i64>,
+        HashMap<String, (i64, i64)>,
+    );
+
+    let threshold_secs = i64::try_from(stale_threshold.as_secs()).unwrap_or(i64::MAX);
+
+    // The four queries below must read one consistent point in time.
+    // Under `READ COMMITTED`, each takes its own snapshot. A task could
+    // then move from `PENDING` to claimed between the open-executions and
+    // pending-tasks reads. The execution query runs too early to see the
+    // new execution. The task query runs too late to still see it
+    // pending. The merge then counts the build in neither column and
+    // reports `safe_to_retire: true` for a build that still has live
+    // work. `build_reachability`, the per-build helper this function
+    // replaces the *loop* over, avoided this. It folded all four counters
+    // into one `SELECT`, which PostgreSQL evaluates against a single
+    // snapshot. `REPEATABLE READ` restores that guarantee here. Every
+    // statement in the transaction shares the snapshot taken at its first
+    // query. The four grouped passes then observe one instant, the same
+    // way one multi-subquery `SELECT` did.
+    let (id_rows, open_executions, pending_tasks, worker_counts): ReachabilityQueryResults = conn
+        .build_transaction()
+        .repeatable_read()
+        .read_only()
+        .run(async |conn| -> HarvestResult<_> {
+            let id_rows: Vec<IdRow> = diesel::sql_query(all_build_ids_query())
+                .load(conn)
+                .await
+                .map_err(database_error)?;
+
+            let open_executions: HashMap<String, i64> =
+                diesel::sql_query(all_build_open_executions_query())
+                    .load::<CountRow>(conn)
+                    .await
+                    .map_err(database_error)?
+                    .into_iter()
+                    .map(|r| (r.build_id, r.n))
+                    .collect();
+
+            let pending_tasks: HashMap<String, i64> =
+                diesel::sql_query(all_build_pending_tasks_query())
+                    .load::<CountRow>(conn)
+                    .await
+                    .map_err(database_error)?
+                    .into_iter()
+                    .map(|r| (r.build_id, r.n))
+                    .collect();
+
+            let worker_counts: HashMap<String, (i64, i64)> =
+                diesel::sql_query(all_build_worker_counts_query())
+                    .bind::<diesel::sql_types::BigInt, _>(threshold_secs)
+                    .load::<WorkerCountRow>(conn)
+                    .await
+                    .map_err(database_error)?
+                    .into_iter()
+                    .map(|r| (r.build_id, (r.active_workers, r.stale_workers)))
+                    .collect();
+
+            Ok((id_rows, open_executions, pending_tasks, worker_counts))
+        })
+        .await?;
+
+    Ok(id_rows
+        .into_iter()
+        .map(|row| {
+            let open = open_executions.get(&row.build_id).copied().unwrap_or(0);
+            let pending = pending_tasks.get(&row.build_id).copied().unwrap_or(0);
+            let (active, stale) = worker_counts.get(&row.build_id).copied().unwrap_or((0, 0));
+            BuildReachability {
+                build_id: row.build_id,
+                open_executions: open,
+                pending_tasks: pending,
+                active_workers: active,
+                stale_workers: stale,
+                safe_to_retire: open == 0 && pending == 0,
+            }
+        })
+        .collect())
 }
 
 /// Return reachability snapshots for all distinct build IDs, aggregated across

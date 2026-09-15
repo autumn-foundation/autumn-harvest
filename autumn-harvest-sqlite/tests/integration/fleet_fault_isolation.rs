@@ -8,6 +8,20 @@
 //! broken one in that pass was never driven. Not once, forever, even across
 //! a restart. The fix keeps driving the rest of the fleet. It still reports
 //! the first error, matching the existing single-error `poll_once` signature.
+//!
+//! Also covers the residual issue #1555 gap. `run_until_idle`'s outer loop
+//! propagated `poll_once`'s error with a bare `?` too. It stopped after ONE
+//! internal pass whenever a broken execution was present, not the documented
+//! "repeat until quiescent". A multi-cycle execution then needed several
+//! external `run_until_idle()` calls to finish, instead of one.
+//!
+//! A follow-up review of the #1555 fix (Codex P1) found that a naive
+//! "keep looping" fix re-drives a broken execution on EVERY internal pass.
+//! For a WORKFLOW-handler panic, each re-drive strikes the bounded panic
+//! budget (`WORKFLOW_PANIC_MAX_ATTEMPTS`). A persistently-panicking
+//! execution could exhaust its budget and get sealed `FAILED` within ONE
+//! external call, instead of one strike per call. The fix skips a
+//! newly-erroring execution for the rest of that `run_until_idle` call.
 
 // The `#[workflow]` macro references its input param through expansion.
 #![allow(clippy::used_underscore_binding)]
@@ -37,6 +51,47 @@ async fn healthy_wf(_ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     Ok(n * 2)
 }
 
+/// Needs TWO sequential decision cycles, unlike `healthy_wf`'s one. One
+/// `run_until_idle()` pass is indistinguishable from full convergence for a
+/// one-cycle workflow. That is why #1536's own regression test missed the
+/// #1555 gap.
+#[workflow]
+async fn two_step_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    let a = ctx
+        .execute_activity_raw("increment", json!(n), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    let b = ctx
+        .execute_activity_raw("increment", a, "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(b.as_i64().unwrap_or_default())
+}
+
+fn increment_activity() -> autumn_harvest_sqlite::ActivitySpec {
+    autumn_harvest_sqlite::ActivitySpec::new(1, |input: serde_json::Value| {
+        Ok(json!(input.as_i64().unwrap_or_default() + 1))
+    })
+}
+
+/// Errors on a LATER pass, not the first. Cycle 1 schedules a real activity
+/// (progress, no error). Only once that activity resolves does cycle 2 reach
+/// `RequestCancelExternalWorkflow`, a DIFFERENT unsupported command than
+/// `broken_wf`'s `SignalExternalWorkflow`.
+#[workflow]
+async fn broken_after_one_cycle_wf(
+    ctx: &WorkflowContext,
+    target: ExecutionId,
+) -> Result<(), String> {
+    let _ = ctx
+        .execute_activity_raw("increment", json!(0), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    ctx.request_cancel_external_workflow(target)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// A second, dedicated broken workflow with its own attempt counter. A
 /// distinct type keeps the counter test isolated from `broken_wf`'s use in
 /// the other tests in this file, which run concurrently in the same binary.
@@ -53,20 +108,31 @@ async fn counting_broken_wf(ctx: &WorkflowContext, target: ExecutionId) -> Resul
 /// Starts executions of `workflow_name` until one sorts, as an
 /// `ExecutionId` string, after `after`. It then lands later in
 /// `running_executions`'s ascending scan — the ordering the issue's repro
-/// forces (~1-2 tries on average).
+/// forces (~1-2 tries in the common case).
+///
+/// `ExecutionId::new()` fixes the first two bytes to the
+/// `ShardId::UNENCODED` sentinel (`0xFFFF`). Every generated id already
+/// sorts near the TOP of the id space. Sometimes `after` ALSO draws a
+/// near-maximum byte right after that fixed prefix (about 1-in-256 calls).
+/// Then a fresh random candidate's odds of landing higher collapse. This
+/// is a real, measured case, not a paranoid one. A repro run of 500 trials
+/// against this exact runtime hit it 3 times. Each needed several hundred
+/// tries. 50 tries is not a safe bound for that case. The retry count
+/// below is sized so even that unlucky case fails astronomically rarely.
+/// The common case still costs 1-2 tries.
 fn start_after(
     rt: &mut SqliteRuntime,
     workflow_name: &str,
     input: &serde_json::Value,
     after: ExecutionId,
 ) -> ExecutionId {
-    for _ in 0..50i64 {
+    for _ in 0..20_000i64 {
         let id = rt.start_workflow(workflow_name, input.clone()).unwrap();
         if id.to_string() > after.to_string() {
             return id;
         }
     }
-    panic!("did not land an execution after the target one in 50 tries");
+    panic!("did not land an execution after the target one in 20,000 tries");
 }
 
 fn start_healthy_after(rt: &mut SqliteRuntime, broken: ExecutionId) -> ExecutionId {
@@ -207,4 +273,150 @@ async fn poll_once_still_attempts_every_broken_execution_in_one_pass() {
         rt.outcome(second).unwrap(),
         ExecutionOutcome::Running
     ));
+}
+
+/// Issue #1555's repro. A lone persistently-broken execution must not cap
+/// `run_until_idle`'s convergence at one decision cycle per call. A single
+/// call must drive a multi-cycle, unrelated execution all the way to
+/// completion. It must still report the broken execution's error.
+#[tokio::test]
+async fn run_until_idle_converges_a_multi_cycle_execution_in_one_call_past_a_broken_one() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&broken_wf_info());
+    rt.register_workflow(&two_step_wf_info());
+    rt.register_activity_raw("increment", increment_activity());
+
+    let broken = rt
+        .start_workflow("broken_wf", json!(ExecutionId::new()))
+        .unwrap();
+    let healthy_after = start_after(&mut rt, "two_step_wf", &json!(10), broken);
+
+    let err = rt
+        .run_until_idle()
+        .await
+        .expect_err("the broken execution's error must still surface, not be swallowed");
+    assert!(
+        matches!(err, SqliteError::Unsupported(_)),
+        "expected SqliteError::Unsupported, got {err:?}"
+    );
+
+    assert!(
+        matches!(
+            rt.outcome(healthy_after).unwrap(),
+            ExecutionOutcome::Completed(ref v) if v.as_i64() == Some(12)
+        ),
+        "a single run_until_idle() call must drive a multi-cycle unrelated \
+         execution to completion, not just one decision cycle"
+    );
+}
+
+/// `run_until_idle`'s outer loop keeps only the FIRST error seen across ALL
+/// passes (`first_error.get_or_insert`), not the last pass's error. Pass 1
+/// has only `broken_wf`'s error. Pass 2 adds a SECOND, differently-named
+/// error once `broken_after_one_cycle_wf`'s activity resolves. The returned
+/// error must still be pass 1's.
+#[tokio::test]
+async fn run_until_idle_keeps_the_first_error_seen_across_passes_not_a_later_one() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&broken_wf_info());
+    rt.register_workflow(&broken_after_one_cycle_wf_info());
+    rt.register_activity_raw("increment", increment_activity());
+
+    rt.start_workflow("broken_wf", json!(ExecutionId::new()))
+        .unwrap();
+    rt.start_workflow("broken_after_one_cycle_wf", json!(ExecutionId::new()))
+        .unwrap();
+
+    let err = rt
+        .run_until_idle()
+        .await
+        .expect_err("a fleet with no progressable work left must still report an error");
+    match err {
+        SqliteError::Unsupported(msg) => {
+            assert!(
+                msg.contains("SignalExternalWorkflow"),
+                "run_until_idle must keep pass 1's error (broken_wf's), not \
+                 pass 2's different error (RequestCancelExternalWorkflow); \
+                 got: {msg}"
+            );
+        }
+        other => panic!("expected SqliteError::Unsupported, got {other:?}"),
+    }
+}
+
+/// Panics on EVERY decision cycle. Distinct from `broken_wf`: a panic is
+/// contained under a bounded budget (`WORKFLOW_PANIC_MAX_ATTEMPTS`), not
+/// rejected outright. Re-driving it repeatedly has an observable side
+/// effect an unsupported command does not.
+#[workflow]
+async fn always_panics_wf(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    let _ = ctx;
+    panic!("workflow boom");
+}
+
+/// Needs FOUR sequential decision cycles, more than the default panic
+/// budget of three. It keeps `run_until_idle`'s internal loop running long
+/// enough to re-strike a co-located panicking execution, if the fix did not
+/// skip it after its first strike.
+#[workflow]
+async fn four_step_wf(ctx: &WorkflowContext, start: i64) -> Result<i64, String> {
+    let step1 = ctx
+        .execute_activity_raw("increment", json!(start), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    let step2 = ctx
+        .execute_activity_raw("increment", step1, "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    let step3 = ctx
+        .execute_activity_raw("increment", step2, "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    let step4 = ctx
+        .execute_activity_raw("increment", step3, "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(step4.as_i64().unwrap_or_default())
+}
+
+/// Codex P1 follow-up on the #1555 fix. A single `run_until_idle()` call
+/// must strike a persistently-panicking execution AT MOST ONCE, even while
+/// an unrelated execution needs many more internal passes to converge.
+/// Re-striking it every pass would exhaust
+/// `WORKFLOW_PANIC_MAX_ATTEMPTS` and seal it `FAILED` within one call.
+/// That denies the caller a chance to react to the first
+/// `WorkflowPanicked` error between calls.
+#[tokio::test]
+async fn run_until_idle_strikes_a_panicking_execution_at_most_once_per_call() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&always_panics_wf_info());
+    rt.register_workflow(&four_step_wf_info());
+    rt.register_activity_raw("increment", increment_activity());
+
+    let panicking = rt.start_workflow("always_panics_wf", json!(0)).unwrap();
+    let long_running = rt.start_workflow("four_step_wf", json!(0)).unwrap();
+
+    let err = rt
+        .run_until_idle()
+        .await
+        .expect_err("a persistently-panicking execution must still surface an error");
+    assert!(
+        matches!(err, SqliteError::WorkflowPanicked { .. }),
+        "expected SqliteError::WorkflowPanicked, got {err:?}"
+    );
+
+    assert!(
+        matches!(rt.outcome(panicking).unwrap(), ExecutionOutcome::Running),
+        "one run_until_idle() call must strike a panicking execution AT MOST \
+         ONCE and leave it RUNNING, not exhaust its whole panic budget while \
+         unrelated work keeps the call's internal loop going"
+    );
+    assert!(
+        matches!(
+            rt.outcome(long_running).unwrap(),
+            ExecutionOutcome::Completed(ref v) if v.as_i64() == Some(4)
+        ),
+        "the unrelated multi-cycle execution must still converge fully in \
+         the same call"
+    );
 }

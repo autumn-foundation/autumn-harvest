@@ -203,6 +203,15 @@ name = "diagnose_bench"
 harness = false
 
 # Deterministic (non-criterion) instruction/allocation-count profiling
+# harness for `lineage::LineageWalk` / `LineageTreeReport::finish` -- the
+# pure, in-memory half of `GET /workflows/{id}/lineage` (issue #621). No
+# feature requirement: `lineage` is an unconditional module. See
+# `benches/lineage_profile.rs`.
+[[bench]]
+name = "lineage_profile"
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling
 # harness for `queue_coverage::partition_uncovered_and_paused` -- the
 # pure, per-shard, in-memory core of `GET /admin/queue-coverage` (issue
 # #774). No feature requirement: `queue_coverage` is an unconditional

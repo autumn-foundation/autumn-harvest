@@ -278,6 +278,17 @@ pub enum PartitionCommand {
         /// How many cohorts ahead of "now" the engine keeps pre-created.
         #[arg(long, value_name = "N", default_value_t = autumn_harvest::partition::DEFAULT_LOOKAHEAD_COHORTS)]
         lookahead_cohorts: u32,
+
+        /// Omit the phase-1 guard that refuses when a logical-replication
+        /// publication covers `harvest_events` without
+        /// `publish_via_partition_root`.
+        ///
+        /// Set this only when the subscriber runs the partitioned layout too.
+        /// Without it, an operator who has done exactly that could use this
+        /// override on `enable`. They could not use it on the large-table
+        /// plan — the only path large deployments are told to use.
+        #[arg(long = "allow-incompatible-publications")]
+        allow_incompatible_publications: bool,
     },
 
     /// **Convert this shard to the partitioned layout.**
@@ -5978,10 +5989,12 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
         PartitionCommand::Plan {
             cohort_width_secs,
             lookahead_cohorts,
+            allow_incompatible_publications,
         } => {
             let opts = autumn_harvest::partition::EnableOptions {
                 cohort_width_secs: *cohort_width_secs,
                 lookahead_cohorts: *lookahead_cohorts,
+                allow_incompatible_publications: *allow_incompatible_publications,
                 ..autumn_harvest::partition::EnableOptions::default()
             };
             opts.validate()
@@ -6085,6 +6098,7 @@ async fn run_partition_status(shards: &[String], format: DrFormat) -> Result<(),
                         &mut conn,
                         autumn_harvest::chrono::Utc::now(),
                         &autumn_harvest::partition::SweepOptions::default(),
+                        None,
                     )
                     .await
                     {
@@ -6165,6 +6179,8 @@ async fn run_partition_maintain(
             autumn_harvest::chrono::Utc::now(),
             lookahead_cohorts,
             &sweep,
+            None,
+            None,
         )
         .await
         {
@@ -6228,6 +6244,9 @@ async fn run_partition_disable(shards: &[String], format: DrFormat) -> Result<()
 /// The nonzero exit is the point: `harvest partition enable --shard a --shard b`
 /// that converted `a` and failed on `b` has left a half-converted cluster, and a
 /// zero exit would let a deployment script move on as though it had not.
+// One text/JSON report, field by field. Splitting it would scatter one
+// operator-facing rendering across helpers that only print once each.
+#[allow(clippy::too_many_lines)]
 fn emit_partition_report(
     rows: &[PartitionShardReport],
     format: DrFormat,
@@ -6291,6 +6310,13 @@ fn emit_partition_report(
                         m.sweep.dropped.len(),
                         m.sweep.straggler_rows_deleted,
                     );
+                    if m.sweep.truncated {
+                        // Issue #1270 item 1's whole reason for existing. A
+                        // pass that dropped and blocked nothing must not
+                        // read as "shard is clean". It may really mean the
+                        // pass ran out of budget before it looked at the rest.
+                        println!("  sweep: truncated, ran out of budget before finishing");
+                    }
                     if let Some(e) = &m.last_error {
                         println!("  INCOMPLETE: {e}");
                     }
@@ -6300,6 +6326,12 @@ fn emit_partition_report(
                     for b in &m.sweep.blocked {
                         println!("  blocked: {b}");
                     }
+                    // A partial catch-up: some of the lookahead window covered,
+                    // some not. Named individually so an operator can tell
+                    // exactly which range still lands in the DEFAULT partition.
+                    for b in &m.lookahead_blocked {
+                        println!("  lookahead blocked: {b}");
+                    }
                 }
                 if let Some(sweep) = &r.would_sweep {
                     println!(
@@ -6307,6 +6339,9 @@ fn emit_partition_report(
                         sweep.dropped.len(),
                         sweep.blocked.len()
                     );
+                    if sweep.truncated {
+                        println!("  sweep: truncated, ran out of budget before finishing");
+                    }
                     for b in &sweep.blocked {
                         println!("  blocked: {b}");
                     }
