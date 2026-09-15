@@ -591,8 +591,8 @@ pub const METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD: &str =
 /// `0` when the sweep left no such row pending, matching
 /// [`METRIC_QUEUE_OLDEST_PENDING_AGE`]'s convention so a drained backlog does
 /// not leave a stale reading behind. Distinguishes "retrying, will resolve"
-/// from "stuck since Tuesday" without reasoning about shard topology — the
-/// gap `docs/sharding.md` and the backup-restore runbook both used to name
+/// from "stuck since Tuesday" without reasoning about shard topology. Both
+/// `docs/sharding.md` and the backup-restore runbook used to name this gap
 /// as open.
 pub const METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE: &str =
     "harvest.external_signal.by_id_oldest_pending_indeterminate_age";
