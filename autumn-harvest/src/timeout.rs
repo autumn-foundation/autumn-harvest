@@ -2515,6 +2515,15 @@ enum DeliveryRoute {
         /// about.
         uninspected: Vec<crate::external_target_location::UninspectedShard>,
     },
+    /// A keyed signal already landed on some shard for this business key,
+    /// found while resolving the target's location (issue #1318). No
+    /// delivery attempt runs; the caller records `ExternalSignalDelivered`
+    /// directly.
+    ///
+    /// Never produced for a cancel. Cancel carries no idempotency key, so
+    /// `resolve_delivery_route`'s `idempotency_key` argument is always
+    /// `None` on that path, and this variant requires `Some`.
+    AlreadyDelivered,
 }
 
 /// Resolve which database an outbox delivery to `target` must run against
@@ -2606,6 +2615,10 @@ async fn resolve_delivery_route(
     caller_exec_id: ExecutionId,
     uninspectable: &crate::external_target_location::UninspectableShards,
     metrics: &(dyn MetricsRecorder + Send + Sync),
+    // `Some` only on the signal path, and only when the caller opted into a
+    // keyed delivery (issue #1318). Cancel always passes `None` — it has no
+    // idempotency-key concept.
+    idempotency_key: Option<&str>,
 ) -> DeliveryRoute {
     let Some(pool) = sharded_pool else {
         return DeliveryRoute::Caller {
@@ -2665,6 +2678,7 @@ async fn resolve_delivery_route(
                     workflow_id,
                     Some((caller_shard, conn)),
                     Some(uninspectable),
+                    idempotency_key,
                 )
                 .await
                 {
@@ -2696,6 +2710,22 @@ async fn resolve_delivery_route(
                     }
                     crate::external_target_location::TargetLocation::NotFound => {
                         return DeliveryRoute::NoRunAnywhere;
+                    }
+                    // The key was already delivered — on this shard or
+                    // another one, it does not matter which. No location
+                    // resolution is needed at all: the caller must record
+                    // delivery, never attempt a fresh insert (issue #1318).
+                    crate::external_target_location::TargetLocation::AlreadyDelivered {
+                        shard,
+                        ..
+                    } => {
+                        tracing::info!(
+                            workflow_name,
+                            workflow_id,
+                            %shard,
+                            "by-id signal: idempotency key already delivered; skipping re-delivery"
+                        );
+                        return DeliveryRoute::AlreadyDelivered;
                     }
                     crate::external_target_location::TargetLocation::Indeterminate {
                         uninspected,
@@ -3117,6 +3147,7 @@ pub async fn enforce_external_signals_outbox(
                     caller_exec_id,
                     &uninspectable,
                     metrics,
+                    idempotency_key.as_deref(),
                 )
                 .await;
 
@@ -3216,6 +3247,11 @@ pub async fn enforce_external_signals_outbox(
                     // business key: the same not-found policy a per-shard
                     // delivery attempt would have applied.
                     DeliveryRoute::NoRunAnywhere => not_found_terminal(),
+                    // The keyed request was already fulfilled elsewhere
+                    // (issue #1318): report delivered, attempt nothing.
+                    DeliveryRoute::AlreadyDelivered => {
+                        Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
+                    }
                     // Inconclusive — leave the row pending rather than write a
                     // wrong terminal into the caller's append-only history.
                     DeliveryRoute::Retry { reason, uninspected } => {
@@ -3604,7 +3640,8 @@ pub async fn enforce_external_cancels_outbox(
 
                 // Route to the database that actually owns the target
                 // (issue #1146) — an observation for a `WorkflowId` target,
-                // the encoded shard for an `ExecutionId` one.
+                // the encoded shard for an `ExecutionId` one. Cancel has no
+                // idempotency-key concept, so `None` here (issue #1318).
                 let route = resolve_delivery_route(
                     conn,
                     active_sharded_pool.as_ref(),
@@ -3612,6 +3649,7 @@ pub async fn enforce_external_cancels_outbox(
                     caller_exec_id,
                     &uninspectable,
                     metrics,
+                    None,
                 )
                 .await;
 
@@ -3653,6 +3691,19 @@ pub async fn enforce_external_cancels_outbox(
                     // Every expected shard answered and none holds this
                     // business key.
                     DeliveryRoute::NoRunAnywhere => not_found_terminal(),
+                    // Unreachable in practice: `resolve_delivery_route` is
+                    // called above with `idempotency_key: None`, and this
+                    // route only arises when a key is given (issue #1318).
+                    // Handled defensively rather than with `unreachable!()`
+                    // so a future wiring mistake degrades to a retried row,
+                    // not a panicked scanner.
+                    DeliveryRoute::AlreadyDelivered => {
+                        tracing::error!(
+                            "cancel outbox sweep: unexpected AlreadyDelivered route -- cancel \
+                             carries no idempotency key"
+                        );
+                        return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new(), caller_shard)));
+                    }
                     // Inconclusive — leave pending rather than record a wrong
                     // terminal in the caller's append-only history.
                     DeliveryRoute::Retry { reason, uninspected } => {
