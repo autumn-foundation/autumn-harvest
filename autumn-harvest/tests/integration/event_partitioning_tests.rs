@@ -2734,6 +2734,72 @@ async fn phase_4_rejects_an_impostor_index_with_the_wrong_sort_order() {
 }
 
 #[tokio::test]
+async fn the_scripted_plans_lookahead_window_check_fires_before_commit() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // This is the scripted plan's own version of `enable_sql`'s pre-commit
+    // lookahead check (issue #1270). Plant an unrelated relation under the
+    // deterministic name phase 4's window step needs for one cohort.
+    // `CREATE TABLE IF NOT EXISTS ... PARTITION OF` treats that name as
+    // taken and silently skips it. Without this check, phase 4 would
+    // COMMIT anyway, and the plan would report success while that cohort
+    // stayed uncovered — appends piling into `harvest_events_p_default`.
+    let now = Utc::now();
+    let width = partition::DEFAULT_COHORT_WIDTH_SECS;
+    let colliding_start =
+        partition::cohort_start(now + chrono::Duration::seconds(width * 2), width);
+    let colliding_name = partition::partition_name(colliding_start);
+    diesel::sql_query(format!("DROP TABLE IF EXISTS {colliding_name}"))
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query(format!("CREATE TABLE {colliding_name} (id bigint)"))
+        .execute(&mut conn)
+        .await
+        .expect("plant a colliding, unrelated relation");
+
+    let mut hit_guard = false;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), now) {
+        if step.phase > 4 {
+            break;
+        }
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("only 3 of 4"),
+                "phase 4 must reject the incomplete window with its own explanatory \
+                 error naming the shortfall, not fail some other way: {msg}"
+            );
+            hit_guard = true;
+            break;
+        }
+    }
+    assert!(
+        hit_guard,
+        "the scripted plan's window step must verify full lookahead coverage before \
+         its COMMIT, the same way enable_sql does, rather than letting the plan \
+         report success over an uncovered write window"
+    );
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut conn)
+        .await
+        .expect("clear the aborted transaction, as the runbook instructs");
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "a failed lookahead check must leave harvest_events exactly as it was, not \
+         partially converted"
+    );
+
+    diesel::sql_query(format!("DROP TABLE IF EXISTS {colliding_name}"))
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
 async fn an_append_racing_the_execution_delete_cannot_commit_an_orphan() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
@@ -3703,6 +3769,52 @@ async fn enabling_creates_the_drop_gate_index_the_migration_no_longer_ships() {
         .await,
         "the enable path must build the drop gate's index"
     );
+}
+
+#[tokio::test]
+async fn enabling_refuses_an_impostor_drop_gate_index_of_the_wrong_shape() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // An unrelated index already holds the fixed name the drop gate needs,
+    // on the wrong table. `CREATE INDEX IF NOT EXISTS` matches by name
+    // alone, so it would otherwise be accepted in place of the index the
+    // sweeper's tier-1 probe needs on `harvest_workflow_executions
+    // (created_at)`. Every later probe would then run a sequential scan
+    // of that table instead of the O(1) index lookup the design relies on.
+    diesel::sql_query("DROP INDEX IF EXISTS idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query("CREATE INDEX idx_harvest_we_created_at ON harvest_events (id)")
+        .execute(&mut conn)
+        .await
+        .expect("plant the impostor");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err("an impostor drop-gate index must fail the conversion, not pass silently");
+    assert!(
+        err.to_string().contains("idx_harvest_we_created_at"),
+        "the refusal must name the impostor index: {err}"
+    );
+    assert_eq!(
+        partition::detect_layout(&mut conn)
+            .await
+            .expect("detect layout"),
+        EventLayout::Unpartitioned,
+        "a failed drop-gate shape check must leave harvest_events exactly as it \
+         was, not partially converted"
+    );
+
+    diesel::sql_query("DROP INDEX idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .expect("clear the impostor");
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enabling must succeed once the impostor is gone");
 }
 
 #[tokio::test]
@@ -5325,6 +5437,71 @@ async fn the_scripted_plans_drop_gate_marker_survives_separate_sessions() {
         .execute(&mut conn)
         .await
         .ok();
+}
+
+#[tokio::test]
+async fn the_scripted_plans_mark_step_refuses_an_impostor_drop_gate_index() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // An unrelated index already holds the fixed name on the wrong table.
+    // `CREATE INDEX CONCURRENTLY IF NOT EXISTS` matches by name alone, so
+    // the build step below is a no-op against it. The mark step reads the
+    // probe's `existed=true` marker and must check the pre-existing
+    // relation's shape before trusting it. Otherwise it would silently
+    // comment the impostor as the engine-owned drop gate.
+    diesel::sql_query("DROP INDEX IF EXISTS idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query("CREATE INDEX idx_harvest_we_created_at ON harvest_events (id)")
+        .execute(&mut conn)
+        .await
+        .expect("plant the impostor");
+
+    let steps = partition::migration_plan_steps(&EnableOptions::default(), Utc::now());
+    let probe = steps
+        .iter()
+        .find(|s| s.sql.contains("$harvest_dropgate_probe_958$"))
+        .expect("the plan must probe whether it will own the drop-gate index");
+    let build = steps
+        .iter()
+        .find(|s| {
+            s.sql.contains("CREATE INDEX CONCURRENTLY")
+                && s.sql.contains("idx_harvest_we_created_at")
+        })
+        .expect("the plan must build the drop-gate index");
+    let mark = steps
+        .iter()
+        .find(|s| s.sql.contains("harvest_dropgate_mark_958"))
+        .expect("the plan must mark the drop-gate index conditionally");
+
+    diesel::sql_query(&probe.sql)
+        .execute(&mut conn)
+        .await
+        .expect("probe");
+    diesel::sql_query(&build.sql)
+        .execute(&mut conn)
+        .await
+        .expect("build (a no-op here: the impostor already occupies the name)");
+    let err = diesel::sql_query(&mark.sql)
+        .execute(&mut conn)
+        .await
+        .expect_err("the mark step must refuse an impostor, not silently mark it");
+    assert!(
+        err.to_string().contains("idx_harvest_we_created_at"),
+        "the refusal must name the impostor index: {err}"
+    );
+
+    diesel::sql_query("DROP SEQUENCE IF EXISTS harvest_1270_drop_gate_probe")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query("DROP INDEX idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .expect("clear the impostor");
 }
 
 #[tokio::test]

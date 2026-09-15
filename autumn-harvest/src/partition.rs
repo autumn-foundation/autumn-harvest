@@ -2070,6 +2070,13 @@ re-run this.', bad;
     -- Commented only on a FRESH create, never on a pre-existing index of
     -- this name: `disable_partitioning` reads that comment to tell whether
     -- it owns removing this index. See `DROP_GATE_INDEX_MARKER`.
+    --
+    -- A same-named relation of the wrong shape is not treated as
+    -- sufficient. `CREATE INDEX ... IF NOT EXISTS` matches by name alone,
+    -- so a table, or an index on unrelated columns, would otherwise be
+    -- silently accepted in place of the index the sweeper's drop-gate
+    -- probe needs. Every later `created_at < $1` probe would then run a
+    -- sequential scan of `harvest_workflow_executions` instead.
     IF NOT EXISTS (
         SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
          WHERE c.relname = 'idx_harvest_we_created_at' AND n.nspname = current_schema()
@@ -2078,6 +2085,19 @@ re-run this.', bad;
              || 'ON harvest_workflow_executions (created_at)';
         EXECUTE 'COMMENT ON INDEX idx_harvest_we_created_at IS '
              || quote_literal('{DROP_GATE_INDEX_MARKER}');
+    ELSIF NOT EXISTS (
+        SELECT 1 FROM pg_class c
+        JOIN pg_index i ON i.indexrelid = c.oid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = (i.indkey::int2[])[0]
+         WHERE c.relname = 'idx_harvest_we_created_at' AND n.nspname = current_schema()
+           AND i.indisvalid AND i.indrelid = 'harvest_workflow_executions'::regclass
+           AND a.attname = 'created_at'
+    ) THEN
+        RAISE EXCEPTION 'harvest #1270: idx_harvest_we_created_at already names a \
+relation that is not a valid index with created_at as its leading column on \
+harvest_workflow_executions. The sweeper drop-gate probe would fall back to a \
+sequential scan. Rename or drop it, then retry.';
     END IF;
 
     -- The catch-all, created before any cohort partition so there is never an
@@ -4376,13 +4396,39 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
              ON harvest_workflow_executions (created_at)"
                 .to_string(),
         ),
+        // `CREATE INDEX ... IF NOT EXISTS` above matches by name alone. A
+        // table, or an index on unrelated columns, already at this name
+        // would be silently accepted as the sweeper's drop-gate index.
+        // Every later `created_at < $1` probe would then run a sequential
+        // scan of `harvest_workflow_executions`. This step reads the probe
+        // recorded before the build ran. `existed=true` means the build
+        // above was a no-op. The pre-existing relation's shape is checked
+        // here before it is trusted.
         step(
             2,
             format!(
-                "DO $harvest_dropgate_mark_958$\nDECLARE marker text;\nBEGIN\n    \
+                "DO $harvest_dropgate_mark_958$\nDECLARE marker text; shaped boolean;\nBEGIN\n    \
                  SELECT obj_description('harvest_1270_drop_gate_probe'::regclass, 'pg_class')\n      \
                  INTO marker;\n    \
-                 IF marker NOT LIKE '%existed=true%' THEN\n        \
+                 IF marker LIKE '%existed=true%' THEN\n        \
+                 SELECT EXISTS (\n            \
+                 SELECT 1 FROM pg_class c\n            \
+                 JOIN pg_index i ON i.indexrelid = c.oid\n            \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace\n            \
+                 JOIN pg_attribute a\n              \
+                 ON a.attrelid = i.indrelid AND a.attnum = (i.indkey::int2[])[0]\n             \
+                 WHERE c.relname = 'idx_harvest_we_created_at'\n               \
+                 AND n.nspname = current_schema()\n               \
+                 AND i.indisvalid AND i.indrelid = 'harvest_workflow_executions'::regclass\n               \
+                 AND a.attname = 'created_at'\n        \
+                 ) INTO shaped;\n        \
+                 IF NOT shaped THEN\n            \
+                 RAISE EXCEPTION 'harvest #1270: idx_harvest_we_created_at already names a \
+                 relation that is not a valid index with created_at as its leading column \
+                 on harvest_workflow_executions. The sweeper drop-gate probe would fall \
+                 back to a sequential scan. Rename or drop it, then retry.';\n        \
+                 END IF;\n    \
+                 ELSE\n        \
                  EXECUTE 'COMMENT ON INDEX idx_harvest_we_created_at IS '\n             \
                  || quote_literal('{DROP_GATE_INDEX_MARKER}');\n    \
                  END IF;\n    \
@@ -4794,18 +4840,43 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // append for up to a tick interval into the DEFAULT partition, whose
         // drain then holds ACCESS EXCLUSIVE while it moves them back — the
         // append stall this whole change exists to avoid.
+        //
+        // Verified before this COMMIT, the same way `enable_sql` verifies
+        // its own lookahead loop. `CREATE TABLE IF NOT EXISTS` above
+        // silently skips a cohort whose deterministic name collides with an
+        // unrelated relation. A caller that only checked the catalog after
+        // this plan finished would already own an uncovered write window.
+        // Appends would pile into `harvest_events_p_default`, with no way
+        // back except another conversion. Failing here instead rolls back
+        // this phase's own transaction (`BEGIN` two steps above). The
+        // large-table plan can then simply be resumed once the collision
+        // is resolved.
         step(
             4,
             format!(
-                "DO $harvest_window_958$\nDECLARE lo timestamptz; hi timestamptz; step int;\n\
-                 BEGIN\n    FOR step IN 0..{lookahead} LOOP\n        \
+                "DO $harvest_window_958$\nDECLARE lo timestamptz; hi timestamptz; step int; \
+                 created_count int;\nBEGIN\n    FOR step IN 0..{lookahead} LOOP\n        \
                  lo := harvest_event_cohort(now() + (step * {width}) * interval '1 second');\n        \
                  hi := lo + ({width} * interval '1 second');\n        \
                  EXECUTE format(\n            \
                  'CREATE TABLE IF NOT EXISTS %I PARTITION OF harvest_events \
                  FOR VALUES FROM (%L) TO (%L)',\n            \
                  '{PARTITION_PREFIX}' || to_char(lo AT TIME ZONE 'UTC', 'YYYYMMDDHH24MISS'),\n            \
-                 lo, hi);\n    END LOOP;\nEND\n$harvest_window_958$"
+                 lo, hi);\n    END LOOP;\n    \
+                 SELECT count(*) INTO created_count\n      \
+                 FROM pg_inherits i\n      \
+                 JOIN pg_class child ON child.oid = i.inhrelid\n      \
+                 JOIN pg_class parent ON parent.oid = i.inhparent\n      \
+                 JOIN pg_namespace n ON n.oid = parent.relnamespace\n     \
+                 WHERE parent.relname = 'harvest_events'\n       \
+                 AND n.nspname = current_schema()\n       \
+                 AND child.relname LIKE '{PARTITION_PREFIX}%'\n       \
+                 AND child.relname <> '{DEFAULT_PARTITION}';\n    \
+                 IF created_count <> {lookahead} + 1 THEN\n        \
+                 RAISE EXCEPTION 'harvest #1270: only % of % lookahead cohort partitions \
+could be built; an existing relation likely occupies one of the deterministic names. Drop \
+or rename it, then retry.', created_count, {lookahead} + 1;\n    \
+                 END IF;\nEND\n$harvest_window_958$"
             ),
         ),
         step(4, "COMMIT".to_string()),
