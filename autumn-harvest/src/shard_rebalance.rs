@@ -561,11 +561,12 @@ pub const COPIED_EVENT_COLUMNS: &[&str] = &[
 pub fn history_fingerprint(events: &[crate::event::WorkflowEvent]) -> String {
     let mut hasher = Sha256::new();
 
-    // 1. The decoded events themselves, in order. `canonical` is one buffer
-    // reused across every event instead of a fresh `String` per event: the
-    // hashed bytes are identical either way (`serde_json::to_writer` emits
-    // the same bytes `serde_json::to_string` does, just into a caller-owned
-    // buffer), so this is not a behavior change, only fewer allocations on a
+    // 1. The decoded events themselves, in order. `canonical` is one
+    // buffer, reused across every event. A fresh `String` per event is
+    // not needed. `serde_json::to_writer` emits the same bytes
+    // `serde_json::to_string` does, into a caller-owned buffer instead of
+    // a new one. The hashed bytes are therefore identical either way.
+    // This is not a behavior change. It only removes allocations, on a
     // loop that can run to however many events a history holds.
     let mut canonical = Vec::new();
     for event in events {
