@@ -143,6 +143,71 @@ pub const fn stuck_running_tasks_query() -> &'static str {
        AND t.started_at < NOW() - ($1::bigint * INTERVAL '1 second')"
 }
 
+/// Re-queue an orphaned task for another attempt, folding what were two
+/// separate round trips into one.
+///
+/// Runs *after* the caller already holds the row lock. That lock comes
+/// from a plain `SELECT ... FOR UPDATE` naming only `harvest_task_queue`,
+/// in [`requeue_orphan`]. This statement then combines the row-state
+/// re-check and the worker-liveness re-check into a single `UPDATE ...
+/// WHERE ... RETURNING`. It replaces what used to be a dedicated liveness
+/// `SELECT` followed by the `UPDATE`.
+///
+/// **This statement must never be the first one to touch the row in its
+/// transaction.** An `UPDATE`'s own row lock only guarantees a fresh read
+/// of *that row*, and only if it has to wait for a concurrent holder.
+/// Postgres's `EvalPlanQual` re-check re-reads the target tuple. But it
+/// evaluates the rest of the `WHERE` clause using the snapshot the
+/// statement started with, taken *before* any wait. That includes this
+/// statement's `NOT EXISTS` against `harvest_workers`. A worker that
+/// resurrects while this statement is blocked on the row lock would then
+/// be invisible to the `NOT EXISTS` check. The task would be wrongly
+/// requeued out from under a worker still processing it. Confirmed
+/// against a real Postgres: two concurrent sessions plus a third
+/// committing the resurrection mid-wait (see this PR's review history for
+/// the reproduction).
+///
+/// The caller's preceding `SELECT ... FOR UPDATE` absorbs that wait
+/// instead. By the time *this* statement runs, the row lock is already
+/// ours, so this statement can never itself block. A fresh top-level
+/// statement in `READ COMMITTED` always starts with a snapshot as of its
+/// own start. That start is after the caller's wait, if any, resolved.
+/// That is what makes the liveness check here as fresh as the dedicated
+/// `SELECT` it replaces, not merely close to it.
+///
+/// `$1` = task id, `$2` = claiming worker id, `$3` = the crash-strike
+/// count the caller observed at scan time. `$4` = the new crash-strike
+/// count to record. `$5` = the worker-stale threshold in seconds. `$6` =
+/// the current time, bound by the caller rather than read via SQL `NOW()`
+/// -- see [`requeue_orphan`]'s call site for why.
+///
+/// Returns the row's id if it was actually transitioned. Returns no row
+/// otherwise: state/worker/strikes no longer match what the scan
+/// observed, or the claiming worker is not dead after all.
+#[must_use]
+pub const fn requeue_orphan_stmt() -> &'static str {
+    "UPDATE harvest_task_queue \
+     SET state = 'PENDING', \
+         worker_id = NULL, \
+         started_at = NULL, \
+         sticky_worker_id = NULL, \
+         sticky_until = NULL, \
+         last_heartbeat_at = NULL, \
+         error = NULL, \
+         crash_strikes = $4, \
+         scheduled_at = $6 \
+     WHERE id = $1 \
+       AND state = 'RUNNING' \
+       AND worker_id = $2 \
+       AND crash_strikes = $3 \
+       AND NOT EXISTS ( \
+           SELECT 1 FROM harvest_workers w \
+           WHERE w.worker_id = $2 \
+             AND w.last_heartbeat_at > $6 - ($5::bigint * INTERVAL '1 second') \
+       ) \
+     RETURNING id"
+}
+
 // ---------------------------------------------------------------------------
 // Orphan-reclaim scanner (DB)
 // ---------------------------------------------------------------------------
@@ -181,9 +246,14 @@ mod scanner {
             .expect("database UUIDs must round-trip into ExecutionId")
     }
 
-    /// Re-check, under a row lock, whether the worker that holds `worker_id` is
-    /// still dead. Guards against a worker that resurrected between the broad
-    /// scan and acquiring the task lock.
+    /// Re-check, under a row lock, whether the worker that holds `worker_id`
+    /// is still dead. Guards against a worker that resurrected between the
+    /// broad scan and acquiring the task lock.
+    ///
+    /// Must run as its own statement, after the caller already holds the
+    /// task row's lock. See `requeue_orphan_stmt`'s doc comment: a
+    /// statement combining this check with the row's own lock acquisition
+    /// is unsafe under lock contention.
     async fn worker_still_dead(
         conn: &mut AsyncPgConnection,
         worker_id: &str,
@@ -218,6 +288,13 @@ mod scanner {
     ) -> HarvestResult<bool> {
         use crate::schema::harvest_task_queue::dsl;
 
+        #[derive(diesel::QueryableByName)]
+        struct IdRow {
+            #[diesel(sql_type = diesel::sql_types::Uuid)]
+            #[allow(dead_code)]
+            id: uuid::Uuid,
+        }
+
         let task_id = task.id;
         let worker = task.worker_id.clone();
         let prior_strikes = task.crash_strikes;
@@ -226,49 +303,48 @@ mod scanner {
             let Some(worker_id) = worker else {
                 return Ok(false);
             };
-            // Lock the row and re-verify it is still the same orphan.
-            let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
+            // Lock the row first, in its own statement that names only
+            // `harvest_task_queue`. This is what makes the combined
+            // statement below safe. See `requeue_orphan_stmt`'s doc
+            // comment: the liveness re-check cannot share a statement
+            // with the row's own lock acquisition.
+            let locked: Option<uuid::Uuid> = dsl::harvest_task_queue
                 .find(task_id)
                 .for_update()
-                .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
+                .select(dsl::id)
                 .first(conn)
                 .await
                 .optional()
                 .map_err(crate::error::database_error)?;
-            match current {
-                Some((state, Some(wid), strikes))
-                    if state == "RUNNING" && wid == worker_id && strikes == prior_strikes => {}
-                _ => return Ok(false),
-            }
-            if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
+            if locked.is_none() {
                 return Ok(false);
             }
 
-            diesel::update(dsl::harvest_task_queue.find(task_id))
-                .set((
-                    dsl::state.eq("PENDING"),
-                    dsl::worker_id.eq(None::<String>),
-                    dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
-                    dsl::sticky_worker_id.eq(None::<String>),
-                    dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
-                    // Clear the dead attempt's heartbeat timestamp so the
-                    // fresh attempt is not immediately timed out by the
-                    // COALESCE(last_heartbeat_at, started_at) scanner.
-                    // heartbeat_details is preserved so a retry can still
-                    // read the last flushed checkpoint.
-                    dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
-                    // Clear the previous error: crashes don't leave a
-                    // meaningful error string, and the stale message from an
-                    // earlier clean failure would otherwise appear as
-                    // previous_failure() on the next attempt.
-                    dsl::error.eq(None::<String>),
-                    dsl::crash_strikes.eq(new_strikes),
-                    dsl::scheduled_at.eq(Utc::now()),
-                ))
-                .execute(conn)
+            // Now guaranteed a fresh snapshot: a new top-level statement,
+            // issued only after the lock above is already ours. This one
+            // can never itself have to wait. Re-verifies the row is still
+            // the same orphan, and re-checks the claiming worker is still
+            // dead, together in the write's own WHERE clause.
+            //
+            // `now` is read here, in Rust, rather than via SQL `NOW()`.
+            // Postgres fixes `NOW()` at the transaction's start, not the
+            // statement's. A statement issued after the lock above had to
+            // wait would still see the pre-wait time. Reading it here
+            // matches the pre-fix code, which computed `Utc::now()` at
+            // this same point -- after the row lock, not before it.
+            let now = Utc::now();
+            let updated: Option<IdRow> = diesel::sql_query(super::requeue_orphan_stmt())
+                .bind::<diesel::sql_types::Uuid, _>(task_id)
+                .bind::<diesel::sql_types::Text, _>(&worker_id)
+                .bind::<diesel::sql_types::Integer, _>(prior_strikes)
+                .bind::<diesel::sql_types::Integer, _>(new_strikes)
+                .bind::<diesel::sql_types::BigInt, _>(worker_stale_secs)
+                .bind::<diesel::sql_types::Timestamptz, _>(now)
+                .get_result(conn)
                 .await
+                .optional()
                 .map_err(crate::error::database_error)?;
-            Ok(true)
+            Ok(updated.is_some())
         }))
         .await
     }
@@ -279,6 +355,13 @@ mod scanner {
     /// Never touches `crash_strikes` and never quarantines. Being stuck this
     /// way says nothing about the task itself. It means a reset attempt could
     /// not reach the database in time, not that the task is poisonous.
+    ///
+    /// Leaving `crash_strikes` untouched matters beyond quarantine counting.
+    /// A re-claim of the row this frees still carries the same `crash_strikes`
+    /// value. `worker.rs`'s `reset_timed_out_workflow_task` also guards its
+    /// own write on `attempt`, not only `crash_strikes`. A delayed reset from
+    /// this row's PRIOR attempt then cannot match the fresh claim and undo
+    /// it. See that function's own doc comment.
     ///
     /// Returns `true` if the row was actually transitioned (it was still the
     /// same stuck `RUNNING` attempt), `false` if a concurrent actor already
@@ -345,6 +428,10 @@ mod scanner {
                     dsl::sticky_worker_id.eq(None::<String>),
                     dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
                     dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
+                    // Mirrors `requeue_orphan_stmt`: a stale `error` from an
+                    // earlier attempt must not survive into the fresh one it
+                    // no longer describes.
+                    dsl::error.eq(None::<String>),
                     dsl::scheduled_at.eq(Utc::now()),
                 ))
                 .execute(conn)
@@ -615,6 +702,14 @@ mod scanner {
                 let Some(worker_id) = worker else {
                     return Ok((false, None, Vec::new(), Vec::new(), Vec::new()));
                 };
+                // Lock the row and re-verify it is still the same orphan.
+                // This cannot fold the worker-liveness check into the same
+                // statement. See `requeue_orphan_stmt`'s doc comment: a
+                // wait on this row's lock would leave the liveness check
+                // reading a stale pre-wait snapshot of `harvest_workers`.
+                // `worker_still_dead` below is deliberately a separate,
+                // later statement instead. It runs only once this lock is
+                // already ours, so it is guaranteed a fresh snapshot.
                 let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
                     .find(task_id)
                     .for_update()
@@ -772,9 +867,9 @@ mod scanner {
         // `WorkflowFailed` carries a payload-bearing `details` field.
         codecs: &crate::payload_codec::PayloadCodecs,
     ) -> HarvestResult<ReclaimSummary> {
-        // Clamp once at the entry point so neither the SQL interval arithmetic
-        // nor the chrono::Duration re-check (in `worker_still_dead`) can ever
-        // overflow on an out-of-range caller value.
+        // Clamp once at the entry point. Neither the candidate scan nor
+        // the per-row liveness re-check can then overflow the SQL
+        // interval arithmetic on an out-of-range caller value.
         let worker_stale_secs = worker_stale_secs.clamp(0, super::MAX_WORKER_STALE_SECS);
         // Chaos: inject a transient DB/connection error before the orphan scan
         // (issue #940 AC1(b)). The reclaim is idempotent and the poll loop

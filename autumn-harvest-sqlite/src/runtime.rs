@@ -1,7 +1,7 @@
 //! The embedded, single-writer runtime: registration, start/signal ingress, the
 //! decision loop, and the two atomic-persist sites (dispatch + terminal).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use autumn_harvest::builder::{
@@ -969,10 +969,54 @@ impl SqliteRuntime {
     /// (re-read per driven cycle, issue #1069 P2). Returns `true` if any execution
     /// made durable progress this pass.
     ///
+    /// One execution's error (issue #1530) does NOT stop this pass. This pass
+    /// still drives every other execution.
+    ///
+    /// [`run_until_blocked`](Self::run_until_blocked) targets ONE execution
+    /// the caller already knows, so it stays fail-fast on error. This call
+    /// drives many UNRELATED executions, so one failure must not silently
+    /// starve the rest.
+    ///
     /// # Errors
     ///
-    /// See [`run_until_blocked`](Self::run_until_blocked).
+    /// Returns the FIRST execution's error, in `ExecutionId` order, if any.
+    /// Every other error in the same pass is logged (`tracing::warn!`), not
+    /// dropped. See [`run_until_blocked`](Self::run_until_blocked) for the
+    /// error variants a single execution can produce.
     pub async fn poll_once(&mut self) -> SqliteResult<bool> {
+        let mut skip = HashSet::new();
+        let (progress, first_error) = self.poll_once_pass(&mut skip).await?;
+        first_error.map_or(Ok(progress), Err)
+    }
+
+    /// One fleet-wide driving pass, shared by [`poll_once`](Self::poll_once)
+    /// and [`run_until_idle`](Self::run_until_idle).
+    ///
+    /// Returns progress and the first error SEPARATELY (issue #1555).
+    /// `poll_once` collapses both into its public `Result<bool>`, which
+    /// loses whether the pass still made progress on an `Err`.
+    /// `run_until_idle` needs that separate signal. It keeps converging the
+    /// rest of the fleet past a persistently-broken execution, instead of
+    /// stopping after one pass.
+    ///
+    /// `skip` names executions to leave alone this pass. A NEWLY-erroring
+    /// execution is added to it before this call returns (issue #1555
+    /// follow-up review, Codex P1).
+    ///
+    /// `poll_once` passes a fresh, empty set every call. This is a no-op
+    /// change for it: it still drives every execution exactly once.
+    /// `run_until_idle` reuses ONE set across all its internal passes. A
+    /// broken execution is then driven AT MOST ONCE per external call, even
+    /// across many internal passes.
+    ///
+    /// Re-driving it on every pass would keep striking
+    /// [`contain_workflow_panic`](Self::contain_workflow_panic)'s bounded
+    /// panic budget. That seals a panicking workflow `FAILED` within one
+    /// call, instead of leaving each strike visible between calls.
+    async fn poll_once_pass(
+        &mut self,
+        skip: &mut HashSet<ExecutionId>,
+    ) -> SqliteResult<(bool, Option<SqliteError>)> {
         // Re-read the wall clock per driven cycle (issue #1069 P2) — see the
         // rationale on `run_until_blocked`. The `_as_of` variant keeps a fixed
         // caller `now` for deterministic simulation.
@@ -981,14 +1025,22 @@ impl SqliteRuntime {
         let now_fn = self.now_fn.clone();
         let failure_now = move || now_fn().timestamp_millis();
         let mut progress = false;
+        let mut first_error = None;
         for exec in store::running_executions(&self.conn)? {
+            if skip.contains(&exec) {
+                continue;
+            }
             let now = (self.now_fn)().timestamp_millis();
-            match self.drive_one_cycle(exec, now, &failure_now).await? {
-                RunState::WaitingSignal(_) | RunState::WaitingTimer => {}
-                _ => progress = true,
+            match self.drive_one_cycle(exec, now, &failure_now).await {
+                Ok(RunState::WaitingSignal(_) | RunState::WaitingTimer) => {}
+                Ok(_) => progress = true,
+                Err(err) => {
+                    skip.insert(exec);
+                    record_fleet_error(exec, err, &mut first_error);
+                }
             }
         }
-        Ok(progress)
+        Ok((progress, first_error))
     }
 
     /// Like [`poll_once`](Self::poll_once) but with an injected "as-of" time. A
@@ -998,7 +1050,8 @@ impl SqliteRuntime {
     ///
     /// # Errors
     ///
-    /// See [`run_until_blocked`](Self::run_until_blocked).
+    /// See [`poll_once`](Self::poll_once) — one execution's error does not stop
+    /// this pass from driving the rest of the fleet (issue #1530).
     #[doc(hidden)]
     pub async fn poll_once_as_of(&mut self, now: DateTime<Utc>) -> SqliteResult<bool> {
         // Millisecond precision — see `run_until_blocked_as_of` (issue #1069 P2).
@@ -1006,34 +1059,61 @@ impl SqliteRuntime {
         // `_as_of` simulation: `failure_now() == now` (deterministic, sleep-free).
         let failure_now = move || now;
         let mut progress = false;
+        let mut first_error = None;
         for exec in store::running_executions(&self.conn)? {
-            match self.drive_one_cycle(exec, now, &failure_now).await? {
-                RunState::WaitingSignal(_) | RunState::WaitingTimer => {}
-                _ => progress = true,
+            match self.drive_one_cycle(exec, now, &failure_now).await {
+                Ok(RunState::WaitingSignal(_) | RunState::WaitingTimer) => {}
+                Ok(_) => progress = true,
+                Err(err) => record_fleet_error(exec, err, &mut first_error),
             }
         }
-        Ok(progress)
+        first_error.map_or_else(|| Ok(progress), Err)
     }
 
-    /// Repeatedly [`poll_once`](Self::poll_once) until the fleet is quiescent (no
-    /// execution makes progress — every remaining run is terminal or blocked on
-    /// an external input).
+    /// Repeatedly drive one fleet-wide pass until the fleet is quiescent.
+    /// Quiescent means no execution makes progress: every remaining run is
+    /// terminal or blocked on an external input.
+    ///
+    /// A pass with a per-execution error still counts as progress if any
+    /// OTHER execution advanced (issue #1555). This loop keeps calling
+    /// passes past such an error. One [`poll_once`](Self::poll_once) pass
+    /// already drives every other execution past a broken one, the same way
+    /// (issue #1530).
+    ///
+    /// The first error seen across ALL passes is deferred. It returns once
+    /// the fleet actually quiesces, not the first time any pass errors. One
+    /// external call now converges the whole fleet. It no longer stalls at
+    /// one decision cycle per persistently-broken execution.
+    ///
+    /// An execution that errors is driven AT MOST ONCE for the rest of this
+    /// call (Codex P1 follow-up review to issue #1555). Without that, a
+    /// long-running call could re-drive the SAME broken execution on every
+    /// internal pass. For a panicking workflow, that burns through its
+    /// bounded panic budget. It seals `FAILED` within one call, instead of
+    /// one strike per call. A fresh external call re-attempts it.
     ///
     /// # Errors
     ///
-    /// Returns [`SqliteError::Runaway`] if the fleet never quiesces within the
-    /// [`MAX_ITERATIONS`] safety bound — surfaced honestly (mirroring
-    /// [`run_until_blocked`](Self::run_until_blocked)'s [`SqliteError::Stuck`])
-    /// rather than swallowed as a clean `Ok(())` a caller cannot distinguish from
-    /// genuine quiescence. Also propagates any per-execution error (see
-    /// [`run_until_blocked`](Self::run_until_blocked)).
+    /// Returns [`SqliteError::Runaway`] if the fleet never quiesces within
+    /// the [`MAX_ITERATIONS`] safety bound and no per-execution error ever
+    /// occurred. This is surfaced honestly, mirroring
+    /// [`run_until_blocked`](Self::run_until_blocked)'s
+    /// [`SqliteError::Stuck`]. A clean `Ok(())` here would be
+    /// indistinguishable from genuine quiescence. Otherwise this returns the
+    /// first per-execution error, once quiescent or at the safety bound.
     pub async fn run_until_idle(&mut self) -> SqliteResult<()> {
+        let mut first_error = None;
+        let mut skip = HashSet::new();
         for _ in 0..MAX_ITERATIONS {
-            if !self.poll_once().await? {
-                return Ok(());
+            let (progress, err) = self.poll_once_pass(&mut skip).await?;
+            if let Some(err) = err {
+                first_error.get_or_insert(err);
+            }
+            if !progress {
+                return first_error.map_or(Ok(()), Err);
             }
         }
-        Err(SqliteError::Runaway)
+        Err(first_error.unwrap_or(SqliteError::Runaway))
     }
 
     /// Run exactly one decision cycle at logical time `now` (epoch milliseconds):
@@ -2090,6 +2170,19 @@ fn drive_span_meta(workflow_name: &str, workflow_id: &str) -> WorkflowExecuteSpa
         deadline_at: None,
         parent_execution_id: None,
     }
+}
+
+/// Record one execution's fleet-pass error (issue #1530).
+///
+/// Log every error so none is silently dropped. Keep only the first for
+/// the caller. Later executions in this pass still run.
+fn record_fleet_error(exec: ExecutionId, err: SqliteError, first_error: &mut Option<SqliteError>) {
+    tracing::warn!(
+        execution_id = %exec,
+        error = %err,
+        "execution failed this decision cycle; the fleet poll continues with the rest"
+    );
+    first_error.get_or_insert(err);
 }
 
 const fn command_name(cmd: &WorkflowCommand) -> &'static str {

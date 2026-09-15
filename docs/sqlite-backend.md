@@ -267,6 +267,11 @@ match rt.outcome(exec)? {
 - **`poll_once()`** for a custom loop — e.g. a background tick where you decide
   the cadence and inspect the `bool` progress flag yourself.
 
+`poll_once()`/`run_until_idle()` drive every execution in a pass even if an
+earlier one errors — see [§11](#11-v01-non-goals-and-follow-ups) for what
+happens to a rejected execution. `run_until_blocked(exec)` is the one
+fail-fast driver, since it already targets a single execution.
+
 `outcome(exec)`, `load_history(exec)`, and `activity_attempts(exec, name)` are
 **pure reads** — they never advance a run.
 
@@ -376,6 +381,14 @@ specific command/feature:
   **`continue_as_new`**.
 - **Worker sessions** (`create_session`) and **cancellable durable timers**
   (`start_timer` / `TimerHandle::…` — use the fire-once `ctx.timer(...)`).
+
+A rejected execution stays `RUNNING` and keeps erroring on every later drive.
+It does not block unrelated executions, though. `poll_once` still drives the
+rest of the fleet in the same pass (issue #1530), and `run_until_idle` still
+converges the rest of the fleet to quiescence in one call — it no longer
+stops after one internal pass the first time the broken execution errors
+(issue #1555). Both keep reporting the broken execution's error to the
+caller; neither drops it.
 
 Backend-level non-goals: distributed / multi-writer workers, `LISTEN`/`NOTIFY`
 push wake-ups, multi-server crash recovery, schedules, the management API,

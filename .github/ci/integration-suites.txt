@@ -74,6 +74,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          admission_gate_authoritative
 linux        autumn-harvest         integration                      -                          audit_export_tests
 linux        autumn-harvest         integration                      -                          auto_heartbeat_tests
+linux        autumn-harvest         integration                      -                          build_reachability_fanout_perf
 linux        autumn-harvest         integration                      -                          business_day_timer_tests
 linux        autumn-harvest         integration                      -                          canary_tests
 linux        autumn-harvest         integration                      -                          capability_miss_tests
@@ -102,6 +103,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          mutex_lease_reclaim_perf
 linux        autumn-harvest         integration                      -                          mutex_tests
 linux        autumn-harvest         integration                      -                          panic_containment_tests
+linux        autumn-harvest         integration                      -                          poison_pill_reclaim_perf
 linux        autumn-harvest         integration                      -                          queue_pause_success_metric_tests
 linux        autumn-harvest         integration                      -                          queue_pause_tests
 linux        autumn-harvest         integration                      -                          quota_enforcement_tests
@@ -120,6 +122,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          scheduler_overdue_pass_perf
 linux        autumn-harvest         integration                      -                          scheduler_overdue_tests
 linux        autumn-harvest         integration                      -                          scheduler_registration_tests
+linux        autumn-harvest         integration                      -                          shard_database_sweep_tests
 linux        autumn-harvest         integration                      -                          shard_placement_by_id_tests
 linux        autumn-harvest         integration                      -                          sharded_runtime_tests
 linux        autumn-harvest         integration                      -                          start_idempotency_tests

@@ -68,11 +68,12 @@ mod claim_bench_support;
 mod e2e_bench_support;
 
 use e2e_bench_support::{
-    BenchScenario, CHECK_ENV_VAR, Metric, PUBLISHED_BASELINES, REPLAY_CONTROL_DRIFT_PCT,
-    REPRO_TOLERANCE_PCT, ReproVerdict, SCENARIO_FILTER_ENV_VAR, SHARD_COUNTS, SHARD_FILTER_ENV_VAR,
-    ScenarioReport, baseline_for, relative_error_pct, render_matrix, render_value,
+    BenchScenario, CELL_HARD_TIMEOUT_SECS, CENSUS_CLEAR_TIMEOUT_SECS, CHECK_ENV_VAR, CellOutcome,
+    Metric, PUBLISHED_BASELINES, REPLAY_CONTROL_DRIFT_PCT, REPRO_TOLERANCE_PCT, ReproVerdict,
+    SCENARIO_FILTER_ENV_VAR, SHARD_COUNTS, SHARD_FILTER_ENV_VAR, ScenarioReport, TaskCensus,
+    await_cell, baseline_for, relative_error_pct, render_matrix, render_value,
     replay_control_drift_pct, repro_verdict, selected_scenarios, selected_shard_counts,
-    unknown_scenario_ids, unknown_shard_counts,
+    unknown_scenario_ids, unknown_shard_counts, wait_for_census_to_clear,
 };
 
 fn main() {
@@ -119,30 +120,8 @@ async fn run() {
     let mut reports: Vec<ScenarioReport> = Vec::new();
     for shards in shard_counts {
         for scenario in scenarios.iter().copied() {
-            eprintln!("==> {} at {shards} shard(s)", scenario.as_str());
-            // Each cell runs in its own task, so a panic in one becomes a
-            // `JoinError` rather than unwinding out of `main`. Without this a
-            // single unlucky database error aborts the whole sweep, discards
-            // every cell already measured, and skips teardown for the databases
-            // the remaining cells would have created.
-            let outcome = tokio::spawn(run_scenario(scenario, shards)).await;
-            match outcome {
-                Ok(Ok(report)) => reports.push(report),
-                Ok(Err(reason)) => {
-                    println!(
-                        "\n> **Skipped** `{}` at {shards} shard(s): {}\n",
-                        scenario.as_str(),
-                        reason
-                    );
-                }
-                Err(join) => {
-                    println!(
-                        "\n> **Failed** `{}` at {shards} shard(s): the scenario panicked \
-                         ({join}). Later cells still ran; databases this cell created may \
-                         need dropping by hand.\n",
-                        scenario.as_str(),
-                    );
-                }
+            if let Some(report) = run_cell(scenario, shards).await {
+                reports.push(report);
             }
         }
     }
@@ -205,14 +184,89 @@ async fn run() {
     }
 }
 
+/// Run one scenario at one shard count, reporting a sound result if there is
+/// one and printing a notice otherwise.
+///
+/// Each cell runs in its own task, so a panic in one becomes a `JoinError`
+/// rather than unwinding out of `main`. Without this a single unlucky
+/// database error aborts the whole sweep, discards every cell already
+/// measured, and skips teardown for the databases the remaining cells would
+/// have created.
+///
+/// `await_cell` adds a hard wall-clock ceiling on top. `SCENARIO_BUDGET_SECS`
+/// is only a *cooperative* deadline; the scenario checks it between its own
+/// awaits, and only starts counting after `setup_shards` returns. A wedged
+/// database can otherwise park this await forever (issue #1288).
+/// `await_cell`'s own ceiling is `CELL_HARD_TIMEOUT_SECS`, wider than the
+/// scenario's own budget: it also has to cover provisioning and teardown,
+/// which run outside that cooperative deadline. A timed-out cell's databases
+/// are not dropped here; the next run's stale-database sweep reclaims them.
+async fn run_cell(scenario: BenchScenario, shards: u32) -> Option<ScenarioReport> {
+    eprintln!("==> {} at {shards} shard(s)", scenario.as_str());
+    let census = TaskCensus::new();
+    let handle = tokio::spawn(run_scenario(scenario, shards, census.clone()));
+    let outcome = await_cell(
+        handle,
+        std::time::Duration::from_secs(CELL_HARD_TIMEOUT_SECS),
+    )
+    .await;
+    if matches!(outcome, CellOutcome::TimedOut | CellOutcome::Panicked(_)) {
+        // `await_cell` joining the scenario's own task proves that task's
+        // frame has dropped, on a timeout or a panic alike. It proves
+        // nothing about a worker or connection task that frame only asked
+        // to abort (`Fleet` and `SignalServer`'s `Drop` cannot `await`,
+        // panic unwind included). So wait for those to actually stop too,
+        // before the next cell's provisioning sweep can see their
+        // still-open connections.
+        wait_for_census_to_clear(
+            &census,
+            std::time::Duration::from_secs(CENSUS_CLEAR_TIMEOUT_SECS),
+        )
+        .await;
+    }
+    match outcome {
+        CellOutcome::Report(report) => return Some(report),
+        CellOutcome::Skipped(reason) => {
+            println!(
+                "\n> **Skipped** `{}` at {shards} shard(s): {}\n",
+                scenario.as_str(),
+                reason
+            );
+        }
+        CellOutcome::Panicked(join) => {
+            println!(
+                "\n> **Failed** `{}` at {shards} shard(s): the scenario panicked \
+                 ({join}). Later cells still ran; databases this cell created may \
+                 need dropping by hand.\n",
+                scenario.as_str(),
+            );
+        }
+        CellOutcome::TimedOut => {
+            println!(
+                "\n> **Timed out** `{}` at {shards} shard(s): the {CELL_HARD_TIMEOUT_SECS}s \
+                 hard cell ceiling was exhausted and the task was aborted. Later cells \
+                 still ran; databases this cell created were not dropped and will be \
+                 reclaimed by a later run's stale-database sweep.\n",
+                scenario.as_str(),
+            );
+        }
+    }
+    None
+}
+
 async fn run_scenario(
     scenario: BenchScenario,
     shards: u32,
+    census: TaskCensus,
 ) -> Result<ScenarioReport, e2e_bench_support::db::SkipReason> {
     match scenario {
-        BenchScenario::Throughput => e2e_bench_support::db::run_throughput(shards).await,
-        BenchScenario::DispatchLatency => e2e_bench_support::db::run_dispatch_latency(shards).await,
-        BenchScenario::SignalRoundtrip => e2e_bench_support::db::run_signal_roundtrip(shards).await,
+        BenchScenario::Throughput => e2e_bench_support::db::run_throughput(shards, census).await,
+        BenchScenario::DispatchLatency => {
+            e2e_bench_support::db::run_dispatch_latency(shards, census).await
+        }
+        BenchScenario::SignalRoundtrip => {
+            e2e_bench_support::db::run_signal_roundtrip(shards, census).await
+        }
         BenchScenario::ReplayThroughput => {
             Ok(e2e_bench_support::run_replay_throughput(shards).await)
         }

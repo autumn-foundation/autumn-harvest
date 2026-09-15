@@ -157,7 +157,8 @@ GET /admin/codec/rotation      # admin-gated, read-only
         "last_event_id": 998112,
         "rows_reencrypted": 999588,
         "completed_at": null,
-        "updated_at": "2026-08-29T11:03:22Z"
+        "updated_at": "2026-08-29T11:03:22Z",
+        "next_revalidation_at": null
       }
     }
   ],
@@ -166,6 +167,15 @@ GET /admin/codec/rotation      # admin-gated, read-only
   "unavailable_shards": []
 }
 ```
+
+`updated_at` is cursor liveness: the last time this row was written, moved
+by every batch that advances the cursor, busy or not. `next_revalidation_at`
+is a different thing (issue #1258): the deadline for the next re-census of
+an *already-completed* pass. It is `null` while a pass has not converged;
+once converged, it is armed and then rearmed only when its own interval
+comes due — an ordinary advancing write on a busy shard does not move it.
+Do not read `updated_at` as "how soon will a stray row be found" — that is
+what `next_revalidation_at` answers.
 
 `rows_remaining_total` is only a count when `status` is `"complete"`. Under
 `"partial"` it is a **lower bound** — an unread shard's rows are unknown, never
