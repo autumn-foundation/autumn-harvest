@@ -958,10 +958,15 @@ impl RateLimitBucketGcOutcome {
     }
 
     /// A pass that could not run on this shard.
+    ///
+    /// Takes `dry_run` from the config, the way `collected` already does.
+    /// Issue #1316: `..Self::default()` alone leaves `dry_run` at `false`, so
+    /// a failed dry-run preview would report as a failed REAL pass.
     #[must_use]
-    fn failed(error: String) -> Self {
+    fn failed(error: String, dry_run: bool) -> Self {
         Self {
             error: Some(error),
+            dry_run,
             ..Self::default()
         }
     }
@@ -1739,7 +1744,10 @@ impl RetentionRuntime {
                                 );
                                 monitor_task.update_rate_limit_buckets(
                                     shard,
-                                    RateLimitBucketGcOutcome::failed(error.to_string()),
+                                    RateLimitBucketGcOutcome::failed(
+                                        error.to_string(),
+                                        config.dry_run,
+                                    ),
                                 );
                                 continue;
                             }
@@ -1784,7 +1792,10 @@ impl RetentionRuntime {
                                 );
                                 monitor_task.update_rate_limit_buckets(
                                     shard,
-                                    RateLimitBucketGcOutcome::failed(err.to_string()),
+                                    RateLimitBucketGcOutcome::failed(
+                                        err.to_string(),
+                                        config.dry_run,
+                                    ),
                                 );
                             }
                         }
