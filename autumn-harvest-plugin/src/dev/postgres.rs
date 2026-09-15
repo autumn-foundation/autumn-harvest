@@ -257,6 +257,15 @@ impl EphemeralPostgres {
         })?;
         append_conf(data_dir, &postgres_conf_lines(port, &socket_dir))?;
 
+        // Refresh the record's `created_at` to right here, not the value from
+        // the top of `start` (issue #1299 review). `initdb` above has no
+        // timeout and can run long on a loaded machine. The reaper's startup
+        // grace period covers the gap between this `pg_ctl start` and the
+        // postmaster writing its own pid file, not `initdb`'s duration.
+        // Stamping it any earlier could exhaust the grace window before the
+        // gap it is meant to cover even begins.
+        write_session_record(session_dir, data_dir, None, binaries)?;
+
         let log_file = session_dir.join("postgres.log");
         run_tool(
             &binaries.tool("pg_ctl"),
@@ -700,9 +709,11 @@ fn escape_conf_string(value: &str) -> String {
 
 /// Write (or rewrite) the session record the reaper reads.
 ///
-/// Atomically, via [`write_private_atomic`] — this file is rewritten once the
-/// postmaster is up, and a kill during that rewrite is exactly the case the
-/// reaper exists for.
+/// Atomically, via [`write_private_atomic`] — a kill during any rewrite is
+/// exactly the case the reaper exists for. Called three times: at session
+/// creation, again right before `pg_ctl start`, and again once the
+/// postmaster is up. The middle call refreshes `created_at` past `initdb`'s
+/// unbounded duration (issue #1299).
 fn write_session_record(
     session_dir: &Path,
     data_dir: &Path,

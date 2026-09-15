@@ -972,6 +972,75 @@ fn reap_skips_a_freshly_created_session_with_no_pid_file_yet() {
 }
 
 #[test]
+fn the_grace_period_boundary_is_15_seconds_not_some_other_unit() {
+    // Issue #1299 review. The other grace-period tests use margins (5
+    // minutes, ~0 seconds) wide enough that a wrong unit (15ms, 15 minutes)
+    // would not fail either. This pins the boundary itself, on one record so
+    // only the elapsed time differs between the two assertions.
+    let mut aging = record(4242, None);
+    let created_at = chrono::Utc::now() - chrono::Duration::seconds(14);
+    aging.created_at = created_at;
+
+    let still_within_grace = decide_reap(
+        &aging,
+        false,
+        PostmasterIdentity::NotRunning,
+        99,
+        created_at + chrono::Duration::seconds(14),
+    );
+    assert_eq!(
+        still_within_grace,
+        ReapDecision::Skip(SkipReason::PossiblyStillStarting),
+        "14s after creation must still be within the grace period: {still_within_grace:?}"
+    );
+
+    let past_grace = decide_reap(
+        &aging,
+        false,
+        PostmasterIdentity::NotRunning,
+        99,
+        created_at + chrono::Duration::seconds(16),
+    );
+    assert!(
+        matches!(past_grace, ReapDecision::Remove),
+        "16s after creation must be past the grace period: {past_grace:?}"
+    );
+}
+
+#[test]
+fn a_skipped_session_is_reaped_once_it_ages_past_the_grace_period() {
+    // Issue #1299 review. The same record, unmodified — `Skip` must never
+    // depend on a side effect that would re-stamp `created_at` on disk. Only
+    // the wall clock moves between the two polls.
+    let record = record(4242, None);
+
+    let first_poll = decide_reap(
+        &record,
+        false,
+        PostmasterIdentity::NotRunning,
+        99,
+        record.created_at + chrono::Duration::seconds(5),
+    );
+    assert_eq!(
+        first_poll,
+        ReapDecision::Skip(SkipReason::PossiblyStillStarting),
+        "{first_poll:?}"
+    );
+
+    let second_poll = decide_reap(
+        &record,
+        false,
+        PostmasterIdentity::NotRunning,
+        99,
+        record.created_at + chrono::Duration::seconds(16),
+    );
+    assert!(
+        matches!(second_poll, ReapDecision::Remove),
+        "the same record must be reaped once it ages out: {second_poll:?}"
+    );
+}
+
+#[test]
 fn a_tokenless_but_live_postmaster_is_skipped_not_stopped() {
     // Issue #1295. A tokenless record used to fall back to plain liveness.
     // A live pid at the recorded number was treated as a match. That held
@@ -1278,6 +1347,18 @@ fn a_backslash_in_the_session_path_cannot_break_the_generated_config() {
     assert!(
         conf.contains(r"unix_socket_directories = '/tmp/bstest/a\\tb'"),
         "a literal backslash must be doubled, or Postgres decodes it as an escape: {conf}"
+    );
+}
+
+#[test]
+fn a_backslash_and_a_quote_together_are_both_escaped_independently() {
+    // Issue #1299 review. Pins that the two escapes compose: each fires
+    // regardless of the other's output, so neither pass can undo or
+    // duplicate the other's work.
+    let conf = postgres_conf_lines(5432, Path::new(r"/tmp/a\b'c")).join("\n");
+    assert!(
+        conf.contains(r"unix_socket_directories = '/tmp/a\\b''c'"),
+        "the backslash and the quote must each be doubled on their own: {conf}"
     );
 }
 

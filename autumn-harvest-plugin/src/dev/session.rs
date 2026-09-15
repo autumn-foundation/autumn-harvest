@@ -79,7 +79,11 @@ pub struct SessionRecord {
     /// stops the cluster through `pg_ctl` or leaves it alone.
     #[serde(default)]
     pub postmaster_start_token: Option<String>,
-    /// When the session started, for diagnostics.
+    /// When the session started, for diagnostics — and, since issue #1299,
+    /// the anchor for the reaper's startup grace period. Refreshed right
+    /// before `pg_ctl start`, not stamped once at session-directory
+    /// creation. `initdb` has no timeout, so an earlier stamp could exhaust
+    /// the grace window before the gap it covers even begins.
     pub created_at: DateTime<Utc>,
 }
 
@@ -181,6 +185,11 @@ pub fn record_is_self_consistent(record: &SessionRecord, session_dir: &Path) -> 
 /// record this young cannot be told apart from one whose postmaster is
 /// mid-start. One old enough to clear this window can, because a real
 /// postmaster writes its pid file within a small fraction of it.
+///
+/// Wall-clock, like `created_at` itself: a clock set backward after a
+/// record is written could delay reaping it, never bring one forward. This
+/// is a dev-only tool, and the cost of that is a leaked directory, not a
+/// wrong deletion.
 const POSTMASTER_STARTUP_GRACE: chrono::Duration = chrono::Duration::seconds(15);
 
 /// Decide what to do with one session record.

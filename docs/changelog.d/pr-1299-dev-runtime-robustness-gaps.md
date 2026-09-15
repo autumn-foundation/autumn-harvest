@@ -26,10 +26,11 @@ module.
 2. `decide_reap` takes the current time and, when no postmaster pid is known
    at all, treats that absence as uncertain rather than proof within a
    15-second startup grace period measured from the record's `created_at`.
-   Past the window, absence is Remove as before. A new `SkipReason::
-   PossiblyStillStarting` names the skip. A record whose absence is proven
-   another way (a known pid confirmed not running) is unaffected — the grace
-   period only ever applies when no postmaster pid was ever recorded or read.
+   Past the window, absence is Remove as before. A new
+   `SkipReason::PossiblyStillStarting` names the skip. A record whose
+   absence is proven another way (a known pid confirmed not running) is
+   unaffected — the grace period only ever applies when no postmaster pid
+   was ever recorded or read.
 3. `abandon_cluster` and the readiness-failure path in `DevRuntime::start`
    now share one `report_leaked_teardown` helper, so a lost cluster is always
    logged and printed and the two paths cannot drift apart again. The start
@@ -51,3 +52,25 @@ to age their records past the grace window, so they keep testing confirmed
 absence rather than the new skip. The lib-side
 `leaked_teardown_tests::the_message_names_the_teardown_failure` pins the
 shared teardown-reporting helper's wording.
+
+**Review round.** Four independent reviews (correctness, security,
+test-coverage, Rust idioms) plus the repo's Codex bot all converged on one
+real bug in the first pass: `created_at` was stamped once, before `initdb`
+ran, not before `pg_ctl start`. `initdb` has no timeout, so on a slow
+machine the 15-second grace window could already be spent before the
+actual risk window — between `pg_ctl start` and the postmaster writing its
+pid file — even began. Fixed by refreshing the session record's
+`created_at` right before invoking `pg_ctl start`, so the window is anchored
+where the race actually starts. Two new tests,
+`the_grace_period_boundary_is_15_seconds_not_some_other_unit` and
+`a_skipped_session_is_reaped_once_it_ages_past_the_grace_period`, pin the
+boundary itself and that a skip never re-stamps the record. A third,
+`a_backslash_and_a_quote_together_are_both_escaped_independently`, pins that
+the two `escape_conf_string` passes compose without one undoing the other.
+
+**Accepted gap.** `abandon_cluster`'s own return-value behavior (the start
+error survives a concurrent teardown failure) is verified only by reading
+the code, not by a test that drives a real `postgres.shutdown()` failure —
+matching the issue's own note that this path is "hard to reach without
+fault injection." Adding an injectable-failure seam for `EphemeralPostgres`
+was judged out of scope for this narrow bugfix.
