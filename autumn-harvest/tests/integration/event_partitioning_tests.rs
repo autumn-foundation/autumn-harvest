@@ -1933,6 +1933,71 @@ async fn the_straggler_delete_removes_orphan_rows_but_leaves_the_stragglers_own(
     );
 }
 
+#[tokio::test]
+async fn sweep_restores_the_callers_statement_timeout_inside_a_nested_transaction() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    let old = Utc::now() - chrono::Duration::days(10);
+    let straggler = insert_execution(&mut conn, "sst_timeout_wf", "st-1", old, None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(straggler),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed straggler history");
+    backdate_events(&mut conn, straggler, old).await;
+    let orphan = seed_expired(&mut conn, "sst_timeout_orphan_wf", "or-1", old).await;
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(orphan)
+        .execute(&mut conn)
+        .await
+        .expect("delete the orphan's execution row directly");
+
+    diesel::sql_query("SET statement_timeout = '12345ms'")
+        .execute(&mut conn)
+        .await
+        .expect("set a distinctive statement_timeout on this connection");
+
+    // The straggler delete pins its own `statement_timeout` inside its own
+    // nested transaction, the same savepoint shape as `list_partitions`'s
+    // `DateStyle`. Called from inside this outer transaction, the setting
+    // must not leak past it.
+    let observed_timeout = conn
+        .transaction::<String, autumn_harvest::HarvestError, _>(async |conn| {
+            partition::sweep(
+                conn,
+                Utc::now(),
+                &SweepOptions {
+                    straggler_grace: Some(Duration::from_secs(0)),
+                    ..SweepOptions::default()
+                },
+            )
+            .await
+            .expect("sweep, with the straggler delete bounded by its own statement_timeout");
+            let row = diesel::sql_query("SELECT current_setting('statement_timeout') AS v")
+                .get_result::<TextRow>(conn)
+                .await
+                .expect("read statement_timeout back inside the same outer transaction");
+            Ok(row.v)
+        })
+        .await
+        .expect("outer transaction");
+
+    assert_eq!(
+        observed_timeout, "12345ms",
+        "the caller's own statement_timeout must survive a nested straggler \
+         delete untouched, not be left at whatever value the delete forced \
+         internally"
+    );
+}
+
 // ══ Pure unit coverage for the cohort algebra ══════════════════════════════
 
 #[test]
@@ -4145,6 +4210,108 @@ async fn a_partly_blocked_lookahead_catchup_reports_which_cohort_is_uncovered() 
     assert!(
         !ensured.created.is_empty(),
         "cohorts other than the colliding one must still be created; got {ensured:?}"
+    );
+
+    diesel::sql_query(format!("DROP TABLE IF EXISTS {colliding_name}"))
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn maintenance_reports_a_blocked_cohort_instead_of_erroring_when_the_rest_already_exists() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(
+        &mut conn,
+        &EnableOptions {
+            lookahead_cohorts: 1,
+            ..EnableOptions::default()
+        },
+    )
+    .await
+    .expect("enable with a narrow lookahead window");
+
+    // `ensure_partitions` treated "created nothing new this pass" as
+    // "nothing at all is covered," and errored even when every unblocked
+    // cohort in the window already existed. Reproduce that shape directly.
+    // Every cohort but one already exists before this call, from a mix of
+    // `enable` and a prior `ensure_cohort` pass. A healthy tick over the
+    // wider window then creates nothing new.
+    let width = partition::DEFAULT_COHORT_WIDTH_SECS;
+    let now = Utc::now();
+    partition::ensure_cohort(&mut conn, now + chrono::Duration::seconds(width * 3))
+        .await
+        .expect("pre-create the far cohort outside the call under test");
+    let blocked_start = partition::cohort_start(now + chrono::Duration::seconds(width * 2), width);
+    let colliding_name = partition::partition_name(blocked_start);
+    diesel::sql_query(format!("DROP TABLE IF EXISTS {colliding_name}"))
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query(format!("CREATE TABLE {colliding_name} (id bigint)"))
+        .execute(&mut conn)
+        .await
+        .expect("plant a colliding, unrelated relation");
+
+    let ensured = partition::ensure_partitions(&mut conn, now, 3, Duration::from_secs(2))
+        .await
+        .expect(
+            "a window mostly covered by pre-existing cohorts must not error just \
+             because nothing new was created this pass",
+        );
+
+    assert!(
+        ensured.created.is_empty(),
+        "every unblocked cohort already existed; nothing new should have been \
+         created: {ensured:?}"
+    );
+    assert!(
+        ensured.blocked.contains(&blocked_start.to_rfc3339()),
+        "the collided cohort must still be reported blocked: {ensured:?}"
+    );
+
+    diesel::sql_query(format!("DROP TABLE IF EXISTS {colliding_name}"))
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn enabling_refuses_when_a_lookahead_cohort_name_collides() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // Plant an unrelated relation under the name `enable_sql`'s lookahead
+    // loop needs for one cohort in its window. `CREATE TABLE IF NOT EXISTS
+    // ... PARTITION OF` treats that name as taken and silently skips it, so
+    // the script itself reports no error. `enable_partitioning` must still
+    // catch the gap by reading the catalog back. It must not report a
+    // conversion complete when one cohort of its write window is missing.
+    let width = partition::DEFAULT_COHORT_WIDTH_SECS;
+    let now = Utc::now();
+    let colliding_start =
+        partition::cohort_start(now + chrono::Duration::seconds(width * 2), width);
+    let colliding_name = partition::partition_name(colliding_start);
+    diesel::sql_query(format!("DROP TABLE IF EXISTS {colliding_name}"))
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query(format!("CREATE TABLE {colliding_name} (id bigint)"))
+        .execute(&mut conn)
+        .await
+        .expect("plant a colliding, unrelated relation");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "a missing lookahead cohort must fail the conversion report, not pass silently",
+        );
+    assert!(
+        err.to_string().contains(&colliding_name),
+        "the refusal must name the missing cohort: {err}"
     );
 
     diesel::sql_query(format!("DROP TABLE IF EXISTS {colliding_name}"))

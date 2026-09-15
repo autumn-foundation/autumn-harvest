@@ -6175,6 +6175,18 @@ async fn run_partition_maintain(
     max_attempts: usize,
     format: DrFormat,
 ) -> Result<(), CliError> {
+    // A zero budget stops `sweep_inner` before it evaluates a single
+    // partition, yet still records that unevaluated partition as
+    // `resume_after`. Every later invocation then resumes at the same
+    // point and reclaims nothing, forever — reject it here rather than
+    // let it run.
+    if max_attempts == 0 {
+        return Err(CliError::InvalidInput(
+            "--max-attempts must be at least 1; a zero budget stops every pass before it \
+             evaluates a partition, and reclamation stalls permanently"
+                .to_string(),
+        ));
+    }
     let targets = parse_shard_targets(shards)?;
     let sweep = autumn_harvest::partition::SweepOptions {
         max_drops,

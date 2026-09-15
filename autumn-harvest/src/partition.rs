@@ -1037,7 +1037,7 @@ pub struct EnsurePartitionsOutcome {
 /// # Errors
 ///
 /// [`HarvestError::Database`] on a catalog or DDL failure, or when every
-/// cohort in the window was blocked and none could be created.
+/// cohort in the window was blocked and none was already covered either.
 #[cfg(feature = "db")]
 pub async fn ensure_partitions(
     conn: &mut AsyncPgConnection,
@@ -1051,13 +1051,17 @@ pub async fn ensure_partitions(
     };
     let mut created = Vec::new();
     let mut blocked: Vec<String> = Vec::new();
+    // Counts a cohort found already in place, same as one just created here.
+    // `created.is_empty()` alone cannot tell "nothing needed doing" apart
+    // from "nothing at all is covered" — see the check below.
+    let mut already_covered = 0u32;
     for step in 0..=i64::from(lookahead_cohorts) {
         let Some(at) = now.checked_add_signed(chrono::Duration::seconds(width * step)) else {
             break;
         };
         match ensure_cohort_with_width(conn, at, width, lock_timeout).await {
             Ok((name, true)) => created.push(name),
-            Ok((_, false)) => {}
+            Ok((_, false)) => already_covered += 1,
             // One cohort that cannot be carved out must not stop the REST of
             // the window from being created.
             //
@@ -1084,10 +1088,16 @@ pub async fn ensure_partitions(
             }
         }
     }
-    if created.is_empty() && !blocked.is_empty() {
-        // Nothing at all could be covered — that is not a partial success, and
-        // the caller must record it rather than report an empty, healthy-looking
-        // maintenance pass.
+    if created.is_empty() && already_covered == 0 && !blocked.is_empty() {
+        // Nothing at all is covered — neither created this pass nor already in
+        // place — which is not a partial success. The caller must record it
+        // rather than report an empty, healthy-looking maintenance pass.
+        //
+        // `already_covered` is what keeps this from firing on a healthy tick.
+        // That tick created nothing new because the unblocked cohorts already
+        // existed, with only one straggler still blocked. It (issue #1270)
+        // covers most of the window. It must return its structured, partial
+        // outcome, not an error swallowed by `maintain`'s `?`.
         return Err(HarvestError::Database(format!(
             "no cohort partition could be created; appends will land in \
              {DEFAULT_PARTITION}. blocked cohorts: {}",
@@ -1574,11 +1584,39 @@ pub async fn enable_partitioning(
             .map_or(EnableMode::Fresh, |legacy| EnableMode::AttachLegacy {
                 cutover: legacy.upper.unwrap_or(now),
             });
-    let partitions_created = parts
+    let partitions_created: Vec<String> = parts
         .into_iter()
         .filter(|p| !p.is_default && p.name != LEGACY_PARTITION)
         .map(|p| p.name)
         .collect();
+
+    // Issue #1270: `CREATE TABLE IF NOT EXISTS ... PARTITION OF` inside
+    // `enable_sql` silently skips a cohort whose deterministic name is already
+    // taken by an unrelated relation. Reading the catalog back, as above, then
+    // just omits that name — a caller sees a report that looks complete. Check
+    // the read against the same step-by-step name derivation `enable_sql`'s own
+    // lookahead loop uses, so a collision is reported instead of swallowed.
+    let expected_cohorts: Vec<String> = (0..=i64::from(opts.lookahead_cohorts))
+        .filter_map(|step| {
+            now.checked_add_signed(chrono::Duration::seconds(width * step))
+                .map(|at| partition_name(cohort_start(at, width)))
+        })
+        .collect();
+    let missing: Vec<&str> = expected_cohorts
+        .iter()
+        .filter(|name| !partitions_created.contains(name))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Err(HarvestError::Database(format!(
+            "harvest_events was converted, but the lookahead cohort partition(s) {} were \
+             not created. An existing relation already occupies that name and is not this \
+             engine's partition. Writes for that cohort will land in {DEFAULT_PARTITION} \
+             until the collision is resolved.",
+            missing.join(", ")
+        )));
+    }
+
     Ok(EnableReport {
         mode,
         partitions_created,
@@ -3309,7 +3347,20 @@ async fn delete_orphan_rows(
         // timeout, one batch's `DELETE` has no bound of its own.
         // `max_batches` bounds the number of statements, not how long any
         // one of them may run (issue #1270 item 2).
+        // The original value is read and restored explicitly, the same way
+        // and for the same reason as `list_partitions`'s `DateStyle` save.
+        // Diesel opens this `transaction` as a SAVEPOINT when called inside a
+        // caller's own transaction. Releasing a savepoint does not undo a
+        // `SET LOCAL` inside it — only a rollback does. Left unrestored, this
+        // batch's timeout would leak into every later statement on the
+        // caller's own transaction.
         let result = Box::pin(conn.transaction::<i64, HarvestError, _>(async |conn| {
+            let original_timeout =
+                diesel::sql_query("SELECT current_setting('statement_timeout') AS v")
+                    .get_result::<TextRow>(conn)
+                    .await
+                    .map_err(database_error)?
+                    .v;
             exec(conn, &format!("SET LOCAL statement_timeout = '{ms}ms'")).await?;
             let n = if let Some(lower) = lower {
                 query.bind::<Timestamptz, _>(lower).execute(conn).await
@@ -3317,6 +3368,14 @@ async fn delete_orphan_rows(
                 query.execute(conn).await
             }
             .map_err(database_error)?;
+            let restore_stmt =
+                diesel::sql_query("SELECT format('SET LOCAL statement_timeout = %L', $1) AS v")
+                    .bind::<Text, _>(&original_timeout)
+                    .get_result::<TextRow>(conn)
+                    .await
+                    .map_err(database_error)?
+                    .v;
+            exec(conn, &restore_stmt).await?;
             Ok(i64::try_from(n).unwrap_or(i64::MAX))
         }))
         .await;

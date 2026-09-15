@@ -772,6 +772,21 @@ impl RetentionConfig {
                     .to_string(),
             );
         }
+        // A zero budget passed straight through to `SweepOptions::max_attempts`
+        // makes `sweep_inner` stop before it evaluates a single partition. It
+        // still records that first, unevaluated partition as `resume_after`,
+        // so every later pass resumes at the same point and reclaims nothing,
+        // forever. `max_drops_per_tick` has no matching floor. A zero drop
+        // budget legitimately means "evaluate but never drop," which is not a
+        // stuck state the way a zero attempt budget is.
+        if self.partitions.enabled && self.partitions.max_attempts_per_tick == 0 {
+            return Err(
+                "partitions.max_attempts_per_tick must be at least 1 when partition \
+                 maintenance is enabled; a zero budget stops every pass before it \
+                 evaluates a partition, and reclamation stalls permanently"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -3444,6 +3459,26 @@ mod tests {
         let mut config = RetentionConfig::default();
         config.partitions.enabled = true;
         config.partitions.lookahead_cohorts = 1;
+        assert!(config.validate().is_ok());
+    }
+
+    // A zero budget passed to `SweepOptions::max_attempts` stops `sweep_inner`
+    // before it evaluates a partition, yet still records that unevaluated
+    // partition as `resume_after`. Every later pass then resumes at the same
+    // point and reclaims nothing, forever.
+    #[test]
+    fn partition_maintenance_rejects_zero_max_attempts_when_enabled() {
+        let mut config = RetentionConfig::default();
+        config.partitions.enabled = true;
+        config.partitions.max_attempts_per_tick = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn partition_maintenance_zero_max_attempts_is_fine_when_disabled() {
+        let mut config = RetentionConfig::default();
+        config.partitions.enabled = false;
+        config.partitions.max_attempts_per_tick = 0;
         assert!(config.validate().is_ok());
     }
 
