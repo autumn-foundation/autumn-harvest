@@ -871,6 +871,7 @@ fn reap_leaves_a_live_session_alone() {
         true,
         PostmasterIdentity::Confirmed,
         99,
+        chrono::Utc::now(),
     );
     assert!(
         matches!(decision, ReapDecision::Skip { .. }),
@@ -887,6 +888,7 @@ fn reap_never_touches_our_own_session() {
         true,
         PostmasterIdentity::Confirmed,
         4242,
+        chrono::Utc::now(),
     );
     assert!(
         matches!(decision, ReapDecision::Skip { .. }),
@@ -903,6 +905,7 @@ fn reap_stops_an_orphaned_postmaster_then_removes_the_directory() {
         false,
         PostmasterIdentity::Confirmed,
         99,
+        chrono::Utc::now(),
     );
     assert!(
         matches!(
@@ -917,24 +920,55 @@ fn reap_stops_an_orphaned_postmaster_then_removes_the_directory() {
 
 #[test]
 fn reap_removes_the_directory_when_the_postmaster_is_already_gone() {
+    // A known postmaster pid confirmed not running is proof on its own — the
+    // startup grace period (issue #1299) only ever applies when no postmaster
+    // was ever known.
     let decision = decide_reap(
         &record(4242, Some(4243)),
         false,
         PostmasterIdentity::NotRunning,
         99,
+        chrono::Utc::now(),
     );
     assert!(matches!(decision, ReapDecision::Remove), "{decision:?}");
 }
 
 #[test]
 fn reap_removes_a_session_that_died_before_recording_a_postmaster() {
+    // Old enough that the startup grace period (issue #1299) has passed: a
+    // record with no known postmaster this stale is confirmed dead, not
+    // merely still starting.
+    let mut aged = record(4242, None);
+    aged.created_at = chrono::Utc::now() - chrono::Duration::minutes(5);
     let decision = decide_reap(
-        &record(4242, None),
+        &aged,
         false,
         PostmasterIdentity::NotRunning,
         99,
+        chrono::Utc::now(),
     );
     assert!(matches!(decision, ReapDecision::Remove), "{decision:?}");
+}
+
+#[test]
+fn reap_skips_a_freshly_created_session_with_no_pid_file_yet() {
+    // Issue #1299. `pg_ctl` may have already launched Postgres before the
+    // owner was killed, and `postmaster.pid` appears only once the
+    // postmaster itself writes it. A record this new gets the benefit of the
+    // doubt rather than being read as proof no server exists.
+    let fresh = record(4242, None);
+    let decision = decide_reap(
+        &fresh,
+        false,
+        PostmasterIdentity::NotRunning,
+        99,
+        chrono::Utc::now(),
+    );
+    assert_eq!(
+        decision,
+        ReapDecision::Skip(SkipReason::PossiblyStillStarting),
+        "{decision:?}"
+    );
 }
 
 #[test]
@@ -949,6 +983,7 @@ fn a_tokenless_but_live_postmaster_is_skipped_not_stopped() {
         false,
         PostmasterIdentity::Unknown,
         99,
+        chrono::Utc::now(),
     );
     assert_eq!(
         decision,
@@ -1230,6 +1265,19 @@ fn a_quote_in_the_session_path_cannot_break_the_generated_config() {
     assert!(
         conf.contains("unix_socket_directories = '/tmp/o''brien/socket'"),
         "a literal quote must be doubled, per Postgres's own escaping rule: {conf}"
+    );
+}
+
+#[test]
+fn a_backslash_in_the_session_path_cannot_break_the_generated_config() {
+    // Issue #1299. Postgres's config lexer processes backslash escapes inside
+    // a single-quoted value, not just doubled quotes. An unescaped backslash
+    // decodes to a different string than the one the runtime created —
+    // verified empirically against a real `postgres -C`.
+    let conf = postgres_conf_lines(5432, Path::new(r"/tmp/bstest/a\tb")).join("\n");
+    assert!(
+        conf.contains(r"unix_socket_directories = '/tmp/bstest/a\\tb'"),
+        "a literal backslash must be doubled, or Postgres decodes it as an escape: {conf}"
     );
 }
 
@@ -2143,7 +2191,13 @@ fn a_reused_owner_pid_does_not_strand_a_session_forever() {
 
     // Same pid as ours, but the owner is *not* the recorded one: reap it.
     assert_eq!(
-        decide_reap(&record, false, PostmasterIdentity::Confirmed, 4242),
+        decide_reap(
+            &record,
+            false,
+            PostmasterIdentity::Confirmed,
+            4242,
+            chrono::Utc::now()
+        ),
         ReapDecision::StopThenRemove {
             postmaster_pid: 4243
         },
@@ -2152,13 +2206,25 @@ fn a_reused_owner_pid_does_not_strand_a_session_forever() {
 
     // Genuinely ours: still skipped, and still says so.
     assert_eq!(
-        decide_reap(&record, true, PostmasterIdentity::Confirmed, 4242),
+        decide_reap(
+            &record,
+            true,
+            PostmasterIdentity::Confirmed,
+            4242,
+            chrono::Utc::now()
+        ),
         ReapDecision::Skip(SkipReason::OwnedByThisProcess)
     );
 
     // Someone else's live session: skipped for the other reason.
     assert_eq!(
-        decide_reap(&record, true, PostmasterIdentity::Confirmed, 99),
+        decide_reap(
+            &record,
+            true,
+            PostmasterIdentity::Confirmed,
+            99,
+            chrono::Utc::now()
+        ),
         ReapDecision::Skip(SkipReason::OwnerAlive)
     );
 }
@@ -2236,6 +2302,10 @@ fn an_unreadable_postmaster_pid_file_leaves_the_session_alone() {
     let mut stale = record(u32::MAX - 1, None);
     stale.owner_start_token = None;
     stale.data_dir = data_dir.clone();
+    // Old enough that the startup grace period (issue #1299) has passed, so
+    // this test still exercises confirmed absence rather than the "might
+    // still be starting" skip a freshly created record now gets.
+    stale.created_at = chrono::Utc::now() - chrono::Duration::minutes(5);
     std::fs::write(
         session_dir.join("session.json"),
         stale.to_json().expect("json"),
@@ -2260,6 +2330,38 @@ fn an_unreadable_postmaster_pid_file_leaves_the_session_alone() {
         "with no pid file at all the session is a corpse and must be reclaimed"
     );
     assert!(!session_dir.exists(), "{}", session_dir.display());
+}
+
+#[test]
+fn a_freshly_created_session_with_no_pid_file_survives_the_full_reap_pipeline() {
+    // Issue #1299, end to end. `decide_reap` is pinned directly above; this
+    // drives the same scenario through `reap_stale_sessions` itself. `pg_ctl`
+    // can launch Postgres before the owner is killed, so a record written
+    // moments ago with no `postmaster.pid` yet is not proof the cluster never
+    // started — deleting its directory now could strand a live postmaster.
+    let base = tempfile::tempdir().expect("temp dir");
+    let root = autumn_harvest_plugin::dev::session_root(base.path()).expect("session root");
+
+    let session_dir = root.join("session-4242-0000000c");
+    let data_dir = session_dir.join("data");
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+    let mut fresh = record(u32::MAX - 1, None);
+    fresh.owner_start_token = None;
+    fresh.data_dir = data_dir;
+    std::fs::write(
+        session_dir.join("session.json"),
+        fresh.to_json().expect("json"),
+    )
+    .expect("write record");
+
+    // No `postmaster.pid` at all yet, same as the real window between
+    // `pg_ctl start` and the postmaster writing its own pid file.
+    assert_eq!(
+        autumn_harvest_plugin::dev::reap_stale_sessions(&root).expect("reap"),
+        0,
+        "a record this new must not be read as proof no server exists"
+    );
+    assert!(session_dir.exists(), "{}", session_dir.display());
 }
 
 #[test]

@@ -135,6 +135,14 @@ pub enum SkipReason {
     /// Issue #1295: unknown identity is not a match, so the reaper does not
     /// signal the pid or delete the directory.
     PostmasterIdentityUnknown,
+    /// No postmaster pid is known yet, and the record is too new to trust
+    /// that as proof nothing is running.
+    ///
+    /// Issue #1299: `pg_ctl` may have already launched Postgres before the
+    /// owner was killed, and `postmaster.pid` appears only once the
+    /// postmaster itself writes it. Absence is evidence only once the
+    /// startup grace period has passed.
+    PossiblyStillStarting,
 }
 
 /// Identity of the process at a recorded postmaster pid.
@@ -165,22 +173,36 @@ pub fn record_is_self_consistent(record: &SessionRecord, session_dir: &Path) -> 
     record.data_dir == session_dir.join("data")
 }
 
+/// How long after creation a record with no known postmaster still gets the
+/// benefit of the doubt (issue #1299).
+///
+/// `pg_ctl` can launch Postgres before the owner is killed, and
+/// `postmaster.pid` appears only once the postmaster itself writes it. A
+/// record this young cannot be told apart from one whose postmaster is
+/// mid-start; one old enough to clear this window can, because a real
+/// postmaster writes its pid file within a small fraction of it.
+const POSTMASTER_STARTUP_GRACE: chrono::Duration = chrono::Duration::seconds(15);
+
 /// Decide what to do with one session record.
 ///
-/// Pure: liveness and identity are supplied by the caller so the whole table
-/// can be tested without processes.
+/// Pure: liveness, identity and the current time are all supplied by the
+/// caller, so the whole table can be tested without processes or a real
+/// clock.
 ///
 /// `postmaster` decides between three outcomes, not two. `Confirmed` reaps
 /// through `StopThenRemove`. `NotRunning` removes the directory with no
-/// signal — nothing is there to signal. `Unknown` skips reaping. The pid is
-/// alive, but identity is unproven, so neither stopping it nor deleting its
-/// directory is safe (issue #1295).
+/// signal — nothing is there to signal, unless the record is still within its
+/// startup grace period (issue #1299), in which case absence is not yet
+/// proof and the session is skipped. `Unknown` skips reaping outright: the
+/// pid is alive, but identity is unproven, so neither stopping it nor
+/// deleting its directory is safe (issue #1295).
 #[must_use]
-pub const fn decide_reap(
+pub fn decide_reap(
     record: &SessionRecord,
     owner_alive: bool,
     postmaster: PostmasterIdentity,
     self_pid: u32,
+    now: DateTime<Utc>,
 ) -> ReapDecision {
     // Liveness first, and `owner_alive` is an *identity* answer: the caller
     // computes it from the recorded owner start token, not from the pid alone.
@@ -204,6 +226,11 @@ pub const fn decide_reap(
         }
         (Some(_), PostmasterIdentity::Unknown) => {
             ReapDecision::Skip(SkipReason::PostmasterIdentityUnknown)
+        }
+        (None, PostmasterIdentity::NotRunning)
+            if now.signed_duration_since(record.created_at) < POSTMASTER_STARTUP_GRACE =>
+        {
+            ReapDecision::Skip(SkipReason::PossiblyStillStarting)
         }
         _ => ReapDecision::Remove,
     }
