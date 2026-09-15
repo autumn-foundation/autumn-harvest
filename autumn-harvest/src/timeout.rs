@@ -2508,10 +2508,10 @@ enum DeliveryRoute {
         ///
         /// Mirrors [`crate::external_target_location::TargetLocation::Indeterminate`]'s
         /// list when this came from an incomplete fan-out. When it came from
-        /// the target shard's pool being unconfigured, this is a single
-        /// synthetic entry naming that shard with
-        /// [`crate::external_target_location::UninspectedReasonKind::NoPool`] —
-        /// both are "why is this row stuck" instances the same counter cares
+        /// the target shard's pool being unconfigured instead, this is a
+        /// single synthetic entry naming that shard with
+        /// [`crate::external_target_location::UninspectedReasonKind::NoPool`].
+        /// Both are "why is this row stuck" instances the same counter cares
         /// about.
         uninspected: Vec<crate::external_target_location::UninspectedShard>,
     },
@@ -2680,12 +2680,12 @@ async fn resolve_delivery_route(
                         ref uninspected,
                         ..
                     } => {
-                        // A live/terminal run was found, but not every expected
-                        // shard could be inspected — a silently ambiguous
-                        // SUCCESS, not a stall, since delivery still proceeds
-                        // (issue #1307). The log line lives in
+                        // A live/terminal run was found, but not every
+                        // expected shard could be inspected. A silently
+                        // ambiguous SUCCESS, not a stall, since delivery
+                        // still proceeds (issue #1307). The log line lives in
                         // `resolve_location_by_workflow_id_with`, next to the
-                        // condition it counts; this is the metric twin.
+                        // condition it counts. This is the metric twin.
                         if !uninspected.is_empty() {
                             metrics.record_external_by_id_found_over_incomplete_fanout(
                                 shard_metric_label(shard),
@@ -2953,17 +2953,17 @@ async fn attempt_signal_delivery(
 /// Age of the oldest pending by-id row a sweep left retrying, memoized for the
 /// length of that sweep (issue #1307).
 ///
-/// Mirrors [`crate::external_target_location::UninspectableShards`]'s shape —
+/// Mirrors [`crate::external_target_location::UninspectableShards`]'s shape:
 /// an `Arc<Mutex<_>>` the per-row transaction closure can update by
-/// reference, rather than a value threaded back through the step-outcome
+/// reference. This avoids threading a value back through the step-outcome
 /// tuple both sweeps already return.
 ///
-/// Only ever grows during a sweep, so the maximum observed `age` at the end IS
-/// the oldest pending row this sweep visited: the claim query orders by
-/// `(timestamp, id)` ascending, so a backlog is drained oldest-first, and a
-/// row that resolves to [`DeliveryRoute::Retry`] is added to the sweep's own
-/// exclusion list — it is not reclaimed this sweep, but it is not lost either,
-/// since the next full sweep tick reclaims it with a fresh, larger `age`.
+/// Only ever grows during a sweep. So the maximum observed `age` at the end
+/// IS the oldest pending row this sweep visited. The claim query orders by
+/// `(timestamp, id)` ascending, so a backlog is drained oldest-first. A row
+/// that resolves to [`DeliveryRoute::Retry`] is added to the sweep's own
+/// exclusion list. It is not reclaimed this sweep, but it is not lost
+/// either: the next full sweep tick reclaims it with a fresh, larger `age`.
 #[derive(Clone, Debug, Default)]
 struct OldestPendingIndeterminateAge(std::sync::Arc<std::sync::Mutex<Option<chrono::Duration>>>);
 
@@ -2978,7 +2978,7 @@ impl OldestPendingIndeterminateAge {
         }
     }
 
-    /// Seconds, or `0.0` if this sweep left no row pending — matching
+    /// Seconds, or `0.0` if this sweep left no row pending. Matches
     /// [`MetricsRecorder::record_queue_oldest_pending_age`]'s convention so a
     /// drained backlog does not leave a stale gauge value behind.
     #[allow(clippy::cast_precision_loss)] // millisecond age never approaches 2^53

@@ -102,9 +102,9 @@ use crate::worker::DbPool;
 /// Why a shard could not be inspected, as a bounded label a metric can carry
 /// (issue #1307).
 ///
-/// `#[non_exhaustive]`: a probe fails in exactly these three ways today, but a
-/// new failure shape must slot in as a new variant, not force a caller to
-/// guess from `reason`'s prose.
+/// `#[non_exhaustive]`: a probe fails in exactly these three ways today. A new
+/// failure shape must slot in as a new variant, not force a caller to guess
+/// from `reason`'s prose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum UninspectedReasonKind {
@@ -120,7 +120,7 @@ pub enum UninspectedReasonKind {
 impl UninspectedReasonKind {
     /// The bounded metric-label value for this kind (issue #1307).
     ///
-    /// Per ADR-0001 §7, only low-cardinality values may label a metric — this
+    /// Per ADR-0001 §7, only low-cardinality values may label a metric. This
     /// is that value, kept separate from [`std::fmt::Display`] so a future
     /// operator-facing rendering of `self` does not silently change a metric
     /// label.
@@ -140,10 +140,10 @@ impl UninspectedReasonKind {
 /// resolution is being reported as inconclusive rather than as an answer.
 ///
 /// `#[non_exhaustive]` deliberately: `reason` is prose for an operator log
-/// line, and [`Self::kind`] is its machine-readable twin (issue #1307) —
-/// callers that need to act differently on a no-pool vs. a timed-out vs. a
-/// failed-query shard use `kind`; the log line still reads `reason`. Adding a
-/// third field must not be a breaking change.
+/// line. [`Self::kind`] is its machine-readable twin (issue #1307). A caller
+/// that must act differently on a no-pool vs. a timed-out vs. a failed-query
+/// shard uses `kind`. The log line still reads `reason`. Adding a third
+/// field must not be a breaking change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct UninspectedShard {
@@ -1363,11 +1363,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_shard_with_no_configured_pool_is_classified_as_no_pool() {
-        // `ShardedDbPool` requires at least one configured pool, so shard 0
-        // carries one (unreachable — irrelevant to this test, which is about
-        // shard 1, for which no pool is configured at all). The router's
-        // fan-out is the union of the pool's shards and its own, so shard 0
-        // is unavoidably probed too; that classification is covered by
+        // `ShardedDbPool` requires at least one configured pool. Shard 0
+        // carries one (unreachable), but this test is about shard 1, for
+        // which no pool is configured at all. The router's fan-out is the
+        // union of the pool's shards and its own. So shard 0 is unavoidably
+        // probed too. That classification is covered by
         // `a_peer_shard_whose_connection_cannot_be_acquired_is_classified_as_acquire_timeout`.
         let mut pools = std::collections::BTreeMap::new();
         pools.insert(ShardId::new(0), unreachable_pool());

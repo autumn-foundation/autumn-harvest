@@ -567,20 +567,20 @@ pub const METRIC_EXTERNAL_SIGNAL_SENT: &str = "harvest.workflow.external_signal.
 /// [`METRIC_EXTERNAL_SIGNAL_SENT`]'s cancel twin.
 pub const METRIC_EXTERNAL_CANCEL_SENT: &str = "harvest.workflow.external_cancel.sent";
 
-/// Counter: a by-id fan-out could not inspect every expected shard, so its
-/// answer is `Indeterminate` and the outbox row it was resolving stays
+/// Counter: a by-id fan-out could not inspect every expected shard. Its
+/// answer is `Indeterminate`, and the outbox row it was resolving stays
 /// pending (issue #1307).
 ///
-/// Incremented once per uninspected shard named in the retry outcome that
-/// produced it — a row whose fan-out missed two shards increments this
-/// twice, once per shard. Labels: `shard`, `kind`
+/// Incremented once per uninspected shard named in the retry outcome. A row
+/// whose fan-out missed two shards increments this twice, once per shard.
+/// Labels: `shard`, `kind`
 /// ([`crate::external_target_location::UninspectedReasonKind::as_label`]).
 ///
 /// This is the counter twin of the `"by-id target resolution inconclusive"`
-/// warning both outbox sweeps already log; see
+/// warning both outbox sweeps already log. See
 /// [`METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE`] for the companion
-/// gauge that answers "how long has this been stuck", which a rate on this
-/// counter alone cannot.
+/// gauge that answers "how long has this been stuck". A rate on this counter
+/// alone cannot answer that.
 pub const METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD: &str =
     "harvest.external_signal.by_id_indeterminate_shard";
 
@@ -591,9 +591,9 @@ pub const METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD: &str =
 /// `0` when the sweep left no such row pending, matching
 /// [`METRIC_QUEUE_OLDEST_PENDING_AGE`]'s convention so a drained backlog does
 /// not leave a stale reading behind. Distinguishes "retrying, will resolve"
-/// from "stuck since Tuesday" without requiring an operator to reason about
-/// shard topology — the gap `docs/sharding.md` and the backup-restore runbook
-/// both used to name as open.
+/// from "stuck since Tuesday" without reasoning about shard topology — the
+/// gap `docs/sharding.md` and the backup-restore runbook both used to name
+/// as open.
 pub const METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE: &str =
     "harvest.external_signal.by_id_oldest_pending_indeterminate_age";
 
@@ -607,7 +607,7 @@ pub const METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE: &str =
 /// #1307).
 ///
 /// Distinct from [`METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD`]: that counter
-/// is a stall (the row stays pending), this one is a delivery that went
+/// is a stall, where the row stays pending. This one is a delivery that went
 /// ahead on a partial view. Labelled `shard` (the shard the run was found on)
 /// only, per ADR-0001 §7.
 pub const METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT: &str =
@@ -3309,9 +3309,9 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = age_secs;
     }
 
-    /// A by-id fan-out found a live/terminal run and delivered, but one or
-    /// more expected shards could not be inspected — a silently ambiguous
-    /// success (issue #1307). `shard` is the shard the run was found on.
+    /// A by-id fan-out found a live/terminal run and delivered. One or more
+    /// expected shards could not be inspected — a silently ambiguous success
+    /// (issue #1307). `shard` is the shard the run was found on.
     ///
     /// Maps to the counter [`METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT`].
     fn record_external_by_id_found_over_incomplete_fanout(&self, shard: u16) {
@@ -4642,7 +4642,7 @@ mod tests {
 
     #[test]
     fn by_id_indeterminate_fanout_observability_has_default_noop_impls_and_stable_names() {
-        // Issue #1307: the outbox sweeps couldn't previously distinguish
+        // Issue #1307: the outbox sweeps could not previously distinguish
         // "retrying, will resolve" from "stuck since Tuesday" except by
         // grepping the `by-id target resolution inconclusive` warning.
         let rec = NoOpMetrics;
