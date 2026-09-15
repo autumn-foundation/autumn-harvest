@@ -47,7 +47,7 @@ pub fn run(build: &BuildRequest, opts: &Options) -> crate::Result<Report> {
         emitted.extend(mirs);
         warnings.extend(notes);
     }
-    emitted.extend(driver::collect_mir_paths(&opts.mir_paths));
+    emitted.extend(driver::collect_mir_paths(&opts.mir_paths)?);
     emitted.sort_by(|a, b| a.path.cmp(&b.path));
     emitted.dedup_by(|a, b| a.path == b.path);
 
@@ -110,7 +110,7 @@ pub fn run(build: &BuildRequest, opts: &Options) -> crate::Result<Report> {
         ));
     }
     let parse_failures = parse_failure_boundaries(&docs);
-    let program = resolve::Program::build(docs, &roots)?;
+    let program = resolve::Program::build_with_model(docs, &roots, &model)?;
     let (mut workflows, analysis_warnings) =
         analysis::analyze_with_warnings(&program, &model, &entries);
     warnings.extend(analysis_warnings);
