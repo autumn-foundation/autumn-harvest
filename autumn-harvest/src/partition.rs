@@ -4487,6 +4487,18 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // match. Both sides are re-aggregated through `unnest ...
         // WITH ORDINALITY` first so they share the same (one-based)
         // bounds.
+        //
+        // `i.indoption` is checked too, not just column identity and
+        // order. It carries each key column's sort direction and NULLS
+        // placement, packed as flag bits per column. Phase 2's own
+        // `CREATE UNIQUE INDEX` never specifies `DESC` or `NULLS FIRST`,
+        // so a correctly built index always has every bit zero. An
+        // operator's own index on the same columns, built `DESC`
+        // instead, would otherwise pass this guard as "correctly
+        // shaped". Postgres cannot reuse it as the parent's PK-backing
+        // index on `ATTACH PARTITION`. It builds a real replacement
+        // inside the window this phase promises is metadata-only instead —
+        // the exact failure this guard exists to catch.
         step(
             4,
             format!(
@@ -4497,6 +4509,7 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
                  WHERE ns.nspname = current_schema() AND i.indisvalid\n       \
                  AND i.indrelid = 'harvest_events'::regclass\n       \
                  AND i.indisunique AND i.indpred IS NULL\n       \
+                 AND (SELECT bool_and(opt = 0) FROM unnest(i.indoption::int2[]) AS u(opt))\n       \
                  AND (\n           \
                  (c.relname = '{LEGACY_PARTITION}_pk_idx'\n            \
                  AND (SELECT array_agg(x ORDER BY o) FROM unnest(i.indkey::int2[]) \

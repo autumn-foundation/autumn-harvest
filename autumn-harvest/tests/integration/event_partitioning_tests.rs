@@ -2676,6 +2676,64 @@ async fn phase_4_rejects_a_structurally_incompatible_impostor_index() {
 }
 
 #[tokio::test]
+async fn phase_4_rejects_an_impostor_index_with_the_wrong_sort_order() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // A valid, unique index already holds the name phase 2 would use for
+    // the partition-key index. It has the RIGHT columns but the WRONG
+    // sort order (`id DESC` instead of plain ascending). `CREATE ... IF
+    // NOT EXISTS` in phase 2 finds the name taken and silently skips
+    // building a real one. A guard checking only column identity, not
+    // `indoption`, would count this impostor as ready. Postgres cannot
+    // reuse a DESC-ordered index as the parent's PK-backing index on
+    // ATTACH PARTITION, though.
+    diesel::sql_query("DROP INDEX IF EXISTS harvest_events_legacy_pk_idx")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query(
+        "CREATE UNIQUE INDEX harvest_events_legacy_pk_idx ON harvest_events (id DESC, cohort)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("plant the impostor");
+
+    let mut hit_guard = false;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now()) {
+        if step.phase > 4 {
+            break;
+        }
+        if let Err(e) = diesel::sql_query(&step.sql).execute(&mut conn).await {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("phase 2 left"),
+                "phase 4 must reject the impostor with its own explanatory error naming \
+                 the cause, not fail some other way: {msg}"
+            );
+            hit_guard = true;
+            break;
+        }
+    }
+    assert!(
+        hit_guard,
+        "phase 4's shape guard must fire on a right-column, wrong-sort-order impostor, \
+         rather than letting ATTACH PARTITION build a real replacement inside the \
+         window this phase advertises as metadata-only"
+    );
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut conn)
+        .await
+        .expect("clear the aborted transaction, as the runbook instructs");
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "the guard must fire before anything observable is mutated"
+    );
+}
+
+#[tokio::test]
 async fn an_append_racing_the_execution_delete_cannot_commit_an_orphan() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
