@@ -63,7 +63,7 @@ instead.
 `crate_name_from_stem` used `is_ascii_alphanumeric()` where the
 artifact-path helpers already required `is_ascii_hexdigit()`; a hand-supplied
 `--mir` file such as `payments-workflows.mir` had `workflows` treated as
-rustc's metadata hash. All three call sites now share one `is_metadata_hash`
+rustc's metadata hash. All four call sites now share one `is_metadata_hash`
 predicate.
 
 **9. Opaque `-p` package specs are resolved via `cargo pkgid`, not accepted
@@ -73,6 +73,23 @@ fall back to accepting artifacts from any workspace member — letting a
 dependency's workflows through whenever the selected package had none of its
 own. Such a SPEC is now resolved to its exact package id via `cargo pkgid`;
 an unresolvable one is a hard error, never "every package".
+
+**10. Two soundness/precision bugs in this pass's own fixes, found by a
+follow-up review and fixed the same way — RED fixture first (P1).**
+
+- Item 1's dominance filter used plain (reflexive) dominance. Every block
+  dominates itself, so a read in the sanitizer's *own* block was treated
+  as post-kill even when it ran, as a plain statement, before the
+  sanitizer's own terminator. `killed_kinds_at` now requires **strict**
+  dominance (`kill_at != at`): a kill can only apply to a read in a
+  block genuinely reached only through it.
+- Item 6's `fn_item_resolution` candidate guard rejected only
+  brace/quote-leading and whitespace-containing text. A bare `true`,
+  `false`, byte-string (`b"..."`), or C-string (`c"..."`) literal
+  argument to *any* resolved-body call starts with a plain letter and
+  contains no whitespace, so it passed as a callee path candidate and
+  raised a spurious `external-crate-body` boundary. The guard now also
+  rejects a quote anywhere in the candidate and the two boolean literals.
 
 **Also in this pass:** `Allowlist` gained `#[serde(deny_unknown_fields)]`
 (the model structs already had it); the R&D report's boundary table and

@@ -316,13 +316,12 @@ fn an_overlay_trusted_crate_is_honored_by_resolve_call() {
 
     let overlay = Model::from_toml("[[trusted]]\nname = \"some_crate\"\nreason = \"test\"\n")
         .expect("overlay parses");
-    let merged = Model::builtin().expect("builtin model").merged_with(overlay);
-    let with_overlay = Program::build_with_model(
-        vec![parse_fixture("spike.mir")],
-        &fixture_roots(),
-        &merged,
-    )
-    .unwrap();
+    let merged = Model::builtin()
+        .expect("builtin model")
+        .merged_with(overlay);
+    let with_overlay =
+        Program::build_with_model(vec![parse_fixture("spike.mir")], &fixture_roots(), &merged)
+            .unwrap();
     assert_eq!(
         with_overlay.resolve_call("wf::{closure#0}", "some_crate::never_emitted"),
         Resolution::External("some_crate::never_emitted".to_string()),

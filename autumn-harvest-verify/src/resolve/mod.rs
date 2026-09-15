@@ -38,6 +38,7 @@ mod subst;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use crate::Model;
 use crate::mir::ast::{Body, Local, MirDoc, Operand, Statement, StaticItem, Terminator};
 use crate::model::callee::{CalleePath, TypeName};
 use crate::util::{
@@ -45,7 +46,6 @@ use crate::util::{
     segments, split_last, split_top_trim, strip_generics_everywhere,
 };
 use crate::verdict::BoundaryKind;
-use crate::Model;
 
 pub use impls::ImplHeader;
 pub use subst::Substitution;
@@ -276,7 +276,11 @@ impl Program {
         Ok(Self::build_with_trusted(docs, sources, trusted))
     }
 
-    fn build_with_trusted(docs: Vec<MirDoc>, sources: &SourceRoots, trusted_crates: BTreeSet<String>) -> Self {
+    fn build_with_trusted(
+        docs: Vec<MirDoc>,
+        sources: &SourceRoots,
+        trusted_crates: BTreeSet<String>,
+    ) -> Self {
         let mut program = Self {
             docs,
             trusted_crates,

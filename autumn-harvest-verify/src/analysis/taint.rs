@@ -207,8 +207,11 @@ impl TaintSet {
 /// **terminator**. Two calls in sequence — the sink
 /// `ctx.execute_activity_raw(.., keys.clone())` and the later
 /// `keys.sort()` — therefore never share a block. A read's own block
-/// pins it to one side of the kill or the other. Block-level dominance is
-/// enough, with no statement position needed within a block.
+/// pins it to one side of the kill or the other, for any read in a
+/// *different* block. A read in the sanitizer's own block is a third
+/// case: it always ran before the sanitizer's terminator, so it is never
+/// killed. [`TaintState::killed_kinds_at`] uses strict dominance to keep
+/// that case separate from the "read strictly after" case.
 type Kill = (Place, TaintKind, String);
 
 /// The taint of every place in one body, plus its aliases and sanitizer kills.
@@ -297,19 +300,32 @@ impl TaintState {
     }
 
     /// Which kinds are killed for `place`, as observed from `at`. A kill
-    /// applies only when its own block **dominates** `at`, i.e. every path
-    /// from the entry to `at` passes through the sanitizer call. A read
-    /// whose block the kill does not dominate happens on a path that could
-    /// not have gone through the sanitizer yet, or at all. It must keep
-    /// seeing the pre-sanitizer taint.
-    fn killed_kinds_at(&self, place: &Place, at: usize, graph: &ControlGraph) -> BTreeSet<TaintKind> {
+    /// applies only when its own block **strictly dominates** `at`. That
+    /// means every path from the entry to `at` passes through the
+    /// sanitizer call, and `at` is not that same block. A read whose block
+    /// the kill does not strictly dominate happens on a path that could
+    /// not have gone through the sanitizer yet. Such a path might never
+    /// reach the sanitizer at all. It must keep seeing the pre-sanitizer
+    /// taint.
+    ///
+    /// Strictness matters for a read in the sanitizer's *own* block. A
+    /// sanitizer call is always a block terminator, so every statement in
+    /// that block runs before it. Plain dominance cannot see that
+    /// ordering. Every block dominates itself, so it would treat such a
+    /// read as already killed even though it ran first.
+    fn killed_kinds_at(
+        &self,
+        place: &Place,
+        at: usize,
+        graph: &ControlGraph,
+    ) -> BTreeSet<TaintKind> {
         self.kills
             .iter()
             .filter(|(p, _, block)| {
                 covers(p, place)
                     && graph
                         .index_of(block)
-                        .is_some_and(|kill_at| graph.dominates(kill_at, at))
+                        .is_some_and(|kill_at| kill_at != at && graph.dominates(kill_at, at))
             })
             .map(|(_, k, _)| *k)
             .collect()
@@ -356,7 +372,11 @@ impl TaintState {
             return raw;
         };
         let killed = self.killed_kinds_at(&self.canonical(place), at, graph);
-        if killed.is_empty() { raw } else { raw.without(&killed) }
+        if killed.is_empty() {
+            raw
+        } else {
+            raw.without(&killed)
+        }
     }
 
     /// Taint of every place rooted at `local` (how an out-parameter is read
@@ -385,7 +405,11 @@ impl TaintState {
             projections: Vec::new(),
         };
         let killed = self.killed_kinds_at(&root, at, graph);
-        if killed.is_empty() { raw } else { raw.without(&killed) }
+        if killed.is_empty() {
+            raw
+        } else {
+            raw.without(&killed)
+        }
     }
 
     /// Add `set` to `place`; `true` when anything new landed.
@@ -537,15 +561,22 @@ mod tests {
         let graph = chain_graph();
 
         assert!(
-            !state.read_at(&place(2, &[]), false, "bb0", &graph).is_empty(),
+            !state
+                .read_at(&place(2, &[]), false, "bb0", &graph)
+                .is_empty(),
             "bb0 runs before bb1 (the sanitizer); it must still see the taint"
         );
         assert!(
-            state.read_at(&place(2, &[]), false, "bb1", &graph).is_empty(),
-            "a read in the sanitizer's own block is dominated by it"
+            !state
+                .read_at(&place(2, &[]), false, "bb1", &graph)
+                .is_empty(),
+            "a read in the sanitizer's own block runs before its terminator; \
+             the kill must not reach backwards inside its own block"
         );
         assert!(
-            state.read_at(&place(2, &[]), false, "bb2", &graph).is_empty(),
+            state
+                .read_at(&place(2, &[]), false, "bb2", &graph)
+                .is_empty(),
             "bb2 runs only after bb1, which dominates it: the read is clean"
         );
         assert!(
@@ -573,7 +604,13 @@ mod tests {
              because another kind's slots are full"
         );
         assert!(set.has(TaintKind::Value));
-        assert_eq!(set.facts().iter().filter(|f| f.kind == TaintKind::Order).count(), MAX_FACTS);
+        assert_eq!(
+            set.facts()
+                .iter()
+                .filter(|f| f.kind == TaintKind::Order)
+                .count(),
+            MAX_FACTS
+        );
     }
 
     #[test]

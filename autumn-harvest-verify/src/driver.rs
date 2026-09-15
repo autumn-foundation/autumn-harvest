@@ -342,8 +342,10 @@ impl PackageSpec {
 
     /// Does this spec select the metadata package `(name, version)`?
     ///
-    /// A spec whose name could not be read matches everything: cargo decides
-    /// which package it meant, and the run has already warned about it.
+    /// A spec whose name could not be read matches everything. This is a
+    /// defensive default, not a reachable path from [`package_ids`]:
+    /// `package_ids` resolves a name-less spec through `cargo pkgid` and
+    /// returns before ever calling this method.
     fn matches(&self, name: Option<&str>, version: Option<&str>) -> bool {
         let Some(mine) = self.name.as_deref() else {
             return true;
@@ -1438,9 +1440,10 @@ fn purge_fingerprints(
         };
         for entry in entries.filter_map(Result::ok) {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let matches = prefixes
-                .iter()
-                .any(|prefix| name.strip_prefix(prefix.as_str()).is_some_and(is_metadata_hash));
+            let matches = prefixes.iter().any(|prefix| {
+                name.strip_prefix(prefix.as_str())
+                    .is_some_and(is_metadata_hash)
+            });
             if matches {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
@@ -2287,7 +2290,11 @@ mod tests {
         // workspace, where `cargo pkgid` resolves the spec to this crate's
         // own package id.
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let spec_text = format!("path+file://{}#{}", dir.display(), env!("CARGO_PKG_VERSION"));
+        let spec_text = format!(
+            "path+file://{}#{}",
+            dir.display(),
+            env!("CARGO_PKG_VERSION")
+        );
         let parsed = parse_package_spec(&spec_text);
         assert_eq!(
             parsed.name, None,

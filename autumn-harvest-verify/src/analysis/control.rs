@@ -334,7 +334,11 @@ fn dominance(successors: &[Vec<usize>], reachable: &[bool]) -> Vec<Vec<bool>> {
     let mut out = vec![vec![false; count]; count];
     for b in 0..count {
         for a in 0..count {
-            let holds = dom.get(b).and_then(|row| row.get(a)).copied().unwrap_or(false)
+            let holds = dom
+                .get(b)
+                .and_then(|row| row.get(a))
+                .copied()
+                .unwrap_or(false)
                 && reachable.get(a).copied().unwrap_or(false)
                 && reachable.get(b).copied().unwrap_or(false);
             if let Some(cell) = out.get_mut(a).and_then(|row| row.get_mut(b)) {
@@ -488,9 +492,15 @@ mod tests {
             graph.index_of("bb1").expect("bb1"),
             graph.index_of("bb2").expect("bb2"),
         );
-        assert!(graph.dominates(entry, arm), "the entry dominates every block");
+        assert!(
+            graph.dominates(entry, arm),
+            "the entry dominates every block"
+        );
         assert!(graph.dominates(entry, join));
-        assert!(graph.dominates(entry, entry), "every block dominates itself");
+        assert!(
+            graph.dominates(entry, entry),
+            "every block dominates itself"
+        );
         assert!(
             !graph.dominates(arm, join),
             "the join is also reached directly from bb0, so bb1 does not dominate it"

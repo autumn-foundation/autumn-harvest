@@ -49,7 +49,12 @@ const MAX_IMPLICIT_PASSES: u32 = 8;
 /// Taint of reading one operand, from `frame.block` — flow-sensitive to any
 /// sanitizer kill that block dominates ([`TaintState::read_at`]). `discriminant`
 /// restricts the read to the place and its ancestors (see [`super::taint`]).
-fn read_operand(frame: Frame<'_>, operand: &Operand, state: &TaintState, discriminant: bool) -> TaintSet {
+fn read_operand(
+    frame: Frame<'_>,
+    operand: &Operand,
+    state: &TaintState,
+    discriminant: bool,
+) -> TaintSet {
     match operand {
         Operand::Copy(place) | Operand::Move(place) => {
             state.read_at(place, discriminant, &frame.block.label, frame.graph)
@@ -479,7 +484,12 @@ impl<'a> Analyzer<'a> {
     /// The return value and every written `&mut` out-parameter, from the
     /// converged state — each read at every live return block
     /// ([`read_at_every_return`]).
-    fn build_outcome(body: &Body, state: &TaintState, graph: &ControlGraph, has_sink: bool) -> BodyOutcome {
+    fn build_outcome(
+        body: &Body,
+        state: &TaintState,
+        graph: &ControlGraph,
+        has_sink: bool,
+    ) -> BodyOutcome {
         let mut outcome = BodyOutcome {
             ret: read_at_every_return(
                 state,
@@ -747,7 +757,15 @@ impl<'a> Analyzer<'a> {
         if let Some(rule) = site.source()
             && self.bare_row_applies(frame, &site.printed, &rule.path, rule.receiver.as_deref())
         {
-            return self.transfer_source(frame, call, rule, &site.printed, &arg_taints, state, emit);
+            return self.transfer_source(
+                frame,
+                call,
+                rule,
+                &site.printed,
+                &arg_taints,
+                state,
+                emit,
+            );
         }
 
         if let Some(rule) = site.sanitizer() {
@@ -1006,7 +1024,14 @@ impl<'a> Analyzer<'a> {
             state,
             Some(&outcome),
         );
-        self.descend_closures(frame, call, arg_taints, state, &BTreeSet::new(), report.is_some());
+        self.descend_closures(
+            frame,
+            call,
+            arg_taints,
+            state,
+            &BTreeSet::new(),
+            report.is_some(),
+        );
         if outcome.has_sink
             && let Some(report) = report
         {
@@ -1204,7 +1229,8 @@ impl<'a> Analyzer<'a> {
     /// observed call — a function passed by value is not itself a call site.
     fn is_trusted_bodyless_path(&self, printed: &str, parsed: &CalleePath) -> bool {
         self.model.is_std_free_fn(parsed)
-            || path_roots(&callee_owner_text(printed, parsed)).any(|root| self.is_trusted_root(root))
+            || path_roots(&callee_owner_text(printed, parsed))
+                .any(|root| self.is_trusted_root(root))
     }
 
     /// Factor (2) of [`Self::is_trusted_bodyless`]: trust read off the
@@ -1512,7 +1538,13 @@ impl<'a> Analyzer<'a> {
     ///
     /// Contributes directly to `out` rather than returning a target to invoke:
     /// there is no body to seed and analyze, only a callee path to classify.
-    fn fn_item_callback(&mut self, frame: Frame<'_>, operand: &Operand, out: &mut TaintSet, emit: bool) {
+    fn fn_item_callback(
+        &mut self,
+        frame: Frame<'_>,
+        operand: &Operand,
+        out: &mut TaintSet,
+        emit: bool,
+    ) {
         let Some((printed, resolution)) = self.fn_item_resolution(frame, operand) else {
             return;
         };
@@ -1537,7 +1569,10 @@ impl<'a> Analyzer<'a> {
             let mut hops = frame.hops.to_vec();
             hops.push(Hop {
                 function: frame.path.to_string(),
-                step: format!("invokes fn item {printed} ({})", first_sentence(&rule.reason)),
+                step: format!(
+                    "invokes fn item {printed} ({})",
+                    first_sentence(&rule.reason)
+                ),
             });
             out.insert(Fact {
                 kind: rule.kind,
@@ -1637,7 +1672,11 @@ impl<'a> Analyzer<'a> {
     /// `{closure@..}` span, so the closure path never sees it — yet
     /// `.map(Uuid::new_v4)`, `.unwrap_or_else(Instant::now)` and
     /// `.or_insert_with(SystemTime::now)` are all this shape.
-    fn fn_item_resolution(&self, frame: Frame<'_>, operand: &Operand) -> Option<(String, Resolution)> {
+    fn fn_item_resolution(
+        &self,
+        frame: Frame<'_>,
+        operand: &Operand,
+    ) -> Option<(String, Resolution)> {
         let candidate = match operand {
             Operand::Const { text, .. } => {
                 // `Operand::Const::text` is the whole printed operand,
@@ -1654,7 +1693,10 @@ impl<'a> Analyzer<'a> {
                 // for one.
                 let text = frame.subst.apply(text);
                 let trimmed = text.trim();
-                trimmed.strip_prefix("const ").unwrap_or(trimmed).to_string()
+                trimmed
+                    .strip_prefix("const ")
+                    .unwrap_or(trimmed)
+                    .to_string()
             }
             Operand::Copy(place) | Operand::Move(place) => {
                 let declared = frame.body.locals.get(&place.local)?;
@@ -1669,10 +1711,17 @@ impl<'a> Analyzer<'a> {
         // of tick()}`, a coroutine's own future-object type, extracts as
         // "async fn body of tick()" and would otherwise pass every other
         // check here.
+        //
+        // A real path or fn-item name never contains a quote either. `true`,
+        // `false`, and the byte-string and C-string literal forms
+        // (`b"..."`, `c"..."`, `br"..."`, `cr"..."`) all start with a plain
+        // letter. They would otherwise pass the checks above.
         if candidate.is_empty()
             || !candidate.starts_with(is_path_start)
             || candidate.starts_with(['{', '"', '\''])
             || candidate.contains(char::is_whitespace)
+            || candidate.contains('"')
+            || matches!(candidate, "true" | "false")
         {
             return None;
         }
@@ -2088,8 +2137,9 @@ impl<'a> Analyzer<'a> {
     }
 }
 
-/// `fn(u64) -> u64 {add_clock}` → `add_clock`; a plain path is returned as-is
-/// by the caller.
+/// `fn(u64) -> u64 {add_clock}` → `add_clock`. `None` when `ty` has no
+/// bracketed fn-item form. The plain-path case is handled separately, by
+/// the `Operand::Const` arm of [`Analyzer::fn_item_resolution`] above.
 fn fn_item_path(ty: &str) -> Option<String> {
     let at = ty.rfind('{')?;
     let rest = ty.get(at.saturating_add(1)..)?;
@@ -2204,24 +2254,39 @@ fn read_at_every_return(
         if !matches!(block.terminator, Terminator::Return) {
             continue;
         }
-        if graph.index_of(&block.label).is_none_or(|at| !graph.is_live(at)) {
+        if graph
+            .index_of(&block.label)
+            .is_none_or(|at| !graph.is_live(at))
+        {
             continue;
         }
         any = true;
         out.absorb(&state.read_at(place, discriminant, &block.label, graph));
     }
-    if any { out } else { state.read(place, discriminant) }
+    if any {
+        out
+    } else {
+        state.read(place, discriminant)
+    }
 }
 
 /// [`read_at_every_return`] for [`TaintState::read_root`] (an out-parameter).
-fn read_root_at_every_return(state: &TaintState, body: &Body, graph: &ControlGraph, local: Local) -> TaintSet {
+fn read_root_at_every_return(
+    state: &TaintState,
+    body: &Body,
+    graph: &ControlGraph,
+    local: Local,
+) -> TaintSet {
     let mut out = TaintSet::new();
     let mut any = false;
     for block in &body.blocks {
         if !matches!(block.terminator, Terminator::Return) {
             continue;
         }
-        if graph.index_of(&block.label).is_none_or(|at| !graph.is_live(at)) {
+        if graph
+            .index_of(&block.label)
+            .is_none_or(|at| !graph.is_live(at))
+        {
             continue;
         }
         any = true;
@@ -2252,7 +2317,12 @@ fn read_root_at_every_return(state: &TaintState, body: &Body, graph: &ControlGra
 ///
 /// Returns `true` when anything new landed, so the caller can iterate: a
 /// control-derived value can itself decide a later branch.
-fn implicit_flow(frame: Frame<'_>, body: &Body, graph: &ControlGraph, state: &mut TaintState) -> bool {
+fn implicit_flow(
+    frame: Frame<'_>,
+    body: &Body,
+    graph: &ControlGraph,
+    state: &mut TaintState,
+) -> bool {
     let branches = tainted_branches(body, state, graph);
     if branches.is_empty() {
         return false;

@@ -1281,7 +1281,11 @@ fn an_unconverged_fixpoint_is_a_named_boundary_never_a_silent_partial_answer() {
 fn order_body(name: &str, read_first: bool) -> String {
     let sink = "_0 = WorkflowContext::execute_activity_raw(move _1, move _3)";
     let sort = "_3 = Vec::<String>::sort(move _3)";
-    let (first, second) = if read_first { (sink, sort) } else { (sort, sink) };
+    let (first, second) = if read_first {
+        (sink, sort)
+    } else {
+        (sort, sink)
+    };
     format!(
         "fn {name}(_1: &WorkflowContext) -> u64 {{\n\
         \x20   let mut _0: u64;\n\
@@ -1337,6 +1341,59 @@ fn a_value_read_after_the_sanitizer_is_clean() {
         findings.is_empty(),
         "the sink reads the HashMap keys only after `sort()` has run on every \
          path that reaches it; findings = {findings:#?}"
+    );
+}
+
+/// One function. A plain statement copies the HashMap keys into `_4`.
+/// Then `sort()` runs as that same block's terminator. A later block
+/// feeds `_4` to the sink. The copy and the sort share a block. A method
+/// call is always a MIR block terminator, so the copy always runs first.
+fn same_block_order_body(name: &str) -> String {
+    format!(
+        "fn {name}(_1: &WorkflowContext) -> u64 {{\n\
+        \x20   let mut _0: u64;\n\
+        \x20   let _2: HashMap<String, u64>;\n\
+        \x20   let _3: Vec<String>;\n\
+        \x20   let _4: Vec<String>;\n\n\
+        \x20   bb0: {{\n\
+        \x20       _2 = HashMap::<String, u64>::new() -> [return: bb1, unwind continue];\n\
+        \x20   }}\n\n\
+        \x20   bb1: {{\n\
+        \x20       _3 = HashMap::<String, u64>::keys(move _2) -> [return: bb2, unwind continue];\n\
+        \x20   }}\n\n\
+        \x20   bb2: {{\n\
+        \x20       _4 = copy _3;\n\
+        \x20       _3 = Vec::<String>::sort(move _3) -> [return: bb3, unwind continue];\n\
+        \x20   }}\n\n\
+        \x20   bb3: {{\n\
+        \x20       _0 = WorkflowContext::execute_activity_raw(move _1, move _4) -> [return: bb4, unwind continue];\n\
+        \x20   }}\n\n\
+        \x20   bb4: {{\n\
+        \x20       return;\n\
+        \x20   }}\n}}\n"
+    )
+}
+
+#[test]
+fn a_value_read_in_the_sanitizers_own_block_before_the_call_keeps_its_taint() {
+    let name = "wf_read_in_sanitizer_block";
+    let text = same_block_order_body(name);
+    let doc = mir::parse("fixture", "generated.mir", &text);
+    let program = Program::build(vec![doc], &SourceRoots::default()).expect("build");
+    let m = model();
+    let mut analyzer = Analyzer::new(&program, &m);
+    analyzer.analyze_body(
+        name,
+        &autumn_harvest_verify::resolve::Substitution::new(),
+        &[],
+        &[],
+    );
+    assert!(
+        !analyzer.findings.is_empty(),
+        "the copy at `_4 = copy _3` runs before `sort()`'s own terminator in \
+         the same block; a kill must never reach backwards inside its own \
+         block; findings = {:#?}",
+        analyzer.findings
     );
 }
 
@@ -1434,5 +1491,58 @@ fn a_closure_argument_with_no_body_in_the_analyzed_set_is_a_boundary() {
             .any(|b| b.kind == BoundaryKind::UnresolvedCallback),
         "a closure argument whose body is absent from the analyzed set must \
          raise `unresolved-callback`; boundaries = {boundaries:?}"
+    );
+}
+
+// ── Issue #1296 P2: a bare literal argument is never a fn-item candidate ───
+
+/// `helper` is a fully analyzed, deterministic body. `wf_const_bool_arg`
+/// calls it with a plain `bool` constant alongside its real argument.
+/// Every argument of a resolved-body call is scanned for a fn-item
+/// candidate, so the literal must not be misread as one.
+fn resolved_call_with_const_arg(literal: &str) -> String {
+    format!(
+        "fn helper(_1: u64, _2: bool) -> u64 {{\n\
+        \x20   let mut _0: u64;\n\n\
+        \x20   bb0: {{\n\
+        \x20       _0 = copy _1;\n\
+        \x20       return;\n\
+        \x20   }}\n}}\n\n\
+        fn wf_const_arg(_1: &WorkflowContext, _2: u64) -> u64 {{\n\
+        \x20   let mut _0: u64;\n\
+        \x20   let _3: u64;\n\n\
+        \x20   bb0: {{\n\
+        \x20       _3 = helper(move _2, {literal}) -> [return: bb1, unwind continue];\n\
+        \x20   }}\n\n\
+        \x20   bb1: {{\n\
+        \x20       _0 = WorkflowContext::execute_activity_raw(move _1, move _3) -> [return: bb2, unwind continue];\n\
+        \x20   }}\n\n\
+        \x20   bb2: {{\n\
+        \x20       return;\n\
+        \x20   }}\n}}\n"
+    )
+}
+
+#[test]
+fn a_bool_literal_argument_is_never_read_as_a_fn_item_path() {
+    let text = resolved_call_with_const_arg("const true");
+    let (boundaries, findings) = analyze_generated(&text, "wf_const_arg");
+    assert!(
+        boundaries.is_empty() && findings.is_empty(),
+        "`const true` is a bool literal, not a callable path; it must not \
+         raise `external-crate-body`; boundaries = {boundaries:?}, \
+         findings = {findings:?}"
+    );
+}
+
+#[test]
+fn a_byte_string_literal_argument_is_never_read_as_a_fn_item_path() {
+    let text = resolved_call_with_const_arg("const b\"x\"");
+    let (boundaries, findings) = analyze_generated(&text, "wf_const_arg");
+    assert!(
+        boundaries.is_empty() && findings.is_empty(),
+        "`const b\"x\"` is a byte-string literal, not a callable path; it \
+         must not raise `external-crate-body`; boundaries = {boundaries:?}, \
+         findings = {findings:?}"
     );
 }
