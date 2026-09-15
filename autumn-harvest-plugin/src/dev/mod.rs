@@ -65,8 +65,8 @@ pub use discovery::{
 };
 use postgres::refuse_to_run_as_root;
 pub use postgres::{
-    EphemeralPostgres, MAX_UNIX_SOCKET_PATH_LEN, ephemeral_dsn, postgres_conf_lines,
-    running_as_root, unix_socket_path_len, write_private_atomic,
+    EphemeralPostgres, MAX_UNIX_SOCKET_PATH_LEN, ephemeral_dsn, escape_conf_string,
+    postgres_conf_lines, running_as_root, unix_socket_path_len, write_private_atomic,
 };
 #[cfg(target_os = "linux")]
 pub use reaper::parse_proc_status_uid;
@@ -489,8 +489,7 @@ impl DevRuntime {
             // cluster with it — and if it could not, say so rather than
             // reporting only the readiness failure.
             if let Err(teardown) = runtime.shutdown().await {
-                tracing::error!(%teardown, "dev runtime: storage was left behind");
-                eprintln!("harvest-dev: storage was left behind: {teardown}");
+                report_leaked_teardown(&teardown);
             }
             return Err(error);
         }
@@ -771,15 +770,39 @@ async fn resolve_binaries() -> Result<PostgresBinaries, DevError> {
 /// `take()` into a local first: holding the guard across the awaited shutdown is
 /// the classic deadlock shape, and the `on_shutdown` hook contends for this very
 /// lock. The error is passed through so callers read as `return Err(...)`.
+///
+/// The start error stays the one returned — it is the cause. But a teardown
+/// failure on top of it must not be silent (issue #1299). The caller sees
+/// only `error`, so a lost cluster with no report of it would be invisible.
 async fn abandon_cluster(
     postgres: &Arc<Mutex<Option<EphemeralPostgres>>>,
     error: DevError,
 ) -> DevError {
     let taken = postgres.lock().await.take();
-    if let Some(postgres) = taken {
-        postgres.shutdown().await.ok();
+    if let Some(postgres) = taken
+        && let Err(teardown) = postgres.shutdown().await
+    {
+        report_leaked_teardown(&teardown);
     }
     error
+}
+
+/// Report a teardown failure so a leaked cluster is never silent.
+///
+/// Shared by every path that gives up on an already-started cluster:
+/// [`abandon_cluster`], and the readiness-failure path in
+/// [`DevRuntime::start`]. The two cannot drift apart again (issue #1299).
+fn report_leaked_teardown(error: &DevError) {
+    tracing::error!(%error, "dev runtime: storage was left behind");
+    eprintln!("{}", leaked_teardown_message(error));
+}
+
+/// The stderr line [`report_leaked_teardown`] prints.
+///
+/// Split out so its wording is a plain, testable function rather than
+/// something only observable by capturing process output.
+fn leaked_teardown_message(error: &DevError) -> String {
+    format!("harvest-dev: storage was left behind: {error}")
 }
 
 /// Refuse to start if ambient Harvest configuration selects `split`/`external`
@@ -1178,5 +1201,27 @@ mod server_panic_tests {
         let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
 
         assert_eq!(panic_payload_message(&*payload), "boom");
+    }
+}
+
+#[cfg(test)]
+mod leaked_teardown_tests {
+    //! Issue #1299. `abandon_cluster` used to discard a teardown failure with
+    //! `.ok()`, unlike the readiness-failure path in `DevRuntime::start`. Both
+    //! now share `report_leaked_teardown`; this pins the message it prints.
+
+    use super::{DevError, leaked_teardown_message};
+
+    #[test]
+    fn the_message_names_the_teardown_failure() {
+        let error = DevError::StopUnconfirmed { pid: 4243 };
+
+        let message = leaked_teardown_message(&error);
+
+        assert!(
+            message.starts_with("harvest-dev: storage was left behind: "),
+            "{message}"
+        );
+        assert!(message.contains("4243"), "{message}");
     }
 }

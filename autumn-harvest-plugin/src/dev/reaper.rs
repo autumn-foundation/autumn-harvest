@@ -390,12 +390,20 @@ fn reap_one_session(
         owner_is_the_recorded_one(&record),
         postmaster,
         self_pid,
+        chrono::Utc::now(),
     );
     match decision {
         ReapDecision::Skip(SkipReason::PostmasterIdentityUnknown) => {
             tracing::warn!(
                 path = %dir.display(),
                 "dev runtime: leaving a session whose postmaster identity cannot be confirmed"
+            );
+            return false;
+        }
+        ReapDecision::Skip(SkipReason::PossiblyStillStarting) => {
+            tracing::debug!(
+                path = %dir.display(),
+                "dev runtime: leaving a recent session whose postmaster may still be starting"
             );
             return false;
         }
