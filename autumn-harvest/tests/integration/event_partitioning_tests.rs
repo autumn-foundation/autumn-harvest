@@ -5085,6 +5085,60 @@ async fn enable_refuses_a_unique_index_with_cohort_only_as_an_include_column() {
 }
 
 #[tokio::test]
+async fn enable_refuses_a_constraint_backed_unique_index_without_cohort() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // An operator's own UNIQUE CONSTRAINT, not a bare index. The guard used
+    // to exclude every constraint-backed index unconditionally, meaning to
+    // avoid re-flagging the engine's own pkey and (workflow_exec_id,
+    // event_id) constraints. That also hid an operator's own constraint.
+    // `CREATE TABLE ... (LIKE ...)` has no INCLUDING CONSTRAINTS option, so
+    // conversion would silently drop it rather than refuse or replay it.
+    // The uniqueness it enforced would then stop being checked, with no
+    // error at all.
+    diesel::sql_query(
+        "ALTER TABLE harvest_events DROP CONSTRAINT IF EXISTS harvest_events_wf_only_uq",
+    )
+    .execute(&mut conn)
+    .await
+    .ok();
+    diesel::sql_query(
+        "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_wf_only_uq \
+         UNIQUE (workflow_exec_id)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("plant an operator's own unique constraint missing the partition key");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "a constraint-backed unique index missing cohort must be refused exactly like \
+             a bare one, not silently dropped by the conversion",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("harvest_events_wf_only_uq") && msg.contains("cohort"),
+        "the message must name the offending constraint and explain what is missing: {msg}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "refusing before mutating: the table must still be the ordinary, unpartitioned one"
+    );
+
+    diesel::sql_query("ALTER TABLE harvest_events DROP CONSTRAINT harvest_events_wf_only_uq")
+        .execute(&mut conn)
+        .await
+        .ok();
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enabling must succeed once the operator's constraint is gone");
+}
+
+#[tokio::test]
 async fn enable_refuses_a_dependent_view() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
@@ -6518,4 +6572,85 @@ async fn converting_refuses_to_drop_the_row_security_it_cannot_carry() {
     partition::enable_partitioning(&mut conn, &EnableOptions::default())
         .await
         .expect("conversion must proceed once the row security is gone");
+}
+
+#[tokio::test]
+async fn disabling_refuses_row_security_configured_on_a_leaf_partition_only() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // At least one row, so `enable_partitioning` attaches `LEGACY_PARTITION`
+    // instead of dropping it as empty — the leaf this test needs to exist.
+    let seed = insert_execution(&mut conn, "rls_leaf_wf", "rls-leaf", Utc::now(), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(seed),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed");
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // RLS is per-relation, not inherited from the parent. Set directly on
+    // one leaf partition, never on `harvest_events` itself: a guard that
+    // checks only the parent's own `pg_class`/`pg_policy` rows would find
+    // nothing here. `disable_partitioning`'s revert then drops the whole
+    // partition tree with CASCADE, silently destroying this leaf's policy
+    // along with it.
+    diesel::sql_query(format!(
+        "ALTER TABLE {} ENABLE ROW LEVEL SECURITY",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("enable RLS on the leaf");
+    diesel::sql_query(format!(
+        "CREATE POLICY harvest_events_legacy_tenant ON {} \
+         USING (workflow_exec_id IS NOT NULL)",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("create policy on the leaf");
+
+    let err = partition::disable_partitioning(&mut conn)
+        .await
+        .expect_err(
+            "row security configured on a leaf partition alone must still refuse the \
+             revert, not let CASCADE silently destroy it",
+        )
+        .to_string();
+    assert!(
+        err.contains("harvest_events_legacy_tenant"),
+        "the refusal must name the policy found on the leaf: {err}"
+    );
+    assert!(
+        partition::detect_layout(&mut conn)
+            .await
+            .expect("layout")
+            .is_partitioned(),
+        "the refusal must come before anything mutates"
+    );
+
+    diesel::sql_query(format!(
+        "DROP POLICY harvest_events_legacy_tenant ON {}",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop policy");
+    diesel::sql_query(format!(
+        "ALTER TABLE {} DISABLE ROW LEVEL SECURITY",
+        partition::LEGACY_PARTITION
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("disable RLS");
+    partition::disable_partitioning(&mut conn)
+        .await
+        .expect("revert must proceed once the leaf's row security is gone");
 }

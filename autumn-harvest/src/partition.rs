@@ -1199,6 +1199,15 @@ pub async fn incompatible_publications(conn: &mut AsyncPgConnection) -> HarvestR
 /// is itself an exposure, so this reports what it found and leaves the decision
 /// with the operator, exactly as the publication guard does.
 ///
+/// Both catalog queries check `harvest_events`'s leaf partitions too, not
+/// just the parent — matching [`dependent_views`] and
+/// [`user_defined_triggers`]. On the `disable_partitioning` path
+/// `harvest_events` is the partitioned parent, and RLS is per-relation.
+/// `ENABLE ROW LEVEL SECURITY` or a `CREATE POLICY` can be set directly on
+/// one leaf, independent of the parent. A parent-only check would miss it,
+/// and the later revert drops the whole partition tree with `CASCADE`,
+/// silently destroying that leaf's policies along with it.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] if either catalog query fails.
@@ -1211,15 +1220,33 @@ pub async fn row_security_config(
         "SELECT COALESCE(bool_or(c.relrowsecurity OR c.relforcerowsecurity), false) AS v
            FROM pg_class c
            JOIN pg_namespace n ON n.oid = c.relnamespace
-          WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()",
+          WHERE n.nspname = current_schema()
+            AND (
+              c.relname = 'harvest_events'
+              OR c.oid IN (
+                   SELECT i.inhrelid FROM pg_inherits i
+                     JOIN pg_class p ON p.oid = i.inhparent
+                     JOIN pg_namespace pn ON pn.oid = p.relnamespace
+                    WHERE p.relname = 'harvest_events' AND pn.nspname = current_schema()
+                 )
+            )",
     )
     .await?;
     let policies = diesel::sql_query(
-        "SELECT p.polname AS v
+        "SELECT DISTINCT p.polname AS v
            FROM pg_policy p
            JOIN pg_class c ON c.oid = p.polrelid
            JOIN pg_namespace n ON n.oid = c.relnamespace
-          WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
+          WHERE n.nspname = current_schema()
+            AND (
+              c.relname = 'harvest_events'
+              OR c.oid IN (
+                   SELECT i.inhrelid FROM pg_inherits i
+                     JOIN pg_class p ON p.oid = i.inhparent
+                     JOIN pg_namespace pn ON pn.oid = p.relnamespace
+                    WHERE p.relname = 'harvest_events' AND pn.nspname = current_schema()
+                 )
+            )
           ORDER BY 1",
     )
     .load::<TextRow>(conn)
@@ -1421,6 +1448,14 @@ async fn refuse_if_user_triggers(conn: &mut AsyncPgConnection, verb: &str) -> Ha
 /// `cohort` as a key column is perfectly valid on the flat layout.
 /// Replaying it verbatim aborts the conversion with a raw `Postgres` error
 /// that does not say what is unsupported or why (issue #1270 item 10).
+///
+/// Excludes the two engine constraints by name, not every constraint-backed
+/// index. `harvest_events_pkey` and `harvest_events_workflow_exec_id_event_id_key`
+/// never have `cohort` before conversion — that is exactly what conversion
+/// adds. An operator's own unique constraint missing `cohort` is a different
+/// case. `CREATE TABLE ... (LIKE ...)` has no `INCLUDING CONSTRAINTS` option,
+/// so it would be silently dropped rather than replayed. The uniqueness
+/// invariant it enforced would then stop being checked, with no error at all.
 #[cfg(feature = "db")]
 async fn unique_indexes_without_cohort(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
     let rows = diesel::sql_query(
@@ -1431,7 +1466,11 @@ async fn unique_indexes_without_cohort(conn: &mut AsyncPgConnection) -> HarvestR
           WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
             AND i.indisunique
             AND NOT EXISTS (
-                SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid
+                SELECT 1 FROM pg_constraint con
+                 WHERE con.conindid = i.indexrelid
+                   AND con.conname IN (
+                       'harvest_events_pkey', 'harvest_events_workflow_exec_id_event_id_key'
+                   )
             )
             AND NOT EXISTS (
                 SELECT 1 FROM unnest(i.indkey[0:i.indnkeyatts - 1]::int2[]) AS colnum
@@ -1457,11 +1496,13 @@ async fn refuse_if_unique_index_without_cohort(conn: &mut AsyncPgConnection) -> 
     Err(HarvestError::Config(format!(
         "refusing to convert harvest_events: it carries {} that does not include `cohort` \
          ({}). Postgres requires the partition key in every unique index on a partitioned \
-         table, so replaying this index verbatim onto the partitioned parent aborts the \
-         conversion. Adding `cohort` would weaken the index exactly as it would weaken \
-         (workflow_exec_id, event_id) — which is why the engine's own uniqueness moved into \
-         the insert trigger instead — so this is not done automatically. Drop or redefine \
-         the index before converting.",
+         table. A plain index would replay verbatim onto the partitioned parent and abort \
+         the conversion outright; a constraint-backed one would instead be silently dropped \
+         by CREATE TABLE ... (LIKE ...), which has no INCLUDING CONSTRAINTS option, and its \
+         uniqueness invariant would stop being enforced with no error at all. Adding `cohort` \
+         would weaken the index exactly as it would weaken (workflow_exec_id, event_id) — \
+         which is why the engine's own uniqueness moved into the insert trigger instead — so \
+         this is not done automatically. Drop or redefine the index before converting.",
         if indexes.len() == 1 {
             "a unique index"
         } else {
@@ -1965,7 +2006,13 @@ engine (%), created after the pre-flight check ran. Drop the trigger, then re-ru
       JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
        AND i.indisunique
-       AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)
+       AND NOT EXISTS (
+             SELECT 1 FROM pg_constraint con
+              WHERE con.conindid = i.indexrelid
+                AND con.conname IN (
+                    'harvest_events_pkey', 'harvest_events_workflow_exec_id_event_id_key'
+                )
+           )
        AND NOT EXISTS (
              SELECT 1 FROM unnest(i.indkey[0:i.indnkeyatts - 1]::int2[]) AS colnum
                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = colnum
@@ -4207,8 +4254,12 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // `enable_partitioning` makes this check in Rust
         // (`unique_indexes_without_cohort`); the scripted path needs its own.
         // Postgres requires the partition key in every unique index on a
-        // partitioned table. Replaying one verbatim in phase 4 aborts —
-        // with a raw Postgres error that does not say what is unsupported.
+        // partitioned table. A plain index replayed verbatim in phase 4
+        // aborts outright. A constraint-backed one is silently dropped by
+        // `CREATE TABLE ... (LIKE ...)` instead, losing its uniqueness
+        // invariant with no error at all. `harvest_events_pkey` and
+        // `harvest_events_workflow_exec_id_event_id_key` are excluded by
+        // name: conversion is what adds `cohort` to those two.
         step(
             1,
             "DO $harvest_uidx_958$\nDECLARE bad text;\nBEGIN\n    \
@@ -4218,8 +4269,13 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
              JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
              WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
              AND i.indisunique\n       \
-             AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = \
-             i.indexrelid)\n       \
+             AND NOT EXISTS (\n           \
+             SELECT 1 FROM pg_constraint con\n            \
+             WHERE con.conindid = i.indexrelid\n              \
+             AND con.conname IN (\n                  \
+             'harvest_events_pkey', 'harvest_events_workflow_exec_id_event_id_key'\n              \
+             )\n       \
+             )\n       \
              AND NOT EXISTS (\n           \
              SELECT 1 FROM unnest(i.indkey[0:i.indnkeyatts - 1]::int2[]) AS colnum\n             \
              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = colnum\n            \
@@ -4228,10 +4284,11 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
              IF bad IS NOT NULL THEN\n        \
              RAISE EXCEPTION 'harvest #958: unique index(es) on harvest_events do not \
              include cohort (%). Postgres requires the partition key in every unique index \
-             on a partitioned table, so replaying one verbatim in phase 4 aborts. Adding \
-             cohort would weaken the index the same way it would weaken (workflow_exec_id, \
-             event_id), so this is not done automatically. Drop or redefine the index \
-             before running this plan.', bad;\n    \
+             on a partitioned table. A plain index would abort by replaying verbatim in \
+             phase 4; a constraint-backed one would instead be silently dropped, its \
+             uniqueness invariant no longer enforced. Adding cohort would weaken the index \
+             the same way it would weaken (workflow_exec_id, event_id), so this is not done \
+             automatically. Drop or redefine the index before running this plan.', bad;\n    \
              END IF;\nEND\n$harvest_uidx_958$;"
                 .to_string(),
         ),
@@ -4723,8 +4780,13 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
              JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
              WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
              AND i.indisunique\n       \
-             AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = \
-             i.indexrelid)\n       \
+             AND NOT EXISTS (\n           \
+             SELECT 1 FROM pg_constraint con\n            \
+             WHERE con.conindid = i.indexrelid\n              \
+             AND con.conname IN (\n                  \
+             'harvest_events_pkey', 'harvest_events_workflow_exec_id_event_id_key'\n              \
+             )\n       \
+             )\n       \
              AND NOT EXISTS (\n           \
              SELECT 1 FROM unnest(i.indkey[0:i.indnkeyatts - 1]::int2[]) AS colnum\n             \
              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = colnum\n            \
@@ -4733,9 +4795,10 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
              IF bad IS NOT NULL THEN\n        \
              RAISE EXCEPTION 'harvest #958: unique index(es) on harvest_events do not \
              include cohort (%), created since phase 1''s check ran. Postgres requires the \
-             partition key in every unique index on a partitioned table, so replaying one \
-             verbatim in the ATTACH below aborts. Drop or redefine the index, then re-run \
-             this plan.', bad;\n    \
+             partition key in every unique index on a partitioned table. A plain index \
+             would abort by replaying verbatim in the ATTACH below; a constraint-backed one \
+             would instead be silently dropped, its uniqueness invariant no longer enforced. \
+             Drop or redefine the index, then re-run this plan.', bad;\n    \
              END IF;\nEND\n$harvest_uidx_958_p4$;"
                 .to_string(),
         ),
