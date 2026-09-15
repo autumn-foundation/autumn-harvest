@@ -1099,6 +1099,83 @@ async fn ui_dead_letters_invalid_shard_id_redisplays_form_instead_of_aborting_pa
     );
 }
 
+/// RED (was): `page`/`limit` were still typed `Option<i64>` directly on
+/// `DeadLetterListParams`. That is the same mechanism #1540/#1560 already
+/// fixed on the Workflows and Workers pages, and the one this page's own
+/// `shard_id`/`task_kind`/`failed_after`/`failed_before` fixes left over.
+/// `?limit=not-a-number` failed axum's own query deserialization with a
+/// bare 400 before `list_dead_letters_ui` ever ran, discarding the
+/// `workflow_name` filter the operator had already typed alongside it.
+///
+/// GREEN (this commit): the request still renders the DLQ page (`200`)
+/// and preserves the other filter. It surfaces a `role="alert"` message
+/// naming the bad value next to the "Per page" field.
+#[tokio::test]
+async fn ui_dead_letters_invalid_limit_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(
+        &app,
+        "/dead-letters?limit=not-a-number&workflow_name=invoice_workflow",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid limit must not abort the whole DLQ page: {html}"
+    );
+    assert!(
+        html.contains("value=\"invoice_workflow\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+}
+
+/// Same fix, the `page` field. No form field backs it; it drives the
+/// Previous/Next links instead, a distinct code path. Covered
+/// independently here rather than assumed symmetric with `limit`,
+/// matching the Workflows/Workers pages' own `page` coverage.
+#[tokio::test]
+async fn ui_dead_letters_invalid_page_redisplays_list_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(
+        &app,
+        "/dead-letters?page=not-a-number&workflow_name=invoice_workflow",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid page must not abort the whole DLQ page: {html}"
+    );
+    assert!(
+        html.contains("value=\"invoice_workflow\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the pagination controls: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+    assert!(
+        html.contains("Page 1"),
+        "falls back to page 1 (zero-based page 0) instead of guessing: {html}"
+    );
+}
+
 /// DLQ Summary toggle (issue #385): the aggregation view groups entries,
 /// reports counts merged across shards, and links back into the filtered list.
 #[tokio::test]
