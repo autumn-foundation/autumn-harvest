@@ -54,12 +54,35 @@ Flat profile, pre-fix (`docs/perf-artifacts/history-fingerprint/before-callgrind
   2,815,082 ( 0.61%)  history_fingerprint_profile::support::build_history  <- one-time history build
 ```
 
-`build_history` — the harness's one-time input construction, not the
-target — is 0.61% of the profile; `history_fingerprint` itself, and
-everything it calls (the SHA-256 hashing, the JSON canonicalization, and
-`HistoryMatcher::new`'s bookkeeping), accounts for the other 99.39%. That
-clears the ≥5%-of-workload gate by nearly 20×, whichever way the split is
-drawn.
+### Workload share
+
+`build_history`'s flat self-cost line above (0.61%) is **not** its true
+cost, and is not used as one below. A flat callgrind profile only
+attributes a self-cost line to the function whose own code ran; any
+callee `build_history` invokes but that is not inlined into it — the
+`json!` macro expansion and `format!` calls inside `activity_payload`,
+and the allocations both entail — shows up under its own name elsewhere
+in the same flat listing instead (some of the `malloc`/`btree`/`String`
+lines above are a mix of both functions' calls into shared code).
+Subtracting only the 0.61% self-cost line would overstate
+`history_fingerprint`'s share.
+
+`docs/perf-artifacts/history-fingerprint/build-history-inclusive-callgrind-flat.txt`
+isolates `build_history`'s real, inclusive cost instead: a dedicated
+harness (`history_fingerprint_workload_share_profile.rs`) whose only job
+is to call `build_history` and nothing else, so its whole-process
+instruction count *is* that function's inclusive cost.
+
+| | Instructions (Ir) |
+|---|---|
+| Combined harness (build + fingerprint), pre-fix | 461,455,374 |
+| `build_history` alone, inclusive | 119,026,482 |
+| `history_fingerprint`, inclusive (by subtraction) | 342,428,892 |
+
+`history_fingerprint` accounts for **74.21%** of the combined harness —
+clearing the ≥5%-of-workload gate by roughly 15×. `build_history` is
+25.79%, not 0.61%. Reproduced identically across 3 runs of the isolation
+harness (`119,026,482` every time).
 
 Two things stand out in the flat profile:
 
@@ -182,7 +205,14 @@ valgrind --tool=dhat --dhat-out-file=dhat.json "$BIN"
 # Instructions (reported for completeness):
 valgrind --tool=callgrind --branch-sim=no --cache-sim=no --callgrind-out-file=cg.out "$BIN"
 callgrind_annotate --threshold=98 cg.out | head -10
+
+# Workload share (build_history's inclusive cost, isolated):
+BASE_BIN=$(cargo bench -p autumn-harvest --no-default-features --features testing \
+  --bench history_fingerprint_workload_share_profile --no-run --message-format=json 2>/dev/null \
+  | jq -r 'select(.executable != null) | .executable')
+valgrind --tool=callgrind --branch-sim=no --cache-sim=no --callgrind-out-file=cg-base.out "$BASE_BIN"
 ```
 
 Full artifacts: `docs/perf-artifacts/history-fingerprint/{before,after}-callgrind-flat.txt`,
-`{before,after}-dhat.json`.
+`{before,after}-dhat.json`,
+`build-history-inclusive-callgrind-flat.txt`.

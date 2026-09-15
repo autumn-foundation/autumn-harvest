@@ -313,6 +313,15 @@ name = "history_fingerprint_profile"
 required-features = ["testing"]
 harness = false
 
+# Isolates build_history's own inclusive cost (see the doc comment) so
+# history_fingerprint_profile.rs's workload-share claim in
+# docs/performance-history-fingerprint.md rests on a real measurement, not a
+# flat-profile self-cost line.
+[[bench]]
+name = "history_fingerprint_workload_share_profile"
+required-features = ["testing"]
+harness = false
+
 # Task-claim / enqueue throughput benchmark (issue #786). `harness = false` +
 # its own `main()`: `claim_task` is destructive (PENDING -> RUNNING), so
 # criterion's repeat-the-closure model would drain the seeded backlog and time
