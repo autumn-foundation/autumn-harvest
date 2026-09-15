@@ -170,7 +170,7 @@ pub fn emit_mir_with_warnings(req: &BuildRequest) -> crate::Result<(Vec<EmittedM
     let mut emitted: Vec<EmittedMir> = Vec::new();
     for package in &packages {
         let spec = package.as_ref();
-        let accept = package_ids(&metadata, spec, &mut warnings)?;
+        let accept = package_ids(&metadata, req.manifest_path.as_deref(), spec)?;
         // Everything that matches metadata by name — target enumeration,
         // fingerprint purging — uses the *resolved name*; cargo itself gets the
         // spec verbatim, so a form this tool cannot read still reaches it.
@@ -207,6 +207,39 @@ fn workspace_metadata(req: &BuildRequest) -> crate::Result<serde_json::Value> {
         .map_err(|e| Error::Cargo(format!("`cargo metadata` produced unreadable JSON: {e}")))
 }
 
+/// Resolve a `-p` SPEC this tool's own parser could not read a `name` from
+/// to its exact package id, via `cargo pkgid`. It is the authority on
+/// cargo's own SPEC grammar: bare names, `name@version`, the deprecated
+/// `name:version`, and the URL/full-package-id forms none of those cover.
+///
+/// # Errors
+/// When cargo cannot run, or the SPEC matches no package in the workspace's
+/// dependency graph.
+fn resolve_pkgid(manifest_path: Option<&Path>, spec: &str) -> crate::Result<String> {
+    let mut cmd = Command::new(cargo_bin());
+    cmd.arg("pkgid");
+    if let Some(path) = manifest_path {
+        cmd.arg("--manifest-path").arg(path);
+    }
+    cmd.arg("-p").arg(spec);
+    let out = cmd
+        .output()
+        .map_err(|e| Error::Cargo(format!("cannot run `cargo pkgid -p {spec}`: {e}")))?;
+    if !out.status.success() {
+        return Err(Error::Cargo(format!(
+            "`cargo pkgid -p {spec}` failed:\n{}",
+            stderr_tail(&out.stderr)
+        )));
+    }
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if id.is_empty() {
+        return Err(Error::Cargo(format!(
+            "`cargo pkgid -p {spec}` produced no package id"
+        )));
+    }
+    Ok(id)
+}
+
 /// The `package_id`s a `compiler-artifact` message may carry to be accepted as
 /// this invocation's output.
 ///
@@ -216,23 +249,39 @@ fn workspace_metadata(req: &BuildRequest) -> crate::Result<serde_json::Value> {
 /// so this is the filter that keeps a dependency's `.mir` out of the analysis.
 fn package_ids(
     metadata: &serde_json::Value,
+    manifest_path: Option<&Path>,
     package: Option<&PackageSpec>,
-    warnings: &mut Vec<String>,
 ) -> crate::Result<std::collections::BTreeSet<String>> {
     let packages = metadata
         .get("packages")
         .and_then(serde_json::Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
+    // A SPEC this tool could not read a bare `name` from: a registry/git
+    // URL, or a package's own full package id
+    // (`path+file:///workspace/a#0.1.0`). There the fragment is a bare
+    // version, because the path already pins the package. `cargo pkgid`
+    // resolves any SPEC cargo itself accepts to an exact package id. That
+    // id is the scope this run accepts. It is never "every workspace
+    // member", which used to let a dependency's artifacts through
+    // whenever the selected package built none of its own.
     if let Some(spec) = package
         && spec.name.is_none()
     {
-        warnings.push(format!(
-            "cannot read `-p {}` as `name`, `name@version` or `name:version`; it is \
-             passed to cargo unchanged, and this run accepts artifacts from any \
-             workspace member for it",
-            spec.spec
-        ));
+        let resolved = resolve_pkgid(manifest_path, &spec.spec)?;
+        return packages
+            .iter()
+            .filter_map(|pkg| pkg.get("id").and_then(serde_json::Value::as_str))
+            .find(|id| *id == resolved)
+            .map(|id| std::iter::once(id.to_string()).collect())
+            .ok_or_else(|| {
+                Error::Cargo(format!(
+                    "`cargo pkgid -p {}` resolved to `{resolved}`, which is not a workspace \
+                     member `cargo metadata` reports; harvest-verify can only analyze \
+                     workspace members, never an arbitrary dependency",
+                    spec.spec
+                ))
+            });
     }
     let mut ids = std::collections::BTreeSet::new();
     let mut known: Vec<String> = Vec::new();
@@ -571,32 +620,40 @@ pub fn rustc_version() -> String {
 /// no such suffix (a hand-trimmed fixture like `format_and_outparams.mir`) is
 /// used whole. Dashes become underscores either way, because that is how the
 /// crate name appears inside the MIR itself.
-#[must_use]
-pub fn collect_mir_paths(paths: &[PathBuf]) -> Vec<EmittedMir> {
+///
+/// # Errors
+/// When a `--mir` directory, or a subdirectory reached while walking it,
+/// cannot be read. A permissions failure used to be swallowed as an empty
+/// directory. That turned a broken input into `analyzed 0` with exit 0 in
+/// non-strict mode — the one outcome a gate must never reach by accident.
+pub fn collect_mir_paths(paths: &[PathBuf]) -> crate::Result<Vec<EmittedMir>> {
     let mut out: Vec<EmittedMir> = Vec::new();
     for path in paths {
         if path.is_dir() {
-            collect_dir(path, &mut out);
+            collect_dir(path, &mut out)?;
         } else {
             push_mir(path, &mut out);
         }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out.dedup_by(|a, b| a.path == b.path);
-    out
+    Ok(out)
 }
 
 /// Walk `dir` for `.mir` files, **without following symlinks**.
 ///
-/// `symlink_metadata` rather than `is_dir`/`is_file`: a linked directory turns
-/// the walk into someone else's tree, and a linked file makes the report name a
-/// path whose content lives somewhere the caller never pointed at. Only regular
-/// files are accepted, so a fifo or device node named `x.mir` cannot block the
-/// run either.
-fn collect_dir(dir: &Path, out: &mut Vec<EmittedMir>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
+/// `symlink_metadata` rather than `is_dir`/`is_file`: a linked directory
+/// turns the walk into someone else's tree, and a linked file makes the
+/// report name a path whose content lives somewhere the caller never
+/// pointed at. Only regular files are accepted, so a fifo or device node
+/// named `x.mir` cannot block the run either. That skip stays silent and
+/// deliberate, unlike a directory this invocation asked to read and could
+/// not.
+fn collect_dir(dir: &Path, out: &mut Vec<EmittedMir>) -> crate::Result<()> {
+    let entries = std::fs::read_dir(dir).map_err(|e| Error::Io {
+        path: dir.display().to_string(),
+        source: e,
+    })?;
     let mut paths: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
     paths.sort();
     for path in paths {
@@ -607,11 +664,12 @@ fn collect_dir(dir: &Path, out: &mut Vec<EmittedMir>) {
             continue;
         }
         if meta.is_dir() {
-            collect_dir(&path, out);
+            collect_dir(&path, out)?;
         } else if meta.is_file() && path.extension().is_some_and(|e| e == "mir") {
             push_mir(&path, out);
         }
     }
+    Ok(())
 }
 
 fn push_mir(path: &Path, out: &mut Vec<EmittedMir>) {
@@ -627,18 +685,31 @@ fn push_mir(path: &Path, out: &mut Vec<EmittedMir>) {
 }
 
 /// `wf_corpus-3f2a91c0d4e5b678` → `wf_corpus`; `spike` → `spike`.
+///
+/// A hand-supplied `--mir` file need not carry a metadata hash at all
+/// (`format_and_outparams.mir`). When its stem does end in a `-<suffix>`
+/// component, that suffix is only a metadata hash when it is hexadecimal.
+/// `payments-workflows.mir` must qualify as crate `payments_workflows`,
+/// not `payments`, because `workflows` is not hex. [`is_metadata_hash`] is
+/// the one predicate every caller shares. The artifact-path derivation
+/// below and this stem derivation can then never disagree about what a
+/// hash looks like.
 fn crate_name_from_stem(stem: &str) -> String {
     let base = match stem.rsplit_once('-') {
-        Some((head, hash))
-            if !head.is_empty()
-                && hash.len() >= 8
-                && hash.chars().all(|c| c.is_ascii_alphanumeric()) =>
-        {
-            head
-        }
+        Some((head, hash)) if !head.is_empty() && is_metadata_hash(hash) => head,
         _ => stem,
     };
     base.replace('-', "_")
+}
+
+/// True when `suffix` is shaped like cargo's metadata hash: hexadecimal,
+/// and at least 8 digits long. 16 hex digits is what current rustc emits;
+/// the length is not a stable promise, hence `>=`, not `==`. The
+/// *alphabet* is stable, though. Cargo's hash is a `u64` printed in hex,
+/// never alphanumeric. A plain word suffix such as `-workflows` or
+/// `-verify` is never mistaken for one.
+fn is_metadata_hash(suffix: &str) -> bool {
+    suffix.len() >= 8 && suffix.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Split a flag variable into tokens the way cargo itself reads it.
@@ -1277,7 +1348,7 @@ fn hashed_mir_candidates(path: &Path) -> Vec<PathBuf> {
                 .and_then(|s| s.to_str())
                 .and_then(|stem| stem.strip_prefix(base))
                 .and_then(|rest| rest.strip_prefix('-'))
-                .is_some_and(|hash| hash.len() >= 8 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+                .is_some_and(is_metadata_hash)
         })
         .collect();
     out.sort();
@@ -1304,12 +1375,12 @@ fn mir_beside(path: &Path) -> Option<PathBuf> {
     has_metadata_hash(stem).then(|| dir.join(format!("{stem}.mir")))
 }
 
-/// True when `stem` ends in `-<hash>`, cargo's metadata hash (16 hex digits
-/// today; the length is not a stable promise, so ≥ 8 hex digits is the test).
+/// True when `stem` ends in `-<hash>`, cargo's metadata hash. Shares
+/// [`is_metadata_hash`] with [`crate_name_from_stem`] and
+/// [`hashed_mir_candidates`], so the three never disagree about what counts.
 fn has_metadata_hash(stem: &str) -> bool {
-    stem.rsplit_once('-').is_some_and(|(head, hash)| {
-        !head.is_empty() && hash.len() >= 8 && hash.chars().all(|c| c.is_ascii_hexdigit())
-    })
+    stem.rsplit_once('-')
+        .is_some_and(|(head, hash)| !head.is_empty() && is_metadata_hash(hash))
 }
 
 /// Delete the fingerprints of the unit that failed to produce a `.mir`, so the
@@ -1367,11 +1438,9 @@ fn purge_fingerprints(
         };
         for entry in entries.filter_map(Result::ok) {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let matches = prefixes.iter().any(|prefix| {
-                name.strip_prefix(prefix.as_str()).is_some_and(|hash| {
-                    hash.len() >= 8 && hash.chars().all(|c| c.is_ascii_hexdigit())
-                })
-            });
+            let matches = prefixes
+                .iter()
+                .any(|prefix| name.strip_prefix(prefix.as_str()).is_some_and(is_metadata_hash));
             if matches {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
@@ -1446,6 +1515,20 @@ mod tests {
             crate_name_from_stem("a-b"),
             "a_b",
             "a short suffix is not a metadata hash"
+        );
+        // Issue #1296 P2. A hand-supplied `--mir` file's ordinary name can
+        // end in an 8+ character alphanumeric, non-hexadecimal component.
+        // That component used to be stripped as if it were rustc's
+        // metadata hash.
+        assert_eq!(
+            crate_name_from_stem("payments-workflows"),
+            "payments_workflows",
+            "`workflows` is 9 letters but not hex, so it is not a metadata hash"
+        );
+        assert_eq!(
+            crate_name_from_stem("payments-workflows-3f2a91c0d4e5b678"),
+            "payments_workflows",
+            "the real hash after it is still stripped"
         );
     }
 
@@ -1866,7 +1949,7 @@ mod tests {
         let mir = dir.path().join("seeded-1234567890abcdef.mir");
         std::fs::write(&mir, "// mir").expect("write");
         std::fs::write(dir.path().join("seeded.rlib"), "").expect("write");
-        let found = collect_mir_paths(&[dir.path().to_path_buf()]);
+        let found = collect_mir_paths(&[dir.path().to_path_buf()]).expect("readable dir");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].crate_name, "seeded");
         assert_eq!(found[0].path, mir);
@@ -1878,7 +1961,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mir = dir.path().join("fixture.mir");
         std::fs::write(&mir, "// mir").expect("write");
-        let found = collect_mir_paths(std::slice::from_ref(&mir));
+        let found = collect_mir_paths(std::slice::from_ref(&mir)).expect("readable file");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].crate_name, "fixture");
     }
@@ -2089,31 +2172,25 @@ mod tests {
     fn ids(
         metadata: &serde_json::Value,
         spec: Option<&str>,
-    ) -> (
-        crate::Result<std::collections::BTreeSet<String>>,
-        Vec<String>,
-    ) {
-        let mut warnings = Vec::new();
+    ) -> crate::Result<std::collections::BTreeSet<String>> {
         let parsed = spec.map(parse_package_spec);
-        let out = package_ids(metadata, parsed.as_ref(), &mut warnings);
-        (out, warnings)
+        package_ids(metadata, None, parsed.as_ref())
     }
 
     #[test]
     fn package_ids_come_from_metadata_and_a_typo_is_an_error() {
         let metadata = two_member_workspace();
         assert_eq!(
-            ids(&metadata, Some("a")).0.expect("a is a member"),
+            ids(&metadata, Some("a")).expect("a is a member"),
             std::iter::once("path+file:///w/a#a@0.1.0".to_string()).collect()
         );
         assert_eq!(
             ids(&metadata, None)
-                .0
                 .expect("no -p means every workspace member")
                 .len(),
             2
         );
-        let err = ids(&metadata, Some("nope")).0.expect_err("unknown package");
+        let err = ids(&metadata, Some("nope")).expect_err("unknown package");
         assert!(format!("{err}").contains("nope"), "{err}");
         assert!(
             format!("{err}").contains("a@0.1.0") && format!("{err}").contains("b@0.2.0"),
@@ -2163,23 +2240,19 @@ mod tests {
         let metadata = two_member_workspace();
         // The regression: `-p a@0.1.0` is a valid SPEC that used to be compared
         // whole against the bare name `a`, so the run died before cargo ran.
-        let (accepted, warnings) = ids(&metadata, Some("a@0.1.0"));
+        let accepted = ids(&metadata, Some("a@0.1.0"));
         assert_eq!(
             accepted.expect("a@0.1.0 is that member"),
             std::iter::once("path+file:///w/a#a@0.1.0".to_string()).collect()
         );
-        assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(
             ids(&metadata, Some("a:0.1.0"))
-                .0
                 .expect("the deprecated form resolves too")
                 .len(),
             1
         );
 
-        let err = ids(&metadata, Some("a@9.9.9"))
-            .0
-            .expect_err("the version must match exactly");
+        let err = ids(&metadata, Some("a@9.9.9")).expect_err("the version must match exactly");
         assert!(
             format!("{err}").contains("a@9.9.9") && format!("{err}").contains("a@0.1.0"),
             "the error names the spec and the known packages: {err}"
@@ -2187,20 +2260,47 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_spec_is_passed_through_with_a_warning() {
+    fn a_spec_this_tool_cannot_read_a_name_from_is_an_error_not_every_member() {
+        // Issue #1296 P2: a SPEC of a shape this tool's parser cannot read
+        // a `name` from used to fall back to "every workspace member
+        // matches". That let a dependency's artifacts through a
+        // `-p <full package id>` filter whenever the selected package
+        // itself had none. The mock `two_member_workspace` has no real
+        // workspace behind it for `cargo pkgid` to resolve against. An
+        // opaque spec is now a real `cargo pkgid` failure — an error,
+        // never a silent "everything".
         let metadata = two_member_workspace();
-        let (accepted, warnings) = ids(&metadata, Some("https://example.com/registry"));
-        assert_eq!(
-            accepted
-                .expect("an unreadable spec is cargo's to judge")
-                .len(),
-            2,
-            "artifacts are then accepted from any workspace member"
-        );
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let err = ids(&metadata, Some("https://example.com/registry"))
+            .expect_err("an unresolvable spec must be an error, not every workspace member");
         assert!(
-            warnings[0].contains("https://example.com/registry"),
-            "the warning must name the spec it could not read: {warnings:?}"
+            format!("{err}").contains("https://example.com/registry"),
+            "the error must name the spec that could not be resolved: {err}"
+        );
+    }
+
+    #[test]
+    fn a_full_package_id_spec_resolves_via_cargo_pkgid() {
+        // The exact shape the issue names: `path+file:///workspace/a#0.1.0`
+        // carries no `name`, only a path and a version, because the path
+        // already pins the package. `parse_package_spec` cannot read a
+        // name out of "0.6.0". This runs against this crate's own real
+        // workspace, where `cargo pkgid` resolves the spec to this crate's
+        // own package id.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec_text = format!("path+file://{}#{}", dir.display(), env!("CARGO_PKG_VERSION"));
+        let parsed = parse_package_spec(&spec_text);
+        assert_eq!(
+            parsed.name, None,
+            "this tool's own parser must not be able to read a name from {spec_text:?}"
+        );
+
+        let metadata = workspace_metadata(&BuildRequest::default()).expect("cargo metadata");
+        let resolved =
+            package_ids(&metadata, None, Some(&parsed)).expect("cargo pkgid resolves the spec");
+        assert_eq!(
+            resolved,
+            std::iter::once(spec_text).collect(),
+            "resolved to {resolved:?}, expected the id of this crate's own package"
         );
     }
 
@@ -2284,7 +2384,7 @@ mod tests {
         .expect("symlink");
         std::os::unix::fs::symlink(&elsewhere, scanned.join("subdir")).expect("symlink");
 
-        let found = collect_mir_paths(std::slice::from_ref(&scanned));
+        let found = collect_mir_paths(std::slice::from_ref(&scanned)).expect("readable dir");
         assert_eq!(
             found
                 .iter()
@@ -2293,6 +2393,50 @@ mod tests {
             vec![scanned.join("real-1234567890abcdef.mir")],
             "a linked file and a linked directory are both outside what the \
              caller pointed at"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_mir_subdirectory_is_an_error_not_an_empty_result() {
+        // Issue #1296 P2: a `--mir` subdirectory this invocation cannot
+        // read used to be silently treated as empty. That turned a
+        // permissions failure into `analyzed 0` with exit 0 under a
+        // non-strict run.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let readable = dir.path().join("readable-1234567890abcdef.mir");
+        std::fs::write(&readable, "// mir").expect("write");
+        let locked = dir.path().join("locked");
+        std::fs::create_dir_all(&locked).expect("mkdir");
+        std::fs::write(locked.join("hidden-1234567890abcdef.mir"), "// mir").expect("write");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+
+        let still_readable = std::fs::read_dir(&locked).is_ok();
+        let result = collect_mir_paths(std::slice::from_ref(&dir.path().to_path_buf()));
+
+        // Restore permissions so the tempdir can be cleaned up regardless of
+        // the assertion outcome.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+
+        if still_readable {
+            // Running as root, or on a filesystem that does not enforce
+            // mode bits: `chmod 000` was a no-op. This fixture cannot
+            // exercise the failure the test exists for, so skip rather
+            // than false-fail.
+            eprintln!(
+                "skipping an_unreadable_mir_subdirectory_is_an_error_not_an_empty_result: \
+                 chmod 000 did not block read_dir in this environment"
+            );
+            return;
+        }
+        let err = result.expect_err("an unreadable subdirectory must be an error, not `[]`");
+        assert!(
+            format!("{err}").contains(&locked.display().to_string()),
+            "the error must name the directory that could not be read: {err}"
         );
     }
 

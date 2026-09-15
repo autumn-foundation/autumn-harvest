@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use autumn_harvest_verify::BoundaryKind;
 use autumn_harvest_verify::mir::{self, MirDoc};
+use autumn_harvest_verify::model::Model;
 use autumn_harvest_verify::resolve::{Program, Resolution, SourceRoots};
 
 fn fixtures_dir() -> PathBuf {
@@ -290,6 +291,42 @@ fn a_body_that_is_simply_absent_is_a_missing_body_boundary() {
             BoundaryKind::ExternalCrateBody,
             "some_crate::never_emitted".to_string()
         )
+    );
+}
+
+#[test]
+fn an_overlay_trusted_crate_is_honored_by_resolve_call() {
+    // Issue #1296 P2: `resolve_call`'s own `[[trusted]]` check used to read
+    // only the builtin model (`Model::builtin_ref()`), never the merged
+    // model a `--model` overlay produces. An overlay that added a trusted
+    // crate could then not stop a body-less call rooted at it from
+    // becoming an `external-crate-body` boundary. The analysis stage's own
+    // (overlay-aware) trust check never got a say, because `resolve_call`
+    // had already decided.
+    let without_overlay =
+        Program::build(vec![parse_fixture("spike.mir")], &fixture_roots()).unwrap();
+    assert_eq!(
+        without_overlay.resolve_call("wf::{closure#0}", "some_crate::never_emitted"),
+        Resolution::Boundary(
+            BoundaryKind::ExternalCrateBody,
+            "some_crate::never_emitted".to_string()
+        ),
+        "without an overlay, an untrusted crate is still an honest boundary"
+    );
+
+    let overlay = Model::from_toml("[[trusted]]\nname = \"some_crate\"\nreason = \"test\"\n")
+        .expect("overlay parses");
+    let merged = Model::builtin().expect("builtin model").merged_with(overlay);
+    let with_overlay = Program::build_with_model(
+        vec![parse_fixture("spike.mir")],
+        &fixture_roots(),
+        &merged,
+    )
+    .unwrap();
+    assert_eq!(
+        with_overlay.resolve_call("wf::{closure#0}", "some_crate::never_emitted"),
+        Resolution::External("some_crate::never_emitted".to_string()),
+        "an overlay-trusted crate must resolve as a pure propagator, never a boundary"
     );
 }
 

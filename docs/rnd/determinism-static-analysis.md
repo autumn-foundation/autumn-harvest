@@ -461,7 +461,7 @@ why it is listed as a boundary condition below and not sold as soundness.
 
 ## Soundness boundaries
 
-Twelve boundary kinds are the complete set of names the tool can answer
+Fourteen boundary kinds are the complete set of names the tool can answer
 `unknown`. The names below are the exact strings the CLI prints
 (`--list-boundaries`), the JSON emits, and the report table carries; they come
 from `autumn_harvest_verify::BoundaryKind::ALL` and the two guard halves keep
@@ -481,17 +481,23 @@ this table equal to it in both directions.
 | `mir-parse` | A malformed item header, an unterminated body, a dump that is not valid UTF-8, or **any statement or terminator inside a live block whose head is not on the parser's known list** | `unknown`, carrying the parse detail | **The format-drift tripwire.** Three separate paths feed it, because an earlier revision had only the first: an unparsed item is recorded and re-raised at the call that names it (`resolve_call` step 6); a non-UTF-8 dump is decoded lossily, warned about, and carries the boundary on every workflow of its crate; and an unrecognised statement/terminator head inside a reachable non-cleanup block raises it where it stands (`BENIGN_STATEMENT_HEADS` / `BENIGN_TERMINATOR_HEADS` in `analysis/summary.rs` are the allow-lists, so a *new* MIR shape is loud rather than dropped). `parse_fixtures::truncated_input_never_panics` and `::injected_junk_lines_never_panic_and_are_recorded` pin the parser half. |
 | `missing-body` | A callee resolved by name to a body absent from the analyzed dump set, **or** an `<impl at FILE:l:c>` body whose source file could not be read or parsed | `unknown` | Usually means a target was not built into the MIR set. The second half matters more than it looks: impl bodies are located by scanning the source line the MIR header names, so an unreadable file (a remapped path, a path dependency outside the source roots) used to make the body silently invisible — which meant the *same* `.mir` gave different verdicts from different working directories. It is a boundary now. |
 | `drop-glue` | A `drop(place)` terminator on a place whose type has a `::drop` body in the analyzed set that the analyzer cannot confirm is that type's `Drop` impl | `unknown`, naming the dropped type and why | **Emitted since the audited revision.** A resolvable user `Drop` impl is *followed* — the glue is analyzed with the dropped place as the `&mut self` argument, exactly as an explicit `Ty::drop(&mut place)` would be, so a `Drop` body that reads ambient state or emits a command is visible. Every `<impl at …>::drop` is indexed at `Program::build` under the type it takes as `&mut self`: from the impl **header** where a source root can be read, and from the body's own **receiver parameter** where it cannot. Two same-named types are then told apart by the dropped local's declared module, and a residual tie is unioned rather than discarded — asking for a single body and getting none on a tie reads as "this type has no glue", which is how a `Drop` that reads the wall clock came back `proven`. The boundary is what is left, and it has two shapes: glue whose body is not in the analyzed set, and — the one that used to be silent — a `::drop` body whose impl header could not be read at all, which is *every* drop in a pre-emitted dump analyzed with no source root. A type nothing in the analyzed set implements `Drop` for stays inert; that is what keeps dropping a `String` from being a boundary. Its residual limit is **nested-field glue** — dropping a struct runs its fields' `Drop` impls too, and only the outermost type is looked up. |
+| `fixpoint-exhausted` | The per-body taint fixpoint (`MAX_ROUNDS = 24`) hits its round cap while state is still changing — a dependency chain long enough, laid out against the block sweep order, to need more rounds than the cap allows | `unknown`, naming the body | Issue #1296 round 6. The cap used to stop silently, treating an unconverged partial state as if it were the true fixpoint — a missing propagation could then read as `proven-deterministic`. The lattice is finite so continuing to convergence is possible in principle; the boundary is the cheaper, still-honest alternative, and the cap stays as a defence against a pathological or malformed body. |
+| `unresolved-callback` | A closure argument's span is present at the call site, but no body anywhere in the analyzed set was printed with it (a partial dump, or a handler registration whose body was never emitted) | `unknown`, naming the closure span | Issue #1296 round 7. Silently contributing nothing here is how a callback with a source or a sink inside it went unseen — the callback is assumed invoked by every other path through this code, so a missing body is a gap in evidence, not evidence of cleanliness. |
 
-**All twelve are reachable in the shipped code.** An earlier revision of this
+**All fourteen are reachable in the shipped code.** An earlier revision of this
 report recorded `drop-glue` as declared-but-never-emitted; the soundness review
 of this PR turned that into a demonstrated false negative (a `Drop` impl
 containing a sink came back `proven-deterministic`), and it is now both followed
 and, where unresolvable, raised. `inline-asm`, `unresolved-generic`, `recursion`,
 `missing-body` and `drop-glue` are emitted — by `analysis/summary.rs`,
 `resolve/mod.rs`, `analysis/summary.rs`, both, and `analysis/summary.rs`
-respectively — even though no corpus case currently pins them.
+respectively — even though no corpus case currently pins them. `fixpoint-exhausted`
+and `unresolved-callback` were added by issue #1296's Codex-review follow-up
+(rounds 6 and 7 on PR #1294) and are likewise unpinned by the corpus — both need
+a generated pathological body, which is what their own unit tests in
+`autumn-harvest-verify/tests/analysis_fixtures.rs` supply instead.
 
-Four of the twelve are pinned by corpus workflows asserted to come back
+Four of the fourteen are pinned by corpus workflows asserted to come back
 `unknown` and never `proven-deterministic` — `wf_dyn_unknown_impl`
 (`dyn-dispatch`), `wf_fn_pointer` (`indirect-call`), `wf_extern_c` (`ffi`) and
 `wf_raw_pointer_static_mut` (`unsafe-raw-pointer`) — by
@@ -563,14 +569,20 @@ approximate, and a reader who quotes a verdict needs them.
   ambient if **any** candidate is, and an ambiguous impl method is analyzed in
   all of its candidate bodies with the findings unioned (the trace carries
   `[ambiguous impl (N candidates, unioned)]`). Both cases add a report warning.
-- **Sanitizer kills are per-place and monotone, not flow-sensitive.** Taint is a
-  per-body fixpoint over places and the kill set only ever grows, so a `sort()`
-  anywhere in a body kills `Order` taint on that place for the whole body,
-  including at program points that execute *before* the sort — and including on
-  paths where the sort does not run at all. A value sorted on one branch counts
-  as sorted on every branch. That is a soundness hole in the safe-looking
-  direction (it under-reports), it is the known cost of the design, and making it
-  flow-sensitive is the single highest-value precision upgrade (§Future work).
+- **Sanitizer kills are flow-sensitive by block dominance (fixed by issue #1296
+  round 6).** A kill discovered at one sanitizer call site now applies only to
+  reads whose block that call site **dominates** — every path from the entry to
+  the read must pass through the sanitizer first. A read that executes before
+  the sanitizer, or on a path that never reaches it, keeps its taint; MIR always
+  lowers a call as a block *terminator*, so a sink and a later sanitizer in the
+  same straight-line function never share a block, and block-level dominance
+  alone settles which side of the sanitizer a given read is on — no
+  statement-position tracking is needed within a block. The storage layer
+  (`TaintState`) keeps every fact exactly as observed and never strips one at
+  write time; only a *read*, taken at its own block via `TaintState::read_at`,
+  is filtered. `analysis::taint::tests::a_kill_is_flow_sensitive_by_block_dominance`
+  and `analysis_fixtures::a_value_read_before_the_sanitizer_keeps_its_taint` /
+  `::a_value_read_after_the_sanitizer_is_clean` pin the fix.
 - **Recursion is cut rather than solved, and a sink inside the cycle is lost.**
   See §Interprocedural summaries: the partial summary carries `has_sink: false`,
   so a command emitted only through a recursive cycle contributes no finding. The
@@ -604,6 +616,11 @@ audited revision, each one a place where a determined counterexample gets a
 reader who has to decide whether to trust a verdict needs the list that was not
 fixed, not only the list that was.
 
+> Issue #1296's Codex-review follow-up closed three items a prior revision of
+> this list numbered 3, 8 and 9 — `MAX_FACTS` was kind-blind, `Allowlist` had
+> no `deny_unknown_fields`, and sanitizer kills were not flow-sensitive. The
+> list below is renumbered; nothing else cites the old numbers.
+
 1. **A dependency's *extension trait* on a std type is trusted.** `impl DepExt
    for String` in an unemitted dependency prints with both the self type and the
    trait trimmed, so the receiver argument's `&std::string::String` is the only
@@ -621,28 +638,20 @@ fixed, not only the list that was.
    `(type, trait, method)` with the impl's module, by span-to-*every*-body, and
    by the dropped self type respectively, and a residual ambiguity is unioned
    rather than resolved by proximity.
-3. **`MAX_FACTS = 6` per place is kind-blind.** Six `Value` facts saturating a
-   place before an `Order` fact arrives would hide the order flow. No probe has
-   made it bite, and no slot is reserved per `TaintKind`.
-4. **`write_back_refs` tests the root local's declared type**, so an `&mut`
+3. **`write_back_refs` tests the root local's declared type**, so an `&mut`
    argument passed as a projection (`move (_5.0)`) is skipped when `_5` is not
    itself `&mut`.
-5. **`is_clean_ctx_call()` returns before descending closures.** A closure handed
+4. **`is_clean_ctx_call()` returns before descending closures.** A closure handed
    to a `[[non_sink]]` ctx method (`await_condition(|| …)`, say) is not analyzed,
    so a source or a sink inside it is lost. `side_effect` is handled correctly by
    `opaque_closure_args`; the non-sink family has no equivalent.
-6. **Nested-field drop glue is not followed.** Dropping a struct runs its fields'
+5. **Nested-field drop glue is not followed.** Dropping a struct runs its fields'
    `Drop` impls; only the outermost type is resolved (§Soundness boundaries,
    `drop-glue`).
-7. **Implicit flow is per-body.** There is no interprocedural control context: a
+6. **Implicit flow is per-body.** There is no interprocedural control context: a
    helper called from inside a tainted branch is not re-analyzed under that
    branch's taint.
-8. **`Allowlist` has no `deny_unknown_fields`.** The *model* structs do — a typo
-   in an overlay is a hard error — but a misspelt key in
-   `harvest-verify.allow.toml` is silently ignored.
-9. **Sanitizer kills are per-place and monotone** (restated: it is both a design
-   approximation and the residual imprecision most likely to matter).
-10. **`tokio::select!` is invisible in MIR**, so HVG010/DET011 remain its only
+7. **`tokio::select!` is invisible in MIR**, so HVG010/DET011 remain its only
     defence.
 
 ---
@@ -1318,10 +1327,9 @@ In rough priority order, all explicitly deferred rather than silently omitted:
    module precisely so this swap does not touch the taint engine. This is the
    long-term answer to the format-stability risk, and it retires the maintenance
    liability the whole design currently carries.
-3. **Flow-sensitive sanitizers.** Today `sort()` anywhere in a body kills `Order`
-   taint for that place everywhere in the body. Making the kill flow-sensitive is
-   the single highest-value precision upgrade and would remove the most
-   embarrassing residual imprecision.
+3. ~~**Flow-sensitive sanitizers.**~~ **Done (issue #1296 round 6).** Sanitizer
+   kills are now filtered per read by block dominance rather than applied as a
+   body-wide blanket clear; see §Limitations that are not boundaries.
 4. **Opt-in dependency-body analysis** (`--all-crates`). Whole-graph MIR is 383
    MB for one example, so it cannot be the default — but a targeted opt-in for a
    suspect crate would convert many `external-crate-body` unknowns into answers.

@@ -27,8 +27,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::mir::ast::{Local, Place, Projection};
 use crate::verdict::{Hop, Site, TaintKind};
 
-/// How many distinct facts one place keeps. Beyond this the analysis has all
-/// the evidence a report can use, and more only slows the fixpoint down.
+use super::control::ControlGraph;
+
+/// How many distinct facts of **one kind** one place keeps (see
+/// [`TaintSet::insert`]). Beyond this the analysis has all the evidence a
+/// report can use for that kind, and more only slows the fixpoint down.
 const MAX_FACTS: usize = 6;
 /// How long a hop chain may grow before its middle is elided.
 const MAX_HOPS: usize = 48;
@@ -123,11 +126,21 @@ impl TaintSet {
     }
 
     /// Add one fact; `true` when it was not already present.
+    ///
+    /// [`MAX_FACTS`] caps facts **per kind**, not the set as a whole. A
+    /// place that already holds six `Order` facts must still accept the
+    /// first `Value` fact that reaches it. A single global cap let six
+    /// `Order` sources fill a collection's slots before a later
+    /// clock-derived `Value` source arrived. The `Value` fact was then
+    /// silently dropped. A subsequent `sort` cleared the retained `Order`
+    /// facts, and the place read as clean even though it carried real
+    /// non-determinism.
     pub fn insert(&mut self, fact: Fact) -> bool {
         if self.facts.iter().any(|f| f.key() == fact.key()) {
             return false;
         }
-        if self.facts.len() >= MAX_FACTS {
+        let same_kind = self.facts.iter().filter(|f| f.kind == fact.kind).count();
+        if same_kind >= MAX_FACTS {
             return false;
         }
         self.facts.push(fact);
@@ -187,6 +200,17 @@ impl TaintSet {
     }
 }
 
+/// One sanitizer kill: `place` lost `kind` at the call site in `block`.
+///
+/// The block is what makes a kill flow-sensitive (see
+/// [`TaintState::read_at`]). MIR always lowers a method call as a block
+/// **terminator**. Two calls in sequence — the sink
+/// `ctx.execute_activity_raw(.., keys.clone())` and the later
+/// `keys.sort()` — therefore never share a block. A read's own block
+/// pins it to one side of the kill or the other. Block-level dominance is
+/// enough, with no statement position needed within a block.
+type Kill = (Place, TaintKind, String);
+
 /// The taint of every place in one body, plus its aliases and sanitizer kills.
 #[derive(Debug, Default)]
 pub struct TaintState {
@@ -194,8 +218,8 @@ pub struct TaintState {
     places: BTreeMap<Local, Vec<(Vec<Projection>, TaintSet)>>,
     /// Local → the place it is a reference to (`_6 = &mut _4` ⇒ `_6` ↦ `_4`).
     aliases: BTreeMap<Local, Place>,
-    /// Places a sanitizer cleared, and of which kinds.
-    kills: Vec<(Place, TaintKind)>,
+    /// Places a sanitizer cleared, of which kinds, and where.
+    kills: Vec<Kill>,
 }
 
 impl TaintState {
@@ -241,78 +265,63 @@ impl TaintState {
         current
     }
 
-    /// Record that a sanitizer cleared `kind` on `place` (and everything under it).
+    /// Record that a sanitizer at `block` cleared `kind` on `place` (and
+    /// everything under it).
     ///
-    /// Kills are **monotone**: once a place has been sorted, it stays sorted for
-    /// the rest of the fixpoint. Without that, a flow-insensitive round would
-    /// re-add the taint the previous round's `sort` had just removed, and the
-    /// analysis would oscillate instead of converging.
-    pub fn kill(&mut self, place: &Place, kind: TaintKind) {
+    /// Kills are **monotone**: once discovered, a kill is never retracted.
+    /// [`Self::read_at`] decides — per read, from the read's own block —
+    /// whether it applies. That is what makes a flow-insensitive round loop
+    /// still converge. The kill *set* only grows, over a finite universe of
+    /// call sites, so re-running a round with more kills in hand cannot
+    /// oscillate.
+    pub fn kill(&mut self, place: &Place, kind: TaintKind, block: &str) {
         let canonical = self.canonical(place);
         if !self
             .kills
             .iter()
-            .any(|(p, k)| *p == canonical && *k == kind)
+            .any(|(p, k, b)| *p == canonical && *k == kind && b == block)
         {
-            self.kills.push((canonical, kind));
+            self.kills.push((canonical, kind, block.to_string()));
         }
     }
 
     /// Start with the kills a previous attempt discovered.
-    pub fn seed_kills(&mut self, kills: &[(Place, TaintKind)]) {
+    pub fn seed_kills(&mut self, kills: &[Kill]) {
         self.kills = kills.to_vec();
     }
 
     /// The kills discovered so far.
     #[must_use]
-    pub fn kills(&self) -> &[(Place, TaintKind)] {
+    pub fn kills(&self) -> &[Kill] {
         &self.kills
     }
 
-    /// Drop every fact a kill covers. Returns `true` when anything was removed.
-    pub fn apply_kills(&mut self) -> bool {
-        if self.kills.is_empty() {
-            return false;
-        }
-        let kills = self.kills.clone();
-        let mut changed = false;
-        for (local, entries) in &mut self.places {
-            for (projections, set) in entries.iter_mut() {
-                let place = Place {
-                    local: *local,
-                    projections: projections.clone(),
-                };
-                let killed: BTreeSet<TaintKind> = kills
-                    .iter()
-                    .filter(|(p, _)| covers(p, &place))
-                    .map(|(_, k)| *k)
-                    .collect();
-                if killed.is_empty() {
-                    continue;
-                }
-                let filtered = set.without(&killed);
-                if filtered != *set {
-                    *set = filtered;
-                    changed = true;
-                }
-            }
-        }
-        changed
-    }
-
-    /// Which kinds are killed for `place`.
-    fn killed_kinds(&self, place: &Place) -> BTreeSet<TaintKind> {
+    /// Which kinds are killed for `place`, as observed from `at`. A kill
+    /// applies only when its own block **dominates** `at`, i.e. every path
+    /// from the entry to `at` passes through the sanitizer call. A read
+    /// whose block the kill does not dominate happens on a path that could
+    /// not have gone through the sanitizer yet, or at all. It must keep
+    /// seeing the pre-sanitizer taint.
+    fn killed_kinds_at(&self, place: &Place, at: usize, graph: &ControlGraph) -> BTreeSet<TaintKind> {
         self.kills
             .iter()
-            .filter(|(p, _)| covers(p, place))
-            .map(|(_, k)| *k)
+            .filter(|(p, _, block)| {
+                covers(p, place)
+                    && graph
+                        .index_of(block)
+                        .is_some_and(|kill_at| graph.dominates(kill_at, at))
+            })
+            .map(|(_, k, _)| *k)
             .collect()
     }
 
-    /// Taint of a read of `place`.
+    /// Taint of a read of `place`, **not** filtered by any sanitizer kill.
     ///
-    /// `discriminant_only` restricts the read to `place` and its ancestors (see
-    /// the module docs).
+    /// `discriminant_only` restricts the read to `place` and its ancestors
+    /// (see the module docs). Used where no block context is available:
+    /// tests, and callers that read the fully-accumulated state rather
+    /// than one program point. [`Self::read_at`] is the flow-sensitive
+    /// counterpart every transfer function inside a body uses.
     #[must_use]
     pub fn read(&self, place: &Place, discriminant_only: bool) -> TaintSet {
         let place = self.canonical(place);
@@ -330,7 +339,28 @@ impl TaintState {
         out
     }
 
-    /// Taint of every place rooted at `local` (how an out-parameter is read back).
+    /// [`Self::read`], filtered to the kills that dominate `at_block`.
+    #[must_use]
+    pub fn read_at(
+        &self,
+        place: &Place,
+        discriminant_only: bool,
+        at_block: &str,
+        graph: &ControlGraph,
+    ) -> TaintSet {
+        let raw = self.read(place, discriminant_only);
+        if self.kills.is_empty() || raw.is_empty() {
+            return raw;
+        }
+        let Some(at) = graph.index_of(at_block) else {
+            return raw;
+        };
+        let killed = self.killed_kinds_at(&self.canonical(place), at, graph);
+        if killed.is_empty() { raw } else { raw.without(&killed) }
+    }
+
+    /// Taint of every place rooted at `local` (how an out-parameter is read
+    /// back), **not** filtered by any sanitizer kill. See [`Self::read`].
     #[must_use]
     pub fn read_root(&self, local: Local) -> TaintSet {
         let mut out = TaintSet::new();
@@ -340,29 +370,45 @@ impl TaintState {
         out
     }
 
+    /// [`Self::read_root`], filtered to the kills that dominate `at_block`.
+    #[must_use]
+    pub fn read_root_at(&self, local: Local, at_block: &str, graph: &ControlGraph) -> TaintSet {
+        let raw = self.read_root(local);
+        if self.kills.is_empty() || raw.is_empty() {
+            return raw;
+        }
+        let Some(at) = graph.index_of(at_block) else {
+            return raw;
+        };
+        let root = Place {
+            local,
+            projections: Vec::new(),
+        };
+        let killed = self.killed_kinds_at(&root, at, graph);
+        if killed.is_empty() { raw } else { raw.without(&killed) }
+    }
+
     /// Add `set` to `place`; `true` when anything new landed.
+    ///
+    /// Kills are never consulted here: storage keeps every fact exactly as
+    /// it was observed. A kill only ever hides facts from a *read* whose
+    /// block it dominates ([`Self::read_at`]). Stripping at write time, as
+    /// an earlier revision did, destroyed the very distinction this exists
+    /// to keep. A value read before the sanitizer ran would already be gone
+    /// by the time anything asked for it.
     pub fn add(&mut self, place: &Place, set: &TaintSet) -> bool {
         if set.is_empty() {
             return false;
         }
         let place = self.canonical(place);
-        let killed = self.killed_kinds(&place);
-        let set = if killed.is_empty() {
-            set.clone()
-        } else {
-            set.without(&killed)
-        };
-        if set.is_empty() {
-            return false;
-        }
         let entries = self.places.entry(place.local).or_default();
         if let Some((_, existing)) = entries
             .iter_mut()
             .find(|(projections, _)| *projections == place.projections)
         {
-            return existing.absorb(&set);
+            return existing.absorb(set);
         }
-        entries.push((place.projections, set));
+        entries.push((place.projections, set.clone()));
         true
     }
 
@@ -464,24 +510,70 @@ mod tests {
         assert!(!state.read(&place(6, &[]), false).is_empty());
     }
 
+    /// `bb0 -> bb1 -> bb2`, straight line: `bb1` dominates `bb2` but not `bb0`.
+    fn chain_graph() -> ControlGraph {
+        let text = "fn f() -> u8 {\n    let mut _0: u8;\n\n\
+                     bb0: {\n        goto -> bb1;\n    }\n\n\
+                     bb1: {\n        goto -> bb2;\n    }\n\n\
+                     bb2: {\n        return;\n    }\n}\n";
+        let doc = crate::mir::parse("test", "t.mir", text);
+        let body = doc.bodies.first().cloned().expect("one body");
+        ControlGraph::new(&body)
+    }
+
     #[test]
-    fn a_kill_removes_and_then_blocks_a_kind() {
+    fn a_kill_is_flow_sensitive_by_block_dominance() {
+        // Issue #1296 P1. A sanitizer kill used to be applied everywhere
+        // in the body once discovered, including at reads that execute
+        // before the sanitizer ever runs. `read_at` fixes that. A kill
+        // only hides a fact from a read whose block the kill's own block
+        // dominates.
         let mut state = TaintState::new();
         state.add(
             &place(2, &[]),
             &TaintSet::of(fact("keys", TaintKind::Order)),
         );
-        state.kill(&place(2, &[]), TaintKind::Order);
-        assert!(state.apply_kills());
-        assert!(state.read(&place(2, &[]), false).is_empty());
-        state.add(
-            &place(2, &[]),
-            &TaintSet::of(fact("keys", TaintKind::Order)),
+        state.kill(&place(2, &[]), TaintKind::Order, "bb1");
+        let graph = chain_graph();
+
+        assert!(
+            !state.read_at(&place(2, &[]), false, "bb0", &graph).is_empty(),
+            "bb0 runs before bb1 (the sanitizer); it must still see the taint"
         );
         assert!(
-            state.read(&place(2, &[]), false).is_empty(),
-            "a sorted place stays sorted for the rest of the fixpoint"
+            state.read_at(&place(2, &[]), false, "bb1", &graph).is_empty(),
+            "a read in the sanitizer's own block is dominated by it"
         );
+        assert!(
+            state.read_at(&place(2, &[]), false, "bb2", &graph).is_empty(),
+            "bb2 runs only after bb1, which dominates it: the read is clean"
+        );
+        assert!(
+            !state.read(&place(2, &[]), false).is_empty(),
+            "the unfiltered read still sees the raw fact — storage never \
+             discards anything a kill covers"
+        );
+    }
+
+    #[test]
+    fn the_per_place_cap_is_per_kind_not_global() {
+        // Issue #1296 P1: seven `Order` facts used to fill the cap and cause an
+        // eighth fact of a DIFFERENT kind (`Value`) to be silently dropped.
+        let mut set = TaintSet::new();
+        for i in 0..MAX_FACTS {
+            assert!(set.insert(fact(&format!("order-{i}"), TaintKind::Order)));
+        }
+        assert!(
+            !set.insert(fact("one-more-order", TaintKind::Order)),
+            "a seventh Order fact past the per-kind cap is still dropped"
+        );
+        assert!(
+            set.insert(fact("value", TaintKind::Value)),
+            "a fact of a kind not yet represented must never be dropped just \
+             because another kind's slots are full"
+        );
+        assert!(set.has(TaintKind::Value));
+        assert_eq!(set.facts().iter().filter(|f| f.kind == TaintKind::Order).count(), MAX_FACTS);
     }
 
     #[test]

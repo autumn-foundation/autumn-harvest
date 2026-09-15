@@ -46,11 +46,14 @@ const MAX_ROUNDS: u32 = 24;
 /// fact. Facts are deduplicated on `(kind, source)` over a finite set of
 /// sources, so the alternation terminates well inside this cap.
 const MAX_IMPLICIT_PASSES: u32 = 8;
-/// Taint of reading one operand. `discriminant` restricts the read to the
-/// place and its ancestors (see [`super::taint`]).
-fn read_operand(operand: &Operand, state: &TaintState, discriminant: bool) -> TaintSet {
+/// Taint of reading one operand, from `frame.block` — flow-sensitive to any
+/// sanitizer kill that block dominates ([`TaintState::read_at`]). `discriminant`
+/// restricts the read to the place and its ancestors (see [`super::taint`]).
+fn read_operand(frame: Frame<'_>, operand: &Operand, state: &TaintState, discriminant: bool) -> TaintSet {
     match operand {
-        Operand::Copy(place) | Operand::Move(place) => state.read(place, discriminant),
+        Operand::Copy(place) | Operand::Move(place) => {
+            state.read_at(place, discriminant, &frame.block.label, frame.graph)
+        }
         Operand::Const { .. } => TaintSet::new(),
     }
 }
@@ -128,6 +131,9 @@ struct Frame<'f> {
     subst: &'f Substitution,
     /// The hop chain from the workflow entry to this body.
     hops: &'f [Hop],
+    /// This body's control graph, for dominance-aware reads
+    /// ([`TaintState::read_at`]) and control-dependent implicit flow.
+    graph: &'f ControlGraph,
 }
 
 impl<'f> Frame<'f> {
@@ -376,19 +382,38 @@ impl<'a> Analyzer<'a> {
             );
             return conservative(args);
         };
+        // The CFG never changes while the facts do. Dominance and
+        // post-dominance are therefore computed once per body and shared by
+        // every round, by implicit flow and by the control-dependent-sink
+        // pass. A sanitizer kill's flow-sensitivity
+        // ([`TaintState::read_at`]) depends on the graph being in hand from
+        // the very first round of the very first attempt.
+        let graph = ControlGraph::new(body);
         let frame = Frame {
             path,
             body,
             block: first,
             subst,
             hops,
+            graph: &graph,
         };
         let mut state = TaintState::new();
-        let mut kills: Vec<(Place, TaintKind)> = Vec::new();
-        // The CFG never changes while the facts do, so post-dominance is
-        // computed at most once per body and shared by implicit flow and by the
-        // control-dependent-sink pass.
-        let mut graph: Option<ControlGraph> = None;
+        let mut kills: Vec<(Place, TaintKind, String)> = Vec::new();
+        // Set when a round loop below hits `MAX_ROUNDS` while state was still
+        // changing on the last round. The fixpoint did not converge, so the
+        // state below is a partial answer, not the true one. It is reported
+        // as a boundary rather than trusted, because an unconverged body
+        // missing a later propagation would otherwise read as
+        // `proven-deterministic`.
+        let mut fixpoint_exhausted = false;
+        // Two nested loops. The inner one is the flow-insensitive fixpoint
+        // over facts. The outer one exists for a sanitizer discovered
+        // *late* in a round (`keys().collect()` in `bb3`, `sort()` in
+        // `bb5`). [`TaintState::read_at`] only sees a kill once it is in
+        // `state.kills()`, so a read processed earlier *this attempt*
+        // cannot yet be dominance-aware of it. Re-running the whole body
+        // with the kills already seeded is the cheapest correct answer, and
+        // the kill set only grows, so it terminates.
         for _attempt in 0..3 {
             state = TaintState::new();
             state.seed_kills(&kills);
@@ -404,26 +429,36 @@ impl<'a> Analyzer<'a> {
                 }
             }
             for _pass in 0..MAX_IMPLICIT_PASSES {
+                let mut round_converged = false;
                 for _round in 0..MAX_ROUNDS {
                     let mut changed = false;
                     for block in &body.blocks {
                         changed |= self.run_block(frame.at(block), &mut state, None);
                     }
-                    changed |= state.apply_kills();
                     if !changed {
+                        round_converged = true;
                         break;
                     }
                 }
-                state.apply_kills();
-                if !implicit_flow(frame, body, &mut graph, &mut state) {
+                if !round_converged {
+                    fixpoint_exhausted = true;
+                }
+                if !implicit_flow(frame, body, &graph, &mut state) {
                     break;
                 }
             }
-            state.apply_kills();
             if state.kills().len() == kills.len() {
                 break;
             }
             kills = state.kills().to_vec();
+        }
+        if fixpoint_exhausted {
+            self.push_boundary(
+                BoundaryKind::FixpointExhausted,
+                &format!("{path}: the taint fixpoint did not converge within {MAX_ROUNDS} rounds"),
+                path,
+                "bb0",
+            );
         }
 
         // Reporting pass: sinks, boundaries and forbidden effects are emitted
@@ -437,10 +472,19 @@ impl<'a> Analyzer<'a> {
         for block in &body.blocks {
             self.run_block(frame.at(block), &mut state, Some(&mut report));
         }
-        self.control_dependent_sinks(path, body, &mut graph, &sinks, &branches);
+        self.control_dependent_sinks(path, &graph, &sinks, &branches);
+        Self::build_outcome(body, &state, &graph, !sinks.is_empty())
+    }
 
+    /// The return value and every written `&mut` out-parameter, from the
+    /// converged state — each read at every live return block
+    /// ([`read_at_every_return`]).
+    fn build_outcome(body: &Body, state: &TaintState, graph: &ControlGraph, has_sink: bool) -> BodyOutcome {
         let mut outcome = BodyOutcome {
-            ret: state.read(
+            ret: read_at_every_return(
+                state,
+                body,
+                graph,
                 &Place {
                     local: Local(0),
                     projections: Vec::new(),
@@ -448,13 +492,13 @@ impl<'a> Analyzer<'a> {
                 false,
             ),
             out: BTreeMap::new(),
-            has_sink: !sinks.is_empty(),
+            has_sink,
         };
         for (index, (local, declared)) in body.params.iter().enumerate() {
             if !declared.trim_start().starts_with("&mut") && !declared.contains("*mut") {
                 continue;
             }
-            let written = state.read_root(*local);
+            let written = read_root_at_every_return(state, body, graph, *local);
             if !written.is_empty() {
                 outcome.out.insert(index, written);
             }
@@ -509,7 +553,7 @@ impl<'a> Analyzer<'a> {
                     .discriminant_of
                     .as_ref()
                     .is_some_and(|p| Some(p) == operand_place(operand));
-                set.absorb(&read_operand(operand, state, discriminant));
+                set.absorb(&read_operand(frame, operand, state, discriminant));
             }
             if let Some(alloc) = &rvalue.static_alloc {
                 // `const {allocN: *mut T}` is a raw pointer to a static, not a
@@ -563,7 +607,7 @@ impl<'a> Analyzer<'a> {
                 if targets.len() >= 2
                     && let Some(report) = report
                 {
-                    let facts = read_operand(operand, state, false);
+                    let facts = read_operand(frame, operand, state, false);
                     if !facts.is_empty() {
                         report.branches.push(BranchRecord {
                             block: frame.block.label.clone(),
@@ -629,7 +673,7 @@ impl<'a> Analyzer<'a> {
         let arg_taints: Vec<TaintSet> = call
             .args
             .iter()
-            .map(|operand| read_operand(operand, state, false))
+            .map(|operand| read_operand(frame, operand, state, false))
             .collect();
         let union = union_of(&arg_taints);
 
@@ -686,13 +730,13 @@ impl<'a> Analyzer<'a> {
                 .iter()
                 .map(|index| index.saturating_add(offset))
                 .collect();
-            self.descend_closures(frame, call, &arg_taints, state, &opaque);
+            self.descend_closures(frame, call, &arg_taints, state, &opaque, emit);
             // A command's result is recorded in history and replayed verbatim.
             return false;
         }
 
         if site.registers_handler() {
-            self.descend_closures(frame, call, &arg_taints, state, &BTreeSet::new());
+            self.descend_closures(frame, call, &arg_taints, state, &BTreeSet::new(), emit);
             return false;
         }
 
@@ -703,11 +747,11 @@ impl<'a> Analyzer<'a> {
         if let Some(rule) = site.source()
             && self.bare_row_applies(frame, &site.printed, &rule.path, rule.receiver.as_deref())
         {
-            return self.transfer_source(frame, call, rule, &site.printed, &arg_taints, state);
+            return self.transfer_source(frame, call, rule, &site.printed, &arg_taints, state, emit);
         }
 
         if let Some(rule) = site.sanitizer() {
-            return self.transfer_sanitizer(frame, call, rule, &arg_taints, state);
+            return self.transfer_sanitizer(frame, call, rule, &arg_taints, state, emit);
         }
 
         if let Some(rule) = site.reduction() {
@@ -770,6 +814,7 @@ impl<'a> Analyzer<'a> {
     /// created inside the workflow body reaching `lock()` is not a source, while
     /// the identical call on a `static` one — whose read already tainted the
     /// receiver — is.
+    #[allow(clippy::too_many_arguments)]
     fn transfer_source(
         &mut self,
         frame: Frame<'_>,
@@ -778,6 +823,7 @@ impl<'a> Analyzer<'a> {
         printed: &str,
         arg_taints: &[TaintSet],
         state: &mut TaintState,
+        emit: bool,
     ) -> bool {
         let ambient = rule
             .receiver
@@ -798,7 +844,7 @@ impl<'a> Analyzer<'a> {
                 hops: hop_chain,
             });
         }
-        self.descend_closures(frame, call, arg_taints, state, &BTreeSet::new());
+        self.descend_closures(frame, call, arg_taints, state, &BTreeSet::new(), emit);
         let mut changed = state.add(call.dest, &set);
         changed |= Self::write_back_refs(frame.body, call.args, &set, state, None);
         changed
@@ -817,14 +863,15 @@ impl<'a> Analyzer<'a> {
         rule: &SanitizerRule,
         arg_taints: &[TaintSet],
         state: &mut TaintState,
+        emit: bool,
     ) -> bool {
         let union = union_of(arg_taints);
-        let closure_taint = self.closure_argument_taint(frame, call, arg_taints, state);
+        let closure_taint = self.closure_argument_taint(frame, call, arg_taints, state, emit);
         if closure_taint.is_empty() {
             if let Some(receiver) = call.args.first().and_then(operand_place) {
-                state.kill(receiver, rule.clears);
+                state.kill(receiver, rule.clears, &frame.block.label);
             }
-            state.kill(call.dest, rule.clears);
+            state.kill(call.dest, rule.clears, &frame.block.label);
             let mut cleared = BTreeSet::new();
             cleared.insert(rule.clears);
             return state.add(call.dest, &union.without(&cleared));
@@ -959,7 +1006,7 @@ impl<'a> Analyzer<'a> {
             state,
             Some(&outcome),
         );
-        self.descend_closures(frame, call, arg_taints, state, &BTreeSet::new());
+        self.descend_closures(frame, call, arg_taints, state, &BTreeSet::new(), report.is_some());
         if outcome.has_sink
             && let Some(report) = report
         {
@@ -1085,7 +1132,7 @@ impl<'a> Analyzer<'a> {
                     function: frame.path.to_string(),
                     step: format!("calls {printed}"),
                 };
-                self.descend_closures(frame, call, arg_taints, state, &BTreeSet::new());
+                self.descend_closures(frame, call, arg_taints, state, &BTreeSet::new(), emit);
                 let mut changed = state.add(call.dest, &union.with_hop(&hop));
                 changed |= Self::write_back_refs(frame.body, call.args, &union, state, None);
                 changed
@@ -1144,13 +1191,31 @@ impl<'a> Analyzer<'a> {
     /// top of braces.
     fn is_trusted_bodyless(&self, frame: Frame<'_>, call: CallOperands<'_>, printed: &str) -> bool {
         let parsed = CalleePath::parse(printed);
-        if self.model.is_std_free_fn(&parsed) {
+        if self.is_trusted_bodyless_path(printed, &parsed) {
             return true;
         }
-        // (1) A trusted crate root at the head of the callee's OWNER path.
-        if path_roots(&callee_owner_text(printed, &parsed)).any(|root| self.is_trusted_root(root)) {
-            return true;
-        }
+        self.is_trusted_bodyless_receiver(frame, call, &parsed)
+    }
+
+    /// Factors (1) and (3) of [`Self::is_trusted_bodyless`]: the parts that
+    /// need only the callee path itself, no call site to read a receiver
+    /// argument from. Used there, and for a bare `fn`-item callback
+    /// ([`Self::fn_item_callback`]). A callback has a callee path but no
+    /// observed call — a function passed by value is not itself a call site.
+    fn is_trusted_bodyless_path(&self, printed: &str, parsed: &CalleePath) -> bool {
+        self.model.is_std_free_fn(parsed)
+            || path_roots(&callee_owner_text(printed, parsed)).any(|root| self.is_trusted_root(root))
+    }
+
+    /// Factor (2) of [`Self::is_trusted_bodyless`]: trust read off the
+    /// receiver — a primitive self type, or a receiver argument/declared type
+    /// rooted entirely in trusted crates.
+    fn is_trusted_bodyless_receiver(
+        &self,
+        frame: Frame<'_>,
+        call: CallOperands<'_>,
+        parsed: &CalleePath,
+    ) -> bool {
         let Some(receiver) = parsed.receiver.as_deref() else {
             return false;
         };
@@ -1299,7 +1364,11 @@ impl<'a> Analyzer<'a> {
             };
             let mut inner_hops = frame.hops.to_vec();
             inner_hops.push(hop.clone());
-            let seeded = vec![state.read(place, false).with_hop(&hop)];
+            let seeded = vec![
+                state
+                    .read_at(place, false, &frame.block.label, frame.graph)
+                    .with_hop(&hop),
+            ];
             let outcome = self.analyze_body(target, &Substitution::new(), &seeded, &inner_hops);
             changed |= state.add(place, &outcome.ret);
             if let Some(written) = outcome.out.get(&0) {
@@ -1322,7 +1391,9 @@ impl<'a> Analyzer<'a> {
     }
 
     /// Analyze every closure passed as an argument, assuming it is invoked, and
-    /// fold what it returns into the call's destination.
+    /// fold what it returns into the call's destination. `emit` is `true` only
+    /// on the final reporting pass, which is when a missing callback becomes a
+    /// boundary rather than being silently retried next round.
     fn descend_closures(
         &mut self,
         frame: Frame<'_>,
@@ -1330,8 +1401,9 @@ impl<'a> Analyzer<'a> {
         arg_taints: &[TaintSet],
         state: &mut TaintState,
         opaque: &BTreeSet<usize>,
+        emit: bool,
     ) {
-        let taint = self.closure_argument_taint_inner(frame, call, arg_taints, state, opaque);
+        let taint = self.closure_argument_taint_inner(frame, call, arg_taints, state, opaque, emit);
         if !taint.is_empty() {
             state.add(call.dest, &taint);
         }
@@ -1344,8 +1416,9 @@ impl<'a> Analyzer<'a> {
         call: CallOperands<'_>,
         arg_taints: &[TaintSet],
         state: &mut TaintState,
+        emit: bool,
     ) -> TaintSet {
-        self.closure_argument_taint_inner(frame, call, arg_taints, state, &BTreeSet::new())
+        self.closure_argument_taint_inner(frame, call, arg_taints, state, &BTreeSet::new(), emit)
     }
 
     /// Every closure argument outside `opaque`, analyzed as if it were invoked
@@ -1358,6 +1431,7 @@ impl<'a> Analyzer<'a> {
         arg_taints: &[TaintSet],
         state: &mut TaintState,
         opaque: &BTreeSet<usize>,
+        emit: bool,
     ) -> TaintSet {
         let mut out = TaintSet::new();
         for (index, operand) in call.args.iter().enumerate() {
@@ -1378,7 +1452,23 @@ impl<'a> Analyzer<'a> {
             // picking one, can lose the finding.
             let mut note = String::new();
             let targets: Vec<(String, String, bool)> = match closure {
-                Some((_, bodies)) if bodies.is_empty() => Vec::new(),
+                // A closure span is present, but no body in the analyzed
+                // set was printed with it. That happens with a partial
+                // dump, or a handler registration whose body was never
+                // emitted. Silently contributing nothing here is how a
+                // callback with a sink or a source inside it went unseen.
+                // The honest answer is `unknown`, never a quiet `proven`.
+                Some((span, bodies)) if bodies.is_empty() => {
+                    if emit {
+                        self.push_boundary(
+                            BoundaryKind::UnresolvedCallback,
+                            &span,
+                            frame.path,
+                            &frame.block.label,
+                        );
+                    }
+                    Vec::new()
+                }
                 Some((span, bodies)) => {
                     note = self.union_note(frame.path, &span, Ambiguity::Closure, &bodies);
                     bodies
@@ -1386,11 +1476,13 @@ impl<'a> Analyzer<'a> {
                         .map(|body| (span.clone(), body, true))
                         .collect()
                 }
-                None => self
-                    .fn_item_targets(frame, operand)
-                    .into_iter()
-                    .map(|path| (path.clone(), path, false))
-                    .collect(),
+                None => {
+                    self.fn_item_callback(frame, operand, &mut out, emit);
+                    self.fn_item_targets(frame, operand)
+                        .into_iter()
+                        .map(|path| (path.clone(), path, false))
+                        .collect()
+                }
             };
             for (span, target, has_env) in targets {
                 self.invoke_argument_body(
@@ -1410,6 +1502,64 @@ impl<'a> Analyzer<'a> {
             }
         }
         out
+    }
+
+    /// A bare `fn` item argument that names no body in the analyzed set.
+    /// Runs it through the model exactly as a direct call would be. So
+    /// `.unwrap_or_else(SystemTime::now)` starts a source, and
+    /// `.map(String::from)` — a `[[std_free_fn]]` — stays clean, instead of
+    /// silently contributing nothing either way.
+    ///
+    /// Contributes directly to `out` rather than returning a target to invoke:
+    /// there is no body to seed and analyze, only a callee path to classify.
+    fn fn_item_callback(&mut self, frame: Frame<'_>, operand: &Operand, out: &mut TaintSet, emit: bool) {
+        let Some((printed, resolution)) = self.fn_item_resolution(frame, operand) else {
+            return;
+        };
+        let Resolution::External(_) = resolution else {
+            // `Body`/`Bodies` are handled by the ordinary invoke path; a
+            // `Boundary` from `resolve_call` (an explicitly rooted, untrusted
+            // path) is honoured as-is.
+            if let Resolution::Boundary(kind, detail) = resolution
+                && emit
+            {
+                self.push_boundary(kind, &detail, frame.path, &frame.block.label);
+            }
+            return;
+        };
+        let parsed = CalleePath::parse(&printed);
+        let classes = self.model.classify(&parsed, None);
+        if let Some(rule) = classes.iter().find_map(|c| match c {
+            CallClass::Source(rule) => Some(*rule),
+            _ => None,
+        }) {
+            let at = Self::site(frame.path, &frame.block.label, &printed);
+            let mut hops = frame.hops.to_vec();
+            hops.push(Hop {
+                function: frame.path.to_string(),
+                step: format!("invokes fn item {printed} ({})", first_sentence(&rule.reason)),
+            });
+            out.insert(Fact {
+                kind: rule.kind,
+                source: at,
+                hops,
+            });
+            return;
+        }
+        if classes
+            .iter()
+            .any(|c| matches!(c, CallClass::Sanctioned(_) | CallClass::NonSink(_)))
+        {
+            return;
+        }
+        if emit && !self.is_trusted_bodyless_path(&printed, &parsed) {
+            self.push_boundary(
+                BoundaryKind::ExternalCrateBody,
+                &printed,
+                frame.path,
+                &frame.block.label,
+            );
+        }
     }
 
     /// One `(argument, body)` pair from [`Self::closure_argument_taint_inner`]:
@@ -1478,39 +1628,65 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    /// Every body a bare `fn` item argument names, if the analyzed set has it.
+    /// The callee path a bare `fn` item argument names, and where it
+    /// resolves. Returns `None` when `operand` is not shaped like a
+    /// function item at all.
     ///
     /// A fn item is a ZST: MIR passes it as the constant `add_clock`, and its
     /// type is spelled `fn(u64) -> u64 {add_clock}`. Neither carries a
     /// `{closure@..}` span, so the closure path never sees it — yet
     /// `.map(Uuid::new_v4)`, `.unwrap_or_else(Instant::now)` and
     /// `.or_insert_with(SystemTime::now)` are all this shape.
-    fn fn_item_targets(&self, frame: Frame<'_>, operand: &Operand) -> Vec<String> {
+    fn fn_item_resolution(&self, frame: Frame<'_>, operand: &Operand) -> Option<(String, Resolution)> {
         let candidate = match operand {
             Operand::Const { text, .. } => {
+                // `Operand::Const::text` is the whole printed operand,
+                // including the `const ` keyword (`const add_clock`, `const
+                // 1_u64`) — the same shape [`Analyzer::const_taint`] strips
+                // before reading a static. Unlike the declared-type arm
+                // below, this is never brace-wrapped for a real fn item;
+                // that form lives on the TYPE instead. A bracketed constant
+                // here is a `{closure@..}` (already handled by
+                // `closure_span_of` upstream), an `{async fn body of f()}`
+                // marker, or an `{allocN: ..}` footer reference. None of
+                // them is a plain path, and the `{`/`"`/`'` guard below
+                // rejects all three rather than mistaking their contents
+                // for one.
                 let text = frame.subst.apply(text);
-                fn_item_path(&text).unwrap_or(text)
+                let trimmed = text.trim();
+                trimmed.strip_prefix("const ").unwrap_or(trimmed).to_string()
             }
             Operand::Copy(place) | Operand::Move(place) => {
-                let Some(declared) = frame.body.locals.get(&place.local) else {
-                    return Vec::new();
-                };
+                let declared = frame.body.locals.get(&place.local)?;
                 let declared = frame.subst.apply(declared);
-                let Some(path) = fn_item_path(&declared) else {
-                    return Vec::new();
-                };
-                path
+                fn_item_path(&declared)?
             }
         };
         let candidate = candidate.trim();
-        if candidate.is_empty() || !candidate.starts_with(is_path_start) {
-            return Vec::new();
+        // A real path or fn-item name never contains whitespace. This is
+        // what rejects `fn_item_path` matching the *inside* of a
+        // non-fn-item brace form it was not designed for. `{async fn body
+        // of tick()}`, a coroutine's own future-object type, extracts as
+        // "async fn body of tick()" and would otherwise pass every other
+        // check here.
+        if candidate.is_empty()
+            || !candidate.starts_with(is_path_start)
+            || candidate.starts_with(['{', '"', '\''])
+            || candidate.contains(char::is_whitespace)
+        {
+            return None;
         }
         let bare = strip_generics_everywhere(candidate);
-        match self.program.resolve_call(frame.path, &bare) {
-            Resolution::Body(target) => vec![target],
-            Resolution::Bodies(targets, _) => targets,
-            Resolution::External(_) | Resolution::Boundary(..) => Vec::new(),
+        let resolution = self.program.resolve_call(frame.path, &bare);
+        Some((bare, resolution))
+    }
+
+    /// Every body a bare `fn` item argument names, if the analyzed set has it.
+    fn fn_item_targets(&self, frame: Frame<'_>, operand: &Operand) -> Vec<String> {
+        match self.fn_item_resolution(frame, operand) {
+            Some((_, Resolution::Body(target))) => vec![target],
+            Some((_, Resolution::Bodies(targets, _))) => targets,
+            _ => Vec::new(),
         }
     }
 
@@ -1676,15 +1852,13 @@ impl<'a> Analyzer<'a> {
     fn control_dependent_sinks(
         &mut self,
         path: &str,
-        body: &Body,
-        graph: &mut Option<ControlGraph>,
+        graph: &ControlGraph,
         sinks: &[SinkRecord],
         branches: &[BranchRecord],
     ) {
         if sinks.is_empty() || branches.is_empty() {
             return;
         }
-        let graph = graph.get_or_insert_with(|| ControlGraph::new(body));
         for branch in branches {
             let Some(branch_at) = graph.index_of(&branch.block) else {
                 continue;
@@ -2007,6 +2181,55 @@ fn copied_reference(body: &Body, dest: &Place, rvalue: &crate::mir::ast::Rvalue)
         .then(|| place.clone())
 }
 
+/// The value of `place` as the **caller** observes it: the union, over every
+/// live `return`-terminated block, of the dominance-filtered read from that
+/// block ([`TaintState::read_at`]).
+///
+/// A body can return from more than one block, and a sanitizer on one
+/// return path says nothing about a different one. The safe answer is the
+/// union of what every live return sees, never a guess at which one a
+/// given call took. A body with no live return at all (it always panics or
+/// loops) falls back to the unfiltered read. That is the safe direction
+/// for a place that is never actually handed back.
+fn read_at_every_return(
+    state: &TaintState,
+    body: &Body,
+    graph: &ControlGraph,
+    place: &Place,
+    discriminant: bool,
+) -> TaintSet {
+    let mut out = TaintSet::new();
+    let mut any = false;
+    for block in &body.blocks {
+        if !matches!(block.terminator, Terminator::Return) {
+            continue;
+        }
+        if graph.index_of(&block.label).is_none_or(|at| !graph.is_live(at)) {
+            continue;
+        }
+        any = true;
+        out.absorb(&state.read_at(place, discriminant, &block.label, graph));
+    }
+    if any { out } else { state.read(place, discriminant) }
+}
+
+/// [`read_at_every_return`] for [`TaintState::read_root`] (an out-parameter).
+fn read_root_at_every_return(state: &TaintState, body: &Body, graph: &ControlGraph, local: Local) -> TaintSet {
+    let mut out = TaintSet::new();
+    let mut any = false;
+    for block in &body.blocks {
+        if !matches!(block.terminator, Terminator::Return) {
+            continue;
+        }
+        if graph.index_of(&block.label).is_none_or(|at| !graph.is_live(at)) {
+            continue;
+        }
+        any = true;
+        out.absorb(&state.read_root_at(local, &block.label, graph));
+    }
+    if any { out } else { state.read_root(local) }
+}
+
 /// Implicit flow: a value produced *by* a tainted branch carries that branch's
 /// taint (D4/D5).
 ///
@@ -2029,17 +2252,11 @@ fn copied_reference(body: &Body, dest: &Place, rvalue: &crate::mir::ast::Rvalue)
 ///
 /// Returns `true` when anything new landed, so the caller can iterate: a
 /// control-derived value can itself decide a later branch.
-fn implicit_flow(
-    frame: Frame<'_>,
-    body: &Body,
-    graph: &mut Option<ControlGraph>,
-    state: &mut TaintState,
-) -> bool {
-    let branches = tainted_branches(body, state);
+fn implicit_flow(frame: Frame<'_>, body: &Body, graph: &ControlGraph, state: &mut TaintState) -> bool {
+    let branches = tainted_branches(body, state, graph);
     if branches.is_empty() {
         return false;
     }
-    let graph = graph.get_or_insert_with(|| ControlGraph::new(body));
     let mut changed = false;
     for branch in &branches {
         let Some(branch_at) = graph.index_of(&branch.block) else {
@@ -2073,12 +2290,13 @@ fn implicit_flow(
     changed
 }
 
-/// Every `switchInt` whose operand carries taint, read against `state`.
+/// Every `switchInt` whose operand carries taint, read against `state` from
+/// its own block (flow-sensitive to a dominating sanitizer kill).
 ///
 /// Deliberately side-effect free: the reporting pass collects the same records
 /// while it emits findings, but the fixpoint needs them without emitting
 /// anything.
-fn tainted_branches(body: &Body, state: &TaintState) -> Vec<BranchRecord> {
+fn tainted_branches(body: &Body, state: &TaintState, graph: &ControlGraph) -> Vec<BranchRecord> {
     let mut out = Vec::new();
     for block in &body.blocks {
         let Terminator::SwitchInt { operand, targets } = &block.terminator else {
@@ -2087,7 +2305,12 @@ fn tainted_branches(body: &Body, state: &TaintState) -> Vec<BranchRecord> {
         if targets.len() < 2 {
             continue;
         }
-        let facts = read_operand(operand, state, false);
+        let facts = match operand {
+            Operand::Copy(place) | Operand::Move(place) => {
+                state.read_at(place, false, &block.label, graph)
+            }
+            Operand::Const { .. } => TaintSet::new(),
+        };
         if facts.is_empty() {
             continue;
         }

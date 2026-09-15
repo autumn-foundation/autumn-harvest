@@ -13,6 +13,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AllowEntry {
     /// Fully-qualified workflow fn path (`crate::module::name`).
     pub workflow: String,
@@ -21,6 +22,7 @@ pub struct AllowEntry {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Allowlist {
     #[serde(default)]
     pub allow: Vec<AllowEntry>,
@@ -123,6 +125,15 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(message.contains("seeded::wf_x"), "{message}");
+    }
+
+    #[test]
+    fn an_unknown_field_is_a_hard_error() {
+        // Issue #1296 "also worth doing": the model structs reject a typo'd key
+        // with `deny_unknown_fields`; the allowlist used to accept one silently.
+        let text = "[[allow]]\nworkflow = \"seeded::wf_x\"\njustification = \"reason\"\njustifcation = \"typo\"\n";
+        let err = toml::from_str::<Allowlist>(text).expect_err("a typo'd key must be rejected");
+        assert!(format!("{err}").contains("unknown field"), "{err}");
     }
 
     #[test]
