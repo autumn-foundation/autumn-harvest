@@ -823,16 +823,39 @@ pub(crate) async fn load_child_executions_from_url(
         .expect("failed to reload child workflow executions")
 }
 
+/// Issue #1298: `insert_workflow_execution()` must be safe to call more than
+/// once against the same database. A fixed `workflow_id` collided with the
+/// partial `UNIQUE(workflow_name, workflow_id)` active index on the second
+/// call. That index also covers a fresh `RUNNING` row, not only a sealed
+/// one. The documented `HARVEST_TEST_DATABASE_URL` fallback runs more than
+/// one test in a process, so it hits this exact path.
+#[tokio::test]
+async fn insert_workflow_execution_helper_is_safe_to_call_more_than_once() {
+    let (mut conn, _container) = setup_test_db().await;
+
+    let first = insert_workflow_execution(&mut conn).await;
+    let second = insert_workflow_execution(&mut conn).await;
+
+    assert_ne!(
+        first, second,
+        "each call should mint a distinct execution, never reusing a row"
+    );
+}
+
 /// Insert a minimal `harvest_workflow_executions` row and return its UUID.
 pub(crate) async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
     let exec_id = ExecutionId::new();
+    // Unique per call so repeated runs against the same (non-throwaway)
+    // database never collide on the partial `UNIQUE(workflow_name, workflow_id)`
+    // active index (issue #1298).
+    let workflow_id = format!("e2e-wf-{}", Uuid::new_v4().simple());
     let row = NewWorkflowExecution {
         quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "e2e_test_workflow",
-        workflow_id: "e2e-wf-001",
+        workflow_id: &workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: 0,
         input: serde_json::json!({"test": true}),
@@ -937,10 +960,8 @@ pub(crate) async fn insert_workflow_execution_on_shard(
 }
 
 /// Insert a RUNNING execution with a caller-supplied `workflow_id` (all other
-/// fields mirror [`insert_workflow_execution`]). Needed when a single test/setup
-/// inserts more than one live execution: they would otherwise collide on the
-/// partial `UNIQUE(workflow_name, workflow_id)` active index that
-/// [`insert_workflow_execution`]'s hardcoded id trips on a second call.
+/// fields mirror [`insert_workflow_execution`]). Use this when a test needs a
+/// specific, known `workflow_id`; [`insert_workflow_execution`] mints its own.
 pub(crate) async fn insert_workflow_execution_with_id(
     conn: &mut AsyncPgConnection,
     workflow_id: &str,
@@ -6462,19 +6483,6 @@ async fn worker_continue_as_new_records_own_start_source_referencing_predecessor
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
         .await
         .expect("failed to connect to Postgres container");
-    // Isolate from a shared HARVEST_TEST_DATABASE_URL: other e2e tests reuse the
-    // fixed `e2e_test_workflow` / `e2e-wf-001` identity, so clear those rows
-    // (and the child workflow's) up front. A no-op against a fresh CI container.
-    for stmt in [
-        "DELETE FROM harvest_events WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow'))",
-        "DELETE FROM harvest_task_queue WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow'))",
-        "DELETE FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow')",
-    ] {
-        diesel::sql_query(stmt)
-            .execute(&mut conn)
-            .await
-            .expect("pre-test scrub");
-    }
 
     let original_exec_id = insert_workflow_execution(&mut conn).await;
     // Give the predecessor a DISTINCT source so "successor never inherits" is
@@ -6563,19 +6571,6 @@ async fn worker_child_workflow_records_child_start_source_referencing_parent() {
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
         .await
         .expect("failed to connect to Postgres container");
-    // Isolate from a shared HARVEST_TEST_DATABASE_URL: other e2e tests reuse the
-    // fixed `e2e_test_workflow` / `e2e-wf-001` identity, so clear those rows
-    // (and the child workflow's) up front. A no-op against a fresh CI container.
-    for stmt in [
-        "DELETE FROM harvest_events WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow'))",
-        "DELETE FROM harvest_task_queue WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow'))",
-        "DELETE FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow')",
-    ] {
-        diesel::sql_query(stmt)
-            .execute(&mut conn)
-            .await
-            .expect("pre-test scrub");
-    }
 
     let parent_exec_id = insert_workflow_execution(&mut conn).await;
     let workflow_input = serde_json::json!({"value": "from-parent"});
@@ -6613,6 +6608,15 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
         .expect("failed to connect to Postgres container");
 
     let original_exec_id = insert_workflow_execution(&mut conn).await;
+    // `insert_workflow_execution()` mints a fresh `workflow_id` per call
+    // (issue #1298), so read back the one this run actually got instead of
+    // assuming a fixed literal.
+    let original_workflow_id: String = harvest_workflow_executions::table
+        .find(original_exec_id.as_uuid())
+        .select(harvest_workflow_executions::workflow_id)
+        .first(&mut conn)
+        .await
+        .expect("failed to read the freshly inserted workflow_id");
     let initial_input = serde_json::json!({"phase": "init"});
     enqueue_started_workflow_task(&mut conn, original_exec_id, initial_input.clone()).await;
 
@@ -6708,7 +6712,7 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
     assert!(
         original_row
             .workflow_id
-            .starts_with("e2e-wf-001::continued-as-new:"),
+            .starts_with(&format!("{original_workflow_id}::continued-as-new:")),
         "sealed historical runs should get a synthetic workflow_id during rollback",
     );
 
@@ -6717,13 +6721,13 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
         .find(|execution| execution.id == successor_exec_id.as_uuid())
         .expect("successor execution should still exist after rollback rewrite");
     assert_eq!(
-        successor_row.workflow_id, "e2e-wf-001",
+        successor_row.workflow_id, original_workflow_id,
         "the latest run should retain the original logical workflow_id",
     );
 
     let rows_on_original_key = executions
         .iter()
-        .filter(|execution| execution.workflow_id == "e2e-wf-001")
+        .filter(|execution| execution.workflow_id == original_workflow_id)
         .count();
     assert_eq!(
         rows_on_original_key, 1,
