@@ -115,12 +115,16 @@ document. Point a generator at either. See [`openapi.md`](openapi.md).
 
 ## Content negotiation: send `Accept: application/json`
 
-Send `Accept: application/json` on every request (issue #1579). `curl`
-sends a bare `Accept: */*` by default. Autumn's error-page content
-negotiation treats that as browser navigation, and answers a validation
-error with a styled HTML page, not the JSON body this contract
-documents. The `harvest` CLI sends the explicit header on every request
-for this reason.
+Send `Accept: application/json` on every plain request (issue #1579).
+`curl` sends a bare `Accept: */*` by default. Autumn's error-page
+content negotiation treats that as browser navigation, and answers a
+validation error with a styled HTML page, not the JSON body this
+contract documents. The `harvest` CLI sends the explicit header on
+every plain request for this reason.
+
+A streaming route is the exception: send `Accept: text/event-stream`
+to `.../events/stream` or `.../stream` instead. `docs/api-contract.json`
+marks each such route's `content_type` accordingly.
 
 ---
 

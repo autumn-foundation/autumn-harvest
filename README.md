@@ -368,11 +368,15 @@ a bearer token. Successful responses are printed as pretty JSON by default; use
 inline `--*-json` values or `--*-file PATH`; use `-` as the file path to read
 from stdin.
 
-The CLI sends `Accept: application/json` on every request (issue #1579). Send
-the same header from `curl` or any other direct client. `curl` sends a bare
-`Accept: */*` by default. Autumn's error-page content negotiation treats that
-as browser navigation, and answers a validation error with a styled HTML
-page, not the JSON body this section documents.
+The CLI sends `Accept: application/json` on every plain request (issue
+#1579). Send the same header from `curl` or any other direct client.
+`curl` sends a bare `Accept: */*` by default. Autumn's error-page content
+negotiation treats that as browser navigation, and answers a validation
+error with a styled HTML page, not the JSON body this section documents.
+
+This does not apply to a streaming request. `harvest events tail` sends
+`Accept: text/event-stream`, and so must any direct client of the
+`.../events/stream` or `.../stream` routes.
 
 ### Migrating a dedicated Harvest database
 
