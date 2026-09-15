@@ -9590,9 +9590,9 @@ async fn catch_up_target_bounds_the_resume_cycle_when_the_backlog_outgrows_the_b
         .await
         .expect("enable");
 
-    // Three cohorts, all already past, each pinned by its own
-    // still-RUNNING execution: droppable once that execution completes,
-    // blocked until then.
+    // Three cohorts, all already past, each pinned by its own execution
+    // row: droppable once that execution is collected, blocked until
+    // then.
     let mut execs = Vec::new();
     for (n, days_ago) in [4_i64, 3, 2].into_iter().enumerate() {
         let ts = Utc::now() - chrono::Duration::days(days_ago);
@@ -9677,20 +9677,18 @@ async fn catch_up_target_bounds_the_resume_cycle_when_the_backlog_outgrows_the_b
          got {outcome_2:?}"
     );
 
-    // Unblock everything, then drive the cycle to completion. A bounded
-    // sequence of further passes -- each still only one attempt, the
-    // same budget as before -- must eventually drop all four partitions.
-    // None may be skipped forever, including the two the cursor has
-    // already passed once while they were still blocked.
+    // Collect every pinning execution, unblocking all four cohorts. Then
+    // drive the cycle to completion. A bounded sequence of further
+    // passes -- each still only one attempt, the same budget as before
+    // -- must eventually drop all four partitions. None may be skipped
+    // forever, including the two the cursor has already passed once
+    // while they were still blocked.
     for exec in &execs {
-        diesel::sql_query(
-            "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
-             WHERE id = $1",
-        )
-        .bind::<diesel::sql_types::Uuid, _>(*exec)
-        .execute(&mut conn)
-        .await
-        .expect("complete the pinned execution");
+        diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(*exec)
+            .execute(&mut conn)
+            .await
+            .expect("collect the pinning execution, unblocking its cohort");
     }
 
     let mut resume_after = outcome_2.sweep.next_resume;
