@@ -5656,6 +5656,45 @@ fn envelope_608(plain: &Value) -> Value {
     encoded["data"]["output"].clone()
 }
 
+/// Undo the identity codec's collision-escape nesting (issue #1253) on one
+/// stored event's payload field, restoring it to `encoded_value` exactly as
+/// given.
+///
+/// Both `start_or_load_workflow_execution` and `store::append_events`
+/// always encode through identity codecs. Suppose a caller hands either an
+/// already-envelope-shaped payload field, to simulate a foreign
+/// codec-encrypting write. The escape guard then sees a collision and
+/// wraps it a second time. That is correct for a real caller, whose
+/// plaintext coincidentally looks like an envelope. Here it is a test
+/// artifact: this fixture wants the SINGLE codec-encoded shape a real
+/// deployment stores, not identity's defensive double wrap. This patches
+/// the stored event back to that shape.
+async fn reset_event_field(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    event_id: i32,
+    field: &str,
+    encoded_value: Value,
+) {
+    let mut event_data: Value = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_events::event_id.eq(event_id))
+        .select(harvest_events::event_data)
+        .first(&mut *conn)
+        .await
+        .expect("load event row");
+    event_data["data"][field] = encoded_value;
+    diesel::update(
+        harvest_events::table
+            .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+            .filter(harvest_events::event_id.eq(event_id)),
+    )
+    .set(harvest_events::event_data.eq(event_data))
+    .execute(&mut *conn)
+    .await
+    .expect("restore event field");
+}
+
 /// Single-shard API+UI app with read-path decoding enabled (issue #608):
 /// admin boundary + codec registry mirrored + the opt-in flag set.
 fn build_decode_enabled_api_with_ui_app(database_url: &str) -> axum::Router {
@@ -5832,6 +5871,7 @@ async fn workflow_detail_ui_renders_decoded_input() {
     )
     .await
     .expect("workflow insert should succeed");
+    reset_event_field(&mut conn, exec_id, 0, "input", input_envelope.clone()).await;
 
     // Blocked-on panel + timeline fixtures (issue #608, AC4): an
     // envelope-bearing timeline event, a pending activity whose stored
@@ -5850,19 +5890,29 @@ async fn workflow_detail_ui_renders_decoded_input() {
         let history = autumn_harvest::store::load_history_undecoded(&mut conn, exec_id)
             .await
             .expect("load history");
+        let timeline_event_id = history.next_event_id;
+        let timeline_input = envelope_608(&json!({"card": "pii-detail-event"}));
         autumn_harvest::store::append_events(
             &mut conn,
             exec_id,
             &[autumn_harvest::WorkflowEvent::ActivityScheduled {
                 activity_id: autumn_harvest::types::ActivityExecId::new(),
                 name: "charge_card".to_string(),
-                input: envelope_608(&json!({"card": "pii-detail-event"})),
+                input: timeline_input.clone(),
                 queue: "default".to_string(),
             }],
-            history.next_event_id,
+            timeline_event_id,
         )
         .await
         .expect("append timeline event");
+        reset_event_field(
+            &mut conn,
+            exec_id,
+            timeline_event_id,
+            "input",
+            timeline_input,
+        )
+        .await;
 
         let mut params = autumn_harvest::queue::EnqueueParams::new(
             "default",

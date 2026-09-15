@@ -82,7 +82,8 @@ use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::models::NewWorkflowExecution;
 use autumn_harvest::payload_codec::{
-    CODEC_ENVELOPE_KID_KEY, CODEC_LEGACY_KEY_ID, CodecError, PayloadCodec, PayloadCodecs,
+    CODEC_ENVELOPE_KEY, CODEC_ENVELOPE_KID_KEY, CODEC_LEGACY_KEY_ID, CodecError, IdentityCodec,
+    PayloadCodec, PayloadCodecs,
 };
 use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::store;
@@ -2219,6 +2220,162 @@ async fn a_four_key_version_1_payload_is_not_counted_by_the_census() {
             .expect("sweep"),
         0,
         "and must not be rewritten"
+    );
+}
+
+/// Issue #1253: the census SQL must recognize the current nested envelope
+/// shape too, not just the two legacy flat ones.
+///
+/// A genuinely rotated real codec stays flat — see
+/// `PayloadCodecs::encode_payload`'s doc for why. The only producer of a
+/// nested row is the collision-escape guard, which fires only when the
+/// active codec is identity.
+///
+/// Register identity under a named key to exercise the escape path WITH a
+/// `kid`. This mirrors an embedder using identity as a deliberate "store
+/// in the clear" rotation key — `codec_rotation`'s own doc on
+/// `active_key_would_decrypt` describes this as supported.
+///
+/// This proves the SQL predicate's new branch against a real row. It also
+/// proves an emergent property: a value the escape guard protected gets
+/// properly re-encrypted once real rotation converts it onto an actual key.
+#[tokio::test]
+async fn a_nested_envelope_is_counted_and_swept() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = PayloadCodecs::default();
+    codecs
+        .register_key("k1", Arc::new(IdentityCodec))
+        .expect("register k1");
+    codecs
+        .register_key("k2", Arc::new(XorCodec(0x22)))
+        .expect("register k2");
+    codecs.set_active_key("k1").expect("activate k1");
+
+    let exec_id = insert_execution(&mut conn, "nested").await;
+    // Envelope-shaped business data: the exact collision this fix escapes.
+    let colliding = json!({
+        "_harvest_codec_envelope": 2,
+        "codec_id": "xor",
+        "data": "AAAA",
+        "kid": "k9",
+    });
+    store::append_events_with_codecs(
+        &mut conn,
+        exec_id,
+        &[started(colliding.clone())],
+        0,
+        &codecs,
+    )
+    .await
+    .expect("append events");
+
+    let rows = raw_event_data(&mut conn, exec_id).await;
+    let field = &rows[0]["data"]["input"];
+    assert_eq!(
+        field.as_object().map(serde_json::Map::len),
+        Some(1),
+        "the escaped row is nested, one top-level key: {field}"
+    );
+    assert_eq!(field[CODEC_ENVELOPE_KEY]["codec_id"], "identity");
+    assert_eq!(field[CODEC_ENVELOPE_KEY][CODEC_ENVELOPE_KID_KEY], "k1");
+
+    codecs.set_active_key("k2").expect("flip");
+    let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress");
+    assert_eq!(
+        progress.rows_remaining(),
+        1,
+        "the nested row under the now-outgoing key k1 must be counted: {:?}",
+        progress.rows_by_key_id
+    );
+    assert_eq!(
+        sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("sweep"),
+        1,
+        "and must be converted onto k2 -- the escaped plaintext is now genuinely encrypted"
+    );
+
+    let converted = raw_event_data(&mut conn, exec_id).await;
+    match codecs
+        .decode_event(converted[0].clone())
+        .expect("decode after sweep")
+    {
+        WorkflowEvent::WorkflowStarted { input, .. } => {
+            assert_eq!(
+                input, colliding,
+                "the original business value survives escape, census, and re-encryption \
+                 byte-identical"
+            );
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+/// The nested-shape sibling of `a_near_envelope_is_neither_counted_nor_swept`.
+/// Business data shaped almost, but not quite, like a nested envelope must
+/// not be counted -- here, a sibling key breaking the one-key guarantee.
+#[tokio::test]
+async fn a_nested_near_envelope_is_neither_counted_nor_swept() {
+    use autumn_harvest::schema::harvest_events;
+
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "nested_near").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+
+    let row_id: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .select(harvest_events::id)
+        .first(&mut conn)
+        .await
+        .expect("row id");
+    let mut data: Value = harvest_events::table
+        .find(row_id)
+        .select(harvest_events::event_data)
+        .first(&mut conn)
+        .await
+        .expect("row");
+    // Business data shaped almost like a nested envelope: a sibling key
+    // alongside the discriminator breaks the one-key guarantee the nested
+    // shape's safety depends on.
+    data["data"]["input"] = json!({
+        "_harvest_codec_envelope": {"codec_id": "xor", "data": "AAAA"},
+        "something_else": true,
+    });
+    diesel::update(harvest_events::table.find(row_id))
+        .set(harvest_events::event_data.eq(&data))
+        .execute(&mut conn)
+        .await
+        .expect("update");
+
+    codecs.set_active_key("k2").expect("flip");
+    let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress");
+    assert_eq!(
+        progress.rows_remaining(),
+        0,
+        "a nested near-envelope must not be counted: {:?}",
+        progress.rows_by_key_id
+    );
+    assert_eq!(
+        sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("sweep"),
+        0,
+        "and must not be swept either"
     );
 }
 

@@ -88,9 +88,10 @@ response copy only. The append-only event invariant is untouched.
 
 ## Provenance caveat — decoded values are not authenticated
 
-A codec envelope is purely self-describing (`{"_harvest_codec_envelope": 1,
-"codec_id", "data"}`): nothing binds it to "written by the engine's encode
-path". The identity codec is always registered, and workflow inputs, signal
+A codec envelope is purely self-describing (`{"_harvest_codec_envelope":
+{"codec_id", "data"}}`, or one of the pre-#1253 flat shapes on older rows):
+nothing binds it to "written by the engine's encode path". The identity codec
+is always registered, and workflow inputs, signal
 payloads, and activity error strings are caller-influenced — so **any writer
 who can start a workflow (or shape an error string) can seed envelope-shaped
 data**, and every decoded surface will render whatever the registered codec

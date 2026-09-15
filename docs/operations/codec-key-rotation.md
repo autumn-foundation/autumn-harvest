@@ -307,12 +307,17 @@ still invisible to it and still require the fence.
 
 ### ⚠️ Upgrade every reader before activating a keyed codec
 
-Activating a non-legacy key switches new writes to **envelope version 2** (four
-keys, carrying `kid`). A reader built before issue #948 recognises an envelope
-only as exactly three keys with version 1, and its decoder returns anything
-else *unchanged* rather than rejecting it. A pre-#948 worker therefore hands the
-raw envelope object to workflow code as if it were the payload — silent wrong
-data, not a loud failure.
+Activating a non-legacy key switches new writes to **envelope version 2**
+(four keys, carrying `kid`). A reader built before issue #948 recognises an
+envelope only as exactly three keys with version 1, and its decoder returns
+anything else *unchanged* rather than rejecting it. A pre-#948 worker
+therefore hands the raw envelope object to workflow code as if it were the
+payload — silent wrong data, not a loud failure.
+
+Issue #1253 does not change this. A keyed write still emits this same flat,
+four-key shape — never the nested shape #1253 introduced, which only the
+identity-codec collision-escape path writes. See ADR-0003's "Nesting is
+scoped to the escape case only" addendum for why.
 
 `activate_codec_key` (issue #1244) enforces the deployment order
 structurally: it refuses while any worker that has heartbeated within

@@ -365,9 +365,10 @@ mod db {
     };
 
     /// The exact SQL mirror of
-    /// [`codec_envelope_parts`](crate::payload_codec) — an object with
-    /// `_harvest_codec_envelope == 1`, string `codec_id`, string `data`, and
-    /// either exactly those three keys or those three plus a string `kid`.
+    /// [`codec_envelope_parts`](crate::payload_codec): the current nested
+    /// shape (issue #1253), or one of the two flat shapes issue #948 wrote
+    /// before it. The flat shapes are kept read-only, for history written
+    /// before issue #1253.
     ///
     /// Kept byte-for-byte in step with the Rust shape check so the census can
     /// never count a row the sweep is unable to convert (which would make the
@@ -376,14 +377,15 @@ mod db {
     /// `tests/integration/codec_rotation_db_tests.rs` pins the two together.
     const ENVELOPE_PREDICATE: &str = "
               jsonb_typeof(f.value) = 'object'
-          AND jsonb_typeof(f.value -> 'codec_id') = 'string'
-          AND jsonb_typeof(f.value -> 'data') = 'string'
           AND (
-                  -- Version 1: exactly three keys, no `kid`. Every pre-#948
-                  -- envelope, and every envelope written while the legacy key
-                  -- is active.
+                  -- Version 1 (flat, legacy, read-only): exactly three keys,
+                  -- no `kid`. Every pre-#948 envelope, and every envelope
+                  -- written while the legacy key is active outside a
+                  -- collision-escape.
                   (
-                      f.value -> '_harvest_codec_envelope' = '1'::jsonb
+                      jsonb_typeof(f.value -> 'codec_id') = 'string'
+                  AND jsonb_typeof(f.value -> 'data') = 'string'
+                  AND f.value -> '_harvest_codec_envelope' = '1'::jsonb
                       -- jsonb compares numbers as `numeric`, so the line above
                       -- alone also accepts 1.0 -- which serde_json's `as_i64`
                       -- rejects. Pin the text form too, so Postgres and Rust
@@ -392,15 +394,41 @@ mod db {
                   AND (SELECT COUNT(*) FROM jsonb_object_keys(f.value)) = 3
                   )
                OR
-                  -- Version 2: exactly four keys, the fourth a `kid` satisfying
-                  -- the same charset/length rule `validate_key_id` applies in
-                  -- Rust (so crafted workflow input cannot inject census rows).
+                  -- Version 2 (flat, legacy, read-only): exactly four keys,
+                  -- the fourth a `kid` satisfying the same charset/length
+                  -- rule `validate_key_id` applies in Rust (so crafted
+                  -- workflow input cannot inject census rows).
                   (
-                      f.value -> '_harvest_codec_envelope' = '2'::jsonb
+                      jsonb_typeof(f.value -> 'codec_id') = 'string'
+                  AND jsonb_typeof(f.value -> 'data') = 'string'
+                  AND f.value -> '_harvest_codec_envelope' = '2'::jsonb
                   AND f.value ->> '_harvest_codec_envelope' = '2'
                   AND (SELECT COUNT(*) FROM jsonb_object_keys(f.value)) = 4
                   AND jsonb_typeof(f.value -> 'kid') = 'string'
                   AND f.value ->> 'kid' ~ '^[A-Za-z0-9._:-]{1,64}$'
+                  )
+               OR
+                  -- Version 3 (nested, issue #1253, current): the field's
+                  -- ONLY top-level key is the discriminator, mapping to an
+                  -- object with string codec_id/data and, optionally, a
+                  -- `kid` satisfying the same rule as above. Nesting is what
+                  -- makes this shape safe: it can never share the flat
+                  -- branches' collision with business data, because it
+                  -- depends on one fact (the field has exactly one key)
+                  -- rather than an exact sibling-key combination.
+                  (
+                      (SELECT COUNT(*) FROM jsonb_object_keys(f.value)) = 1
+                  AND jsonb_typeof(f.value -> '_harvest_codec_envelope') = 'object'
+                  AND jsonb_typeof(f.value -> '_harvest_codec_envelope' -> 'codec_id') = 'string'
+                  AND jsonb_typeof(f.value -> '_harvest_codec_envelope' -> 'data') = 'string'
+                  AND (
+                          (SELECT COUNT(*) FROM jsonb_object_keys(f.value -> '_harvest_codec_envelope')) = 2
+                       OR (
+                              (SELECT COUNT(*) FROM jsonb_object_keys(f.value -> '_harvest_codec_envelope')) = 3
+                          AND jsonb_typeof(f.value -> '_harvest_codec_envelope' -> 'kid') = 'string'
+                          AND f.value -> '_harvest_codec_envelope' ->> 'kid' ~ '^[A-Za-z0-9._:-]{1,64}$'
+                          )
+                      )
                   )
               )";
 
@@ -545,12 +573,12 @@ mod db {
             "SELECT key_id, COUNT(*)::BIGINT AS row_count \
              FROM ( \
                  SELECT e.id AS event_row_id, \
-                        COALESCE(f.value ->> 'kid', $2) AS key_id \
+                        COALESCE(f.value ->> 'kid', f.value -> '_harvest_codec_envelope' ->> 'kid', $2) AS key_id \
                  FROM harvest_events e \
                  CROSS JOIN LATERAL unnest($1::TEXT[]) AS k(field) \
                  CROSS JOIN LATERAL (SELECT e.event_data -> 'data' -> k.field) AS f(value) \
                  WHERE f.value IS NOT NULL AND {ENVELOPE_PREDICATE} \
-                 GROUP BY e.id, COALESCE(f.value ->> 'kid', $2) \
+                 GROUP BY e.id, COALESCE(f.value ->> 'kid', f.value -> '_harvest_codec_envelope' ->> 'kid', $2) \
              ) s \
              GROUP BY key_id"
         );
@@ -2018,7 +2046,10 @@ mod db {
     /// A pre-#948 reader recognises an envelope only as exactly three keys at
     /// version 1. A version-2 envelope (four keys, a `kid`) comes back
     /// unchanged from its decoder — silent wrong data, not an error. See
-    /// [`PayloadCodecs::set_active_key`]'s rustdoc.
+    /// [`PayloadCodecs::set_active_key`]'s rustdoc. Issue #1253's nested
+    /// shape does not change this. A genuinely activated key still writes
+    /// the flat version-2 shape this check has always covered, never
+    /// nested — see [`PayloadCodecs::encode_payload`]'s doc for why.
     ///
     /// This function is the structural version of that rustdoc's manual
     /// rollout-ordering warning. Every live worker's `harvest_workers.labels`

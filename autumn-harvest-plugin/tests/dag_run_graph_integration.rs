@@ -16,9 +16,10 @@ use std::time::Duration;
 
 use autumn_harvest::dag::DagBuilder;
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::models::NewHarvestEvent;
 use autumn_harvest::prelude::*;
 use autumn_harvest::scheduler::{RegisteredDag, SchedulerMonitor, compile_dag_catalog};
-use autumn_harvest::schema::harvest_workflow_executions;
+use autumn_harvest::schema::{harvest_events, harvest_workflow_executions};
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId, Priority, ShardId, WorkerId};
@@ -205,9 +206,8 @@ fn build_app_with_codec(pool: &DbPool) -> HarvestApiApp {
 /// whose `input` has been run through the reversing codec, i.e. exactly what a
 /// codec-encrypting deployment stores in `harvest_events.event_data`.
 ///
-/// `store::append_events` encodes with the identity codec, whose
-/// `encode_payload` is a pass-through clone — so the already-enveloped `input`
-/// survives verbatim into storage.
+/// `seed_run` inserts events raw (not through `store::append_events`), so the
+/// already-enveloped `input` survives verbatim into storage.
 fn codec_encoded_compensation_dispatch(
     compensator_name: &str,
     compensates_node: &str,
@@ -404,9 +404,34 @@ async fn seed_run(
     .expect("seed workflow");
 
     let history = store::load_history(conn, exec_id).await.unwrap();
-    store::append_events(conn, exec_id, &events, history.next_event_id)
+    // Raw insert, not `store::append_events`: several fixtures above hand-build
+    // an already-enveloped payload field to reproduce a codec deployment's
+    // on-disk shape (issue #1253). `append_events` runs every field through
+    // the identity codec's `encode_payload`. That now escapes anything
+    // already shaped like an envelope, by nesting it (the issue #1253 fix).
+    // A second pass here would corrupt these fixtures' hand-built shape.
+    // A direct insert stores each event's JSON exactly as constructed, which
+    // is what this test suite has always intended by "identity stores it
+    // verbatim".
+    let rows: Vec<NewHarvestEvent> = events
+        .iter()
+        .enumerate()
+        .map(|(i, event)| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let event_id = history.next_event_id + i as i32;
+            NewHarvestEvent {
+                workflow_exec_id: exec_id.as_uuid(),
+                event_id,
+                event_type: event.type_name(),
+                event_data: serde_json::to_value(event).expect("serialize seed event"),
+            }
+        })
+        .collect();
+    diesel::insert_into(harvest_events::table)
+        .values(&rows)
+        .execute(conn)
         .await
-        .expect("append seed events");
+        .expect("insert seed events");
 
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set(harvest_workflow_executions::state.eq(state))
