@@ -3987,6 +3987,77 @@ async fn enable_survives_two_indexes_colliding_at_the_identifier_limit() {
 }
 
 #[tokio::test]
+async fn enable_survives_an_operator_view_colliding_with_the_rename_target() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // A populated table takes the path that renames the primary key's
+    // backing index to `harvest_events_pkey__pre958`. The old collision
+    // check only queried `pg_indexes`, so a same-named VIEW — sharing the
+    // same schema-scoped relation namespace, but not an index — looked
+    // free. The implicit index rename inside `RENAME CONSTRAINT` then
+    // failed on the real collision Postgres enforces.
+    let exec = insert_execution(&mut conn, "viewcol_wf", "viewcol-1", day(2026, 2, 3), None).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        ExecutionId::from_uuid(exec),
+        &sample_events(),
+        0,
+    )
+    .await
+    .expect("seed a populated table");
+
+    diesel::sql_query("DROP VIEW IF EXISTS harvest_events_pkey__pre958")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query("CREATE VIEW harvest_events_pkey__pre958 AS SELECT 1 AS operator_marker")
+        .execute(&mut conn)
+        .await
+        .expect("plant an operator's own view at the rename's natural target name");
+
+    let report = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect(
+            "a collision check scoped to pg_indexes alone would have missed the \
+             operator's view and aborted on the real Postgres collision",
+        );
+    assert!(
+        matches!(report.mode, EnableMode::AttachLegacy { .. }),
+        "precondition: a populated table must take the path that renames the \
+         index, got {:?}",
+        report.mode
+    );
+
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT EXISTS (SELECT 1 FROM information_schema.views \
+              WHERE table_schema = current_schema() \
+                AND table_name = 'harvest_events_pkey__pre958') AS v",
+        )
+        .await,
+        "the operator's own view must survive under its original name"
+    );
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT NOT EXISTS (SELECT 1 FROM pg_indexes \
+              WHERE schemaname = current_schema() \
+                AND indexname = 'harvest_events_pkey__pre958') AS v",
+        )
+        .await,
+        "the renamed index must have been disambiguated away from the view's name"
+    );
+
+    diesel::sql_query("DROP VIEW IF EXISTS harvest_events_pkey__pre958")
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
 async fn enable_truncates_a_multibyte_index_name_by_bytes_not_characters() {
     #[derive(diesel::QueryableByName)]
     struct IndexRow {
@@ -4357,6 +4428,62 @@ async fn disable_survives_two_indexes_colliding_at_the_identifier_limit() {
          disable replays each captured index definition verbatim, once the old \
          parent's own copies are safely renamed out of the way: {names:?}"
     );
+}
+
+#[tokio::test]
+async fn disable_survives_an_operator_view_colliding_with_the_rename_target() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // `disable_partitioning` renames the partitioned parent's own primary
+    // key backing index to `harvest_events_pkey__old` before reclaiming the
+    // bare name for the rebuilt flat table. The old collision check only
+    // queried `pg_indexes`, so a same-named VIEW looked free. The implicit
+    // index rename inside `RENAME CONSTRAINT` then failed on the real
+    // collision Postgres enforces.
+    diesel::sql_query("DROP VIEW IF EXISTS harvest_events_pkey__old")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query("CREATE VIEW harvest_events_pkey__old AS SELECT 1 AS operator_marker")
+        .execute(&mut conn)
+        .await
+        .expect("plant an operator's own view at the rename's natural target name");
+
+    partition::disable_partitioning(&mut conn).await.expect(
+        "a collision check scoped to pg_indexes alone would have missed the \
+         operator's view and aborted on the real Postgres collision",
+    );
+
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT EXISTS (SELECT 1 FROM information_schema.views \
+              WHERE table_schema = current_schema() \
+                AND table_name = 'harvest_events_pkey__old') AS v",
+        )
+        .await,
+        "the operator's own view must survive under its original name"
+    );
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT NOT EXISTS (SELECT 1 FROM pg_indexes \
+              WHERE schemaname = current_schema() \
+                AND indexname = 'harvest_events_pkey__old') AS v",
+        )
+        .await,
+        "the renamed index must have been disambiguated away from the view's name"
+    );
+
+    diesel::sql_query("DROP VIEW IF EXISTS harvest_events_pkey__old")
+        .execute(&mut conn)
+        .await
+        .ok();
 }
 
 #[tokio::test]

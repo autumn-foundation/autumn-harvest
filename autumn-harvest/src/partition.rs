@@ -1587,12 +1587,15 @@ const RENAME_HELPER_DECLARE: &str = "    new_name text;\n    bump     int;\n    
 /// per-schema, so theirs is scoped to `current_schema()`.
 ///
 /// A PRIMARY KEY or UNIQUE constraint's rename also renames its BACKING
-/// index, which Postgres allocates from the schema-wide relation namespace.
-/// So the constraint loop's own collision check covers `pg_indexes` too,
-/// not just `pg_constraint`. Otherwise an unrelated index already holding
-/// the candidate name looks free here. The `RENAME CONSTRAINT` then fails
-/// on the implicit index rename, with an error that does not point at the
-/// actual cause.
+/// index. Postgres allocates that name from the schema-wide relation
+/// namespace, shared with every table, view, sequence and materialized
+/// view in the schema, not just other indexes. So the constraint loop's
+/// own collision check queries `pg_class` directly, not `pg_indexes`.
+/// Checking only `pg_indexes` would miss a same-named table, view or
+/// sequence. The `RENAME CONSTRAINT` would then fail on the implicit
+/// index rename, with an error that does not point at the actual cause.
+/// The index loop below makes the identical query for the identical
+/// reason.
 ///
 /// The constraint loop also records the ACTUAL new name it gave the three
 /// well-known legacy constraints, into `legacy_pk_new_name`,
@@ -1625,8 +1628,9 @@ fn collision_safe_rename_stmts(table: &str, suffix: &str) -> String {
          new_name := new_name || tail;\n        \
          WHILE EXISTS (SELECT 1 FROM pg_constraint\n                       \
          WHERE conname = new_name AND conrelid = '{table}'::regclass)\n           \
-         OR EXISTS (SELECT 1 FROM pg_indexes\n                       \
-         WHERE indexname = new_name AND schemaname = current_schema())\n        \
+         OR EXISTS (SELECT 1 FROM pg_class c\n                       \
+         JOIN pg_namespace n ON n.oid = c.relnamespace\n                       \
+         WHERE c.relname = new_name AND n.nspname = current_schema())\n        \
          LOOP\n            \
          bump := bump + 1;\n            \
          tail := '{suffix}' || '_' || bump::text;\n            \
@@ -1662,8 +1666,9 @@ fn collision_safe_rename_stmts(table: &str, suffix: &str) -> String {
          new_name := left(new_name, length(new_name) - 1);\n        \
          END LOOP;\n        \
          new_name := new_name || tail;\n        \
-         WHILE EXISTS (SELECT 1 FROM pg_indexes\n                       \
-         WHERE indexname = new_name AND schemaname = current_schema())\n        \
+         WHILE EXISTS (SELECT 1 FROM pg_class c\n                       \
+         JOIN pg_namespace n ON n.oid = c.relnamespace\n                       \
+         WHERE c.relname = new_name AND n.nspname = current_schema())\n        \
          LOOP\n            \
          bump := bump + 1;\n            \
          tail := '{suffix}' || '_' || bump::text;\n            \
@@ -2212,9 +2217,11 @@ fn truncate_ident(s: &str, max: usize) -> &str {
 ///
 /// Constraint names are unique per-table, so `table` scopes that half of the
 /// check. But a PRIMARY KEY or UNIQUE constraint's rename also renames its
-/// BACKING index, schema-wide. So the check covers `pg_indexes` too. An
-/// unrelated index already holding the candidate name would otherwise look
-/// free here, and the caller's `RENAME CONSTRAINT` would fail on the
+/// BACKING index. That name comes from the schema-wide relation namespace,
+/// shared with every table, view, sequence and materialized view, not just
+/// other indexes. So the check queries `pg_class` directly, not
+/// `pg_indexes`. A same-named table, view or sequence would otherwise
+/// look free here, and the caller's `RENAME CONSTRAINT` would fail on the
 /// implicit index rename.
 #[cfg(feature = "db")]
 async fn collision_safe_constraint_name(
@@ -2235,8 +2242,9 @@ async fn collision_safe_constraint_name(
         let taken = diesel::sql_query(
             "SELECT EXISTS (SELECT 1 FROM pg_constraint \
               WHERE conname = $1 AND conrelid = $2::regclass) \
-              OR EXISTS (SELECT 1 FROM pg_indexes \
-              WHERE indexname = $1 AND schemaname = current_schema()) AS v",
+              OR EXISTS (SELECT 1 FROM pg_class c \
+              JOIN pg_namespace n ON n.oid = c.relnamespace \
+              WHERE c.relname = $1 AND n.nspname = current_schema()) AS v",
         )
         .bind::<Text, _>(&candidate)
         .bind::<Text, _>(table)
@@ -2253,8 +2261,12 @@ async fn collision_safe_constraint_name(
 
 /// Rust-native counterpart of [`collision_safe_rename_stmts`], for indexes.
 ///
-/// Index names are relations, unique per-schema (not per-table), so the
-/// check is scoped to `current_schema()` alone.
+/// Index names are relations, unique per-schema (not per-table). That
+/// namespace is shared with every table, view, sequence and materialized
+/// view too. So the check queries `pg_class` directly, scoped to
+/// `current_schema()`, rather than `pg_indexes` alone. A same-named table,
+/// view or sequence would otherwise look free here, and the caller's
+/// `RENAME` would fail on the actual collision Postgres enforces.
 #[cfg(feature = "db")]
 async fn collision_safe_index_name(
     conn: &mut AsyncPgConnection,
@@ -2271,8 +2283,9 @@ async fn collision_safe_index_name(
         let room = 63usize.saturating_sub(suffix.len() + tag.len());
         let candidate = format!("{}{suffix}{tag}", truncate_ident(old_name, room));
         let taken = diesel::sql_query(
-            "SELECT EXISTS (SELECT 1 FROM pg_indexes \
-              WHERE indexname = $1 AND schemaname = current_schema()) AS v",
+            "SELECT EXISTS (SELECT 1 FROM pg_class c \
+              JOIN pg_namespace n ON n.oid = c.relnamespace \
+              WHERE c.relname = $1 AND n.nspname = current_schema()) AS v",
         )
         .bind::<Text, _>(&candidate)
         .get_result::<BoolRow>(conn)
