@@ -197,6 +197,18 @@ const EXEC_FK_TRIGGER: &str = "harvest_events_exec_fk_trg";
 /// latter.
 const DROP_GATE_INDEX_MARKER: &str = "harvest#958 drop-gate index; created by partition enable, safe for partition disable to remove";
 
+/// Stamped on `harvest_1270_drop_gate_probe` (the durable ownership-check
+/// table behind [`DROP_GATE_INDEX_MARKER`]) so the probe step can refuse to
+/// reuse a same-named relation it did not create.
+///
+/// `CREATE TABLE IF NOT EXISTS` on a fixed name silently succeeds against an
+/// operator's own unrelated table of that name. A later step would then
+/// `DELETE FROM` and `DROP TABLE` it. The probe step checks this comment
+/// before touching an existing relation, and only ever creates the table
+/// itself when the name is free.
+const PROBE_TABLE_MARKER: &str =
+    "harvest#1270 drop-gate probe; created by the scripted migration plan, safe to drop";
+
 // ── Sweep "blocked" reasons ────────────────────────────────────────────────
 //
 // Constants, not inline literals, because `docs/partitioned-events.md` explains
@@ -3870,16 +3882,53 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // boundary. `disable_partitioning` later reads a comment this only
         // stamps when it was this step that created the index — see
         // `DROP_GATE_INDEX_MARKER`.
+        //
+        // Three more properties this step holds, each behind its own guard:
+        //
+        // - Ownership. `CREATE TABLE IF NOT EXISTS` on a fixed name would
+        //   silently reuse an unrelated operator table of that exact name.
+        //   The mark step would then `DELETE`/`DROP` it. A pre-existing
+        //   relation is only ever reused when it carries
+        //   `PROBE_TABLE_MARKER` in its own comment. Any other relation
+        //   there aborts the step instead of touching it.
+        //
+        // - Retry safety. A run can resume after phase 2 was interrupted
+        //   between the `CONCURRENTLY` build and the mark step. A bare
+        //   re-probe there would see the index it just built. It would
+        //   overwrite the ORIGINAL `false` with `true`, skipping the mark
+        //   the retried run still owes. So a probe row is only ever
+        //   written once; a second pass over an already-populated table
+        //   leaves it alone.
+        //
+        // - Publication safety. An ordinary table's `INSERT` is
+        //   publication-visible under a `FOR ALL TABLES` publication (see
+        //   `EnableOptions::allow_incompatible_publications`), and the
+        //   subscriber never received this table's DDL to apply it against.
+        //   `UNLOGGED` has no WAL for logical decoding to read, so its
+        //   writes are never replicated regardless of publication scope.
         step(
             2,
-            "DO $harvest_dropgate_probe_958$\nBEGIN\n    \
-             CREATE TABLE IF NOT EXISTS harvest_1270_drop_gate_probe (existed boolean);\n    \
-             DELETE FROM harvest_1270_drop_gate_probe;\n    \
-             INSERT INTO harvest_1270_drop_gate_probe\n    \
-             SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace\n                    \
-             WHERE c.relname = 'idx_harvest_we_created_at' AND n.nspname = current_schema());\n\
-             END\n$harvest_dropgate_probe_958$"
-                .to_string(),
+            format!(
+                "DO $harvest_dropgate_probe_958$\nBEGIN\n    \
+                 IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace\n            \
+                 WHERE c.relname = 'harvest_1270_drop_gate_probe' AND n.nspname = current_schema())\n    \
+                 THEN\n        \
+                 IF obj_description('harvest_1270_drop_gate_probe'::regclass, 'pg_class')\n           \
+                 IS DISTINCT FROM '{PROBE_TABLE_MARKER}' THEN\n            \
+                 RAISE EXCEPTION\n                \
+                 'harvest_1270_drop_gate_probe exists and is not engine-owned; refusing to reuse it';\n        \
+                 END IF;\n    \
+                 ELSE\n        \
+                 CREATE UNLOGGED TABLE harvest_1270_drop_gate_probe (existed boolean);\n        \
+                 COMMENT ON TABLE harvest_1270_drop_gate_probe IS '{PROBE_TABLE_MARKER}';\n    \
+                 END IF;\n    \
+                 IF NOT EXISTS (SELECT 1 FROM harvest_1270_drop_gate_probe) THEN\n        \
+                 INSERT INTO harvest_1270_drop_gate_probe\n        \
+                 SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace\n                       \
+                 WHERE c.relname = 'idx_harvest_we_created_at' AND n.nspname = current_schema());\n    \
+                 END IF;\n\
+                 END\n$harvest_dropgate_probe_958$"
+            ),
         ),
         concurrent(
             2,
@@ -4018,6 +4067,88 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
                  n;\n    \
                  END IF;\nEND\n$harvest_assert_958$;"
             ),
+        ),
+        // Phase 1's view, trigger and unique-index guards run once, up
+        // front. A large-live-table plan can then spend hours in phases 2
+        // and 3 before phase 4 ever opens this window. A schema deployment
+        // landing in that gap — a new view, a new trigger, a new unique
+        // index — passed no check at all. The rename below would still
+        // carry it into the same silent-staleness or abort that phase 1
+        // exists to catch.
+        //
+        // Repeated here, immediately before the rename, inside the SAME
+        // transaction. Each check is a plain catalog SELECT, so this does
+        // not change when phase 4 first takes its lock. It only shrinks
+        // the unchecked window from the whole phase 2/3 duration down to
+        // the handful of statements between this check and the rename.
+        step(
+            4,
+            "DO $harvest_views_958_p4$\nDECLARE bad text;\nBEGIN\n    \
+             SELECT string_agg(DISTINCT dependent_ns.nspname || '.' || dependent_view.relname, \
+             ', ')\n      INTO bad\n      \
+             FROM pg_depend\n      \
+             JOIN pg_rewrite ON pg_depend.objid = pg_rewrite.oid\n      \
+             JOIN pg_class dependent_view ON pg_rewrite.ev_class = dependent_view.oid\n      \
+             JOIN pg_class source_table ON pg_depend.refobjid = source_table.oid\n      \
+             JOIN pg_namespace dependent_ns ON dependent_ns.oid = dependent_view.relnamespace\n      \
+             JOIN pg_namespace source_ns ON source_ns.oid = source_table.relnamespace\n     \
+             WHERE source_table.relname = 'harvest_events'\n       \
+             AND source_ns.nspname = current_schema()\n       \
+             AND dependent_view.relkind IN ('v', 'm')\n       \
+             AND dependent_view.oid <> source_table.oid;\n    \
+             IF bad IS NOT NULL THEN\n        \
+             RAISE EXCEPTION 'harvest #958: view(s) depend on harvest_events (%), created \
+             since phase 1''s check ran. Phase 4 renames it out of the way; Postgres tracks \
+             a view''s dependency by OID, not name, so the view keeps pointing at the \
+             renamed relation and silently stops seeing rows written after this plan \
+             commits. Drop or redefine the view, then re-run this plan.', bad;\n    \
+             END IF;\nEND\n$harvest_views_958_p4$;"
+                .to_string(),
+        ),
+        step(
+            4,
+            format!(
+                "DO $harvest_trig_958_p4$\nDECLARE bad text;\nBEGIN\n    \
+                 SELECT string_agg(t.tgname, ', ' ORDER BY t.tgname) INTO bad\n      \
+                 FROM pg_trigger t\n      \
+                 JOIN pg_class c ON c.oid = t.tgrelid\n      \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
+                 WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
+                 AND NOT t.tgisinternal\n       \
+                 AND t.tgname <> '{EXEC_FK_TRIGGER}';\n    \
+                 IF bad IS NOT NULL THEN\n        \
+                 RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not managed by \
+                 this engine (%), created since phase 1''s check ran. CREATE TABLE ... \
+                 (LIKE ...) has no INCLUDING TRIGGERS option — every one of them is \
+                 silently dropped from the replacement. Drop the trigger, then re-run this \
+                 plan.', bad;\n    \
+                 END IF;\nEND\n$harvest_trig_958_p4$;"
+            ),
+        ),
+        step(
+            4,
+            "DO $harvest_uidx_958_p4$\nDECLARE bad text;\nBEGIN\n    \
+             SELECT string_agg(i.indexrelid::regclass::text, ', ') INTO bad\n      \
+             FROM pg_index i\n      \
+             JOIN pg_class c ON c.oid = i.indrelid\n      \
+             JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
+             WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
+             AND i.indisunique\n       \
+             AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = \
+             i.indexrelid)\n       \
+             AND NOT EXISTS (\n           \
+             SELECT 1 FROM unnest(i.indkey[0:i.indnkeyatts - 1]::int2[]) AS colnum\n             \
+             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = colnum\n            \
+             WHERE a.attname = 'cohort'\n       \
+             );\n    \
+             IF bad IS NOT NULL THEN\n        \
+             RAISE EXCEPTION 'harvest #958: unique index(es) on harvest_events do not \
+             include cohort (%), created since phase 1''s check ran. Postgres requires the \
+             partition key in every unique index on a partitioned table, so replaying one \
+             verbatim in the ATTACH below aborts. Drop or redefine the index, then re-run \
+             this plan.', bad;\n    \
+             END IF;\nEND\n$harvest_uidx_958_p4$;"
+                .to_string(),
         ),
         // Captured BEFORE the rename, so each definition still names
         // `harvest_events` and replays verbatim onto the new parent. The two
