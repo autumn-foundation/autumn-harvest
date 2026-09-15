@@ -1666,6 +1666,120 @@ async fn the_sweep_rotates_past_a_permanently_blocked_prefix_across_passes() {
 }
 
 #[tokio::test]
+async fn the_durable_sweep_cursor_lets_maintain_rotate_across_separate_processes() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Same shape as `the_sweep_rotates_past_a_permanently_blocked_prefix_across_passes`,
+    // exercised through the durable cursor `harvest partition maintain`
+    // reads and writes instead. `RetentionRuntime` carries the cursor
+    // forward in memory, tick to tick. Each CLI invocation is a fresh
+    // process with none. Without a durable store, a permanently blocked
+    // prefix would starve every manual catch-up run the same way.
+    let width = partition::DEFAULT_COHORT_WIDTH_SECS;
+    let blocked_a = Utc::now() - chrono::Duration::days(20);
+    let blocked_b = Utc::now() - chrono::Duration::days(19);
+    let droppable = Utc::now() - chrono::Duration::days(18);
+    for (label, at) in [("durcursor-a", blocked_a), ("durcursor-b", blocked_b)] {
+        let exec = insert_execution(&mut conn, "durcursor_wf", label, at, None).await;
+        autumn_harvest::store::append_events(
+            &mut conn,
+            ExecutionId::from_uuid(exec),
+            &sample_events(),
+            0,
+        )
+        .await
+        .expect("seed a running execution pinning this cohort");
+        backdate_events(&mut conn, exec, at).await;
+    }
+    partition::ensure_cohort(&mut conn, droppable)
+        .await
+        .expect("materialize the reclaimable cohort");
+    let droppable_partition = partition::partition_name(partition::cohort_start(droppable, width));
+
+    diesel::sql_query("DROP SEQUENCE IF EXISTS harvest_1270_partition_maintain_cursor")
+        .execute(&mut conn)
+        .await
+        .ok();
+    assert!(
+        partition::read_durable_sweep_cursor(&mut conn)
+            .await
+            .expect("read cursor")
+            .is_none(),
+        "precondition: no cursor recorded yet"
+    );
+
+    // First "invocation", its own connection: no cursor yet, so it starts
+    // at the oldest partition and its budget is spent on the blocked
+    // prefix.
+    let mut first_conn = connect(&url).await;
+    let mut opts = SweepOptions {
+        max_attempts: 2,
+        ..SweepOptions::default()
+    };
+    opts.resume_after = partition::read_durable_sweep_cursor(&mut first_conn)
+        .await
+        .expect("read cursor");
+    let first = partition::maintain(
+        &mut first_conn,
+        Utc::now(),
+        partition::DEFAULT_LOOKAHEAD_COHORTS,
+        &opts,
+    )
+    .await
+    .expect("first maintain")
+    .expect("harvest_events is partitioned in this test");
+    assert!(
+        first.sweep.dropped.is_empty(),
+        "the budget must be entirely consumed by the two blocked cohorts; got {first:?}"
+    );
+    assert!(first.sweep.truncated, "got {first:?}");
+    partition::write_durable_sweep_cursor(&mut first_conn, first.sweep.resume_after.as_deref())
+        .await
+        .expect("persist cursor");
+
+    // Second "invocation", a SEPARATE connection. The point under test is
+    // that the cursor survives a process boundary, not just an in-memory
+    // one within a single connection.
+    let mut second_conn = connect(&url).await;
+    let mut opts2 = SweepOptions {
+        max_attempts: 2,
+        ..SweepOptions::default()
+    };
+    opts2.resume_after = partition::read_durable_sweep_cursor(&mut second_conn)
+        .await
+        .expect("read cursor");
+    assert!(
+        opts2.resume_after.is_some(),
+        "the first invocation must have left a cursor to resume from"
+    );
+    let second = partition::maintain(
+        &mut second_conn,
+        Utc::now(),
+        partition::DEFAULT_LOOKAHEAD_COHORTS,
+        &opts2,
+    )
+    .await
+    .expect("second maintain")
+    .expect("harvest_events is partitioned in this test");
+    assert!(
+        second.sweep.dropped.contains(&droppable_partition),
+        "the second invocation must reach the droppable cohort past the \
+         blocked prefix using the durable cursor, not restart at the \
+         oldest partition; got {second:?}"
+    );
+
+    diesel::sql_query("DROP SEQUENCE IF EXISTS harvest_1270_partition_maintain_cursor")
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
 async fn the_straggler_delete_removes_orphan_rows_but_leaves_the_stragglers_own() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;

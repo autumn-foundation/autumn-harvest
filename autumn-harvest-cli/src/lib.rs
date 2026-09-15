@@ -6196,11 +6196,22 @@ async fn run_partition_maintain(
             }
         };
         let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
+        // Each CLI invocation is a fresh process with no monitor of its
+        // own, unlike `RetentionRuntime`'s in-memory tick loop. So the
+        // rotation cursor a bounded sweep needs, to get past a
+        // permanently blocked prefix, has to be read back from durable
+        // storage instead. Best-effort: a read failure just starts this
+        // pass from the oldest partition, same as the very first run ever.
+        let mut shard_sweep = sweep.clone();
+        shard_sweep.resume_after = autumn_harvest::partition::read_durable_sweep_cursor(&mut conn)
+            .await
+            .ok()
+            .flatten();
         match autumn_harvest::partition::maintain(
             &mut conn,
             autumn_harvest::chrono::Utc::now(),
             lookahead_cohorts,
-            &sweep,
+            &shard_sweep,
         )
         .await
         {
@@ -6214,6 +6225,16 @@ async fn run_partition_maintain(
                 // ordinary zero-drain report and exit 0 while the DEFAULT
                 // partition stayed undrained, and scheduled operator
                 // automation would never notice.
+                //
+                // Best-effort here too: persisting the cursor is what
+                // lets the NEXT invocation get past a blocked prefix. A
+                // write failure must not turn a completed pass into a
+                // reported error.
+                let _ = autumn_harvest::partition::write_durable_sweep_cursor(
+                    &mut conn,
+                    outcome.sweep.resume_after.as_deref(),
+                )
+                .await;
                 row.error.clone_from(&outcome.last_error);
                 row.maintenance = Some(outcome);
             }

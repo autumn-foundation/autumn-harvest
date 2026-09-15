@@ -3566,6 +3566,92 @@ async fn maintenance_owner_gap(
     }))
 }
 
+/// Durable per-shard store for [`SweepOptions::resume_after`], for a caller
+/// with no monitor of its own to read the prior pass's outcome from.
+///
+/// `RetentionRuntime` already carries the cursor forward in memory, tick to
+/// tick — see `retention::run_partition_maintenance`. `harvest partition
+/// maintain` has no such memory: each CLI invocation is a fresh process.
+/// A permanently blocked prefix would then consume `max_attempts` on
+/// every manual catch-up run. That is the same starvation `resume_after`
+/// exists to fix, just triggered by a process boundary instead of a
+/// monitor never being read.
+///
+/// A `SEQUENCE`, not a `TABLE`, for the same reason as
+/// `harvest_1270_drop_gate_probe`. Postgres structurally excludes
+/// sequences from every publication, so this durable operational state
+/// never becomes a `FOR ALL TABLES` sync target. Unlike that probe, this
+/// sequence is never dropped. It is the CLI's permanent cursor store, one
+/// per shard database, read before a sweep and written back after.
+const MAINTAIN_CURSOR_SEQUENCE: &str = "harvest_1270_partition_maintain_cursor";
+
+#[derive(diesel::QueryableByName)]
+struct OptTextRow {
+    #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+    v: Option<String>,
+}
+
+/// Read the durable cursor [`MAINTAIN_CURSOR_SEQUENCE`] holds, if any.
+///
+/// `Ok(None)` both when the sequence does not exist yet (no pass has run
+/// through this function before) and when it exists but carries no
+/// comment. Both read as the same "nothing to resume from" outcome.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] on a catalog failure.
+#[cfg(feature = "db")]
+pub async fn read_durable_sweep_cursor(
+    conn: &mut AsyncPgConnection,
+) -> HarvestResult<Option<String>> {
+    let rows = diesel::sql_query(format!(
+        "SELECT obj_description(c.oid, 'pg_class') AS v \
+           FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE c.relname = '{MAINTAIN_CURSOR_SEQUENCE}' AND n.nspname = current_schema()"
+    ))
+    .load::<OptTextRow>(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows.into_iter().next().and_then(|r| r.v))
+}
+
+/// Persist `resume_after` into [`MAINTAIN_CURSOR_SEQUENCE`]'s comment,
+/// creating the sequence on first use.
+///
+/// `None` clears the comment rather than leaving a stale cursor behind.
+/// A pass that finished with nothing left to resume from must not leave
+/// the next run seeking a partition that is no longer relevant.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] on a catalog failure.
+#[cfg(feature = "db")]
+pub async fn write_durable_sweep_cursor(
+    conn: &mut AsyncPgConnection,
+    resume_after: Option<&str>,
+) -> HarvestResult<()> {
+    exec(
+        conn,
+        &format!("CREATE SEQUENCE IF NOT EXISTS {MAINTAIN_CURSOR_SEQUENCE}"),
+    )
+    .await?;
+    // `resume_after` is an engine-generated partition name, not operator
+    // input. This still asks Postgres to build the statement rather than
+    // interpolating it by hand. `%I`/`%L` quote and escape exactly the
+    // way `EXECUTE ... quote_literal(...)` does elsewhere in this file.
+    // `%L` renders a NULL argument as the bare keyword `NULL`, so one
+    // query covers both clearing and setting the comment.
+    let stmt = diesel::sql_query("SELECT format('COMMENT ON SEQUENCE %I IS %L', $1, $2) AS v")
+        .bind::<Text, _>(MAINTAIN_CURSOR_SEQUENCE)
+        .bind::<diesel::sql_types::Nullable<Text>, _>(resume_after)
+        .get_result::<TextRow>(conn)
+        .await
+        .map_err(database_error)?
+        .v;
+    exec(conn, &stmt).await?;
+    Ok(())
+}
+
 /// One full maintenance pass: extend the lookahead window, drain the `DEFAULT`
 /// partition, then sweep.
 ///
