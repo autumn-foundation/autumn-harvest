@@ -16705,11 +16705,14 @@ async fn check_continue_as_new_type<'a>(
             // predecessor's shard, so it is only sound once we know the target
             // key routes to that same shard (Codex P1 on PR #1159).
             if let Err(error) = reject_cross_shard_continue_as_new(
+                conn,
                 info.name,
                 &execution.workflow_name,
                 &execution.workflow_id,
                 execution.shard_id,
-            ) {
+            )
+            .await?
+            {
                 error
             } else if let Err(error) = classify_successor_deadline_representable(
                 info.name,
@@ -16790,8 +16793,9 @@ enum SuccessorSlot {
     Free,
 }
 
-/// Reject a cross-type continuation whose target key routes to a *different*
-/// shard than the predecessor lives on (issue #803, Codex P1 on PR #1159).
+/// Reject a cross-type continuation whose target key is genuinely occupied by
+/// a live run on another shard (issue #803; occupancy check added for issue
+/// #1308).
 ///
 /// Rendezvous routing hashes the **pair** `(workflow_name, workflow_id)`, so
 /// changing the type changes the shard the key resolves to — empirically for
@@ -16799,75 +16803,153 @@ enum SuccessorSlot {
 /// predecessor's shard: the seal and the insert are one transaction, and
 /// Postgres has no cross-shard transaction to move it with.
 ///
-/// Left unguarded that silently breaks two things a multi-shard deployment
-/// relies on:
+/// A divergent route is not itself a problem. The problem is
+/// `(workflow_name, workflow_id)` uniqueness. [`resolve_successor_slot`] can
+/// only see the predecessor's shard. A **live** run of the target type on the
+/// routed shard is invisible to it. The successor would be created alongside
+/// it — two live runs sharing one key. So this checks the routed shard for
+/// real, via [`external_target_location::check_cross_shard_occupancy`]
+/// (issue #1146's observation-based fan-out), instead of refusing on the hash
+/// mismatch alone. A residency-pinned target (issue #697) whose key hashes
+/// elsewhere, but is not actually occupied there, may now proceed.
 ///
-/// 1. **`(workflow_name, workflow_id)` uniqueness**, because
-///    [`resolve_successor_slot`] can only see the predecessor's shard: a live
-///    run of the target type sitting on the hash-derived shard is invisible, so
-///    the successor is created alongside it and two live runs share one key.
+/// Issue #1146 also removed the second reason this guard used to carry.
+/// By-id signal/cancel (issue #751) resolved its target by hashing the new
+/// pair. That would report the relocated successor as `target_unknown`.
+/// Delivery now finds a run wherever it lives, so reachability was never at
+/// stake for this check either.
 ///
-/// Issue #1146 removed the *second* reason this guard originally carried —
-/// that `workflow_id`-addressed signal/cancel (issue #751) resolved its target
-/// by hashing the new pair and would therefore report the relocated successor
-/// `target_unknown`. By-id delivery now finds a run wherever it lives
-/// (`external_target_location::resolve_location_by_workflow_id`), so
-/// reachability is no longer at stake. The uniqueness reason above is
-/// untouched and is on its own sufficient: two live runs under one business key
-/// is a corrupt state no addressing scheme can repair. Relaxing this guard into
-/// a real cross-shard occupancy check — which #1146's fan-out now makes
-/// possible — is a genuine follow-up, deliberately not taken here.
+/// # Fail-closed cases (Codex point, issue #1308)
 ///
-/// So this fails the transition **closed**, matching what the feature already
-/// does for every other unsupported target (blank, unregistered, DAG, occupied
-/// slot): a loud, deterministic, actionable terminal failure instead of silent
-/// misrouting and a broken uniqueness invariant.
+/// The occupancy fan-out is a **read**, not a lock. A live run can still be
+/// created on the routed shard between the check and the successor insert.
+/// This narrows the pre-#1308 race window rather than closing it. The
+/// pre-#1308 window was the *entire* transition, unconditionally refused.
+/// Closing the window needs a cross-shard reservation this change does not
+/// add.
+///
+/// A shard that cannot be inspected reports
+/// [`external_target_location::CrossShardOccupancy::Indeterminate`]. This
+/// handler must decide now. It has no retry queue, unlike the outbox
+/// scanners. So an indeterminate answer is rejected exactly like a confirmed
+/// occupant. This matches the pre-#1308 posture for every divergent target.
+///
+/// One indeterminate case is not a business rejection at all: a failed query
+/// on the **held** (predecessor's own) connection. Postgres has already
+/// aborted that transaction, so no later statement on it can succeed —
+/// including the `persist_workflow_failure` write a plain rejection uses.
+/// This returns `Err` (a real [`HarvestError`]) instead. It propagates past
+/// the caller's `?` to roll back the outer transaction cleanly. That matches
+/// how `resolve_location_by_workflow_id_with`'s own doc says a
+/// held-connection failure must be handled.
 ///
 /// **Single-shard deployments are unaffected** — one shard means the key can
 /// only ever resolve to it, so this never fires. It is also inert when no
 /// global router is installed (tests, embedders that never call
 /// `install_global_router`), since the target shard is then unknowable and
 /// guessing would be worse than the status quo.
-fn reject_cross_shard_continue_as_new(
+///
+/// `Ok(Err(msg))` is an ordinary business rejection, matching
+/// [`resolve_successor_slot`]'s convention. `Err` is the held-connection case
+/// above: a real database error, meant to propagate.
+async fn reject_cross_shard_continue_as_new(
+    conn: &mut AsyncPgConnection,
     target: &str,
     predecessor_type: &str,
     workflow_id: &str,
     predecessor_shard: i32,
-) -> Result<(), String> {
-    // Cheap exemption first: naming the run's own type changes no key, so it
-    // needs no routing lookup at all (Codex P2 on PR #1159).
-    if target == predecessor_type {
-        return Ok(());
-    }
+) -> HarvestResult<Result<(), String>> {
     let target_shard =
         crate::shard::external_target_owning_shard(&crate::types::ExternalTarget::WorkflowId {
             workflow_name: target.to_string(),
             workflow_id: workflow_id.to_string(),
         });
-    classify_cross_shard_continue_as_new(
+    let target_shard = match classify_cross_shard_continue_as_new(
         target,
         predecessor_type,
+        predecessor_shard,
+        target_shard,
+    ) {
+        CrossShardContinueAsNewFastPath::Allow => return Ok(Ok(())),
+        CrossShardContinueAsNewFastPath::NeedsOccupancyCheck { target_shard } => target_shard,
+    };
+    let occupancy =
+        cross_shard_continue_as_new_occupancy(conn, target, workflow_id, predecessor_shard).await;
+
+    // A failure on the HELD connection (this transition's own shard) is not an
+    // ordinary "could not check a peer" outcome.
+    // `resolve_location_by_workflow_id_with` aborts the whole transaction when
+    // that query fails. It returns `Indeterminate` with an entry for exactly
+    // that shard (issue #1146, `external_target_location.rs`'s doc on the
+    // held-connection error arm). No further statement on `conn` can succeed
+    // after that, including `persist_workflow_failure`'s own writes. So this
+    // must propagate a real error and let the OUTER transaction roll back. It
+    // must not try to record a terminal failure on a connection that can no
+    // longer accept one.
+    if let crate::external_target_location::CrossShardOccupancy::Indeterminate { uninspected } =
+        &occupancy
+        && indeterminate_is_from_the_held_connection(uninspected, predecessor_shard)
+    {
+        return Err(crate::error::database_error(format!(
+            "cross-shard occupancy check for ('{target}', '{workflow_id}') failed on the \
+             predecessor's own connection, aborting the transaction: {uninspected:?}"
+        )));
+    }
+
+    Ok(render_cross_shard_continue_as_new_result(
+        target,
         workflow_id,
         predecessor_shard,
         target_shard,
-    )
+        &occupancy,
+    ))
 }
 
-/// Pure decision behind [`reject_cross_shard_continue_as_new`].
+/// Pure decision behind the held-connection check in
+/// [`reject_cross_shard_continue_as_new`] (issue #1308).
 ///
-/// Split out so the inert / co-located / divergent matrix is unit-testable
-/// without installing a process-global router (which would race sibling tests
-/// in the same binary), matching how [`classify_successor_slot`] and
-/// [`classify_continue_as_new_target`] are tested.
+/// Only the held shard's own query failure ever appears in `uninspected` for
+/// this reason. A peer shard's failure — no pool, a timed-out acquisition, a
+/// failed query — never carries the held shard's id. See
+/// `external_target_location::resolve_location_by_workflow_id_with`'s doc for
+/// why that arm is the sole source of this shape.
+#[must_use]
+fn indeterminate_is_from_the_held_connection(
+    uninspected: &[crate::external_target_location::UninspectedShard],
+    held_shard: i32,
+) -> bool {
+    uninspected.iter().any(|u| u.shard.as_i32() == held_shard)
+}
+
+/// Outcome of [`reject_cross_shard_continue_as_new`]'s cheap, I/O-free checks
+/// (issue #803, extended issue #1308).
+///
+/// Split out so the inert / co-located / divergent matrix stays unit-testable
+/// without installing a process-global router. Installing one would race
+/// sibling tests in the same binary. This matches how
+/// [`classify_successor_slot`] and [`classify_continue_as_new_target`] are
+/// tested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrossShardContinueAsNewFastPath {
+    /// The transition needs no occupancy check: allow it.
+    Allow,
+    /// The target key routes to a different shard than the predecessor's.
+    /// An occupancy check on `target_shard` decides the outcome.
+    NeedsOccupancyCheck {
+        /// The shard the target key's rendezvous hash names.
+        target_shard: crate::types::ShardId,
+    },
+}
+
+/// Pure decision behind [`reject_cross_shard_continue_as_new`]'s fast path.
 ///
 /// `target_shard == None` means no global router is installed.
 fn classify_cross_shard_continue_as_new(
     target: &str,
     predecessor_type: &str,
-    workflow_id: &str,
     predecessor_shard: i32,
     target_shard: Option<crate::types::ShardId>,
-) -> Result<(), String> {
+) -> CrossShardContinueAsNewFastPath {
     if target == predecessor_type {
         // Naming the run's OWN type is a supported request (it re-resolves that
         // type's declared defaults) and leaves `(workflow_name, workflow_id)`
@@ -16879,25 +16961,88 @@ fn classify_cross_shard_continue_as_new(
         // #697) a run is deliberately pinned OFF its hash-derived shard, so
         // without this arm every such entity would be failed terminally the
         // moment it named its own type.
-        return Ok(());
+        return CrossShardContinueAsNewFastPath::Allow;
     }
     let Some(target_shard) = target_shard else {
         // No global router installed: the target shard is unknowable here, and
         // a deployment without a router is single-shard by construction.
-        return Ok(());
+        return CrossShardContinueAsNewFastPath::Allow;
     };
     if target_shard.as_i32() == predecessor_shard {
-        return Ok(());
+        return CrossShardContinueAsNewFastPath::Allow;
     }
-    Err(format!(
-        "continue_as_new into '{target}' would place the successor on shard {predecessor_shard} \
-         (the predecessor's shard, since the seal and the successor insert are one transaction), \
-         but the key ('{target}', '{workflow_id}') routes to shard {}. Cross-shard relocation is \
-         not supported: proceeding could admit a second live run of the target type on the routed \
-         shard, because the uniqueness check can only see the predecessor's shard. Keep this \
-         entity on one type and branch internally, or run a single-shard deployment",
-        target_shard.as_i32()
-    ))
+    CrossShardContinueAsNewFastPath::NeedsOccupancyCheck { target_shard }
+}
+
+/// Run [`reject_cross_shard_continue_as_new`]'s occupancy fan-out, reusing the
+/// predecessor's own connection for its own shard (issue #1308).
+///
+/// Reports [`external_target_location::CrossShardOccupancy::Indeterminate`]
+/// with no uninspected shards when no sharded pool is configured. That
+/// matches the fail-closed posture the pre-#1308 hash rejection took for
+/// every divergent target. So an embedder that never wires one up sees no
+/// behavior change.
+async fn cross_shard_continue_as_new_occupancy(
+    conn: &mut AsyncPgConnection,
+    target: &str,
+    workflow_id: &str,
+    predecessor_shard: i32,
+) -> crate::external_target_location::CrossShardOccupancy {
+    let Some(pool) = crate::shard::GLOBAL_SHARDED_POOL
+        .read()
+        .ok()
+        .and_then(|p| p.clone())
+    else {
+        return crate::external_target_location::CrossShardOccupancy::Indeterminate {
+            uninspected: Vec::new(),
+        };
+    };
+    let router = crate::shard::GLOBAL_SHARD_ROUTER
+        .read()
+        .ok()
+        .and_then(|g| g.clone());
+    crate::external_target_location::check_cross_shard_occupancy(
+        &pool,
+        router.as_ref(),
+        target,
+        workflow_id,
+        Some((crate::types::ShardId::new(predecessor_shard), conn)),
+    )
+    .await
+}
+
+/// Pure decision behind [`reject_cross_shard_continue_as_new`]'s final verdict
+/// (issue #1308), split out so it is unit-testable without a database.
+fn render_cross_shard_continue_as_new_result(
+    target: &str,
+    workflow_id: &str,
+    predecessor_shard: i32,
+    target_shard: crate::types::ShardId,
+    occupancy: &crate::external_target_location::CrossShardOccupancy,
+) -> Result<(), String> {
+    use crate::external_target_location::CrossShardOccupancy;
+    match occupancy {
+        CrossShardOccupancy::Free => Ok(()),
+        CrossShardOccupancy::Occupied { shard } => Err(format!(
+            "continue_as_new into '{target}' would place the successor on shard \
+             {predecessor_shard} (the predecessor's shard, since the seal and the successor \
+             insert are one transaction), but a live run already holds the key ('{target}', \
+             '{workflow_id}') on shard {shard}. Two live runs would share one business key. Keep \
+             this entity on one type and branch internally, or run a single-shard deployment"
+        )),
+        CrossShardOccupancy::Indeterminate { uninspected } => Err(format!(
+            "continue_as_new into '{target}' would place the successor on shard \
+             {predecessor_shard}. The key ('{target}', '{workflow_id}') routes to shard \
+             {} but the fan-out could not check every expected shard for a live run: {}. \
+             Refusing to risk two live runs sharing one business key. Retry the continuation",
+            target_shard.as_i32(),
+            uninspected
+                .iter()
+                .map(|u| format!("shard {} ({})", u.shard, u.reason))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 /// Reject a cross-type continuation whose target declares an
@@ -38512,31 +38657,32 @@ mod tests {
         use crate::types::ShardId;
 
         // The reachable shape: pinned to shard 0 (issue #697), hashes to 2.
-        assert!(
+        assert_eq!(
             classify_cross_shard_continue_as_new(
                 "trial_subscription",
                 "trial_subscription",
-                "sub-42",
                 0,
                 Some(ShardId::new(2)),
-            )
-            .is_ok(),
+            ),
+            CrossShardContinueAsNewFastPath::Allow,
             "naming the run's own type must be exempt: the key is unchanged, so a pinned \
              execution whose hash points elsewhere must still be allowed to continue"
         );
 
-        // ...and a GENUINE type change on that same divergent routing is still
-        // rejected, so the exemption above cannot be masking a dead guard.
-        assert!(
+        // ...and a GENUINE type change on that same divergent routing still
+        // needs an occupancy check, so the exemption above cannot be masking a
+        // dead guard.
+        assert_eq!(
             classify_cross_shard_continue_as_new(
                 "paid_subscription",
                 "trial_subscription",
-                "sub-42",
                 0,
                 Some(ShardId::new(2)),
-            )
-            .is_err(),
-            "a real type change on divergent routing must still be rejected"
+            ),
+            CrossShardContinueAsNewFastPath::NeedsOccupancyCheck {
+                target_shard: ShardId::new(2)
+            },
+            "a real type change on divergent routing must still need an occupancy check"
         );
     }
 
@@ -38682,70 +38828,177 @@ mod tests {
         );
     }
 
-    /// The full inert / co-located / divergent matrix for the cross-shard
-    /// guard, driven through the pure decision so no process-global router is
-    /// installed (which would race sibling tests in this binary).
+    /// This test drives the full inert / co-located / divergent matrix for
+    /// the cross-shard guard's fast path. It goes through the pure decision,
+    /// so no process-global router is installed. Installing one would race
+    /// sibling tests in this binary.
     #[test]
     fn can803_cross_shard_guard_matrix() {
         use crate::types::ShardId;
 
         // No router installed => inert. A deployment without one is
         // single-shard by construction, and guessing would be worse.
-        assert!(
+        assert_eq!(
             classify_cross_shard_continue_as_new(
                 "paid_subscription",
                 "trial_subscription",
-                "sub-1",
                 0,
                 None
-            )
-            .is_ok(),
+            ),
+            CrossShardContinueAsNewFastPath::Allow,
             "with no router installed the guard must not reject"
         );
 
         // Target key routes to the predecessor's own shard => allowed. This is
         // every single-shard deployment, and the co-located slice of a
         // multi-shard one.
-        assert!(
+        assert_eq!(
             classify_cross_shard_continue_as_new(
                 "paid_subscription",
                 "trial_subscription",
-                "sub-1",
                 0,
                 Some(ShardId::new(0))
-            )
-            .is_ok(),
+            ),
+            CrossShardContinueAsNewFastPath::Allow,
             "a co-located target must never be rejected"
         );
-        assert!(
+        assert_eq!(
             classify_cross_shard_continue_as_new(
                 "paid_subscription",
                 "trial_subscription",
-                "sub-1",
                 3,
                 Some(ShardId::new(3))
-            )
-            .is_ok(),
+            ),
+            CrossShardContinueAsNewFastPath::Allow,
             "co-location on a non-zero shard must also be allowed"
         );
 
-        // Divergent => rejected, and the message must name BOTH shards so an
-        // operator can tell which way it diverged without reading the source.
-        let error = classify_cross_shard_continue_as_new(
+        // Divergent => needs an occupancy check, naming the routed shard.
+        assert_eq!(
+            classify_cross_shard_continue_as_new(
+                "paid_subscription",
+                "trial_subscription",
+                0,
+                Some(ShardId::new(2)),
+            ),
+            CrossShardContinueAsNewFastPath::NeedsOccupancyCheck {
+                target_shard: ShardId::new(2)
+            },
+            "a target routing to another shard must need an occupancy check"
+        );
+    }
+
+    /// [`render_cross_shard_continue_as_new_result`] must let the transition
+    /// through when the key is not actually occupied elsewhere (issue #1308).
+    /// This is the behavior change this issue exists for. A divergent hash is
+    /// no longer enough, on its own, to refuse the continuation.
+    #[test]
+    fn can1308_an_unoccupied_divergent_target_is_allowed() {
+        use crate::external_target_location::CrossShardOccupancy;
+        use crate::types::ShardId;
+
+        assert!(
+            render_cross_shard_continue_as_new_result(
+                "paid_subscription",
+                "sub-42",
+                0,
+                ShardId::new(2),
+                &CrossShardOccupancy::Free,
+            )
+            .is_ok(),
+            "a divergent key with no live run anywhere must be allowed to continue"
+        );
+    }
+
+    /// [`indeterminate_is_from_the_held_connection`] must flag exactly the
+    /// held/predecessor shard's own failure, never an unrelated peer's (issue
+    /// #1308 review finding). The two must not be treated alike: the held
+    /// one means the whole transaction is already aborted.
+    #[test]
+    fn can1308_held_connection_failure_is_distinguished_from_a_peers() {
+        use crate::external_target_location::{UninspectedReasonKind, UninspectedShard};
+
+        let held_failed = [UninspectedShard {
+            shard: crate::types::ShardId::new(0),
+            reason: "query failed".to_string(),
+            kind: UninspectedReasonKind::QueryError,
+        }];
+        assert!(
+            indeterminate_is_from_the_held_connection(&held_failed, 0),
+            "the held shard's own failure must be recognized"
+        );
+
+        let peer_failed = [UninspectedShard {
+            shard: crate::types::ShardId::new(1),
+            reason: "no pool configured".to_string(),
+            kind: UninspectedReasonKind::NoPool,
+        }];
+        assert!(
+            !indeterminate_is_from_the_held_connection(&peer_failed, 0),
+            "an unrelated peer's failure must not be mistaken for the held connection's"
+        );
+
+        assert!(
+            !indeterminate_is_from_the_held_connection(&[], 0),
+            "no uninspected shards at all must not be mistaken for a held-connection failure"
+        );
+    }
+
+    /// A genuinely occupied target key is still rejected, naming the key and
+    /// the shard the live run actually holds it on (issue #1308).
+    #[test]
+    fn can1308_an_occupied_divergent_target_is_rejected() {
+        use crate::external_target_location::CrossShardOccupancy;
+        use crate::types::ShardId;
+
+        let error = render_cross_shard_continue_as_new_result(
             "paid_subscription",
-            "trial_subscription",
             "sub-42",
             0,
-            Some(ShardId::new(2)),
+            ShardId::new(2),
+            &CrossShardOccupancy::Occupied {
+                shard: ShardId::new(2),
+            },
         )
-        .expect_err("a target routing to another shard must be rejected");
+        .expect_err("an occupied key must still be rejected");
         assert!(
-            error.contains("shard 0") && error.contains("shard 2"),
-            "the rejection must name both the predecessor's and the routed shard: {error}"
+            error.contains("shard 2")
+                && error.contains("paid_subscription")
+                && error.contains("sub-42"),
+            "the rejection must name the occupied shard and the target key: {error}"
         );
+    }
+
+    /// A shard that could not be inspected fails closed, exactly like the
+    /// pre-#1308 hash-based rejection (issue #1308). This handler must decide
+    /// now: it has no retry queue.
+    #[test]
+    fn can1308_an_indeterminate_shard_fails_closed() {
+        use crate::external_target_location::{
+            CrossShardOccupancy, UninspectedReasonKind, UninspectedShard,
+        };
+        use crate::types::ShardId;
+
+        // The uninspected shard (3) deliberately differs from the routed one
+        // (2). The rejection must name the shard the fan-out actually could
+        // not check, not the hash-predicted one (issue #1308 review finding).
+        let error = render_cross_shard_continue_as_new_result(
+            "paid_subscription",
+            "sub-42",
+            0,
+            ShardId::new(2),
+            &CrossShardOccupancy::Indeterminate {
+                uninspected: vec![UninspectedShard {
+                    shard: ShardId::new(3),
+                    reason: "connection acquisition timed out".to_string(),
+                    kind: UninspectedReasonKind::AcquireTimeout,
+                }],
+            },
+        )
+        .expect_err("an uninspectable shard must fail closed");
         assert!(
-            error.contains("paid_subscription") && error.contains("sub-42"),
-            "the rejection must name the target key: {error}"
+            error.contains("shard 3"),
+            "the rejection must name the shard that actually could not be checked: {error}"
         );
     }
 
