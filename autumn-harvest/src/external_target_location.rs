@@ -99,15 +99,51 @@ use crate::shard::{ShardRouter, ShardedDbPool};
 use crate::types::ShardId;
 use crate::worker::DbPool;
 
+/// Why a shard could not be inspected, as a bounded label a metric can carry
+/// (issue #1307).
+///
+/// `#[non_exhaustive]`: a probe fails in exactly these three ways today, but a
+/// new failure shape must slot in as a new variant, not force a caller to
+/// guess from `reason`'s prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UninspectedReasonKind {
+    /// This process has no configured pool for the shard.
+    NoPool,
+    /// A connection could not be acquired, or the probe did not answer, in
+    /// time.
+    AcquireTimeout,
+    /// The connection was acquired but the resolution query itself failed.
+    QueryError,
+}
+
+impl UninspectedReasonKind {
+    /// The bounded metric-label value for this kind (issue #1307).
+    ///
+    /// Per ADR-0001 §7, only low-cardinality values may label a metric — this
+    /// is that value, kept separate from [`std::fmt::Display`] so a future
+    /// operator-facing rendering of `self` does not silently change a metric
+    /// label.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::NoPool => "no_pool",
+            Self::AcquireTimeout => "acquire_timeout",
+            Self::QueryError => "query_error",
+        }
+    }
+}
+
 /// A shard a by-business-key fan-out expected to inspect but could not.
 ///
 /// Its presence in a [`TargetLocation::Indeterminate`] is the reason the
 /// resolution is being reported as inconclusive rather than as an answer.
 ///
-/// `#[non_exhaustive]` deliberately: `reason` is prose for an operator log line
-/// today, and the obvious next addition is a machine-readable discriminant
-/// (no-pool vs. acquisition-timeout vs. query-error) that callers can act on
-/// differently. Adding it must not be a breaking change.
+/// `#[non_exhaustive]` deliberately: `reason` is prose for an operator log
+/// line, and [`Self::kind`] is its machine-readable twin (issue #1307) —
+/// callers that need to act differently on a no-pool vs. a timed-out vs. a
+/// failed-query shard use `kind`; the log line still reads `reason`. Adding a
+/// third field must not be a breaking change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct UninspectedShard {
@@ -116,6 +152,8 @@ pub struct UninspectedShard {
     /// Why it could not be queried (no configured pool, connection failure,
     /// query failure), for the operator-facing log line.
     pub reason: String,
+    /// The bounded discriminant behind `reason`, for metrics (issue #1307).
+    pub kind: UninspectedReasonKind,
 }
 
 /// Where a `(workflow_name, workflow_id)`-addressed target actually lives.
@@ -475,7 +513,8 @@ pub const FANOUT_PEER_BOUND: std::time::Duration = std::time::Duration::from_sec
 /// very next sweep.
 #[derive(Clone, Debug, Default)]
 pub struct UninspectableShards {
-    shards: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<ShardId, String>>>,
+    shards:
+        std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<ShardId, (String, UninspectedReasonKind)>>>,
 }
 
 impl UninspectableShards {
@@ -485,9 +524,10 @@ impl UninspectableShards {
         Self::default()
     }
 
-    /// The recorded reason `shard` could not be inspected earlier in this sweep.
+    /// The recorded reason and kind `shard` could not be inspected earlier in
+    /// this sweep.
     #[must_use]
-    pub fn recorded(&self, shard: ShardId) -> Option<String> {
+    pub fn recorded(&self, shard: ShardId) -> Option<(String, UninspectedReasonKind)> {
         self.shards
             .lock()
             .ok()
@@ -496,9 +536,9 @@ impl UninspectableShards {
 
     /// Record that `shard` could not be inspected. The first reason wins, so the
     /// log names the original failure rather than a later re-derivation of it.
-    pub fn record(&self, shard: ShardId, reason: String) {
+    pub fn record(&self, shard: ShardId, reason: String, kind: UninspectedReasonKind) {
         if let Ok(mut guard) = self.shards.lock() {
-            guard.entry(shard).or_insert(reason);
+            guard.entry(shard).or_insert((reason, kind));
         }
     }
 }
@@ -641,6 +681,7 @@ pub async fn resolve_location_by_workflow_id_with(
                         reason: format!(
                             "resolution query failed on the caller's own connection,                              aborting its transaction: {e}"
                         ),
+                        kind: UninspectedReasonKind::QueryError,
                     });
                     return TargetLocation::Indeterminate { uninspected };
                 }
@@ -650,8 +691,8 @@ pub async fn resolve_location_by_workflow_id_with(
 
         // 2. Already known bad this sweep: report it without paying the bound
         //    a second time. (Recorded already, so it does not re-memoize.)
-        if let Some(reason) = memo.and_then(|m| m.recorded(shard)) {
-            uninspected.push(UninspectedShard { shard, reason });
+        if let Some((reason, kind)) = memo.and_then(|m| m.recorded(shard)) {
+            uninspected.push(UninspectedShard { shard, reason, kind });
             continue;
         }
 
@@ -661,6 +702,7 @@ pub async fn resolve_location_by_workflow_id_with(
                 memo,
                 shard,
                 "no storage pool configured in this process".to_string(),
+                UninspectedReasonKind::NoPool,
             );
             continue;
         };
@@ -686,7 +728,7 @@ pub async fn resolve_location_by_workflow_id_with(
         match probe_peer_shard(shard_pool, workflow_name, workflow_id).await {
             Ok(Some(run)) => candidates.push((shard, run)),
             Ok(None) => {}
-            Err(reason) => mark_uninspected(&mut uninspected, memo, shard, reason),
+            Err((reason, kind)) => mark_uninspected(&mut uninspected, memo, shard, reason, kind),
         }
     }
 
@@ -751,28 +793,44 @@ async fn probe_peer_shard(
     shard_pool: &DbPool,
     workflow_name: &str,
     workflow_id: &str,
-) -> Result<Option<ResolvedRun>, String> {
+) -> Result<Option<ResolvedRun>, (String, UninspectedReasonKind)> {
     let probe = tokio::time::timeout(FANOUT_PEER_BOUND, async {
         let acquire_bound = peer_acquire_bound(shard_pool);
         let mut conn = match tokio::time::timeout(acquire_bound, shard_pool.get()).await {
             Ok(Ok(conn)) => conn,
-            Ok(Err(e)) => return Err(format!("could not acquire a connection: {e}")),
+            Ok(Err(e)) => {
+                return Err((
+                    format!("could not acquire a connection: {e}"),
+                    UninspectedReasonKind::AcquireTimeout,
+                ));
+            }
             Err(_elapsed) => {
-                return Err(format!(
-                    "no connection available within {acquire_bound:?} (pool busy or \
-                 unreachable)"
+                return Err((
+                    format!(
+                        "no connection available within {acquire_bound:?} (pool busy or \
+                     unreachable)"
+                    ),
+                    UninspectedReasonKind::AcquireTimeout,
                 ));
             }
         };
         crate::execution::resolve_execution_id_by_workflow_id(&mut conn, workflow_name, workflow_id)
             .await
-            .map_err(|e| format!("resolution query failed: {e}"))
+            .map_err(|e| {
+                (
+                    format!("resolution query failed: {e}"),
+                    UninspectedReasonKind::QueryError,
+                )
+            })
     })
     .await;
 
     match probe {
         Ok(result) => result,
-        Err(_elapsed) => Err(format!("shard did not answer within {FANOUT_PEER_BOUND:?}")),
+        Err(_elapsed) => Err((
+            format!("shard did not answer within {FANOUT_PEER_BOUND:?}"),
+            UninspectedReasonKind::AcquireTimeout,
+        )),
     }
 }
 
@@ -823,11 +881,12 @@ fn mark_uninspected(
     memo: Option<&UninspectableShards>,
     shard: ShardId,
     reason: String,
+    kind: UninspectedReasonKind,
 ) {
     if let Some(memo) = memo {
-        memo.record(shard, reason.clone());
+        memo.record(shard, reason.clone(), kind);
     }
-    uninspected.push(UninspectedShard { shard, reason });
+    uninspected.push(UninspectedShard { shard, reason, kind });
 }
 
 /// May a delivery to `target` be attempted **inline** (issue #1146)?
@@ -947,9 +1006,14 @@ mod tests {
     }
 
     fn uninspected(shard: i32) -> UninspectedShard {
+        uninspected_with_kind(shard, UninspectedReasonKind::QueryError)
+    }
+
+    fn uninspected_with_kind(shard: i32, kind: UninspectedReasonKind) -> UninspectedShard {
         UninspectedShard {
             shard: ShardId::new(shard),
             reason: "test".to_string(),
+            kind,
         }
     }
 
@@ -1191,8 +1255,15 @@ mod tests {
     fn the_memo_reports_back_a_shard_it_recorded() {
         let memo = UninspectableShards::new();
         assert_eq!(memo.recorded(ShardId::new(1)), None);
-        memo.record(ShardId::new(1), "no pool".to_string());
-        assert_eq!(memo.recorded(ShardId::new(1)), Some("no pool".to_string()));
+        memo.record(
+            ShardId::new(1),
+            "no pool".to_string(),
+            UninspectedReasonKind::NoPool,
+        );
+        assert_eq!(
+            memo.recorded(ShardId::new(1)),
+            Some(("no pool".to_string(), UninspectedReasonKind::NoPool))
+        );
         assert_eq!(
             memo.recorded(ShardId::new(2)),
             None,
@@ -1201,19 +1272,39 @@ mod tests {
     }
 
     #[test]
-    fn the_memo_keeps_the_first_reason_it_was_given() {
+    fn the_memo_keeps_the_first_reason_and_kind_it_was_given() {
         // The short-circuit path deliberately does not re-record, so an operator
         // sees the original diagnosis rather than a later re-derivation of it.
         let memo = UninspectableShards::new();
         memo.record(
             ShardId::new(1),
             "could not acquire a connection".to_string(),
+            UninspectedReasonKind::AcquireTimeout,
         );
-        memo.record(ShardId::new(1), "something later and vaguer".to_string());
+        memo.record(
+            ShardId::new(1),
+            "something later and vaguer".to_string(),
+            UninspectedReasonKind::QueryError,
+        );
         assert_eq!(
             memo.recorded(ShardId::new(1)),
-            Some("could not acquire a connection".to_string())
+            Some((
+                "could not acquire a connection".to_string(),
+                UninspectedReasonKind::AcquireTimeout
+            ))
         );
+    }
+
+    #[test]
+    fn uninspected_reason_kind_has_a_bounded_metric_label_per_variant() {
+        // issue #1307: the label is the metric-facing value, kept distinct from
+        // any future Display/Debug rendering.
+        assert_eq!(UninspectedReasonKind::NoPool.as_label(), "no_pool");
+        assert_eq!(
+            UninspectedReasonKind::AcquireTimeout.as_label(),
+            "acquire_timeout"
+        );
+        assert_eq!(UninspectedReasonKind::QueryError.as_label(), "query_error");
     }
 
     #[test]
@@ -1256,5 +1347,71 @@ mod tests {
             FANOUT_PEER_BOUND,
             "an unopened pool must be allowed to finish its handshake"
         );
+    }
+
+    // ── UninspectedReasonKind classification (issue #1307) ─────────────────
+
+    fn unreachable_pool() -> DbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://unused:unused@127.0.0.1:1/unused");
+        deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds")
+    }
+
+    #[tokio::test]
+    async fn a_shard_with_no_configured_pool_is_classified_as_no_pool() {
+        // `ShardedDbPool` requires at least one configured pool, so shard 0
+        // carries one (unreachable — irrelevant to this test, which is about
+        // shard 1, for which no pool is configured at all). The router's
+        // fan-out is the union of the pool's shards and its own, so shard 0
+        // is unavoidably probed too; that classification is covered by
+        // `a_peer_shard_whose_connection_cannot_be_acquired_is_classified_as_acquire_timeout`.
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(ShardId::new(0), unreachable_pool());
+        let pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+        let router = ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(0),
+        );
+
+        let placement =
+            resolve_location_by_workflow_id_with(&pool, Some(&router), "wf", "id", None, None)
+                .await;
+
+        match placement {
+            TargetLocation::Indeterminate { uninspected } => {
+                let shard_1 = uninspected
+                    .iter()
+                    .find(|u| u.shard == ShardId::new(1))
+                    .expect("shard 1 has no configured pool and must be reported uninspected");
+                assert_eq!(shard_1.kind, UninspectedReasonKind::NoPool);
+            }
+            other => panic!("expected Indeterminate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_shard_whose_connection_cannot_be_acquired_is_classified_as_acquire_timeout() {
+        // A pool that CANNOT hand over a connection (nothing listens on the
+        // configured address) must be reported `AcquireTimeout`, never
+        // `QueryError` — no query ever ran.
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(ShardId::new(0), unreachable_pool());
+        let pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+        let placement =
+            resolve_location_by_workflow_id_with(&pool, None, "wf", "id", None, None).await;
+
+        match placement {
+            TargetLocation::Indeterminate { uninspected } => {
+                assert_eq!(uninspected.len(), 1);
+                assert_eq!(uninspected[0].kind, UninspectedReasonKind::AcquireTimeout);
+            }
+            other => panic!("expected Indeterminate, got {other:?}"),
+        }
     }
 }

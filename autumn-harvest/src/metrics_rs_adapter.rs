@@ -53,7 +53,10 @@ use crate::telemetry::{
     METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT, METRIC_CONCURRENCY_SUPERSEDED,
     METRIC_CONNECTOR_DISPATCHED, METRIC_CONNECTOR_LAG, METRIC_CONNECTOR_POISONED,
     METRIC_CONNECTOR_RECEIVED, METRIC_DEBOUNCE_FIRED, METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN,
-    METRIC_EXTERNAL_SIGNAL_SENT, METRIC_LABEL_ACTION, METRIC_LABEL_ACTIVITY,
+    METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT, METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD,
+    METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE, METRIC_EXTERNAL_CANCEL_SENT,
+    METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE, METRIC_EXTERNAL_SIGNAL_SENT,
+    METRIC_LABEL_ACTION, METRIC_LABEL_ACTIVITY,
     METRIC_LABEL_ACTIVITY_NAME, METRIC_LABEL_BUILD_ID, METRIC_LABEL_DECISION,
     METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_GAP, METRIC_LABEL_KEY, METRIC_LABEL_KIND,
     METRIC_LABEL_NAME, METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME, METRIC_LABEL_PATH,
@@ -703,6 +706,48 @@ impl MetricsRecorder for MetricsRsRecorder {
         }
     }
 
+    fn record_external_cancel_sent(&self, outcome: &str, reason_code: Option<&str>) {
+        if let Some(reason) = reason_code {
+            counter!(
+                METRIC_EXTERNAL_CANCEL_SENT,
+                METRIC_LABEL_OUTCOME => outcome.to_owned(),
+                METRIC_LABEL_REASON_CODE => reason.to_owned(),
+            )
+            .increment(1);
+        } else {
+            counter!(
+                METRIC_EXTERNAL_CANCEL_SENT,
+                METRIC_LABEL_OUTCOME => outcome.to_owned(),
+            )
+            .increment(1);
+        }
+    }
+
+    fn record_external_by_id_indeterminate_shard(&self, shard: u16, kind: &str) {
+        counter!(
+            METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD,
+            METRIC_LABEL_SHARD => shard.to_string(),
+            METRIC_LABEL_KIND => kind.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_external_signal_by_id_oldest_pending_indeterminate_age(&self, age_secs: f64) {
+        gauge!(METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE).set(age_secs);
+    }
+
+    fn record_external_cancel_by_id_oldest_pending_indeterminate_age(&self, age_secs: f64) {
+        gauge!(METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE).set(age_secs);
+    }
+
+    fn record_external_by_id_found_over_incomplete_fanout(&self, shard: u16) {
+        counter!(
+            METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT,
+            METRIC_LABEL_SHARD => shard.to_string(),
+        )
+        .increment(1);
+    }
+
     fn record_rate_limit_tokens_available(&self, key: &str, tokens: f64) {
         gauge!(
             METRIC_RATE_LIMIT_TOKENS_AVAILABLE,
@@ -1324,6 +1369,12 @@ mod tests {
         // Issue #617: chain-timeout counter bridge.
         rec.record_workflow_timeout("wf", "q");
         rec.record_workflow_chain_timeout("wf", "q");
+        // Issue #1307: by-id indeterminate-fan-out observability.
+        rec.record_external_cancel_sent("delivered", None);
+        rec.record_external_by_id_indeterminate_shard(0, "no_pool");
+        rec.record_external_signal_by_id_oldest_pending_indeterminate_age(0.0);
+        rec.record_external_cancel_by_id_oldest_pending_indeterminate_age(0.0);
+        rec.record_external_by_id_found_over_incomplete_fanout(0);
     }
 
     // -----------------------------------------------------------------------

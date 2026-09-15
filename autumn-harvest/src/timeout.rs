@@ -2504,6 +2504,16 @@ enum DeliveryRoute {
     Retry {
         /// Operator-facing explanation for the log line.
         reason: String,
+        /// The shard(s) responsible, structured for metrics (issue #1307).
+        ///
+        /// Mirrors [`crate::external_target_location::TargetLocation::Indeterminate`]'s
+        /// list when this came from an incomplete fan-out. When it came from
+        /// the target shard's pool being unconfigured, this is a single
+        /// synthetic entry naming that shard with
+        /// [`crate::external_target_location::UninspectedReasonKind::NoPool`] —
+        /// both are "why is this row stuck" instances the same counter cares
+        /// about.
+        uninspected: Vec<crate::external_target_location::UninspectedShard>,
     },
 }
 
@@ -2588,12 +2598,20 @@ async fn execution_id_residence(
     }
 }
 
+/// A shard id as a metric label value (issue #1307). Saturates rather than
+/// panics: a metric label must never crash the sweep it is observing.
+fn shard_metric_label(shard: crate::types::ShardId) -> u16 {
+    u16::try_from(shard.as_i32()).unwrap_or(u16::MAX)
+}
+
+#[allow(clippy::too_many_lines)]
 async fn resolve_delivery_route(
     conn: &mut AsyncPgConnection,
     sharded_pool: Option<&crate::shard::ShardedDbPool>,
     target: &ExternalTarget,
     caller_exec_id: ExecutionId,
     uninspectable: &crate::external_target_location::UninspectableShards,
+    metrics: &(dyn MetricsRecorder + Send + Sync),
 ) -> DeliveryRoute {
     let Some(pool) = sharded_pool else {
         return DeliveryRoute::Caller {
@@ -2659,15 +2677,29 @@ async fn resolve_delivery_route(
                     ref found @ crate::external_target_location::TargetLocation::Found {
                         shard,
                         ref run,
+                        ref uninspected,
                         ..
-                    } => (
-                        shard,
-                        !crate::erase::is_terminal_state(&run.state),
-                        // Not merely "every shard answered": a complete fan-out
-                        // that found a SECOND live run of this key is equally
-                        // unable to assert that nothing is running under it.
-                        found.is_authoritative_for_key(),
-                    ),
+                    } => {
+                        // A live/terminal run was found, but not every expected
+                        // shard could be inspected — a silently ambiguous
+                        // SUCCESS, not a stall, since delivery still proceeds
+                        // (issue #1307). The log line lives in
+                        // `resolve_location_by_workflow_id_with`, next to the
+                        // condition it counts; this is the metric twin.
+                        if !uninspected.is_empty() {
+                            metrics.record_external_by_id_found_over_incomplete_fanout(
+                                shard_metric_label(shard),
+                            );
+                        }
+                        (
+                            shard,
+                            !crate::erase::is_terminal_state(&run.state),
+                            // Not merely "every shard answered": a complete fan-out
+                            // that found a SECOND live run of this key is equally
+                            // unable to assert that nothing is running under it.
+                            found.is_authoritative_for_key(),
+                        )
+                    }
                     crate::external_target_location::TargetLocation::NotFound => {
                         return DeliveryRoute::NoRunAnywhere;
                     }
@@ -2688,6 +2720,7 @@ async fn resolve_delivery_route(
                                 "could not inspect every shard for (workflow_name={workflow_name}, \
                                  workflow_id={workflow_id}): {named}"
                             ),
+                            uninspected,
                         };
                     }
                 }
@@ -2725,6 +2758,11 @@ async fn resolve_delivery_route(
         },
         (None, _) => DeliveryRoute::Retry {
             reason: format!("target shard {target_shard} has no storage pool in this process"),
+            uninspected: vec![crate::external_target_location::UninspectedShard {
+                shard: target_shard,
+                reason: "target shard has no storage pool in this process".to_string(),
+                kind: crate::external_target_location::UninspectedReasonKind::NoPool,
+            }],
         },
     }
 }
@@ -2912,6 +2950,47 @@ async fn attempt_signal_delivery(
     }
 }
 
+/// Age of the oldest pending by-id row a sweep left retrying, memoized for the
+/// length of that sweep (issue #1307).
+///
+/// Mirrors [`crate::external_target_location::UninspectableShards`]'s shape —
+/// an `Arc<Mutex<_>>` the per-row transaction closure can update by
+/// reference, rather than a value threaded back through the step-outcome
+/// tuple both sweeps already return.
+///
+/// Only ever grows during a sweep, so the maximum observed `age` at the end IS
+/// the oldest pending row this sweep visited: the claim query orders by
+/// `(timestamp, id)` ascending, so a backlog is drained oldest-first, and a
+/// row that resolves to [`DeliveryRoute::Retry`] is added to the sweep's own
+/// exclusion list — it is not reclaimed this sweep, but it is not lost either,
+/// since the next full sweep tick reclaims it with a fresh, larger `age`.
+#[derive(Clone, Debug, Default)]
+struct OldestPendingIndeterminateAge(std::sync::Arc<std::sync::Mutex<Option<chrono::Duration>>>);
+
+impl OldestPendingIndeterminateAge {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn observe(&self, age: chrono::Duration) {
+        if let Ok(mut guard) = self.0.lock() {
+            *guard = Some(guard.map_or(age, |oldest| oldest.max(age)));
+        }
+    }
+
+    /// Seconds, or `0.0` if this sweep left no row pending — matching
+    /// [`MetricsRecorder::record_queue_oldest_pending_age`]'s convention so a
+    /// drained backlog does not leave a stale gauge value behind.
+    #[allow(clippy::cast_precision_loss)] // millisecond age never approaches 2^53
+    fn seconds(&self) -> f64 {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .map_or(0.0, |age| age.num_milliseconds() as f64 / 1000.0)
+    }
+}
+
 /// Enforce all currently expired task timeouts against the database state.
 ///
 /// This mutates queue rows and workflow history so timed-out tasks are not
@@ -2954,6 +3033,11 @@ pub async fn enforce_external_signals_outbox(
     // each re-probe costs the full acquisition bound. Shared across every step
     // of this sweep, discarded when it returns.
     let uninspectable = crate::external_target_location::UninspectableShards::new();
+
+    // Age of the oldest pending by-id row this sweep left retrying (issue
+    // #1307). See `OldestPendingIndeterminateAge` for why the maximum
+    // observed age at sweep end is the right answer.
+    let oldest_indeterminate = OldestPendingIndeterminateAge::new();
 
     let mut excluded_event_ids: Vec<i64> = Vec::new();
 
@@ -3038,6 +3122,7 @@ pub async fn enforce_external_signals_outbox(
                     &target,
                     caller_exec_id,
                     &uninspectable,
+                    metrics,
                 )
                 .await;
 
@@ -3139,11 +3224,18 @@ pub async fn enforce_external_signals_outbox(
                     DeliveryRoute::NoRunAnywhere => not_found_terminal(),
                     // Inconclusive — leave the row pending rather than write a
                     // wrong terminal into the caller's append-only history.
-                    DeliveryRoute::Retry { reason } => {
+                    DeliveryRoute::Retry { reason, uninspected } => {
                         tracing::warn!(
                             %reason,
                             "outbox sweep: by-id target resolution inconclusive; leaving row pending"
                         );
+                        for shard in &uninspected {
+                            metrics.record_external_by_id_indeterminate_shard(
+                                shard_metric_label(shard.shard),
+                                shard.kind.as_label(),
+                            );
+                        }
+                        oldest_indeterminate.observe(age);
                         return Ok(Some((false, Some(row.id))));
                     }
                 };
@@ -3198,6 +3290,9 @@ pub async fn enforce_external_signals_outbox(
         }
     }
 
+    metrics.record_external_signal_by_id_oldest_pending_indeterminate_age(
+        oldest_indeterminate.seconds(),
+    );
     Ok(count)
 }
 
@@ -3425,6 +3520,11 @@ pub async fn enforce_external_cancels_outbox(
     // of this sweep, discarded when it returns.
     let uninspectable = crate::external_target_location::UninspectableShards::new();
 
+    // Age of the oldest pending by-id row this sweep left retrying (issue
+    // #1307). See `OldestPendingIndeterminateAge` for why the maximum
+    // observed age at sweep end is the right answer.
+    let oldest_indeterminate = OldestPendingIndeterminateAge::new();
+
     let mut excluded_event_ids: Vec<i64> = Vec::new();
 
     loop {
@@ -3517,6 +3617,7 @@ pub async fn enforce_external_cancels_outbox(
                     &target,
                     caller_exec_id,
                     &uninspectable,
+                    metrics,
                 )
                 .await;
 
@@ -3560,11 +3661,18 @@ pub async fn enforce_external_cancels_outbox(
                     DeliveryRoute::NoRunAnywhere => not_found_terminal(),
                     // Inconclusive — leave pending rather than record a wrong
                     // terminal in the caller's append-only history.
-                    DeliveryRoute::Retry { reason } => {
+                    DeliveryRoute::Retry { reason, uninspected } => {
                         tracing::warn!(
                             %reason,
                             "cancel outbox sweep: by-id target resolution inconclusive; leaving row pending"
                         );
+                        for shard in &uninspected {
+                            metrics.record_external_by_id_indeterminate_shard(
+                                shard_metric_label(shard.shard),
+                                shard.kind.as_label(),
+                            );
+                        }
+                        oldest_indeterminate.observe(age);
                         return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new(), caller_shard)));
                     }
                     DeliveryRoute::CrossShard {
@@ -3930,6 +4038,9 @@ pub async fn enforce_external_cancels_outbox(
         }
     }
 
+    metrics.record_external_cancel_by_id_oldest_pending_indeterminate_age(
+        oldest_indeterminate.seconds(),
+    );
     Ok(count)
 }
 

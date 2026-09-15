@@ -112,6 +112,13 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     "harvest_replication_rpo_known",
     "harvest_shard_generation",
     "harvest_shard_fenced_total",
+    // Issue #1307 — by-id fan-out observability. No starter rule ships for
+    // these yet (no operational threshold data to pin one against); catalogued
+    // so an embedder's own alert can reference them.
+    "harvest_external_signal_by_id_indeterminate_shard_total",
+    "harvest_external_signal_by_id_oldest_pending_indeterminate_age",
+    "harvest_external_cancel_by_id_oldest_pending_indeterminate_age",
+    "harvest_external_signal_by_id_found_over_incomplete_fanout_total",
 ];
 
 #[test]

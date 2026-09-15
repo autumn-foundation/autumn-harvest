@@ -358,10 +358,20 @@ append-only history and cannot be taken back, so it is only ever recorded from a
 *complete* fan-out. The consequence is that a shard which is permanently
 uninspectable *in this process* — a router whose `readable_shards` names a shard
 no pool was ever configured for, say — leaves every affected by-id request
-pending indefinitely, and a workflow awaiting the outcome waits with it. There is
-no metric for this yet; the signal is the per-row `by-id target resolution
-inconclusive` warning, which names the shard and the reason. The plugin's
-startup `missing_router_shards` check prevents the steady-state form of this
+pending indefinitely, and a workflow awaiting the outcome waits with it. The
+per-row `by-id target resolution inconclusive` warning still names the shard
+and the reason (issue #1146), and three metrics now cover what the warning
+alone could not (issue #1307): the counter
+`harvest.external_signal.by_id_indeterminate_shard`, labelled `shard` and
+`kind`, for which shard and why; the gauges
+`harvest.external_signal.by_id_oldest_pending_indeterminate_age` and its
+`external_cancel` twin, for how long a row has been stuck — the number an
+operator actually wants to alert on, since it tells "retrying, will resolve"
+apart from "stuck since Tuesday" without reasoning about shard topology; and
+the counter `harvest.external_signal.by_id_found_over_incomplete_fanout` for
+the sibling case where a live run *was* found and delivered to, but the
+answer came from an incomplete fan-out. The plugin's startup
+`missing_router_shards` check prevents the steady-state form of this
 misconfiguration; a hand-rolled embedder whose `sharded_pool` is narrower than
 its router can still reach it.
 
