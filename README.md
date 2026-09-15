@@ -368,6 +368,19 @@ a bearer token. Successful responses are printed as pretty JSON by default; use
 inline `--*-json` values or `--*-file PATH`; use `-` as the file path to read
 from stdin.
 
+The CLI sends `Accept: application/json` on every JSON request (issue
+#1579). Send the same header from `curl` or any other direct client of
+a JSON route. `curl` sends a bare `Accept: */*` by default. Autumn's
+error-page content negotiation treats that as browser navigation, and
+answers a validation error with a styled HTML page, not the JSON body
+this section documents.
+
+Match each route's own declared content type instead: `harvest events
+tail` sends `Accept: text/event-stream`, and so must any direct client
+of the `.../events/stream` or `.../stream` routes. `GET /admin/metrics`
+and `GET /admin/queues/scaling?format=prometheus` return Prometheus
+plain text; do not send `Accept: application/json` to either.
+
 ### Migrating a dedicated Harvest database
 
 In the default `harvest.mode = "embedded"`, Harvest's migrations are Autumn's:

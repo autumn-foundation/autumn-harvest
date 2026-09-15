@@ -7541,6 +7541,13 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
         ApiMethod::Post => client.post(url),
         ApiMethod::Delete => client.delete(url),
     };
+    // Issue #1579: a bare `Accept: */*` (curl's own default) makes the
+    // server's error-page negotiation treat the request as browser
+    // navigation. It then returns an HTML error page, not the
+    // documented JSON body, on a validation error. State the CLI's
+    // real expectation here so its behavior never depends on a
+    // client-library default.
+    let builder = builder.header("Accept", "application/json");
     let builder = if let Some(token) = &cli.token {
         builder.bearer_auth(token)
     } else {
