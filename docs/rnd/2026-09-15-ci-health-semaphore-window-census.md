@@ -18,6 +18,15 @@ commit history (`c652867`). All 17 failing runs are now individually
 job-logged below; every category is a verified count, not an inference
 from a branch name.
 
+**Second correction, same PR.** Fixing the above introduced a fresh
+arithmetic error: the run-count-check paragraph counted 5 runs as
+carrying both a cargo-deny failure and a second own-code failure, when
+item 4's own prose already named only 3 — 2 of the 5
+(`34879949306`, `34873735733`) were correctly described as cargo-deny-only
+in item 4's bullets but wrongly folded into the "dual-failure" count
+anyway. Fixed below: item 2/item 4 overlap is 3 runs, item 4 has 10
+own-code rows across 5 branches (not 12 rows across 4).
+
 **Status:** health report, evidence added to existing issue #1558 — no PR
 opened against `ci.yml`, no test changed. Continues the series in
 `docs/rnd/2026-09-0[3-8]-ci-health-semaphore*.md` and
@@ -114,7 +123,7 @@ consecutive full-suite runs at 0 failures. This run is simply the last
 live occurrence of that already-fixed flake, on the same PR that fixed it,
 before the fix commit landed. No new action needed.
 
-### 4. Own-branch WIP: 6 failures, at least 8 distinct own-code signatures across 4 branches
+### 4. Own-branch WIP: 10 runs carry an own-code failure, across 5 branches, at least 8 distinct signatures
 
 The rest were deterministic gates correctly failing on each branch's own
 in-progress change — not a CI-health signal, but itemized here (rather
@@ -135,13 +144,15 @@ signature without checking each push individually:
   noted so a future pass recognizes the repeat rather than re-investigating
   from zero.
 - `claude/determined-brahmagupta-j0vmw3` (dev/reaper.rs work), 3 failing
-  pushes: a comment-hygiene CH007 regression (`34876736763`) and a
-  `clippy::too_many_lines` catch (`34874351972`) in `reaper.rs`, both
-  pushes also carrying item 2's cargo-deny failure; the third push
-  (`34879949306`) failed only on cargo-deny.
+  pushes, only 2 of which carry an own-code row here: a comment-hygiene
+  CH007 regression (`34876736763`) and a `clippy::too_many_lines` catch
+  (`34874351972`) in `reaper.rs`, both also carrying item 2's cargo-deny
+  failure. The third push (`34879949306`) failed *only* on cargo-deny —
+  it is entirely an item 2 row, not counted again here.
 - `claude/issue-1555-tdd-refactor-26zumg`'s earliest push (`34873735733`,
-  17:16:21Z) failed only on item 2's cargo-deny cluster — its later push
-  (`34888311292`) is items 1 and 3 above.
+  17:16:21Z) failed only on item 2's cargo-deny cluster — entirely an
+  item 2 row, not counted here either. Its later push (`34888311292`) is
+  items 1 and 3 above, also not an item 4 row.
 - `claude/gracious-carson-lygokt` (codec envelope PR #1569): a
   `clippy::redundant_clone` catch in `payload_codec.rs` (`34891219422`).
 - `claude/pensive-brahmagupta-htddux` (Bolt PR #1577): a comment-hygiene
@@ -153,26 +164,40 @@ signature without checking each push individually:
   found only once every run was individually job-logged. Single occurrence,
   own-branch, not investigated further this session.
 
-**Run-count check.** Some runs failed more than one job, so items 1-4's
-tables/lists overlap by run id (not by count): item 1's 2 runs
-(`34888311292`, `34922392508`); item 3 is `34888311292` again (a second,
-distinct failed job on that same run); item 2's 8 cargo-deny runs, 5 of
-which (`34883968010`, `34879949306`, `34876736763`, `34874351972`,
-`34873735733`) also carry a second, distinct own-code failure listed under
-item 4, and 3 of which (`34877128464`, `34875349496`, `34874959976`) failed
-*only* on cargo-deny; item 4's remaining rows
-(`34925551916`, `34924353340`, `34891509704`, `34888038964`,
-`34891219422`, `34933650236`, `34883440260`) each failed on an own-code
-issue with no cargo-deny component. Counting each of the 17 run **ids**
-once regardless of how many jobs it failed: 2 (item 1, `34888311292` +
-`34922392508`) + 3 (item 2's cargo-deny-only runs) + 12 (item 4's distinct
-run ids, five of which double as item 2 rows) = 17, with `34888311292`
-counted once under item 1 despite also being item 3. Every one of the 17
-run ids sampled this session (`34933650236`, `34925551916`, `34924353340`,
-`34922392508`, `34891509704`, `34891219422`, `34888311292`, `34888038964`,
-`34883968010`, `34883440260`, `34879949306`, `34877128464`, `34876736763`,
-`34875349496`, `34874959976`, `34874351972`, `34873735733`) was
-individually job-logged, not inferred from a branch name.
+**Run-count check (corrected — the first version of this paragraph wrongly
+counted 5 dual-failure overlaps against item 4's own text, which names
+only 3).** Some runs failed more than one job, so items 1-4's tables/lists
+overlap by run id (not by count):
+
+- Item 1: 2 runs (`34888311292`, `34922392508`).
+- Item 3: `34888311292` again — a second, distinct failed job on that same
+  run, not a new run id.
+- Item 2: 8 cargo-deny runs. Of these, exactly **3** (`34883968010`,
+  `34876736763`, `34874351972`) also carry a second, distinct own-code
+  failure listed under item 4. The other **5** (`34879949306`,
+  `34877128464`, `34873735733`, `34875349496`, `34874959976`) failed *only*
+  on cargo-deny — item 4's own prose already says this for
+  `34879949306` and `34873735733`; it was only this summary paragraph's
+  arithmetic that miscounted them as dual-failure.
+- Item 4: **10** runs carry an own-code failure (5 `bold-lovelace-agnczk` +
+  2 `determined-brahmagupta-j0vmw3` + 1 `gracious-carson-lygokt` + 1
+  `pensive-brahmagupta-htddux` + 1 `sharp-feynman-w310nk`), 3 of which
+  double as item 2 rows per above, and 7 of which
+  (`34925551916`, `34924353340`, `34891509704`, `34888038964`,
+  `34891219422`, `34933650236`, `34883440260`) have no cargo-deny
+  component at all.
+
+Counting each of the 17 run **ids** once regardless of how many jobs it
+failed: 2 (item 1) + 5 (item 2's cargo-deny-only runs) + 10 (item 4's
+own-code runs, 3 of which are also item 2 rows) = 17, with `34888311292`
+counted once under item 1 despite also being item 3, and the 3 item
+2/item 4 overlaps counted once each under item 4's 10, not added again
+from item 2's 8. Every one of the 17 run ids sampled this session
+(`34933650236`, `34925551916`, `34924353340`, `34922392508`,
+`34891509704`, `34891219422`, `34888311292`, `34888038964`, `34883968010`,
+`34883440260`, `34879949306`, `34877128464`, `34876736763`, `34875349496`,
+`34874959976`, `34874351972`, `34873735733`) was individually job-logged,
+not inferred from a branch name.
 
 **No occurrence of the previously-tracked Grafana dashboard panel-id
 collision among the 17 explicit failures** (`docs/rnd/2026-09-14-...md`
@@ -241,7 +266,7 @@ signatures).
   (`20_000i64`, matching the fix commit's stated change and its own
   20-consecutive-run verification, which this session did not independently
   rerun).
-- **Item 4:** all 12 remaining run-rows individually job-logged; the
+- **Item 4:** all 10 own-code run-rows individually job-logged; the
   run-count check above accounts for all 17 total failures against items
   1-4 with no run left uncategorized and none double-counted.
 - No revert check applies — no fix in this report to verify red-then-green
