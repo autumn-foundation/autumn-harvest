@@ -2076,7 +2076,11 @@ re-run this.', bad;
     -- so a table, or an index on unrelated columns, would otherwise be
     -- silently accepted in place of the index the sweeper's drop-gate
     -- probe needs. Every later `created_at < $1` probe would then run a
-    -- sequential scan of `harvest_workflow_executions` instead.
+    -- sequential scan of `harvest_workflow_executions` instead. A partial
+    -- index (`WHERE false`, say) or a non-btree access method would still
+    -- match on table and column alone, so both are checked too: the
+    -- probe's `<` comparison needs a full, ordered index to avoid that
+    -- same sequential scan.
     IF NOT EXISTS (
         SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
          WHERE c.relname = 'idx_harvest_we_created_at' AND n.nspname = current_schema()
@@ -2091,12 +2095,14 @@ re-run this.', bad;
         JOIN pg_namespace n ON n.oid = c.relnamespace
         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = (i.indkey::int2[])[0]
          WHERE c.relname = 'idx_harvest_we_created_at' AND n.nspname = current_schema()
-           AND i.indisvalid AND i.indrelid = 'harvest_workflow_executions'::regclass
+           AND i.indisvalid AND i.indpred IS NULL
+           AND i.indrelid = 'harvest_workflow_executions'::regclass
            AND a.attname = 'created_at'
+           AND c.relam = (SELECT oid FROM pg_am WHERE amname = 'btree')
     ) THEN
         RAISE EXCEPTION 'harvest #1270: idx_harvest_we_created_at already names a \
-relation that is not a valid index with created_at as its leading column on \
-harvest_workflow_executions. The sweeper drop-gate probe would fall back to a \
+relation that is not a non-partial btree index with created_at as its leading column \
+on harvest_workflow_executions. The sweeper drop-gate probe would fall back to a \
 sequential scan. Rename or drop it, then retry.';
     END IF;
 
@@ -4403,7 +4409,19 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // scan of `harvest_workflow_executions`. This step reads the probe
         // recorded before the build ran. `existed=true` means the build
         // above was a no-op. The pre-existing relation's shape is checked
-        // here before it is trusted.
+        // here before it is trusted. It must be valid, non-partial, btree,
+        // and have `created_at` leading. A partial index, such as `WHERE
+        // false`, would still match on table and column alone. So would a
+        // non-btree access method, which the `<` probe cannot use.
+        //
+        // A rejection here cannot also drop `harvest_1270_drop_gate_probe`
+        // itself. Its `existed=true` stamp was written by the probe step,
+        // before this one ever ran. An uncaught `RAISE EXCEPTION` rolls
+        // back everything this DO block did, a `DROP SEQUENCE` included,
+        // not only the parts after it. The error message below names the
+        // sequence explicitly. A retry after fixing the impostor starts
+        // from a fresh probe, rather than replaying the stale
+        // `existed=true` it would otherwise still find.
         step(
             2,
             format!(
@@ -4419,14 +4437,18 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
                  ON a.attrelid = i.indrelid AND a.attnum = (i.indkey::int2[])[0]\n             \
                  WHERE c.relname = 'idx_harvest_we_created_at'\n               \
                  AND n.nspname = current_schema()\n               \
-                 AND i.indisvalid AND i.indrelid = 'harvest_workflow_executions'::regclass\n               \
-                 AND a.attname = 'created_at'\n        \
+                 AND i.indisvalid AND i.indpred IS NULL\n               \
+                 AND i.indrelid = 'harvest_workflow_executions'::regclass\n               \
+                 AND a.attname = 'created_at'\n               \
+                 AND c.relam = (SELECT oid FROM pg_am WHERE amname = 'btree')\n        \
                  ) INTO shaped;\n        \
                  IF NOT shaped THEN\n            \
                  RAISE EXCEPTION 'harvest #1270: idx_harvest_we_created_at already names a \
-                 relation that is not a valid index with created_at as its leading column \
-                 on harvest_workflow_executions. The sweeper drop-gate probe would fall \
-                 back to a sequential scan. Rename or drop it, then retry.';\n        \
+                 relation that is not a non-partial btree index with created_at as its \
+                 leading column on harvest_workflow_executions. The sweeper drop-gate probe \
+                 would fall back to a sequential scan. Rename or drop the impostor, drop \
+                 sequence harvest_1270_drop_gate_probe (it remembers the stale check), then \
+                 re-run phase 2.';\n        \
                  END IF;\n    \
                  ELSE\n        \
                  EXECUTE 'COMMENT ON INDEX idx_harvest_we_created_at IS '\n             \

@@ -3818,6 +3818,85 @@ async fn enabling_refuses_an_impostor_drop_gate_index_of_the_wrong_shape() {
 }
 
 #[tokio::test]
+async fn enabling_refuses_a_partial_drop_gate_index() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // Right table, right leading column, but `WHERE false` — a valid index
+    // that matches no row. It would pass a guard that checks only table,
+    // validity and leading column. The sweeper's `created_at < $1` probe
+    // cannot use it for anything the predicate excludes. Most partitions
+    // would still fall back to a sequential scan.
+    diesel::sql_query("DROP INDEX IF EXISTS idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query(
+        "CREATE INDEX idx_harvest_we_created_at ON harvest_workflow_executions \
+         (created_at) WHERE false",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("plant the impostor");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err("a partial impostor index must fail the conversion, not pass silently");
+    assert!(
+        err.to_string().contains("idx_harvest_we_created_at"),
+        "the refusal must name the impostor index: {err}"
+    );
+
+    diesel::sql_query("DROP INDEX idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .expect("clear the impostor");
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enabling must succeed once the impostor is gone");
+}
+
+#[tokio::test]
+async fn enabling_refuses_a_non_btree_drop_gate_index() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // Right table, right leading column, but a hash index. Hash indexes
+    // cannot serve a `<` range comparison at all. The sweeper's `created_at
+    // < $1` probe would fall back to a sequential scan, even though a
+    // same-named, same-column index exists.
+    diesel::sql_query("DROP INDEX IF EXISTS idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query(
+        "CREATE INDEX idx_harvest_we_created_at ON harvest_workflow_executions \
+         USING hash (created_at)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("plant the impostor");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err("a non-btree impostor index must fail the conversion, not pass silently");
+    assert!(
+        err.to_string().contains("idx_harvest_we_created_at"),
+        "the refusal must name the impostor index: {err}"
+    );
+
+    diesel::sql_query("DROP INDEX idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .expect("clear the impostor");
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enabling must succeed once the impostor is gone");
+}
+
+#[tokio::test]
 async fn maintenance_says_what_is_wrong_when_the_runtime_role_cannot_own_partitions() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
@@ -5494,6 +5573,25 @@ async fn the_scripted_plans_mark_step_refuses_an_impostor_drop_gate_index() {
         "the refusal must name the impostor index: {err}"
     );
 
+    // The RAISE aborted the whole DO block, so the DROP SEQUENCE inside it
+    // never took effect either — the probe's `existed=true` stamp is still
+    // there. The error message must say so. A retry that skips straight
+    // back to the probe step would otherwise inherit this stale value,
+    // instead of re-evaluating the (by then fixed) collision.
+    assert!(
+        err.to_string().contains("harvest_1270_drop_gate_probe"),
+        "the refusal must also name the probe sequence a retry needs to clear: {err}"
+    );
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT to_regclass('harvest_1270_drop_gate_probe') IS NOT NULL AS v",
+        )
+        .await,
+        "the failed mark step must not have dropped the probe sequence out from \
+         under its own error message"
+    );
+
     diesel::sql_query("DROP SEQUENCE IF EXISTS harvest_1270_drop_gate_probe")
         .execute(&mut conn)
         .await
@@ -5502,6 +5600,98 @@ async fn the_scripted_plans_mark_step_refuses_an_impostor_drop_gate_index() {
         .execute(&mut conn)
         .await
         .expect("clear the impostor");
+}
+
+#[tokio::test]
+async fn the_scripted_plans_drop_gate_retry_marks_the_index_built_after_the_collision_clears() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // The full remediation path the previous test's error message
+    // instructs: drop the impostor AND the stale probe sequence, then
+    // re-run probe/build/mark from the top. A retry that skipped dropping
+    // the sequence would still see `existed=true` from the failed first
+    // attempt. It would then skip commenting the genuinely fresh-built
+    // index as engine-owned.
+    diesel::sql_query("DROP INDEX IF EXISTS idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query("CREATE INDEX idx_harvest_we_created_at ON harvest_events (id)")
+        .execute(&mut conn)
+        .await
+        .expect("plant the impostor");
+
+    let steps = partition::migration_plan_steps(&EnableOptions::default(), Utc::now());
+    let probe = steps
+        .iter()
+        .find(|s| s.sql.contains("$harvest_dropgate_probe_958$"))
+        .expect("the plan must probe whether it will own the drop-gate index");
+    let build = steps
+        .iter()
+        .find(|s| {
+            s.sql.contains("CREATE INDEX CONCURRENTLY")
+                && s.sql.contains("idx_harvest_we_created_at")
+        })
+        .expect("the plan must build the drop-gate index");
+    let mark = steps
+        .iter()
+        .find(|s| s.sql.contains("harvest_dropgate_mark_958"))
+        .expect("the plan must mark the drop-gate index conditionally");
+
+    diesel::sql_query(&probe.sql)
+        .execute(&mut conn)
+        .await
+        .expect("probe");
+    diesel::sql_query(&build.sql)
+        .execute(&mut conn)
+        .await
+        .expect("build (a no-op here: the impostor already occupies the name)");
+    diesel::sql_query(&mark.sql)
+        .execute(&mut conn)
+        .await
+        .expect_err("the mark step must refuse the impostor on the first attempt");
+
+    // Remediate exactly as instructed: drop the impostor and the stale probe.
+    diesel::sql_query("DROP INDEX idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .expect("clear the impostor");
+    diesel::sql_query("DROP SEQUENCE harvest_1270_drop_gate_probe")
+        .execute(&mut conn)
+        .await
+        .expect("clear the stale probe");
+
+    diesel::sql_query(&probe.sql)
+        .execute(&mut conn)
+        .await
+        .expect("probe again, now that the collision is gone");
+    diesel::sql_query(&build.sql)
+        .execute(&mut conn)
+        .await
+        .expect("build a genuine index this time");
+    diesel::sql_query(&mark.sql)
+        .execute(&mut conn)
+        .await
+        .expect("mark the genuinely fresh-built index as engine-owned");
+
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT obj_description('idx_harvest_we_created_at'::regclass, 'pg_class') \
+              = 'harvest#958 drop-gate index; created by partition enable, safe for \
+              partition disable to remove' AS v",
+        )
+        .await,
+        "the index built after the retry must be marked engine-owned, not skipped \
+         because of a stale existed=true carried over from the failed first attempt"
+    );
+
+    diesel::sql_query("DROP INDEX IF EXISTS idx_harvest_we_created_at")
+        .execute(&mut conn)
+        .await
+        .ok();
 }
 
 #[tokio::test]
