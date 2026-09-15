@@ -267,6 +267,20 @@ jobs:
         run: cargo clippy -p autumn-harvest-cli --all-targets -- -D warnings
       - name: Clippy autumn-harvest-sqlite
         run: cargo clippy -p autumn-harvest-sqlite --all-targets -- -D warnings
+      # Same issue #962 rule as every other crate on this page: a workspace
+      # member gets NO clippy coverage without its own step, and these three
+      # standalone example crates (each its own `examples/*/Cargo.toml`
+      # workspace member, not a `--example` target under `autumn-harvest`)
+      # never got one. Unlike claude-agent-daemon/autumn-harvest-redis below,
+      # no `--no-deps` is needed: all three use `autumn-harvest`'s default
+      # features (plus `db`/`testing`), so they do not inherit that crate's
+      # no-default-features warnings.
+      - name: Clippy saga-choreography example
+        run: cargo clippy -p saga-choreography --all-targets -- -D warnings
+      - name: Clippy billing-autumn-web example
+        run: cargo clippy -p billing-autumn-web --all-targets -- -D warnings
+      - name: Clippy standalone-runner example
+        run: cargo clippy -p standalone-runner --all-targets -- -D warnings
       # Same issue #962 rule as the verify and redis crates below: a new
       # workspace member gets NO clippy coverage without its own step here.
       # `--no-deps` scopes the deny to the example, because it depends on
@@ -766,6 +780,28 @@ jobs:
       - name: Run autumn-harvest-redis unit tests (issue #1312)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-redis --lib
+      # No CI job ever built or ran these three example crates' own test
+      # suites. Each ships real, in-memory (`WorkflowSimulator`) tests for the
+      # documented pattern it exists to demonstrate -- saga-choreography's
+      # signal/child-workflow saga (docs/getting-started/04-signals.md tells a
+      # reader to run `cargo test -p saga-choreography` directly),
+      # billing-autumn-web's checkout saga (README.md's first pointer past
+      # hello-world), and standalone-runner's external-runner mode -- but
+      # nothing before this step exercised any of them beyond `cargo build`.
+      # The only existing coverage was narrow grep guards for specific past
+      # docs defects (check-search-attr-query-syntax.sh,
+      # check-readme-testing-dep-version.sh, check-no-powershell-env-syntax.sh),
+      # none of which touch the crates' own assertions. None need a live
+      # database, so they run here rather than on `test-db-linux`.
+      - name: Run saga-choreography example tests
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        run: cargo test -p saga-choreography
+      - name: Run billing-autumn-web example tests
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        run: cargo test -p billing-autumn-web
+      - name: Run standalone-runner example tests
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p standalone-runner
       - name: Run business_metrics example tests (issue #758)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
