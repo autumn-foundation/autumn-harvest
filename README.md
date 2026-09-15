@@ -369,10 +369,10 @@ inline `--*-json` values or `--*-file PATH`; use `-` as the file path to read
 from stdin.
 
 The CLI sends `Accept: application/json` on every request (issue #1579). Send
-the same header from `curl` or any other direct client. Autumn's error-page
-content negotiation treats a missing `Accept` header as browser navigation and
-answers a validation error with a styled HTML page, not the JSON body this
-section documents.
+the same header from `curl` or any other direct client. `curl` sends a bare
+`Accept: */*` by default. Autumn's error-page content negotiation treats that
+as browser navigation, and answers a validation error with a styled HTML
+page, not the JSON body this section documents.
 
 ### Migrating a dedicated Harvest database
 

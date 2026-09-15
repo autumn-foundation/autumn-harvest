@@ -158,11 +158,12 @@ async fn read_only_command_does_not_send_source_header() {
 
 #[tokio::test]
 async fn execute_sends_explicit_json_accept_header() {
-    // Issue #1579: `reqwest::Client::new()` sends no `Accept` header by
-    // default. The server's error-page negotiation then reads that as
-    // browser navigation. It returns an HTML error page, not the
+    // Issue #1579: a bare `Accept: */*` (curl's own default) makes the
+    // server's error-page negotiation treat the request as browser
+    // navigation. It then returns an HTML error page, not the
     // documented JSON body, on a validation error. An explicit
-    // `Accept: application/json` avoids that misclassification.
+    // `Accept: application/json` avoids that regardless of what a
+    // client library's own default would have sent.
     let (base_url, request_task) = spawn_one_response_server("200 OK", r#"{"ok":true}"#).await;
     let cli = Cli::try_parse_from(["harvest", "--base-url", &base_url, "health"])
         .expect("CLI args should parse");
