@@ -113,6 +113,17 @@ document. Point a generator at either. See [`openapi.md`](openapi.md).
 
 ---
 
+## Content negotiation: send `Accept: application/json`
+
+Send `Accept: application/json` on every request (issue #1579). Autumn's
+error-page content negotiation treats a missing `Accept` header as browser
+navigation. It then answers a validation error with a styled HTML page,
+not the JSON body this contract documents. `curl` and a bare
+`reqwest::Client::new()` both send no `Accept` header by default; the
+`harvest` CLI sends the explicit header on every request for this reason.
+
+---
+
 ## Using the contract alongside the CLI
 
 The `harvest` CLI uses `api_request()` to translate every subcommand into an

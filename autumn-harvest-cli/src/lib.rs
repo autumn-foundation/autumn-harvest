@@ -7541,6 +7541,12 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
         ApiMethod::Post => client.post(url),
         ApiMethod::Delete => client.delete(url),
     };
+    // Issue #1579: `reqwest::Client::new()` sends no `Accept` header by
+    // default. The server's error-page negotiation reads a missing
+    // `Accept` as browser navigation. It then returns an HTML error page,
+    // not the documented JSON body, on a validation error. State the
+    // CLI's real expectation here so it does not depend on that default.
+    let builder = builder.header("Accept", "application/json");
     let builder = if let Some(token) = &cli.token {
         builder.bearer_auth(token)
     } else {
