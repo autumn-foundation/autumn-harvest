@@ -31,7 +31,7 @@ use autumn_harvest::WorkflowEvent;
 use autumn_harvest::history_export::HistoryExportDocument;
 use autumn_harvest::partition::{self, EnableMode, EnableOptions, EventLayout, SweepOptions};
 use autumn_harvest::retention::{
-    ArchiverFuture, HistoryArchiver, RetentionConfig, RetentionRuntime,
+    ArchiverFuture, HistoryArchiver, PartitionMaintenanceConfig, RetentionConfig, RetentionRuntime,
 };
 use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::MetricsRecorder;
@@ -355,6 +355,31 @@ async fn run_one_tick(
     }
     runtime.shutdown();
     result.expect("retention tick did not complete partition maintenance in time")
+}
+
+/// Poll a live [`RetentionRuntime`] for its shard-0 result, stopping once a
+/// maintenance pass stamped `at` no earlier than `since` shows up.
+///
+/// Unlike [`run_one_tick`], this does not spawn or shut down the runtime.
+/// A caller driving more than one tick against the SAME runtime instance
+/// calls this once per tick instead.
+async fn wait_for_maintenance(
+    runtime: &RetentionRuntime,
+    since: DateTime<Utc>,
+) -> autumn_harvest::retention::RetentionTickResult {
+    for _ in 0..400 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snap = runtime.monitor().snapshot();
+        if let Some(r) = snap.per_shard.iter().find(|r| r.shard == 0)
+            && r.partition_maintenance
+                .as_ref()
+                .and_then(|m| m.at)
+                .is_some_and(|at| at >= since)
+        {
+            return r.clone();
+        }
+    }
+    panic!("a maintenance pass did not complete in time");
 }
 
 // ══ AC1: opt-in layout, both enable modes, documented migration path ═══════
@@ -1780,6 +1805,63 @@ async fn the_durable_sweep_cursor_lets_maintain_rotate_across_separate_processes
 }
 
 #[tokio::test]
+async fn write_durable_sweep_cursor_refuses_a_foreign_sequence() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // `CREATE SEQUENCE IF NOT EXISTS` on a fixed name, unguarded, would
+    // otherwise reuse an operator's own unrelated sequence of that exact
+    // name. The following `COMMENT ON SEQUENCE` would then overwrite
+    // whatever comment it already carried.
+    diesel::sql_query("DROP SEQUENCE IF EXISTS harvest_1270_partition_maintain_cursor")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query("CREATE SEQUENCE harvest_1270_partition_maintain_cursor")
+        .execute(&mut conn)
+        .await
+        .expect("plant an operator's own sequence of this exact name");
+    diesel::sql_query(
+        "COMMENT ON SEQUENCE harvest_1270_partition_maintain_cursor IS 'an operator comment'",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed the operator's own comment");
+
+    let err =
+        partition::write_durable_sweep_cursor(&mut conn, Some("harvest_events_p_20260101000000"))
+            .await
+            .expect_err("a foreign sequence of this name must not be reused");
+    assert!(err.to_string().contains("not engine-owned"), "got: {err}");
+
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT obj_description('harvest_1270_partition_maintain_cursor'::regclass, \
+              'pg_class') = 'an operator comment' AS v",
+        )
+        .await,
+        "the operator's own comment must survive untouched"
+    );
+
+    // The read side has the mirror obligation: an operator's own comment
+    // text must never be parsed as cursor data.
+    assert!(
+        partition::read_durable_sweep_cursor(&mut conn)
+            .await
+            .expect("read cursor")
+            .is_none(),
+        "a foreign sequence's comment must never be parsed as cursor data"
+    );
+
+    diesel::sql_query("DROP SEQUENCE harvest_1270_partition_maintain_cursor")
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
 async fn the_straggler_delete_removes_orphan_rows_but_leaves_the_stragglers_own() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
@@ -2718,6 +2800,56 @@ async fn list_partitions_is_correct_regardless_of_the_sessions_date_style() {
 }
 
 #[tokio::test]
+async fn list_partitions_restores_the_callers_date_style_inside_a_nested_transaction() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    diesel::sql_query("SET DateStyle = 'SQL, DMY'")
+        .execute(&mut conn)
+        .await
+        .expect("set a non-ISO DateStyle on this connection");
+
+    // `list_partitions` pins `ISO, YMD` inside its OWN transaction, so
+    // `pg_get_expr` renders parseable bounds regardless of the caller's
+    // style. Called from a caller already inside a transaction, Diesel's
+    // `transaction()` here opens a SAVEPOINT rather than a real `BEGIN`.
+    // `SET LOCAL` reverts at the end of the enclosing transaction BLOCK.
+    // Releasing a savepoint is not that — it merges the savepoint's
+    // changes into the parent instead. This proves the forced ISO style
+    // does not leak past `list_partitions` into the rest of this outer
+    // transaction.
+    let observed_date_style = conn
+        .transaction::<String, autumn_harvest::HarvestError, _>(async |conn| {
+            partition::list_partitions(conn)
+                .await
+                .expect("list partitions");
+            let row = diesel::sql_query("SELECT current_setting('DateStyle') AS v")
+                .get_result::<TextRow>(conn)
+                .await
+                .expect("read DateStyle back inside the same outer transaction");
+            Ok(row.v)
+        })
+        .await
+        .expect("outer transaction");
+
+    assert_eq!(
+        observed_date_style, "SQL, DMY",
+        "the caller's own DateStyle must survive a nested list_partitions \
+         call untouched, not be left at the ISO style list_partitions \
+         forces internally"
+    );
+
+    diesel::sql_query("RESET DateStyle")
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
 async fn the_layout_works_when_harvest_is_installed_outside_public() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
@@ -3503,6 +3635,120 @@ async fn maintenance_says_what_is_wrong_when_the_runtime_role_cannot_own_partiti
         outcome.last_error, None,
         "and it must report clean: {outcome:?}"
     );
+}
+
+#[tokio::test]
+async fn the_retention_runtime_preserves_the_cursor_across_a_failed_tick() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    for stmt in [
+        "DO $$ BEGIN \
+           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'harvest_rt_cursor_958') \
+           THEN CREATE ROLE harvest_rt_cursor_958 LOGIN PASSWORD 'cursor958'; END IF; END $$",
+        "GRANT USAGE ON SCHEMA public TO harvest_rt_cursor_958",
+        "GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA public TO harvest_rt_cursor_958",
+        "GRANT postgres TO harvest_rt_cursor_958",
+    ] {
+        diesel::sql_query(stmt)
+            .execute(&mut conn)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable as the owning role");
+
+    // Same blocked-prefix shape as
+    // `the_sweep_rotates_past_a_permanently_blocked_prefix_across_passes`,
+    // so the startup pass truncates and records a rotation cursor.
+    let blocked_a = Utc::now() - chrono::Duration::days(20);
+    let blocked_b = Utc::now() - chrono::Duration::days(19);
+    let droppable = Utc::now() - chrono::Duration::days(18);
+    for (label, at) in [("failcursor-a", blocked_a), ("failcursor-b", blocked_b)] {
+        let exec = insert_execution(&mut conn, "failcursor_wf", label, at, None).await;
+        autumn_harvest::store::append_events(
+            &mut conn,
+            ExecutionId::from_uuid(exec),
+            &sample_events(),
+            0,
+        )
+        .await
+        .expect("seed a running execution pinning this cohort");
+        backdate_events(&mut conn, exec, at).await;
+    }
+    // A reclaimable cohort past the blocked prefix. Its mere existence
+    // makes a 2-attempt budget spent entirely on the two blocked cohorts
+    // read as truncated. Without it, the budget covers everything there
+    // is, and truncated stays false.
+    partition::ensure_cohort(&mut conn, droppable)
+        .await
+        .expect("materialize the reclaimable cohort");
+
+    let runtime_url = url.replace(
+        "postgres://postgres:postgres@",
+        "postgres://harvest_rt_cursor_958:cursor958@",
+    );
+    let pools = ShardedDbPool::single(build_pool(&runtime_url));
+    let config = RetentionConfig {
+        partitions: PartitionMaintenanceConfig {
+            max_attempts_per_tick: 2,
+            ..PartitionMaintenanceConfig::default()
+        },
+        // Long enough that only the startup pass and `run_now()` calls
+        // below drive a tick; this test does not wait on the interval.
+        tick_interval_secs: 3600,
+        ..RetentionConfig::default()
+    };
+    let started = Utc::now();
+    let runtime = RetentionRuntime::spawn(pools, config, Arc::new(NoopMetrics), None, None)
+        .expect("retention runtime should spawn when enabled");
+
+    let first = wait_for_maintenance(&runtime, started).await;
+    let cursor = first
+        .partition_maintenance
+        .as_ref()
+        .and_then(|m| m.sweep.resume_after.clone())
+        .expect("the startup pass must be truncated and record a rotation cursor");
+
+    // Break maintenance: revoke the runtime role's ownership membership,
+    // so the NEXT `maintain` call returns Err outright.
+    diesel::sql_query("REVOKE postgres FROM harvest_rt_cursor_958")
+        .execute(&mut conn)
+        .await
+        .expect("revoke ownership");
+
+    let second_started = Utc::now();
+    runtime.run_now();
+    let second = wait_for_maintenance(&runtime, second_started).await;
+    runtime.shutdown();
+
+    let maintenance = second
+        .partition_maintenance
+        .as_ref()
+        .expect("a maintenance outcome must still be reported for a failed pass");
+    assert!(
+        maintenance.last_error.is_some(),
+        "the failure must be reported, not silently swallowed: {maintenance:?}"
+    );
+    assert_eq!(
+        maintenance.sweep.resume_after.as_deref(),
+        Some(cursor.as_str()),
+        "a failed pass must preserve the prior tick's rotation cursor rather \
+         than resetting it to None. Otherwise the next successful pass \
+         restarts at the oldest partition, and the blocked prefix starves \
+         reclamation again; got {maintenance:?}"
+    );
+
+    diesel::sql_query("DROP OWNED BY harvest_rt_cursor_958")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query("DROP ROLE IF EXISTS harvest_rt_cursor_958")
+        .execute(&mut conn)
+        .await
+        .ok();
 }
 
 #[tokio::test]
@@ -4429,6 +4675,63 @@ async fn enable_refuses_a_user_defined_trigger() {
     );
 
     diesel::sql_query("DROP TRIGGER harvest_1270_audit_trg ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn enable_refuses_an_operator_trigger_disguised_under_the_engines_reserved_name() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // The engine's own insert-time trigger is always named
+    // `harvest_events_exec_fk_trg`. The old guard excluded any trigger of
+    // that exact name, unconditionally, as engine-managed. An operator's
+    // own trigger sharing the name, but calling a different function,
+    // would go unprotected. It would fall through a conversion that
+    // drops every trigger it does not explicitly carry forward.
+    diesel::sql_query("DROP TRIGGER IF EXISTS harvest_events_exec_fk_trg ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query(
+        "CREATE OR REPLACE FUNCTION harvest_1270_disguised_trg() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("create the operator's own trigger function");
+    diesel::sql_query(
+        "CREATE TRIGGER harvest_events_exec_fk_trg BEFORE INSERT ON harvest_events \
+         FOR EACH ROW EXECUTE FUNCTION harvest_1270_disguised_trg()",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("plant an operator trigger under the engine's reserved name");
+
+    let err = partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect_err(
+            "a same-named trigger calling a different function is not the \
+             engine's own, and must still be refused",
+        );
+    assert!(
+        err.to_string().contains("harvest_events_exec_fk_trg"),
+        "got: {err}"
+    );
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "r",
+        "refusing before mutating"
+    );
+
+    diesel::sql_query("DROP TRIGGER harvest_events_exec_fk_trg ON harvest_events")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query("DROP FUNCTION IF EXISTS harvest_1270_disguised_trg()")
         .execute(&mut conn)
         .await
         .ok();

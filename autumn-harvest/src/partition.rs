@@ -185,6 +185,14 @@ const DISABLE_RENAME_SUFFIX: &str = "__old";
 /// ROW` trigger that changes a partitioned row's destination.
 const EXEC_FK_TRIGGER: &str = "harvest_events_exec_fk_trg";
 
+/// The function [`EXEC_FK_TRIGGER`] runs. Every trigger-refusal check
+/// excludes the engine's own trigger by BOTH this and [`EXEC_FK_TRIGGER`],
+/// not the name alone. An operator's own unrelated trigger that happens to
+/// share this exact reserved name would otherwise look engine-managed. It
+/// would go unprotected through a conversion that drops every trigger it
+/// does not explicitly carry forward.
+const EXEC_FK_TRIGGER_FUNCTION: &str = "harvest_events_require_execution";
+
 /// Comment `enable_sql`/`migration_plan_steps` stamp on
 /// `idx_harvest_we_created_at` when THEY are the ones that create it.
 ///
@@ -721,9 +729,23 @@ pub async fn list_partitions(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<
     // here, inside its own transaction, rather than on the shared
     // connection, so this never changes what any other statement on this
     // connection sees.
+    //
+    // Explicitly restored before that transaction ends, rather than left
+    // to `SET LOCAL`'s own reset. When a caller invokes this from inside
+    // its OWN transaction, Diesel's `transaction()` here opens a
+    // SAVEPOINT, not a real `BEGIN`. `SET LOCAL` reverts at the end of the
+    // enclosing transaction BLOCK. Releasing a savepoint is not that — it
+    // merges the savepoint's changes into the parent instead. Left
+    // unrestored, the forced `ISO, YMD` would leak into every later
+    // statement on the caller's own transaction.
     let rows = Box::pin(conn.transaction::<Vec<Row>, HarvestError, _>(async |conn| {
+        let original_datestyle = diesel::sql_query("SELECT current_setting('DateStyle') AS v")
+            .get_result::<TextRow>(conn)
+            .await
+            .map_err(database_error)?
+            .v;
         exec(conn, "SET LOCAL DateStyle = 'ISO, YMD'").await?;
-        diesel::sql_query(
+        let rows = diesel::sql_query(
             "SELECT child.relname AS name,
                     pg_get_expr(child.relpartbound, child.oid) AS bound
                FROM pg_inherits i
@@ -734,7 +756,15 @@ pub async fn list_partitions(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<
         )
         .load::<Row>(conn)
         .await
-        .map_err(database_error)
+        .map_err(database_error)?;
+        let restore_stmt = diesel::sql_query("SELECT format('SET LOCAL DateStyle = %L', $1) AS v")
+            .bind::<Text, _>(&original_datestyle)
+            .get_result::<TextRow>(conn)
+            .await
+            .map_err(database_error)?
+            .v;
+        exec(conn, &restore_stmt).await?;
+        Ok(rows)
     }))
     .await?;
 
@@ -1303,6 +1333,11 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
 /// propagated from a parent-level `CREATE TRIGGER` onto every leaf carries
 /// the SAME name there. So excluding [`EXEC_FK_TRIGGER`] by name still
 /// excludes its clones too.
+///
+/// Excluded by its FUNCTION too, not the name alone — see
+/// [`EXEC_FK_TRIGGER_FUNCTION`]. An operator's own trigger sharing the
+/// reserved name, but calling a different function, is still flagged
+/// here. It is not silently waved through as engine-managed.
 #[cfg(feature = "db")]
 async fn user_defined_triggers(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
     let rows = diesel::sql_query(
@@ -1321,10 +1356,18 @@ async fn user_defined_triggers(conn: &mut AsyncPgConnection) -> HarvestResult<Ve
                  )
             )
             AND NOT t.tgisinternal
-            AND t.tgname <> $1
+            AND NOT (
+              t.tgname = $1
+              AND t.tgfoid IN (
+                    SELECT p.oid FROM pg_proc p
+                     WHERE p.proname = $2
+                       AND p.pronamespace = n.oid
+                  )
+            )
           ORDER BY 1",
     )
     .bind::<Text, _>(EXEC_FK_TRIGGER)
+    .bind::<Text, _>(EXEC_FK_TRIGGER_FUNCTION)
     .load::<TextRow>(conn)
     .await
     .map_err(database_error)?;
@@ -1883,7 +1926,10 @@ the pre-flight check ran. Drop or redefine the view, then re-run this.', bad;
       JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()
        AND NOT t.tgisinternal
-       AND t.tgname <> '{EXEC_FK_TRIGGER}';
+       AND NOT (t.tgname = '{EXEC_FK_TRIGGER}' AND t.tgfoid IN (
+             SELECT p.oid FROM pg_proc p
+              WHERE p.proname = '{EXEC_FK_TRIGGER_FUNCTION}' AND p.pronamespace = n.oid
+           ));
     IF bad IS NOT NULL THEN
         RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not managed by this \
 engine (%), created after the pre-flight check ran. Drop the trigger, then re-run this.', bad;
@@ -3583,25 +3629,31 @@ async fn maintenance_owner_gap(
 /// never becomes a `FOR ALL TABLES` sync target. Unlike that probe, this
 /// sequence is never dropped. It is the CLI's permanent cursor store, one
 /// per shard database, read before a sweep and written back after.
+#[cfg(feature = "db")]
 const MAINTAIN_CURSOR_SEQUENCE: &str = "harvest_1270_partition_maintain_cursor";
 
+/// Stamped on [`MAINTAIN_CURSOR_SEQUENCE`], with the cursor value appended,
+/// so a read or write can tell an engine-owned sequence apart from an
+/// operator's own same-named one.
+///
+/// Without this, `CREATE SEQUENCE IF NOT EXISTS` would silently reuse an
+/// operator's unrelated sequence of this exact name. The following
+/// `COMMENT ON SEQUENCE` would then overwrite whatever comment it already
+/// carried. A read has the mirror problem. Without a marker to check,
+/// it would parse an operator's own comment text as if it were a
+/// partition name to resume from.
+#[cfg(feature = "db")]
+const MAINTAIN_CURSOR_MARKER: &str = "harvest#1270 partition-maintain cursor";
+
+#[cfg(feature = "db")]
 #[derive(diesel::QueryableByName)]
 struct OptTextRow {
     #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
     v: Option<String>,
 }
 
-/// Read the durable cursor [`MAINTAIN_CURSOR_SEQUENCE`] holds, if any.
-///
-/// `Ok(None)` both when the sequence does not exist yet (no pass has run
-/// through this function before) and when it exists but carries no
-/// comment. Both read as the same "nothing to resume from" outcome.
-///
-/// # Errors
-///
-/// [`HarvestError::Database`] on a catalog failure.
 #[cfg(feature = "db")]
-pub async fn read_durable_sweep_cursor(
+async fn read_maintain_cursor_comment(
     conn: &mut AsyncPgConnection,
 ) -> HarvestResult<Option<String>> {
     let rows = diesel::sql_query(format!(
@@ -3615,6 +3667,32 @@ pub async fn read_durable_sweep_cursor(
     Ok(rows.into_iter().next().and_then(|r| r.v))
 }
 
+/// Read the durable cursor [`MAINTAIN_CURSOR_SEQUENCE`] holds, if any.
+///
+/// `Ok(None)` covers three cases. The sequence does not exist yet. It
+/// exists but carries no comment. Or it exists but is not engine-owned,
+/// so an operator's own comment text is never parsed as cursor data. All
+/// three read as the same "nothing to resume from" outcome.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] on a catalog failure.
+#[cfg(feature = "db")]
+pub async fn read_durable_sweep_cursor(
+    conn: &mut AsyncPgConnection,
+) -> HarvestResult<Option<String>> {
+    let Some(comment) = read_maintain_cursor_comment(conn).await? else {
+        return Ok(None);
+    };
+    let Some(cursor) = comment
+        .strip_prefix(MAINTAIN_CURSOR_MARKER)
+        .and_then(|rest| rest.strip_prefix(": cursor="))
+    else {
+        return Ok(None);
+    };
+    Ok((!cursor.is_empty()).then(|| cursor.to_string()))
+}
+
 /// Persist `resume_after` into [`MAINTAIN_CURSOR_SEQUENCE`]'s comment,
 /// creating the sequence on first use.
 ///
@@ -3622,28 +3700,52 @@ pub async fn read_durable_sweep_cursor(
 /// A pass that finished with nothing left to resume from must not leave
 /// the next run seeking a partition that is no longer relevant.
 ///
+/// Refuses (rather than overwriting) a pre-existing relation of this name
+/// that does not carry [`MAINTAIN_CURSOR_MARKER`]. That is the same
+/// ownership check [`enable_sql`]'s drop-gate probe makes, ported to a
+/// plain sequence of Rust calls. This function already holds a live
+/// connection, and needs no cross-session durability of its own.
+///
 /// # Errors
 ///
-/// [`HarvestError::Database`] on a catalog failure.
+/// [`HarvestError::Database`] on a catalog failure, or when a same-named
+/// relation exists and is not engine-owned.
 #[cfg(feature = "db")]
 pub async fn write_durable_sweep_cursor(
     conn: &mut AsyncPgConnection,
     resume_after: Option<&str>,
 ) -> HarvestResult<()> {
-    exec(
+    let exists = scalar_bool(
         conn,
-        &format!("CREATE SEQUENCE IF NOT EXISTS {MAINTAIN_CURSOR_SEQUENCE}"),
+        &format!(
+            "SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+              WHERE c.relname = '{MAINTAIN_CURSOR_SEQUENCE}' AND n.nspname = current_schema()) AS v"
+        ),
     )
     .await?;
-    // `resume_after` is an engine-generated partition name, not operator
-    // input. This still asks Postgres to build the statement rather than
-    // interpolating it by hand. `%I`/`%L` quote and escape exactly the
-    // way `EXECUTE ... quote_literal(...)` does elsewhere in this file.
-    // `%L` renders a NULL argument as the bare keyword `NULL`, so one
-    // query covers both clearing and setting the comment.
+    if exists {
+        let owned = read_maintain_cursor_comment(conn)
+            .await?
+            .is_some_and(|c| c.starts_with(MAINTAIN_CURSOR_MARKER));
+        if !owned {
+            return Err(HarvestError::Database(format!(
+                "{MAINTAIN_CURSOR_SEQUENCE} exists and is not engine-owned; refusing to reuse it"
+            )));
+        }
+    } else {
+        exec(conn, &format!("CREATE SEQUENCE {MAINTAIN_CURSOR_SEQUENCE}")).await?;
+    }
+    let comment = format!(
+        "{MAINTAIN_CURSOR_MARKER}: cursor={}",
+        resume_after.unwrap_or("")
+    );
+    // Still asks Postgres to build the statement rather than
+    // interpolating `comment` by hand. `%I`/`%L` quote and escape exactly
+    // the way `EXECUTE ... quote_literal(...)` does elsewhere in this
+    // file.
     let stmt = diesel::sql_query("SELECT format('COMMENT ON SEQUENCE %I IS %L', $1, $2) AS v")
         .bind::<Text, _>(MAINTAIN_CURSOR_SEQUENCE)
-        .bind::<diesel::sql_types::Nullable<Text>, _>(resume_after)
+        .bind::<Text, _>(&comment)
         .get_result::<TextRow>(conn)
         .await
         .map_err(database_error)?
@@ -3975,22 +4077,26 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // trigger is dropped from the replacement with no error at all.
         step(
             1,
-            "DO $harvest_trig_958$\nDECLARE bad text;\nBEGIN\n    \
-             SELECT string_agg(t.tgname, ', ' ORDER BY t.tgname) INTO bad\n      \
-             FROM pg_trigger t\n      \
-             JOIN pg_class c ON c.oid = t.tgrelid\n      \
-             JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
-             WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
-             AND NOT t.tgisinternal\n       \
-             AND t.tgname <> '{EXEC_FK_TRIGGER}';\n    \
-             IF bad IS NOT NULL THEN\n        \
-             RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not managed by \
-             this engine (%). CREATE TABLE ... (LIKE ...) has no INCLUDING TRIGGERS option \
-             — every one of them is silently dropped from the replacement. Drop the \
-             trigger before running this plan, or reproduce it on the converted layout by \
-             hand afterwards.', bad;\n    \
-             END IF;\nEND\n$harvest_trig_958$;"
-                .to_string(),
+            format!(
+                "DO $harvest_trig_958$\nDECLARE bad text;\nBEGIN\n    \
+                 SELECT string_agg(t.tgname, ', ' ORDER BY t.tgname) INTO bad\n      \
+                 FROM pg_trigger t\n      \
+                 JOIN pg_class c ON c.oid = t.tgrelid\n      \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
+                 WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
+                 AND NOT t.tgisinternal\n       \
+                 AND NOT (t.tgname = '{EXEC_FK_TRIGGER}' AND t.tgfoid IN (\n             \
+                 SELECT p.oid FROM pg_proc p\n              \
+                 WHERE p.proname = '{EXEC_FK_TRIGGER_FUNCTION}' AND p.pronamespace = n.oid\n           \
+                 ));\n    \
+                 IF bad IS NOT NULL THEN\n        \
+                 RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not managed by \
+                 this engine (%). CREATE TABLE ... (LIKE ...) has no INCLUDING TRIGGERS option \
+                 — every one of them is silently dropped from the replacement. Drop the \
+                 trigger before running this plan, or reproduce it on the converted layout by \
+                 hand afterwards.', bad;\n    \
+                 END IF;\nEND\n$harvest_trig_958$;"
+            ),
         ),
         // ── 1: refuse early if a unique index would abort phase 4 ─────────
         //
@@ -4424,7 +4530,10 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
                  JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
                  WHERE c.relname = 'harvest_events' AND n.nspname = current_schema()\n       \
                  AND NOT t.tgisinternal\n       \
-                 AND t.tgname <> '{EXEC_FK_TRIGGER}';\n    \
+                 AND NOT (t.tgname = '{EXEC_FK_TRIGGER}' AND t.tgfoid IN (\n             \
+                 SELECT p.oid FROM pg_proc p\n              \
+                 WHERE p.proname = '{EXEC_FK_TRIGGER_FUNCTION}' AND p.pronamespace = n.oid\n           \
+                 ));\n    \
                  IF bad IS NOT NULL THEN\n        \
                  RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not managed by \
                  this engine (%), created since phase 1''s check ran. CREATE TABLE ... \

@@ -1119,6 +1119,21 @@ async fn run_partition_maintenance(
     // here instead would race exactly that gap.
     let last_snapshot = cursor_snapshot;
     for (shard, pool) in pools.iter_shards() {
+        // Read once per shard. Both a connection failure below and a
+        // `maintain` failure further down need this SAME prior cursor,
+        // carried forward into their own `MaintenanceOutcome::failed`
+        // rather than lost. `failed` builds a zero-valued outcome with no
+        // access to prior state. A bare `update_partitions` call with it
+        // would reset `resume_after` to `None` on any single failed tick,
+        // even a transient connection blip. That is the same starvation
+        // `resume_after` exists to fix, just triggered by an intermittent
+        // failure instead of a process boundary.
+        let prior_resume_after = last_snapshot
+            .per_shard
+            .iter()
+            .find(|r| r.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
+            .and_then(|r| r.partition_maintenance.as_ref())
+            .and_then(|m| m.sweep.resume_after.clone());
         let mut conn = match pool.get().await {
             Ok(conn) => conn,
             Err(error) => {
@@ -1130,20 +1145,14 @@ async fn run_partition_maintenance(
                     error = %error,
                     "harvest event-partition maintenance could not acquire a connection"
                 );
-                monitor.update_partitions(
-                    shard,
-                    crate::partition::MaintenanceOutcome::failed(error.to_string()),
-                );
+                let mut outcome = crate::partition::MaintenanceOutcome::failed(error.to_string());
+                outcome.sweep.resume_after = prior_resume_after;
+                monitor.update_partitions(shard, outcome);
                 continue;
             }
         };
         let mut shard_opts = sweep_opts.clone();
-        shard_opts.resume_after = last_snapshot
-            .per_shard
-            .iter()
-            .find(|r| r.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
-            .and_then(|r| r.partition_maintenance.as_ref())
-            .and_then(|m| m.sweep.resume_after.clone());
+        shard_opts.resume_after = prior_resume_after.clone();
         match crate::partition::maintain(
             &mut conn,
             now,
@@ -1192,10 +1201,9 @@ async fn run_partition_maintenance(
                 // failing shard is indistinguishable from one that never
                 // opted in, because both would show `partition_maintenance:
                 // null`.
-                monitor.update_partitions(
-                    shard,
-                    crate::partition::MaintenanceOutcome::failed(err.to_string()),
-                );
+                let mut outcome = crate::partition::MaintenanceOutcome::failed(err.to_string());
+                outcome.sweep.resume_after = prior_resume_after;
+                monitor.update_partitions(shard, outcome);
             }
         }
     }
