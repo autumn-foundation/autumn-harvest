@@ -497,6 +497,12 @@ fn the_scripted_plan_honours_allow_incompatible_publications() {
             .any(|s| s.sql.contains("$harvest_pub_958$")),
         "the publication guard must be present by default"
     );
+    assert!(
+        with_guard
+            .iter()
+            .any(|s| s.sql.contains("$harvest_pub_958_p4$")),
+        "the phase-4 publication recheck must also be present by default"
+    );
 
     let opts = EnableOptions {
         allow_incompatible_publications: true,
@@ -509,6 +515,14 @@ fn the_scripted_plan_honours_allow_incompatible_publications() {
             .all(|s| !s.sql.contains("$harvest_pub_958$")),
         "allow_incompatible_publications must drop the publication guard step, \
          mirroring enable_partitioning's own override"
+    );
+    assert!(
+        without_guard
+            .iter()
+            .all(|s| !s.sql.contains("$harvest_pub_958_p4$")),
+        "allow_incompatible_publications must also drop the phase-4 recheck — \
+         otherwise an operator who opted out in phase 1 is still blocked, \
+         hours later, at the rename"
     );
 }
 
@@ -4421,7 +4435,7 @@ async fn the_scripted_plans_drop_gate_marker_survives_separate_sessions() {
     let steps = partition::migration_plan_steps(&EnableOptions::default(), Utc::now());
     let probe = steps
         .iter()
-        .find(|s| s.sql.contains("harvest_1270_drop_gate_probe") && s.sql.contains("INSERT INTO"))
+        .find(|s| s.sql.contains("$harvest_dropgate_probe_958$"))
         .expect("the plan must probe whether it will own the drop-gate index");
     let build = steps
         .iter()
@@ -4477,17 +4491,15 @@ async fn the_probe_step_refuses_a_same_named_table_it_did_not_create() {
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
 
-    // `CREATE TABLE IF NOT EXISTS` on a fixed name would otherwise reuse an
+    // `CREATE TABLE` on a fixed name, unguarded, would otherwise reuse an
     // operator's own unrelated table of that exact name. The mark step
-    // later deletes its row and drops it. Plant one ahead of the probe
-    // step to prove that no longer happens.
-    diesel::sql_query(
-        "CREATE TABLE harvest_1270_drop_gate_probe (existed boolean, operator_data text)",
-    )
-    .execute(&mut conn)
-    .await
-    .expect("plant an operator's own unrelated table of this name");
-    diesel::sql_query("INSERT INTO harvest_1270_drop_gate_probe VALUES (true, 'do not touch me')")
+    // later drops it. Plant one ahead of the probe step to prove that no
+    // longer happens.
+    diesel::sql_query("CREATE TABLE harvest_1270_drop_gate_probe (operator_data text)")
+        .execute(&mut conn)
+        .await
+        .expect("plant an operator's own unrelated table of this name");
+    diesel::sql_query("INSERT INTO harvest_1270_drop_gate_probe VALUES ('do not touch me')")
         .execute(&mut conn)
         .await
         .expect("seed the operator's table with its own row");
@@ -4495,7 +4507,7 @@ async fn the_probe_step_refuses_a_same_named_table_it_did_not_create() {
     let steps = partition::migration_plan_steps(&EnableOptions::default(), Utc::now());
     let probe = steps
         .iter()
-        .find(|s| s.sql.contains("harvest_1270_drop_gate_probe") && s.sql.contains("INSERT INTO"))
+        .find(|s| s.sql.contains("$harvest_dropgate_probe_958$"))
         .expect("the plan must probe whether it will own the drop-gate index");
 
     let err = diesel::sql_query(&probe.sql)
@@ -4521,7 +4533,7 @@ async fn the_probe_step_refuses_a_same_named_table_it_did_not_create() {
 }
 
 #[tokio::test]
-async fn the_probe_step_is_unlogged_so_a_publication_never_sees_its_writes() {
+async fn the_probe_step_writes_no_row_data_so_a_publication_never_sees_it() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
@@ -4533,7 +4545,7 @@ async fn the_probe_step_is_unlogged_so_a_publication_never_sees_its_writes() {
     let steps = partition::migration_plan_steps(&EnableOptions::default(), Utc::now());
     let probe = steps
         .iter()
-        .find(|s| s.sql.contains("harvest_1270_drop_gate_probe") && s.sql.contains("INSERT INTO"))
+        .find(|s| s.sql.contains("$harvest_dropgate_probe_958$"))
         .expect("the plan must probe whether it will own the drop-gate index");
     diesel::sql_query(&probe.sql)
         .execute(&mut conn)
@@ -4541,18 +4553,29 @@ async fn the_probe_step_is_unlogged_so_a_publication_never_sees_its_writes() {
         .expect("probe");
 
     // A `FOR ALL TABLES` publication automatically covers every ordinary
-    // table, including this one — and the subscriber never received its
-    // DDL to apply the row against. UNLOGGED has no WAL for logical
-    // decoding to read, so its writes are never replicated regardless of
-    // publication scope.
+    // table, including this one, and only ever replicates DML on a
+    // member table — never DDL or `COMMENT`. A table this step never
+    // writes a row to has nothing for such a publication to carry,
+    // regardless of scope. And it needs no `UNLOGGED` trick to get that,
+    // which would lose its state on crash recovery instead.
     assert!(
         scalar_bool(
             &mut conn,
-            "SELECT relpersistence = 'u' AS v FROM pg_class \
+            "SELECT relpersistence = 'p' AS v FROM pg_class \
               WHERE oid = 'harvest_1270_drop_gate_probe'::regclass",
         )
         .await,
-        "the probe table must be UNLOGGED, not an ordinary table"
+        "the probe table must be an ordinary, crash-durable table"
+    );
+    assert!(
+        scalar_bool(
+            &mut conn,
+            "SELECT count(*) = 0 AS v FROM pg_attribute \
+              WHERE attrelid = 'harvest_1270_drop_gate_probe'::regclass \
+                AND attnum > 0 AND NOT attisdropped",
+        )
+        .await,
+        "the probe table must carry no columns, and so no row data at all"
     );
 
     diesel::sql_query("DROP TABLE IF EXISTS harvest_1270_drop_gate_probe")
@@ -4574,7 +4597,7 @@ async fn a_retried_probe_step_does_not_overwrite_the_original_reading() {
     let steps = partition::migration_plan_steps(&EnableOptions::default(), Utc::now());
     let probe = steps
         .iter()
-        .find(|s| s.sql.contains("harvest_1270_drop_gate_probe") && s.sql.contains("INSERT INTO"))
+        .find(|s| s.sql.contains("$harvest_dropgate_probe_958$"))
         .expect("the plan must probe whether it will own the drop-gate index");
     let build = steps
         .iter()
@@ -4598,8 +4621,8 @@ async fn a_retried_probe_step_does_not_overwrite_the_original_reading() {
     // A retry after phase 2 was interrupted between the build and the mark
     // step — the runbook's own documented recovery. The index the FIRST
     // pass built now exists. A bare re-probe would overwrite the ORIGINAL
-    // `false` with `true`, and the mark step would then skip the marker it
-    // still owes.
+    // `false` reading with `true`, and the mark step would then skip the
+    // marker it still owes.
     diesel::sql_query(&probe.sql)
         .execute(&mut conn)
         .await
@@ -4608,7 +4631,8 @@ async fn a_retried_probe_step_does_not_overwrite_the_original_reading() {
     assert!(
         scalar_bool(
             &mut conn,
-            "SELECT existed = false AS v FROM harvest_1270_drop_gate_probe",
+            "SELECT obj_description('harvest_1270_drop_gate_probe'::regclass, 'pg_class') \
+              LIKE '%existed=false%' AS v",
         )
         .await,
         "a retried probe must not overwrite the original reading"
@@ -4663,6 +4687,86 @@ async fn the_scripted_plan_rechecks_a_dependent_view_created_after_phase_1() {
     );
 
     diesel::sql_query("DROP VIEW IF EXISTS harvest_1270_late_view")
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn the_scripted_plan_rechecks_row_level_security_enabled_after_phase_1() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    run_plan_phases(&mut conn, 1..=3).await;
+
+    // Turned on only after phase 1's own RLS check already passed.
+    diesel::sql_query("ALTER TABLE harvest_events ENABLE ROW LEVEL SECURITY")
+        .execute(&mut conn)
+        .await
+        .expect("enable row security after phase 1 ran");
+
+    let mut failed = false;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 4)
+    {
+        if diesel::sql_query(&step.sql)
+            .execute(&mut conn)
+            .await
+            .is_err()
+        {
+            failed = true;
+        }
+    }
+    assert!(
+        failed,
+        "phase 4 must refuse row security enabled after phase 1 already ran"
+    );
+
+    diesel::sql_query("ALTER TABLE harvest_events DISABLE ROW LEVEL SECURITY")
+        .execute(&mut conn)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn the_scripted_plan_rechecks_a_publication_added_after_phase_1() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    run_plan_phases(&mut conn, 1..=3).await;
+
+    // Added only after phase 1's own publication check already passed.
+    diesel::sql_query("DROP PUBLICATION IF EXISTS harvest_1270_late_pub")
+        .execute(&mut conn)
+        .await
+        .ok();
+    diesel::sql_query("CREATE PUBLICATION harvest_1270_late_pub FOR TABLE harvest_events")
+        .execute(&mut conn)
+        .await
+        .expect("add a publication covering harvest_events after phase 1 ran");
+
+    let mut failed = false;
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+        .into_iter()
+        .filter(|s| s.phase == 4)
+    {
+        if diesel::sql_query(&step.sql)
+            .execute(&mut conn)
+            .await
+            .is_err()
+        {
+            failed = true;
+        }
+    }
+    assert!(
+        failed,
+        "phase 4 must refuse a publication added after phase 1 already ran"
+    );
+
+    diesel::sql_query("DROP PUBLICATION IF EXISTS harvest_1270_late_pub")
         .execute(&mut conn)
         .await
         .ok();

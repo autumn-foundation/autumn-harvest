@@ -3869,63 +3869,74 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // optional here: a plain build holds SHARE for its duration and every
         // insert, state update and retention delete waits behind it.
         //
-        // Whether it already existed is stashed in an ordinary table before
-        // the build, read back after. `CREATE INDEX CONCURRENTLY` cannot run
-        // inside a `DO` block or transaction. So this cannot check-and-mark
+        // Whether it already existed is stashed durably before the build,
+        // read back after. `CREATE INDEX CONCURRENTLY` cannot run inside a
+        // `DO` block or transaction. So this cannot check-and-mark
         // atomically the way `enable_sql` does. The runbook itself documents
         // running its `CONCURRENTLY` statements one at a time, which an
         // operator can do from separate `psql` invocations, each its own
         // session. A session-local marker (a GUC, say) would read back
         // empty in a later session. It would then default to marking an
         // operator's own pre-existing index as engine-owned — the opposite
-        // of what the marker exists to prevent. A real table has no such session
-        // boundary. `disable_partitioning` later reads a comment this only
-        // stamps when it was this step that created the index — see
-        // `DROP_GATE_INDEX_MARKER`.
+        // of what the marker exists to prevent. `disable_partitioning`
+        // later reads a comment this only stamps when it was this step
+        // that created the index — see `DROP_GATE_INDEX_MARKER`.
         //
-        // Three more properties this step holds, each behind its own guard:
+        // The reading itself lives in a `COMMENT ON TABLE`, not a row, on a
+        // zero-column table this step creates for exactly that purpose.
+        // Three properties fall out of that choice, each behind its own
+        // guard below:
         //
-        // - Ownership. `CREATE TABLE IF NOT EXISTS` on a fixed name would
+        // - Ownership. `CREATE TABLE` on a fixed name, unguarded, would
         //   silently reuse an unrelated operator table of that exact name.
-        //   The mark step would then `DELETE`/`DROP` it. A pre-existing
-        //   relation is only ever reused when it carries
-        //   `PROBE_TABLE_MARKER` in its own comment. Any other relation
-        //   there aborts the step instead of touching it.
+        //   The mark step would then `DROP` it. A pre-existing relation is
+        //   only ever reused when its own comment already carries
+        //   `PROBE_TABLE_MARKER`. Any other relation there aborts the step
+        //   instead of touching it.
         //
         // - Retry safety. A run can resume after phase 2 was interrupted
         //   between the `CONCURRENTLY` build and the mark step. A bare
         //   re-probe there would see the index it just built. It would
-        //   overwrite the ORIGINAL `false` with `true`, skipping the mark
-        //   the retried run still owes. So a probe row is only ever
-        //   written once; a second pass over an already-populated table
+        //   overwrite the ORIGINAL reading with the wrong one, skipping
+        //   the mark the retried run still owes. So the comment is only
+        //   ever written once; a second pass over an already-commented table
         //   leaves it alone.
         //
-        // - Publication safety. An ordinary table's `INSERT` is
-        //   publication-visible under a `FOR ALL TABLES` publication (see
-        //   `EnableOptions::allow_incompatible_publications`), and the
-        //   subscriber never received this table's DDL to apply it against.
-        //   `UNLOGGED` has no WAL for logical decoding to read, so its
-        //   writes are never replicated regardless of publication scope.
+        // - Crash and publication safety, together, for free. A comment is
+        //   catalog metadata, not table data. Logical replication carries
+        //   DML on a publication's member tables, never DDL or `COMMENT`.
+        //   So a `FOR ALL TABLES` publication (see
+        //   `EnableOptions::allow_incompatible_publications`) never sees
+        //   this. An `UNLOGGED` table would dodge that same publication
+        //   too, but it loses its rows on crash recovery, which a plain
+        //   ordinary table does not. A catalog comment is WAL logged like
+        //   any other catalog change. It survives a crash between the
+        //   build and the mark step exactly as durably as the
+        //   engine-created index it is tracking.
         step(
             2,
             format!(
-                "DO $harvest_dropgate_probe_958$\nBEGIN\n    \
+                "DO $harvest_dropgate_probe_958$\nDECLARE marker text;\nBEGIN\n    \
                  IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace\n            \
                  WHERE c.relname = 'harvest_1270_drop_gate_probe' AND n.nspname = current_schema())\n    \
                  THEN\n        \
-                 IF obj_description('harvest_1270_drop_gate_probe'::regclass, 'pg_class')\n           \
+                 SELECT obj_description('harvest_1270_drop_gate_probe'::regclass, 'pg_class')\n           \
+                 INTO marker;\n        \
+                 IF marker IS NULL OR left(marker, length('{PROBE_TABLE_MARKER}'))\n           \
                  IS DISTINCT FROM '{PROBE_TABLE_MARKER}' THEN\n            \
                  RAISE EXCEPTION\n                \
                  'harvest_1270_drop_gate_probe exists and is not engine-owned; refusing to reuse it';\n        \
                  END IF;\n    \
                  ELSE\n        \
-                 CREATE UNLOGGED TABLE harvest_1270_drop_gate_probe (existed boolean);\n        \
-                 COMMENT ON TABLE harvest_1270_drop_gate_probe IS '{PROBE_TABLE_MARKER}';\n    \
+                 CREATE TABLE harvest_1270_drop_gate_probe ();\n    \
                  END IF;\n    \
-                 IF NOT EXISTS (SELECT 1 FROM harvest_1270_drop_gate_probe) THEN\n        \
-                 INSERT INTO harvest_1270_drop_gate_probe\n        \
-                 SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace\n                       \
-                 WHERE c.relname = 'idx_harvest_we_created_at' AND n.nspname = current_schema());\n    \
+                 SELECT obj_description('harvest_1270_drop_gate_probe'::regclass, 'pg_class')\n      \
+                 INTO marker;\n    \
+                 IF marker IS NULL THEN\n        \
+                 EXECUTE 'COMMENT ON TABLE harvest_1270_drop_gate_probe IS '\n            \
+                 || quote_literal('{PROBE_TABLE_MARKER}: existed='\n                \
+                 || (EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace\n                       \
+                 WHERE c.relname = 'idx_harvest_we_created_at' AND n.nspname = current_schema()))::text);\n    \
                  END IF;\n\
                  END\n$harvest_dropgate_probe_958$"
             ),
@@ -3939,9 +3950,10 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         step(
             2,
             format!(
-                "DO $harvest_dropgate_mark_958$\nDECLARE preexisted boolean;\nBEGIN\n    \
-                 SELECT existed INTO preexisted FROM harvest_1270_drop_gate_probe;\n    \
-                 IF preexisted IS DISTINCT FROM true THEN\n        \
+                "DO $harvest_dropgate_mark_958$\nDECLARE marker text;\nBEGIN\n    \
+                 SELECT obj_description('harvest_1270_drop_gate_probe'::regclass, 'pg_class')\n      \
+                 INTO marker;\n    \
+                 IF marker NOT LIKE '%existed=true%' THEN\n        \
                  EXECUTE 'COMMENT ON INDEX idx_harvest_we_created_at IS '\n             \
                  || quote_literal('{DROP_GATE_INDEX_MARKER}');\n    \
                  END IF;\n    \
@@ -4005,11 +4017,25 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // ── 4: THE WINDOW — one transaction, metadata only ────────────────
         step(4, "BEGIN".to_string()),
         step(4, format!("SET LOCAL lock_timeout = '{lock_ms}ms'")),
-        // The first thing inside the window, so a plan resumed over a lost
-        // phase-2 build aborts before it has renamed anything. Without it,
-        // `ATTACH PARTITION` below discovers the missing index only once the
-        // exclusive lock is held, and builds it there.
-        // Checks SHAPE, not just name and `indisvalid` (issue #1270 item 11).
+        // Taken explicitly, and first, rather than left to whichever later
+        // statement happens to need it. `ALTER TABLE ... RENAME` below
+        // acquires the same `ACCESS EXCLUSIVE` lock anyway, so this adds
+        // no new wait; it only moves an existing one earlier. Every check
+        // between here and the rename now runs against a table nothing
+        // else can attach a view, trigger, publication membership or
+        // policy to. A check that instead ran before this lock would
+        // still leave that exact gap open, between itself and the
+        // rename's own lock acquisition.
+        step(
+            4,
+            "LOCK TABLE harvest_events IN ACCESS EXCLUSIVE MODE".to_string(),
+        ),
+        // Re-verifies shape, not just name and `indisvalid` (issue #1270
+        // item 11), now that the plan holds the lock above. A plan resumed
+        // over a lost phase-2 build aborts here before it has renamed
+        // anything. Without it, `ATTACH PARTITION` below discovers the
+        // missing index only once inside the same window, and builds it
+        // there.
         // Suppose either fixed name already belonged to a VALID but
         // structurally incompatible index — wrong columns, not unique,
         // partial. `CREATE ... IF NOT EXISTS` in phase 2 would then have
@@ -4068,19 +4094,57 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
                  END IF;\nEND\n$harvest_assert_958$;"
             ),
         ),
-        // Phase 1's view, trigger and unique-index guards run once, up
-        // front. A large-live-table plan can then spend hours in phases 2
-        // and 3 before phase 4 ever opens this window. A schema deployment
-        // landing in that gap — a new view, a new trigger, a new unique
-        // index — passed no check at all. The rename below would still
-        // carry it into the same silent-staleness or abort that phase 1
-        // exists to catch.
+        // All five of phase 1's guards — publication, row security, view,
+        // trigger and unique-index — run once, up front. A large-live-table
+        // plan can then spend hours in phases 2 and 3 before phase 4 ever
+        // opens this window. A new view, trigger, publication membership,
+        // enabled row security, or unique index landing in that gap passed
+        // no check at all. The rename below would still carry it into the
+        // same silent-staleness, dropped-data or abort that phase 1 exists
+        // to catch.
         //
         // Repeated here, immediately before the rename, inside the SAME
-        // transaction. Each check is a plain catalog SELECT, so this does
-        // not change when phase 4 first takes its lock. It only shrinks
-        // the unchecked window from the whole phase 2/3 duration down to
-        // the handful of statements between this check and the rename.
+        // transaction and behind the `ACCESS EXCLUSIVE` lock taken above.
+        // Nothing conflicting can have attached to `harvest_events` since
+        // that lock was granted. So a pass here is conclusive for the
+        // rest of this transaction, not just a narrower race window.
+        step(
+            4,
+            "DO $harvest_pub_958_p4$\nDECLARE bad text;\nBEGIN\n    \
+             SELECT string_agg(DISTINCT t.pubname, ', ') INTO bad\n      \
+             FROM pg_publication_tables t\n     \
+             WHERE t.schemaname = current_schema()\n       \
+             AND t.tablename = 'harvest_events';\n    \
+             IF bad IS NOT NULL THEN\n        \
+             RAISE EXCEPTION 'harvest #958: harvest_events is published by %, added since \
+             phase 1''s check ran. The partitioned layout is not compatible with a flat \
+             logical-replication subscriber. Run the partitioned layout on the subscriber \
+             too, or drop the publication, then re-run this plan.', bad;\n    \
+             END IF;\nEND\n$harvest_pub_958_p4$;"
+                .to_string(),
+        ),
+        step(
+            4,
+            "DO $harvest_rls_958_p4$\nDECLARE pols text; rls bool;\nBEGIN\n    \
+             SELECT COALESCE(bool_or(c.relrowsecurity OR c.relforcerowsecurity), false)\n      \
+             INTO rls\n      \
+             FROM pg_class c\n      \
+             JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
+             WHERE c.relname = 'harvest_events' AND n.nspname = current_schema();\n    \
+             SELECT string_agg(p.polname, ', ' ORDER BY p.polname) INTO pols\n      \
+             FROM pg_policy p\n      \
+             JOIN pg_class c ON c.oid = p.polrelid\n      \
+             JOIN pg_namespace n ON n.oid = c.relnamespace\n     \
+             WHERE c.relname = 'harvest_events' AND n.nspname = current_schema();\n    \
+             IF rls OR pols IS NOT NULL THEN\n        \
+             RAISE EXCEPTION 'harvest #958: harvest_events has row level security \
+             configured (policies: %), added since phase 1''s check ran. Phase 4 replaces \
+             it with a table built by CREATE TABLE ... (LIKE ...), which copies neither \
+             the row-security flags nor any policy. Drop the policies, then re-run this \
+             plan.', COALESCE(pols, 'none, but row security is enabled');\n    \
+             END IF;\nEND\n$harvest_rls_958_p4$;"
+                .to_string(),
+        ),
         step(
             4,
             "DO $harvest_views_958_p4$\nDECLARE bad text;\nBEGIN\n    \
@@ -4295,7 +4359,9 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
     // way the literal above stays a single readable top-to-bottom runbook
     // (issue #1270 item 7).
     if opts.allow_incompatible_publications {
-        steps.retain(|s| !s.sql.contains("$harvest_pub_958$"));
+        steps.retain(|s| {
+            !s.sql.contains("$harvest_pub_958$") && !s.sql.contains("$harvest_pub_958_p4$")
+        });
     }
     steps
 }
