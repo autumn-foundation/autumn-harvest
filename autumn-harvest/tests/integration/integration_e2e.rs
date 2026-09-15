@@ -827,8 +827,8 @@ pub(crate) async fn load_child_executions_from_url(
 /// once against the same database. A fixed `workflow_id` collided with the
 /// partial `UNIQUE(workflow_name, workflow_id)` active index on the second
 /// call. That index also covers a fresh `RUNNING` row, not only a sealed
-/// one. This is exactly what happens when the documented
-/// `HARVEST_TEST_DATABASE_URL` fallback runs more than one test in a process.
+/// one. The documented `HARVEST_TEST_DATABASE_URL` fallback runs more than
+/// one test in a process, so it hits this exact path.
 #[tokio::test]
 async fn insert_workflow_execution_helper_is_safe_to_call_more_than_once() {
     let (mut conn, _container) = setup_test_db().await;
@@ -960,10 +960,8 @@ pub(crate) async fn insert_workflow_execution_on_shard(
 }
 
 /// Insert a RUNNING execution with a caller-supplied `workflow_id` (all other
-/// fields mirror [`insert_workflow_execution`]). Needed when a single test/setup
-/// inserts more than one live execution: they would otherwise collide on the
-/// partial `UNIQUE(workflow_name, workflow_id)` active index that
-/// [`insert_workflow_execution`]'s hardcoded id trips on a second call.
+/// fields mirror [`insert_workflow_execution`]). Use this when a test needs a
+/// specific, known `workflow_id`; [`insert_workflow_execution`] mints its own.
 pub(crate) async fn insert_workflow_execution_with_id(
     conn: &mut AsyncPgConnection,
     workflow_id: &str,

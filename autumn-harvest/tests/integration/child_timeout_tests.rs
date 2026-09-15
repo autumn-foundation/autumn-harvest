@@ -584,9 +584,7 @@ async fn setup_parent_racing_overdue_real_child(
     use diesel::{ExpressionMethods, QueryDsl};
 
     let parent_exec_id = insert_workflow_execution(conn).await;
-    // The child is a SEPARATE live execution, so it needs a distinct workflow_id
-    // — reusing `insert_workflow_execution` (hardcoded id) would collide with the
-    // parent on the partial UNIQUE(workflow_name, workflow_id) active index.
+    // A `child-*` workflow_id marks this row as the child, for readability.
     let child_exec_id =
         insert_workflow_execution_with_id(conn, &format!("child-{}", uuid::Uuid::new_v4())).await;
 
