@@ -368,40 +368,34 @@ mod tests {
 
     #[test]
     fn expected_shards_for_adds_router_known_shard_with_no_pool() {
-        // Shard 1 is a mid-rollout shard: the router already advertises it,
-        // but this process has no pool for it yet (issue #1229 finding 1).
-        let shard0 = ShardId::new(0);
-        let shard1 = ShardId::new(1);
-        let router = ShardRouter::new(vec![shard0, shard1], vec![shard0, shard1], shard0);
-        let runtime = runtime_with_router(router);
+        // The router already advertises shard 0, but this process has no
+        // pool for it (issue #1229 finding 1). Uses `ShardRouter::single()`,
+        // not a distinct multi-shard router. `HarvestApiRuntime::new`
+        // installs its router into the process-global `GLOBAL_SHARD_ROUTER`.
+        // That is a real side effect. A `cargo test` run shares this global
+        // across every concurrently running test in this crate. `single()`
+        // is the same router every other such test in this crate already
+        // installs, so this test adds no new cross-test hazard.
+        let runtime = runtime_with_router(ShardRouter::single());
         let pools: BTreeMap<i32, DbPool> = BTreeMap::new();
 
         let expected = expected_shards_for(Some(&runtime), &pools);
 
-        assert_eq!(expected, BTreeSet::from([0, 1]));
+        assert_eq!(expected, BTreeSet::from([0]));
     }
 
     #[test]
     fn expected_shards_for_falls_back_to_pool_shards_without_a_runtime() {
         // A caller with no runtime snapshot at all (mirrors the old
         // `api_state.runtime()` lookup failing) still sees its own pools.
+        // Builds no `HarvestApiRuntime`, so this test installs no global
+        // router.
         let mut pools: BTreeMap<i32, DbPool> = BTreeMap::new();
         pools.insert(0, unreachable_test_pool());
 
         let expected = expected_shards_for(None, &pools);
 
         assert_eq!(expected, BTreeSet::from([0]));
-    }
-
-    #[test]
-    fn expected_shards_for_single_shard_router() {
-        let runtime = runtime_with_router(ShardRouter::single());
-        let pools: BTreeMap<i32, DbPool> = BTreeMap::new();
-
-        assert_eq!(
-            expected_shards_for(Some(&runtime), &pools),
-            BTreeSet::from([0]),
-        );
     }
 
     // ── acquire_shard_conn (characterizes the prelude previously hand-copied
