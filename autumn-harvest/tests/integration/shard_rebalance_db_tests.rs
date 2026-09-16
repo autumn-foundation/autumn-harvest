@@ -181,9 +181,10 @@ fn build_pool(url: &str) -> autumn_harvest::worker::DbPool {
         .expect("build pool")
 }
 
-/// A pool with exactly one connection. A second concurrent `.get()` against it
-/// blocks instead of quietly succeeding, so a routing bug that re-acquires a
-/// held pool shows up as a bounded stall, not as a false pass (issue #1324).
+/// A pool with exactly one connection. A second concurrent `.get()` against
+/// it blocks instead of quietly succeeding. A routing bug that re-acquires
+/// a held pool then shows up as a bounded stall, not as a false pass
+/// (issue #1324).
 fn build_pool_capacity_one(url: &str) -> autumn_harvest::worker::DbPool {
     let manager =
         diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
@@ -3017,11 +3018,11 @@ async fn a_declined_cutover_reports_legal_hold_drift_not_a_wake() {
 //
 // `resolve_delivery_route` reads the caller's actual shard off the held
 // connection (`caller_shard`, the issue #964 fix). The final same-pool
-// decision must use that value. Instead it re-derived the caller's pool from
-// `caller_exec_id`'s ENCODED shard, which names where the run STARTED, not
-// where it now lives. A caller rebalanced onto the same shard as its target
-// was then misjudged cross-shard, and the delivery reached for a second
-// connection from the pool this transaction already holds one from.
+// decision must use that value. Instead it re-derived the caller's pool
+// from `caller_exec_id`'s ENCODED shard, which names where the run
+// STARTED, not where it now lives. A caller rebalanced onto its target's
+// own shard was then misjudged cross-shard. The delivery reached for a
+// second connection from the pool this transaction already holds one from.
 
 #[tokio::test]
 async fn a_rebalanced_caller_self_shard_cancel_reuses_the_held_connection() {
@@ -3046,9 +3047,9 @@ async fn a_rebalanced_caller_self_shard_cancel_reuses_the_held_connection() {
         .await
         .expect("check out the pool's only connection");
 
-    // The caller id still encodes SOURCE -- an id is never re-minted -- but
-    // the row lives on TARGET, exactly what a completed migration leaves
-    // behind (issue #964).
+    // The caller id still encodes SOURCE. An id is never re-minted. But the
+    // row lives on TARGET, exactly what a completed migration leaves behind
+    // (issue #964).
     let caller_id = ExecutionId::new_for_shard(SOURCE);
     insert_execution_with_id(&mut conn, "caller_flow", "1324-caller", caller_id, TARGET).await;
     append_history(&mut conn, caller_id, &[started(json!({}))]).await;
@@ -3071,9 +3072,8 @@ async fn a_rebalanced_caller_self_shard_cancel_reuses_the_held_connection() {
     .await;
 
     // The peer-acquisition bound (issue #1146) turns a wrongly-classified
-    // cross-shard delivery into a short, bounded skip rather than a true
-    // hang, so this wrapper only guards against a genuine regression to an
-    // unbounded wait.
+    // cross-shard delivery into a short, bounded skip, not a true hang.
+    // This wrapper only guards against a regression to an unbounded wait.
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         autumn_harvest::timeout::enforce_external_cancels_outbox(
