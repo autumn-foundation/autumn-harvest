@@ -2641,6 +2641,21 @@ async fn resolve_delivery_route(
         _ => caller_exec_id.shard(),
     };
 
+    // Belt-and-braces (issue #1324). Fail loud here, not with `pool_for`'s
+    // silent default-shard fallback below. `conn` came from `caller_shard`'s
+    // pool by construction. A missing entry for it means this process does
+    // not know the shard `conn` actually serves.
+    if pool.exact_pool_for(caller_shard).is_none() {
+        return DeliveryRoute::Retry {
+            reason: format!("caller shard {caller_shard} has no storage pool in this process"),
+            uninspected: vec![crate::external_target_location::UninspectedShard {
+                shard: caller_shard,
+                reason: "caller shard has no storage pool in this process".to_string(),
+                kind: crate::external_target_location::UninspectedReasonKind::NoPool,
+            }],
+        };
+    }
+
     let (target_shard, expected_live, may_assert_key_state) = match target {
         ExternalTarget::ExecutionId(id) => {
             // Authoritative by construction: an id identifies exactly one run,
@@ -2763,9 +2778,14 @@ async fn resolve_delivery_route(
     // slot, so pointer equality of the slots is really *shard-id* equality and
     // reports two aliases of one pool as different (issue #1146; the same trap
     // `external_target_location::same_underlying_pool` was extracted for).
+    // `caller_shard`, not `caller_exec_id` (issue #1324). The id's encoded
+    // shard names where the run STARTED. A rebalanced caller now lives
+    // elsewhere. `caller_shard` above already read the real one off `conn`.
+    // Comparing pools by the id instead brings back the held-pool
+    // mislabelling issue #964 fixed one level up.
     match (
         pool.exact_pool_for(target_shard),
-        pool.exact_pool_for_execution(caller_exec_id),
+        pool.exact_pool_for(caller_shard),
     ) {
         (Some(target_pool), Some(caller_pool))
             if crate::external_target_location::same_underlying_pool(target_pool, caller_pool) =>

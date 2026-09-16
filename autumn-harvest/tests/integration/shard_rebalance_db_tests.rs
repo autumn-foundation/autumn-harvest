@@ -181,6 +181,20 @@ fn build_pool(url: &str) -> autumn_harvest::worker::DbPool {
         .expect("build pool")
 }
 
+/// A pool with exactly one connection. A second concurrent `.get()` against it
+/// blocks instead of quietly succeeding, so a routing bug that re-acquires a
+/// held pool shows up as a bounded stall, not as a false pass (issue #1324).
+fn build_pool_capacity_one(url: &str) -> autumn_harvest::worker::DbPool {
+    let manager =
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            url,
+        );
+    deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("build size-1 pool")
+}
+
 async fn connect(url: &str) -> AsyncPgConnection {
     <AsyncPgConnection as AsyncConnection>::establish(url)
         .await
@@ -2996,5 +3010,93 @@ async fn a_declined_cutover_reports_legal_hold_drift_not_a_wake() {
     assert!(
         !reason.contains("woke") && !reason.contains("quiescent"),
         "a hold-drift decline must not also claim a wake happened; got: {reason}"
+    );
+}
+
+// ── Issue #1324 ─────────────────────────────────────────────────────────────
+//
+// `resolve_delivery_route` reads the caller's actual shard off the held
+// connection (`caller_shard`, the issue #964 fix). The final same-pool
+// decision must use that value. Instead it re-derived the caller's pool from
+// `caller_exec_id`'s ENCODED shard, which names where the run STARTED, not
+// where it now lives. A caller rebalanced onto the same shard as its target
+// was then misjudged cross-shard, and the delivery reached for a second
+// connection from the pool this transaction already holds one from.
+
+#[tokio::test]
+async fn a_rebalanced_caller_self_shard_cancel_reuses_the_held_connection() {
+    // TARGET holds exactly one connection for the whole test. A routing
+    // decision that reaches for a second one there cannot get it in time.
+    let (source_url, _source_container) = setup_isolated_db().await;
+    let (target_url, _target_container) = setup_isolated_db().await;
+    let pools = [
+        (SOURCE, build_pool(&source_url)),
+        (TARGET, build_pool_capacity_one(&target_url)),
+    ]
+    .into_iter()
+    .collect();
+    let sharded_pool = ShardedDbPool::from_map(pools, SOURCE);
+    let target_pool = sharded_pool
+        .exact_pool_for(TARGET)
+        .expect("TARGET pool is configured")
+        .clone();
+
+    let mut conn = target_pool
+        .get()
+        .await
+        .expect("check out the pool's only connection");
+
+    // The caller id still encodes SOURCE -- an id is never re-minted -- but
+    // the row lives on TARGET, exactly what a completed migration leaves
+    // behind (issue #964).
+    let caller_id = ExecutionId::new_for_shard(SOURCE);
+    insert_execution_with_id(&mut conn, "caller_flow", "1324-caller", caller_id, TARGET).await;
+    append_history(&mut conn, caller_id, &[started(json!({}))]).await;
+
+    // The cancel target also lives on TARGET, so the correct route is
+    // `Caller`: deliver on `conn` itself, and never acquire a second one.
+    let target_id = ExecutionId::new_for_shard(TARGET);
+    insert_execution_with_id(&mut conn, "target_flow", "1324-target", target_id, TARGET).await;
+    append_history(&mut conn, target_id, &[started(json!({}))]).await;
+
+    let cancel_id = autumn_harvest::types::ExternalCancelId::new();
+    append_more(
+        &mut conn,
+        caller_id,
+        &[WorkflowEvent::ExternalCancelRequested {
+            cancel_id,
+            target: autumn_harvest::types::ExternalTarget::ExecutionId(target_id),
+        }],
+    )
+    .await;
+
+    // The peer-acquisition bound (issue #1146) turns a wrongly-classified
+    // cross-shard delivery into a short, bounded skip rather than a true
+    // hang, so this wrapper only guards against a genuine regression to an
+    // unbounded wait.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        autumn_harvest::timeout::enforce_external_cancels_outbox(
+            &mut conn,
+            &autumn_harvest::telemetry::NoOpMetrics,
+            std::time::Duration::from_secs(60),
+            &Some(sharded_pool),
+            &[TARGET],
+            &codecs(),
+        ),
+    )
+    .await;
+
+    let processed = result
+        .expect("must not stall: the caller's current shard, not its id's encoded origin, decides whether delivery reuses `conn`")
+        .expect("cancel outbox sweep must succeed");
+    assert_eq!(
+        processed, 1,
+        "the same-shard cancel-by-id delivery must be processed in this sweep"
+    );
+    assert_eq!(
+        state_of(&mut conn, target_id).await.as_deref(),
+        Some("CANCELLED"),
+        "the target must actually be cancelled, not merely left un-stalled"
     );
 }
