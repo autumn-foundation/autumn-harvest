@@ -14,10 +14,32 @@ faster than Temporal, and the report does not say that it is.
 ## The two arms
 
 The harvest arm is the `postgres` arm of
-[`../0010-cross-mode-throughput/`](../0010-cross-mode-throughput/), run
-unchanged. Running one binary for both assays is deliberate: it makes the
-harvest number in this report and the harvest number in assay #10 the same
-measurement rather than two that might drift.
+[`../0010-cross-mode-throughput/`](../0010-cross-mode-throughput/), run from
+the same binary but **at this assay's own registered payload**, which assay
+#10's L1 cannot use. The two assays therefore report two different harvest
+measurements, not one shared one.
+
+An earlier revision ran #10's arm unchanged and said the two assays shared a
+single measurement. That was wrong: #10 seeds the canonical empty object,
+because its L1 compares against a published figure taken that way, and #11
+registers a ~40-byte payload for both of its arms. Running #10's arm here
+measured #10's workload and reproduced its cell, not this assay's.
+
+So the harvest arm must set `ASSAY10_INPUT_JSON`. Without it the run
+reproduces assay #10's number, not this assay's:
+
+```bash
+ASSAY10_ARMS=postgres \
+ASSAY10_WORKFLOWS=2000 \
+ASSAY10_REPS=3 \
+ASSAY10_INPUT_JSON='{"p":"0123456789abcdef0123456789abcdef"}' \
+  cargo run --release --manifest-path \
+  ../0010-cross-mode-throughput/Cargo.toml
+```
+
+The apparatus refuses to grade any pre-registered line on an overridden run,
+and prints a "Not graded" notice instead, because assay #10's band cannot
+grade a workload that is not assay #10's.
 
 The Temporal arm is `main.go` here. Shape parity is enforced by hand:
 
@@ -53,6 +75,10 @@ go build -o assay11 .
 # It starts and removes the Temporal container itself, so nothing is left
 # running against the Postgres the harvest arm needs.
 ```
+
+The harvest arm runs separately, never at the same time, with the
+`ASSAY10_INPUT_JSON` override given in [The two arms](#the-two-arms) above.
+Omitting it reproduces assay #10's cell rather than this assay's.
 
 | variable | default | meaning |
 |:--|:--|:--|
