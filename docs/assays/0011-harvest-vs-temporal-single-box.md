@@ -153,10 +153,20 @@ number. Against a ~25% spread that matters, so the 1.98x cell is not directly
 comparable to the rows above it. Its single-repetition span would be 2.24x to
 1.80x taken from the same three repetitions.
 
-Re-measuring **strengthened** the result rather than softening it. The old
-250-row cell read 28.85 for Temporal and now reads 36.17, so the shallowest
-margin moves from 1.22x to 1.53x: the pre-correction cells were understating
-Temporal, not flattering it.
+The re-measured 250-row Temporal cell reads **36.17**, against **28.85** in
+the pre-correction diagnostic, so the shallowest margin in the table above is
+1.53x where the old one was 1.22x.
+
+**That difference cannot be attributed to the correction.** Both are single
+repetitions, and the gap between them is about 25%, which is the same size as
+this arm's own measured repetition spread over the registered sweep. An
+earlier revision of this report read the increase as evidence that the
+pre-correction cells had been understating Temporal, and that inference does
+not hold: run-to-run variation alone is sufficient to produce it. Separating
+the two would need the before and after configurations repeated enough times
+to tell them apart, which this diagnostic does not do. What can be said is
+narrower and is all that is said here: **the re-measured cell is 36.17, and
+Temporal still wins at every depth in the table.**
 
 **These are single repetitions against a Temporal arm whose spread over three
 repetitions was about 25%.** The ratios are therefore coarse, and the 1.45x

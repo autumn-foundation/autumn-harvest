@@ -1,3 +1,26 @@
+<!-- EDITORIAL HEADER, added after capture. The captured output follows
+     unchanged below this block. -->
+
+# Assay #11's harvest arm, at the registered ~40-byte payload
+
+**The trailing `## pre-registered lines` block in the captured output below
+does not apply to this run, and should be ignored.**
+
+This run overrides `ASSAY10_INPUT_JSON` with assay #11's registered payload.
+Assay #10's L1 compares its Postgres arm against a published figure taken with
+the canonical `{}` input, so an overridden run is a different workload and
+#10's band cannot grade it. The binary printed the block anyway, because at the
+time of this run it graded unconditionally. That is fixed: the apparatus now
+refuses to grade any run whose seeded input is not the canonical one, and
+prints a "Not graded" notice instead. Found by review on PR #1622.
+
+The capture is kept unedited rather than regenerated, so the archive shows what
+the run actually printed. The measurement itself — three repetitions, mean
+5.47 workflows/sec, every repetition correctness-PASS — is unaffected by the
+defect, which was in the verdict printing and not in the measuring.
+
+---
+
 # Assay #10 — cross-mode throughput
 
 Workflow `harvest_e2e_bench_wf`, 3 activities, 7 dispatches per run.

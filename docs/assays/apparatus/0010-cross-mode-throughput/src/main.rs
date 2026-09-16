@@ -1043,6 +1043,25 @@ async fn main() {
             .map(|(_, rates, _)| mean(rates))
     };
     println!("\n## pre-registered lines\n");
+
+    // Grade nothing when the seeded input is not the canonical one.
+    //
+    // Assay #10's L1 compares this arm against a published figure taken with
+    // `start_params` seeding an empty object. A run that overrides the input,
+    // as assay #11 does with its own registered payload, is a different
+    // workload. Printing an L1 verdict for it would grade one assay's run
+    // against another assay's band. Found by review on PR #1622.
+    if settings.input_json != INPUT_JSON {
+        println!(
+            "* **Not graded.** `ASSAY10_INPUT_JSON` is `{}`, not the canonical `{INPUT_JSON}`. \
+             L1 compares this arm against a published figure taken at the canonical input, so \
+             an overridden run is a different workload and no pre-registered line here applies \
+             to it.",
+            settings.input_json
+        );
+        return;
+    }
+
     let Some(pg) = find(Arm::Postgres) else {
         println!(
             "* **L1** the postgres arm produced no valid repetition, so every line here \
