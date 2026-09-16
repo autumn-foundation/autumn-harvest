@@ -55851,6 +55851,7 @@ mod tests {
             history_bloat_warned_at: None,
             triage_note: None,
             migrated_run_terminal_at: None,
+            staging_vacated_state: None,
         }
     }
 

@@ -2788,52 +2788,73 @@ async fn delete_candidate_execution(
         // (e.g. a delete error below) discards the summary too, so no
         // orphan can result. The summary INSERT happens AFTER the hold
         // re-check (a held row is never summarized) and BEFORE the deletes.
-        if let Some(policy) = summary {
-            let row: Option<SummarySourceRow> = harvest_workflow_executions::table
-                .find(candidate_id)
-                .select((
-                    harvest_workflow_executions::legal_hold_set_at,
-                    harvest_workflow_executions::legal_hold_until,
-                    harvest_workflow_executions::workflow_name,
-                    harvest_workflow_executions::workflow_id,
-                    harvest_workflow_executions::state,
-                    harvest_workflow_executions::started_at,
-                    harvest_workflow_executions::completed_at,
-                    harvest_workflow_executions::shard_id,
-                    harvest_workflow_executions::output,
-                    harvest_workflow_executions::error,
-                    harvest_workflow_executions::search_attrs,
-                    harvest_workflow_executions::parent_id,
-                    harvest_workflow_executions::migrated_from_shards,
-                ))
-                .for_update()
-                .first::<SummarySourceRow>(conn)
-                .await
-                .optional()
-                .map_err(database_error)?;
+        // The row read and hold re-check are unconditional (issue #1317
+        // review, P1): whether a summary gets written now has TWO
+        // independent triggers, not one. Summary retention being
+        // configured is the original (#752) trigger. The other is new:
+        // `migrated_from_shards` non-empty means this row was itself the
+        // TARGET of a shard-rebalance migration at some point, so a source
+        // shard elsewhere can still hold a `MIGRATED` seal whose forwarding
+        // chain resolves here, not yet observed terminal
+        // (`reconcile_migrated_seal_terminality` / `live_copy_is_terminal`).
+        // Hard-deleting this row with no trace at all would make every
+        // future reconciliation attempt for that seal fail with "neither
+        // its execution row nor its summary exists" forever, leaving the
+        // seal's business key blocked past any operator's reach. So this
+        // one case gets a minimal, payload-free summary even when summary
+        // retention is otherwise disabled -- just enough for reconciliation
+        // to read a terminal state. Every other row's behavior, and this
+        // row's own retention age/eligibility, is unchanged.
+        let row: Option<SummarySourceRow> = harvest_workflow_executions::table
+            .find(candidate_id)
+            .select((
+                harvest_workflow_executions::legal_hold_set_at,
+                harvest_workflow_executions::legal_hold_until,
+                harvest_workflow_executions::workflow_name,
+                harvest_workflow_executions::workflow_id,
+                harvest_workflow_executions::state,
+                harvest_workflow_executions::started_at,
+                harvest_workflow_executions::completed_at,
+                harvest_workflow_executions::shard_id,
+                harvest_workflow_executions::output,
+                harvest_workflow_executions::error,
+                harvest_workflow_executions::search_attrs,
+                harvest_workflow_executions::parent_id,
+                harvest_workflow_executions::migrated_from_shards,
+            ))
+            .for_update()
+            .first::<SummarySourceRow>(conn)
+            .await
+            .optional()
+            .map_err(database_error)?;
 
-            // `None` = row concurrently deleted: nothing to summarize; the
-            // deletes below are harmless no-ops (matches the hold-only
-            // path's missing-row behavior).
-            if let Some((
-                set_at,
-                until,
-                workflow_name,
-                workflow_id,
-                state,
-                started_at,
-                completed_at,
-                shard_id,
-                output,
-                error,
-                search_attrs,
-                parent_id,
-                migrated_from_shards,
-            )) = row
-            {
-                if legal_hold_active(set_at, until, now) {
-                    return Ok(CandidateDeleteOutcome::SkippedHeld);
-                }
+        // `None` = row concurrently deleted: nothing to summarize; the
+        // deletes below are harmless no-ops (matches the pre-#752 missing-
+        // row behavior).
+        if let Some((
+            set_at,
+            until,
+            workflow_name,
+            workflow_id,
+            state,
+            started_at,
+            completed_at,
+            shard_id,
+            output,
+            error,
+            search_attrs,
+            parent_id,
+            migrated_from_shards,
+        )) = row
+        {
+            if legal_hold_active(set_at, until, now) {
+                return Ok(CandidateDeleteOutcome::SkippedHeld);
+            }
+            let was_ever_migrated_here = migrated_from_shards
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|hops| !hops.is_empty());
+            if summary.is_some() || was_ever_migrated_here {
                 // completed_at is NOT NULL by the candidate query's WHERE
                 // clause; fall back to started_at defensively so the NOT
                 // NULL summary column always has a value.
@@ -2841,15 +2862,17 @@ async fn delete_candidate_execution(
                 // Clamp at 0: a `completed_at` before `started_at` (clock
                 // skew across nodes) must never produce a negative duration.
                 let duration_ms = Some((completed - started_at).num_milliseconds().max(0));
-                // Payload capture is opt-in (AC3): a policy with capture
-                // disabled leaves result/error NULL.
-                let (result, error_out) = if policy.capture_payload {
-                    (
+                // Payload capture is opt-in (AC3), and only ever happens
+                // under an explicit policy that asked for it. The
+                // migration-target tombstone case has no policy, so it
+                // always leaves result/error NULL -- identity and timing
+                // only, exactly like a `capture_payload: false` policy.
+                let (result, error_out) = match summary {
+                    Some(policy) if policy.capture_payload => (
                         cap_result_payload(output, policy.max_payload_bytes),
                         cap_error_text(error.as_deref(), policy.max_payload_bytes),
-                    )
-                } else {
-                    (None, None)
+                    ),
+                    _ => (None, None),
                 };
                 // Codec caveat (issue #752): the summary stores the
                 // `output`/`search_attrs` COLUMNS verbatim — these are
@@ -2890,25 +2913,6 @@ async fn delete_candidate_execution(
                     .await
                     .map_err(database_error)?;
                 summarized = inserted > 0;
-            }
-        } else {
-            // Summary retention disabled: byte-for-byte the pre-#752
-            // hold-only re-check.
-            let hold: Option<HoldTimestamps> = harvest_workflow_executions::table
-                .find(candidate_id)
-                .select((
-                    harvest_workflow_executions::legal_hold_set_at,
-                    harvest_workflow_executions::legal_hold_until,
-                ))
-                .for_update()
-                .first::<HoldTimestamps>(conn)
-                .await
-                .optional()
-                .map_err(database_error)?;
-            if let Some((set_at, until)) = hold
-                && legal_hold_active(set_at, until, now)
-            {
-                return Ok(CandidateDeleteOutcome::SkippedHeld);
             }
         }
 

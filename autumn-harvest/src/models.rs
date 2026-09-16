@@ -245,6 +245,12 @@ pub struct WorkflowExecution {
     /// retention and erasure keep treating it as a `MIGRATED` seal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migrated_run_terminal_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The state a shard-rebalance staging vacate sealed over (issue #1317
+    /// review). Non-`None` only while the migration that vacated this row
+    /// is still in flight. An abort restores `state` to this value and
+    /// clears it. A successful cutover just clears it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub staging_vacated_state: Option<String>,
 }
 
 /// Serialize a nullable `start_source` column, reporting a `None` (pre-upgrade /

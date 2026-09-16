@@ -391,6 +391,54 @@ async fn summary_disabled_deletes_and_writes_no_summary() {
     assert_eq!(count_summaries(&mut conn).await, 0, "no summary row");
 }
 
+/// Issue #1317 review, P1: a row this shard EVER received via shard-rebalance
+/// migration can still be the un-reconciled forwarding target of a `MIGRATED`
+/// seal on another shard. Deleting it with no trace at all, even under the
+/// default `summary: None` policy, would make that seal's reconciliation
+/// error forever. So this one case gets a minimal, payload-free tombstone
+/// summary even though summary retention is otherwise off.
+#[tokio::test]
+async fn summary_disabled_still_tombstones_a_row_that_was_ever_a_migration_target() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let old = Utc::now() - chrono::Duration::days(2);
+    let exec_id = insert_completed(&mut conn, "wf", "migrated-target", old).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET migrated_from_shards = '[0]'::jsonb \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(&mut conn)
+    .await
+    .expect("mark the row as a migration target");
+
+    let config = history_only(Some(Duration::from_secs(86_400))); // summary: None
+    let metrics = Arc::new(CapturingMetrics::default());
+    let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
+
+    assert_eq!(result.deleted_count, 1);
+    assert_eq!(
+        result.summarized_count, 1,
+        "a migration target must be tombstoned even with summary retention off"
+    );
+    assert_eq!(count_executions(&mut conn).await, 0, "execution deleted");
+    assert_eq!(
+        count_summaries(&mut conn).await,
+        1,
+        "tombstone summary written"
+    );
+
+    let s = load_summary(&mut conn, exec_id).await.expect("summary row");
+    assert_eq!(s.workflow_name, "wf");
+    assert_eq!(s.workflow_id, "migrated-target");
+    assert_eq!(s.state, "COMPLETED");
+    assert!(s.result.is_none(), "the tombstone never captures a payload");
+    assert!(s.error.is_none(), "the tombstone never captures a payload");
+}
+
 // AC2 + AC3: a summary row is written in the same delete transaction, carrying
 // identity/timing/shard/search-attrs. summarized_count reported.
 #[tokio::test]

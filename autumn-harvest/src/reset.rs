@@ -1716,6 +1716,7 @@ mod tests {
             triage_note: None,
             quota_key: None,
             migrated_run_terminal_at: None,
+            staging_vacated_state: None,
         }
     }
 

@@ -3090,6 +3090,55 @@ async fn rolling_back_the_seal_column_refuses_once_a_key_has_both_a_seal_and_a_r
     );
 }
 
+/// Issue #1317 review, P2: while `staging_vacated_state` is non-NULL, it is
+/// the only surviving record of a vacated row's prior state. Dropping the
+/// column then would strand that row: an abort could still delete the
+/// staged copy, but could no longer restore what it vacated.
+#[tokio::test]
+async fn rolling_back_the_vacate_marker_column_refuses_while_a_marker_is_set() {
+    let shards = setup_two_shards().await;
+    let mut source = shards.source().await;
+    let down_sql =
+        include_str!("../../migrations/20260916151612_harvest_staging_vacated_state/down.sql");
+
+    source
+        .batch_execute(
+            "INSERT INTO harvest_workflow_executions \
+               (id, workflow_name, workflow_id, run_id, shard_id, state, input, \
+                started_at, created_at, staging_vacated_state) \
+             VALUES \
+               (gen_random_uuid(), 'wf', 'down-migration-vacate', gen_random_uuid(), 0, \
+                'CONTINUED_AS_NEW', '{}', now(), now(), 'COMPLETED')",
+        )
+        .await
+        .expect("seed a mid-staging vacate marker");
+
+    let err = Box::pin(
+        source.transaction::<(), diesel::result::Error, _>(async |conn| {
+            conn.batch_execute(down_sql).await
+        }),
+    )
+    .await
+    .expect_err("the guard must refuse while a vacate marker is set");
+    assert!(
+        err.to_string().contains("cannot roll back"),
+        "expected the guard's own message, got {err}"
+    );
+
+    let column_still_present: ScalarCount = diesel::sql_query(
+        "SELECT count(*)::BIGINT AS value FROM information_schema.columns \
+          WHERE table_name = 'harvest_workflow_executions' \
+            AND column_name = 'staging_vacated_state'",
+    )
+    .get_result(&mut source)
+    .await
+    .expect("check column presence");
+    assert_eq!(
+        column_still_present.value, 1,
+        "an aborted rollback must leave the column in place"
+    );
+}
+
 fn signal_with_start_allow_duplicate<'a>(
     workflow_name: &'a str,
     workflow_id: &'a str,
