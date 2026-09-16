@@ -1,6 +1,6 @@
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      
 --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- CTE Scan on claimed  (cost=524595.07..524595.09 rows=1 width=817) (actual rows=1 loops=1)
+ CTE Scan on claimed  (cost=462413.76..462413.78 rows=1 width=817) (actual rows=1 loops=1)
    Buffers: shared hit=275 dirtied=6 written=3
    CTE paused_queues
      ->  Aggregate  (cost=13.11..13.12 rows=1 width=32) (actual rows=1 loops=1)
@@ -35,24 +35,24 @@
                              Buffers: shared hit=1
                        ->  CTE Scan on concurrency_pending_keys  (cost=0.00..5.12 rows=256 width=32) (never executed)
    CTE candidate
-     ->  Limit  (cost=524020.97..524020.98 rows=1 width=208) (actual rows=1 loops=1)
+     ->  Limit  (cost=461845.97..461845.98 rows=1 width=208) (actual rows=1 loops=1)
            Buffers: shared hit=248
-           ->  LockRows  (cost=524020.97..524058.66 rows=3015 width=208) (actual rows=1 loops=1)
+           ->  LockRows  (cost=461845.97..461883.66 rows=3015 width=208) (actual rows=1 loops=1)
                  Buffers: shared hit=248
-                 ->  Sort  (cost=524020.97..524028.51 rows=3015 width=208) (actual rows=1 loops=1)
+                 ->  Sort  (cost=461845.97..461853.51 rows=3015 width=208) (actual rows=1 loops=1)
                        Sort Key: (CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'w1'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END) DESC, harvest_task_queue_1.priority DESC, harvest_task_queue_1.scheduled_at
                        Sort Method: quicksort  Memory: 2103kB
                        Buffers: shared hit=247
-                       ->  Nested Loop  (cost=0.00..524005.89 rows=3015 width=208) (actual rows=10000 loops=1)
+                       ->  Nested Loop  (cost=0.00..461830.89 rows=3015 width=208) (actual rows=10000 loops=1)
                              Join Filter: ((harvest_task_queue_1.task_type <> 'activity'::text) OR (harvest_task_queue_1.activity_name IS NULL) OR (harvest_task_queue_1.activity_name <> ALL (paused_activities.names)))
                              Buffers: shared hit=241
                              ->  CTE Scan on paused_activities  (cost=0.00..0.02 rows=1 width=88) (actual rows=1 loops=1)
-                             ->  Nested Loop  (cost=0.00..523904.01 rows=3170 width=188) (actual rows=10000 loops=1)
+                             ->  Nested Loop  (cost=0.00..461729.01 rows=3170 width=188) (actual rows=10000 loops=1)
                                    Join Filter: (harvest_task_queue_1.queue_name <> ALL (paused_queues.names))
                                    Buffers: shared hit=241
                                    ->  CTE Scan on paused_queues  (cost=0.00..0.02 rows=1 width=88) (actual rows=1 loops=1)
                                          Buffers: shared hit=8
-                                   ->  Seq Scan on harvest_task_queue harvest_task_queue_1  (cost=0.00..523829.00 rows=3333 width=142) (actual rows=10000 loops=1)
+                                   ->  Seq Scan on harvest_task_queue harvest_task_queue_1  (cost=0.00..461654.00 rows=3333 width=142) (actual rows=10000 loops=1)
                                          Filter: (((session_id IS NULL) OR (sticky_worker_id = 'w1'::text)) AND ((task_type <> 'activity'::text) OR (activity_name IS NULL) OR (required_capabilities IS NOT NULL) OR (activity_name <> ALL ('{}'::text[]))) AND (state = 'PENDING'::text) AND (queue_name = ANY ('{bench-q-0,bench-q-1,bench-q-2,bench-q-3}'::text[])) AND (scheduled_at <= now()) AND ((schedule_to_close_at IS NULL) OR (schedule_to_close_at > now())) AND ((sticky_worker_id IS NULL) OR (sticky_worker_id = 'w1'::text) OR (sticky_until IS NULL) OR (sticky_until <= now())) AND ((concurrency_key IS NULL) OR (concurrency_cap IS NULL) OR (COALESCE((SubPlan 5), '0'::bigint) < concurrency_cap)) AND ((rate_limit_key IS NULL) OR (activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 14)) AND ((task_type <> 'workflow'::text) OR (workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 7))) AND ((required_capabilities IS NULL) OR (NOT (SubPlan 12))))
                                          Buffers: shared hit=233
                                          SubPlan 5
@@ -60,10 +60,10 @@
                                                  Filter: ((concurrency_key = harvest_task_queue_1.concurrency_key) AND (task_type = harvest_task_queue_1.task_type))
                                                  Buffers: shared hit=4
                                          SubPlan 14
-                                           ->  Seq Scan on harvest_rate_limit_buckets b  (cost=0.00..43.00 rows=183 width=32) (never executed)
+                                           ->  Seq Scan on harvest_rate_limit_buckets b  (cost=0.00..1.96 rows=5 width=32) (never executed)
                                                  Filter: (LEAST(COALESCE(CASE WHEN (override_expires_at > now()) THEN override_burst ELSE NULL::double precision END, burst), ((tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(override_expires_at, last_refilled_at), now()) - last_refilled_at))))::double precision * COALESCE(override_refill_rate, refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(override_expires_at, last_refilled_at), last_refilled_at)))))::double precision * refill_rate))) >= '1'::double precision)
                                          SubPlan 7
-                                           ->  Seq Scan on harvest_workflow_executions e  (cost=0.00..19.77 rows=1 width=16) (never executed)
+                                           ->  Seq Scan on harvest_workflow_executions e  (cost=0.00..31.23 rows=1 width=16) (never executed)
                                                  Filter: (state = 'PAUSED'::text)
                                          SubPlan 12
                                            ->  Function Scan on jsonb_array_elements r  (cost=32.65..38.90 rows=2 width=0) (never executed)
@@ -81,13 +81,18 @@
                                                    ->  Index Scan using harvest_workers_pkey on harvest_workers harvest_workers_3  (cost=0.14..8.16 rows=1 width=32) (never executed)
                                                          Index Cond: (worker_id = 'w1'::text)
    CTE rate_limit_debit
-     ->  Update on harvest_rate_limit_buckets b_1  (cost=0.15..8.38 rows=1 width=78) (actual rows=0 loops=1)
-           ->  Nested Loop  (cost=0.15..8.38 rows=1 width=78) (actual rows=0 loops=1)
-                 ->  CTE Scan on candidate  (cost=0.00..0.02 rows=1 width=88) (actual rows=1 loops=1)
-                       Filter: (activity_name <> ALL ('{}'::text[]))
-                 ->  Index Scan using harvest_rate_limit_buckets_pkey on harvest_rate_limit_buckets b_1  (cost=0.15..8.22 rows=1 width=94) (actual rows=0 loops=1)
-                       Index Cond: ((key)::text = (candidate.rate_limit_key)::text)
+     ->  Update on harvest_rate_limit_buckets b_1  (cost=0.03..2.07 rows=1 width=78) (actual rows=0 loops=1)
+           Buffers: shared hit=1
+           ->  Hash Join  (cost=0.03..2.07 rows=1 width=78) (actual rows=0 loops=1)
+                 Hash Cond: ((b_1.key)::text = (candidate.rate_limit_key)::text)
+                 Buffers: shared hit=1
+                 ->  Seq Scan on harvest_rate_limit_buckets b_1  (cost=0.00..1.96 rows=5 width=102) (actual rows=1 loops=1)
                        Filter: (LEAST(COALESCE(CASE WHEN (override_expires_at > now()) THEN override_burst ELSE NULL::double precision END, burst), ((tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(override_expires_at, last_refilled_at), now()) - last_refilled_at))))::double precision * COALESCE(override_refill_rate, refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(override_expires_at, last_refilled_at), last_refilled_at)))))::double precision * refill_rate))) >= '1'::double precision)
+                       Rows Removed by Filter: 5
+                       Buffers: shared hit=1
+                 ->  Hash  (cost=0.02..0.02 rows=1 width=88) (actual rows=0 loops=1)
+                       ->  CTE Scan on candidate  (cost=0.00..0.02 rows=1 width=88) (actual rows=1 loops=1)
+                             Filter: (activity_name <> ALL ('{}'::text[]))
    CTE claimed
      ->  Update on harvest_task_queue harvest_task_queue_2  (cost=0.29..14.27 rows=1 width=123) (actual rows=1 loops=1)
            Buffers: shared hit=275 dirtied=6 written=3
@@ -108,8 +113,8 @@
                        Index Cond: (id = candidate_1.id)
                        Buffers: shared hit=3
  Planning:
-   Buffers: shared hit=1215 read=10
- Planning Time: 5.518 ms
- Execution Time: 20.131 ms
-(111 rows)
+   Buffers: shared hit=1220 read=10
+ Planning Time: 4.335 ms
+ Execution Time: 16.022 ms
+(116 rows)
 

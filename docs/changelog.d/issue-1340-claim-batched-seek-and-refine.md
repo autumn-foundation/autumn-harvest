@@ -36,6 +36,14 @@ one bucket, instead of the single-row path's documented one-token bound.
 cheap, read-only concurrency check runs first, so the rate-limit debit
 only ever runs for a candidate that already cleared the concurrency gate.
 
+PR review (Codex) caught a fourth bug, in the measurement itself, not the
+implementation: the first draft's end-to-end capture shared one fixture
+across both the single-row and batched loops, so the batched loop — which
+ran second — measured a smaller, differently-shaped backlog than the
+single-row loop had (the single-row loop's 400 claims move rows `PENDING`
+-> `RUNNING`), silently invalidating the ratio. Fixed by reseeding an
+identical fresh fixture before each loop.
+
 **Not wired into the default claim path.** `claim_task`/`claim_task_on_shard`
 are unchanged. Issue #1340 is explicit that no query change should land
 against it without sign-off from someone with full context on `queue.rs`'s
@@ -67,10 +75,11 @@ literal).
 regenerated from a single run of
 `autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh` (now
 includes a committed, `#[ignore]`d capture test for the end-to-end numbers,
-not an ad hoc run): idle cost is 1.05x the single-row path (290 vs 275
-buffers, 10,000-row/4-queue/256-key fixture); under hot contention (2,000
+not an ad hoc run, and reseeds an identical fixture per loop per the fix
+above): idle cost is 1.05x the single-row path (290 vs 275 buffers,
+10,000-row/4-queue/256-key fixture); under hot contention (2,000
 `RUNNING` rows on the same keys) the batched path is ~2.0x faster
-end-to-end over 400 real claims each (mean 915.0ms vs 1,831.0ms per
+end-to-end over 400 real claims each (mean 850.7ms vs 1,717.3ms per
 claim). Neither query gets an index-driven bounded scan at this backlog
 depth — the win is the concurrency-key aggregate's cost, not a `LIMIT`
 pushdown, so the O(backlog)-scaling question ledger #5 left open remains

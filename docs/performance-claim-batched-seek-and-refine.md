@@ -21,11 +21,11 @@ scan at this backlog depth -- both plan as a full `Seq Scan` feeding a
 At the 256-key hot-contention scenario (same backlog, 2,000 `RUNNING` rows
 spread across the same keys), the batch candidate fetch costs slightly
 FEWER buffers than the single-row scan (10,077 against 10,410) and far
-less wall-clock: 23.5ms against 159.0ms in an isolated
+less wall-clock: 26.2ms against 122.6ms in an isolated
 `EXPLAIN (ANALYZE, BUFFERS)`. A real end-to-end drive of the compiled
 `claim_task` and `claim_task_batched` functions against the same fixture
-shows the same direction, at a similar margin: mean 915.0ms per batched
-claim against 1,831.0ms per single-row claim (2.00x), over 400 real
+shows the same direction, at a similar margin: mean 850.7ms per batched
+claim against 1,717.3ms per single-row claim (2.02x), over 400 real
 claims each.
 
 The mechanism: the single-row path always evaluates
@@ -102,12 +102,21 @@ The end-to-end 400-claim numbers come from
 `claim_batched_tests::zz_capture_claim_batched_end_to_end_latency`, an
 `#[ignore]`d test the perf-repro script runs -- not an ad hoc, unreproducible
 run. It drives the real compiled `queue::claim_task` and
-`queue::claim_task_batched` functions against the same hot-contention
-fixture, single-row path first, so the batched path's own numbers do not
-benefit from a warmer cache. Absolute milliseconds reflect this
-measurement's own container, not reference hardware -- read the ~2.0x
-ratio, not the absolute figures, the same caveat every prior ledger entry
-and `docs/performance.md` page carries.
+`queue::claim_task_batched` functions against the hot-contention fixture,
+single-row path first, so the batched path's own numbers do not benefit
+from a warmer cache. Absolute milliseconds reflect this measurement's own
+container, not reference hardware -- read the ~2.0x ratio, not the
+absolute figures, the same caveat every prior ledger entry and
+`docs/performance.md` page carries.
+
+**Each path reseeds its own fresh copy of the fixture, not a shared one.**
+A review finding on this PR (Codex) caught the first draft sharing one
+fixture across both loops: the single-row loop's 400 claims move rows
+`PENDING` -> `RUNNING`, so the batched loop that ran after it was measuring
+a smaller, differently-shaped backlog (about 9,600 pending / 2,400
+running) than the documented 10,000/2,000 fixture -- silently invalidating
+the comparison. `reseed_end_to_end_fixture` now runs once per loop, so
+both paths measure against an identical, freshly seeded backlog.
 
 ## What this does not establish
 

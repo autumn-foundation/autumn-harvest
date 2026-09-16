@@ -796,37 +796,16 @@ async fn batched_claim_capability_routed_activity_bypasses_the_ineligible_gate()
 
 // ── End-to-end latency capture (evidence for docs/performance-claim-batched-seek-and-refine.md) ──
 
-/// Real end-to-end latency, `claim_task` against `claim_task_batched`, at
-/// the hot-contention fixture `docs/performance-claim-batched-seek-and-refine.md`
-/// cites.
+/// (Re)seed the 10,000-row/4-queue/256-key backlog plus 2,000 `RUNNING`
+/// rows on the same keys -- the exact hot-contention fixture
+/// `docs/performance-claim-batched-seek-and-refine.md` cites.
 ///
-/// `autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh`
-/// also takes SQL-only `EXPLAIN` captures. Unlike those, this drives the
-/// REAL compiled functions over real connections. So it is the only
-/// source for that page's headline milliseconds-per-claim numbers.
-/// Single-row runs first, so the batched path's own numbers never benefit
-/// from a warmer cache.
-///
-/// `CLAIM_BATCHED_CAPTURE_N` overrides the claim count per path (default
-/// 400).
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-#[ignore = "evidence generator, not a CI assertion -- run via \
-            autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh"]
-async fn zz_capture_claim_batched_end_to_end_latency() {
-    let bench = match super::claim_bench_support::db::setup_bench_db().await {
-        Ok(bench) => bench,
-        Err(reason) => {
-            eprintln!("no database reachable ({}); nothing captured", reason.0);
-            return;
-        }
-    };
-
-    let n: usize = std::env::var("CLAIM_BATCHED_CAPTURE_N")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(400);
-
-    let mut seed_conn = connect(&bench.url).await;
+/// Called once per measured loop in
+/// [`zz_capture_claim_batched_end_to_end_latency`], not once per capture.
+/// So each path claims against an identical, freshly seeded backlog,
+/// rather than whatever the other path's claims left behind.
+async fn reseed_end_to_end_fixture(url: &str) {
+    let mut seed_conn = connect(url).await;
     seed_conn
         .batch_execute("TRUNCATE harvest_task_queue")
         .await
@@ -862,7 +841,39 @@ async fn zz_capture_claim_batched_end_to_end_latency() {
         .batch_execute("ANALYZE harvest_task_queue")
         .await
         .expect("analyze");
-    drop(seed_conn);
+}
+
+/// Real end-to-end latency, `claim_task` against `claim_task_batched`, at
+/// the hot-contention fixture `docs/performance-claim-batched-seek-and-refine.md`
+/// cites.
+///
+/// `autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh`
+/// also takes SQL-only `EXPLAIN` captures. Unlike those, this drives the
+/// REAL compiled functions over real connections. So it is the only
+/// source for that page's headline milliseconds-per-claim numbers. Each
+/// path measures against its own freshly reseeded copy of the identical
+/// fixture -- see [`reseed_end_to_end_fixture`] for why that reseed is
+/// not optional. Single-row still runs first, so the batched path's own
+/// numbers never benefit from a warmer page cache.
+///
+/// `CLAIM_BATCHED_CAPTURE_N` overrides the claim count per path (default
+/// 400).
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[ignore = "evidence generator, not a CI assertion -- run via \
+            autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh"]
+async fn zz_capture_claim_batched_end_to_end_latency() {
+    let bench = match super::claim_bench_support::db::setup_bench_db().await {
+        Ok(bench) => bench,
+        Err(reason) => {
+            eprintln!("no database reachable ({}); nothing captured", reason.0);
+            return;
+        }
+    };
+
+    let n: usize = std::env::var("CLAIM_BATCHED_CAPTURE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(400);
 
     let queues = vec![
         "bench-q-0".to_string(),
@@ -872,6 +883,14 @@ async fn zz_capture_claim_batched_end_to_end_latency() {
     ];
     let mut conn = connect(&bench.url).await;
 
+    // Each path gets its OWN fresh 10,000-row/2,000-`RUNNING` fixture. A
+    // shared fixture would let the single-row loop's 400 claims (PENDING
+    // -> RUNNING) leave the batched loop measuring a smaller, differently
+    // shaped backlog. That was a real methodological bug a review caught
+    // on this PR (Codex, P2). The two loops would no longer measure the
+    // same starting conditions. That silently invalidates the ratio this
+    // capture exists to produce.
+    reseed_end_to_end_fixture(&bench.url).await;
     let mut single_ms = Vec::with_capacity(n);
     for _ in 0..n {
         let start = std::time::Instant::now();
@@ -885,6 +904,7 @@ async fn zz_capture_claim_batched_end_to_end_latency() {
         single_ms.push(elapsed_ms);
     }
 
+    reseed_end_to_end_fixture(&bench.url).await;
     let mut batch_ms = Vec::with_capacity(n);
     for _ in 0..n {
         let start = std::time::Instant::now();
@@ -910,6 +930,12 @@ async fn zz_capture_claim_batched_end_to_end_latency() {
     let single_stats = super::claim_bench_support::LatencyStats::from_samples(&single_ms);
     let batch_stats = super::claim_bench_support::LatencyStats::from_samples(&batch_ms);
 
+    // The true minimum, not the first sample. An earlier draft of this
+    // capture mislabeled `.first()` as "min" -- only correct by
+    // coincidence, since samples are not collected in sorted order.
+    let single_min = single_ms.iter().copied().fold(f64::INFINITY, f64::min);
+    let batch_min = batch_ms.iter().copied().fold(f64::INFINITY, f64::min);
+
     let summary = format!(
         "single-row claim_task: n={} mean={:.3}ms p50={:.3}ms p99={:.3}ms min={:.3}ms max={:.3}ms\n\
          batched  claim_task_batched: n={} mean={:.3}ms p50={:.3}ms p99={:.3}ms min={:.3}ms max={:.3}ms\n",
@@ -917,14 +943,14 @@ async fn zz_capture_claim_batched_end_to_end_latency() {
         single_stats.mean_ms,
         single_stats.p50_ms,
         single_stats.p99_ms,
-        single_ms.first().copied().unwrap_or(0.0),
-        single_ms.iter().copied().fold(0.0_f64, f64::max),
+        single_min,
+        single_stats.max_ms,
         batch_stats.count,
         batch_stats.mean_ms,
         batch_stats.p50_ms,
         batch_stats.p99_ms,
-        batch_ms.first().copied().unwrap_or(0.0),
-        batch_ms.iter().copied().fold(0.0_f64, f64::max),
+        batch_min,
+        batch_stats.max_ms,
     );
 
     let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
