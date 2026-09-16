@@ -2442,11 +2442,21 @@ async fn awaits_outbox_does_not_wait_on_a_peer_shard_whose_only_connection_is_bu
     .await;
     let elapsed = started.elapsed();
 
-    swept
+    let processed = swept
         .expect("the sweep must RETURN when a peer's only connection is busy, not hang on it")
         .expect("await outbox sweep should succeed");
+    assert_eq!(
+        processed, 0,
+        "an unreachable peer must resolve nothing this sweep, not process the row"
+    );
+    // A fully busy, size-1 peer pool takes `peer_acquire_bound`'s TIGHT arm
+    // here (`FANOUT_ACQUIRE_BOUND`, 250ms). This site does NOT use the
+    // generous `SHARD_ACQUIRE_BOUND` (5s) from a different acquisition
+    // elsewhere in this file. Assert against the tight bound, with slack.
+    // A regression that widens `FANOUT_ACQUIRE_BOUND` itself must still
+    // fail this test, not hide inside a looser margin.
     assert!(
-        elapsed < autumn_harvest::audit_export::SHARD_ACQUIRE_BOUND,
+        elapsed < autumn_harvest::external_target_location::FANOUT_ACQUIRE_BOUND * 8,
         "the sweep must decline to wait on a busy peer pool rather than stall \
          for the generous scanner bound -- took {elapsed:?}"
     );
@@ -2587,8 +2597,12 @@ async fn cancel_outbox_deferred_check_does_not_wait_on_a_peer_shard_whose_only_c
         processed, 1,
         "the by-id cancel must still be resolved this sweep"
     );
+    // Same tight bound as the awaits-outbox test above. A fully busy,
+    // size-1 peer pool takes `peer_acquire_bound`'s `FANOUT_ACQUIRE_BOUND`
+    // arm (250ms) here. This is NOT the generous `SHARD_ACQUIRE_BOUND`
+    // (5s) used for a different acquisition elsewhere in this file.
     assert!(
-        elapsed < autumn_harvest::audit_export::SHARD_ACQUIRE_BOUND,
+        elapsed < autumn_harvest::external_target_location::FANOUT_ACQUIRE_BOUND * 8,
         "the deferred unfinished-handler check must decline to wait on a busy \
          peer pool rather than stall for the generous scanner bound -- took \
          {elapsed:?}"
