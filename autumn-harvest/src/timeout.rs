@@ -2601,7 +2601,13 @@ async fn execution_id_residence(
             .await
             .unwrap_or(entry)
     } else {
-        crate::shard_rebalance::resolve_execution_shard(pool, id)
+        // `_holding`, not the bare hop-walk (issue #1324, Codex review). A
+        // migration's forwarding pointer usually lands in one hop. But the
+        // walk still checks out a connection to confirm no further hop
+        // follows. A target rebalanced onto the caller's shard puts that
+        // confirmation hop on `caller_shard`'s own pool. A bare checkout
+        // there self-deadlocks a pool of size one.
+        crate::shard_rebalance::resolve_execution_shard_holding(conn, pool, id, caller_shard)
             .await
             .unwrap_or(entry)
     }
@@ -2640,6 +2646,21 @@ async fn resolve_delivery_route(
         _ if caller_exec_id.shard().is_unencoded() => pool.default_shard(),
         _ => caller_exec_id.shard(),
     };
+
+    // Belt-and-braces (issue #1324). Fail loud here, not with `pool_for`'s
+    // silent default-shard fallback below. `conn` came from `caller_shard`'s
+    // pool by construction. A missing entry for it means this process does
+    // not know the shard `conn` actually serves.
+    if pool.exact_pool_for(caller_shard).is_none() {
+        return DeliveryRoute::Retry {
+            reason: format!("caller shard {caller_shard} has no storage pool in this process"),
+            uninspected: vec![crate::external_target_location::UninspectedShard {
+                shard: caller_shard,
+                reason: "caller shard has no storage pool in this process".to_string(),
+                kind: crate::external_target_location::UninspectedReasonKind::NoPool,
+            }],
+        };
+    }
 
     let (target_shard, expected_live, may_assert_key_state) = match target {
         ExternalTarget::ExecutionId(id) => {
@@ -2763,9 +2784,14 @@ async fn resolve_delivery_route(
     // slot, so pointer equality of the slots is really *shard-id* equality and
     // reports two aliases of one pool as different (issue #1146; the same trap
     // `external_target_location::same_underlying_pool` was extracted for).
+    // `caller_shard`, not `caller_exec_id` (issue #1324). The id's encoded
+    // shard names where the run STARTED. A rebalanced caller now lives
+    // elsewhere. `caller_shard` above already read the real one off `conn`.
+    // Comparing pools by the id instead brings back the held-pool
+    // mislabelling issue #964 fixed one level up.
     match (
         pool.exact_pool_for(target_shard),
-        pool.exact_pool_for_execution(caller_exec_id),
+        pool.exact_pool_for(caller_shard),
     ) {
         (Some(target_pool), Some(caller_pool))
             if crate::external_target_location::same_underlying_pool(target_pool, caller_pool) =>
@@ -3999,16 +4025,45 @@ pub async fn enforce_external_cancels_outbox(
                                         .await
                                         .unwrap_or(entry)
                                 } else {
-                                    crate::shard_rebalance::resolve_execution_shard(pool, exec_id)
-                                        .await
-                                        .unwrap_or(entry)
+                                    // `_holding` (issue #1324, Codex review).
+                                    // The bare hop-walk's own confirmation
+                                    // checkout can land on `caller_shard`'s
+                                    // pool. That is `conn`'s own pool here,
+                                    // and reaching for it fresh self-deadlocks.
+                                    crate::shard_rebalance::resolve_execution_shard_holding(
+                                        conn,
+                                        pool,
+                                        exec_id,
+                                        caller_shard,
+                                    )
+                                    .await
+                                    .unwrap_or(entry)
                                 };
                             Some(resolved)
                         }
                         None => None,
                     };
+                    // `residence`, not `exact_pool_for_execution(exec_id)`
+                    // (issue #1324). The bits-based lookup ignores the
+                    // forwarding-aware resolution just above. It can report
+                    // the target's stale origin pool instead. A rebalanced
+                    // target then reads as cross-pool from a caller it is
+                    // actually co-located with. The `else` branch below then
+                    // acquires a second connection from the pool `conn`
+                    // already holds one from.
+                    //
+                    // No isolated DB test reproduces this one directly. Any
+                    // real migration that makes `residence` differ from
+                    // `entry` above needs `resolve_execution_shard`'s own
+                    // hop-walk. That walk checks out a connection on the
+                    // destination shard regardless of this bug. Under the
+                    // pool-size-1 setup that would expose this defect, the
+                    // walk hits its own, pre-existing hazard first. Covered
+                    // by inspection, and by the sibling fix above in
+                    // `resolve_delivery_route`, which this mirrors.
                     let same_pool_as_caller = outer_sharded_pool.as_ref().is_none_or(|pool| {
-                        pool.exact_pool_for_execution(exec_id)
+                        residence
+                            .and_then(|shard| pool.exact_pool_for(shard))
                             .is_some_and(|e_pool| {
                                 crate::external_target_location::same_underlying_pool(
                                     e_pool,

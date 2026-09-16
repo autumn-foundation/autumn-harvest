@@ -613,9 +613,9 @@ pub use db::{
     abort_migration, activate_target, assert_schema_parity, begin_migration, commit_cutover,
     conn_for_execution_forwarded, conn_for_live_shard, conn_for_shard, forward_of_held_row,
     list_migration_candidates, load_migration, migrate_execution, migrate_quiescent_executions,
-    observe_quiescence, residence_chain, resolve_execution_shard, resolve_target_shard,
-    resolve_target_shard_holding, resume_incomplete_migrations, shard_of_held_row, stage_copy,
-    verify_target_copy,
+    observe_quiescence, residence_chain, resolve_execution_shard, resolve_execution_shard_holding,
+    resolve_target_shard, resolve_target_shard_holding, resume_incomplete_migrations,
+    shard_of_held_row, stage_copy, verify_target_copy,
 };
 
 #[cfg(feature = "db")]
@@ -2904,6 +2904,81 @@ mod db {
         }
         // Mirrors `resolve_forward_chain`'s bound and error exactly; the pure
         // function is what the unit tests pin, this is its async twin.
+        resolve_forward_chain(origin, |_| Some(origin))
+    }
+
+    /// [`resolve_execution_shard`], for a caller already holding a connection
+    /// from the pool that serves `held_shard`.
+    ///
+    /// The hop-walk above has no notion of an already-held connection, so a
+    /// hop landing on `held_shard`'s own pool still calls `checkout`, an
+    /// unconditional `pool.get()`. Under the documented pool-size-1
+    /// configuration that pool has nothing left to hand out, and the call
+    /// blocks forever (issue #1324, Codex review). A migration's forwarding
+    /// pointer is usually collapsed straight to the live shard, in one hop.
+    /// The walk still confirms with one more read past it. That
+    /// confirmation is exactly where a rebalanced target lands back on the
+    /// caller's own pool.
+    ///
+    /// Every hop whose shard resolves to the SAME physical pool as
+    /// `held_shard` reads on `conn` instead of checking one out. Only a
+    /// genuinely different database is reached through `pool`, mirroring how
+    /// [`resolve_target_shard_holding`] already does this for a `WorkflowId`
+    /// target.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`resolve_execution_shard`].
+    pub async fn resolve_execution_shard_holding(
+        conn: &mut AsyncPgConnection,
+        pool: &ShardedDbPool,
+        exec_id: ExecutionId,
+        held_shard: ShardId,
+    ) -> HarvestResult<ShardId> {
+        let held_pool = pool.pool_for(held_shard);
+        let origin = pool.routed_shard_for_execution(exec_id);
+        let forwarded = !exec_id.shard().is_unencoded() && origin != exec_id.shard();
+        let mut current = origin;
+        for hop in 0..MAX_FORWARD_HOPS {
+            // The ORIGIN hop is tolerant (see `checkout_entry`) unless routing
+            // already forwarded it, exactly like `resolve_execution_shard`.
+            // Every hop after it names one specific database, and must fail
+            // closed rather than fall back. So `on_held` uses `exact_pool_for`
+            // there. `pool_for`'s default-shard fallback would let a
+            // genuinely unconfigured forwarded hop alias onto `held_shard`'s
+            // pool by coincidence. It would then read `conn`'s database in
+            // its place, and report a never-inspected hop as resolved
+            // (issue #1324, Codex review).
+            let forward = if hop == 0 && !forwarded {
+                if crate::external_target_location::same_underlying_pool(
+                    pool.pool_for(current),
+                    held_pool,
+                ) {
+                    read_forward(conn, exec_id).await?
+                } else {
+                    let mut hop_conn = checkout_entry(pool, current).await?;
+                    read_forward(&mut hop_conn, exec_id).await?
+                }
+            } else {
+                let Some(shard_pool) = pool.exact_pool_for(current) else {
+                    return Err(HarvestError::ShardUnavailable {
+                        shard_id: current.as_i32(),
+                        reason: "no database pool is configured for this shard on this node"
+                            .to_string(),
+                    });
+                };
+                if crate::external_target_location::same_underlying_pool(shard_pool, held_pool) {
+                    read_forward(conn, exec_id).await?
+                } else {
+                    let mut hop_conn = checkout(pool, current).await?;
+                    read_forward(&mut hop_conn, exec_id).await?
+                }
+            };
+            match forward {
+                None => return Ok(current),
+                Some(next) => current = next,
+            }
+        }
         resolve_forward_chain(origin, |_| Some(origin))
     }
 
