@@ -58,7 +58,7 @@ series; not re-diagnosed.
 
 ## 🌡️ Symptom
 
-### 1. `worker_fails_workflow_when_activity_start_to_close_timeout_elapses`: 0/1 confirmed assertion exposure, spanning 18h14m before PR #1563's merge and 19h33m after it (corrected from an initial "0/15" — see below)
+### 1. `worker_fails_workflow_when_activity_start_to_close_timeout_elapses`: 0/1 confirmed assertion exposure, post-merge only — no confirmed pre-merge exposure exists (corrected from an initial "0/15 spanning both windows" — see below)
 
 Issue #1558 tracked this test racing between the enforcement sweep's
 `StartToClose` deadline (anchored at `claim_task` time) and
@@ -154,19 +154,30 @@ docs-only — and now also the 2 of 3 "executions" that crashed before
 reaching the assertion) give no information either way about whether the
 tracked signature recurred.
 
-**This is not the rerun campaign issue #1558 asked for** — it is
-frequency-in-the-wild evidence over calendar time and a shifting set of
-branches, not N identical-commit reruns, and per this role's own Tier
-distinctions it does not by itself confirm the fix. It is a genuine data
-point the prior reports didn't have: roughly nineteen and a half hours of
-real CI traffic post-fix produced zero recurrences of a signature that had
-appeared 3 times in a comparable ~17-hour window one day earlier (the 09-14
-report's census). **Correction (post-review):** an earlier draft of this
-report described that traffic as spanning "ten unrelated branches' worth of
-failures" — false. The 10 post-merge failures came from only **5 distinct
-branches**: `claude/hopeful-pascal-tbijcf` alone accounts for half of them
-(5 of 10, all successive commits on one PR as it iterated through review),
-with `claude/gifted-mccarthy-25ztga` contributing 2 and three other branches
+**This is not the rerun campaign issue #1558 asked for**, and per the
+correction above it is much less than the "frequency-in-the-wild over
+calendar time" evidence this report originally claimed. **Correction
+(post-review):** an earlier draft of this paragraph said "roughly
+nineteen and a half hours of real CI traffic post-fix produced zero
+recurrences... versus 3 occurrences the day before" — that treats every
+hour of elapsed CI time as if it were an opportunity for the signature to
+appear, which the correction above already shows is false: the sole
+confirmed assertion exposure (`35034838493`, 23:15:28Z) sits over nine
+hours *after* the merge, and this report has **no confirmed pre-merge
+exposure at all** to compare it against. There is no "19.5 hours of
+traffic," only one confirmed data point, well inside the post-merge
+window. The comparison to "3 occurrences the day before" (the 09-14
+report's genuine, confirmed occurrences) is not undermined by this
+correction, but the implied symmetry — hours of quiet traffic on one side
+against hours of confirmed occurrences on the other — is. Separately, an
+earlier draft of this same paragraph described the 15 explicit failures'
+branch spread as "ten unrelated branches' worth of failures" — also
+false, though this is about the failure population generally, not about
+assertion exposure specifically. The 10 post-merge failures came from only
+**5 distinct branches**: `claude/hopeful-pascal-tbijcf` alone accounts for
+half of them (5 of 10, all successive commits on one PR as it iterated
+through review), with `claude/gifted-mccarthy-25ztga` contributing 2 and
+three other branches
 contributing 1 each. That materially narrows the independence of this
 evidence — five branches iterating, one of them repeatedly, is a much
 smaller draw than ten unrelated ones — though it does not overlap with item
