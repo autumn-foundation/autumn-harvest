@@ -203,13 +203,22 @@ async fn drain_workflow_start_outbox_batch(
     // once per row (issue #1620, Ledger).
     let claimed = rows.len();
     let mut delivered_marks: Vec<(i64, ExecutionId)> = Vec::new();
-    let mut failed_marks: Vec<(i64, String, u64)> = Vec::new();
+    // The retry deadline is captured as a monotonic `Instant`, not a
+    // duration, right when each row's own dispatch fails (issue #1620
+    // review). A later row's dispatch can still be running at that
+    // point. Computing the deadline here, rather than a fixed delay
+    // applied when the batched mark finally runs below, keeps this
+    // row's actual backoff close to `retry_delay_ms`, instead of that
+    // delay starting only once every other row in the batch has also
+    // finished dispatching.
+    let mut failed_marks: Vec<(i64, String, std::time::Instant)> = Vec::new();
     for row in rows {
         match dispatch_workflow_start_request(state, &row.request()).await {
             Ok(exec_id) => delivered_marks.push((row.id, exec_id)),
             Err(error) => {
                 let delay_ms = retry_delay_ms(&config, &row);
-                failed_marks.push((row.id, error.to_string(), delay_ms));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(delay_ms);
+                failed_marks.push((row.id, error.to_string(), deadline));
             }
         }
     }
@@ -558,24 +567,36 @@ async fn mark_outbox_rows_delivered_batch(
     Ok(marked.into_iter().map(|row| row.id).collect())
 }
 
-/// Marks every failed row in `rows` (`(id, error, retry_delay_ms)` triples)
-/// in one round trip via `UNNEST`, instead of one `UPDATE` per row (issue
-/// #1620, Ledger). Each row keeps its own already-computed retry delay.
-/// [`retry_delay_ms`] depends on that row's own `delivery_attempts`.
-/// Batching changes only the round-trip count, not the per-row backoff.
+/// Marks every failed row in `rows` (`(id, error, deadline)` triples) in
+/// one round trip via `UNNEST`, instead of one `UPDATE` per row (issue
+/// #1620, Ledger). Each row keeps its own already-computed retry
+/// deadline. [`retry_delay_ms`] depends on that row's own
+/// `delivery_attempts`, so batching does not change the per-row backoff
+/// amount. `deadline` is a monotonic `Instant`, captured when that row's
+/// own dispatch failed, not when this function runs. Re-deriving the
+/// remaining delay from it here keeps a row's actual retry time close to
+/// its configured backoff, even when a later row's dispatch is slow.
 async fn mark_outbox_rows_failed_batch(
     conn: &mut AsyncPgConnection,
     claimant: &str,
-    rows: &[(i64, String, u64)],
+    rows: &[(i64, String, std::time::Instant)],
 ) -> Result<(), diesel::result::Error> {
     if rows.is_empty() {
         return Ok(());
     }
     let ids: Vec<i64> = rows.iter().map(|(id, _, _)| *id).collect();
     let errors: Vec<&str> = rows.iter().map(|(_, error, _)| error.as_str()).collect();
+    // Each `deadline` was computed from THIS row's own dispatch failure,
+    // not from when the batch's remaining dispatches finish (issue
+    // #1620 review). Re-deriving the remaining delay here, right before
+    // the query, keeps that row's own backoff close to
+    // `retry_delay_ms`, whatever the rest of the batch took.
+    let now = std::time::Instant::now();
     let delays: Vec<i64> = rows
         .iter()
-        .map(|(_, _, delay_ms)| i64::try_from(*delay_ms).unwrap_or(i64::MAX))
+        .map(|(_, _, deadline)| {
+            i64::try_from(deadline.saturating_duration_since(now).as_millis()).unwrap_or(i64::MAX)
+        })
         .collect();
 
     diesel::sql_query(
@@ -830,12 +851,21 @@ mod tests {
         let short_id = insert_claimed(&mut conn, "r1620-short-delay").await;
         let long_id = insert_claimed(&mut conn, "r1620-long-delay").await;
 
+        let now = std::time::Instant::now();
         mark_outbox_rows_failed_batch(
             &mut conn,
             "worker-A",
             &[
-                (short_id, "boom-short".to_owned(), 1_000),
-                (long_id, "boom-long".to_owned(), 100_000),
+                (
+                    short_id,
+                    "boom-short".to_owned(),
+                    now + std::time::Duration::from_millis(1_000),
+                ),
+                (
+                    long_id,
+                    "boom-long".to_owned(),
+                    now + std::time::Duration::from_millis(100_000),
+                ),
             ],
         )
         .await
