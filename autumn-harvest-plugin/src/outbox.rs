@@ -164,6 +164,16 @@ pub async fn drain_workflow_start_outbox_once(
         .map(|stats| stats.delivered)
 }
 
+/// How many dispatch outcomes accumulate before their marks flush.
+///
+/// A row stays claimed -- unreachable by any relay's reclaim, and for a
+/// failed row, unreachable for its own retry -- until its mark flushes.
+/// Flushing every `OUTBOX_MARK_FLUSH_EVERY` outcomes bounds that wait to
+/// a handful of dispatches. The alternative, flushing only once after
+/// the whole batch has dispatched, bounds it to the rest of the batch
+/// instead (issue #1620 review, Codex).
+const OUTBOX_MARK_FLUSH_EVERY: usize = 8;
+
 async fn drain_workflow_start_outbox_batch(
     state: &AppState,
     limit: i64,
@@ -199,17 +209,18 @@ async fn drain_workflow_start_outbox_batch(
     // starts a distinct workflow execution. The mark that follows dispatch
     // is a single fixed-shape `UPDATE ... WHERE id = $1 AND claimed_by =
     // $2`. It differs only in its bound values. This collects the marks
-    // here and issues them once per batch, per outcome, below, instead of
-    // once per row (issue #1620, Ledger).
+    // here and flushes them in chunks of `OUTBOX_MARK_FLUSH_EVERY`, below.
+    // That replaces one mark per row (issue #1620, Ledger) and also
+    // replaces one mark for the whole batch (issue #1620 review, Codex).
     let claimed = rows.len();
+    let mut delivered = 0_usize;
     let mut delivered_marks: Vec<(i64, ExecutionId)> = Vec::new();
     // The retry deadline is captured as a monotonic `Instant`, not a
     // duration, right when each row's own dispatch fails (issue #1620
     // review). A later row's dispatch can still be running at that
-    // point. The batched mark below computes the deadline once every
-    // row has finished dispatching. Capturing it here instead keeps
-    // this row's actual backoff close to `retry_delay_ms`. Otherwise
-    // the delay would start only once the whole batch finishes.
+    // point. The flush computes the deadline once it runs. Capturing it
+    // here instead keeps this row's actual backoff close to
+    // `retry_delay_ms`, whatever the rest of the chunk took.
     let mut failed_marks: Vec<(i64, String, std::time::Instant)> = Vec::new();
     for row in rows {
         match dispatch_workflow_start_request(state, &row.request()).await {
@@ -221,12 +232,50 @@ async fn drain_workflow_start_outbox_batch(
                 failed_marks.push((row.id, error.to_string(), deadline));
             }
         }
-    }
 
+        if delivered_marks.len() + failed_marks.len() >= OUTBOX_MARK_FLUSH_EVERY {
+            delivered += flush_outbox_marks(
+                &mut app_conn,
+                &claimant,
+                &mut delivered_marks,
+                &mut failed_marks,
+                outbox_metrics.as_ref(),
+            )
+            .await
+            .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+        }
+    }
+    delivered += flush_outbox_marks(
+        &mut app_conn,
+        &claimant,
+        &mut delivered_marks,
+        &mut failed_marks,
+        outbox_metrics.as_ref(),
+    )
+    .await
+    .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+
+    Ok(OutboxDrainStats { claimed, delivered })
+}
+
+/// Marks one chunk's worth of dispatch outcomes and clears both buffers.
+///
+/// Called mid-loop, every `OUTBOX_MARK_FLUSH_EVERY` outcomes, and once
+/// more after the loop for the remainder. Returns the number of rows this
+/// flush durably marked delivered.
+///
+/// # Errors
+///
+/// Returns a Diesel error if either batched mark cannot be executed.
+async fn flush_outbox_marks(
+    conn: &mut AsyncPgConnection,
+    claimant: &str,
+    delivered_marks: &mut Vec<(i64, ExecutionId)>,
+    failed_marks: &mut Vec<(i64, String, std::time::Instant)>,
+    outbox_metrics: Option<&std::sync::Arc<dyn autumn_harvest::telemetry::MetricsRecorder>>,
+) -> Result<usize, diesel::result::Error> {
     let delivered = delivered_marks.len();
-    let marked_ids = mark_outbox_rows_delivered_batch(&mut app_conn, &claimant, &delivered_marks)
-        .await
-        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    let marked_ids = mark_outbox_rows_delivered_batch(conn, claimant, delivered_marks).await?;
 
     // issue #618: count the "outbox" bypass EXACTLY ONCE per row. The
     // gate is THIS claimant durably marking that row delivered, i.e. the
@@ -251,9 +300,9 @@ async fn drain_workflow_start_outbox_batch(
     // durably committed. The loss is permanent because `delivered_at`
     // is no longer NULL, so no later flush ever reclaims those rows to
     // retry the count.
-    if let Some(metrics) = outbox_metrics.as_ref() {
+    if let Some(metrics) = outbox_metrics {
         let marked_id_set: std::collections::HashSet<i64> = marked_ids.into_iter().collect();
-        for (id, _) in &delivered_marks {
+        for (id, _) in delivered_marks.iter() {
             if marked_id_set.contains(id) {
                 metrics.record_admission_bypassed(
                     autumn_harvest::admission_gate::StartProducer::Outbox.as_str(),
@@ -261,12 +310,12 @@ async fn drain_workflow_start_outbox_batch(
             }
         }
     }
+    delivered_marks.clear();
 
-    mark_outbox_rows_failed_batch(&mut app_conn, &claimant, &failed_marks)
-        .await
-        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    mark_outbox_rows_failed_batch(conn, claimant, failed_marks).await?;
+    failed_marks.clear();
 
-    Ok(OutboxDrainStats { claimed, delivered })
+    Ok(delivered)
 }
 
 /// Drain all currently due workflow-start outbox rows.
@@ -860,12 +909,12 @@ mod tests {
                 (
                     short_id,
                     "boom-short".to_owned(),
-                    now + std::time::Duration::from_millis(1_000),
+                    now + std::time::Duration::from_secs(1),
                 ),
                 (
                     long_id,
                     "boom-long".to_owned(),
-                    now + std::time::Duration::from_millis(100_000),
+                    now + std::time::Duration::from_secs(100),
                 ),
             ],
         )
@@ -898,6 +947,135 @@ mod tests {
 
         diesel::sql_query("DELETE FROM harvest_workflow_outbox WHERE id = ANY($1)")
             .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(vec![short_id, long_id])
+            .execute(&mut conn)
+            .await
+            .expect("cleanup");
+    }
+
+    /// Exercises `flush_outbox_marks` the way the chunked drain loop calls
+    /// it: once per chunk, not once for the whole batch. A slow later
+    /// dispatch must not hold an earlier row's claim past
+    /// `OUTBOX_MARK_FLUSH_EVERY` outcomes (issue #1620 review, Codex).
+    /// Two sequential chunks, each with one delivered and one failed
+    /// row, must mark all four rows and leave both buffers empty after
+    /// every call.
+    #[tokio::test]
+    async fn flush_outbox_marks_applies_each_chunk_and_clears_its_buffers() {
+        use diesel_async::AsyncConnection;
+
+        async fn insert_claimed(conn: &mut AsyncPgConnection, workflow_id: &str) -> i64 {
+            #[derive(diesel::QueryableByName)]
+            struct IdRow {
+                #[diesel(sql_type = diesel::sql_types::BigInt)]
+                id: i64,
+            }
+            diesel::sql_query(
+                "INSERT INTO harvest_workflow_outbox
+                    (workflow_name, workflow_id, queue_name, input, claimed_by, claimed_at)
+                 VALUES ('r1620_wf', $1, 'default', '{}'::jsonb, 'worker-A', NOW())
+                 RETURNING id",
+            )
+            .bind::<diesel::sql_types::Text, _>(workflow_id)
+            .get_result::<IdRow>(conn)
+            .await
+            .expect("insert claimed outbox row")
+            .id
+        }
+
+        #[derive(diesel::QueryableByName)]
+        struct MarkState {
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            delivered_execution_id: Option<String>,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            last_error: Option<String>,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            claimed_by: Option<String>,
+        }
+
+        let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+            eprintln!("SKIP: HARVEST_TEST_DATABASE_URL unset");
+            return;
+        };
+        let mut conn = AsyncPgConnection::establish(&url)
+            .await
+            .expect("connect to test DB");
+
+        let chunk1_ok = insert_claimed(&mut conn, "r1620-chunk1-ok").await;
+        let chunk1_err = insert_claimed(&mut conn, "r1620-chunk1-err").await;
+        let chunk2_ok = insert_claimed(&mut conn, "r1620-chunk2-ok").await;
+        let chunk2_err = insert_claimed(&mut conn, "r1620-chunk2-err").await;
+
+        let mut delivered_marks = vec![(chunk1_ok, ExecutionId::new())];
+        let mut failed_marks = vec![(
+            chunk1_err,
+            "boom-1".to_owned(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )];
+        let flushed = flush_outbox_marks(
+            &mut conn,
+            "worker-A",
+            &mut delivered_marks,
+            &mut failed_marks,
+            None,
+        )
+        .await
+        .expect("flush chunk 1");
+        assert_eq!(flushed, 1, "chunk 1 marks its one delivered row");
+        assert!(
+            delivered_marks.is_empty(),
+            "delivered buffer clears after flush"
+        );
+        assert!(failed_marks.is_empty(), "failed buffer clears after flush");
+
+        let mut delivered_marks = vec![(chunk2_ok, ExecutionId::new())];
+        let mut failed_marks = vec![(
+            chunk2_err,
+            "boom-2".to_owned(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )];
+        let flushed = flush_outbox_marks(
+            &mut conn,
+            "worker-A",
+            &mut delivered_marks,
+            &mut failed_marks,
+            None,
+        )
+        .await
+        .expect("flush chunk 2");
+        assert_eq!(flushed, 1, "chunk 2 marks its own delivered row");
+
+        for (id, expect_delivered) in [
+            (chunk1_ok, true),
+            (chunk1_err, false),
+            (chunk2_ok, true),
+            (chunk2_err, false),
+        ] {
+            let row: MarkState = diesel::sql_query(
+                "SELECT delivered_execution_id, last_error, claimed_by \
+                 FROM harvest_workflow_outbox WHERE id = $1",
+            )
+            .bind::<diesel::sql_types::BigInt, _>(id)
+            .get_result(&mut conn)
+            .await
+            .expect("read row");
+            assert_eq!(
+                row.claimed_by, None,
+                "row {id} claim is released, whichever chunk marked it"
+            );
+            if expect_delivered {
+                assert!(
+                    row.delivered_execution_id.is_some(),
+                    "row {id} should be marked delivered"
+                );
+            } else {
+                assert!(row.last_error.is_some(), "row {id} should be marked failed");
+            }
+        }
+
+        diesel::sql_query("DELETE FROM harvest_workflow_outbox WHERE id = ANY($1)")
+            .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(vec![
+                chunk1_ok, chunk1_err, chunk2_ok, chunk2_err,
+            ])
             .execute(&mut conn)
             .await
             .expect("cleanup");
