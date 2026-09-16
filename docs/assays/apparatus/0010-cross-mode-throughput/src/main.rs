@@ -206,16 +206,21 @@ type BoxFut<'a> =
 /// is backend-neutral, so the embedded backend and the Postgres core run
 /// identical workflow code. Only persistence and dispatch differ between
 /// arms.
-fn wf_three_activities(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+/// The body matches `bench_workflow` in the published harness statement for
+/// statement. It ignores the workflow input, invokes each activity with JSON
+/// null, and returns `{"ok": true}`. An earlier version forwarded the
+/// ~40-byte input into all three activity commands. It also returned the last
+/// activity result. That made this a workload which resembled the published
+/// one, rather than the port by value L1 compares against. Found by review on
+/// PR #1617.
+fn wf_three_activities(ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move {
-        let mut last = serde_json::Value::Null;
-        for activity in ACTIVITIES {
-            last = ctx
-                .execute_activity_raw(activity, input.clone(), QUEUE)
+        for name in ACTIVITIES {
+            ctx.execute_activity_raw(name, serde_json::Value::Null, QUEUE)
                 .await
                 .map_err(|err| err.to_string())?;
         }
-        Ok(last)
+        Ok(serde_json::json!({ "ok": true }))
     })
 }
 
@@ -501,8 +506,22 @@ impl RedisProbe {
 // Worker pool.
 // ---------------------------------------------------------------------------
 
-fn runtime_config(worker_id: &str) -> WorkerRuntimeConfig {
-    let mut config: WorkerRuntimeConfig = WorkerConfig::default().with_queues([QUEUE]).into();
+/// Build the worker configuration, with `LISTEN`/`NOTIFY` wired.
+///
+/// `WorkerConfig::default()` leaves the notification urls empty, so
+/// `Worker::run` starts no listener and the worker falls back to its poll
+/// interval. The canonical fleet calls
+/// `with_shard_notification_database_urls`, and `docs/benchmarks.md` states
+/// the published numbers were taken with notifications wired. Leaving them
+/// unwired handicaps the plain-Postgres control in both assays. That inflates
+/// the Redis ratio L2 grades, and it depresses harvest against Temporal.
+/// Found by review on PR #1617.
+fn runtime_config(worker_id: &str, database_url: &str) -> WorkerRuntimeConfig {
+    let mut config: WorkerRuntimeConfig = WorkerConfig::default()
+        .with_queues([QUEUE])
+        .with_shard_assignments([ShardId::new(0)])
+        .with_shard_notification_database_urls([(ShardId::new(0), database_url.to_string())])
+        .into();
     config.worker_id = worker_id.to_string();
     config.poll_interval = Duration::from_millis(WORKER_POLL_MS);
     config.shutdown_timeout = Duration::from_secs(10);
@@ -519,14 +538,14 @@ struct Pool {
 }
 
 impl Pool {
-    fn start(pool: &DbPool, run: &str) -> Self {
+    fn start(pool: &DbPool, run: &str, database_url: &str) -> Self {
         let registry = registry();
         let mut workers = Vec::with_capacity(WORKERS);
         let mut handles = Vec::with_capacity(WORKERS);
         for index in 0..WORKERS {
             let worker = Arc::new(
                 Worker::new(
-                    runtime_config(&format!("{run}-w{index}")),
+                    runtime_config(&format!("{run}-w{index}"), database_url),
                     Arc::clone(&registry),
                 )
                 .expect("worker should build"),
@@ -741,7 +760,7 @@ async fn run_postgres_arm(settings: &Settings, arm: Arm, rep: usize) -> RepOutco
     let mut conn = connect(&settings.database_url).await;
 
     let started = Instant::now();
-    let workers = Pool::start(&pool, &run);
+    let workers = Pool::start(&pool, &run, &settings.database_url);
 
     let mut truncated = false;
     loop {

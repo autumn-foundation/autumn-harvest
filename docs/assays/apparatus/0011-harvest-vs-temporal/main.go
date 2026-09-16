@@ -52,9 +52,9 @@ var activityRuns atomic.Uint64
 // input would have Temporal serialize and persist that payload into every
 // activity-completion history event, a cost the harvest arm never pays, and
 // the registered shape says both arms are inert. Found by review on PR #1617.
-func Step1(ctx context.Context, in string) error { activityRuns.Add(1); return nil }
-func Step2(ctx context.Context, in string) error { activityRuns.Add(1); return nil }
-func Step3(ctx context.Context, in string) error { activityRuns.Add(1); return nil }
+func Step1(ctx context.Context) error { activityRuns.Add(1); return nil }
+func Step2(ctx context.Context) error { activityRuns.Add(1); return nil }
+func Step3(ctx context.Context) error { activityRuns.Add(1); return nil }
 
 // BenchWorkflow runs the three steps in sequence, matching wf_three_activities.
 func BenchWorkflow(ctx workflow.Context, in string) (string, error) {
@@ -67,8 +67,13 @@ func BenchWorkflow(ctx workflow.Context, in string) (string, error) {
 	}
 	ctx = workflow.WithActivityOptions(ctx, opts)
 
+	// Each activity is invoked with no argument, matching the harvest handler,
+	// which passes JSON null to every activity and ignores its own input.
+	// Passing the workflow input down would make Temporal serialize it into
+	// three activity-scheduled events per run that harvest never writes.
+	// Found by review on PR #1617.
 	for _, act := range []any{Step1, Step2, Step3} {
-		if err := workflow.ExecuteActivity(ctx, act, in).Get(ctx, nil); err != nil {
+		if err := workflow.ExecuteActivity(ctx, act).Get(ctx, nil); err != nil {
 			return "", err
 		}
 	}
