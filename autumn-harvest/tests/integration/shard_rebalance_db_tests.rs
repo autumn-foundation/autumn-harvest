@@ -3236,7 +3236,13 @@ async fn cancelling_a_sealed_source_is_left_pending_not_reported_delivered() {
 /// The live residence resolves through `pool_for`'s default fallback instead,
 /// which is how every other read path in the engine reaches a run's database.
 /// Safe because the lookup is keyed by execution id: a fallback landing on the
-/// wrong database finds no row, never another run's data. Prior residences keep
+/// wrong database finds no row, never another run's data.
+///
+/// The RESOLVED shard also names the fallback, not the id's decoded origin
+/// (issue #1317 review). A caller trusting this value for a follow-up
+/// connection -- SSE listen, best-effort audit attribution -- must reach
+/// the row's actual database. Otherwise it names a shard with no pool at
+/// all. Prior residences keep
 /// the exact form and are covered by the retired/unreachable tests above.
 #[tokio::test]
 async fn single_pool_resolves_an_execution_whose_id_encodes_another_shard() {
@@ -3259,13 +3265,18 @@ async fn single_pool_resolves_an_execution_whose_id_encodes_another_shard() {
         .await
     };
 
+    // Issue #1317 review: the id still names shard 7, but the connection
+    // that actually answered came from the fallback default pool.
+    // Reporting `foreign` here sent a follow-up connection -- SSE listen,
+    // best-effort audit attribution -- to a shard with no pool of its own.
+    // That happened even though the row itself is reachable.
     let live = resolve_execution_shard(&pool, exec_id)
         .await
         .expect("a single-pool deployment must resolve its own execution");
     assert_eq!(
-        live, foreign,
-        "the id still names shard 7; it is the POOL lookup that falls back, \
-         so the resolved residence is reported as the id's own shard"
+        live, SOURCE,
+        "the resolved residence must name the shard the connection actually \
+         came from, not the id's decoded origin"
     );
 
     let chain = residence_chain(&pool, exec_id)
@@ -3273,7 +3284,7 @@ async fn single_pool_resolves_an_execution_whose_id_encodes_another_shard() {
         .expect("residence chain must not report the only database unavailable");
     assert_eq!(
         chain,
-        vec![foreign],
+        vec![SOURCE],
         "a run that never migrated has a one-shard residence chain"
     );
 }

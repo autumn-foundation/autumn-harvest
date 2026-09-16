@@ -3325,6 +3325,18 @@ mod db {
         // Tolerate a missing pool only for an id resolving to its own encoded
         // shard -- the single-pool case `checkout_entry` exists for.
         let forwarded = !exec_id.shard().is_unencoded() && origin != exec_id.shard();
+        // `checkout_entry` falls back to the default pool when `origin` has
+        // no pool of its own (issue #1317 review). `entry_shard` is the
+        // shard that fallback actually reads from. A resolution ending at
+        // the entry hop then reports where the connection came from, not
+        // the id's decoded origin. Only the entry hop can fall back --
+        // every later hop follows a stored pointer through `checkout`,
+        // which has none.
+        let entry_shard = if !forwarded && pool.exact_pool_for(origin).is_none() {
+            pool.default_shard()
+        } else {
+            origin
+        };
         let mut current = origin;
         for hop in 0..MAX_FORWARD_HOPS {
             // The ORIGIN hop is tolerant (see `checkout_entry`) unless routing
@@ -3336,7 +3348,7 @@ mod db {
                 checkout(pool, current).await?
             };
             match read_forward(&mut conn, exec_id).await? {
-                None => return Ok(current),
+                None => return Ok(if hop == 0 { entry_shard } else { current }),
                 Some(next) => current = next,
             }
         }

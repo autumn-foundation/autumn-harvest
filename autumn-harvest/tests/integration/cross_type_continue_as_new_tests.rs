@@ -908,9 +908,9 @@ async fn a_terminal_prior_run_of_the_target_type_blocks_the_transition() {
 }
 
 /// A reconciled `MIGRATED` seal of the target type must free the successor
-/// slot (issue #1317 review, round 4). `resolve_successor_slot` used to
-/// order a released seal behind a live occupant rather than excluding it, so
-/// a *sole* reconciled seal still read as an occupant and
+/// slot (issue #1317 review). `resolve_successor_slot` used to order a
+/// released seal behind a live occupant rather than excluding it. A *sole*
+/// reconciled seal therefore still read as an occupant.
 /// `classify_successor_slot` terminally failed the predecessor even though
 /// the widened active-uniqueness index no longer counts the seal as taken.
 #[tokio::test]
@@ -922,7 +922,7 @@ async fn a_reconciled_migrated_occupant_of_the_target_type_frees_the_slot() {
     let phase2 = leaked("paid_subscription");
     let workflow_id = format!("sub-{}", Uuid::new_v4().simple());
 
-    // A prior run of the target type was rebalanced elsewhere and its live
+    // A prior run of the target type was rebalanced elsewhere. Its live
     // copy has since finished — the reconciler already marked this seal
     // `migrated_run_terminal_at`, so it no longer occupies the key.
     let seal = start_root(&mut conn, phase2, &workflow_id, serde_json::json!({})).await;
