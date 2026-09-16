@@ -421,12 +421,12 @@ async fn workflow_list_excludes_a_staged_migration_by_default_but_finds_it_expli
     // Issue #1317: the default listing already excluded `MIGRATED` (a
     // sealed source, not a workflow) to avoid double-counting a FINISHED
     // migration across shards. A migration IN PROGRESS has the identical
-    // shape: the source still holds the live `RUNNING` row while the
+    // shape. The source still holds the live `RUNNING` row, while the
     // target holds a staged `MIGRATING` copy with the same id and
     // `created_at`. Left in, the default listing would double-count that
     // too. This single-database test cannot reproduce the cross-shard
     // duplicate directly, but it pins the mechanism the real fix relies
-    // on: `MIGRATING` is invisible to the default listing, and still
+    // on. `MIGRATING` is invisible to the default listing, and still
     // reachable through an explicit `state=MIGRATING` filter.
     let (database_url, _container) = setup_single_database().await;
     let pool = build_pool(&database_url);
@@ -434,7 +434,14 @@ async fn workflow_list_excludes_a_staged_migration_by_default_but_finds_it_expli
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
 
-    let live = seed_workflow(&database_url, ShardId::new(0), "entity_flow", "wf-live", None).await;
+    let live = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "entity_flow",
+        "wf-live",
+        None,
+    )
+    .await;
     let staged = seed_workflow(
         &database_url,
         ShardId::new(0),

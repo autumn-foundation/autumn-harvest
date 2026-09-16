@@ -1706,9 +1706,11 @@ impl WorkflowHandle {
     pub async fn cancel(&self, reason: &str) -> HarvestResult<CancelledWorkflowExecution> {
         // Resolve residence, not origin (issue #1317): `self.shard()` names
         // where `exec_id` was minted, not where a rebalanced run lives now.
-        let mut conn =
-            crate::shard_rebalance::conn_for_execution_forwarded(&self.client.inner.pools, self.exec_id)
-                .await?;
+        let mut conn = crate::shard_rebalance::conn_for_execution_forwarded(
+            &self.client.inner.pools,
+            self.exec_id,
+        )
+        .await?;
         crate::execution::cancel_live_attempt(
             &mut conn,
             self.exec_id,
@@ -1733,9 +1735,11 @@ impl WorkflowHandle {
     /// [`HarvestError::Database`] for persistence failures.
     pub async fn terminate(&self, reason: &str) -> HarvestResult<CancelledWorkflowExecution> {
         // Resolve residence, not origin (issue #1317): see `cancel` above.
-        let mut conn =
-            crate::shard_rebalance::conn_for_execution_forwarded(&self.client.inner.pools, self.exec_id)
-                .await?;
+        let mut conn = crate::shard_rebalance::conn_for_execution_forwarded(
+            &self.client.inner.pools,
+            self.exec_id,
+        )
+        .await?;
         crate::execution::terminate_live_attempt(
             &mut conn,
             self.exec_id,
@@ -2043,8 +2047,8 @@ impl WorkflowHandle {
         }
     }
 
-    /// The shard `exec_id` currently lives on (issue #1317): a rebalanced
-    /// run's `ExecutionId` still encodes its ORIGIN, so callers needing the
+    /// The shard `exec_id` currently lives on (issue #1317). A rebalanced
+    /// run's `ExecutionId` still encodes its ORIGIN. Callers needing the
     /// live residence must resolve through the forwarding pointer rather
     /// than decode the id directly.
     async fn shard(&self) -> HarvestResult<ShardId> {
@@ -2081,9 +2085,11 @@ impl WorkflowHandle {
     /// — the original row — so behavior is unchanged for the non-retry case.
     async fn load_effective_execution(&self) -> HarvestResult<WorkflowExecution> {
         // Resolve residence, not origin (issue #1317): see `cancel` above.
-        let mut conn =
-            crate::shard_rebalance::conn_for_execution_forwarded(&self.client.inner.pools, self.exec_id)
-                .await?;
+        let mut conn = crate::shard_rebalance::conn_for_execution_forwarded(
+            &self.client.inner.pools,
+            self.exec_id,
+        )
+        .await?;
         crate::execution::resolve_live_attempt(&mut conn, self.exec_id).await
     }
 
@@ -2124,7 +2130,7 @@ impl WorkflowHandle {
         }
 
         // Resolve residence for `target` -- the effective execution after the
-        // retry-chain walk above, which can differ from `self.exec_id` -- not
+        // retry-chain walk above, which can differ from `self.exec_id`. Not
         // its origin (issue #1317): see `cancel` above.
         let mut conn =
             crate::shard_rebalance::conn_for_execution_forwarded(&self.client.inner.pools, target)

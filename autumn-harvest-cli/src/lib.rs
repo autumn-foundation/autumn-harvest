@@ -10044,9 +10044,9 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
                 ));
             }
             let pool = build_pool(&targets)?;
-            let after = after_created_at.zip(*after_execution_id).map(|(at, id)| {
-                (at, autumn_harvest::types::ExecutionId::from_uuid(id))
-            });
+            let after = after_created_at
+                .zip(*after_execution_id)
+                .map(|(at, id)| (at, autumn_harvest::types::ExecutionId::from_uuid(id)));
             let report = autumn_harvest::shard_rebalance::migrate_quiescent_executions_after(
                 &pool,
                 ShardId::new(*from),

@@ -1600,8 +1600,8 @@ mod db {
     /// `is_active_conflict_state` treats a `MIGRATED` seal as active
     /// forever, on purpose: the run is still live, just on another shard.
     /// Nothing else checks the other side of that trade. This reads the
-    /// live copy's current state -- from its execution row, or from its
-    /// retention-demoted summary once the row itself is gone -- and reports
+    /// live copy's current state. The source is its execution row, or its
+    /// retention-demoted summary once the row itself is gone. It reports
     /// whether that state is terminal.
     ///
     /// `MIGRATED` itself does not count as terminal here: a live copy that
@@ -1611,8 +1611,8 @@ mod db {
     ///
     /// [`HarvestError::ShardUnavailable`] when the live shard has no pool
     /// here. [`HarvestError::Database`] when neither the execution row nor
-    /// its summary exists there -- a seal whose live copy is simply absent
-    /// is a different bug and must not be silently reported terminal.
+    /// its summary exists there. A seal whose live copy is simply absent
+    /// is a different bug. It must not be silently reported terminal.
     async fn live_copy_is_terminal(
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
@@ -1642,9 +1642,9 @@ mod db {
     /// Release a rebalanced source seal's uniqueness slot once its live copy
     /// is done (issue #1317).
     ///
-    /// Idempotent: a no-op when `exec_id` does not name a seal on `source`,
-    /// when it is already marked, or when the live copy has not finished
-    /// yet. Safe to call from an operator sweep or on demand.
+    /// Idempotent: a no-op when `exec_id` does not name a seal on `source`.
+    /// Also a no-op when it is already marked, or when the live copy has
+    /// not finished yet. Safe to call from an operator sweep or on demand.
     ///
     /// # Errors
     ///
@@ -1714,9 +1714,9 @@ mod db {
             let exec_id = ExecutionId::from_uuid(row.id);
             // `Ok(false)`: not yet terminal, try again next sweep. `Err`: a
             // single unreachable target names a database problem, not this
-            // seal's; skip it and let the next sweep retry (issue #1317,
-            // mirroring `resume_incomplete_migrations`'s per-record
-            // handling). Both are a silent no-op here, same as each other.
+            // seal's. Skip it and let the next sweep retry (issue #1317).
+            // This mirrors `resume_incomplete_migrations`'s per-record
+            // handling. Both are a silent no-op here, same as each other.
             if matches!(
                 reconcile_migrated_seal_terminality(&mut source, pool, exec_id).await,
                 Ok(true)
@@ -1744,15 +1744,15 @@ mod db {
     ///    events *and* the same next-command state.
     ///
     /// `codecs` not registering a payload's codec or key at all (issue
-    /// #1317) — the `harvest` CLI's shard commands have no way to obtain an
-    /// application's own encryption keys, only the deployment that embeds
-    /// Harvest does — degrades to check 1 alone rather than refusing to
-    /// migrate every encrypted deployment. The returned fingerprint is then
-    /// prefixed `raw:` and hashes the byte-identical raw rows check 1 already
-    /// verified, instead of the decoded events check 2 could not produce. Any
-    /// OTHER decode failure (a genuinely malformed payload, say) still fails
-    /// verification: only [`HarvestError::UnknownCodecKey`] and
-    /// [`HarvestError::UnknownPayloadCodec`] trigger this.
+    /// #1317) degrades to check 1 alone, rather than refusing to migrate
+    /// every encrypted deployment. The `harvest` CLI's shard commands have
+    /// no way to obtain an application's own encryption keys; only the
+    /// deployment that embeds Harvest does. The returned fingerprint is
+    /// then prefixed `raw:`. It hashes the byte-identical raw rows check 1
+    /// already verified, instead of the decoded events check 2 could not
+    /// produce. Any OTHER decode failure (a genuinely malformed payload,
+    /// say) still fails verification: only [`HarvestError::UnknownCodecKey`]
+    /// and [`HarvestError::UnknownPayloadCodec`] trigger this.
     ///
     /// Returns the agreed fingerprint. A failure aborts the migration with the
     /// source untouched.
@@ -1822,8 +1822,18 @@ mod db {
             // already proved the raw rows byte-identical; that is the
             // verification this call can still perform without the
             // application's own codec.
-            (Err(HarvestError::UnknownCodecKey { .. } | HarvestError::UnknownPayloadCodec { .. }), _)
-            | (_, Err(HarvestError::UnknownCodecKey { .. } | HarvestError::UnknownPayloadCodec { .. })) => {
+            (
+                Err(
+                    HarvestError::UnknownCodecKey { .. } | HarvestError::UnknownPayloadCodec { .. },
+                ),
+                _,
+            )
+            | (
+                _,
+                Err(
+                    HarvestError::UnknownCodecKey { .. } | HarvestError::UnknownPayloadCodec { .. },
+                ),
+            ) => {
                 format!("raw:{}", raw_history_fingerprint(&source_raw))
             }
             (Err(e), _) | (_, Err(e)) => return Err(e),
@@ -2303,11 +2313,11 @@ mod db {
         .map_err(database_error)?;
 
         if claimed == 0 {
-            // Either this exact record is already `ABORTED` -- most likely
-            // this call retrying one whose target cleanup failed after a
-            // prior attempt's claim committed (issue #1317) -- or the
+            // Either this exact record is already `ABORTED`, or the
             // migration is past its cutover, or there is no record at all.
-            // Only the first is ours to retry.
+            // The `ABORTED` case is most likely this call retrying one
+            // whose target cleanup failed after a prior attempt's claim
+            // committed (issue #1317). Only that case is ours to retry.
             let phase = load_migration(source, exec_id).await?.map(|r| r.phase);
             if phase != Some(MigrationPhase::Aborted) {
                 let phase_str =
@@ -2327,14 +2337,14 @@ mod db {
         // every id routing to it resolving nowhere.
         //
         // Run unconditionally, whether this call just won the claim above or
-        // is retrying one an earlier call already won (issue #1317): the
+        // is retrying one an earlier call already won (issue #1317). The
         // claim and this cleanup are two separate commits against two
-        // separate databases, so a target-cleanup failure (a dropped
+        // separate databases. A target-cleanup failure (a dropped
         // connection, say) after the claim already committed must not
         // strand the record where no later call can retry it.
-        // `discard_staged_copy_restoring_seal` runs in one transaction and
-        // is a no-op once the target is no longer `MIGRATING`, so repeating
-        // it here is always safe, not merely safe on the first attempt.
+        // `discard_staged_copy_restoring_seal` runs in one transaction. It
+        // is a no-op once the target is no longer `MIGRATING`. Repeating it
+        // here is always safe, not merely safe on the first attempt.
         Box::pin(target.transaction::<(), HarvestError, _>(async |conn| {
             discard_staged_copy_restoring_seal(&mut *conn, exec_id).await
         }))
@@ -2372,9 +2382,9 @@ mod db {
     /// Where a resumed candidate scan picks back up: the `(created_at, id)`
     /// of the last row a prior call examined (issue #1317).
     ///
-    /// Two columns, not one, because `created_at` alone is not unique: a
-    /// keyset scan ordered by a non-unique column can re-see or skip rows
-    /// straddling a tie. `id` breaks every tie deterministically.
+    /// Two columns, not one, because `created_at` alone is not unique.
+    /// A keyset scan ordered by a non-unique column can re-see or skip
+    /// rows straddling a tie. `id` breaks every tie deterministically.
     pub type MigrationScanCursor = (DateTime<Utc>, ExecutionId);
 
     #[derive(diesel::QueryableByName)]
@@ -2403,11 +2413,12 @@ mod db {
     ///
     /// `after`, when `Some`, resumes a prior scan strictly past that
     /// `MigrationScanCursor` (issue #1317). Without it, a shard whose oldest
-    /// `scan_limit` rows are permanently blocked (an active session, a parked
-    /// child) fills the whole window on every call, and repeating the batch
-    /// command never reaches an eligible row sitting behind that prefix: the
-    /// scan always restarts at the oldest row. Threading the last-seen cursor
-    /// forward makes repeated calls advance monotonically instead.
+    /// `scan_limit` rows are permanently blocked (an active session, a
+    /// parked child) fills the whole window on every call. Repeating the
+    /// batch command never reaches an eligible row sitting behind that
+    /// prefix. The scan always restarts at the oldest row. Threading the
+    /// last-seen cursor forward makes repeated calls advance monotonically
+    /// instead.
     ///
     /// # Errors
     ///
@@ -2725,9 +2736,8 @@ mod db {
     /// Without this, the scan always starts at the shard's oldest `RUNNING`
     /// row. Pass the previous call's
     /// [`MigrationBatchReport::next_scan_cursor`] to make repeated calls
-    /// advance monotonically through a shard whose oldest rows are
-    /// permanently blocked, rather than re-examining the same prefix
-    /// forever.
+    /// advance monotonically. This avoids re-examining the same prefix
+    /// forever on a shard whose oldest rows are permanently blocked.
     ///
     /// # Errors
     ///
@@ -2763,7 +2773,7 @@ mod db {
 
         let examined = candidates.len();
         // A full window means there may be more past the last row this scan
-        // saw; a short one means the scan reached the end of the shard's
+        // saw. A short one means the scan reached the end of the shard's
         // `RUNNING` population, at least as of this call (issue #1317).
         let next_scan_cursor = (examined == usize::try_from(scan_limit).unwrap_or(usize::MAX))
             .then(|| candidates.last().map(|c| (c.created_at, c.execution_id)))

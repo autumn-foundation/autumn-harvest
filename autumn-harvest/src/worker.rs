@@ -38001,6 +38001,7 @@ mod tests {
             triage_note: None,
             quota_key: None,
             created_at: chrono::Utc::now(),
+            migrated_run_terminal_at: None,
         }
     }
 

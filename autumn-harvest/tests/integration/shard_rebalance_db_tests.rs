@@ -1621,10 +1621,10 @@ async fn repeating_the_batch_command_advances_past_a_blocked_prefix() {
     // Issue #1317: before this fix, the scan always restarted at the
     // shard's oldest `RUNNING` row. A busy shard's oldest rows are exactly
     // the population most likely to be permanently blocked (an active
-    // session, a parked child), so they filled the whole `scan_limit`
-    // window on every call -- and no amount of repeating the documented
-    // batch command ever reached an eligible row sitting behind that
-    // prefix, because nothing ever moved the window forward.
+    // session, a parked child). They filled the whole `scan_limit` window
+    // on every call. No amount of repeating the documented batch command
+    // ever reached an eligible row sitting behind that prefix, because
+    // nothing ever moved the window forward.
     let shards = setup_two_shards().await;
     let mut source = shards.source().await;
 
@@ -1632,7 +1632,7 @@ async fn repeating_the_batch_command_advances_past_a_blocked_prefix() {
     // claim indefinitely (the same trick
     // `a_non_quiescent_execution_is_skipped_with_named_blockers` uses). Four,
     // not fewer, because `migrate_quiescent_executions` scans `limit * 4`
-    // (clamped) -- with `limit = 1` that is exactly this prefix's size, so
+    // (clamped). With `limit = 1` that is exactly this prefix's size, so
     // the first call's window is entirely consumed by blocked rows.
     for n in 0..4 {
         let exec_id = quiescent_fixture(&shards, &format!("blocked-{n}")).await;
@@ -1660,9 +1660,9 @@ async fn repeating_the_batch_command_advances_past_a_blocked_prefix() {
 
     // First call: `limit` is small enough that `scan_limit` (4x, per the
     // batch's own headroom policy) exactly covers the blocked prefix. Both
-    // examined rows are named `Skipped` with their blocker -- the scan is
-    // NOT made tighter to exclude them; an operator still sees why each one
-    // did not move.
+    // examined rows are named `Skipped` with their blocker. The scan is
+    // NOT made tighter to exclude them. An operator still sees why each
+    // one did not move.
     let first =
         migrate_quiescent_executions(&shards.pool, SOURCE, TARGET, 1, true, "tester", &codecs())
             .await
@@ -2275,13 +2275,16 @@ async fn a_seal_whose_live_copy_never_finished_is_not_reconciled() {
     let reconciled = reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id)
         .await
         .expect("reconcile must not fail merely because the live copy is still running");
-    assert!(!reconciled, "a live, non-terminal target must not be reconciled");
+    assert!(
+        !reconciled,
+        "a live, non-terminal target must not be reconciled"
+    );
 }
 
 #[tokio::test]
 async fn a_terminate_if_running_start_creates_a_fresh_run_once_the_migrated_prior_finishes() {
-    // Before issue #1317's fix, `MIGRATED` was an active conflict FOREVER:
-    // nothing ever noticed the live copy had finished, so this same start
+    // Before issue #1317's fix, `MIGRATED` was an active conflict FOREVER.
+    // Nothing ever noticed the live copy had finished. So this same start
     // request kept hitting the terminate-branch's `ShardUnavailable` refusal
     // for as long as the source shard existed. This is the plainest form of
     // the bug: an ordinary "run it again" the day after it finished.
@@ -2331,7 +2334,10 @@ async fn a_terminate_if_running_start_creates_a_fresh_run_once_the_migrated_prio
     )
     .await
     .expect("a start over an observed-terminal seal must succeed");
-    assert!(started.created, "must be a fresh run, not an attach to the old seal");
+    assert!(
+        started.created,
+        "must be a fresh run, not an attach to the old seal"
+    );
     assert_ne!(
         started.exec_id, exec_id,
         "the fresh run must be a distinct execution from the migrated one"
@@ -2346,14 +2352,20 @@ async fn a_terminate_if_running_start_creates_a_fresh_run_once_the_migrated_prio
         Some("MIGRATED"),
         "the seal's state must stay MIGRATED, never CONTINUED_AS_NEW"
     );
-    assert_eq!(forward_of(&mut source, exec_id).await, Some(TARGET.as_i32()));
+    assert_eq!(
+        forward_of(&mut source, exec_id).await,
+        Some(TARGET.as_i32())
+    );
 
     // A second reconcile is a no-op, and a second start of the same key
     // reaches the now-active fresh run, not a duplicate-insert error.
     let reconciled_again = reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id)
         .await
         .expect("reconcile");
-    assert!(!reconciled_again, "reconciling an already-marked seal is a no-op");
+    assert!(
+        !reconciled_again,
+        "reconciling an already-marked seal is a no-op"
+    );
 }
 
 fn terminate_if_running_start<'a>(
@@ -2372,13 +2384,14 @@ async fn an_allow_duplicate_start_creates_a_fresh_run_too_once_the_seal_is_recon
     // `AllowDuplicate` attaches to any VISIBLE non-sealed prior, terminal or
     // not -- it never replaces one. Once a seal is observed-terminal it is
     // released from the active-uniqueness slot the SAME way a `sealed`
-    // (`CONTINUED_AS_NEW`/`TERMINATED`) prior already is, so every reuse
-    // policy sees "no prior occupies this key" uniformly, the same as they
-    // already do for a sealed row. `AllowDuplicate` therefore also gets a
-    // fresh run here, not the stale seal's un-refreshed data -- attaching to
-    // it would hand back a row whose `output`/`completed_at` were never
-    // populated (the real result lives on the target), so a fresh run is
-    // the more useful outcome, not merely an accepted side effect.
+    // (`CONTINUED_AS_NEW`/`TERMINATED`) prior already is. Every reuse policy
+    // therefore sees "no prior occupies this key" uniformly, the same as
+    // they already do for a sealed row. `AllowDuplicate` therefore also
+    // gets a fresh run here, not the stale seal's un-refreshed data.
+    // Attaching to it would hand back a row whose `output`/`completed_at`
+    // were never populated (the real result lives on the target). So a
+    // fresh run is the more useful outcome, not merely an accepted side
+    // effect.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "allow-duplicate-me").await;
     migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
@@ -2924,10 +2937,10 @@ async fn aborting_before_staging_ever_touched_the_target_leaves_its_seal_untouch
 #[tokio::test]
 async fn a_repeated_abort_finishes_a_target_cleanup_a_prior_attempt_did_not() {
     // Issue #1317: `abort_migration` claims the abort (phase -> ABORTED, on
-    // the source) BEFORE cleaning up the target's staged copy. Those are two
-    // separate commits against two separate databases, so a target-cleanup
+    // the source) BEFORE cleaning up the target's staged copy. Those are
+    // two separate commits against two separate databases. A target-cleanup
     // failure -- a dropped connection, say -- after the claim already
-    // committed used to strand the record: `resume_incomplete_migrations`
+    // committed used to strand the record. `resume_incomplete_migrations`
     // excludes ABORTED, and a repeated `abort_migration` call refused
     // outright because the claim UPDATE could no longer match a
     // non-ABORTED phase. Neither path could ever finish the cleanup.

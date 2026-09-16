@@ -1539,12 +1539,12 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
 
         // A MIGRATED seal whose live copy has since finished is not an
         // active conflict any more (issue #1317). `is_active_conflict_state`
-        // classifies `MIGRATED` as active unconditionally, which is right
-        // while the live run is going but wrong forever after: nothing else
-        // ever re-checks it, so a start of the same business key attached to
-        // a dead seal permanently. `migrated_run_terminal_at` is the
-        // reconciler's record that the live copy has finished; treat that
-        // exactly like any other terminal prior below.
+        // classifies `MIGRATED` as active unconditionally. That is right
+        // while the live run is going but wrong forever after. Nothing
+        // else ever re-checks it, so a start of the same business key
+        // attached to a dead seal permanently. `migrated_run_terminal_at`
+        // is the reconciler's record that the live copy has finished;
+        // treat that exactly like any other terminal prior below.
         let seal_observed_terminal =
             existing.state == "MIGRATED" && existing.migrated_run_terminal_at.is_some();
 
@@ -2869,7 +2869,7 @@ async fn replace_execution(
     // would defeat retention's and erasure's protection of the forwarding
     // pointer, both keyed on `state = 'MIGRATED'` exactly. The active
     // partial index already excludes an observed-terminal seal via
-    // `migrated_run_terminal_at IS NULL`, so this row is already outside
+    // `migrated_run_terminal_at IS NULL`. So this row is already outside
     // the uniqueness scope without touching its state at all.
     if existing.state != "MIGRATED" {
         diesel::update(harvest_workflow_executions::table.find(existing.id))

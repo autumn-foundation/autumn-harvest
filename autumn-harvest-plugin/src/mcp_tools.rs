@@ -1268,10 +1268,10 @@ async fn watch_tool(
     // covers the whole chain even if we later jump to a successor's exec_id.
     //
     // Resolved through the forwarding pointer, not `exec_id.shard()` (issue
-    // #1317): a rebalanced execution's origin shard is not where
-    // `load_owned_execution` below actually finds it, and this LISTEN
-    // connection must open against the same database or every notification
-    // for the chain is missed.
+    // #1317). A rebalanced execution's origin shard is not where
+    // `load_owned_execution` below actually finds it. This LISTEN
+    // connection must open against the same database, or every
+    // notification for the chain is missed.
     let Some(shard) = crate::api::resolve_shard_best_effort(&api_state, exec_id).await else {
         return crate::api::map_error(autumn_harvest::error::HarvestError::ShardUnavailable {
             shard_id: exec_id.shard().as_i32(),

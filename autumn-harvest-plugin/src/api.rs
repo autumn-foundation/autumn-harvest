@@ -10659,7 +10659,7 @@ async fn export_workflow_history(
             TARGET_WORKFLOW,
             Some(&target),
             "GET /workflows/{id}/history/export",
-            // The row's own residence, not the id's origin (issue #1317):
+            // The row's own residence, not the id's origin (issue #1317).
             // `conn` above is already resolved there, so a rebalanced
             // execution's audit row must say so too.
             Some(ShardId::new(execution.shard_id)),
@@ -11347,10 +11347,10 @@ async fn respond_with_workflow_result(
             TARGET_WORKFLOW,
             Some(&target),
             "GET /workflows/{id}/result",
-            // The row's own residence, not the id's origin (issue #1317):
-            // with `conn: None` just above, a stale origin would make the
+            // The row's own residence, not the id's origin (issue #1317).
+            // With `conn: None` just above, a stale origin would make the
             // pool-acquiring branch below write the audit row to the WRONG
-            // database entirely, not merely mislabel it.
+            // database entirely. Not merely mislabel it.
             resolve_shard_best_effort(api_state, exec_id).await,
             outcome,
             None,
@@ -39796,13 +39796,13 @@ pub(crate) async fn db_conn_for_execution(
 }
 
 /// The shard `exec_id` currently lives on (issue #1317) — `None` on any
-/// resolution failure. For a caller with no row or live connection already
-/// in hand to read `shard_id` off of directly, this is the only way to get
-/// the execution's actual residence instead of its `ExecutionId`'s origin
+/// resolution failure. This is for a caller with no row or live connection
+/// in hand to read `shard_id` off of directly. It is the only way to get
+/// the execution's actual residence, instead of its `ExecutionId`'s origin
 /// shard bits. Used for best-effort audit attribution (mirroring
-/// [`audit_decoded_read`]'s own fail-open shape) and, where establishing a
-/// LISTEN connection cannot wait for an existence check, for resolving
-/// which database to listen against.
+/// [`audit_decoded_read`]'s own fail-open shape). Also used, where
+/// establishing a LISTEN connection cannot wait for an existence check,
+/// for resolving which database to listen against.
 pub(crate) async fn resolve_shard_best_effort(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
@@ -40204,12 +40204,13 @@ pub(crate) async fn load_workflows(
         // by the same predicate.
         //
         // `MIGRATING` has the identical hazard during the staging window
-        // (issue #1317): the source still holds the live `RUNNING`/`PAUSED`
-        // row while the target holds a staged `MIGRATING` copy with the same
-        // `id` and `created_at`. Left in, the default listing double-counts a
-        // migration in progress the same way it used to double-count a
-        // finished one. Excluded here for the same reason, with the same
-        // diagnostic escape hatch via an explicit `state=MIGRATING` filter.
+        // (issue #1317). The source still holds the live `RUNNING`/`PAUSED`
+        // row, while the target holds a staged `MIGRATING` copy with the
+        // same `id` and `created_at`. Left in, the default listing
+        // double-counts a migration in progress the same way it used to
+        // double-count a finished one. Excluded here for the same reason,
+        // with the same diagnostic escape hatch via an explicit
+        // `state=MIGRATING` filter.
         query = query.filter(
             harvest_workflow_executions::state
                 .ne("MIGRATED")
@@ -42869,11 +42870,11 @@ async fn stream_execution_events(
     };
 
     // Get a pooled connection and verify the execution exists BEFORE
-    // resolving the LISTEN/NOTIFY URL: `execution.shard_id` is this row's
+    // resolving the LISTEN/NOTIFY URL. `execution.shard_id` is this row's
     // actual residence, not its id's origin shard (issue #1317). Reusing
     // `exec_id.shard()` here would open the LISTEN connection against a
     // rebalanced execution's origin instead of the live shard `conn` below
-    // resolves to, and every subsequent notification would be missed.
+    // resolves to. Every subsequent notification would be missed.
     let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
         Ok(c) => c,
         Err(e) => return e.into_response(),
@@ -43367,13 +43368,12 @@ async fn stream_workflow_progress(
     };
 
     // Resolve the LISTEN/NOTIFY database URL for this execution's current
-    // residence, not its id's origin shard (issue #1317): the existence
-    // check below reads `execution.shard_id`, and this LISTEN connection
-    // must open against that same database or a rebalanced execution's
-    // chunks are silently missed. Resolved without a row in hand (the
-    // ordering just below deliberately listens before that check runs), so
-    // this walks the forwarding pointer itself rather than reading a
-    // column.
+    // residence, not its id's origin shard (issue #1317). The existence
+    // check below reads `execution.shard_id`. This LISTEN connection must
+    // open against that same database, or a rebalanced execution's chunks
+    // are silently missed. Resolved without a row in hand (the ordering
+    // just below deliberately listens before that check runs). So this
+    // walks the forwarding pointer itself rather than reading a column.
     //
     // No LISTEN/NOTIFY URL configured is a *server* misconfiguration, not a
     // client error: return 503 (retriable once configured), matching the handler
@@ -43381,7 +43381,7 @@ async fn stream_workflow_progress(
     // below is likewise 503 (via `map_error`'s `HarvestError::Database` arm), so
     // both "not configured" and "unreachable" surface as 503, never a 400.
     // A resolution failure here means an infrastructure problem (e.g. a pool
-    // checkout failure), not a missing execution: `resolve_execution_shard`
+    // checkout failure), not a missing execution. `resolve_execution_shard`
     // does not require the row to exist, only that its shard is reachable.
     // A missing execution is still caught by the existence check below.
     let Some(shard) = resolve_shard_best_effort(&api_state, exec_id).await else {
@@ -55731,6 +55731,7 @@ mod tests {
             started_by: None,
             history_bloat_warned_at: None,
             triage_note: None,
+            migrated_run_terminal_at: None,
         }
     }
 

@@ -184,10 +184,10 @@ diesel::table! {
         ///
         /// `is_active_conflict_state` treats `MIGRATED` as active forever, on
         /// purpose -- the run is still live, just elsewhere. Nothing else
-        /// propagates the live copy's terminal completion back here, so a
-        /// start of the same business key attached to this seal forever, long
-        /// past the point the real run finished. Non-NULL releases the row
-        /// from that classification.
+        /// propagates the live copy's terminal completion back here. So a
+        /// start of the same business key attached to this seal forever,
+        /// long past the point the real run finished. Non-NULL releases the
+        /// row from that classification.
         ///
         /// Deliberately NOT a `state` change. Retention and erasure key off
         /// `state = 'MIGRATED'` to protect the forwarding pointer from
