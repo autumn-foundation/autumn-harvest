@@ -218,9 +218,6 @@ async fn drain_workflow_start_outbox_batch(
     let marked_ids = mark_outbox_rows_delivered_batch(&mut app_conn, &claimant, &delivered_marks)
         .await
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
-    mark_outbox_rows_failed_batch(&mut app_conn, &claimant, &failed_marks)
-        .await
-        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
 
     // issue #618: count the "outbox" bypass EXACTLY ONCE per row. The
     // gate is THIS claimant durably marking that row delivered, i.e. the
@@ -235,6 +232,16 @@ async fn drain_workflow_start_outbox_batch(
     // mark: exactly the claimant whose mark wins the row counts it. One
     // committed outbox start is one bypass, even across concurrent
     // reclaims.
+    //
+    // Recorded HERE, right after the delivered mark commits, and before
+    // the failed-row mark below (issue #1620 review). The two marks are
+    // separate statements, not one transaction. Recording the metric
+    // only after BOTH marks ran would risk this: a failure in the
+    // failed-row mark returns early via `?`. That would permanently
+    // drop the bypass count for rows the delivered mark had already
+    // durably committed. The loss is permanent because `delivered_at`
+    // is no longer NULL, so no later flush ever reclaims those rows to
+    // retry the count.
     if let Some(metrics) = outbox_metrics.as_ref() {
         let marked_id_set: std::collections::HashSet<i64> = marked_ids.into_iter().collect();
         for (id, _) in &delivered_marks {
@@ -245,6 +252,10 @@ async fn drain_workflow_start_outbox_batch(
             }
         }
     }
+
+    mark_outbox_rows_failed_batch(&mut app_conn, &claimant, &failed_marks)
+        .await
+        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
 
     Ok(OutboxDrainStats { claimed, delivered })
 }
