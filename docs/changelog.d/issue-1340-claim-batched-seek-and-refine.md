@@ -75,6 +75,16 @@ leading `now_ts` CTE that calls `clock_timestamp()` exactly once; both
 `rate_limit_debit` and `claimed` now read that one materialized value, so
 they always agree on the deadline decision.
 
+Codex then caught an eighth bug, against the original implementation:
+`claimed`'s own `started_at = NOW()` stamps a claim with the
+transaction-frozen start time, not the real time of the claim. A batch
+walk can spend real wall-clock time probing many candidates inside one
+transaction, so `NOW()` can be stale by the whole walk's duration.
+`start_to_close` and `heartbeat_timeout` are measured from `started_at`,
+so a stale stamp silently steals part of a task's timeout budget before
+it starts. Fixed by reusing `now_ts`: `started_at` reads the same
+materialized `clock_timestamp()` value the deadline checks already use.
+
 **Not wired into the default claim path.** `claim_task`/`claim_task_on_shard`
 are unchanged. Issue #1340 is explicit that no query change should land
 against it without sign-off from someone with full context on `queue.rs`'s
@@ -83,7 +93,7 @@ tested, measured building block for that review, not a switch of default
 production behavior. It also does not implement the cross-region DR fence
 (#954) or the by-id claim (#1312) the single-row path carries.
 
-**Test evidence.** `tests/integration/claim_batched_tests.rs` (12 DB-backed
+**Test evidence.** `tests/integration/claim_batched_tests.rs` (13 DB-backed
 tests, red-then-green): equivalence with the single-row path on a plain
 backlog, an adversarial saturated-concurrency-key fixture matching ledger
 #4/#5's own shape, a multi-batch fixture with tied sort keys spanning a
@@ -96,21 +106,25 @@ verified red against the pre-fix code -- drives
 `pg_sleep` so the real-time-vs-frozen-`NOW()` gap is deterministic, not
 timing-dependent), a regression test for the rate-limit-debit-leak-on-
 deadline bug above (same `pg_sleep` technique, asserts the bucket is
-untouched, also verified red then green), sticky routing and a
+untouched, also verified red then green), a regression test for the
+`started_at`-backdating bug above (same `pg_sleep` technique, asserts
+`started_at` lands after the sleep rather than near transaction start,
+also verified red then green), sticky routing and a
 capability-routed-activity gate exercised end-to-end through the real
 function (not just SQL-text checks), and — the gap ledger #5's own
 single-session apparatus explicitly could not close — real concurrent
 Tokio claimers racing a capped concurrency key, asserting the cap is
-never exceeded. `queue.rs`'s `mod tests` gains 10 SQL-shape unit tests
+never exceeded. `queue.rs`'s `mod tests` gains 11 SQL-shape unit tests
 pinning the query text (concurrency gate omitted from the batch scan,
 every other gate preserved byte-for-byte including both capability-label
 branches, the cursor's four-column `OR`-chain, the authoritative
 recheck's exact shape, the concurrency probe's shape, the deadline
 recheck's use of `clock_timestamp()` and not `NOW()` on both the debit
 and the claim, the shared rate-limit-formula helper used instead of a
-fourth hand-copied literal, and the seventh-bug fix that
-`rate_limit_debit` and `claimed` read one shared `now_ts` value rather
-than calling `clock_timestamp()` twice).
+fourth hand-copied literal, the seventh-bug fix that `rate_limit_debit`
+and `claimed` read one shared `now_ts` value rather than calling
+`clock_timestamp()` twice, and the eighth-bug fix that `started_at`
+reads that same shared value instead of the frozen `NOW()`).
 
 **Measurement.** `docs/performance-claim-batched-seek-and-refine.md`,
 regenerated from a single run of

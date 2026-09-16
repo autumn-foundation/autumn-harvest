@@ -879,6 +879,89 @@ async fn batched_claim_never_debits_rate_limit_for_a_concurrency_rejected_candid
     );
 }
 
+/// Regression test for a review finding on this PR. A batch walk can spend
+/// real wall-clock time inside one transaction. `NOW()` stays frozen at
+/// transaction start for that whole walk. So `started_at = NOW()` would
+/// backdate the claim by the walk's duration, silently shortening the
+/// task's `start_to_close`/`heartbeat_timeout` budget (both measured from
+/// `started_at`). `started_at` must instead read the query's own
+/// materialized `clock_timestamp()`, taken at the actual claim.
+#[tokio::test(flavor = "multi_thread")]
+async fn batched_claim_attempt_stamps_started_at_with_real_time_not_frozen_now() {
+    use diesel_async::RunQueryDsl;
+
+    let (_url, mut conn, _container) = setup_db().await;
+    let queue = unique_queue("batched-started-at");
+    let exec_id = insert_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id);
+    params.activity_name = Some("noop".to_string());
+    params.activity_id = Some(Uuid::new_v4());
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+    let before_sleep = chrono::Utc::now();
+
+    #[derive(diesel::QueryableByName)]
+    struct ClaimedRow {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+        started_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+
+    let mut tx = conn.build_transaction().read_committed();
+    let claimed: ClaimedRow = tx
+        .run(
+            async |conn: &mut AsyncPgConnection| -> Result<ClaimedRow, diesel::result::Error> {
+                // Real wall-clock time advances 600ms here. This
+                // transaction's own frozen NOW() does not.
+                diesel::sql_query("SELECT pg_sleep(0.6)")
+                    .execute(conn)
+                    .await?;
+
+                let rows: Vec<ClaimedRow> =
+                    diesel::sql_query(queue::claim_batched_candidate_attempt_query())
+                        .bind::<diesel::sql_types::Text, _>("started-at-tester")
+                        .bind::<diesel::sql_types::Uuid, _>(task_id)
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                            None::<String>,
+                        )
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(
+                            None::<i32>,
+                        )
+                        .bind::<diesel::sql_types::Text, _>("activity")
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                            None::<String>,
+                        )
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                            None::<String>,
+                        )
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                            &Vec::<String>::new(),
+                        )
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+                            None::<chrono::DateTime<chrono::Utc>>,
+                        )
+                        .load(conn)
+                        .await?;
+                Ok(rows.into_iter().next().expect("the row must be claimed"))
+            },
+        )
+        .await
+        .expect("transaction");
+
+    assert_eq!(claimed.id, task_id);
+    let started_at = claimed.started_at.expect("started_at must be set on claim");
+    assert!(
+        started_at > before_sleep + chrono::Duration::milliseconds(400),
+        "started_at must reflect the real time of the claim, after the \
+         600ms in-transaction sleep -- a frozen NOW() would stamp it near \
+         before_sleep instead; before_sleep={before_sleep}, \
+         started_at={started_at}"
+    );
+    assert_eq!(task_state(&mut conn, task_id).await, "RUNNING");
+}
+
 // ── Other preserved gates, exercised end-to-end (not just SQL-shape) ───────
 
 /// Sticky routing, exercised through a real `claim_task_batched` call, not

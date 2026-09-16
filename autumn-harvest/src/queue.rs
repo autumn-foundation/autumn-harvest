@@ -6050,6 +6050,16 @@ pub async fn pending_queue_demand_by_queue_name(
 /// `claimed` read that one materialized value, so they always agree on
 /// the deadline decision.
 ///
+/// A seventh bug, also caught by the same reviewer. `claimed`'s own
+/// `started_at = NOW()` stamps the claim with the transaction-frozen
+/// start time, not the real time of the claim. A batch walk can spend
+/// real time probing many candidates inside one transaction, so `NOW()`
+/// can be stale by the whole walk's duration. `start_to_close` and
+/// `heartbeat_timeout` are measured from `started_at`. A stale stamp
+/// silently steals part of a task's timeout budget before it starts.
+/// The fix reuses `now_ts`: `started_at` reads the same materialized
+/// `clock_timestamp()` value the deadline checks already use.
+///
 /// # What this is not
 ///
 /// This is **not** wired into [`claim_task`] or [`claim_task_on_shard`].
@@ -6294,7 +6304,8 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
              ), \
              claimed AS ( \
                  UPDATE harvest_task_queue \
-                 SET state = 'RUNNING', worker_id = $1, started_at = NOW(), attempt = attempt + 1, \
+                 SET state = 'RUNNING', worker_id = $1, \
+                     started_at = (SELECT ts FROM now_ts), attempt = attempt + 1, \
                      wake_requested = FALSE \
                  WHERE id = $2 \
                    AND ( \
@@ -7389,9 +7400,34 @@ mod tests {
         );
         assert_eq!(
             sql.matches("SELECT ts FROM now_ts").count(),
-            2,
-            "both rate_limit_debit and claimed must read the SAME \
+            3,
+            "rate_limit_debit's deadline check, claimed's deadline check, \
+             and claimed's own started_at stamp must all read the SAME \
              materialized timestamp; got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR. `started_at =
+    /// NOW()` backdates the claim to transaction start, not to when the
+    /// row was actually claimed. A batch walk can spend real wall-clock
+    /// time probing many candidates inside one transaction, so `NOW()`
+    /// can be stale by the whole walk's duration. `start_to_close` and
+    /// `heartbeat_timeout` are measured from `started_at`, so a stale
+    /// stamp silently steals part of a task's timeout budget before it
+    /// even starts.
+    #[test]
+    fn claim_batched_candidate_attempt_query_stamps_started_at_with_real_time() {
+        let sql = claim_batched_candidate_attempt_query();
+        assert!(
+            sql.contains("started_at = (SELECT ts FROM now_ts)"),
+            "started_at must read the same materialized clock_timestamp() \
+             value the deadline checks use, not the transaction-frozen \
+             NOW(); got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("started_at = NOW()"),
+            "started_at must never fall back to the frozen NOW(); \
+             got:\n{sql}"
         );
     }
 
