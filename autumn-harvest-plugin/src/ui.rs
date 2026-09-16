@@ -8691,10 +8691,10 @@ async fn list_schedules_ui(
     Query(params): Query<ScheduleListParams>,
 ) -> Result<Markup, AutumnError> {
     // `page`/`limit` used to `?`-propagate a bare 400 on a non-numeric
-    // value, aborting the whole request before the filter form ever
-    // rendered — the same mechanism #1540/#1560/#1588 already fixed on the
-    // Workflows, Workers and DLQ pages. Degrade to a default and report
-    // the bad value inline instead, matching those pages' own
+    // value. That aborted the whole request before the filter form ever
+    // rendered. It is the same mechanism #1540/#1560/#1588 already fixed
+    // on the Workflows, Workers and DLQ pages. Degrade to a default and
+    // report the bad value inline instead, matching those pages' own
     // `parse_page_query_field`/`parse_limit_query_field` use.
     let (limit, limit_raw, limit_error) =
         parse_limit_query_field(params.limit.as_deref(), DEFAULT_SCHEDULE_PAGE_SIZE);
