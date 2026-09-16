@@ -221,6 +221,15 @@ async fn drain_workflow_start_outbox_batch(
     let rows = claim_due_outbox_rows(&mut app_conn, limit.max(1), &claimant, &config)
         .await
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    // Every row in this batch got `claimed_at` set in that one claim
+    // query. One Instant, taken right after it returns, stands in for
+    // all of their claim times (issue #1620 review, Codex, fifth round).
+    // The drain loop's flush deadline must not run later than this.
+    // Otherwise a row whose claim is close to expiring could sit
+    // flushed-but-not-yet-due past `claim_ttl_ms`, while a slower row's
+    // dispatch is still pending.
+    let batch_claimed_at = std::time::Instant::now();
+    let claim_deadline = batch_claimed_at + Duration::from_millis(config.claim_ttl_ms);
 
     // issue #618, F-round8: the metrics recorder for the exempt-with-bypass-counter
     // "outbox" producer. Fetched once; the bypass is counted per row only AFTER the
@@ -258,12 +267,26 @@ async fn drain_workflow_start_outbox_batch(
         let dispatch_fut = dispatch_workflow_start_request(state, &request);
         tokio::pin!(dispatch_fut);
         let outcome = loop {
-            let elapsed = last_flush.elapsed();
+            let now = std::time::Instant::now();
             let pending = delivered_marks.len() + failed_marks.len();
+            // The flush deadline is the soonest of three candidates
+            // (issue #1620 review, Codex, fifth round). The fixed time
+            // bound. Any failed row's own configured retry deadline -- a
+            // short `base_retry_delay_ms` must not wait behind the fixed
+            // 250ms. This batch's claim deadline, while anything is
+            // pending -- a row must flush before its claim, not just its
+            // mark, goes stale.
+            let mut deadline = last_flush + OUTBOX_MARK_FLUSH_MAX_DELAY;
+            if let Some(earliest_failed) = failed_marks.iter().map(|(_, _, d)| *d).min() {
+                deadline = deadline.min(earliest_failed);
+            }
+            if pending > 0 {
+                deadline = deadline.min(claim_deadline);
+            }
             let remaining = if pending >= OUTBOX_MARK_FLUSH_EVERY {
                 Duration::ZERO
             } else {
-                OUTBOX_MARK_FLUSH_MAX_DELAY.saturating_sub(elapsed)
+                deadline.saturating_duration_since(now)
             };
             tokio::select! {
                 result = &mut dispatch_fut => break result,
