@@ -124,10 +124,15 @@ for row in rows {
 for row in rows {
     match dispatch_workflow_start_request(state, &row.request()).await {
         Ok(exec_id) => delivered_marks.push((row.id, exec_id)),
-        Err(error) => failed_marks.push((row.id, error.to_string(), retry_delay_ms(&config, &row))),
+        Err(error) => {
+            let deadline = Instant::now() + Duration::from_millis(retry_delay_ms(&config, &row));
+            failed_marks.push((row.id, error.to_string(), deadline));
+        }
     }
 }
 let marked_ids = mark_outbox_rows_delivered_batch(&mut app_conn, &claimant, &delivered_marks).await?;
+// Bypass metrics recorded HERE, right after the delivered mark commits and
+// before the fallible failed mark below -- see Equivalence.
 mark_outbox_rows_failed_batch(&mut app_conn, &claimant, &failed_marks).await?;
 ```
 
@@ -135,6 +140,22 @@ mark_outbox_rows_failed_batch(&mut app_conn, &claimant, &failed_marks).await?;
 one array per column and join via `FROM UNNEST($1::bigint[], $2::text[],
 ...) AS v(id, ...)`, instead of a literal `VALUES (...), (...), ...` list
 whose text would grow a distinct shape per batch size.
+
+Two review-round corrections (Codex, on the PR) landed after the numbers
+above were captured, neither changing statement count or buffers:
+
+1. The admission-bypass metric is recorded right after the delivered
+   batch mark commits, not after both marks have run. The two marks are
+   separate statements, not one transaction; recording only after both
+   would have let a failure in the failed-row mark permanently drop the
+   count for rows the delivered mark had already durably committed
+   (`delivered_at` no longer `NULL`, so no later flush retries them).
+2. `mark_outbox_rows_failed_batch` takes a per-row deadline (a monotonic
+   `Instant`, captured when that row's own dispatch failed), not a raw
+   delay applied when the batched mark finally runs. Without this, a row
+   that failed early in a batch whose later dispatches ran slowly would
+   get a retry deadline skewed later by however long the rest of the
+   batch took, instead of its own configured backoff.
 
 Deferring the mark to after the whole batch has dispatched is safe under
 the same idempotency the relay already relies on. A crash between dispatch
