@@ -417,6 +417,53 @@ async fn workflow_list_filters_match_expected_subsets() {
 }
 
 #[tokio::test]
+async fn workflow_list_excludes_a_staged_migration_by_default_but_finds_it_explicitly() {
+    // Issue #1317: the default listing already excluded `MIGRATED` (a
+    // sealed source, not a workflow) to avoid double-counting a FINISHED
+    // migration across shards. A migration IN PROGRESS has the identical
+    // shape: the source still holds the live `RUNNING` row while the
+    // target holds a staged `MIGRATING` copy with the same id and
+    // `created_at`. Left in, the default listing would double-count that
+    // too. This single-database test cannot reproduce the cross-shard
+    // duplicate directly, but it pins the mechanism the real fix relies
+    // on: `MIGRATING` is invisible to the default listing, and still
+    // reachable through an explicit `state=MIGRATING` filter.
+    let (database_url, _container) = setup_single_database().await;
+    let pool = build_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let live = seed_workflow(&database_url, ShardId::new(0), "entity_flow", "wf-live", None).await;
+    let staged = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "entity_flow",
+        "wf-staged-migration",
+        None,
+    )
+    .await;
+    mark_state(&database_url, staged, "MIGRATING").await;
+
+    let (status, json) = get_json(&app, "/workflows").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        workflow_ids(&json),
+        vec!["wf-live".to_string()],
+        "a staged MIGRATING copy must not appear in the default listing"
+    );
+
+    let (_, json) = get_json(&app, "/workflows?state=MIGRATING").await;
+    assert_eq!(
+        workflow_ids(&json),
+        vec!["wf-staged-migration".to_string()],
+        "the diagnostic escape hatch must still find it explicitly"
+    );
+
+    let _ = live;
+}
+
+#[tokio::test]
 async fn workflow_list_invalid_filters_return_400() {
     let (database_url, _container) = setup_single_database().await;
     let pool = build_pool(&database_url);

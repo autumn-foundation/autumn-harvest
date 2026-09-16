@@ -958,7 +958,9 @@ impl WorkflowHandleClient {
             // `options.shard` -- a probe hit never produces deferred
             // follow-ups (below), so this is inert for `finish()` today, but
             // it is the semantically correct value if that ever changes.
-            shard: claim_exec_id.shard(),
+            // Read off `execution.shard_id`, not `claim_exec_id.shard()`
+            // (issue #1317): the id's origin bits do not track a rebalance.
+            shard: ShardId::new(execution.shard_id),
             deferred: PendingStartFollowUps::default(),
         })
     }
@@ -1702,14 +1704,11 @@ impl WorkflowHandle {
     /// [`HarvestError::Config`] when the execution is already terminal, and
     /// [`HarvestError::Database`] for persistence failures.
     pub async fn cancel(&self, reason: &str) -> HarvestResult<CancelledWorkflowExecution> {
-        let mut conn = self
-            .client
-            .inner
-            .pools
-            .pool_for(self.shard())
-            .get()
-            .await
-            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        // Resolve residence, not origin (issue #1317): `self.shard()` names
+        // where `exec_id` was minted, not where a rebalanced run lives now.
+        let mut conn =
+            crate::shard_rebalance::conn_for_execution_forwarded(&self.client.inner.pools, self.exec_id)
+                .await?;
         crate::execution::cancel_live_attempt(
             &mut conn,
             self.exec_id,
@@ -1733,14 +1732,10 @@ impl WorkflowHandle {
     /// Returns [`HarvestError::NotFound`] when the execution does not exist and
     /// [`HarvestError::Database`] for persistence failures.
     pub async fn terminate(&self, reason: &str) -> HarvestResult<CancelledWorkflowExecution> {
-        let mut conn = self
-            .client
-            .inner
-            .pools
-            .pool_for(self.shard())
-            .get()
-            .await
-            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        // Resolve residence, not origin (issue #1317): see `cancel` above.
+        let mut conn =
+            crate::shard_rebalance::conn_for_execution_forwarded(&self.client.inner.pools, self.exec_id)
+                .await?;
         crate::execution::terminate_live_attempt(
             &mut conn,
             self.exec_id,
@@ -1960,15 +1955,10 @@ impl WorkflowHandle {
         &self,
         exec_id: ExecutionId,
     ) -> HarvestResult<Option<crate::failure::DecodedWorkflowFailure>> {
-        let shard = self.client.inner.router.shard_for_execution(exec_id);
-        let mut conn = self
-            .client
-            .inner
-            .pools
-            .pool_for(shard)
-            .get()
-            .await
-            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        // Resolve residence, not origin (issue #1317): see `cancel` above.
+        let mut conn =
+            crate::shard_rebalance::conn_for_execution_forwarded(&self.client.inner.pools, exec_id)
+                .await?;
         let history = crate::store::load_history_with_codecs(
             &mut conn,
             exec_id,
@@ -2053,12 +2043,17 @@ impl WorkflowHandle {
         }
     }
 
-    fn shard(&self) -> ShardId {
-        self.client.inner.router.shard_for_execution(self.exec_id)
+    /// The shard `exec_id` currently lives on (issue #1317): a rebalanced
+    /// run's `ExecutionId` still encodes its ORIGIN, so callers needing the
+    /// live residence must resolve through the forwarding pointer rather
+    /// than decode the id directly.
+    async fn shard(&self) -> HarvestResult<ShardId> {
+        crate::shard_rebalance::resolve_execution_shard(&self.client.inner.pools, self.exec_id)
+            .await
     }
 
-    fn notification_database_url(&self) -> HarvestResult<String> {
-        let shard = self.shard();
+    async fn notification_database_url(&self) -> HarvestResult<String> {
+        let shard = self.shard().await?;
         self.client
             .inner
             .notification_database_urls
@@ -2072,7 +2067,7 @@ impl WorkflowHandle {
     }
 
     async fn connect_listener(&self) -> HarvestResult<WorkflowEventListener> {
-        WorkflowEventListener::connect(&self.notification_database_url()?).await
+        WorkflowEventListener::connect(&self.notification_database_url().await?).await
     }
 
     /// Load the *effective* execution for this handle: the **live attempt** of
@@ -2085,14 +2080,10 @@ impl WorkflowHandle {
     /// For workflows without a retry policy this is exactly `load_execution()`
     /// — the original row — so behavior is unchanged for the non-retry case.
     async fn load_effective_execution(&self) -> HarvestResult<WorkflowExecution> {
-        let mut conn = self
-            .client
-            .inner
-            .pools
-            .pool_for(self.shard())
-            .get()
-            .await
-            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        // Resolve residence, not origin (issue #1317): see `cancel` above.
+        let mut conn =
+            crate::shard_rebalance::conn_for_execution_forwarded(&self.client.inner.pools, self.exec_id)
+                .await?;
         crate::execution::resolve_live_attempt(&mut conn, self.exec_id).await
     }
 
@@ -2132,15 +2123,12 @@ impl WorkflowHandle {
             return Err(HarvestError::WorkflowNotRunning(target));
         }
 
-        let shard = self.shard();
-        let mut conn = self
-            .client
-            .inner
-            .pools
-            .pool_for(shard)
-            .get()
-            .await
-            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        // Resolve residence for `target` -- the effective execution after the
+        // retry-chain walk above, which can differ from `self.exec_id` -- not
+        // its origin (issue #1317): see `cancel` above.
+        let mut conn =
+            crate::shard_rebalance::conn_for_execution_forwarded(&self.client.inner.pools, target)
+                .await?;
         let history = crate::store::load_history_with_codecs(
             &mut conn,
             target,

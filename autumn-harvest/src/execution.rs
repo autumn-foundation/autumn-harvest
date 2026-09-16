@@ -1537,11 +1537,22 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             }
         };
 
+        // A MIGRATED seal whose live copy has since finished is not an
+        // active conflict any more (issue #1317). `is_active_conflict_state`
+        // classifies `MIGRATED` as active unconditionally, which is right
+        // while the live run is going but wrong forever after: nothing else
+        // ever re-checks it, so a start of the same business key attached to
+        // a dead seal permanently. `migrated_run_terminal_at` is the
+        // reconciler's record that the live copy has finished; treat that
+        // exactly like any other terminal prior below.
+        let seal_observed_terminal =
+            existing.state == "MIGRATED" && existing.migrated_run_terminal_at.is_some();
+
         // Branch on active-vs-terminal FIRST (issue #685). An ACTIVE
         // (RUNNING/PAUSED) prior is governed by the orthogonal conflict
         // axis; a terminal non-sealed prior is governed by the reuse axis
         // exactly as before (the conflict axis has no effect there).
-        if is_active_conflict_state(&existing.state) {
+        if is_active_conflict_state(&existing.state) && !seal_observed_terminal {
             match effective_active_conflict_behavior(request.reuse_policy, request.conflict_policy)
             {
                 // Return the existing running/paused execution unchanged —
@@ -2850,14 +2861,26 @@ async fn replace_execution(
     // Seal the prior execution row as CONTINUED_AS_NEW. This removes it from
     // the partial unique index scope (WHERE state NOT IN sealed states),
     // allowing the new row to be inserted without violating the constraint.
-    diesel::update(harvest_workflow_executions::table.find(existing.id))
-        .set((
-            harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
-        ))
-        .execute(conn)
-        .await
-        .map_err(database_error)?;
+    //
+    // A MIGRATED seal is the one exception (issue #1317). Only
+    // `TerminateIfRunning` can reach this function with `existing.state ==
+    // "MIGRATED"`, and only once its live copy is observed terminal (the
+    // caller's `seal_observed_terminal` gate). Overwriting `state` here
+    // would defeat retention's and erasure's protection of the forwarding
+    // pointer, both keyed on `state = 'MIGRATED'` exactly. The active
+    // partial index already excludes an observed-terminal seal via
+    // `migrated_run_terminal_at IS NULL`, so this row is already outside
+    // the uniqueness scope without touching its state at all.
+    if existing.state != "MIGRATED" {
+        diesel::update(harvest_workflow_executions::table.find(existing.id))
+            .set((
+                harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
+                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            ))
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+    }
 
     let new_execution = diesel::insert_into(harvest_workflow_executions::table)
         .values(new_row)

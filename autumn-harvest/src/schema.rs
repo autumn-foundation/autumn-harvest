@@ -179,6 +179,21 @@ diesel::table! {
         /// of shards still holding a copy of this run's bytes. That is what a
         /// cross-residence payload erasure has to traverse.
         migrated_from_shards -> Nullable<Jsonb>,
+        /// Wall-clock a reconciler observed this seal's live copy as terminal
+        /// (issue #1317). NULL until observed.
+        ///
+        /// `is_active_conflict_state` treats `MIGRATED` as active forever, on
+        /// purpose -- the run is still live, just elsewhere. Nothing else
+        /// propagates the live copy's terminal completion back here, so a
+        /// start of the same business key attached to this seal forever, long
+        /// past the point the real run finished. Non-NULL releases the row
+        /// from that classification.
+        ///
+        /// Deliberately NOT a `state` change. Retention and erasure key off
+        /// `state = 'MIGRATED'` to protect the forwarding pointer from
+        /// deletion; this column carries the fact separately so that
+        /// protection stays intact.
+        migrated_run_terminal_at -> Nullable<Timestamptz>,
     }
 }
 

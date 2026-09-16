@@ -1266,7 +1266,20 @@ async fn watch_tool(
     // caught by the first notification instead of being lost. Continue-as-new
     // successors always live on the same shard, so one listener connection
     // covers the whole chain even if we later jump to a successor's exec_id.
-    let notification_url = match api_state.sse_notification_url(exec_id.shard()) {
+    //
+    // Resolved through the forwarding pointer, not `exec_id.shard()` (issue
+    // #1317): a rebalanced execution's origin shard is not where
+    // `load_owned_execution` below actually finds it, and this LISTEN
+    // connection must open against the same database or every notification
+    // for the chain is missed.
+    let Some(shard) = crate::api::resolve_shard_best_effort(&api_state, exec_id).await else {
+        return crate::api::map_error(autumn_harvest::error::HarvestError::ShardUnavailable {
+            shard_id: exec_id.shard().as_i32(),
+            reason: format!("could not resolve the current shard for {exec_id}"),
+        })
+        .into_response();
+    };
+    let notification_url = match api_state.sse_notification_url(shard) {
         Ok(url) => url,
         Err(e) => return crate::api::map_error(e).into_response(),
     };

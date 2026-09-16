@@ -140,6 +140,33 @@ pub async fn send_signal_idempotent(
                 // existing RETRYABLE classification (`HarvestError::is_shard_unavailable`),
                 // so the outbox leaves the row pending and tries again rather than
                 // failing the delivery permanently.
+                //
+                // `MIGRATING` covers two different moments (issue #1317). This
+                // row cannot tell them apart. `commit_cutover` writes only the
+                // SOURCE database, on purpose. That lets it commit even when
+                // the target is briefly unreachable. No distributed two-phase
+                // commit is needed.
+                //
+                // A connection resolved to the target sees the same
+                // `MIGRATING` row in both moments: before cutover, and after
+                // cutover but before activation.
+                //
+                // Accepting the write in the first moment is not safe. If the
+                // migration later aborts, the staged copy is discarded. This
+                // signal would go with it. The caller would see `Ok` for a
+                // signal that silently never existed.
+                //
+                // Refusing in the second moment is suboptimal, not unsafe.
+                // Activation normally follows cutover in the same call.
+                // `resume_incomplete_migrations` finishes the pair after a
+                // crash in between.
+                //
+                // Telling the two moments apart needs a source connection, or
+                // a target-side marker from `commit_cutover`. Callers of this
+                // function are not guaranteed a source connection. A
+                // target-side marker would revive the two-phase dependency
+                // cutover deliberately avoids. So this refuses both,
+                // retryably, rather than risk the unsafe one.
                 state @ ("MIGRATED" | "MIGRATING") => {
                     return Err(HarvestError::ShardUnavailable {
                         shard_id: exec_id.shard().as_i32(),

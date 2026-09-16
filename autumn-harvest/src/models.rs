@@ -239,6 +239,12 @@ pub struct WorkflowExecution {
     /// deliberately-collapsed `migrated_to_shard` pointer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migrated_from_shards: Option<serde_json::Value>,
+    /// Wall-clock a reconciler observed this seal's live copy as terminal
+    /// (issue #1317). `None` until observed; non-`None` releases the row
+    /// from active-conflict classification without changing `state`, so
+    /// retention and erasure keep treating it as a `MIGRATED` seal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migrated_run_terminal_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Serialize a nullable `start_source` column, reporting a `None` (pre-upgrade /
