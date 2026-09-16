@@ -1659,7 +1659,12 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                     crate::error::database_error(diesel::result::Error::RollbackTransaction)
                 })?;
             let target_shard = router.pick_for_new_workflow(&trigger_db.target_workflow_name, &target_workflow_id);
-            let source_shard = router.shard_for_execution(exec_id);
+            // The row's own residence, not the id's origin (issue #1317):
+            // `execution` was loaded from THIS connection above, so
+            // `execution.shard_id` is exactly where it lives, unlike
+            // `router.shard_for_execution(exec_id)`, which decodes the id's
+            // origin and does not see a completed rebalance.
+            let source_shard = crate::types::ShardId::new(execution.shard_id);
 
             // Resolve target metadata (owner, runbook_url, severity, sla, retry_policy)
             let (target_owner, target_runbook_url, target_severity, target_sla, target_retry_policy) = {

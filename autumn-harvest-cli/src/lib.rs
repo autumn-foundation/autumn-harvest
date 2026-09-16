@@ -1924,6 +1924,17 @@ enum ShardCommand {
         /// Report what would move without writing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Resume a prior call's candidate scan past this cursor (issue
+        /// #1317), instead of always starting at the shard's oldest
+        /// `RUNNING` row. Copy both fields verbatim from a prior report's
+        /// `next_scan_cursor`. Without this, a shard whose oldest rows are
+        /// permanently blocked (an active session, a parked child) makes
+        /// every repeated call re-examine the same rows forever.
+        #[arg(long, requires = "after_execution_id")]
+        after_created_at: Option<autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>>,
+        /// See `--after-created-at`; both must be supplied together.
+        #[arg(long, requires = "after_created_at")]
+        after_execution_id: Option<autumn_harvest::uuid::Uuid>,
         /// Print the raw JSON report instead of a human table.
         #[arg(long)]
         json: bool,
@@ -10020,6 +10031,8 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             to,
             limit,
             dry_run,
+            after_created_at,
+            after_execution_id,
             json,
         } => {
             let targets = parse_shard_targets(shards)?;
@@ -10031,7 +10044,10 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
                 ));
             }
             let pool = build_pool(&targets)?;
-            let report = autumn_harvest::shard_rebalance::migrate_quiescent_executions(
+            let after = after_created_at.zip(*after_execution_id).map(|(at, id)| {
+                (at, autumn_harvest::types::ExecutionId::from_uuid(id))
+            });
+            let report = autumn_harvest::shard_rebalance::migrate_quiescent_executions_after(
                 &pool,
                 ShardId::new(*from),
                 ShardId::new(*to),
@@ -10039,6 +10055,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
                 *dry_run,
                 actor.unwrap_or("anonymous"),
                 &PayloadCodecs::default(),
+                after,
             )
             .await
             .map_err(|e| CliError::InvalidInput(e.to_string()))?;
@@ -10120,6 +10137,15 @@ fn format_rebalance_report(
         report.skipped(),
         report.aborted()
     );
+    if let Some((at, id)) = report.next_scan_cursor {
+        let _ = writeln!(
+            out,
+            "more may remain past this window; resume with:\n  \
+             --after-created-at {} --after-execution-id {}",
+            at.to_rfc3339(),
+            id.as_uuid()
+        );
+    }
     out
 }
 

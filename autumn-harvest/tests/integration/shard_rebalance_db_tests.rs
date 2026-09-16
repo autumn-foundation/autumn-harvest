@@ -9,7 +9,7 @@
 //! - **AC1** (quiescent-only; wakes never lost, never doubled) —
 //!   [`a_non_quiescent_execution_is_skipped_with_named_blockers`],
 //!   [`a_signal_arriving_mid_migration_aborts_the_cutover_and_is_not_lost`],
-//!   [`a_signal_arriving_after_cutover_is_delivered_to_the_target`],
+//!   [`a_signal_arriving_after_cutover_is_retried_then_delivered_to_the_target`],
 //!   [`the_sql_cutover_predicate_agrees_with_the_pure_predicate`].
 //! - **AC2** (transactional copy + replay verification before cutover) —
 //!   [`a_timer_parked_execution_migrates_end_to_end`],
@@ -47,8 +47,9 @@ use autumn_harvest::shard_rebalance::{
     MigrationOutcome, MigrationPhase, QuiescenceBlocker, abort_migration, activate_target,
     assess_quiescence, begin_migration, commit_cutover, history_fingerprint,
     list_migration_candidates, load_migration, migrate_execution, migrate_quiescent_executions,
-    observe_quiescence, residence_chain, resolve_execution_shard, resume_incomplete_migrations,
-    stage_copy, verify_target_copy,
+    migrate_quiescent_executions_after, observe_quiescence, reconcile_migrated_seal_terminality,
+    residence_chain, resolve_execution_shard, resume_incomplete_migrations, stage_copy,
+    verify_target_copy,
 };
 use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
@@ -642,6 +643,99 @@ async fn a_schema_mismatch_refuses_the_copy_before_anything_is_written() {
     );
 }
 
+struct XorCodec(u8);
+
+impl autumn_harvest::payload_codec::PayloadCodec for XorCodec {
+    fn codec_id(&self) -> &'static str {
+        "xor-test-codec"
+    }
+    fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+        Ok(raw.iter().map(|b| b ^ self.0).collect())
+    }
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+        Ok(encoded.iter().map(|b| b ^ self.0).collect())
+    }
+}
+
+#[tokio::test]
+async fn verification_degrades_to_the_raw_copy_check_when_the_codec_is_unregistered() {
+    // Issue #1317: `harvest shard rebalance`/`rebalance-resume` pass
+    // `PayloadCodecs::default()` (identity-only) into verification. A
+    // deployment that encodes its payloads under its own codec -- as any
+    // encrypted-at-rest deployment does -- cannot be decoded by that
+    // default registry. Before this fix, `verify_target_copy` propagated
+    // the resulting `UnknownPayloadCodec`/`UnknownCodecKey` error and
+    // refused to migrate at all, for every such deployment.
+    let shards = setup_two_shards().await;
+    let mut app_codecs = PayloadCodecs::default();
+    app_codecs.set_default(std::sync::Arc::new(XorCodec(0x5a)));
+
+    let mut source = shards.source().await;
+    let exec_id = insert_execution(&mut source, "entity_flow", "encrypted-payloads").await;
+    let start_event = started(json!({"seed": 1}));
+    store::append_events_with_codecs(
+        &mut source,
+        exec_id,
+        std::slice::from_ref(&start_event),
+        0,
+        &app_codecs,
+    )
+    .await
+    .expect("append events under the app's own codec");
+    park_on_timer(&mut source, exec_id).await;
+
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    let mut target = shards.target().await;
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+
+    // The CLI's registry, which knows nothing of the application's codec.
+    let cli_codecs = codecs();
+    let fingerprint = verify_target_copy(&mut source, &mut target, exec_id, &cli_codecs)
+        .await
+        .expect(
+            "verification must degrade to the raw byte-identity check, not refuse to \
+             migrate an encrypted deployment outright",
+        );
+    assert!(
+        fingerprint.starts_with("raw:"),
+        "a degraded verification must say so in its fingerprint: {fingerprint}"
+    );
+
+    assert_eq!(
+        load_migration(&mut source, exec_id)
+            .await
+            .expect("load migration")
+            .expect("record exists")
+            .phase,
+        MigrationPhase::Verified,
+        "the migration must still advance to VERIFIED"
+    );
+
+    assert!(
+        commit_cutover(&mut source, exec_id, TARGET)
+            .await
+            .expect("cutover")
+    );
+    activate_target(&mut source, &mut target, exec_id)
+        .await
+        .expect("activate");
+
+    // The target's copy, decoded under the APPLICATION's real codec, is
+    // exactly what was written -- the raw check verified real bytes, not a
+    // vacuous pass.
+    let target_history = store::load_history_with_codecs(&mut target, exec_id, &app_codecs)
+        .await
+        .expect("decode with the real codec");
+    assert_eq!(
+        serde_json::to_value(&target_history.events).unwrap(),
+        serde_json::to_value(vec![start_event]).unwrap()
+    );
+}
+
 // ── AC3: the seal ────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -772,7 +866,27 @@ async fn a_signal_arriving_mid_migration_aborts_the_cutover_and_is_not_lost() {
 }
 
 #[tokio::test]
-async fn a_signal_arriving_after_cutover_is_delivered_to_the_target() {
+async fn a_signal_arriving_after_cutover_is_retried_then_delivered_to_the_target() {
+    // Issue #1317: the prior version of this test seeded the post-cutover
+    // signal with `deliver_signal`, a raw insert into `harvest_signals`.
+    // That never goes through `signal::send_signal_idempotent`, the
+    // engine's real write path.
+    //
+    // So it proved "a signal row already present at activation is
+    // scheduled promptly" (real, and still asserted below). It did not
+    // prove "a signal arriving after cutover is delivered". The production
+    // path would have refused to create that row at all, in the
+    // `"MIGRATED" | "MIGRATING"` branch in `signal.rs`. This test never
+    // drove that branch.
+    //
+    // Rewritten to call the real path. `send_signal_idempotent`, on a
+    // connection resolved to the target, still sees `state = 'MIGRATING'`
+    // there. Cutover writes only the source; activation is what flips the
+    // target to `RUNNING`. The function cannot locally tell "staged, not
+    // yet cut over" apart from "cut over, awaiting activation" — see
+    // `signal.rs` for why. It refuses, retryably, either way. That is
+    // documented, intentional behavior, not a bug this change closes. The
+    // retry succeeds once activation runs.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "entity-late").await;
     let (mut source, mut target) = (shards.source().await, shards.target().await);
@@ -793,30 +907,63 @@ async fn a_signal_arriving_after_cutover_is_delivered_to_the_target() {
     );
 
     // Past the cutover, an id-routed write resolves through the seal to the
-    // target — which is where the signal lands.
+    // target — which is where the signal must land, eventually.
     let resolved = resolve_execution_shard(&shards.pool, exec_id)
         .await
         .expect("resolve");
     assert_eq!(resolved, TARGET);
-    deliver_signal(&mut target, exec_id, "poke", None).await;
 
-    // Activation must notice the pending wake and schedule it NOW rather than
-    // leaving it waiting on a timer seven days out.
+    // The real engine path, on a connection already resolved to the target:
+    // refused, retryably, before activation runs.
+    let refused = autumn_harvest::signal::send_signal_idempotent(
+        &mut target,
+        exec_id,
+        "poke",
+        serde_json::Value::Null,
+        None,
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(HarvestError::ShardUnavailable { .. })),
+        "a signal on the target must be refused, retryably, before activation: {refused:?}"
+    );
+    assert_eq!(
+        count(
+            &mut target,
+            "SELECT count(*)::BIGINT AS value FROM harvest_signals WHERE workflow_exec_id = $1",
+            exec_id
+        )
+        .await,
+        0,
+        "a refused send must roll back its own insert, not leave an orphaned row"
+    );
+
+    // Activation flips the target to `RUNNING`, closing the refusal window.
     activate_target(&mut source, &mut target, exec_id)
         .await
         .expect("activate");
 
-    let due_now = count(
+    // The retry, on the now-`RUNNING` target, succeeds.
+    let delivered = autumn_harvest::signal::send_signal_idempotent(
         &mut target,
-        "SELECT count(*)::BIGINT AS value FROM harvest_task_queue \
-          WHERE workflow_exec_id = $1 AND task_type = 'workflow' \
-            AND state = 'PENDING' AND scheduled_at <= NOW()",
         exec_id,
+        "poke",
+        serde_json::Value::Null,
+        None,
     )
-    .await;
+    .await
+    .expect("the retry must succeed once activation has run");
+    assert!(delivered, "a fresh, non-keyed send is always delivered");
     assert_eq!(
-        due_now, 1,
-        "the post-cutover wake must be dispatchable, not lost"
+        count(
+            &mut target,
+            "SELECT count(*)::BIGINT AS value FROM harvest_signals \
+              WHERE workflow_exec_id = $1 AND NOT consumed",
+            exec_id
+        )
+        .await,
+        1,
+        "the signal must persist on the target once it is live, not be lost"
     );
 
     // Never doubled: the source has no copy of it and nothing claimable.
@@ -1463,10 +1610,103 @@ async fn the_batch_is_bounded_by_its_limit_and_reports_every_outcome() {
 
     // The remaining three are still on the source and still eligible.
     let mut source = shards.source().await;
-    let remaining = list_migration_candidates(&mut source, 100)
+    let remaining = list_migration_candidates(&mut source, 100, None)
         .await
         .expect("candidates");
     assert_eq!(remaining.iter().filter(|c| c.is_eligible()).count(), 3);
+}
+
+#[tokio::test]
+async fn repeating_the_batch_command_advances_past_a_blocked_prefix() {
+    // Issue #1317: before this fix, the scan always restarted at the
+    // shard's oldest `RUNNING` row. A busy shard's oldest rows are exactly
+    // the population most likely to be permanently blocked (an active
+    // session, a parked child), so they filled the whole `scan_limit`
+    // window on every call -- and no amount of repeating the documented
+    // batch command ever reached an eligible row sitting behind that
+    // prefix, because nothing ever moved the window forward.
+    let shards = setup_two_shards().await;
+    let mut source = shards.source().await;
+
+    // Four OLDER executions, permanently blocked: a worker holds their task
+    // claim indefinitely (the same trick
+    // `a_non_quiescent_execution_is_skipped_with_named_blockers` uses). Four,
+    // not fewer, because `migrate_quiescent_executions` scans `limit * 4`
+    // (clamped) -- with `limit = 1` that is exactly this prefix's size, so
+    // the first call's window is entirely consumed by blocked rows.
+    for n in 0..4 {
+        let exec_id = quiescent_fixture(&shards, &format!("blocked-{n}")).await;
+        diesel::sql_query(
+            "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'stuck-worker', \
+                    scheduled_at = NOW(), started_at = NOW() \
+              WHERE workflow_exec_id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut source)
+        .await
+        .expect("claim");
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions SET created_at = NOW() - INTERVAL '2 hours' \
+              WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut source)
+        .await
+        .expect("backdate");
+    }
+
+    // One NEWER execution, genuinely eligible.
+    let eligible_id = quiescent_fixture(&shards, "eligible-behind-the-blocked-prefix").await;
+
+    // First call: `limit` is small enough that `scan_limit` (4x, per the
+    // batch's own headroom policy) exactly covers the blocked prefix. Both
+    // examined rows are named `Skipped` with their blocker -- the scan is
+    // NOT made tighter to exclude them; an operator still sees why each one
+    // did not move.
+    let first =
+        migrate_quiescent_executions(&shards.pool, SOURCE, TARGET, 1, true, "tester", &codecs())
+            .await
+            .expect("first dry run");
+    assert_eq!(first.examined, 4, "the blocked prefix fills this window");
+    assert_eq!(first.skipped(), 4);
+    assert_eq!(first.would_migrate(), 0);
+    let cursor = first
+        .next_scan_cursor
+        .expect("a full window must offer a cursor to resume past");
+
+    // Repeating the SAME command with the SAME limit and no cursor would
+    // find the identical two blocked rows forever -- confirm that directly.
+    let repeated_without_cursor =
+        migrate_quiescent_executions(&shards.pool, SOURCE, TARGET, 1, true, "tester", &codecs())
+            .await
+            .expect("repeated dry run");
+    assert_eq!(
+        repeated_without_cursor.would_migrate(),
+        0,
+        "without the cursor, the scan restarts at the same blocked prefix"
+    );
+
+    // With the cursor, the SAME command finds the eligible execution.
+    let resumed = migrate_quiescent_executions_after(
+        &shards.pool,
+        SOURCE,
+        TARGET,
+        1,
+        true,
+        "tester",
+        &codecs(),
+        Some(cursor),
+    )
+    .await
+    .expect("resumed dry run");
+    assert_eq!(resumed.examined, 1);
+    assert_eq!(resumed.would_migrate(), 1);
+    match &resumed.outcomes[0] {
+        MigrationOutcome::WouldMigrate { execution_id } => {
+            assert_eq!(*execution_id, eligible_id);
+        }
+        other => panic!("expected WouldMigrate, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -2019,6 +2259,165 @@ async fn a_terminate_existing_start_refuses_a_rebalanced_prior_instead_of_replac
     assert_eq!(authoritative_shards(&shards, exec_id).await, vec![TARGET]);
 }
 
+// ── Issue #1317: a completed migrated run must release its business key ─────
+
+#[tokio::test]
+async fn a_seal_whose_live_copy_never_finished_is_not_reconciled() {
+    // Guards the reconciler itself against the false-positive direction:
+    // a still-live target must never be marked observed-terminal.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "still-running").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut source = shards.source().await;
+    let reconciled = reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id)
+        .await
+        .expect("reconcile must not fail merely because the live copy is still running");
+    assert!(!reconciled, "a live, non-terminal target must not be reconciled");
+}
+
+#[tokio::test]
+async fn a_terminate_if_running_start_creates_a_fresh_run_once_the_migrated_prior_finishes() {
+    // Before issue #1317's fix, `MIGRATED` was an active conflict FOREVER:
+    // nothing ever noticed the live copy had finished, so this same start
+    // request kept hitting the terminate-branch's `ShardUnavailable` refusal
+    // for as long as the source shard existed. This is the plainest form of
+    // the bug: an ordinary "run it again" the day after it finished.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "run-me-again").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    // The live copy finishes on the target.
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("complete the migrated run");
+
+    // RED: before reconciliation runs, the seal still looks permanently
+    // active, so the start is still refused exactly as it was pre-fix.
+    let mut source = shards.source().await;
+    let still_refused = autumn_harvest::execution::start_or_load_workflow_execution(
+        &mut source,
+        terminate_if_running_start("entity_flow", "run-me-again"),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(still_refused, Err(HarvestError::ShardUnavailable { .. })),
+        "precondition: an un-reconciled seal must still behave exactly as before, got \
+         {still_refused:?}"
+    );
+
+    let reconciled = reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id)
+        .await
+        .expect("reconcile");
+    assert!(reconciled, "the finished target must be observed terminal");
+
+    // GREEN: the same request now creates a fresh run instead of attaching
+    // to, or being refused by, the dead seal.
+    let started = autumn_harvest::execution::start_or_load_workflow_execution(
+        &mut source,
+        terminate_if_running_start("entity_flow", "run-me-again"),
+        None,
+    )
+    .await
+    .expect("a start over an observed-terminal seal must succeed");
+    assert!(started.created, "must be a fresh run, not an attach to the old seal");
+    assert_ne!(
+        started.exec_id, exec_id,
+        "the fresh run must be a distinct execution from the migrated one"
+    );
+    assert_eq!(started.state, "RUNNING");
+
+    // The seal itself is untouched: `replace_execution` must never overwrite
+    // a MIGRATED row's state, or the forwarding pointer loses retention's
+    // and erasure's protection.
+    assert_eq!(
+        state_of(&mut source, exec_id).await.as_deref(),
+        Some("MIGRATED"),
+        "the seal's state must stay MIGRATED, never CONTINUED_AS_NEW"
+    );
+    assert_eq!(forward_of(&mut source, exec_id).await, Some(TARGET.as_i32()));
+
+    // A second reconcile is a no-op, and a second start of the same key
+    // reaches the now-active fresh run, not a duplicate-insert error.
+    let reconciled_again = reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id)
+        .await
+        .expect("reconcile");
+    assert!(!reconciled_again, "reconciling an already-marked seal is a no-op");
+}
+
+fn terminate_if_running_start<'a>(
+    workflow_name: &'a str,
+    workflow_id: &'a str,
+) -> autumn_harvest::execution::StartWorkflowParams<'a> {
+    autumn_harvest::execution::StartWorkflowParams {
+        reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::TerminateIfRunning,
+        conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+        ..terminate_existing_start(workflow_name, workflow_id)
+    }
+}
+
+#[tokio::test]
+async fn an_allow_duplicate_start_creates_a_fresh_run_too_once_the_seal_is_reconciled() {
+    // `AllowDuplicate` attaches to any VISIBLE non-sealed prior, terminal or
+    // not -- it never replaces one. Once a seal is observed-terminal it is
+    // released from the active-uniqueness slot the SAME way a `sealed`
+    // (`CONTINUED_AS_NEW`/`TERMINATED`) prior already is, so every reuse
+    // policy sees "no prior occupies this key" uniformly, the same as they
+    // already do for a sealed row. `AllowDuplicate` therefore also gets a
+    // fresh run here, not the stale seal's un-refreshed data -- attaching to
+    // it would hand back a row whose `output`/`completed_at` were never
+    // populated (the real result lives on the target), so a fresh run is
+    // the more useful outcome, not merely an accepted side effect.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "allow-duplicate-me").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("complete the migrated run");
+
+    let mut source = shards.source().await;
+    reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id)
+        .await
+        .expect("reconcile")
+        .then_some(())
+        .expect("the finished target must be observed terminal");
+
+    let started = autumn_harvest::execution::start_or_load_workflow_execution(
+        &mut source,
+        terminate_existing_start("entity_flow", "allow-duplicate-me"),
+        None,
+    )
+    .await
+    .expect("AllowDuplicate over an observed-terminal seal must succeed");
+    assert!(started.created);
+    assert_ne!(started.exec_id, exec_id);
+    assert_eq!(
+        state_of(&mut source, exec_id).await.as_deref(),
+        Some("MIGRATED"),
+        "the seal's state must stay MIGRATED"
+    );
+}
+
 #[tokio::test]
 async fn a_business_key_target_resolves_through_the_seal_to_the_live_copy() {
     // A `WorkflowId` target hashes to a fixed shard, and that shard is exactly
@@ -2519,6 +2918,89 @@ async fn aborting_before_staging_ever_touched_the_target_leaves_its_seal_untouch
         .await
             > 0,
         "A's own pre-migration history must survive an abort that never staged over it"
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_abort_finishes_a_target_cleanup_a_prior_attempt_did_not() {
+    // Issue #1317: `abort_migration` claims the abort (phase -> ABORTED, on
+    // the source) BEFORE cleaning up the target's staged copy. Those are two
+    // separate commits against two separate databases, so a target-cleanup
+    // failure -- a dropped connection, say -- after the claim already
+    // committed used to strand the record: `resume_incomplete_migrations`
+    // excludes ABORTED, and a repeated `abort_migration` call refused
+    // outright because the claim UPDATE could no longer match a
+    // non-ABORTED phase. Neither path could ever finish the cleanup.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "abort-retry-me").await;
+
+    begin_migration(&mut shards.source().await, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(
+        &mut shards.source().await,
+        &mut shards.target().await,
+        exec_id,
+        TARGET,
+    )
+    .await
+    .expect("stage");
+
+    // Simulate a claim that committed followed by a cleanup that never ran:
+    // run exactly the claim UPDATE `abort_migration` itself runs, without
+    // calling `abort_migration` at all.
+    let mut source = shards.source().await;
+    let claimed = diesel::sql_query(
+        "UPDATE harvest_shard_migrations \
+            SET phase = 'ABORTED', abort_reason = $2, staged_task = NULL, updated_at = NOW() \
+          WHERE execution_id = $1 AND phase IN ('PENDING', 'COPIED', 'VERIFIED')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>("simulated dropped connection")
+    .execute(&mut source)
+    .await
+    .expect("simulated claim");
+    assert_eq!(claimed, 1, "precondition: the claim itself must succeed");
+
+    // Precondition: the target's staged copy is still fully intact -- the
+    // cleanup this record's phase claims already happened never actually ran.
+    let mut target = shards.target().await;
+    assert!(
+        count(
+            &mut target,
+            "SELECT count(*)::BIGINT AS value FROM harvest_events WHERE workflow_exec_id = $1",
+            exec_id
+        )
+        .await
+            > 0,
+        "precondition: the staged copy must still be sitting on the target"
+    );
+
+    // A later call -- an operator re-running the same command, or an
+    // automated retry -- must finish the cleanup instead of refusing.
+    abort_migration(&mut source, &mut target, exec_id, "operator retry")
+        .await
+        .expect("a repeated abort must retry the target cleanup, not refuse");
+
+    assert_eq!(
+        count(
+            &mut target,
+            "SELECT count(*)::BIGINT AS value FROM harvest_events WHERE workflow_exec_id = $1",
+            exec_id
+        )
+        .await,
+        0,
+        "the target's staged copy must be cleaned up by the retry"
+    );
+    assert_eq!(
+        count(
+            &mut target,
+            "SELECT count(*)::BIGINT AS value FROM harvest_workflow_executions WHERE id = $1",
+            exec_id
+        )
+        .await,
+        0,
+        "a forward migration's staged row has no seal to restore, so it must be gone"
     );
 }
 
