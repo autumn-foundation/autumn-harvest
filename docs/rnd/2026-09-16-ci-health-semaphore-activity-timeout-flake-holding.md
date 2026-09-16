@@ -1,14 +1,15 @@
-# 🚦 Semaphore CI health — activity-timeout flake holds at 0/3 confirmed
-# shard-8 executions (not 0/15, not 0/23 — most job-logged failures never
-# ran the tracked test at all) spanning PR #1563's merge, and a stale
-# migration count blocked one branch three commits running (its panic
-# message's own self-contradiction is a separate, unrelated bug)
+# 🚦 Semaphore CI health — activity-timeout flake holds at 0/1 confirmed
+# assertion exposure (not 0/3, not 0/15, not 0/23 — most job-logged
+# failures never ran the tracked test, and two of three shard-8 runs
+# crashed before reaching its assertion) spanning PR #1563's merge, and a
+# stale migration count blocked one branch three commits running (its
+# panic message's own self-contradiction is a separate, unrelated bug)
 
 **Status:** health report — no PR opened against `ci.yml` or any test. Continues
 the series in `docs/rnd/2026-09-0[3-8]-ci-health-semaphore*.md` through
 `docs/rnd/2026-09-15-ci-health-semaphore-window-census.md`.
 
-**Corrected seven times after review** (Codex on PR #1599): the initial
+**Corrected eight times after review** (Codex on PR #1599): the initial
 draft overclaimed a full 100-run job-level census when only 23 runs were
 actually job-logged (restated twice more after later drafts reintroduced
 the same "full census" wording at other locations); overstated branch
@@ -22,19 +23,20 @@ report's own section heading); claimed the tracked event-history
 assertion could no longer fire post-#1563, when the source still has a
 catch-all panic arm; conflated two entirely different branches in item 3,
 crediting one branch's later unrelated failures to a different branch's
-single, isolated occurrence; and, most substantively, treated "job-logged"
-as equivalent to "actually ran the tracked test" — `test-db-linux` needs
-`[lint, changes]` and is skipped, not run, whenever `lint` fails, which it
-did in 13 of the 15 explicit failures this report counted. Rechecking
-which runs actually executed shard 8 (where the tracked test lives) found
-only 3 in the entire window, not 15 or 23 — one clean pass, two failures
-via one unrelated already-fixed defect, also uncovering that one of those
-runs (`35063499036`) had been mischaracterized as a single-signature
-failure when it actually carried 12 failed jobs across two unrelated
-defects. Each correction is called out inline below at the point it
-applies, verified against source, raw job logs, or direct `curl` of signed
-log URLs rather than taken on faith — the pattern this series' own prior
-reports already follow.
+single, isolated occurrence; treated "job-logged" as equivalent to
+"actually ran the tracked test" — `test-db-linux` needs `[lint, changes]`
+and is skipped, not run, whenever `lint` fails, which it did in 13 of the
+15 explicit failures this report counted, narrowing confirmed shard-8
+executions from 15 or 23 down to 3; and, most substantively of all, that
+same fix reintroduced the branch-conflation error (crediting two branches'
+executions to one) and still overstated exposure at "0/3" — two of those
+three executions crashed in shared setup at `integration_e2e.rs:729:10`,
+before ever reaching the tracked assertion at line 3567, so only **one**
+execution (`35034838493`) actually exercised it. The honestly supported
+figure is **0/1**, not 0/3, 0/15, or 0/23. Each correction is called out
+inline below at the point it applies, verified against source, raw job
+logs, or direct `curl` of signed log URLs rather than taken on faith —
+the pattern this series' own prior reports already follow.
 
 ## 🎯 Verdict path
 
@@ -115,17 +117,34 @@ run's overall conclusion:
 Combined with the cancelled-run audit's `35072771791` (shard 8 also ran,
 also hit the identical missing-column defect, not the tracked signature —
 see below), this window's **actually-confirmed shard-8 executions total
-3, not 15 or 23**: one clean pass, two failures via one unrelated,
-already-diagnosed, since-fixed defect. Notably all three are the *same
-branch*'s (`claude/hopeful-pascal-tbijcf`) successive commits — the clean
-pass predates that branch's schema regression, the two failures postdate
-it and predate its fix. This is a much thinner evidentiary base than "0/23"
-implied: most of the window's 100 runs (all 13 `Lint`-failing explicit
-failures, most of the 55 cancelled runs per the audit below, and all 30
-successful runs — unverified this session whether their `test-db-linux`
-step actually executed rather than being skipped as docs-only) give no
-information either way about whether the tracked signature recurred. The
-honest statement is 0/3 confirmed executions, not 0/15 or 0/23.
+3, not 15 or 23**.
+
+**Correction (post-review), two more errors in the paragraph above at
+first draft.** First — reintroducing a branch-conflation this report's
+own item 3 already corrected — `35034838493` runs on
+`claude/too-many-lines-followup`; only `35063499036` and `35072771791`
+are `claude/hopeful-pascal-tbijcf`'s successive commits. The three
+executions span **two branches**, not one: a single sampled run from one
+branch, and two successive commits from a different branch. Second, and
+more importantly: two of the three (`35063499036`, `35072771791`) panic
+at `integration_e2e.rs:729:10`, in the shared workflow-reload helper the
+test calls **before** ever reaching the event-history `match` at line
+3567 (confirmed directly in both logs above). A test that aborts before
+its own assertion runs had **zero opportunity** to exhibit that
+assertion's tracked signature — counting those two as "non-recurrences"
+overstates the evidence exactly the way an untested code path would.
+**Only `35034838493` actually exercised the assertion** (it passed
+cleanly, meaning it reached line 3567 and matched one of the two accepted
+event shapes). The honestly supported exposure count is **0/1**, not 0/3
+— one confirmed opportunity for the signature to appear, and it didn't.
+This is a far thinner evidentiary base than any of this report's earlier
+"0/15" or "0/23" framings implied: most of the window's 100 runs (all 13
+`Lint`-failing explicit failures, most of the 55 cancelled runs per the
+audit below, all 30 successful runs — unverified this session whether
+their `test-db-linux` step actually executed rather than being skipped as
+docs-only — and now also the 2 of 3 "executions" that crashed before
+reaching the assertion) give no information either way about whether the
+tracked signature recurred.
 
 **This is not the rerun campaign issue #1558 asked for** — it is
 frequency-in-the-wild evidence over calendar time and a shifting set of
@@ -338,21 +357,25 @@ suite-state interaction, no timing component, no order dependence.
 
 **Item 1** is not yet a rendered verdict on PR #1563's fix — that still
 requires the rerun campaign issue #1558 asked for and never got.
-**Correction (post-review), superseding two earlier drafts of this
+**Correction (post-review), superseding three earlier drafts of this
 sentence:** the first draft called the window a "full (not sampled)
 two-day failure census"; the second walked that back to "23 runs actually
-inspected." Both overstate the evidence. The real denominator is not
-"runs job-logged," it is "runs where `test-db-linux` actually executed" —
-and per the Symptom section's correction above, only 3 runs in this
-entire window are confirmed to have done that (`35034838493`,
-`35063499036`, and the cancelled run `35072771791`), all three on the
-same branch's successive commits. Of those 3: one passed the tracked test
-cleanly, two failed via one unrelated, already-diagnosed, since-fixed
-schema defect. **0/3, not 0/15 and not 0/23.** That is directionally
-consistent with the fix holding — no occurrence contradicts it — but it
-is a far thinner base than the frequency-in-the-wild framing this report
-originally claimed, and nowhere near issue #1558's own ≥20x rerun-campaign
-bar. Recorded as a data point for whoever next has the ability to run
+inspected"; the third to "3 runs confirmed to execute `test-db-linux`,"
+still crediting all three to one branch's successive commits when
+`35034838493` is actually a different branch's sole sampled run (two
+branches, not one). All three overstate the evidence, and the third
+missed a further gap: two of those three runs (`35063499036`,
+`35072771791`) panic at `integration_e2e.rs:729:10`, in shared setup,
+**before** the test ever reaches the event-history assertion at line
+3567 — they had no opportunity to exhibit the tracked signature, so
+counting them as non-recurrences is itself an overclaim. Only
+`35034838493` actually exercised the assertion, and it passed. The
+correct figure is **0/1 confirmed exposure**, not 0/3, 0/15, or 0/23.
+That is directionally consistent with the fix holding — the one real
+data point does not contradict it — but it is an extremely thin base,
+nowhere close to the frequency-in-the-wild framing this report originally
+claimed, and nowhere near issue #1558's own ≥20x rerun-campaign bar.
+Recorded as a data point for whoever next has the ability to run
 the actual rerun campaign, not
 claimed as a Tier-1 confirmation.
 
@@ -427,26 +450,32 @@ Items carried forward, unchanged from the 09-08/09-14/09-15 reports:
 
 ## 📊 Measurement
 
-- **Item 1: correction (post-review), third pass.** Two earlier drafts of
-  this line claimed first "100/100 runs... individually job-logged (full
-  census)," then "23 runs actually job-logged, 0/23 carry the signature."
-  Both overstate the evidence: `job-logged` is not the same as `actually
-  executed the tracked test`. `test-db-linux` needs `[lint, changes]`
-  (`ci.yml:948-950`) and is skipped, not run, when `lint` fails —
-  confirmed directly via `list_workflow_jobs` on run `34891219422`, whose
-  `Test DB` legs all show `conclusion: "skipped"`. Of the 15 explicit
-  failures, 13 failed inside `lint` itself, so shard 8 (where the tracked
-  test lives) never ran in any of them. Only 3 runs in the entire window
-  are confirmed to have actually executed shard 8: `35034838493` (tracked
-  test passed — `... ok`, confirmed by direct log grep),
-  `35063499036`, and the cancelled run `35072771791` (both of the latter
-  failed via the same unrelated, already-diagnosed, since-fixed
-  missing-column defect, not the tracked signature). **The correct figure
-  is 0/3, not 0/15 and not 0/23.** The 30 successful runs and the
-  remaining 47 unaudited cancelled runs in this window were not checked
-  for whether `test-db-linux` actually executed versus was skipped, so
-  they add no confirmed exposure either way. Not a same-commit rerun — no
-  revert check applies, since no fix was made or verified this session.
+- **Item 1: correction (post-review), fourth pass.** Three earlier drafts
+  of this line claimed, in turn, "100/100 runs... individually job-logged
+  (full census)," then "23 runs actually job-logged, 0/23 carry the
+  signature," then "3 runs confirmed to execute `test-db-linux`, 0/3
+  carry the signature" (while also wrongly crediting all 3 to one
+  branch's successive commits — `35034838493` is actually a different
+  branch's sole sampled run). Each overstated the evidence. `job-logged`
+  is not `executed the tracked test`: `test-db-linux` needs
+  `[lint, changes]` (`ci.yml:948-950`) and is skipped, not run, when
+  `lint` fails — confirmed directly via `list_workflow_jobs` on run
+  `34891219422`, whose `Test DB` legs all show `conclusion: "skipped"`.
+  Of the 15 explicit failures, 13 failed inside `lint` itself, leaving
+  only 3 runs confirmed to execute shard 8 at all: `35034838493`
+  (`claude/too-many-lines-followup`) and `35063499036` plus the cancelled
+  run `35072771791` (both `claude/hopeful-pascal-tbijcf`, successive
+  commits). But `executed shard 8` is still not `exercised the tracked
+  assertion`: the latter two panic at `integration_e2e.rs:729:10`, in
+  shared setup, before the test ever reaches the event-history `match` at
+  line 3567 — direct log inspection confirms this, not inference. Only
+  `35034838493` actually reached that assertion, and passed. **The
+  correct figure is 0/1, not 0/3, 0/15, or 0/23.** The 30 successful runs
+  and the remaining 47 unaudited cancelled runs in this window were not
+  checked for whether `test-db-linux` actually executed versus was
+  skipped, so they add no confirmed exposure either way. Not a
+  same-commit rerun — no revert check applies, since no fix was made or
+  verified this session.
 - **Item 2:** 3/3 occurrences on one branch confirmed identical panic text
   (`"**107 migrations**"` on both sides) via direct job-log inspection.
 - **Item 3:** 1/1, not a rate.
@@ -484,9 +513,9 @@ Items carried forward, unchanged from the 09-08/09-14/09-15 reports:
   either. 0/2 hidden cancelled-run failures (of the 8-run sample actually
   inspected) carry it either. **None of this changes item 1's own
   denominator correction above**: these 15/2 counts are over runs that
-  failed for *some* reason, not runs that actually executed the tracked
-  test — the operative figure for "did the flake recur" is item 1's 0/3
-  confirmed shard-8 executions, not any count phrased in fifteenths.
+  failed for *some* reason, not runs that actually reached the tracked
+  assertion — the operative figure for "did the flake recur" is item 1's
+  0/1 confirmed exposure, not any count phrased in fifteenths (or thirds).
 
 ## 🔬 Reproduce
 
@@ -597,4 +626,20 @@ sed -n '940,955p' .github/workflows/ci.yml   # test-db-linux: needs: [lint, chan
 # get_job_logs(job_id=104694905315, return_content=false) -> shard 8 of
 #   35063499036; curl + grep "does not exist" -> same missing-column
 #   defect as 35072771791, 106 occurrences in the log.
+
+# The "executed shard 8" != "exercised the assertion" check (a further
+# Codex-flagged gap): confirm exactly where each of the 3 executions'
+# panic/pass actually happened relative to the test's own assertion.
+grep -n "panicked at" /tmp/run35063499036_shard8.log | \
+  grep "worker_fails_workflow_when_activity_start_to_close_timeout_elapses"
+# -> integration_e2e.rs:729:10 (the shared reload helper), same for
+#    35072771791's shard8.log. Compare against the assertion's own
+#    location and catch-all arm:
+sed -n '3560,3588p' autumn-harvest/tests/integration/integration_e2e.rs
+# -> the match starts at 3567, the catch-all panic arm is at 3587-3588 --
+#    both occurrences panicked at 729, well before reaching 3567, so
+#    neither had the opportunity to hit 3587. Only 35034838493's shard 8
+#    (branch claude/too-many-lines-followup, not hopeful-pascal-tbijcf --
+#    corrected after this report initially credited it to the wrong
+#    branch) actually reached and passed the assertion.
 ```
