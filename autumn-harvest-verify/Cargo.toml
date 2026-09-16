@@ -30,5 +30,13 @@ tempfile = "3"
 name = "cargo-harvest-verify"
 path = "src/bin/cargo_harvest_verify.rs"
 
+# Non-criterion instruction/allocation-count profiling harness for `verify()`
+# (issue #962). `harness = false`, own `main()` -- same shape as
+# `autumn-harvest`'s `verify_profile.rs` -- so the compiled artifact is a plain
+# executable a profiler can be pointed at directly.
+[[bench]]
+name = "analyze_profile"
+harness = false
+
 [lints]
 workspace = true
