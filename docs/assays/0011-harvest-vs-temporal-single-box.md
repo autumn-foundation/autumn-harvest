@@ -143,7 +143,15 @@ one out.
 | 250 | 23.64 | 22.60 | 36.17 | 1.53x |
 | 500 | 23.90 | 21.82 | 34.56 | 1.45x |
 | 1,000 | 13.93 | 22.58 | 45.80 | 2.03x |
-| 2,000 | 5.60 | 21.84 | 43.29 | 1.98x |
+| 2,000 | 5.60 | 21.84 | 43.29 † | 1.98x |
+
+† **One cell aggregates differently from the rest.** Every other Temporal cell
+is a single repetition; the 2,000 cell is the registered sweep's three-repetition
+mean (48.95 / 39.28 / 41.66), because that sweep already measured this depth
+properly and discarding it for consistency would be discarding the better
+number. Against a ~25% spread that matters, so the 1.98x cell is not directly
+comparable to the rows above it. Its single-repetition span would be 2.24x to
+1.80x taken from the same three repetitions.
 
 Re-measuring **strengthened** the result rather than softening it. The old
 250-row cell read 28.85 for Temporal and now reads 36.17, so the shallowest
@@ -175,9 +183,9 @@ Three things this separates, none of which the registered line could:
 to omit.** The measured window opens before the worker starts, on both arms,
 so worker startup is charged inside every repetition. Temporal's startup is a
 gRPC client, a sticky cache and a poller fleet; harvest's is in-process. At
-depth 250 the whole Temporal drain is 8.67 s, so startup is a large fraction
-of it, and the 28.85 cell is therefore an **understatement**. The shallow-depth
-cells flatter harvest, and the true 1.22x is narrower still.
+depth 250 the whole Temporal drain is 6.91 s, so startup is a large fraction
+of it, and the 36.17 cell is therefore an **understatement**. The shallow-depth
+cells flatter harvest, and the true 1.53x is wider still.
 
 ### What this does and does not license
 
@@ -206,8 +214,8 @@ may assume without evidence.
    first re-charter. The drain shape is the one #941 rejected.
 2. **The comparison after the `#1177` claim-path defect is fixed.** This assay
    bounds what fixing it would buy: harvest's default mode would move from
-   5.63 to something near its Redis arm's flat 22, which would take the margin
-   from 6.9x to roughly 1.8x at depth 2,000. That is the single highest-value
+   5.60 to something near its Redis arm's flat 22, which would take the margin
+   at depth 2,000 from 7.7x to roughly 2x. That is the single highest-value
    performance fix this assay found.
 3. **A tuned Temporal arm**, configured by someone who operates Temporal, so
    the competitor number stops being a floor.
