@@ -105,13 +105,24 @@ harvest_workflow_executions.migrated_run_terminal_at does not exist")` —
 the same missing-column defect that cascaded through essentially every
 test in that shard's run (dozens of other tests fail at the identical
 line and message in the same log). This is **not** the tracked
-event-history-mismatch signature (which panics inside the test's own
-`matches!`/`match` assertion, not in a shared setup helper on a DB error),
-and it could not be: PR #1563 changed the test's own assertion to accept
-either event shape, so the only way this specific test fails post-merge is
-through something outside that assertion entirely — exactly what happened
-here. Confirmed by direct log inspection, not inferred from the shard-1
-sample alone as an earlier draft did.
+event-history-mismatch signature — the panic is at `integration_e2e.rs:729:10`
+in a shared setup helper on a `DatabaseError`, not at the assertion's own
+`other => panic!("history did not match...")` arm (`integration_e2e.rs:3587`).
+**Correction (post-review):** an earlier draft of this paragraph claimed
+the tracked signature "can no longer occur on this test at all" post-#1563
+— false. Reading the current source directly
+(`integration_e2e.rs:3567-3588`): the `match` still ends in a catch-all
+`other => panic!(...)` arm, so a third event-history shape neither of
+PR #1563's two accepted patterns matches would still trip that exact
+panic. PR #1563 narrowed which shapes are accepted, it did not remove the
+fallback panic arm — so the tracked signature remains structurally
+possible on this test, just not observed in this occurrence. The claim
+here is narrower and fully supported by direct inspection: *this specific
+occurrence*, on shard 8 of run `35072771791`, failed via the DB error at
+line 729 before ever reaching the event-history `match` at line 3567, so
+it is not an instance of the tracked signature — confirmed by direct log
+inspection, not inferred from the shard-1 sample alone as an earlier
+draft did.
 
 Restated precisely: of the 9 hidden `Test DB` failures in `35072771791`,
 one (shard 8) happens to include the tracked test by name, but its failure
@@ -330,10 +341,14 @@ Items carried forward, unchanged from the 09-08/09-14/09-15 reports:
   hid a real job-level failure (9 shards on one run, 3 jobs on another).
   Of the 9 hidden shard failures in the larger run, one (shard 8) included
   the tracked test by name but failed via the same missing-column defect
-  as the other 8 shards, confirmed by direct log inspection — not the
-  tracked event-history-mismatch signature, and not possible to be, since
-  PR #1563's fix means that signature can no longer occur on this test at
-  all. 0/9 hidden shard failures and 0/3 hidden job failures (the other
+  as the other 8 shards, confirmed by direct log inspection (panic at
+  `integration_e2e.rs:729:10`, a DB error in shared setup, before the
+  event-history `match` at line 3567 is ever reached) — not an instance of
+  the tracked event-history-mismatch signature. **Correction (post-review):**
+  the signature itself remains structurally possible on this test post-#1563
+  (the `match` still ends in a catch-all `other => panic!(...)` arm, per
+  direct source inspection); only this specific occurrence is confirmed not
+  to be one. 0/9 hidden shard failures and 0/3 hidden job failures (the other
   cancelled run) carry the tracked signature. 11/19 post-merge and 36/36
   pre-merge cancelled runs remain unaudited.
 - **Combined: correction (post-review).** An earlier draft's "0/15
