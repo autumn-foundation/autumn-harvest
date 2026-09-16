@@ -1845,6 +1845,26 @@ impl WorkflowHandle {
         }
     }
 
+    /// Upper bound on how long [`result_raw`](Self::result_raw) blocks on one
+    /// listener tick before re-checking residence and terminal state on its
+    /// own (issue #1317 review, P1).
+    ///
+    /// This is the whole mechanism, not merely a fallback. The shard-change
+    /// check that rebinds the listener only runs BETWEEN ticks, never while
+    /// one is in flight. A migration that lands mid-tick is invisible until
+    /// the current tick ends one way or another.
+    ///
+    /// An earlier version of this constant used 30 seconds. A long interval
+    /// starves that check for the entire duration of whatever tick was
+    /// already running when the migration happened. That defeats the
+    /// point, since the check exists to notice the migration promptly.
+    ///
+    /// A few seconds bounds that blind spot to something a caller waiting
+    /// on a live workflow result would not perceive as a stall. The cost
+    /// is one cheap residence/state read per tick in the overwhelmingly
+    /// common case where nothing unusual happens for the whole interval.
+    const RESULT_WAIT_SAFETY_NET: Duration = Duration::from_secs(3);
+
     /// Wait until the workflow reaches a terminal state and return its raw JSON
     /// output. Failure terminal states are returned as typed [`HarvestError`]
     /// variants.
@@ -1861,6 +1881,7 @@ impl WorkflowHandle {
                 .await;
         }
 
+        let mut listener_shard = self.shard().await?;
         let mut listener = self.connect_listener().await?;
 
         loop {
@@ -1871,11 +1892,34 @@ impl WorkflowHandle {
                     .await;
             }
 
-            match listener.wait_for_notification().await? {
+            // A listener stays bound to whichever shard it resolved at
+            // connect time (issue #1317 review, P1). If the execution
+            // migrates mid-wait, that connection stays healthy, with no
+            // `ChannelClosed`. But nothing fires on it again: every future
+            // event notifies the NEW shard's channel instead. Rebind
+            // whenever the resolved shard changes.
+            //
+            // `RESULT_WAIT_SAFETY_NET` bounds the wait regardless. A
+            // residence change this check narrowly misses is still caught
+            // on the very next tick. That covers a migration landing
+            // between this read and the wait below. It is not stuck until
+            // the next real notification on a channel that may never fire
+            // again.
+            let current_shard = self.shard().await?;
+            if current_shard != listener_shard {
+                listener = self.connect_listener().await?;
+                listener_shard = current_shard;
+            }
+
+            match listener
+                .wait_for_notification_timeout(Self::RESULT_WAIT_SAFETY_NET)
+                .await?
+            {
                 WorkflowEventWaitOutcome::Notification(_payload) => {}
                 WorkflowEventWaitOutcome::TimedOut => {}
                 WorkflowEventWaitOutcome::ChannelClosed => {
                     listener = self.connect_listener().await?;
+                    listener_shard = self.shard().await?;
                 }
             }
         }

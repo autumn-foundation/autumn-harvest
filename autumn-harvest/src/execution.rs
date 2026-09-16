@@ -5405,9 +5405,19 @@ pub async fn resolve_execution_id_by_workflow_id(
 
     // No active run on this shard: the most-recently-started row is the
     // most-recent terminal.
+    //
+    // A reconciled `MIGRATED` seal (`migrated_run_terminal_at` set) is
+    // excluded outright rather than left to lose an ordinary `started_at`
+    // tie-break (issue #1317 review, P1 follow-up). In practice a fresh
+    // same-key run can only start after this seal's business key was
+    // released. Its own `started_at` is therefore always later and already
+    // wins here. The explicit exclusion removes the dependency on that
+    // timing invariant instead of relying on it. It matches every other
+    // "is this key still occupied" predicate in the engine.
     let terminal = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+        .filter(harvest_workflow_executions::migrated_run_terminal_at.is_null())
         .order(harvest_workflow_executions::started_at.desc())
         .select((
             harvest_workflow_executions::id,

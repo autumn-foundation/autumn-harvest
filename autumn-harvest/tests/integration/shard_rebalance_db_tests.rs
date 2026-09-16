@@ -3398,6 +3398,50 @@ async fn a_business_key_target_resolves_through_the_seal_to_the_live_copy() {
     );
 }
 
+/// Issue #1317 review, P1 follow-up (companion to the test above). Once
+/// the seal is reconciled, it no longer holds the business key on the
+/// hashed shard. Routing must stop resolving through it. Staying pinned
+/// to a released seal forever would block a fresh same-key run elsewhere
+/// from ever being the thing external-target resolution finds.
+#[tokio::test]
+async fn a_business_key_target_no_longer_resolves_through_a_reconciled_seal() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "reconciled-by-key").await;
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("complete the migrated run");
+
+    let mut source = shards.source().await;
+    reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+        .await
+        .expect("reconcile")
+        .then_some(())
+        .expect("the finished target must be observed terminal");
+
+    let by_key = autumn_harvest::types::ExternalTarget::WorkflowId {
+        workflow_name: "entity_flow".to_string(),
+        workflow_id: "reconciled-by-key".to_string(),
+    };
+    let routed =
+        autumn_harvest::shard_rebalance::resolve_target_shard(&shards.pool, &by_key, SOURCE).await;
+    assert_eq!(
+        routed, SOURCE,
+        "a reconciled seal must not be resolved through; routing must fall \
+         back to the hash-routed shard instead"
+    );
+}
+
 #[tokio::test]
 async fn a_reverse_migration_keeps_the_live_shard_last_in_the_residence_chain() {
     // A → B → A is supported precisely so a drain can be undone. The stored

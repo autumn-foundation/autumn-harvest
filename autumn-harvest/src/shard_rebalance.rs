@@ -4040,10 +4040,19 @@ mod db {
         workflow_name: &str,
         workflow_id: &str,
     ) -> Option<ExecutionId> {
+        // A reconciled `MIGRATED` seal (`migrated_run_terminal_at` set) no
+        // longer holds this business key here (issue #1317 review, P1
+        // follow-up). It is excluded from this lookup exactly like it is
+        // excluded from the active-uniqueness index. The same exclusion
+        // applies to every other "is this key still occupied" predicate in
+        // this file. Without the exclusion, external-target resolution
+        // would keep routing through a released seal indefinitely, past
+        // the point a fresh same-key run could exist elsewhere.
         let row: Option<BusinessKeyRow> = diesel::sql_query(
             "SELECT id FROM harvest_workflow_executions \
               WHERE workflow_name = $1 AND workflow_id = $2 \
                 AND state IN ('RUNNING', 'PAUSED', 'MIGRATED', 'MIGRATING') \
+                AND migrated_run_terminal_at IS NULL \
               ORDER BY started_at DESC LIMIT 1",
         )
         .bind::<Text, _>(workflow_name)
