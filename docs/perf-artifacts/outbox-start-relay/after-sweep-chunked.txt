@@ -51,14 +51,19 @@ mark statement alone, n=50: 50 calls -> 7 calls (-86.0%), 568 buffers ->
 
 Chunking trades some of the single-flush shape's round-trip reduction for a
 bound on claim-hold latency (see docs/performance-outbox-start-relay.md,
-"Fix", correction 3). Both floor criteria from the single-flush measurement
-still clear at every swept size:
-  - "Elimination of an N+1": mark-step statement count is O(n / 8) for this
-    all-success workload, not O(n) -- 7 instead of 50 at n=50, not the
-    single-flush shape's O(claim rounds), but still far below one call per
-    row. A mixed-outcome batch is O(2n / 8) worst case (see the caveat
-    above), still O(n / 8), not O(n).
+"Fix", correction 3). Only ONE of the two floor criteria from the
+single-flush measurement still clears on its own at every swept size
+(Codex, on the PR, corrected an earlier draft of this file that claimed
+both did):
+  - "Elimination of an N+1" does NOT independently clear for the chunked
+    shape: OUTBOX_MARK_FLUSH_EVERY=8 is a fixed constant, so
+    ceil(n / 8) -- and the mixed-outcome worst case, ceil(2n / 8) -- is
+    Theta(n), the same complexity class as the pre-#1620 one-mark-per-row
+    baseline, not a lower one. 7 instead of 50 at n=50 is an eightfold
+    constant-factor reduction in call count, not an elimination of the
+    N+1 the way the single-flush shape's O(claim rounds) was.
   - "≥20% reduction in total buffers for a statement that is ≥5% of the
-    workload's buffers": the mark statement is still 58.3% of calls in the
-    chunked shape and drops 28.2% on its own buffer count (568 -> 408 at
+    workload's buffers" DOES independently clear: the mark statement is
+    still 58.3% of calls in the chunked shape and drops 28.2% on its own
+    buffer count (568 -> 408 at
     n=50), clearing the 20% floor.
