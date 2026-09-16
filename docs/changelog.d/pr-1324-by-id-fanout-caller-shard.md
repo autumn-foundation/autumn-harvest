@@ -40,29 +40,48 @@ the same way, by comparing pools through `residence` instead. Found
 independently by two reviewers: a Claude code-review subagent during this
 PR's own multi-angle review, and the repository's Codex PR reviewer.
 
+A third instance sat under both of the first two, in
+`shard_rebalance::resolve_execution_shard` itself — also found by the
+Codex PR reviewer. Resolving a target's residence for a REAL migration
+needs its hop-walk, which checks out a connection to confirm each hop,
+including the terminal one. That checkout has no awareness of any
+already-held connection, so a target that migrated onto the caller's own
+shard makes the confirmation hop land on `conn`'s own pool — an
+unconditional `pool.get()` with no bound at all, worse than either fix
+above. **Fix.** Added `resolve_execution_shard_holding`, a twin of
+`resolve_execution_shard` that takes the held `(shard, connection)` and
+reads any hop landing on that pool through it instead of checking one
+out, mirroring how `resolve_target_shard_holding` already does this for a
+`WorkflowId` target. `execution_id_residence` and the deferred-check
+residence lookup both call it now instead of the bare hop-walk.
+
 **Test evidence.**
 `shard_rebalance_db_tests::a_rebalanced_caller_self_shard_cancel_reuses_the_held_connection`
-reproduces the bug against two real shard databases, with the target
-shard's pool built at capacity one so a wrongly-acquired second connection
-cannot succeed. It mints a caller execution whose id encodes `SOURCE` but
-whose row is written directly onto `TARGET` (what a completed migration
-leaves behind), issues a same-shard by-id cancel, and runs
-`enforce_external_cancels_outbox` against the pool's only connection.
-Confirmed red without the fix (`processed == 0`; the delivery was silently
-skipped) and green with it (`processed == 1`, target state `CANCELLED`).
-The full `shard_rebalance_db_tests` suite (49 tests) and
-`workflow_id_targeted_tests` suite (26 tests) still pass with no
-regressions, as does `cargo clippy --features testing --tests -- -D
-warnings`.
+reproduces the first instance against two real shard databases, with the
+target shard's pool built at capacity one so a wrongly-acquired second
+connection cannot succeed. It mints a caller execution whose id encodes
+`SOURCE` but whose row is written directly onto `TARGET` (what a
+completed migration leaves behind), issues a same-shard by-id cancel, and
+runs `enforce_external_cancels_outbox` against the pool's only
+connection. Confirmed red without the first fix (`processed == 0`; the
+delivery was silently skipped) and green with it (`processed == 1`,
+target state `CANCELLED`).
 
-The second instance has no isolated DB regression test. Reproducing it
-needs a real cross-shard migration for the checked execution, so
-`residence` genuinely differs from its encoded shard. Resolving that
-always calls `shard_rebalance::resolve_execution_shard`, which checks out
-its own connection on the destination shard regardless of this bug. Under
-the pool-size-1 setup that would expose this defect, that unrelated,
-pre-existing checkout hazard fires first and masks the signal. Verified
-by inspection instead: the fix mirrors the first instance exactly, over
-the same `residence` value the surrounding code already computes.
+`shard_rebalance_db_tests::a_migrated_cancel_target_s_unfinished_handler_check_reuses_the_held_connection`
+covers the second and third instances together, against a REAL migration
+this time (`shard_rebalance::migrate_execution`) so the target's
+`residence` genuinely differs from its encoded shard — the case the first
+test's direct-insert shortcut cannot reach. Before the third fix this
+test hung until its own 10-second guard timeout; with only the second fix
+applied it still failed the same way, because the hang sat upstream of
+that comparison, in the residence lookup itself. With all three fixes it
+passes in under 2 seconds, records `("1324b_target_flow", 1)` on a spy
+`MetricsRecorder` (confirming the unfinished-handler check ran, not just
+that the sweep returned), and leaves the target `CANCELLED`.
+
+The full `shard_rebalance_db_tests` suite (50 tests) and
+`workflow_id_targeted_tests` suite (26 tests) pass with no regressions,
+as does the crate's full unit-test suite (3593 tests, 1 pre-existing
+ignore) and `cargo clippy --features testing --tests -- -D warnings`.
 
 **No schema change, no new `WorkflowEvent` variant, no migration.**

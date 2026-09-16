@@ -3101,3 +3101,146 @@ async fn a_rebalanced_caller_self_shard_cancel_reuses_the_held_connection() {
         "the target must actually be cancelled, not merely left un-stalled"
     );
 }
+
+// The same bug pattern lived one step further down the same sweep, and a
+// third instance lived under both: the residence lookup itself.
+//
+// After a cancel commits, `enforce_external_cancels_outbox` checks the
+// target for unfinished update handlers. That check must run on `conn`
+// when the target shares its pool. It compared pools with
+// `exact_pool_for_execution`, the same stale, bits-based lookup
+// `resolve_delivery_route` used.
+//
+// Finding the target's residence in the first place, for a REAL
+// migration, needs `resolve_execution_shard`'s own hop-walk. That walk
+// checked out a connection on the destination shard with no bound at all,
+// and no awareness that `conn` might already be it. Under pool-size-1
+// that is a true, indefinite hang, not the bounded skip
+// `resolve_delivery_route`'s copy of the bug produced.
+
+struct UnfinishedHandlerSpy {
+    calls: std::sync::Mutex<Vec<(String, u64)>>,
+}
+
+impl autumn_harvest::telemetry::MetricsRecorder for UnfinishedHandlerSpy {
+    fn record_workflow_unfinished_handlers(&self, workflow_name: &str, _kind: &str, count: u64) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((workflow_name.to_string(), count));
+    }
+}
+
+#[tokio::test]
+async fn a_migrated_cancel_target_s_unfinished_handler_check_reuses_the_held_connection() {
+    let (source_url, _source_container) = setup_isolated_db().await;
+    let (target_url, _target_container) = setup_isolated_db().await;
+    let pools = [
+        (SOURCE, build_pool(&source_url)),
+        (TARGET, build_pool_capacity_one(&target_url)),
+    ]
+    .into_iter()
+    .collect();
+    let sharded_pool = ShardedDbPool::from_map(pools, SOURCE);
+
+    // The cancel target starts on SOURCE, with an update handler its history
+    // never resolves, then migrates to TARGET. Its id still encodes SOURCE
+    // -- ids are never re-minted -- but the row now lives on TARGET.
+    let mut source = connect(&source_url).await;
+    let target_id = insert_execution(&mut source, "1324b_target_flow", "1324b-target").await;
+    let update_id = autumn_harvest::types::UpdateId::new();
+    append_history(
+        &mut source,
+        target_id,
+        &[
+            started(json!({})),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("wake"),
+                duration_secs: 604_800,
+            },
+            WorkflowEvent::UpdateAdmitted {
+                update_id,
+                name: "approve".to_string(),
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+        ],
+    )
+    .await;
+    park_on_timer(&mut source, target_id).await;
+    drop(source);
+
+    migrate_execution(&sharded_pool, target_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let target_pool = sharded_pool
+        .exact_pool_for(TARGET)
+        .expect("TARGET pool is configured")
+        .clone();
+
+    // The caller lives on TARGET from the start. This regression is about
+    // the TARGET's residence, not the caller's -- the first test above
+    // already covers that.
+    let caller_id = ExecutionId::new_for_shard(TARGET);
+    {
+        let mut prep = target_pool.get().await.expect("temporary setup connection");
+        insert_execution_with_id(
+            &mut prep,
+            "1324b_caller_flow",
+            "1324b-caller",
+            caller_id,
+            TARGET,
+        )
+        .await;
+        append_history(&mut prep, caller_id, &[started(json!({}))]).await;
+    }
+
+    let mut conn = target_pool
+        .get()
+        .await
+        .expect("check out the pool's only connection");
+
+    let cancel_id = autumn_harvest::types::ExternalCancelId::new();
+    append_more(
+        &mut conn,
+        caller_id,
+        &[WorkflowEvent::ExternalCancelRequested {
+            cancel_id,
+            target: autumn_harvest::types::ExternalTarget::ExecutionId(target_id),
+        }],
+    )
+    .await;
+
+    let spy = UnfinishedHandlerSpy {
+        calls: std::sync::Mutex::new(Vec::new()),
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        autumn_harvest::timeout::enforce_external_cancels_outbox(
+            &mut conn,
+            &spy,
+            std::time::Duration::from_secs(60),
+            &Some(sharded_pool),
+            &[TARGET],
+            &codecs(),
+        ),
+    )
+    .await;
+
+    let processed = result
+        .expect("must not hang: neither the residence lookup nor the handler check may reach for a second connection this pool cannot hand out")
+        .expect("cancel outbox sweep must succeed");
+    assert_eq!(processed, 1, "the migrated-target cancel must be processed");
+    assert_eq!(
+        state_of(&mut conn, target_id).await.as_deref(),
+        Some("CANCELLED")
+    );
+
+    let calls = spy.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![("1324b_target_flow".to_string(), 1)],
+        "the unfinished-handler check must run and find the pending update; got: {calls:?}"
+    );
+}

@@ -2601,7 +2601,13 @@ async fn execution_id_residence(
             .await
             .unwrap_or(entry)
     } else {
-        crate::shard_rebalance::resolve_execution_shard(pool, id)
+        // `_holding`, not the bare hop-walk (issue #1324, Codex review). A
+        // migration's forwarding pointer usually lands in one hop. But the
+        // walk still checks out a connection to confirm no further hop
+        // follows. A target rebalanced onto the caller's shard puts that
+        // confirmation hop on `caller_shard`'s own pool. A bare checkout
+        // there self-deadlocks a pool of size one.
+        crate::shard_rebalance::resolve_execution_shard_holding(conn, pool, id, caller_shard)
             .await
             .unwrap_or(entry)
     }
@@ -4019,9 +4025,19 @@ pub async fn enforce_external_cancels_outbox(
                                         .await
                                         .unwrap_or(entry)
                                 } else {
-                                    crate::shard_rebalance::resolve_execution_shard(pool, exec_id)
-                                        .await
-                                        .unwrap_or(entry)
+                                    // `_holding` (issue #1324, Codex review).
+                                    // The bare hop-walk's own confirmation
+                                    // checkout can land on `caller_shard`'s
+                                    // pool. That is `conn`'s own pool here,
+                                    // and reaching for it fresh self-deadlocks.
+                                    crate::shard_rebalance::resolve_execution_shard_holding(
+                                        conn,
+                                        pool,
+                                        exec_id,
+                                        caller_shard,
+                                    )
+                                    .await
+                                    .unwrap_or(entry)
                                 };
                             Some(resolved)
                         }
