@@ -46,9 +46,15 @@ const (
 // activityRuns is the correctness ledger, matching the harvest arm's counter.
 var activityRuns atomic.Uint64
 
-func Step1(ctx context.Context, in string) (string, error) { activityRuns.Add(1); return in, nil }
-func Step2(ctx context.Context, in string) (string, error) { activityRuns.Add(1); return in, nil }
-func Step3(ctx context.Context, in string) (string, error) { activityRuns.Add(1); return in, nil }
+// The three activity bodies return no result, only an error.
+//
+// The harvest arm's body returns JSON null. An activity that returned its
+// input would have Temporal serialize and persist that payload into every
+// activity-completion history event, a cost the harvest arm never pays, and
+// the registered shape says both arms are inert. Found by review on PR #1617.
+func Step1(ctx context.Context, in string) error { activityRuns.Add(1); return nil }
+func Step2(ctx context.Context, in string) error { activityRuns.Add(1); return nil }
+func Step3(ctx context.Context, in string) error { activityRuns.Add(1); return nil }
 
 // BenchWorkflow runs the three steps in sequence, matching wf_three_activities.
 func BenchWorkflow(ctx workflow.Context, in string) (string, error) {
@@ -61,13 +67,12 @@ func BenchWorkflow(ctx workflow.Context, in string) (string, error) {
 	}
 	ctx = workflow.WithActivityOptions(ctx, opts)
 
-	var out string
 	for _, act := range []any{Step1, Step2, Step3} {
-		if err := workflow.ExecuteActivity(ctx, act, in).Get(ctx, &out); err != nil {
+		if err := workflow.ExecuteActivity(ctx, act, in).Get(ctx, nil); err != nil {
 			return "", err
 		}
 	}
-	return out, nil
+	return "", nil
 }
 
 func envInt(key string, fallback int) int {
@@ -209,10 +214,10 @@ func runRep(c client.Client, rep, workflows, capSecs int) (float64, bool) {
 	// two clauses can see it, and the repetition would be timed with extra
 	// retry work in it. Scanned after the measured window closes, so this
 	// costs the rate nothing. Found by review on PR #1617.
-	taskFailures := countWorkflowTaskFailures(ctx, c, runs)
+	taskFailures, scanErrors := countWorkflowTaskFailures(ctx, c, runs)
 
 	correct := !truncated && done == int64(workflows) &&
-		acts == uint64(workflows*3) && taskFailures == 0
+		acts == uint64(workflows*3) && taskFailures == 0 && scanErrors == 0
 
 	rate := 0.0
 	if elapsed > 0 {
@@ -226,8 +231,8 @@ func runRep(c client.Client, rep, workflows, capSecs int) (float64, bool) {
 	if truncated {
 		trunc = ", TRUNCATED"
 	}
-	fmt.Printf("rep %d: %.2f workflows/sec (%d completed in %.2f s, %d activity runs, %d workflow task failures, correctness %s%s)\n",
-		rep, rate, done, elapsed, acts, taskFailures, status, trunc)
+	fmt.Printf("rep %d: %.2f workflows/sec (%d completed in %.2f s, %d activity runs, %d workflow task failures, %d unread histories, correctness %s%s)\n",
+		rep, rate, done, elapsed, acts, taskFailures, scanErrors, status, trunc)
 	return rate, correct
 }
 
@@ -235,8 +240,17 @@ func runRep(c client.Client, rep, workflows, capSecs int) (float64, bool) {
 // WorkflowTaskFailed event and returns how many executions carry at least one.
 //
 // It runs after the measured window, never inside it.
-func countWorkflowTaskFailures(ctx context.Context, c client.Client, runs []client.WorkflowRun) int64 {
+// It returns the failure count and the number of histories it could not read
+// to the end. An unread history proves nothing, so a non-zero scan-error count
+// invalidates the repetition rather than passing it. Found by review on
+// PR #1617.
+func countWorkflowTaskFailures(
+	ctx context.Context,
+	c client.Client,
+	runs []client.WorkflowRun,
+) (int64, int64) {
 	var failures atomic.Int64
+	var scanErrors atomic.Int64
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 16)
 	for _, run := range runs {
@@ -250,6 +264,7 @@ func countWorkflowTaskFailures(ctx context.Context, c client.Client, runs []clie
 			for iter.HasNext() {
 				event, err := iter.Next()
 				if err != nil {
+					scanErrors.Add(1)
 					return
 				}
 				if event.GetEventType() == enumspb.EVENT_TYPE_WORKFLOW_TASK_FAILED {
@@ -260,5 +275,5 @@ func countWorkflowTaskFailures(ctx context.Context, c client.Client, runs []clie
 		}(run)
 	}
 	wg.Wait()
-	return failures.Load()
+	return failures.Load(), scanErrors.Load()
 }

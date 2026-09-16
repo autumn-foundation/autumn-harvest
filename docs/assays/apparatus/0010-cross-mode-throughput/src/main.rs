@@ -936,32 +936,59 @@ async fn main() {
         );
     }
 
+    // An arm whose every repetition failed correctness has no mean at all.
+    // Returning `Some(0.0)` for it would print a numeric verdict. An
+    // all-invalid Redis arm would then read as an L2 kill, rather than as a
+    // line with no valid measurement. Found by review on PR #1617.
     let find = |want: Arm| {
         summary
             .iter()
             .find(|(arm, _, _)| *arm == want)
+            .filter(|(_, rates, _)| !rates.is_empty())
             .map(|(_, rates, _)| mean(rates))
     };
     println!("\n## pre-registered lines\n");
-    if let Some(pg) = find(Arm::Postgres) {
+    let Some(pg) = find(Arm::Postgres) else {
+        println!(
+            "* **L1** the postgres arm produced no valid repetition, so every line here \
+             is **INDETERMINATE**."
+        );
+        return;
+    };
+    {
         let inside = (7.91..=71.19).contains(&pg);
         println!(
             "* **L1** postgres arm {pg:.2} workflows/sec against the [7.91, 71.19] band \
              around the published 23.73: **{}**",
             if inside { "PASS" } else { "KILL" }
         );
+        // The pre-registration says an L1 kill means no cross-mode number from
+        // this apparatus is reported as comparable. Printing L2 and L3 anyway
+        // would present conclusions from an apparatus already declared
+        // invalid. Found by review on PR #1617.
+        if !inside {
+            println!(
+                "* **L2** and **L3** are not graded: L1 failed, and the pre-registration \
+                 withholds every cross-mode number from this apparatus on an L1 kill."
+            );
+            return;
+        }
         if let Some(redis) = find(Arm::RedisPg) {
             let ratio = if pg > 0.0 { redis / pg } else { 0.0 };
             println!(
                 "* **L2** redis_pg / postgres = {ratio:.2}x against a 2.0x line: **{}**",
                 if ratio >= 2.0 { "PASS" } else { "KILL" }
             );
+        } else {
+            println!("* **L2** **INDETERMINATE**: the redis_pg arm has no valid repetition.");
         }
         if let Some(sqlite) = find(Arm::Sqlite) {
             println!(
                 "* **L3** sqlite {sqlite:.2} vs postgres {pg:.2} workflows/sec: **{}**",
                 if sqlite >= pg { "PASS" } else { "KILL" }
             );
+        } else {
+            println!("* **L3** **INDETERMINATE**: the sqlite arm has no valid repetition.");
         }
     }
 }
