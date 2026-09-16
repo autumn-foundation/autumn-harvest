@@ -33971,24 +33971,27 @@ struct StartThrottlePacingOverrideRequest {
 /// TTL'd runtime pacing override on top of a *declared* workflow-start
 /// throttle (issue #945).
 ///
-/// Mirrors `set_rate_limit_pacing_override` exactly (same replace-not-merge
-/// semantics, same TTL validation via [`pacing_override_expiry`], same
-/// shared upsert SQL against `harvest_rate_limit_buckets`), but resolves the
-/// declared baseline from `WorkflowInfo.throttle`
-/// (`#[workflow(throttle(...))]`, issue #607) and the shared bucket key via
-/// [`autumn_harvest::throttle::bucket_key`] rather than the activity-side
-/// `rate_limit_key` convention. An unkeyed/global throttle resolves its
-/// bucket key with an empty resolved-key component
-/// (`throttle::bucket_key(workflow_name, "")`), matching the resolution the
-/// throttle admission path itself uses for a policy with no `key_expr`.
+/// Mirrors `set_rate_limit_pacing_override` exactly. Both share
+/// replace-not-merge semantics, TTL validation via [`pacing_override_expiry`],
+/// and the same upsert SQL against `harvest_rate_limit_buckets`.
+///
+/// This handler resolves the declared baseline from `WorkflowInfo.throttle`
+/// (`#[workflow(throttle(...))]`, issue #607). It resolves the shared bucket
+/// key via [`autumn_harvest::throttle::bucket_key`], not the activity-side
+/// `rate_limit_key` convention.
+///
+/// An unkeyed/global throttle resolves its bucket key with an empty
+/// resolved-key component (`throttle::bucket_key(workflow_name, "")`). This
+/// matches the resolution the throttle admission path itself uses for a
+/// policy with no `key_expr`.
 ///
 /// `404` when `workflow_name` is not registered, or is registered but
 /// declares no throttle. `409` when the throttle is dynamically per-key
-/// (`throttle(key = ...)`, issue #607) — a pacing override targets one
-/// static bucket and cannot disambiguate which resolved tenant key's bucket
-/// to override. `400` on a non-finite/non-positive `refill_per_sec`/`burst`,
-/// an omitted `refill_per_sec`/`burst` pair, or a `ttl_secs` of zero or
-/// above the server cap.
+/// (`throttle(key = ...)`, issue #607). A pacing override targets one static
+/// bucket. It cannot disambiguate which resolved tenant key's bucket to
+/// override. `400` on a non-finite/non-positive `refill_per_sec`/`burst`, an
+/// omitted `refill_per_sec`/`burst` pair, or a `ttl_secs` of zero or above
+/// the server cap.
 #[allow(clippy::too_many_lines)]
 async fn set_start_throttle_pacing_override(
     headers: axum::http::HeaderMap,
@@ -34086,9 +34089,19 @@ async fn set_start_throttle_pacing_override(
         ),
     };
 
-    let runtime = match api_state.runtime().map_err(map_error) {
+    let runtime = match api_state.runtime() {
         Ok(r) => r,
-        Err(e) => return e.into_response(),
+        Err(e) => reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_SET,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            map_error(e)
+        ),
     };
     let Some(workflow) = runtime.registry().workflows.get(&workflow_name) else {
         reject_pacing_override!(
@@ -34305,9 +34318,19 @@ async fn clear_start_throttle_pacing_override(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "DELETE /admin/start-throttle/{workflow_name}/override";
 
-    let runtime = match api_state.runtime().map_err(map_error) {
+    let runtime = match api_state.runtime() {
         Ok(r) => r,
-        Err(e) => return e.into_response(),
+        Err(e) => reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            map_error(e)
+        ),
     };
     let Some(workflow) = runtime.registry().workflows.get(&workflow_name) else {
         reject_pacing_override!(
@@ -35186,14 +35209,14 @@ struct RateLimitPacingOverrideRequest {
 /// TTL'd runtime pacing override on top of a *declared* per-activity rate
 /// limit (issue #945).
 ///
-/// Each call **replaces** the whole override — a field omitted from this
-/// call reverts to the declared baseline even if a *previous* call had
-/// overridden it, rather than being merged forward with that earlier call.
+/// Each call **replaces** the whole override. A field omitted from this call
+/// reverts to the declared baseline, even if a *previous* call had
+/// overridden it. It is not merged forward with that earlier call.
 ///
 /// `404` when `activity_name` is not a registered activity, or is registered
 /// but declares no rate limit. `409` when the activity's rate limit is
-/// dynamically per-key (`rate_limit(key = ...)`, issue #699) — a pacing
-/// override targets one static bucket and cannot disambiguate which
+/// dynamically per-key (`rate_limit(key = ...)`, issue #699). A pacing
+/// override targets one static bucket. It cannot disambiguate which
 /// resolved tenant key's bucket to override. `400` on a non-finite/
 /// non-positive `refill_rate`/`burst`, an omitted `refill_rate`/`burst`
 /// pair, or a `ttl_secs` of zero or above the server cap.
@@ -35292,9 +35315,19 @@ async fn set_rate_limit_pacing_override(
         ),
     };
 
-    let runtime = match api_state.runtime().map_err(map_error) {
+    let runtime = match api_state.runtime() {
         Ok(r) => r,
-        Err(e) => return e.into_response(),
+        Err(e) => reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            map_error(e)
+        ),
     };
     let Some(activity) = runtime.registry().activities.get(&activity_name) else {
         reject_pacing_override!(
@@ -35499,9 +35532,19 @@ async fn clear_rate_limit_pacing_override(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "DELETE /admin/rate-limits/{activity_name}/override";
 
-    let runtime = match api_state.runtime().map_err(map_error) {
+    let runtime = match api_state.runtime() {
         Ok(r) => r,
-        Err(e) => return e.into_response(),
+        Err(e) => reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            map_error(e)
+        ),
     };
     let Some(activity) = runtime.registry().activities.get(&activity_name) else {
         reject_pacing_override!(

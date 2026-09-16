@@ -426,10 +426,15 @@ struct BuildRoutingRetireForm {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct DeadLetterListParams {
+    // `page`/`limit` are `String`, not `i64` — same fix as
+    // `WorkerListParams` and `WorkflowListParams` (#1540/#1560). An
+    // `i64`-typed field fails axum's query deserialization on non-numeric
+    // text with a bare 400 before this handler ever runs. That discards
+    // every other filter already on the URL.
     #[serde(default)]
-    page: Option<i64>,
+    page: Option<String>,
     #[serde(default)]
-    limit: Option<i64>,
+    limit: Option<String>,
     #[serde(default)]
     workflow_name: Option<String>,
     #[serde(default)]
@@ -1128,7 +1133,8 @@ async fn list_workflows_ui(
     // degrade to a default and report the bad value inline instead, the
     // same "one field costs, not the page" contract as
     // `parse_started_bound`.
-    let (limit, limit_raw, limit_error) = parse_limit_query_field(params.limit.as_deref());
+    let (limit, limit_raw, limit_error) =
+        parse_limit_query_field(params.limit.as_deref(), DEFAULT_PAGE_SIZE);
     let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
     let offset = page.saturating_mul(limit);
 
@@ -1264,21 +1270,24 @@ fn parse_page_query_field(raw: Option<&str>) -> (i64, String, Option<String>) {
     )
 }
 
-/// Parses the workflow list page's `limit` ("Per page") query parameter.
+/// Parses a list page's `limit` ("Per page") query parameter.
 ///
-/// Same contract as [`parse_page_query_field`], falling back to
-/// `DEFAULT_PAGE_SIZE` instead of aborting the page.
-fn parse_limit_query_field(raw: Option<&str>) -> (i64, String, Option<String>) {
+/// Same contract as [`parse_page_query_field`], falling back to `default`
+/// instead of aborting the page. `default` lets callers keep their own
+/// per-page default on a parse failure. The DLQ page's default is 50, not
+/// the Workflows/Workers pages' 25, and this shared helper must not
+/// silently override that.
+fn parse_limit_query_field(raw: Option<&str>, default: i64) -> (i64, String, Option<String>) {
     let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return (DEFAULT_PAGE_SIZE, String::new(), None);
+        return (default, String::new(), None);
     };
     trimmed.parse::<i64>().map_or_else(
         |_| {
             (
-                DEFAULT_PAGE_SIZE,
+                default,
                 trimmed.to_string(),
                 Some(format!(
-                    "Invalid limit '{trimmed}'; expected a whole number. Showing {DEFAULT_PAGE_SIZE} per page."
+                    "Invalid limit '{trimmed}'; expected a whole number. Showing {default} per page."
                 )),
             )
         },
@@ -2332,11 +2341,22 @@ async fn list_dead_letters_ui(
     // Read-path payload decoding (issue #608): the page is admin-gated, so an
     // arriving request passes the same predicate the decoder re-checks.
     let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
-    let limit = params
-        .limit
-        .unwrap_or(DEFAULT_DLQ_PAGE_SIZE)
-        .clamp(1, MAX_PAGE_SIZE);
-    let page = params.page.unwrap_or(0).max(0);
+    // Issue: `page`/`limit` were still typed `Option<i64>` directly on
+    // `DeadLetterListParams`. That is the same page-abort mechanism
+    // #1540/#1560 already fixed on the Workflows and Workers pages. A
+    // non-numeric value on either reaches this struct through a
+    // hand-edited URL, a bookmarked link, or a mistyped "Per page".
+    // Any of those failed axum's own query deserialization with a bare
+    // 400. That 400 landed before this handler, or the filter form, ever
+    // ran. It discarded every filter (`workflow_name`, `task_kind`,
+    // `failed_after`, `failed_before`, `shard_id`) the operator had
+    // already entered. This is the DLQ page an operator is
+    // mid-incident-triage on, per docs/runbooks/harvest-alerts.md and
+    // seven other runbooks that point here. Degrade to a default and
+    // report the bad value inline instead.
+    let (limit, limit_raw, limit_error) =
+        parse_limit_query_field(params.limit.as_deref(), DEFAULT_DLQ_PAGE_SIZE);
+    let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
     let offset = page.saturating_mul(limit);
     let (filters, filter_raw) = parse_dead_letter_ui_filters(
         params.workflow_name.as_deref(),
@@ -2356,6 +2376,8 @@ async fn list_dead_letters_ui(
             &filter_raw,
             params.group_by.as_deref(),
             limit,
+            &limit_raw,
+            limit_error.as_deref(),
             params.refresh,
             params.flash.as_deref(),
         )
@@ -2433,10 +2455,13 @@ async fn list_dead_letters_ui(
         is_multi_shard,
         page,
         limit,
+        &limit_raw,
         has_next,
         total_for_pagination,
         params.refresh,
         params.flash.as_deref(),
+        limit_error.as_deref(),
+        page_error.as_deref(),
     ))
 }
 
@@ -2838,7 +2863,8 @@ async fn list_workers_ui(
     // fix as `parse_page_query_field`/`parse_limit_query_field` on the
     // Workflows page (#1540): degrade to a default and report the bad
     // value inline instead of aborting the page.
-    let (limit, limit_raw, limit_error) = parse_limit_query_field(params.limit.as_deref());
+    let (limit, limit_raw, limit_error) =
+        parse_limit_query_field(params.limit.as_deref(), DEFAULT_PAGE_SIZE);
     let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
     let offset = page.saturating_mul(limit);
 
@@ -3351,19 +3377,22 @@ fn render_dead_letters_page(
     is_multi_shard: bool,
     page: i64,
     limit: i64,
+    limit_raw: &str,
     has_next: bool,
     total_matching: usize,
     refresh: Option<u64>,
     flash: Option<&str>,
+    limit_error: Option<&str>,
+    page_error: Option<&str>,
 ) -> Markup {
     let body = html! {
         h2 { "Dead Letters" }
         @if let Some(message) = flash {
             div.flash role="status" tabindex="-1" autofocus { (message) }
         }
-        (render_dead_letter_view_toggle(filters, filter_raw, limit, refresh, None, false))
-        (render_dead_letter_filters(filters, filter_raw, limit, refresh))
-        (render_dead_letter_bulk_actions(filters, filter_raw, limit, refresh, total_matching))
+        (render_dead_letter_view_toggle(filters, filter_raw, limit, limit_raw, refresh, None, false))
+        (render_dead_letter_filters(filters, filter_raw, limit, limit_raw, limit_error, refresh))
+        (render_dead_letter_bulk_actions(filters, filter_raw, limit, limit_raw, refresh, total_matching))
 
         @if rows.is_empty() && shard_errors.is_empty() {
             div.card.empty {
@@ -3385,10 +3414,10 @@ fn render_dead_letters_page(
                 }
             }
 
-            (render_dead_letter_table(rows, filters, filter_raw, limit, refresh))
+            (render_dead_letter_table(rows, filters, filter_raw, limit, limit_raw, refresh))
         }
 
-        (render_dead_letter_pagination(page, limit, has_next, filters, filter_raw, refresh))
+        (render_dead_letter_pagination(page, limit, limit_raw, has_next, filters, filter_raw, refresh, page_error))
     };
 
     // `dead_letter_return_to_path` deliberately excludes `page`. It names
@@ -3401,7 +3430,7 @@ fn render_dead_letters_page(
     // reusing that path (found in review, PR #1396).
     let refresh_target = format!(
         "../ui/dead-letters?page={page}{}",
-        build_dead_letter_query_string(limit, filters, filter_raw, refresh)
+        build_dead_letter_query_string(limit, limit_raw, filters, filter_raw, refresh)
     );
     layout_dead_letters("Dead Letters · Vantage", &body, refresh, &refresh_target)
 }
@@ -3419,6 +3448,8 @@ async fn render_dead_letters_summary_view(
     filter_raw: &DeadLetterUiFilterRaw,
     group_by_raw: Option<&str>,
     limit: i64,
+    limit_raw: &str,
+    limit_error: Option<&str>,
     refresh: Option<u64>,
     flash: Option<&str>,
 ) -> Result<Markup, AutumnError> {
@@ -3451,9 +3482,9 @@ async fn render_dead_letters_summary_view(
         @if let Some(message) = flash {
             div.flash role="status" tabindex="-1" autofocus { (message) }
         }
-        (render_dead_letter_view_toggle(filters, filter_raw, limit, refresh, Some(&group_by_value), true))
-        (render_dead_letter_filters(filters, filter_raw, limit, refresh))
-        (render_dlq_summary_group_by_form(filters, filter_raw, limit, refresh, &group_by))
+        (render_dead_letter_view_toggle(filters, filter_raw, limit, limit_raw, refresh, Some(&group_by_value), true))
+        (render_dead_letter_filters(filters, filter_raw, limit, limit_raw, limit_error, refresh))
+        (render_dlq_summary_group_by_form(filters, filter_raw, limit, limit_raw, refresh, &group_by))
 
         @for (shard_id, error) in &shard_errors {
             div.shard-error {
@@ -3473,7 +3504,7 @@ async fn render_dead_letters_summary_view(
                 }
             }
         } @else {
-            (render_dlq_summary_table(&response, &group_by, filters, filter_raw, limit, refresh))
+            (render_dlq_summary_table(&response, &group_by, filters, filter_raw, limit, limit_raw, refresh))
         }
     };
 
@@ -3484,7 +3515,7 @@ async fn render_dead_letters_summary_view(
     };
     let refresh_target = format!(
         "../ui/dead-letters?view=summary{}{group_by_query}",
-        build_dead_letter_query_string(limit, filters, filter_raw, refresh)
+        build_dead_letter_query_string(limit, limit_raw, filters, filter_raw, refresh)
     );
     Ok(layout_dead_letters(
         "Dead Letters · Summary · Vantage",
@@ -3579,11 +3610,12 @@ fn render_dead_letter_view_toggle(
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
     refresh: Option<u64>,
     group_by_value: Option<&str>,
     summary_active: bool,
 ) -> Markup {
-    let base = build_dead_letter_query_string(limit, filters, filter_raw, refresh);
+    let base = build_dead_letter_query_string(limit, limit_raw, filters, filter_raw, refresh);
     let list_href = if base.is_empty() {
         "dead-letters".to_string()
     } else {
@@ -3612,6 +3644,7 @@ fn render_dlq_summary_group_by_form(
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
     refresh: Option<u64>,
     selected: &[autumn_harvest::dlq::DlqGroupDimension],
 ) -> Markup {
@@ -3638,7 +3671,13 @@ fn render_dlq_summary_group_by_form(
         form.filters method="get" action="dead-letters" {
             input type="hidden" name="view" value="summary";
             (render_dead_letter_hidden_filters_raw(filters, filter_raw))
-            @if limit != DEFAULT_DLQ_PAGE_SIZE {
+            // Prefer `limit_raw` (non-empty only on a genuine parse
+            // failure). An unresolved invalid limit then survives this
+            // resubmission instead of silently reverting. Same reasoning
+            // as `build_dead_letter_query_string`.
+            @if !limit_raw.is_empty() {
+                input type="hidden" name="limit" value=(limit_raw);
+            } @else if limit != DEFAULT_DLQ_PAGE_SIZE {
                 input type="hidden" name="limit" value=(limit);
             }
             @if let Some(refresh) = refresh {
@@ -3679,6 +3718,7 @@ fn render_dlq_summary_table(
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
     refresh: Option<u64>,
 ) -> Markup {
     html! {
@@ -3726,7 +3766,7 @@ fn render_dlq_summary_table(
                             @if is_other {
                                 "—"
                             } @else {
-                                @let (href, partial) = dlq_summary_drilldown_href(&group.key, group_by, filters, filter_raw, limit, refresh);
+                                @let (href, partial) = dlq_summary_drilldown_href(&group.key, group_by, filters, filter_raw, limit, limit_raw, refresh);
                                 a href=(href) title=[partial.then_some("Some dimensions have no list-view filter — results may include extra rows from other groups")] {
                                     @if partial {
                                         "View entries (partial filter) →"
@@ -3764,6 +3804,7 @@ fn dlq_summary_drilldown_href(
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
     refresh: Option<u64>,
 ) -> (String, bool) {
     use autumn_harvest::dlq::DlqGroupDimension;
@@ -3815,7 +3856,7 @@ fn dlq_summary_drilldown_href(
         }
     }
 
-    let query = build_dead_letter_query_string(limit, &drill, &drill_raw, refresh);
+    let query = build_dead_letter_query_string(limit, limit_raw, &drill, &drill_raw, refresh);
     let href = if query.is_empty() {
         "dead-letters".to_string()
     } else {
@@ -3828,11 +3869,21 @@ fn render_dead_letter_filters(
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
+    limit_error: Option<&str>,
     refresh: Option<u64>,
 ) -> Markup {
     let workflow_name = filters.workflow_name.as_deref().unwrap_or("");
     let task_kind = filters.task_kind.map(DeadLetterTaskKind::as_label);
     let refresh_value = refresh.map(|secs| secs.to_string()).unwrap_or_default();
+    // Echo exactly what the operator typed on a parse failure, matching the
+    // Workflows and Workers pages' `render_filters`/`render_worker_filters`.
+    // Falls back to the resolved value when the field was absent or valid.
+    let limit_value = if limit_raw.is_empty() {
+        limit.to_string()
+    } else {
+        limit_raw.to_string()
+    };
 
     html! {
         form.filters method="get" action="dead-letters" {
@@ -3881,7 +3932,15 @@ fn render_dead_letter_filters(
             }
             label {
                 "Per page"
-                input type="number" name="limit" min="1" max=(MAX_PAGE_SIZE) value=(limit);
+                // `type="text"`, not `type="number"`. A number input
+                // sanitizes an invalid value (e.g. "not-a-number") to blank
+                // at render time. The operator could then never see or
+                // correct their own bad input. Matches the Workflows and
+                // Workers pages' "Per page" fields.
+                input type="text" inputmode="numeric" pattern="[0-9]*" name="limit" value=(limit_value);
+                @if let Some(error) = limit_error {
+                    span.field-error role="alert" { (error) }
+                }
             }
             label {
                 "Refresh"
@@ -3904,10 +3963,11 @@ fn render_dead_letter_bulk_actions(
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
     refresh: Option<u64>,
     total_matching: usize,
 ) -> Markup {
-    let return_to = dead_letter_return_to_path(filters, filter_raw, limit, refresh);
+    let return_to = dead_letter_return_to_path(filters, filter_raw, limit, limit_raw, refresh);
     let action_limit = dead_letter_bulk_action_limit(total_matching);
     let replay_label = dead_letter_bulk_action_label("Replay", action_limit, total_matching);
     let discard_label = dead_letter_bulk_action_label("Discard", action_limit, total_matching);
@@ -3964,9 +4024,10 @@ fn render_dead_letter_table(
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
     refresh: Option<u64>,
 ) -> Markup {
-    let return_to = dead_letter_return_to_path(filters, filter_raw, limit, refresh);
+    let return_to = dead_letter_return_to_path(filters, filter_raw, limit, limit_raw, refresh);
     html! {
         table {
             thead {
@@ -4139,16 +4200,22 @@ fn render_dead_letter_hidden_filters(filters: &DeadLetterUiFilters) -> Markup {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_dead_letter_pagination(
     page: i64,
     limit: i64,
+    limit_raw: &str,
     has_next: bool,
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     refresh: Option<u64>,
+    page_error: Option<&str>,
 ) -> Markup {
-    let base = build_dead_letter_query_string(limit, filters, filter_raw, refresh);
+    let base = build_dead_letter_query_string(limit, limit_raw, filters, filter_raw, refresh);
     html! {
+        @if let Some(error) = page_error {
+            span.field-error role="alert" { (error) }
+        }
         div.pagination {
             @if page > 0 {
                 a href={ "dead-letters?page=" (page - 1) (PreEscaped(&base)) } {
@@ -4173,12 +4240,20 @@ fn render_dead_letter_pagination(
 
 fn build_dead_letter_query_string(
     limit: i64,
+    limit_raw: &str,
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     refresh: Option<u64>,
 ) -> String {
     let mut out = String::new();
-    if limit != DEFAULT_DLQ_PAGE_SIZE {
+    // `limit_raw` is non-empty only on a genuine parse failure (see
+    // `parse_limit_query_field`), never for a valid-but-clamped value. An
+    // invalid limit the operator has not yet corrected must not silently
+    // vanish from a Next/Previous link. Same as the Workflows/Workers
+    // pages' own query-string builders.
+    if !limit_raw.is_empty() {
+        let _ = write!(out, "&limit={}", url_encode(limit_raw));
+    } else if limit != DEFAULT_DLQ_PAGE_SIZE {
         let _ = write!(out, "&limit={limit}");
     }
     if let Some(workflow_name) = filters.workflow_name.as_deref() {
@@ -4219,9 +4294,10 @@ fn dead_letter_return_to_path(
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
     refresh: Option<u64>,
 ) -> String {
-    let query = build_dead_letter_query_string(limit, filters, filter_raw, refresh);
+    let query = build_dead_letter_query_string(limit, limit_raw, filters, filter_raw, refresh);
     if query.is_empty() {
         "../ui/dead-letters".to_string()
     } else {
@@ -11630,7 +11706,7 @@ mod tests {
     #[test]
     fn parse_limit_query_field_accepts_valid_values() {
         assert_eq!(
-            parse_limit_query_field(Some("50")),
+            parse_limit_query_field(Some("50"), DEFAULT_PAGE_SIZE),
             (50, String::new(), None)
         );
     }
@@ -11644,9 +11720,12 @@ mod tests {
     /// a silent mismatch with no error explaining it.
     #[test]
     fn parse_limit_query_field_clamps_out_of_range_values() {
-        assert_eq!(parse_limit_query_field(Some("0")), (1, String::new(), None));
         assert_eq!(
-            parse_limit_query_field(Some("100000")),
+            parse_limit_query_field(Some("0"), DEFAULT_PAGE_SIZE),
+            (1, String::new(), None)
+        );
+        assert_eq!(
+            parse_limit_query_field(Some("100000"), DEFAULT_PAGE_SIZE),
             (MAX_PAGE_SIZE, String::new(), None)
         );
     }
@@ -11656,7 +11735,7 @@ mod tests {
     /// while naming the bad value, matching `parse_page_query_field`.
     #[test]
     fn parse_limit_query_field_rejects_non_numeric_text_without_erroring() {
-        let (limit, raw, error) = parse_limit_query_field(Some("a-lot"));
+        let (limit, raw, error) = parse_limit_query_field(Some("a-lot"), DEFAULT_PAGE_SIZE);
         assert_eq!(
             limit, DEFAULT_PAGE_SIZE,
             "an invalid limit falls back to the default page size"
@@ -11666,6 +11745,28 @@ mod tests {
         assert!(
             message.contains("a-lot") && message.contains("limit"),
             "the error names the bad value and the field: {message}"
+        );
+    }
+
+    /// The DLQ page's default page size (50) differs from the
+    /// Workflows/Workers pages' (25). `parse_limit_query_field`'s `default`
+    /// parameter must fall back to the caller's own default on a parse
+    /// failure, not silently substitute `DEFAULT_PAGE_SIZE`.
+    #[test]
+    fn parse_limit_query_field_uses_the_callers_default_not_a_hardcoded_one() {
+        assert_eq!(
+            parse_limit_query_field(None, DEFAULT_DLQ_PAGE_SIZE),
+            (DEFAULT_DLQ_PAGE_SIZE, String::new(), None)
+        );
+        let (limit, raw, error) = parse_limit_query_field(Some("a-lot"), DEFAULT_DLQ_PAGE_SIZE);
+        assert_eq!(
+            limit, DEFAULT_DLQ_PAGE_SIZE,
+            "an invalid limit falls back to the DLQ page's own default, not 25"
+        );
+        assert_eq!(raw, "a-lot");
+        assert!(
+            error.is_some_and(|message| message.contains(&DEFAULT_DLQ_PAGE_SIZE.to_string())),
+            "the error should name the DLQ page's own default"
         );
     }
 
@@ -11706,11 +11807,11 @@ mod tests {
     #[test]
     fn parse_limit_query_field_blank_or_missing_is_not_an_error() {
         assert_eq!(
-            parse_limit_query_field(None),
+            parse_limit_query_field(None, DEFAULT_PAGE_SIZE),
             (DEFAULT_PAGE_SIZE, String::new(), None)
         );
         assert_eq!(
-            parse_limit_query_field(Some("   ")),
+            parse_limit_query_field(Some("   "), DEFAULT_PAGE_SIZE),
             (DEFAULT_PAGE_SIZE, String::new(), None)
         );
     }
@@ -12310,6 +12411,7 @@ mod tests {
             &filters,
             &filter_raw,
             DEFAULT_DLQ_PAGE_SIZE,
+            "",
             None,
             250,
         )
@@ -12346,9 +12448,15 @@ mod tests {
             shard_id: String::new(),
             shard_id_error: None,
         };
-        let html =
-            render_dead_letter_bulk_actions(&filters, &filter_raw, DEFAULT_DLQ_PAGE_SIZE, None, 5)
-                .into_string();
+        let html = render_dead_letter_bulk_actions(
+            &filters,
+            &filter_raw,
+            DEFAULT_DLQ_PAGE_SIZE,
+            "",
+            None,
+            5,
+        )
+        .into_string();
         assert!(
             !html.contains("name=\"task_kind\""),
             "the invalid task_kind must never be submitted as a bulk-action selector: {html}"
@@ -12382,6 +12490,7 @@ mod tests {
             &filters,
             &filter_raw,
             DEFAULT_DLQ_PAGE_SIZE,
+            "",
             None,
             1_200,
         )
@@ -12613,8 +12722,15 @@ mod tests {
                     .to_string(),
             ),
         };
-        let html = render_dead_letter_filters(&filters, &filter_raw, DEFAULT_DLQ_PAGE_SIZE, None)
-            .into_string();
+        let html = render_dead_letter_filters(
+            &filters,
+            &filter_raw,
+            DEFAULT_DLQ_PAGE_SIZE,
+            "",
+            None,
+            None,
+        )
+        .into_string();
         assert!(
             html.contains("field-error") && html.contains("zombie"),
             "task_kind error must render inline: {html}"
@@ -12651,7 +12767,7 @@ mod tests {
             shard_id_error: Some("bad shard_id".to_string()),
         };
         let query =
-            build_dead_letter_query_string(DEFAULT_DLQ_PAGE_SIZE, &filters, &filter_raw, None);
+            build_dead_letter_query_string(DEFAULT_DLQ_PAGE_SIZE, "", &filters, &filter_raw, None);
         assert!(
             query.contains("task_kind=zombie"),
             "invalid task_kind must round-trip: {query}"
@@ -12663,6 +12779,84 @@ mod tests {
         assert!(
             query.contains("shard_id=north"),
             "invalid shard_id must round-trip: {query}"
+        );
+    }
+
+    /// Same fix as the Workers page's own
+    /// `render_worker_pagination_shows_page_error`. An invalid `page` value
+    /// must render its error inline, above the Previous/Next controls.
+    /// This page has no backing form field for `page`.
+    #[test]
+    fn render_dead_letter_pagination_shows_page_error() {
+        let filters = DeadLetterUiFilters::default();
+        let filter_raw = DeadLetterUiFilterRaw::default();
+        let html = render_dead_letter_pagination(
+            0,
+            DEFAULT_DLQ_PAGE_SIZE,
+            "",
+            false,
+            &filters,
+            &filter_raw,
+            None,
+            Some("Invalid page 'nope'; expected a whole number. Showing page 1."),
+        )
+        .into_string();
+        assert!(
+            html.contains("field-error") && html.contains("Invalid page 'nope'"),
+            "the page error must render inline: {html}"
+        );
+    }
+
+    /// Same fix as the Workflows/Workers pages' own
+    /// `build_query_string_preserves_invalid_limit_text_for_pagination`/
+    /// `build_worker_query_string_preserves_invalid_limit_text_for_pagination`:
+    /// `limit_raw` is non-empty only on a genuine parse failure. It must
+    /// override the resolved `limit` in the Next/Previous link instead of
+    /// being silently dropped alongside it.
+    #[test]
+    fn build_dead_letter_query_string_preserves_invalid_limit_text_for_pagination() {
+        let filters = DeadLetterUiFilters::default();
+        let filter_raw = DeadLetterUiFilterRaw::default();
+        assert_eq!(
+            build_dead_letter_query_string(
+                DEFAULT_DLQ_PAGE_SIZE,
+                "not-a-number",
+                &filters,
+                &filter_raw,
+                None
+            ),
+            "&limit=not-a-number"
+        );
+    }
+
+    /// Same "browser sanitizes an invalid number input to blank" defect the
+    /// Workflows/Workers pages already fixed
+    /// (`per_page_input_is_a_text_control_that_can_hold_invalid_text`). The
+    /// DLQ page's "Per page" field must be a text control too.
+    #[test]
+    fn dead_letter_per_page_input_is_a_text_control_that_can_hold_invalid_text() {
+        let filters = DeadLetterUiFilters::default();
+        let filter_raw = DeadLetterUiFilterRaw::default();
+        let html = render_dead_letter_filters(
+            &filters,
+            &filter_raw,
+            DEFAULT_DLQ_PAGE_SIZE,
+            "not-a-number",
+            Some("invalid limit 'not-a-number'"),
+            None,
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"input type="text" inputmode="numeric" pattern="[0-9]*" name="limit""#),
+            "the Per page field must be a text control, not type=\"number\": {html}"
+        );
+        assert!(
+            html.contains("value=\"not-a-number\""),
+            "the operator's invalid input must be preserved: {html}"
+        );
+        assert!(
+            html.contains("field-error") && html.contains("invalid limit"),
+            "the limit error must render inline: {html}"
         );
     }
 
@@ -12698,6 +12892,7 @@ mod tests {
             &filters,
             &filter_raw,
             DEFAULT_DLQ_PAGE_SIZE,
+            "",
             None,
         );
         assert!(
@@ -12733,6 +12928,7 @@ mod tests {
             &filters,
             &filter_raw,
             DEFAULT_DLQ_PAGE_SIZE,
+            "",
             None,
         );
         assert!(
@@ -13944,9 +14140,12 @@ mod tests {
             false,
             2,
             50,
+            "",
             false,
             0,
             Some(30),
+            None,
+            None,
             None,
         )
         .into_string();

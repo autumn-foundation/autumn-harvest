@@ -2515,6 +2515,15 @@ enum DeliveryRoute {
         /// about.
         uninspected: Vec<crate::external_target_location::UninspectedShard>,
     },
+    /// A keyed signal already landed on some shard for this business key,
+    /// found while resolving the target's location (issue #1318). No
+    /// delivery attempt runs; the caller records `ExternalSignalDelivered`
+    /// directly.
+    ///
+    /// Never produced for a cancel. Cancel carries no idempotency key, so
+    /// `resolve_delivery_route`'s `idempotency_key` argument is always
+    /// `None` on that path, and this variant requires `Some`.
+    AlreadyDelivered,
 }
 
 /// Resolve which database an outbox delivery to `target` must run against
@@ -2592,7 +2601,13 @@ async fn execution_id_residence(
             .await
             .unwrap_or(entry)
     } else {
-        crate::shard_rebalance::resolve_execution_shard(pool, id)
+        // `_holding`, not the bare hop-walk (issue #1324, Codex review). A
+        // migration's forwarding pointer usually lands in one hop. But the
+        // walk still checks out a connection to confirm no further hop
+        // follows. A target rebalanced onto the caller's shard puts that
+        // confirmation hop on `caller_shard`'s own pool. A bare checkout
+        // there self-deadlocks a pool of size one.
+        crate::shard_rebalance::resolve_execution_shard_holding(conn, pool, id, caller_shard)
             .await
             .unwrap_or(entry)
     }
@@ -2606,6 +2621,10 @@ async fn resolve_delivery_route(
     caller_exec_id: ExecutionId,
     uninspectable: &crate::external_target_location::UninspectableShards,
     metrics: &(dyn MetricsRecorder + Send + Sync),
+    // `Some` only on the signal path, and only when the caller opted into a
+    // keyed delivery (issue #1318). Cancel always passes `None` — it has no
+    // idempotency-key concept.
+    idempotency_key: Option<&str>,
 ) -> DeliveryRoute {
     let Some(pool) = sharded_pool else {
         return DeliveryRoute::Caller {
@@ -2627,6 +2646,21 @@ async fn resolve_delivery_route(
         _ if caller_exec_id.shard().is_unencoded() => pool.default_shard(),
         _ => caller_exec_id.shard(),
     };
+
+    // Belt-and-braces (issue #1324). Fail loud here, not with `pool_for`'s
+    // silent default-shard fallback below. `conn` came from `caller_shard`'s
+    // pool by construction. A missing entry for it means this process does
+    // not know the shard `conn` actually serves.
+    if pool.exact_pool_for(caller_shard).is_none() {
+        return DeliveryRoute::Retry {
+            reason: format!("caller shard {caller_shard} has no storage pool in this process"),
+            uninspected: vec![crate::external_target_location::UninspectedShard {
+                shard: caller_shard,
+                reason: "caller shard has no storage pool in this process".to_string(),
+                kind: crate::external_target_location::UninspectedReasonKind::NoPool,
+            }],
+        };
+    }
 
     let (target_shard, expected_live, may_assert_key_state) = match target {
         ExternalTarget::ExecutionId(id) => {
@@ -2665,6 +2699,7 @@ async fn resolve_delivery_route(
                     workflow_id,
                     Some((caller_shard, conn)),
                     Some(uninspectable),
+                    idempotency_key,
                 )
                 .await
                 {
@@ -2696,6 +2731,22 @@ async fn resolve_delivery_route(
                     }
                     crate::external_target_location::TargetLocation::NotFound => {
                         return DeliveryRoute::NoRunAnywhere;
+                    }
+                    // The key was already delivered — on this shard or
+                    // another one, it does not matter which. No location
+                    // resolution is needed at all: the caller must record
+                    // delivery, never attempt a fresh insert (issue #1318).
+                    crate::external_target_location::TargetLocation::AlreadyDelivered {
+                        shard,
+                        ..
+                    } => {
+                        tracing::info!(
+                            workflow_name,
+                            workflow_id,
+                            %shard,
+                            "by-id signal: idempotency key already delivered; skipping re-delivery"
+                        );
+                        return DeliveryRoute::AlreadyDelivered;
                     }
                     crate::external_target_location::TargetLocation::Indeterminate {
                         uninspected,
@@ -2733,9 +2784,14 @@ async fn resolve_delivery_route(
     // slot, so pointer equality of the slots is really *shard-id* equality and
     // reports two aliases of one pool as different (issue #1146; the same trap
     // `external_target_location::same_underlying_pool` was extracted for).
+    // `caller_shard`, not `caller_exec_id` (issue #1324). The id's encoded
+    // shard names where the run STARTED. A rebalanced caller now lives
+    // elsewhere. `caller_shard` above already read the real one off `conn`.
+    // Comparing pools by the id instead brings back the held-pool
+    // mislabelling issue #964 fixed one level up.
     match (
         pool.exact_pool_for(target_shard),
-        pool.exact_pool_for_execution(caller_exec_id),
+        pool.exact_pool_for(caller_shard),
     ) {
         (Some(target_pool), Some(caller_pool))
             if crate::external_target_location::same_underlying_pool(target_pool, caller_pool) =>
@@ -3117,6 +3173,7 @@ pub async fn enforce_external_signals_outbox(
                     caller_exec_id,
                     &uninspectable,
                     metrics,
+                    idempotency_key.as_deref(),
                 )
                 .await;
 
@@ -3216,6 +3273,11 @@ pub async fn enforce_external_signals_outbox(
                     // business key: the same not-found policy a per-shard
                     // delivery attempt would have applied.
                     DeliveryRoute::NoRunAnywhere => not_found_terminal(),
+                    // The keyed request was already fulfilled elsewhere
+                    // (issue #1318): report delivered, attempt nothing.
+                    DeliveryRoute::AlreadyDelivered => {
+                        Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
+                    }
                     // Inconclusive — leave the row pending rather than write a
                     // wrong terminal into the caller's append-only history.
                     DeliveryRoute::Retry { reason, uninspected } => {
@@ -3604,7 +3666,8 @@ pub async fn enforce_external_cancels_outbox(
 
                 // Route to the database that actually owns the target
                 // (issue #1146) — an observation for a `WorkflowId` target,
-                // the encoded shard for an `ExecutionId` one.
+                // the encoded shard for an `ExecutionId` one. Cancel has no
+                // idempotency-key concept, so `None` here (issue #1318).
                 let route = resolve_delivery_route(
                     conn,
                     active_sharded_pool.as_ref(),
@@ -3612,6 +3675,7 @@ pub async fn enforce_external_cancels_outbox(
                     caller_exec_id,
                     &uninspectable,
                     metrics,
+                    None,
                 )
                 .await;
 
@@ -3653,6 +3717,19 @@ pub async fn enforce_external_cancels_outbox(
                     // Every expected shard answered and none holds this
                     // business key.
                     DeliveryRoute::NoRunAnywhere => not_found_terminal(),
+                    // Unreachable in practice: `resolve_delivery_route` is
+                    // called above with `idempotency_key: None`, and this
+                    // route only arises when a key is given (issue #1318).
+                    // Handled defensively rather than with `unreachable!()`
+                    // so a future wiring mistake degrades to a retried row,
+                    // not a panicked scanner.
+                    DeliveryRoute::AlreadyDelivered => {
+                        tracing::error!(
+                            "cancel outbox sweep: unexpected AlreadyDelivered route -- cancel \
+                             carries no idempotency key"
+                        );
+                        return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new(), caller_shard)));
+                    }
                     // Inconclusive — leave pending rather than record a wrong
                     // terminal in the caller's append-only history.
                     DeliveryRoute::Retry { reason, uninspected } => {
@@ -3948,16 +4025,45 @@ pub async fn enforce_external_cancels_outbox(
                                         .await
                                         .unwrap_or(entry)
                                 } else {
-                                    crate::shard_rebalance::resolve_execution_shard(pool, exec_id)
-                                        .await
-                                        .unwrap_or(entry)
+                                    // `_holding` (issue #1324, Codex review).
+                                    // The bare hop-walk's own confirmation
+                                    // checkout can land on `caller_shard`'s
+                                    // pool. That is `conn`'s own pool here,
+                                    // and reaching for it fresh self-deadlocks.
+                                    crate::shard_rebalance::resolve_execution_shard_holding(
+                                        conn,
+                                        pool,
+                                        exec_id,
+                                        caller_shard,
+                                    )
+                                    .await
+                                    .unwrap_or(entry)
                                 };
                             Some(resolved)
                         }
                         None => None,
                     };
+                    // `residence`, not `exact_pool_for_execution(exec_id)`
+                    // (issue #1324). The bits-based lookup ignores the
+                    // forwarding-aware resolution just above. It can report
+                    // the target's stale origin pool instead. A rebalanced
+                    // target then reads as cross-pool from a caller it is
+                    // actually co-located with. The `else` branch below then
+                    // acquires a second connection from the pool `conn`
+                    // already holds one from.
+                    //
+                    // No isolated DB test reproduces this one directly. Any
+                    // real migration that makes `residence` differ from
+                    // `entry` above needs `resolve_execution_shard`'s own
+                    // hop-walk. That walk checks out a connection on the
+                    // destination shard regardless of this bug. Under the
+                    // pool-size-1 setup that would expose this defect, the
+                    // walk hits its own, pre-existing hazard first. Covered
+                    // by inspection, and by the sibling fix above in
+                    // `resolve_delivery_route`, which this mirrors.
                     let same_pool_as_caller = outer_sharded_pool.as_ref().is_none_or(|pool| {
-                        pool.exact_pool_for_execution(exec_id)
+                        residence
+                            .and_then(|shard| pool.exact_pool_for(shard))
                             .is_some_and(|e_pool| {
                                 crate::external_target_location::same_underlying_pool(
                                     e_pool,
@@ -3985,8 +4091,20 @@ pub async fn enforce_external_cancels_outbox(
                         .zip(residence)
                         .and_then(|(p, shard)| p.exact_pool_for(shard))
                     {
-                        match pool.get().await {
-                            Ok(mut target_conn) => {
+                        // Bounded like the cross-shard delivery acquisitions
+                        // above (issue #1323, issue #1146). This check
+                        // reaches a peer pool while still holding a
+                        // connection from another pool in the same process.
+                        // This check is best-effort already: it logs its own
+                        // errors instead of propagating them. It logs a
+                        // timed-out acquisition and skips it the same way.
+                        match tokio::time::timeout(
+                            crate::external_target_location::peer_acquire_bound(pool),
+                            pool.get(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(mut target_conn)) => {
                                 if let Err(e) = check_and_report_unfinished_handlers(
                                     &mut target_conn,
                                     exec_id,
@@ -4002,11 +4120,17 @@ pub async fn enforce_external_cancels_outbox(
                                     );
                                 }
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 tracing::error!(
                                     exec_id = %exec_id,
                                     error = %e,
                                     "cancel outbox sweep: failed to acquire target-shard connection for unfinished-handler check"
+                                );
+                            }
+                            Err(_elapsed) => {
+                                tracing::warn!(
+                                    exec_id = %exec_id,
+                                    "cancel outbox sweep: no connection available for the target shard's unfinished-handler check; skipping"
                                 );
                             }
                         }
@@ -4247,10 +4371,28 @@ pub async fn enforce_external_awaits_outbox(
                         );
                         return Ok(Some((false, Some(row.id))));
                     };
-                    let mut target_conn = match pool.get().await {
-                        Ok(c) => c,
-                        Err(e) => {
+                    // Bounded like the cross-shard delivery acquisitions
+                    // above (issue #1323, issue #1146). This read reaches a
+                    // peer pool while still holding a connection from
+                    // another pool in the same process. One timeout checker
+                    // runs per assigned shard. See
+                    // `external_target_location::peer_acquire_bound`.
+                    let mut target_conn = match tokio::time::timeout(
+                        crate::external_target_location::peer_acquire_bound(pool),
+                        pool.get(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(c)) => c,
+                        Ok(Err(e)) => {
                             tracing::error!(error = %e, "await outbox sweep: failed to acquire target connection");
+                            return Ok(Some((false, Some(row.id))));
+                        }
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                target_shard = %target_residence,
+                                "await outbox sweep: no connection available for the target shard; leaving pending"
+                            );
                             return Ok(Some((false, Some(row.id))));
                         }
                     };

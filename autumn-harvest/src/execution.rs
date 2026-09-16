@@ -5239,6 +5239,24 @@ pub async fn terminate_workflow_execution(
     Ok(cancel_result)
 }
 
+/// Whether `state` releases the `(workflow_name, workflow_id)` uniqueness
+/// slot (issue #1308).
+///
+/// Exactly `CONTINUED_AS_NEW` and `TERMINATED` — the two states the partial
+/// unique index `harvest_we_workflow_name_workflow_id_active_key` excludes.
+/// An ordinary terminal run (`COMPLETED`, `FAILED`, `CANCELLED`,
+/// `TIMED_OUT`) still occupies the key: `worker::resolve_successor_slot` and
+/// the re-run `RejectDuplicate` check both reject on it.
+///
+/// This is narrower than [`crate::erase::is_terminal_state`], which governs
+/// replay and delivery semantics, not uniqueness. A cross-shard occupancy
+/// check must use this definition, not that one. Otherwise it disagrees with
+/// the same-shard checks it stands in for.
+#[must_use]
+pub fn workflow_id_slot_is_released(state: &str) -> bool {
+    matches!(state, "CONTINUED_AS_NEW" | "TERMINATED")
+}
+
 /// Non-locking lookup used for the `TerminateIfRunning` pre-check outside any
 /// transaction. Returns `None` if no active execution exists.
 pub async fn try_load_by_key(
@@ -6242,6 +6260,44 @@ pub struct RerunOutcome {
     pub source_sealed: bool,
 }
 
+/// Run the shard-consistency guard's occupancy fan-out for a `workflow_id`
+/// override, reusing the source's own connection for its own shard (issue
+/// #1308).
+///
+/// Reports [`crate::external_target_location::CrossShardOccupancy::Indeterminate`]
+/// with no uninspected shards when no sharded pool is configured. That
+/// matches the fail-closed posture the pre-#1308 hash rejection took for
+/// every divergent override. So an embedder that never wires one up sees no
+/// behavior change.
+async fn rerun_cross_shard_occupancy(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    target_wf_id: &str,
+    source_shard: crate::types::ShardId,
+) -> crate::external_target_location::CrossShardOccupancy {
+    let Some(pool) = crate::shard::GLOBAL_SHARDED_POOL
+        .read()
+        .ok()
+        .and_then(|p| p.clone())
+    else {
+        return crate::external_target_location::CrossShardOccupancy::Indeterminate {
+            uninspected: Vec::new(),
+        };
+    };
+    let router = crate::shard::GLOBAL_SHARD_ROUTER
+        .read()
+        .ok()
+        .and_then(|g| g.clone());
+    crate::external_target_location::check_cross_shard_occupancy(
+        &pool,
+        router.as_ref(),
+        workflow_name,
+        target_wf_id,
+        Some((source_shard, conn)),
+    )
+    .await
+}
+
 /// Re-run a terminal workflow execution: start a BRAND-NEW execution from the
 /// source run's recorded start parameters (issue #777).
 ///
@@ -6307,17 +6363,23 @@ pub struct RerunOutcome {
 /// ## Errors
 ///
 /// - [`HarvestError::NotFound`] when `source_exec_id` does not exist.
-/// - [`HarvestError::Config`] (a 409-shaped state conflict) when the source is
-///   non-terminal, is `CONTINUED_AS_NEW`, already has an automatic workflow-level
-///   retry successor (issue #523 — see the retry-chain gate above), has an
-///   erased input (issue #495) and no explicit override was supplied, is
-///   schedule-attributed and would need to be sealed (see above), the source's
-///   shard has been drained out of `writable_shards` (see the
-///   shard-writability gate above), the target business key is held by a
-///   different live execution, a `workflow_id` override routes to a
-///   different shard than the source (see the shard-consistency guard
-///   above), or a stored `context_headers` / `workflow_retry_policy` value
-///   cannot be parsed (a faithful clone must never silently drop a field).
+/// - [`HarvestError::Config`] (a 409-shaped state conflict). This covers
+///   several source states and guard failures:
+///   - the source is non-terminal, or is `CONTINUED_AS_NEW`.
+///   - the source already has an automatic workflow-level retry successor
+///     (issue #523 — see the retry-chain gate above).
+///   - the source has an erased input (issue #495) and no explicit override
+///     was supplied.
+///   - the source is schedule-attributed and would need to be sealed (see
+///     above).
+///   - the source's shard has been drained out of `writable_shards` (see the
+///     shard-writability gate above).
+///   - the target business key is held by a different live execution.
+///   - a `workflow_id` override routes to a different shard than the source.
+///     That shard is occupied by a live run elsewhere, or could not be
+///     checked (see the shard-consistency guard above).
+///   - a stored `context_headers` / `workflow_retry_policy` value cannot be
+///     parsed. A faithful clone must never silently drop a field.
 /// - [`HarvestError::AlreadyExists`] when a `workflow_id` override collides with
 ///   a live execution.
 /// - [`HarvestError::AdmissionBlocked`] when an active gate blocks the start.
@@ -6481,28 +6543,36 @@ pub async fn rerun_workflow_execution_with_codecs(
                 .workflow_id_override
                 .unwrap_or(source.workflow_id.as_str());
 
-            // 3b. Shard-consistency guard (Codex review, issue #777 PR #1152):
-            // a `workflow_id` override must route to the SAME shard
-            // `ShardRouter::pick_for_new_workflow` would pick for a fresh start
-            // of `(workflow_name, target_wf_id)` — every ordinary explicit-id
-            // start routes via that same function. This whole transaction runs
-            // on ONE connection, pinned to `source.shard_id` (acquired by the
-            // caller before this function is even entered), so a cross-shard
-            // override cannot be routed correctly here: it would insert the new
-            // execution on the WRONG physical database, invisible to the
-            // override's own `RejectDuplicate` uniqueness check, which only
-            // queries the source's shard. Reject rather than silently corrupt
-            // the routing invariant; a same-shard override (the common case,
-            // including every single-shard deployment) is unaffected.
+            // 3b. Shard-consistency guard (Codex review, issue #777 PR #1152;
+            // occupancy check added for issue #1308). A `workflow_id` override
+            // routing to a DIFFERENT shard than the source's is not itself
+            // refused any more. This whole transaction runs on ONE connection.
+            // That connection is pinned to `source.shard_id`, acquired by the
+            // caller before this function is even entered. So the new run can
+            // only ever be created THERE — never on the override's
+            // hash-derived shard. That is fine when the override key is
+            // actually free. The new run lands on the source's shard,
+            // residency-correct when the source was pinned there (issue
+            // #697), and reachable by business key (issue #1146). It is
+            // unsafe only when a live run of the override key already exists
+            // elsewhere. The override's own `RejectDuplicate` check below can
+            // see only the source's shard. So this asks
+            // [`crate::external_target_location::check_cross_shard_occupancy`]
+            // (issue #1146's observation-based fan-out) instead of refusing on
+            // the hash mismatch alone.
             //
-            // Issue #1146 removed the second reason this guard used to cite —
-            // that by-id addressing (issue #751) resolved a `WorkflowId`
-            // target's shard by the identical hash, so a mis-placed run would
-            // be unreachable. By-id delivery now observes every expected shard
-            // and finds a run wherever it is, so reachability is no longer at
-            // stake; the shard-local uniqueness reason above stands on its
-            // own. When the process-global router is unavailable, treat that as
-            // "no divergence is knowable, so do not refuse" — the same rule
+            // The occupancy fan-out is a READ, not a lock. A live run of the
+            // key could still be created elsewhere between this check and the
+            // insert below. This narrows the pre-#1308 race window rather
+            // than closing it. The pre-#1308 window was the whole operation,
+            // unconditionally refused. A shard that cannot be inspected is
+            // reported `Indeterminate` and rejected exactly like a confirmed
+            // occupant. This transaction must decide now, with no retry queue
+            // to fall back on, matching the pre-#1308 posture for every
+            // divergent override.
+            //
+            // When the process-global router is unavailable, treat that as "no
+            // divergence is knowable, so do not refuse" — the same rule
             // `shard::external_target_owning_shard`'s doc records for its own
             // remaining callers. (This guard reaches `pick_for_new_workflow`
             // directly rather than through that function.)
@@ -6517,13 +6587,41 @@ pub async fn rerun_workflow_execution_with_codecs(
                 if let Some(expected) = expected_shard
                     && expected != source_shard
                 {
-                    return Err(HarvestError::Config(format!(
-                        "workflow_id override '{target_wf_id}' routes to shard {expected} \
-                         but the source execution {source_exec_id} lives on shard \
-                         {source_shard}; cross-shard workflow_id overrides are not \
-                         supported — re-run without an override, or start a fresh \
-                         execution directly under the target workflow_id"
-                    )));
+                    let occupancy = rerun_cross_shard_occupancy(
+                        conn,
+                        &source.workflow_name,
+                        target_wf_id,
+                        source_shard,
+                    )
+                    .await;
+                    match occupancy {
+                        crate::external_target_location::CrossShardOccupancy::Free => {}
+                        crate::external_target_location::CrossShardOccupancy::Occupied {
+                            shard,
+                        } => {
+                            return Err(HarvestError::Config(format!(
+                                "workflow_id override '{target_wf_id}' is already held by a \
+                                 live run on shard {shard}; re-run without an override, or \
+                                 start a fresh execution directly under the target \
+                                 workflow_id"
+                            )));
+                        }
+                        crate::external_target_location::CrossShardOccupancy::Indeterminate {
+                            uninspected,
+                        } => {
+                            let uninspected = uninspected
+                                .iter()
+                                .map(|u| format!("shard {} ({})", u.shard, u.reason))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            return Err(HarvestError::Config(format!(
+                                "workflow_id override '{target_wf_id}' routes to shard \
+                                 {expected}, but the fan-out could not check every expected \
+                                 shard for a live run of the key: {uninspected}. Refusing to \
+                                 risk two live runs sharing one business key — retry the re-run"
+                            )));
+                        }
+                    }
                 }
             }
 

@@ -1733,3 +1733,88 @@ async fn a_shard_whose_sweep_fails_reports_the_failure_instead_of_a_silent_zero(
     // ...and one shard's failure never stops another shard's collection.
     assert!(!bucket_exists(&mut conn, "dyn-rate:t:healthy").await);
 }
+
+/// Restores a table hidden by a rename when the case ends, panic or not.
+///
+/// The database is shared across cases (issue #1316). A panic while the
+/// table is hidden — inside the tick driver, not only a later `assert!` —
+/// would otherwise leave the table missing. Every later case would then
+/// fail too.
+struct HiddenTableGuard {
+    url: String,
+    hidden_name: &'static str,
+    real_name: &'static str,
+}
+
+impl Drop for HiddenTableGuard {
+    fn drop(&mut self) {
+        let url = self.url.clone();
+        let hidden_name = self.hidden_name;
+        let real_name = self.real_name;
+        // `Drop` is not async, and the current runtime may already be
+        // stopping. A short-lived thread with its own runtime answers both.
+        let restored = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async move {
+                let Ok(mut conn) = AsyncPgConnection::establish(&url).await else {
+                    return;
+                };
+                let _ =
+                    diesel::sql_query(format!("ALTER TABLE {hidden_name} RENAME TO {real_name}"))
+                        .execute(&mut conn)
+                        .await;
+            });
+        })
+        .join();
+        assert!(restored.is_ok(), "the table-restore guard panicked");
+    }
+}
+
+#[tokio::test]
+async fn a_failed_dry_run_pass_still_reports_dry_run_true() {
+    // Issue #1316: `RateLimitBucketGcOutcome::failed` filled every field but
+    // `error` from `Default`, so a failed DRY-RUN preview reported
+    // `dry_run: false` — indistinguishable from a failed REAL pass. An
+    // operator would read that as "a destructive pass errored partway",
+    // when in fact the tick was a preview and deleted nothing.
+    //
+    // The sibling test above provokes the connection-acquisition `failed()`
+    // call site. This one provokes the OTHER call site: the sweep/preview
+    // query itself, on an otherwise-healthy connection.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_rate_limit_buckets RENAME TO harvest_rate_limit_buckets_1316_hidden",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("hide the table to provoke the sweep query's own failure");
+    let _restore_table = HiddenTableGuard {
+        url: url.clone(),
+        hidden_name: "harvest_rate_limit_buckets_1316_hidden",
+        real_name: "harvest_rate_limit_buckets",
+    };
+
+    let pools = ShardedDbPool::single(build_pool(&url));
+    let config = RetentionConfig {
+        dry_run: true,
+        ..gc_only(WINDOW)
+    };
+    let result = run_one_tick_on(pools, config, Arc::new(CapturingMetrics::default())).await;
+
+    assert!(
+        gc(&result).error.is_some(),
+        "the hidden table must surface as a failure"
+    );
+    assert!(
+        gc(&result).dry_run,
+        "a failed dry-run preview must still report dry_run: true"
+    );
+}

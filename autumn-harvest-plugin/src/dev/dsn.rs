@@ -15,6 +15,13 @@
 //! two modules over already knew that span was a password value. One scanner,
 //! two callers.
 //!
+//! A fourth fact lives here too, for `banner` alone.
+//! [`is_connection_keyword`] says whether a scanned token is a real libpq
+//! keyword. [`keyword_tokens`] reports a bare token, one [`keyword_options`]
+//! silently skips, instead of losing it. Together they close off the two
+//! ways a credential-shaped token used to reach the banner unexamined
+//! (issue #1322).
+//!
 //! # What this is not
 //!
 //! It is **not** a DSN parser, and nothing here decides what gets connected to.
@@ -37,6 +44,74 @@ use std::ops::Range;
 pub(super) fn is_uri_dsn(dsn: &str) -> bool {
     let trimmed = dsn.trim_start();
     trimmed.starts_with("postgresql://") || trimmed.starts_with("postgres://")
+}
+
+/// Whether `key` is a libpq connection keyword.
+///
+/// The list is a superset of what `tokio_postgres` accepts. A missing
+/// keyword only costs a withheld DSN instead of a redacted one. That is
+/// safe.
+///
+/// A keyword-*shaped* token that is not a keyword must never pass. A
+/// mistyped URL like `postgres=//alice:hunter2@db` scans as the harmless
+/// option `postgres`. It has no `password=` key, so the caller has nothing
+/// to blank out (issue #1322).
+///
+/// `autumn-harvest-cli` solves the same problem for migration-target labels.
+/// See `is_connection_keyword` in `autumn-harvest-cli/src/lib.rs`. Keep this
+/// list in step with that one.
+pub(super) fn is_connection_keyword(key: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "application_name",
+        "channel_binding",
+        "client_encoding",
+        "connect_timeout",
+        "dbname",
+        "fallback_application_name",
+        "gssdelegation",
+        "gssencmode",
+        "gsslib",
+        "host",
+        "hostaddr",
+        "keepalives",
+        "keepalives_count",
+        "keepalives_idle",
+        "keepalives_interval",
+        "krbsrvname",
+        "load_balance_hosts",
+        "options",
+        "passfile",
+        "password",
+        "port",
+        "replication",
+        "require_auth",
+        "requirepeer",
+        "requiressl",
+        "scram_client_key",
+        "scram_server_key",
+        "service",
+        "ssl_max_protocol_version",
+        "ssl_min_protocol_version",
+        "sslcert",
+        "sslcertmode",
+        "sslcompression",
+        "sslcrl",
+        "sslcrldir",
+        "sslkey",
+        "sslmode",
+        "sslnegotiation",
+        "sslpassword",
+        "sslrootcert",
+        "sslsni",
+        "target_session_attrs",
+        "tcp_user_timeout",
+        "user",
+    ];
+    // libpq keywords are lowercase. Compare case-insensitively, so `Host=db`
+    // keeps its normal handling instead of being withheld.
+    KEYWORDS
+        .iter()
+        .any(|keyword| key.eq_ignore_ascii_case(keyword))
 }
 
 /// One `keyword = value` option of a libpq keyword/value connection string.
@@ -78,6 +153,30 @@ pub(super) const fn keyword_options(dsn: &str) -> KeywordOptions<'_> {
     KeywordOptions { dsn, index: 0 }
 }
 
+/// One token of a keyword/value connection string, whether or not it turned
+/// out to be a recognized option.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum KeywordToken<'a> {
+    /// A `key=value` option, exactly what [`keyword_options`] yields.
+    Recognized(KeywordOption<'a>),
+    /// A token with no `=`. [`keyword_options`] skips it; [`keyword_tokens`]
+    /// does not.
+    Bare,
+}
+
+/// Read every token of a keyword/value connection string, one at a time.
+///
+/// [`keyword_options`] silently skips a bare token. That is safe for
+/// [`safety`](super::safety), which has `Config::from_str` refusing
+/// malformed input behind it either way. It is not safe for `banner`: a
+/// bare token can hide a whole credential (issue #1322). `banner` reads
+/// every token through [`keyword_tokens`] instead, which loses none of
+/// them.
+pub(super) fn keyword_tokens(dsn: &str) -> impl Iterator<Item = KeywordToken<'_>> {
+    let mut cursor = KeywordOptions { dsn, index: 0 };
+    std::iter::from_fn(move || cursor.next_token())
+}
+
 /// The options of a keyword/value connection string, in the order written.
 ///
 /// Yields non-overlapping [`KeywordOption::value_span`]s that only ever move
@@ -94,49 +193,64 @@ impl<'a> Iterator for KeywordOptions<'a> {
     type Item = KeywordOption<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // A token with no `=` is not an option, so keep going until one is —
-        // every pass consumes at least one character, so this terminates.
-        while self.index < self.dsn.len() {
-            self.skip_whitespace();
-            if self.index >= self.dsn.len() {
-                return None;
+        // A bare token is not an option, so keep going until a real one
+        // turns up or the scan ends. Every step consumes at least one
+        // token, so this terminates.
+        loop {
+            match self.next_token()? {
+                KeywordToken::Recognized(option) => return Some(option),
+                KeywordToken::Bare => {}
             }
-
-            // Keyword: up to the `=` or the whitespace that ends it.
-            let key_start = self.index;
-            while let Some(ch) = self.peek() {
-                if ch == '=' || ch.is_whitespace() {
-                    break;
-                }
-                self.index += ch.len_utf8();
-            }
-            let key = &self.dsn[key_start..self.index];
-
-            // libpq permits whitespace on either side of the `=`.
-            self.skip_whitespace();
-            if self.peek() != Some('=') {
-                // A bare token with no value. `self.index` is past `key_start`
-                // here — the loop above only stops on `=` (handled) or on
-                // whitespace it then consumed — so the scan still advances.
-                continue;
-            }
-            self.index += 1;
-            self.skip_whitespace();
-
-            let value_start = self.index;
-            let value = self.take_value();
-            return Some(KeywordOption {
-                key,
-                value,
-                value_span: value_start..self.index,
-            });
         }
-
-        None
     }
 }
 
-impl KeywordOptions<'_> {
+impl<'a> KeywordOptions<'a> {
+    /// Read one token from the cursor: a recognized option, a bare token, or
+    /// `None` at the end of the string.
+    ///
+    /// The single place both [`keyword_options`] and [`keyword_tokens`] read
+    /// from, so the two cannot disagree about a DSN. That disagreement is
+    /// precisely what this module exists to remove (see the module docs).
+    fn next_token(&mut self) -> Option<KeywordToken<'a>> {
+        if self.index >= self.dsn.len() {
+            return None;
+        }
+        self.skip_whitespace();
+        if self.index >= self.dsn.len() {
+            return None;
+        }
+
+        // Keyword: up to the `=` or the whitespace that ends it.
+        let key_start = self.index;
+        while let Some(ch) = self.peek() {
+            if ch == '=' || ch.is_whitespace() {
+                break;
+            }
+            self.index += ch.len_utf8();
+        }
+        let key = &self.dsn[key_start..self.index];
+
+        // libpq permits whitespace on either side of the `=`.
+        self.skip_whitespace();
+        if self.peek() != Some('=') {
+            // A bare token with no value. `self.index` is past `key_start`
+            // here — the loop above only stops on `=` (handled) or on
+            // whitespace it then consumed — so the scan still advances.
+            return Some(KeywordToken::Bare);
+        }
+        self.index += 1;
+        self.skip_whitespace();
+
+        let value_start = self.index;
+        let value = self.take_value();
+        Some(KeywordToken::Recognized(KeywordOption {
+            key,
+            value,
+            value_span: value_start..self.index,
+        }))
+    }
+
     /// The character at the cursor, without consuming it.
     fn peek(&self) -> Option<char> {
         self.dsn[self.index..].chars().next()
@@ -321,7 +435,10 @@ pub(super) fn percent_decoded(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_uri_dsn, keyword_options, percent_decoded, query_start, uri_query_parameters};
+    use super::{
+        is_connection_keyword, is_uri_dsn, keyword_options, percent_decoded, query_start,
+        uri_query_parameters,
+    };
 
     /// `(key, unescaped value, the value exactly as written)` for every option.
     fn options(dsn: &str) -> Vec<(&str, String, &str)> {
@@ -605,5 +722,72 @@ mod tests {
         assert_eq!(percent_decoded("%4"), "%4");
         assert_eq!(percent_decoded("%"), "%");
         assert_eq!(percent_decoded("plain"), "plain");
+    }
+
+    #[test]
+    fn every_libpq_keyword_is_recognized() {
+        // Kept in step with `is_connection_keyword` in
+        // `autumn-harvest-cli/src/lib.rs` (issue #1322).
+        for keyword in [
+            "application_name",
+            "channel_binding",
+            "client_encoding",
+            "connect_timeout",
+            "dbname",
+            "fallback_application_name",
+            "gssdelegation",
+            "gssencmode",
+            "gsslib",
+            "host",
+            "hostaddr",
+            "keepalives",
+            "keepalives_count",
+            "keepalives_idle",
+            "keepalives_interval",
+            "krbsrvname",
+            "load_balance_hosts",
+            "options",
+            "passfile",
+            "password",
+            "port",
+            "replication",
+            "require_auth",
+            "requirepeer",
+            "requiressl",
+            "scram_client_key",
+            "scram_server_key",
+            "service",
+            "ssl_max_protocol_version",
+            "ssl_min_protocol_version",
+            "sslcert",
+            "sslcertmode",
+            "sslcompression",
+            "sslcrl",
+            "sslcrldir",
+            "sslkey",
+            "sslmode",
+            "sslnegotiation",
+            "sslpassword",
+            "sslrootcert",
+            "sslsni",
+            "target_session_attrs",
+            "tcp_user_timeout",
+            "user",
+        ] {
+            assert!(is_connection_keyword(keyword), "{keyword}");
+            assert!(
+                is_connection_keyword(&keyword.to_uppercase()),
+                "libpq keywords are case-insensitive: {keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_keyword_shaped_token_that_is_not_a_keyword_is_refused() {
+        // The motivating case from issue #1322: a mistyped URL that lost its
+        // `://` scans as the "keyword" `postgres`.
+        for token in ["postgres", "postgresql", "notakeyword", "", "hostx", "ssl"] {
+            assert!(!is_connection_keyword(token), "{token}");
+        }
     }
 }

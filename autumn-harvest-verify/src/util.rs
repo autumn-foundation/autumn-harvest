@@ -37,6 +37,12 @@ pub fn split_top<'a>(text: &'a str, sep: &str) -> Vec<&'a str> {
         return vec![text];
     }
     let bytes = text.as_bytes();
+    // `sep` is non-empty here (the early return above catches the empty
+    // case), so this is the byte `rest.starts_with(sep)` below must match
+    // first. Checking it directly skips that call's `memcmp` dispatch at
+    // most depth-0 positions. Their first byte already rules a match out,
+    // for a multi-byte `sep` like `"::"` or `" as "`.
+    let sep_first = sep.as_bytes()[0];
     let mut parts: Vec<&'a str> = Vec::new();
     let mut depth = 0i32;
     let mut start = 0usize;
@@ -48,7 +54,7 @@ pub fn split_top<'a>(text: &'a str, sep: &str) -> Vec<&'a str> {
             ')' | ']' | '}' => depth = depth.saturating_sub(1),
             _ => {}
         }
-        if depth != 0 {
+        if depth != 0 || bytes.get(idx) != Some(&sep_first) {
             continue;
         }
         let Some(rest) = text.get(idx..) else {

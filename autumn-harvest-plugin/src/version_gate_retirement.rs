@@ -125,6 +125,19 @@ pub struct RetirementShardInspection {
 
 type ShardObservation = shard_fanout::ShardObservation<RetirementCheckShardRow>;
 
+/// Clone-class note. `RetirementKey`, `RetirementAccumulator`, `merge_row`,
+/// and `accumulator_from_row` below near-duplicate `VersionUsageKey`,
+/// `VersionUsageAccumulator`, and their helpers in `version_usage.rs`.
+/// [`build_retirement_check_report`]'s shard-aggregation body near-duplicates
+/// [`build_version_usage_report`](crate::version_usage::build_version_usage_report)
+/// the same way. PR #228 (this file) followed PR #223 (`version_usage.rs`)
+/// the same day, reusing its shard-aggregation shape for a
+/// retirement-specific read model. The two copies have diverged.
+/// `RetirementAccumulator` also tracks `sample_active_execution_ids`, capped
+/// at 10, so operators can look up specific blocking runs.
+/// `VersionUsageAccumulator` has no use for that field. Apply a fix to the
+/// shared aggregation shape to both files. Do not force sample-id tracking
+/// onto `version_usage.rs`.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct RetirementKey {
     workflow_name: String,
@@ -193,29 +206,22 @@ pub async fn build_retirement_check_report(
     ))
 }
 
+/// Which shards this read must inspect, honouring an explicit `shard_id` filter.
+///
+/// Beyond the filter this is the shared cross-shard fan-out rule, and it
+/// delegates to [`crate::shard_fanout::expected_shards`] (itself the core
+/// `external_target_location::fanout_shards`) rather than re-deriving it.
+/// This was a fourth hand-rolled copy of "pool keys ∪ readable ∪ default".
+/// Issue #1146 consolidated the other three onto the shared rule:
+/// `version_usage.rs`, `workflow_reachability.rs`, and `workflow_count.rs`.
+/// This one was left behind. The engine's own by-business-key resolution
+/// now depends on that set meaning the same thing everywhere.
 fn expected_shards(api_state: &HarvestApiState, shard_filter: Option<i32>) -> BTreeSet<i32> {
     if let Some(shard_id) = shard_filter {
         return BTreeSet::from([shard_id]);
     }
-
-    let mut shards = BTreeSet::new();
-    if let Ok(pool) = api_state.storage_pool() {
-        shards.extend(pool.iter_shards().map(|(shard, _)| shard.as_i32()));
-    }
-    if let Ok(runtime) = api_state.runtime() {
-        shards.extend(
-            runtime
-                .router()
-                .readable_shards()
-                .iter()
-                .map(|shard| shard.as_i32()),
-        );
-        shards.insert(runtime.router().default_shard().as_i32());
-    }
-    if shards.is_empty() {
-        shards.insert(0);
-    }
-    shards
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    crate::shard_fanout::expected_shards(api_state, &pools)
 }
 
 async fn observe_shard(
