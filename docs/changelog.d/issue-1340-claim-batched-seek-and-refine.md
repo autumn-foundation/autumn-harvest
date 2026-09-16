@@ -44,6 +44,19 @@ single-row loop had (the single-row loop's 400 claims move rows `PENDING`
 -> `RUNNING`), silently invalidating the ratio. Fixed by reseeding an
 identical fresh fixture before each loop.
 
+Codex's review then caught a fifth bug, back in the implementation: the
+batch scan's `schedule_to_close_at > NOW()` filter uses `NOW()`, frozen
+at transaction start (load-bearing for the keyset cursor, so it cannot
+simply switch to real time). A deadline that passes in REAL wall-clock
+time — while an earlier candidate in a long batch search is still being
+tried, up to `batch_size * max_batches` attempts with the default
+config — would incorrectly still read as live against that frozen
+snapshot, letting an already-expired task be claimed and dispatched.
+Fixed the same way as the concurrency gate: the batch scan's filter
+stays a soft, frozen-`NOW()` pre-filter, and
+`claim_batched_candidate_attempt_query()` gains an authoritative
+`clock_timestamp()` recheck at claim time.
+
 **Not wired into the default claim path.** `claim_task`/`claim_task_on_shard`
 are unchanged. Issue #1340 is explicit that no query change should land
 against it without sign-off from someone with full context on `queue.rs`'s
@@ -52,24 +65,29 @@ tested, measured building block for that review, not a switch of default
 production behavior. It also does not implement the cross-region DR fence
 (#954) or the by-id claim (#1312) the single-row path carries.
 
-**Test evidence.** `tests/integration/claim_batched_tests.rs` (10 DB-backed
+**Test evidence.** `tests/integration/claim_batched_tests.rs` (11 DB-backed
 tests, red-then-green): equivalence with the single-row path on a plain
 backlog, an adversarial saturated-concurrency-key fixture matching ledger
 #4/#5's own shape, a multi-batch fixture with tied sort keys spanning a
 batch boundary (regression test for the tiebreak bug above), `max_batches`
 exhaustion, rate-limit bucket interaction, a regression test for the
 rate-limit-leak bug above (verified red against the pre-fix code, then
-green), sticky routing and a capability-routed-activity gate exercised
-end-to-end through the real function (not just SQL-text checks), and —
-the gap ledger #5's own single-session apparatus explicitly could not
-close — real concurrent Tokio claimers racing a capped concurrency key,
-asserting the cap is never exceeded. `queue.rs`'s `mod tests` gains 7
-SQL-shape unit tests pinning the query text (concurrency gate omitted from
-the batch scan, every other gate preserved byte-for-byte including both
-capability-label branches, the cursor's four-column `OR`-chain, the
-authoritative recheck's exact shape, the concurrency probe's shape, the
-shared rate-limit-formula helper used instead of a fourth hand-copied
-literal).
+green), a regression test for the deadline-recheck bug above (also
+verified red against the pre-fix code -- drives
+`claim_batched_candidate_attempt_query()` directly with an injected
+`pg_sleep` so the real-time-vs-frozen-`NOW()` gap is deterministic, not
+timing-dependent), sticky routing and a capability-routed-activity gate
+exercised end-to-end through the real function (not just SQL-text
+checks), and — the gap ledger #5's own single-session apparatus
+explicitly could not close — real concurrent Tokio claimers racing a
+capped concurrency key, asserting the cap is never exceeded. `queue.rs`'s
+`mod tests` gains 8 SQL-shape unit tests pinning the query text
+(concurrency gate omitted from the batch scan, every other gate preserved
+byte-for-byte including both capability-label branches, the cursor's
+four-column `OR`-chain, the authoritative recheck's exact shape, the
+concurrency probe's shape, the deadline recheck's use of
+`clock_timestamp()` and not `NOW()`, the shared rate-limit-formula helper
+used instead of a fourth hand-copied literal).
 
 **Measurement.** `docs/performance-claim-batched-seek-and-refine.md`,
 regenerated from a single run of

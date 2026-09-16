@@ -6021,6 +6021,15 @@ pub async fn pending_queue_demand_by_queue_name(
 /// only ever runs for a candidate that already cleared the concurrency
 /// gate.
 ///
+/// A fourth bug, also caught in this session's review (Codex): the batch
+/// scan's `schedule_to_close_at > NOW()` filter uses `NOW()`, frozen at
+/// transaction start. A deadline that passes in REAL time while an
+/// earlier candidate is still being tried would incorrectly still read
+/// as live against that frozen snapshot. See
+/// [`claim_batched_candidate_attempt_query`]'s own doc for the fix: a
+/// fresh `clock_timestamp()` recheck at claim time, the same
+/// soft-filter-plus-authoritative-recheck shape the concurrency gate uses.
+///
 /// # What this is not
 ///
 /// This is **not** wired into [`claim_task`] or [`claim_task_on_shard`].
@@ -6073,7 +6082,7 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
              ) \
              SELECT \
                  id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name, \
-                 scheduled_at, \
+                 scheduled_at, schedule_to_close_at, \
                  CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END AS sticky_rank, \
                  CASE \
                      WHEN $4::BIGINT IS NOT NULL AND $4::BIGINT > 0 \
@@ -6202,16 +6211,34 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
 /// The authoritative per-candidate claim attempt for [`claim_task_batched`].
 ///
 /// Applied to one row [`claim_task_batched_candidates_query`] already
-/// locked via `FOR UPDATE SKIP LOCKED`. Matches 0 rows when the
-/// concurrency-key advisory lock is lost, the freshly-rechecked cap is now
-/// saturated, or the rate-limit bucket has no token. In every such case the
-/// caller moves on to the next candidate in the batch. This mirrors
-/// [`claim_task_query`]'s `claimed` CTE exactly, scoped to one known row
-/// instead of joined through a `candidate` CTE.
+/// locked via `FOR UPDATE SKIP LOCKED`. Matches 0 rows in four cases.
+/// The concurrency-key advisory lock is lost. The freshly-rechecked cap
+/// is now saturated. The rate-limit bucket has no token. Or the deadline
+/// recheck below fails. In every such case the caller moves on to the
+/// next candidate in the batch. This mirrors [`claim_task_query`]'s
+/// `claimed` CTE, scoped to one known row instead of joined through a
+/// `candidate` CTE.
+///
+/// # Deadline recheck (review finding, not present in the first draft)
+///
+/// The batch scan's own `schedule_to_close_at > NOW()` filter uses
+/// `NOW()`, frozen at transaction start. See [`claim_task_batched`]'s own
+/// doc for why that freeze is load-bearing for the keyset cursor. A batch
+/// search walking many candidates can take real wall-clock time. Up to
+/// `batch_size * max_batches` attempts, with the default config.
+///
+/// A row's deadline can pass in REAL time while an earlier candidate is
+/// still being tried. That row would incorrectly still read as
+/// not-yet-expired against the batch scan's frozen snapshot. This query's
+/// own `$9` check uses `clock_timestamp()` instead, which is never
+/// frozen. So it catches that case even though the batch scan cannot.
+/// This is the same shape the concurrency gate already uses: a soft
+/// filter in the scan, plus an authoritative recheck at claim time.
 ///
 /// Binds: `$1` worker id, `$2` candidate row id, `$3` concurrency key,
 /// `$4` concurrency cap, `$5` task type. Also `$6` rate limit key, `$7`
-/// activity name, `$8` circuit-breaker-tracked activities.
+/// activity name, `$8` circuit-breaker-tracked activities, `$9` schedule-
+/// to-close deadline.
 #[must_use]
 pub fn claim_batched_candidate_attempt_query() -> &'static str {
     static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
@@ -6251,6 +6278,10 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
                        $6::text IS NULL \
                        OR $7 = ANY($8) \
                        OR EXISTS (SELECT 1 FROM rate_limit_debit WHERE debited_key = $6) \
+                   ) \
+                   AND ( \
+                       $9::timestamptz IS NULL \
+                       OR $9::timestamptz > clock_timestamp() \
                    ) \
                  RETURNING harvest_task_queue.* \
              ) \
@@ -6330,6 +6361,8 @@ struct BatchedClaimCandidate {
     activity_name: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
     scheduled_at: DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    schedule_to_close_at: Option<DateTime<Utc>>,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     sticky_rank: i32,
     #[diesel(sql_type = diesel::sql_types::Integer)]
@@ -6498,6 +6531,9 @@ async fn try_claim_batched_candidate(
             candidate.activity_name.as_deref(),
         )
         .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+            candidate.schedule_to_close_at,
+        )
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -7281,6 +7317,35 @@ mod tests {
             sql.contains("WHERE id = $2"),
             "the claim UPDATE must target exactly the one candidate row \
              already locked by the batch fetch; got:\n{sql}"
+        );
+    }
+
+    /// The deadline recheck must use `clock_timestamp()`, never `NOW()`.
+    /// `NOW()` is frozen at transaction start. So it cannot catch a
+    /// `schedule_to_close_at` deadline that passes in real wall-clock
+    /// time. That can happen while an earlier candidate in a long batch
+    /// search is still being tried. See the query's own doc comment for
+    /// the review finding this closes.
+    #[test]
+    fn claim_batched_candidate_attempt_query_rechecks_the_deadline_against_real_time() {
+        let sql = claim_batched_candidate_attempt_query();
+        assert!(
+            sql.contains("$9::timestamptz IS NULL"),
+            "the deadline recheck must be optional (schedule_to_close_at \
+             defaults to NULL); got:\n{sql}"
+        );
+        assert!(
+            sql.contains("$9::timestamptz > clock_timestamp()"),
+            "the deadline recheck must compare against clock_timestamp(), \
+             not NOW(), or it inherits the same staleness the batch scan's \
+             own soft filter has; got:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("clock_timestamp()").count(),
+            1,
+            "clock_timestamp() must appear exactly once, in the deadline \
+             recheck alone -- every other time-sensitive predicate in this \
+             query is deliberately frozen NOW(); got:\n{sql}"
         );
     }
 
