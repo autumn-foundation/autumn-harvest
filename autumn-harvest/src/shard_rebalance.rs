@@ -1622,10 +1622,18 @@ mod db {
     /// and re-checking it out, never checks out `source`'s own pool again.
     /// On a pool-size-one shard, re-checking it out would deadlock against
     /// the connection the caller still holds.
+    ///
+    /// `source_shard` is that same held shard, checked against every LATER
+    /// hop too (issue #1317 review). A reverse migration's committed window
+    /// can leave a forwarding chain that returns to `source_shard` after
+    /// more than one hop. An example: A -> B staged while B -> A is
+    /// mid-cutover. A hop landing back on `source_shard` would deadlock the
+    /// same way the first hop does, so it is refused instead of attempted.
     async fn live_copy_is_terminal(
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
         first_hop: ShardId,
+        source_shard: ShardId,
     ) -> HarvestResult<bool> {
         let mut current = first_hop;
         let mut conn = checkout(pool, current).await?;
@@ -1635,6 +1643,17 @@ mod db {
                 None => {
                     resolved = Some(current);
                     break;
+                }
+                Some(next) if next == source_shard => {
+                    return Err(HarvestError::ShardUnavailable {
+                        shard_id: next.as_i32(),
+                        reason: format!(
+                            "execution forwarding chain for {exec_id} loops back to shard \
+                             {source_shard}, the shard already held for this reconciliation; \
+                             this is the committed window of an in-progress reverse \
+                             migration, not a resolvable live copy yet"
+                        ),
+                    });
                 }
                 Some(next) => {
                     current = next;
@@ -1678,6 +1697,11 @@ mod db {
     /// Also a no-op when it is already marked, or when the live copy has
     /// not finished yet. Safe to call from an operator sweep or on demand.
     ///
+    /// `source_shard` is the shard `source` connects to (issue #1317
+    /// review). It lets [`live_copy_is_terminal`] refuse a hop that loops
+    /// back to the connection this call already holds, instead of
+    /// deadlocking a pool-size-one shard against itself.
+    ///
     /// # Errors
     ///
     /// Same as [`live_copy_is_terminal`], plus [`HarvestError::Database`] on
@@ -1686,11 +1710,12 @@ mod db {
         source: &mut AsyncPgConnection,
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
+        source_shard: ShardId,
     ) -> HarvestResult<bool> {
         let Some((forward, _)) = existing_seal(source, exec_id).await? else {
             return Ok(false);
         };
-        if !live_copy_is_terminal(pool, exec_id, ShardId::new(forward)).await? {
+        if !live_copy_is_terminal(pool, exec_id, ShardId::new(forward), source_shard).await? {
             return Ok(false);
         }
         let updated = diesel::sql_query(
@@ -1819,7 +1844,7 @@ mod db {
             // learned. Reporting it is what lets an operator notice and
             // retry, rather than trusting a cursor that has already moved
             // past it.
-            match reconcile_migrated_seal_terminality(&mut source, pool, exec_id).await {
+            match reconcile_migrated_seal_terminality(&mut source, pool, exec_id, shard).await {
                 Ok(true) => reconciled += 1,
                 Ok(false) => {}
                 Err(e) => failures.push(SealReconciliationFailure {

@@ -2382,12 +2382,62 @@ async fn a_seal_whose_live_copy_never_finished_is_not_reconciled() {
         .expect("migrate");
 
     let mut source = shards.source().await;
-    let reconciled = reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id)
-        .await
-        .expect("reconcile must not fail merely because the live copy is still running");
+    let reconciled =
+        reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+            .await
+            .expect("reconcile must not fail merely because the live copy is still running");
     assert!(
         !reconciled,
         "a live, non-terminal target must not be reconciled"
+    );
+}
+
+#[tokio::test]
+async fn a_hop_that_loops_back_to_the_held_shard_is_refused_not_deadlocked() {
+    // Issue #1317 review: the committed window of a reverse migration
+    // forwards through the shard reconciliation already holds. A -> B
+    // (done) then B -> A (committed, not yet activated) leaves B's seal
+    // forwarding to A. A's still-staged copy forwards back to B. On a
+    // pool-size-one shard, re-checking out B here would deadlock against
+    // the connection this call already holds. This test cannot reproduce
+    // the deadlock itself without hanging the suite. It pins the fast,
+    // named refusal instead of the slower generic MAX_FORWARD_HOPS cycle
+    // message a multi-connection test pool would otherwise reach.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "there-and-back-cycle").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("A -> B");
+
+    let (mut reverse_source, mut reverse_target) = (shards.target().await, shards.source().await);
+    begin_migration(&mut reverse_source, exec_id, TARGET, SOURCE)
+        .await
+        .expect("begin B -> A");
+    stage_copy(&mut reverse_source, &mut reverse_target, exec_id, SOURCE)
+        .await
+        .expect("stage onto A");
+    verify_target_copy(&mut reverse_source, &mut reverse_target, exec_id, &codecs())
+        .await
+        .expect("verify the staged copy on A");
+    commit_cutover(&mut reverse_source, exec_id, SOURCE)
+        .await
+        .expect("commit B -> A")
+        .then_some(())
+        .expect("the reverse cutover must commit against a quiescent source");
+
+    // Deliberately no `activate_target`: A's staged copy still forwards to
+    // B, the committed-window state the finding describes.
+    let mut b = shards.target().await;
+    let result = reconcile_migrated_seal_terminality(&mut b, &shards.pool, exec_id, TARGET).await;
+    let err = result.expect_err("a hop back to the held shard must be refused, not resolved");
+    let message = err.to_string();
+    assert!(
+        message.contains("loops back to shard") && message.contains(&TARGET.to_string()),
+        "the refusal must name the held shard, got {message}"
+    );
+    assert!(
+        !message.contains("exceeded"),
+        "must fail on the first repeated hop, not after cycling through every hop, got {message}"
     );
 }
 
@@ -2465,9 +2515,10 @@ async fn a_terminate_if_running_start_creates_a_fresh_run_once_the_migrated_prio
          {still_refused:?}"
     );
 
-    let reconciled = reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id)
-        .await
-        .expect("reconcile");
+    let reconciled =
+        reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+            .await
+            .expect("reconcile");
     assert!(reconciled, "the finished target must be observed terminal");
 
     // GREEN: the same request now creates a fresh run instead of attaching
@@ -2504,9 +2555,10 @@ async fn a_terminate_if_running_start_creates_a_fresh_run_once_the_migrated_prio
 
     // A second reconcile is a no-op, and a second start of the same key
     // reaches the now-active fresh run, not a duplicate-insert error.
-    let reconciled_again = reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id)
-        .await
-        .expect("reconcile");
+    let reconciled_again =
+        reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+            .await
+            .expect("reconcile");
     assert!(
         !reconciled_again,
         "reconciling an already-marked seal is a no-op"
@@ -2580,7 +2632,7 @@ async fn an_allow_duplicate_start_creates_a_fresh_run_too_once_the_seal_is_recon
     .expect("complete the migrated run");
 
     let mut source = shards.source().await;
-    reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id)
+    reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
         .await
         .expect("reconcile")
         .then_some(())
@@ -2724,7 +2776,7 @@ async fn a_signal_with_start_attaches_to_the_active_run_not_the_released_seal() 
     .expect("complete the migrated run");
 
     let mut source = shards.source().await;
-    reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id)
+    reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
         .await
         .expect("reconcile");
 
@@ -2749,6 +2801,136 @@ async fn a_signal_with_start_attaches_to_the_active_run_not_the_released_seal() 
     assert_eq!(
         second.exec_id, first.exec_id,
         "must be the SAME execution as the first call created"
+    );
+}
+
+#[tokio::test]
+async fn a_reconciled_seal_alone_does_not_bypass_the_throttle_token() {
+    // Issue #1317 review: `resolve_bypass` reads a `Some` return from
+    // `try_load_by_key` as "an active execution already satisfies the
+    // reuse policy", skipping the throttle token reservation. With only a
+    // reconciled seal present, that used to still return `Some`, so a
+    // same-key restart bypassed configured throttle pacing entirely.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "throttle-over-seal").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("complete the migrated run");
+
+    let mut source = shards.source().await;
+    reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+        .await
+        .expect("reconcile")
+        .then_some(())
+        .expect("the finished target must be observed terminal");
+
+    let bypass = autumn_harvest::throttle::resolve_bypass(
+        &mut source,
+        "entity_flow",
+        "throttle-over-seal",
+        autumn_harvest::types::WorkflowIdReusePolicy::AllowDuplicate,
+    )
+    .await
+    .expect("resolve_bypass must not fail");
+    assert!(
+        !bypass,
+        "a released seal must not read as a live prior satisfying the reuse policy"
+    );
+}
+
+fn allow_duplicate_default_conflict_start<'a>(
+    workflow_name: &'a str,
+    workflow_id: &'a str,
+) -> autumn_harvest::execution::StartWorkflowParams<'a> {
+    autumn_harvest::execution::StartWorkflowParams {
+        reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::AllowDuplicate,
+        conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+        ..terminate_existing_start(workflow_name, workflow_id)
+    }
+}
+
+// Serialises the tests below that mutate the process-global admission gate
+// cache, mirroring the same-purpose lock in `admission_gate_authoritative_tests.rs`.
+static TEST_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+fn fleet_gate_cache(
+    reason: &str,
+) -> std::sync::Arc<autumn_harvest::admission_gate::AdmissionGateCache> {
+    let cache = std::sync::Arc::new(autumn_harvest::admission_gate::AdmissionGateCache::new());
+    cache.refresh(vec![autumn_harvest::admission_gate::AdmissionGate {
+        id: autumn_harvest::admission_gate::AdmissionGateId(Uuid::new_v4()),
+        scope: autumn_harvest::admission_gate::GateScope::Fleet,
+        reason: reason.to_string(),
+        message: None,
+        created_by: "test".to_string(),
+        created_at: Utc::now(),
+        expires_at: None,
+    }]);
+    cache
+}
+
+#[tokio::test]
+async fn an_armed_gate_still_applies_over_a_sole_reconciled_seal() {
+    // Issue #1317 review: `try_load_active_execution_for_update` fed the
+    // admission gate's create-vs-attach mirror
+    // (`start_will_create_new_execution`) a `Some(prior)` for a sole
+    // observed-terminal seal. `AllowDuplicate`'s native active behavior is
+    // Attach, so the mirror reported "no create" and the gate check was
+    // skipped. That happened even though the INSERT actually succeeds,
+    // since the widened active-uniqueness index already excludes an
+    // observed-terminal seal. An armed gate must still see this as a
+    // fresh create and block it.
+    let _serial = TEST_SERIAL.lock().await;
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "gate-over-reconciled-seal").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("complete the migrated run");
+
+    let mut source = shards.source().await;
+    reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+        .await
+        .expect("reconcile")
+        .then_some(())
+        .expect("the finished target must be observed terminal");
+
+    autumn_harvest::admission_gate::set_global_admission_gate_cache(Some(fleet_gate_cache(
+        "gate-over-reconciled-seal-incident",
+    )));
+
+    let blocked = autumn_harvest::execution::start_or_load_workflow_execution(
+        &mut source,
+        allow_duplicate_default_conflict_start("entity_flow", "gate-over-reconciled-seal"),
+        Some(autumn_harvest::admission_gate::GateMode::Check),
+    )
+    .await;
+
+    autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
+
+    assert!(
+        matches!(blocked, Err(HarvestError::AdmissionBlocked { .. })),
+        "a fresh create over a released seal must still face an armed gate, got {blocked:?}"
     );
 }
 

@@ -16972,19 +16972,16 @@ async fn resolve_successor_slot(
     workflow_id: &str,
     predecessor: uuid::Uuid,
 ) -> HarvestResult<Result<SuccessorSlot, String>> {
-    // A released `MIGRATED` seal and a fresh replacement row can both match
-    // this filter at once (issue #1317 review), the same hazard
-    // `load_workflow_execution_by_key_for_update` guards against. Order the
-    // released seal LAST so a live occupant always wins.
+    // An observed-terminal `MIGRATED` seal no longer occupies this slot
+    // (issue #1317). The widened active-uniqueness index already excludes
+    // it, so a fresh successor insert would succeed against it regardless.
+    // Exclude it here too, or a sole reconciled seal reads as a live
+    // occupant and this function wrongly reports the slot as taken.
     let occupant: Option<(uuid::Uuid, String)> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(target))
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
         .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
-        .order(
-            harvest_workflow_executions::migrated_run_terminal_at
-                .is_null()
-                .desc(),
-        )
+        .filter(harvest_workflow_executions::migrated_run_terminal_at.is_null())
         .select((
             harvest_workflow_executions::id,
             harvest_workflow_executions::state,

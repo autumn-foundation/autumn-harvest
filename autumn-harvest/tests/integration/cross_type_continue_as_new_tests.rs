@@ -907,6 +907,78 @@ async fn a_terminal_prior_run_of_the_target_type_blocks_the_transition() {
     );
 }
 
+/// A reconciled `MIGRATED` seal of the target type must free the successor
+/// slot (issue #1317 review, round 4). `resolve_successor_slot` used to
+/// order a released seal behind a live occupant rather than excluding it, so
+/// a *sole* reconciled seal still read as an occupant and
+/// `classify_successor_slot` terminally failed the predecessor even though
+/// the widened active-uniqueness index no longer counts the seal as taken.
+#[tokio::test]
+async fn a_reconciled_migrated_occupant_of_the_target_type_frees_the_slot() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let phase1 = leaked("trial_subscription");
+    let phase2 = leaked("paid_subscription");
+    let workflow_id = format!("sub-{}", Uuid::new_v4().simple());
+
+    // A prior run of the target type was rebalanced elsewhere and its live
+    // copy has since finished — the reconciler already marked this seal
+    // `migrated_run_terminal_at`, so it no longer occupies the key.
+    let seal = start_root(&mut conn, phase2, &workflow_id, serde_json::json!({})).await;
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(seal.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("detach the seal from the queue");
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+           SET state = 'MIGRATED', migrated_to_shard = 9, migrated_at = now(), \
+               migrated_run_terminal_at = now() \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(seal.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("park the reconciled seal");
+
+    let predecessor = start_root(
+        &mut conn,
+        phase1,
+        &workflow_id,
+        serde_json::json!({"next_type": phase2}),
+    )
+    .await;
+
+    let reg = registry(vec![wf(phase1, phase_one), wf(phase2, phase_two)]);
+    let (successor, recorded_type) =
+        drive_transition(&url, predecessor, reg, "w-1317-slot-reconciled-seal").await;
+
+    assert_eq!(
+        recorded_type.as_deref(),
+        Some(phase2),
+        "the transition must succeed rather than fail the predecessor"
+    );
+    assert_ne!(
+        successor, seal,
+        "the successor must be a fresh execution, not the seal"
+    );
+    let successor_row = load_execution(&mut conn, successor).await;
+    assert_eq!(successor_row.workflow_name, phase2);
+    // `phase_two` does no parking, so it may already be COMPLETED by the
+    // time this reads back. The relevant fact is that it started at all
+    // (not "FAILED", the outcome a blocked slot would have produced).
+    assert_ne!(successor_row.state, "FAILED");
+
+    // The seal itself is untouched: it is not the run and must never be
+    // rewritten to make room.
+    let seal_row = load_execution(&mut conn, seal).await;
+    assert_eq!(
+        seal_row.state, "MIGRATED",
+        "the reconciled seal's state must stay MIGRATED"
+    );
+}
+
 /// Naming your OWN type is a supported request — unlike the legacy
 /// `continue_as_new`, it re-resolves *that type's* declared defaults, and it is
 /// what the natural typed form `continue_as_new_as(&own_info(), input)`

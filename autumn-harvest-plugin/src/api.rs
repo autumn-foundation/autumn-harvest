@@ -20901,16 +20901,15 @@ pub(crate) async fn signal_with_start_workflow(
             .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
             .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
             .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
-            // A released `MIGRATED` seal and a fresh replacement row can both
-            // match this filter at once, on the SAME shard (issue #1317
-            // review). A same-key restart after reconciliation lands here via
-            // `pick_for_new_workflow`'s stable hash. Prefer the live row, or
-            // the seal shadows it and this loop reports no live copy at all.
-            .order(
-                harvest_workflow_executions::migrated_run_terminal_at
-                    .is_null()
-                    .desc(),
-            )
+            // An observed-terminal `MIGRATED` seal no longer occupies this
+            // key (issue #1317). The widened active-uniqueness index
+            // already excludes it. Exclude it here too. Otherwise a sole
+            // reconciled seal on the origin shard reads as a live copy
+            // still elsewhere. This handler then refuses a request that
+            // would actually succeed as a fresh start. A live replacement
+            // row never carries this marker, so it still matches
+            // unaffected.
+            .filter(harvest_workflow_executions::migrated_run_terminal_at.is_null())
             .select((
                 harvest_workflow_executions::id,
                 harvest_workflow_executions::state,
@@ -21634,15 +21633,12 @@ async fn update_with_start_workflow(
                 .filter(
                     harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
                 )
-                // A released `MIGRATED` seal and a fresh replacement row can
-                // both match this filter at once, on the SAME shard (issue
-                // #1317 review). Prefer the live row, or the seal shadows it
-                // and this loop reports no live copy at all.
-                .order(
-                    harvest_workflow_executions::migrated_run_terminal_at
-                        .is_null()
-                        .desc(),
-                )
+                // An observed-terminal `MIGRATED` seal no longer occupies
+                // this key (issue #1317) — see the matching scan in the
+                // signal-with-start handler. Exclude it here too, or a sole
+                // reconciled seal refuses a request that would actually
+                // succeed as a fresh start.
+                .filter(harvest_workflow_executions::migrated_run_terminal_at.is_null())
                 .select((
                     harvest_workflow_executions::id,
                     harvest_workflow_executions::state,
