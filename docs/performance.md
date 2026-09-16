@@ -1873,3 +1873,17 @@ standalone note rather than part of the claim-path attribution table above:
   Vantage Builds page and `GET /admin/builds`'s counter query (issue #171),
   batched into three grouped queries (one per source table) instead of one
   combined query per distinct build id.
+* [`docs/performance-history-export.md`](performance-history-export.md) — a
+  self-referential re-serialization loop in `history_export::export_history`,
+  the archival-export path `retention.rs`'s reclamation sweep calls per
+  retiring execution (issue #524/#698/#772/#798), solved as an O(1) fixed
+  point (instructions -22.08%, allocs -19.89%).
+* [`docs/performance-history-fingerprint.md`](performance-history-fingerprint.md)
+  — a per-event canonicalization buffer in
+  `shard_rebalance::history_fingerprint`, the replay-determinism check a
+  shard migration runs on both sides of a copy (`docs/sharding.md`), fixed
+  by reusing one buffer across events (alloc bytes -16.45%).
+* [`docs/performance-lineage.md`](performance-lineage.md) — the per-level and
+  per-node vecs in `lineage::LineageWalk`/`LineageTreeReport::finish`, the
+  in-memory half of `GET /workflows/{id}/lineage` (issue #621), pre-sized
+  instead of grown from empty (instructions -12.89%, allocs -35.25%).
