@@ -5098,10 +5098,11 @@ fn peek_char(dsn: &str, i: usize) -> Option<char> {
 /// *inside the password* rewritten.
 ///
 /// "Whitespace" is Unicode `White_Space` (`char::is_whitespace`), matching
-/// `tokio_postgres::config`'s own `skip_ws` — not ASCII only. The client
-/// treats a no-break space or a vertical tab as an option separator, so this
-/// scan must too, or it reads two options as one and misses a `password` key
-/// hiding past the separator (issue #1321).
+/// `tokio_postgres::config`'s own `skip_ws`. It is not ASCII only.
+///
+/// The client treats a no-break space or a vertical tab as an option
+/// separator. This scan must too. Otherwise it reads two options as one
+/// and a `password` key past the separator goes unseen (issue #1321).
 ///
 /// Returns `None` for a DSN this cannot scan — an unterminated quote, a missing
 /// `=`, a value that never arrives — leaving the caller to pass the original
@@ -5117,11 +5118,13 @@ fn scan_keyword_dsn(
 
     while i < bytes.len() {
         // Whitespace between options, copied verbatim. Unicode `White_Space`
-        // (`char::is_whitespace`), not ASCII: the client separates options the
-        // same way (`tokio_postgres::config`'s `skip_ws`), and a scan that
-        // only knew ASCII read a no-break-space-separated `password=...` as
-        // part of the previous value, so no `password` key was ever found to
-        // redact (issue #1321).
+        // (`char::is_whitespace`), not ASCII.
+        //
+        // The client separates options the same way, via
+        // `tokio_postgres::config`'s `skip_ws`. A scan that only knew ASCII
+        // read a no-break-space-separated `password=...` as part of the
+        // previous value. No `password` key was ever found to redact
+        // (issue #1321).
         let start = i;
         while let Some(c) = peek_char(dsn, i) {
             if !c.is_whitespace() {
@@ -18777,10 +18780,11 @@ mod migrate_cli_tests {
     #[test]
     fn keyword_separators_use_unicode_whitespace_like_the_client_does() {
         // `tokio_postgres` skips option separators with `char::is_whitespace` --
-        // the Unicode `White_Space` property, not ASCII (issue #1321). A scan
-        // that knows only ASCII reads the whole tail as ONE option whose value
-        // contains the text `password=hunter2`, finds no `password` key, and
-        // returns the DSN whole, credential included.
+        // the Unicode `White_Space` property, not ASCII (issue #1321).
+        //
+        // A scan that knows only ASCII reads the whole tail as ONE option.
+        // Its value contains the text `password=hunter2`. No `password` key
+        // is found, so the DSN returns whole, credential included.
         for separator in [
             '\u{0009}', // tab
             '\u{000b}', // vertical tab -- ASCII, but not `is_ascii_whitespace`
