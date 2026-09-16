@@ -30,11 +30,15 @@ each row, dispatches the workflow start, then records the outcome.
   `UNNEST` keeps the statement text fixed regardless of batch size, so this
   stays one prepared-statement shape.
 * **Mark-step statement count goes from `n` to `ceil(n / 8)` per claim
-  round** (`OUTBOX_MARK_FLUSH_EVERY`), not exactly one call per round --
-  see the Fix section's correction 3 for why a single end-of-batch flush
-  regressed claim-release latency and how chunking bounds it. Still the
-  textbook O(n) → O(n/k) shape for a fixed k=8, measured at three input
-  sizes: 1, 3, and 7 mark calls at n=5, 20, 50
+  round for an all-success or all-failure workload** (`OUTBOX_MARK_FLUSH_EVERY`),
+  not exactly one call per round -- see the Fix section's correction 3
+  for why a single end-of-batch flush regressed claim-release latency and
+  how chunking bounds it. A chunk containing BOTH outcomes issues up to 2
+  mark calls (one per outcome type), so a mixed-outcome production batch
+  can see up to `2 * ceil(n / 8)`; the measured harness below never mixes
+  outcomes (see Workload). Still the textbook O(n) → O(n/k) shape for a
+  fixed k=8, measured at three input sizes: 1, 3, and 7 mark calls at
+  n=5, 20, 50
   ([`after-sweep-chunked.txt`](perf-artifacts/outbox-start-relay/after-sweep-chunked.txt)).
   This alone clears the impact floor.
 * **The mark statement's own buffers also drop 28.2%** at n=50 (568 →
@@ -181,7 +185,10 @@ the fourth changes a wall-clock bound the numbers cannot see -- see below.
    1/3/7 (chunked). n=5 is unaffected -- its one 5-row round never
    reaches the 8-outcome threshold. Both floor criteria from the
    single-flush measurement still clear at every swept size; see that
-   file for the recomputed deltas.
+   file for the recomputed deltas. **This re-measurement is all-success**
+   (see Workload) -- a chunk with both delivered AND failed outcomes
+   issues up to 2 mark calls, so a mixed-outcome production batch can see
+   up to double the stated per-chunk count (Codex, on the PR).
 4. `OUTBOX_MARK_FLUSH_EVERY` alone only bounds outcome COUNT: dispatch is
    sequential, so nothing can flush pending marks while one dispatch is
    still in flight. One dispatch that itself runs long still holds every

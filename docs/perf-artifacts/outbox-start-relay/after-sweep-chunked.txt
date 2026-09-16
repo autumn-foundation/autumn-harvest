@@ -16,7 +16,16 @@ n	delivered	claim_calls	mark_calls	mark_buffers	total_calls	total_buffers
 reaches the 8-outcome flush threshold, so only the post-loop flush runs.
 n=20's one 20-row round flushes at 8, 16, then the remaining 4: 3 calls.
 n=50 splits into a 32-row round (flushes at 8/16/24/32: 4 calls) and an
-18-row round (flushes at 8/16, then the remaining 2: 3 calls), 7 total.)
+18-row round (flushes at 8/16, then the remaining 2: 3 calls), 7 total.
+
+CAVEAT (Codex, on the PR): this workload is all-success -- delivered == n
+at every point, since no HandlerRegistry is installed (see the writeup's
+Workload section). ceil(rows_in_round / 8) is the per-OUTCOME-TYPE call
+count. A chunk containing both delivered AND failed rows issues both
+mark_outbox_rows_delivered_batch and mark_outbox_rows_failed_batch, i.e.
+up to 2 mark calls per chunk instead of 1. A mixed-outcome production
+batch can therefore see up to double the mark_calls column above; this
+file does not measure that case.)
 
 -- n=50, top statements by calls --
 calls=   7 ( 58.3%)  buffers=  408 ( 38.0%)  UPDATE harvest_workflow_outbox AS outbox SET delivery_attempts = delivery_attempts + $4, last_error ...
@@ -44,9 +53,11 @@ Chunking trades some of the single-flush shape's round-trip reduction for a
 bound on claim-hold latency (see docs/performance-outbox-start-relay.md,
 "Fix", correction 3). Both floor criteria from the single-flush measurement
 still clear at every swept size:
-  - "Elimination of an N+1": mark-step statement count is O(n / 8), not
-    O(n) -- 7 instead of 50 at n=50, not the single-flush shape's O(claim
-    rounds), but still far below one call per row.
+  - "Elimination of an N+1": mark-step statement count is O(n / 8) for this
+    all-success workload, not O(n) -- 7 instead of 50 at n=50, not the
+    single-flush shape's O(claim rounds), but still far below one call per
+    row. A mixed-outcome batch is O(2n / 8) worst case (see the caveat
+    above), still O(n / 8), not O(n).
   - "≥20% reduction in total buffers for a statement that is ≥5% of the
     workload's buffers": the mark statement is still 58.3% of calls in the
     chunked shape and drops 28.2% on its own buffer count (568 -> 408 at
