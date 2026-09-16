@@ -735,7 +735,12 @@ mod tests {
             "count threshold reached: due regardless of elapsed time"
         );
         assert!(
-            !outbox_mark_flush_due(1, OUTBOX_MARK_FLUSH_MAX_DELAY - Duration::from_millis(1)),
+            !outbox_mark_flush_due(
+                1,
+                OUTBOX_MARK_FLUSH_MAX_DELAY
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("OUTBOX_MARK_FLUSH_MAX_DELAY is well over 1ms")
+            ),
             "under the time threshold and under the count threshold: not due"
         );
         assert!(
@@ -1011,6 +1016,67 @@ mod tests {
             .expect("cleanup");
     }
 
+    async fn flush_outbox_marks_insert_claimed_row(
+        conn: &mut AsyncPgConnection,
+        workflow_id: &str,
+    ) -> i64 {
+        #[derive(diesel::QueryableByName)]
+        struct IdRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            id: i64,
+        }
+        diesel::sql_query(
+            "INSERT INTO harvest_workflow_outbox
+                (workflow_name, workflow_id, queue_name, input, claimed_by, claimed_at)
+             VALUES ('r1620_wf', $1, 'default', '{}'::jsonb, 'worker-A', NOW())
+             RETURNING id",
+        )
+        .bind::<diesel::sql_types::Text, _>(workflow_id)
+        .get_result::<IdRow>(conn)
+        .await
+        .expect("insert claimed outbox row")
+        .id
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct FlushOutboxMarksState {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        delivered_execution_id: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        last_error: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        claimed_by: Option<String>,
+    }
+
+    async fn flush_outbox_marks_one_pair(
+        conn: &mut AsyncPgConnection,
+        ok_id: i64,
+        err_id: i64,
+        error: &str,
+    ) {
+        let mut delivered_marks = vec![(ok_id, ExecutionId::new())];
+        let mut failed_marks = vec![(
+            err_id,
+            error.to_owned(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )];
+        let flushed = flush_outbox_marks(
+            conn,
+            "worker-A",
+            &mut delivered_marks,
+            &mut failed_marks,
+            None,
+        )
+        .await
+        .expect("flush chunk");
+        assert_eq!(flushed, 1, "chunk marks its one delivered row");
+        assert!(
+            delivered_marks.is_empty(),
+            "delivered buffer clears after flush"
+        );
+        assert!(failed_marks.is_empty(), "failed buffer clears after flush");
+    }
+
     /// Exercises `flush_outbox_marks` the way the chunked drain loop calls
     /// it: once per chunk, not once for the whole batch. A slow later
     /// dispatch must not hold an earlier row's claim past
@@ -1022,35 +1088,6 @@ mod tests {
     async fn flush_outbox_marks_applies_each_chunk_and_clears_its_buffers() {
         use diesel_async::AsyncConnection;
 
-        async fn insert_claimed(conn: &mut AsyncPgConnection, workflow_id: &str) -> i64 {
-            #[derive(diesel::QueryableByName)]
-            struct IdRow {
-                #[diesel(sql_type = diesel::sql_types::BigInt)]
-                id: i64,
-            }
-            diesel::sql_query(
-                "INSERT INTO harvest_workflow_outbox
-                    (workflow_name, workflow_id, queue_name, input, claimed_by, claimed_at)
-                 VALUES ('r1620_wf', $1, 'default', '{}'::jsonb, 'worker-A', NOW())
-                 RETURNING id",
-            )
-            .bind::<diesel::sql_types::Text, _>(workflow_id)
-            .get_result::<IdRow>(conn)
-            .await
-            .expect("insert claimed outbox row")
-            .id
-        }
-
-        #[derive(diesel::QueryableByName)]
-        struct MarkState {
-            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-            delivered_execution_id: Option<String>,
-            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-            last_error: Option<String>,
-            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-            claimed_by: Option<String>,
-        }
-
         let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
             eprintln!("SKIP: HARVEST_TEST_DATABASE_URL unset");
             return;
@@ -1059,49 +1096,13 @@ mod tests {
             .await
             .expect("connect to test DB");
 
-        let chunk1_ok = insert_claimed(&mut conn, "r1620-chunk1-ok").await;
-        let chunk1_err = insert_claimed(&mut conn, "r1620-chunk1-err").await;
-        let chunk2_ok = insert_claimed(&mut conn, "r1620-chunk2-ok").await;
-        let chunk2_err = insert_claimed(&mut conn, "r1620-chunk2-err").await;
+        let chunk1_ok = flush_outbox_marks_insert_claimed_row(&mut conn, "r1620-chunk1-ok").await;
+        let chunk1_err = flush_outbox_marks_insert_claimed_row(&mut conn, "r1620-chunk1-err").await;
+        let chunk2_ok = flush_outbox_marks_insert_claimed_row(&mut conn, "r1620-chunk2-ok").await;
+        let chunk2_err = flush_outbox_marks_insert_claimed_row(&mut conn, "r1620-chunk2-err").await;
 
-        let mut delivered_marks = vec![(chunk1_ok, ExecutionId::new())];
-        let mut failed_marks = vec![(
-            chunk1_err,
-            "boom-1".to_owned(),
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-        )];
-        let flushed = flush_outbox_marks(
-            &mut conn,
-            "worker-A",
-            &mut delivered_marks,
-            &mut failed_marks,
-            None,
-        )
-        .await
-        .expect("flush chunk 1");
-        assert_eq!(flushed, 1, "chunk 1 marks its one delivered row");
-        assert!(
-            delivered_marks.is_empty(),
-            "delivered buffer clears after flush"
-        );
-        assert!(failed_marks.is_empty(), "failed buffer clears after flush");
-
-        let mut delivered_marks = vec![(chunk2_ok, ExecutionId::new())];
-        let mut failed_marks = vec![(
-            chunk2_err,
-            "boom-2".to_owned(),
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-        )];
-        let flushed = flush_outbox_marks(
-            &mut conn,
-            "worker-A",
-            &mut delivered_marks,
-            &mut failed_marks,
-            None,
-        )
-        .await
-        .expect("flush chunk 2");
-        assert_eq!(flushed, 1, "chunk 2 marks its own delivered row");
+        flush_outbox_marks_one_pair(&mut conn, chunk1_ok, chunk1_err, "boom-1").await;
+        flush_outbox_marks_one_pair(&mut conn, chunk2_ok, chunk2_err, "boom-2").await;
 
         for (id, expect_delivered) in [
             (chunk1_ok, true),
@@ -1109,7 +1110,7 @@ mod tests {
             (chunk2_ok, true),
             (chunk2_err, false),
         ] {
-            let row: MarkState = diesel::sql_query(
+            let row: FlushOutboxMarksState = diesel::sql_query(
                 "SELECT delivered_execution_id, last_error, claimed_by \
                  FROM harvest_workflow_outbox WHERE id = $1",
             )
