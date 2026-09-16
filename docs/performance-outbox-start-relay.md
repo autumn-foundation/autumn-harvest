@@ -304,8 +304,9 @@ measured call.
 
 **This table predates the Fix section's correction 3** (chunked
 flushing, `OUTBOX_MARK_FLUSH_EVERY=8`) and no longer matches the
-checked-out code's `mark_calls` at n=20 and n=50 -- both floor criteria
-still clear post-chunking, but at different numbers. See
+checked-out code's `mark_calls` at n=20 and n=50. Only the
+buffer-reduction floor criterion still clears post-chunking, not the
+N+1-elimination one (Codex, on the PR) -- see
 [`after-sweep-chunked.txt`](perf-artifacts/outbox-start-relay/after-sweep-chunked.txt)
 for the re-measurement.
 
