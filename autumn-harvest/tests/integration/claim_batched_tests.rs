@@ -588,3 +588,323 @@ async fn batched_claim_respects_the_rate_limit_bucket() {
         "exactly one token must be debited; got {remaining}"
     );
 }
+
+/// Regression test for a review finding on this PR. Walking a batch must
+/// NOT debit a rate-limit token for a candidate the concurrency gate
+/// always rejects.
+///
+/// Every poisoned row here shares BOTH a saturated `concurrency_key` AND a
+/// `rate_limit_key`, funded with many tokens. That is the exact
+/// adversarial combination the fix in
+/// `queue::claim_batched_candidate_concurrency_probe_query` exists to
+/// close. Before that fix, walking past these poisoned rows would debit
+/// one token per row tried.
+#[tokio::test(flavor = "multi_thread")]
+async fn batched_claim_never_debits_rate_limit_for_a_concurrency_rejected_candidate() {
+    let (_url, mut conn, _container) = setup_db().await;
+    let queue = unique_queue("batched-no-leak");
+    let saturated_key = format!("key-{}", Uuid::new_v4().simple());
+    let bucket_key = format!("bucket-{}", Uuid::new_v4().simple());
+
+    queue::ensure_rate_limit_bucket(&mut conn, &bucket_key, 0.0, 100.0)
+        .await
+        .expect("ensure bucket");
+
+    let holder = enqueue_row(
+        &mut conn,
+        &queue,
+        &RowSpec {
+            priority: 0,
+            concurrency_key: Some(saturated_key.clone()),
+            concurrency_cap: Some(1),
+        },
+    )
+    .await;
+    force_running(&mut conn, holder, "holder").await;
+
+    // 10 poisoned rows: saturated concurrency key AND a funded rate-limit
+    // bucket. Each one that reaches the debit step would consume a token.
+    for _ in 0..10 {
+        let exec_id = insert_execution(&mut conn).await;
+        let mut params = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+        params.workflow_exec_id = Some(exec_id);
+        params.activity_name = Some("noop".to_string());
+        params.activity_id = Some(Uuid::new_v4());
+        params.priority = 10;
+        params.concurrency_key = Some(saturated_key.clone());
+        params.max_concurrent = Some(1);
+        params.rate_limit_key = Some(bucket_key.clone());
+        queue::enqueue(&mut conn, &params).await.expect("enqueue");
+    }
+
+    let claimable = enqueue_row(
+        &mut conn,
+        &queue,
+        &RowSpec {
+            priority: 1,
+            concurrency_key: None,
+            concurrency_cap: None,
+        },
+    )
+    .await;
+
+    let claimed = batched_claim_one(&mut conn, &queue, "w6", BatchedClaimConfig::default())
+        .await
+        .expect("the claimable row must be found despite the poisoned rows ahead of it");
+    assert_eq!(claimed, claimable);
+
+    use diesel_async::RunQueryDsl;
+    #[derive(diesel::QueryableByName)]
+    struct Tokens {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        tokens: f64,
+    }
+    let remaining = diesel::sql_query("SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1")
+        .bind::<diesel::sql_types::Text, _>(&bucket_key)
+        .get_result::<Tokens>(&mut conn)
+        .await
+        .expect("tokens")
+        .tokens;
+    assert!(
+        (remaining - 100.0).abs() < 1e-9,
+        "none of the 10 poisoned rows may debit a token -- the winning row \
+         has no rate_limit_key, so the bucket must stay at its starting \
+         100.0; got {remaining}"
+    );
+}
+
+// ── Other preserved gates, exercised end-to-end (not just SQL-shape) ───────
+
+/// Sticky routing, exercised through a real `claim_task_batched` call, not
+/// just a SQL-text assertion.
+///
+/// A row pinned to a worker with a live sticky lease must be claimed by
+/// that worker, and skipped when a different worker polls first.
+#[tokio::test(flavor = "multi_thread")]
+async fn batched_claim_honors_sticky_routing() {
+    let (_url, mut conn, _container) = setup_db().await;
+    let queue = unique_queue("batched-sticky");
+
+    let exec_id = insert_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id);
+    params.activity_name = Some("noop".to_string());
+    params.activity_id = Some(Uuid::new_v4());
+    params.sticky_worker_id = Some("sticky-owner".to_string());
+    params.sticky_timeout = Some(std::time::Duration::from_secs(300));
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+    let claimed_by_other =
+        batched_claim_one(&mut conn, &queue, "not-the-owner", BatchedClaimConfig::default()).await;
+    assert_eq!(
+        claimed_by_other, None,
+        "a live sticky pin must block every other worker"
+    );
+
+    let claimed_by_owner =
+        batched_claim_one(&mut conn, &queue, "sticky-owner", BatchedClaimConfig::default())
+            .await
+            .expect("the pinned worker must be able to claim it");
+    assert_eq!(claimed_by_owner, task_id);
+}
+
+/// The circuit-breaker/ineligible-activities gate exempts a
+/// capability-routed activity (`required_capabilities IS NOT NULL`),
+/// exercised end-to-end.
+///
+/// Both rows share `activity_name`, and that name is passed as
+/// `ineligible_activities`. Only the row WITHOUT `required_capabilities`
+/// must be excluded by it.
+#[tokio::test(flavor = "multi_thread")]
+async fn batched_claim_capability_routed_activity_bypasses_the_ineligible_gate() {
+    let (_url, mut conn, _container) = setup_db().await;
+    let queue = unique_queue("batched-capability");
+    let poisoned_activity = "poison-activity";
+
+    let exec_id = insert_execution(&mut conn).await;
+    let mut plain = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+    plain.workflow_exec_id = Some(exec_id);
+    plain.activity_name = Some(poisoned_activity.to_string());
+    plain.activity_id = Some(Uuid::new_v4());
+    queue::enqueue(&mut conn, &plain).await.expect("enqueue plain");
+
+    let exec_id2 = insert_execution(&mut conn).await;
+    let mut capability_routed =
+        EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+    capability_routed.workflow_exec_id = Some(exec_id2);
+    capability_routed.activity_name = Some(poisoned_activity.to_string());
+    capability_routed.activity_id = Some(Uuid::new_v4());
+    // An empty requirement array is present, not NULL. So it exempts this
+    // row from the ineligible-activities gate. The separate
+    // capability-match EXISTS check below it is vacuously satisfied too --
+    // there are no elements to fail against.
+    capability_routed.required_capabilities = Some(serde_json::json!([]));
+    let capability_task_id = queue::enqueue(&mut conn, &capability_routed)
+        .await
+        .expect("enqueue capability-routed");
+
+    let ineligible = vec![poisoned_activity.to_string()];
+    let claimed = queue::claim_task_batched(
+        &mut conn,
+        std::slice::from_ref(&queue),
+        "w7",
+        "",
+        None,
+        &[],
+        &ineligible,
+        BatchedClaimConfig::default(),
+    )
+    .await
+    .expect("claim")
+    .expect("the capability-routed row must still be claimable");
+    assert_eq!(
+        claimed.id, capability_task_id,
+        "the plain row sharing the same activity_name must stay excluded, \
+         and the capability-routed row must be the one found"
+    );
+}
+
+// ── End-to-end latency capture (evidence for docs/performance-claim-batched-seek-and-refine.md) ──
+
+/// Real end-to-end latency, `claim_task` against `claim_task_batched`, at
+/// the hot-contention fixture `docs/performance-claim-batched-seek-and-refine.md`
+/// cites.
+///
+/// `autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh`
+/// also takes SQL-only `EXPLAIN` captures. Unlike those, this drives the
+/// REAL compiled functions over real connections. So it is the only
+/// source for that page's headline milliseconds-per-claim numbers.
+/// Single-row runs first, so the batched path's own numbers never benefit
+/// from a warmer cache.
+///
+/// `CLAIM_BATCHED_CAPTURE_N` overrides the claim count per path (default
+/// 400).
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[ignore = "evidence generator, not a CI assertion -- run via \
+            autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh"]
+async fn zz_capture_claim_batched_end_to_end_latency() {
+    let bench = match super::claim_bench_support::db::setup_bench_db().await {
+        Ok(bench) => bench,
+        Err(reason) => {
+            eprintln!("no database reachable ({}); nothing captured", reason.0);
+            return;
+        }
+    };
+
+    let n: usize = std::env::var("CLAIM_BATCHED_CAPTURE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(400);
+
+    let mut seed_conn = connect(&bench.url).await;
+    seed_conn
+        .batch_execute("TRUNCATE harvest_task_queue")
+        .await
+        .expect("truncate");
+    seed_conn
+        .batch_execute(
+            "INSERT INTO harvest_task_queue \
+               (id, queue_name, task_type, activity_name, activity_id, input, state, \
+                priority, attempt, max_attempts, scheduled_at, concurrency_key, \
+                concurrency_cap, crash_strikes, wake_requested) \
+             SELECT gen_random_uuid(), 'bench-q-' || (i % 4), 'activity', 'noop', \
+                    gen_random_uuid(), '{}'::jsonb, 'PENDING', (i % 100), 0, 3, \
+                    NOW() - INTERVAL '1 second', 'ckey-' || (i % 256), 1000000, 0, FALSE \
+             FROM generate_series(1, 10000) AS i",
+        )
+        .await
+        .expect("seed backlog");
+    seed_conn
+        .batch_execute(
+            "INSERT INTO harvest_task_queue \
+               (id, queue_name, task_type, activity_name, activity_id, input, state, \
+                priority, worker_id, attempt, max_attempts, scheduled_at, started_at, \
+                concurrency_key, concurrency_cap, crash_strikes, wake_requested) \
+             SELECT gen_random_uuid(), 'bench-q-' || (i % 4), 'activity', 'noop', \
+                    gen_random_uuid(), '{}'::jsonb, 'RUNNING', 0, 'holder-' || i, 1, 3, \
+                    NOW() - INTERVAL '10 second', NOW() - INTERVAL '5 second', \
+                    'ckey-' || (i % 256), 1000000, 0, FALSE \
+             FROM generate_series(1, 2000) AS i",
+        )
+        .await
+        .expect("seed hot-contention rows");
+    seed_conn
+        .batch_execute("ANALYZE harvest_task_queue")
+        .await
+        .expect("analyze");
+    drop(seed_conn);
+
+    let queues = vec![
+        "bench-q-0".to_string(),
+        "bench-q-1".to_string(),
+        "bench-q-2".to_string(),
+        "bench-q-3".to_string(),
+    ];
+    let mut conn = connect(&bench.url).await;
+
+    let mut single_ms = Vec::with_capacity(n);
+    for _ in 0..n {
+        let start = std::time::Instant::now();
+        let claimed = claim_task(&mut conn, &queues, "capture-single", "", None, &[], &[])
+            .await
+            .expect("claim");
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        if claimed.is_none() {
+            break;
+        }
+        single_ms.push(elapsed_ms);
+    }
+
+    let mut batch_ms = Vec::with_capacity(n);
+    for _ in 0..n {
+        let start = std::time::Instant::now();
+        let claimed = claim_task_batched(
+            &mut conn,
+            &queues,
+            "capture-batched",
+            "",
+            None,
+            &[],
+            &[],
+            BatchedClaimConfig::default(),
+        )
+        .await
+        .expect("claim");
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        if claimed.is_none() {
+            break;
+        }
+        batch_ms.push(elapsed_ms);
+    }
+
+    let single_stats = super::claim_bench_support::LatencyStats::from_samples(&single_ms);
+    let batch_stats = super::claim_bench_support::LatencyStats::from_samples(&batch_ms);
+
+    let summary = format!(
+        "single-row claim_task: n={} mean={:.3}ms p50={:.3}ms p99={:.3}ms min={:.3}ms max={:.3}ms\n\
+         batched  claim_task_batched: n={} mean={:.3}ms p50={:.3}ms p99={:.3}ms min={:.3}ms max={:.3}ms\n",
+        single_stats.count,
+        single_stats.mean_ms,
+        single_stats.p50_ms,
+        single_stats.p99_ms,
+        single_ms.first().copied().unwrap_or(0.0),
+        single_ms.iter().copied().fold(0.0_f64, f64::max),
+        batch_stats.count,
+        batch_stats.mean_ms,
+        batch_stats.p50_ms,
+        batch_stats.p99_ms,
+        batch_ms.first().copied().unwrap_or(0.0),
+        batch_ms.iter().copied().fold(0.0_f64, f64::max),
+    );
+
+    let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("autumn-harvest/ has a workspace-root parent")
+        .join("docs")
+        .join("perf-artifacts")
+        .join("claim-batched-seek-and-refine");
+    std::fs::create_dir_all(&out_dir).expect("create artifact output directory");
+    std::fs::write(out_dir.join("end_to_end_latency.txt"), &summary).expect("write artifact");
+
+    eprintln!("== capture complete: label=end_to_end_latency ==\n{summary}");
+}

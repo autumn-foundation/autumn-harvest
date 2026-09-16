@@ -16,6 +16,9 @@
 #   batch_idle.explain.txt     -- claim_task_batched_candidates_query(), same
 #   control_hot.explain.txt    -- claim_task_query() at 256 keys, 2,000 RUNNING
 #   batch_hot.explain.txt      -- claim_task_batched_candidates_query(), same
+#   end_to_end_latency.txt     -- real claim_task vs claim_task_batched calls,
+#                                  same hot-contention fixture (the source for
+#                                  the doc page's headline milliseconds)
 #
 # Preconditions: a reachable Postgres 16 named by HARVEST_TEST_DATABASE_URL,
 # migrated with the full bundle (`autumn_harvest::test_init_sql()`), and a
@@ -151,6 +154,12 @@ mkdir -p "$OUT_DIR"
 cp "$WORK_DIR"/control_idle.explain.txt "$WORK_DIR"/batch_idle.explain.txt \
    "$WORK_DIR"/control_hot.explain.txt "$WORK_DIR"/batch_hot.explain.txt \
    "$OUT_DIR/"
+
+echo "== capturing real end-to-end latency (claim_task vs claim_task_batched) =="
+# The test itself seeds its own fixture (same shape as above) and writes
+# end_to_end_latency.txt directly into $OUT_DIR -- nothing to copy here.
+cargo test -p autumn-harvest --features db,testing --test integration -- \
+  --ignored --nocapture zz_capture_claim_batched_end_to_end_latency
 
 echo "== done. Artifacts in $OUT_DIR =="
 ls -la "$OUT_DIR"

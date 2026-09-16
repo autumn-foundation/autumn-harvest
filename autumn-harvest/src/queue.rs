@@ -6010,6 +6010,17 @@ pub async fn pending_queue_demand_by_queue_name(
 ///    scheduled_at, id)` and compares with an explicit `OR` chain, since
 ///    the columns sort in mixed directions.
 ///
+/// A third bug surfaced in this session's own review, not ledger #5's.
+/// A batch walk debited a rate-limit token for every candidate tried,
+/// including one the concurrency gate always rejects. An adversarial
+/// batch sharing both a saturated `concurrency_key` and a `rate_limit_key`
+/// could leak up to `batch_size * max_batches` tokens from one bucket.
+/// That is far more than the single-row path's documented one-token
+/// bound. See [`claim_batched_candidate_concurrency_probe_query`] for the
+/// fix: a cheap, read-only concurrency check runs first. The debit then
+/// only ever runs for a candidate that already cleared the concurrency
+/// gate.
+///
 /// # What this is not
 ///
 /// This is **not** wired into [`claim_task`] or [`claim_task_on_shard`].
@@ -6030,6 +6041,16 @@ pub async fn pending_queue_demand_by_queue_name(
 /// [`claim_task_query_fenced`] and [`claim_task_by_id_query`] add to the
 /// single-row path. A deployment using either would need those ported here
 /// first.
+///
+/// **Known limitation, safe-side: the advisory lock can be held longer
+/// than the single-row path's.** `pg_try_advisory_xact_lock` is
+/// transaction-scoped and reentrant. So once one candidate in a batch
+/// acquires a saturated key's lock, every later candidate sharing that
+/// key re-acquires it instantly. It then holds the lock until this whole
+/// claim attempt's transaction ends. That span can cover every candidate
+/// in every batch searched. This cannot cause a double-claim. It can only
+/// make other workers' claims on that key wait longer. Unmeasured, and
+/// not the same gap as the fleet-scale-throughput gap named above.
 // The body is one SQL string literal; the line count is the query's, not
 // control flow's -- the same allow `claim_task_query` carries.
 #[allow(clippy::too_many_lines)]
@@ -6239,6 +6260,57 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
     &QUERY
 }
 
+/// A read-only probe: would this candidate's concurrency gate pass right
+/// now?
+///
+/// [`try_claim_batched_candidate`] runs this BEFORE
+/// [`claim_batched_candidate_attempt_query`], and skips straight to the
+/// next candidate on `false` -- never running the rate-limit debit at all.
+///
+/// # Why this exists (review finding, not present in the first draft)
+///
+/// Without this probe, walking a batch debits a rate-limit token for
+/// EVERY candidate tried, even one the concurrency gate was always going
+/// to reject. An adversarial batch can share both a saturated
+/// `concurrency_key` and a `rate_limit_key` across many rows -- exactly
+/// ledger #4/#5's own poisoned-row shape. Each rejected candidate would
+/// still debit a token before failing. So one `claim_task_batched()` call
+/// could leak up to `batch_size * max_batches` tokens from one bucket. The
+/// single-row path bounds this leak at one token per claim attempt
+/// (documented above [`claim_task_on_shard`]). Batching must not multiply
+/// it. This probe restores that same one-token bound: the rate-limit debit
+/// now only ever runs for a candidate whose concurrency gate already
+/// passed.
+///
+/// Binds: `$1` concurrency key, `$2` concurrency cap, `$3` task type --
+/// the same three columns [`claim_batched_candidate_attempt_query`]'s own
+/// concurrency check reads. Takes the SAME `pg_try_advisory_xact_lock` this
+/// candidate's later claim attempt (if any) will also take. The lock is
+/// transaction-scoped and reentrant. Re-acquiring it here is a no-op, not
+/// a second lock. Holding it from here blocks every other claimer from
+/// starting new `RUNNING` work under this key, until this transaction
+/// ends. So the `COUNT` this probe reads stays valid through the later
+/// claim attempt.
+#[must_use]
+pub const fn claim_batched_candidate_concurrency_probe_query() -> &'static str {
+    "SELECT ( \
+         $1::text IS NULL \
+         OR ( \
+             pg_try_advisory_xact_lock(hashtext($1)::bigint) \
+             AND ( \
+                 $2::int IS NULL \
+                 OR ( \
+                     SELECT COUNT(*) FROM harvest_task_queue recheck \
+                     WHERE recheck.concurrency_key = $1 \
+                       AND recheck.task_type = $3 \
+                       AND recheck.state = 'RUNNING' \
+                       AND recheck.worker_id IS NOT NULL \
+                 ) < $2 \
+             ) \
+         ) \
+     ) AS passes"
+}
+
 /// One row from [`claim_task_batched_candidates_query`]: the columns needed
 /// to walk the batch and attempt a claim. Also carries the sort key used to
 /// resume from a keyset cursor on the next batch.
@@ -6362,17 +6434,55 @@ async fn fetch_claim_batch(
         .map_err(crate::error::database_error)
 }
 
+/// Run [`claim_batched_candidate_concurrency_probe_query`] for one
+/// candidate. Only called when `candidate.concurrency_key` is `Some` --
+/// see [`try_claim_batched_candidate`].
+async fn concurrency_probe_passes(
+    conn: &mut AsyncPgConnection,
+    candidate: &BatchedClaimCandidate,
+) -> HarvestResult<bool> {
+    #[derive(diesel::QueryableByName)]
+    struct Passes {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        passes: bool,
+    }
+    let row: Passes = diesel::sql_query(claim_batched_candidate_concurrency_probe_query())
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+            candidate.concurrency_key.as_deref(),
+        )
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(
+            candidate.concurrency_cap,
+        )
+        .bind::<diesel::sql_types::Text, _>(&candidate.task_type)
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(row.passes)
+}
+
 /// Attempt to claim one already-locked candidate.
 ///
 /// `Ok(None)` means the authoritative recheck failed: the lock was lost,
 /// the cap is now saturated, or there is no rate token. That is not an
 /// error, just "try the next candidate in the batch".
+///
+/// Checks the concurrency gate with
+/// [`claim_batched_candidate_concurrency_probe_query`] FIRST, for any
+/// candidate that carries a concurrency key. A rejected candidate never
+/// reaches the rate-limit debit at all -- see that probe's own doc
+/// comment for the leak this prevents.
 async fn try_claim_batched_candidate(
     conn: &mut AsyncPgConnection,
     candidate: &BatchedClaimCandidate,
     worker_id: &str,
     circuit_breaker_activities: &[String],
 ) -> HarvestResult<Option<TaskQueueItem>> {
+    if candidate.concurrency_key.is_some()
+        && !concurrency_probe_passes(conn, candidate).await?
+    {
+        return Ok(None);
+    }
+
     let mut rows: Vec<TaskQueueItem> = diesel::sql_query(claim_batched_candidate_attempt_query())
         .bind::<diesel::sql_types::Text, _>(worker_id)
         .bind::<diesel::sql_types::Uuid, _>(candidate.id)
@@ -7106,6 +7216,7 @@ mod tests {
             "NOT (activity_name = ANY($6))",
             "NOT (activity_name = ANY(paused_activities.names))",
             "required_capabilities IS NULL",
+            "required_capabilities IS NOT NULL",
             "rate_limit_key IS NULL",
         ] {
             assert!(
@@ -7190,6 +7301,36 @@ mod tests {
             2,
             "the debit SET and its own WHERE re-check must both use the \
              shared formula; got:\n{sql}"
+        );
+    }
+
+    /// The concurrency probe must contain no rate-limit text at all. It
+    /// exists specifically so a rejected candidate never reaches the
+    /// debit -- see the query's own doc comment for the leak this
+    /// prevents.
+    #[test]
+    fn claim_batched_candidate_concurrency_probe_query_never_touches_rate_limiting() {
+        let sql = claim_batched_candidate_concurrency_probe_query();
+        assert!(
+            !sql.contains("rate_limit"),
+            "the probe must check concurrency only; got:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("pg_try_advisory_xact_lock").count(),
+            1,
+            "exactly one advisory-lock guard; got:\n{sql}"
+        );
+        assert!(
+            sql.contains(
+                "SELECT COUNT(*) FROM harvest_task_queue recheck \
+                 WHERE recheck.concurrency_key = $1 \
+                   AND recheck.task_type = $3 \
+                   AND recheck.state = 'RUNNING' \
+                   AND recheck.worker_id IS NOT NULL"
+            ),
+            "the probe's recheck must match the attempt query's own \
+             recheck exactly, just against $1/$3 instead of $3/$5; \
+             got:\n{sql}"
         );
     }
 
