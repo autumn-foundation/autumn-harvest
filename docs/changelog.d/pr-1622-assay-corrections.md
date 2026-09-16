@@ -28,13 +28,20 @@
   from an apparatus with known defects, *and* they happened to be right.
 
   **A harvest run was discarded for box contamination, and the report says so
-  in detail.** Its repetitions read 5.39, 5.37 and **15.02** workflows/sec, and
-  that single outlier dragged the mean to 8.60 — which *passes* the L1 validity
-  band the same arm otherwise kills. The cause was `git merge` and `git push`
-  running on the box mid-measurement, against the idleness precondition
-  `docs/benchmarks.md` insists on. It is recorded as the most dangerous failure
-  in this work: a verdict flipped from kill to pass by interference, invisible
-  in the mean and visible only per repetition.
+  in detail.** Its repetitions read 5.39, 5.37 and **15.02** workflows/sec, an
+  outlier roughly 2.8x its own siblings against an arm whose clean repetitions
+  sit inside 5%. The cause was `git merge` and `git push` running on the box
+  mid-measurement, against the idleness precondition `docs/benchmarks.md`
+  insists on. What made it dangerous is that the contamination is invisible in
+  the arm's mean, 8.60, and visible only per repetition, so a harness
+  reporting means alone would have published it.
+
+  An earlier revision additionally claimed that 8.60 *passed* assay #10's L1
+  validity band the same arm otherwise kills, and called it a verdict flipped
+  by interference. That is withdrawn: #10's band was registered for the
+  canonical `{}` input and this run used #11's payload, so the band never
+  applied and the flip could not have occurred. The claim rested on the same
+  defect the apparatus fix above removes.
 
   Also newly reported rather than smoothed away: Temporal's spread across three
   repetitions (39.28-48.95, about 25%) is far wider than harvest's (about 5%),

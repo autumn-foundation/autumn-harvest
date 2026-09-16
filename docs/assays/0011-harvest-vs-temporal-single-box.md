@@ -90,14 +90,28 @@ right. The first is why the re-run was necessary; the second is not a
 justification for having skipped it.
 
 **A fourth harvest run was discarded before the one above.** Its repetitions
-read 5.39, 5.37 and 15.02 workflows/sec, and that single outlier dragged the
-mean to 8.60, which *passes* assay #10's L1 validity band that the same arm
-otherwise kills. The cause was this session running `git merge` and `git push`
-on the box mid-measurement, breaking the idleness precondition
-`docs/benchmarks.md` insists on. It is recorded because it is the most
-dangerous failure mode encountered in this work: a contaminated run that
-flipped a validity verdict from kill to pass, visible only in the per-repetition
-numbers and invisible in the mean.
+read 5.39, 5.37 and **15.02** workflows/sec. The outlier is roughly 2.8x its
+own siblings, against an arm whose three clean repetitions sit inside 5%, so
+it is not this arm's variance. The cause was this session running `git merge`
+and `git push` on the box mid-measurement, against the idleness precondition
+`docs/benchmarks.md` insists on, which documents a concurrent build moving a
+published latency by more than 10x on this class of machine.
+
+It is recorded because of what made it dangerous: the contamination is
+invisible in the arm's mean, which reads 8.60, and visible only in the
+per-repetition numbers. A harness that reported means alone would have
+published it. That is the argument for printing per-cell values, and it is
+the whole lesson here.
+
+**An earlier revision of this paragraph made a stronger claim, and it was
+wrong.** It said the 8.60 mean *passed* assay #10's L1 validity band that the
+same arm otherwise kills, and called that a verdict flipped from kill to pass
+by interference. Assay #10's band was registered for the canonical `{}` input,
+and this run used assay #11's payload, so #10's band never applied to it. The
+apparatus now refuses to grade an overridden run at all, which means the flip
+described could not have occurred. The contamination was real and discarding
+the run was right; the dramatic reading of it was not, and it rested on
+exactly the defect the apparatus fix removed.
 
 ## 🏁 Verdict
 
