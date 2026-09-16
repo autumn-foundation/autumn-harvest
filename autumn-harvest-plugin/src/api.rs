@@ -20905,12 +20905,6 @@ pub(crate) async fn signal_with_start_workflow(
         .router
         .pick_for_new_workflow(&workflow_name, &workflow_id);
     let mut found_shard: Option<(ShardId, PoolConn, ExecutionId, bool)> = None;
-    // A dead, non-live prior found on the canonical shard (issue #1317 review).
-    // Recorded rather than used immediately. A live row on a LATER shard (a
-    // writable-subset artifact, independent of migration) must still win. So
-    // the scan keeps going instead of stopping here. Used only as a fallback
-    // once the full scan confirms no live row exists anywhere.
-    let mut canonical_dead: Option<(ShardId, PoolConn, ExecutionId)> = None;
     let mut seal_only: Option<ShardId> = None;
     for (candidate_shard, shard_pool) in pool.iter_shards() {
         let mut shard_conn = match acquire_conn(shard_pool).await {
@@ -20987,17 +20981,15 @@ pub(crate) async fn signal_with_start_workflow(
             }
             // A dead, non-live prior (COMPLETED/FAILED/CANCELLED/TIMED_OUT).
             // `replace_execution` seals and inserts on the same connection.
-            // So this can anchor a fresh run only when it sits on the
-            // canonical shard — the routed shard a plain `start_workflow`
-            // would also use. Record it as a fallback and keep scanning; a
-            // live row found later still wins (see the `canonical_dead` comment).
-            if candidate_shard == canonical_shard {
-                canonical_dead = Some((
-                    candidate_shard,
-                    shard_conn,
-                    ExecutionId::new_for_shard(candidate_shard),
-                ));
-            }
+            // So this can never anchor a fresh run on a shard other than the
+            // one it sits on (see the comment above the loop). Drop this
+            // connection and keep scanning (issue #1317 review). Holding it
+            // via a `canonical_dead`-style fallback would starve a later
+            // shard aliased to the same size-one pool. A live row found
+            // later still wins. If the scan finds nothing else, the
+            // fallback below reacquires `canonical_shard` fresh, converging
+            // on the exact same (shard, fresh exec_id) this row would have
+            // produced.
         }
     }
 
@@ -21019,8 +21011,6 @@ pub(crate) async fn signal_with_start_workflow(
 
     let (shard, mut conn, exec_id, _will_attach) = if let Some(tuple) = found_shard {
         tuple
-    } else if let Some((shard, conn, exec_id)) = canonical_dead {
-        (shard, conn, exec_id, false)
     } else {
         let conn = match db_conn_for_shard(&api_state, canonical_shard).await {
             Ok(c) => c,
@@ -21665,8 +21655,6 @@ async fn update_with_start_workflow(
             .router
             .pick_for_new_workflow(&workflow_name, &workflow_id);
         let mut found_shard: Option<(ShardId, PoolConn, ExecutionId)> = None;
-        // See the matching `canonical_dead` in the signal-with-start handler.
-        let mut canonical_dead: Option<(ShardId, PoolConn, ExecutionId)> = None;
         let mut seal_only: Option<ShardId> = None;
         for (candidate_shard, shard_pool) in pool.iter_shards() {
             let mut shard_conn = match acquire_conn(shard_pool).await {
@@ -21735,16 +21723,13 @@ async fn update_with_start_workflow(
                     break;
                 }
                 // A dead, non-live prior (COMPLETED/FAILED/CANCELLED/TIMED_OUT) —
-                // see the matching check in the signal-with-start handler. Record
-                // it as a fallback only when on the canonical shard, and keep
-                // scanning; a live row found later still wins.
-                if candidate_shard == canonical_shard {
-                    canonical_dead = Some((
-                        candidate_shard,
-                        shard_conn,
-                        ExecutionId::new_for_shard(candidate_shard),
-                    ));
-                }
+                // see the matching check in the signal-with-start handler.
+                // Drop this connection and keep scanning, rather than
+                // holding it as a fallback (issue #1317 review). A
+                // `canonical_dead`-style hold would starve a later shard
+                // aliased to the same size-one pool. A live row found later
+                // still wins; the fallback below reacquires `canonical_shard`
+                // fresh.
             }
         }
 
@@ -21762,8 +21747,6 @@ async fn update_with_start_workflow(
                 seal_shard.as_i32()
             ))
             .into_response();
-        } else if let Some((shard, conn, exec_id)) = canonical_dead {
-            (shard, conn, exec_id)
         } else {
             let conn = match db_conn_for_shard(&api_state, canonical_shard).await {
                 Ok(c) => c,
