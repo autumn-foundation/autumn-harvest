@@ -305,6 +305,23 @@ name = "replay_profile"
 required-features = ["testing"]
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `shard_rebalance::history_fingerprint` -- the replay-determinism check
+# `verify_target_copy` runs on both sides of a shard migration.
+[[bench]]
+name = "history_fingerprint_profile"
+required-features = ["testing"]
+harness = false
+
+# Isolates build_history's own inclusive cost (see the doc comment) so
+# history_fingerprint_profile.rs's workload-share claim in
+# docs/performance-history-fingerprint.md rests on a real measurement, not a
+# flat-profile self-cost line.
+[[bench]]
+name = "history_fingerprint_workload_share_profile"
+required-features = ["testing"]
+harness = false
+
 # Task-claim / enqueue throughput benchmark (issue #786). `harness = false` +
 # its own `main()`: `claim_task` is destructive (PENDING -> RUNNING), so
 # criterion's repeat-the-closure model would drain the seeded backlog and time
@@ -435,6 +452,16 @@ harness = false
 # `benches/run_chain_profile.rs`.
 [[bench]]
 name = "run_chain_profile"
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `history_export::export_history` -- the archival-export path
+# `retention.rs`'s reclamation sweep calls once per retiring execution before
+# deleting its row (issue #524/#698/#772/#798), also re-exported at the crate
+# root as public API. No feature requirement: `history_export.rs` is pure and
+# unconditional (no DB access). See `benches/history_export_profile.rs`.
+[[bench]]
+name = "history_export_profile"
 harness = false
 
 [lints]

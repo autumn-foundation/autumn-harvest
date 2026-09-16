@@ -118,6 +118,8 @@ const BOUNDARY_NAMES: &[&str] = &[
     "mir-parse",
     "missing-body",
     "drop-glue",
+    "fixpoint-exhausted",
+    "unresolved-callback",
 ];
 
 /// Slice the section starting at `heading` up to the next `\n## ` (or EOF).

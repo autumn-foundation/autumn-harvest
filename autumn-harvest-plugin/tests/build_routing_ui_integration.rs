@@ -139,6 +139,8 @@ async fn post_form(
                 .method("POST")
                 .uri(uri)
                 .header("content-type", "application/x-www-form-urlencoded")
+                // issue #1278: required by the same-origin guard.
+                .header("sec-fetch-site", "same-origin")
                 .body(Body::from(body.into()))
                 .unwrap(),
         )

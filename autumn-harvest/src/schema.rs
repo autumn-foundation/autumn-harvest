@@ -1109,6 +1109,7 @@ diesel::table! {
         unresolved_rows -> Int8,
         completed_at -> Nullable<Timestamptz>,
         updated_at -> Timestamptz,
+        next_revalidation_at -> Nullable<Timestamptz>,
     }
 }
 

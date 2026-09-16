@@ -55,19 +55,11 @@ fn init_sql() -> Vec<u8> {
 struct CapturingMetrics {
     deleted: Mutex<Vec<(String, u64)>>,
     summary_deleted: Mutex<Vec<(String, u64)>>,
-    /// Completed retention-loop iterations, counted from the janitor's
-    /// end-of-iteration liveness tick (#797). This is the only signal that a
-    /// whole tick finished — see `run_one_tick`.
-    completed_ticks: Mutex<u64>,
 }
 
 impl CapturingMetrics {
     fn summary_deleted(&self) -> Vec<(String, u64)> {
         self.summary_deleted.lock().unwrap().clone()
-    }
-
-    fn completed_ticks(&self) -> u64 {
-        *self.completed_ticks.lock().unwrap()
     }
 }
 
@@ -84,10 +76,6 @@ impl MetricsRecorder for CapturingMetrics {
             .lock()
             .unwrap()
             .push((workflow.to_string(), count));
-    }
-
-    fn record_scanner_tick(&self, _scanner: &str, _shard: &str) {
-        *self.completed_ticks.lock().unwrap() += 1;
     }
 }
 
@@ -324,23 +312,36 @@ async fn run_one_tick(
 
     // Wait for the tick to FINISH, not for `ran_at`.
     //
-    // `ran_at` is stamped by the history-retention phase, and later phases —
-    // the execution-summary GC, and partition maintenance on a partitioned
-    // shard — run after it in the same iteration. Waiting on `ran_at` and then
-    // calling `shutdown()` can therefore cancel the loop before the phase
-    // under test has run, which is a race every summary-GC assertion in this
-    // file depends on losing. It surfaced as a CI-only failure of
-    // `summary_gc_deletes_expired_and_emits_metric` under the partitioned
-    // layout, where the extra maintenance phase widened the window enough for
-    // the shutdown to win.
+    // `ran_at` is stamped by the history-retention phase. Later phases run
+    // after it in the same iteration: partition maintenance, and the
+    // execution-summary GC under test here.
     //
-    // The end-of-iteration liveness tick (#797) is unconditional and runs
-    // last, so observing it is exactly "the whole iteration completed".
-    let baseline = metrics.completed_ticks();
+    // A prior version of this helper waited for `ran_at` together with
+    // `metrics.completed_ticks()` crossing a baseline. That reasoning
+    // assumed the end-of-iteration liveness tick from issue #797 is the
+    // only source of that counter, since it is unconditional and runs
+    // last.
+    //
+    // That assumption was wrong. Under partitioned layout,
+    // `run_partition_maintenance_pass` emits its own liveness tick once per
+    // shard, and the runtime emits one more before the main loop even
+    // starts. Both share the exact same counter as the true
+    // end-of-iteration tick. `completed_ticks()` can cross the baseline
+    // right after `ran_at` is stamped, well before the summary-GC phase
+    // runs. `shutdown()` then wins the race against that phase and it
+    // silently deletes nothing. This was the CI-only failure of
+    // `summary_gc_deletes_expired_and_emits_metric` under the partitioned
+    // layout.
+    //
+    // `RetentionMonitor::iterations_completed()` replaces that counter. It
+    // advances exactly once per main-loop iteration, at the true end, after
+    // every phase — GC included — has run. Pairing it with `ran_at` is not
+    // a race.
+    let baseline = runtime.monitor().iterations_completed();
     let mut result = None;
     for _ in 0..400 {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        if metrics.completed_ticks() <= baseline {
+        if runtime.monitor().iterations_completed() <= baseline {
             continue;
         }
         let snap = runtime.monitor().snapshot();

@@ -2837,6 +2837,18 @@ async fn set_rate_limit_pacing_override_audits_every_rejection_branch() {
     let (status, body) = post_json(
         &app,
         &path,
+        json!({ "refill_rate": 5.0, "ttl_secs": 999_999_999 }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "ttl_secs above cap: {body}"
+    );
+
+    let (status, body) = post_json(
+        &app,
+        &path,
         json!({ "refill_rate": 5.0, "brust": 1.0, "ttl_secs": 60 }),
     )
     .await;
@@ -2888,6 +2900,7 @@ async fn set_rate_limit_pacing_override_audits_every_rejection_branch() {
         "burst must be a finite number",
         "must override at least one of",
         "ttl_secs must be greater than zero",
+        "ttl_secs must not exceed the server cap",
     ] {
         assert!(
             declared_failures
@@ -3044,6 +3057,18 @@ async fn set_start_throttle_pacing_override_audits_every_rejection_branch() {
     let (status, body) = post_json(
         &app,
         &path,
+        json!({ "refill_per_sec": 5.0, "ttl_secs": 999_999_999 }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "ttl_secs above cap: {body}"
+    );
+
+    let (status, body) = post_json(
+        &app,
+        &path,
         json!({ "refill_per_sec": 5.0, "brust": 1.0, "ttl_secs": 60 }),
     )
     .await;
@@ -3095,6 +3120,7 @@ async fn set_start_throttle_pacing_override_audits_every_rejection_branch() {
         "burst must be a finite number",
         "must override at least one of",
         "ttl_secs must be greater than zero",
+        "ttl_secs must not exceed the server cap",
     ] {
         assert!(
             declared_failures

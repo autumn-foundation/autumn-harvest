@@ -4768,6 +4768,19 @@ async fn by_id_missing_workflow_id(Path(_workflow_name): Path<String>) -> axum::
 #[allow(clippy::too_many_lines)]
 pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
     let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
+    // issue #1278: the Vantage dead-letter page's bulk-action forms submit
+    // here directly (a relative `../dead-letters/replay` /
+    // `../dead-letters/discard` action from `/ui/dead-letters`), carrying
+    // the operator's session cookie. Every row's per-entry "Replay" and
+    // "Discard" button posts to these same two bulk routes with a single
+    // `dead_letter_id` field, so they cover the whole page. `POST
+    // /dead-letters/{id}/replay` and `POST /dlq/redrive` are separate,
+    // bodyless API-only operations no Vantage form ever targets, so they
+    // stay ungated here. The rest of this router is out of scope too. It is
+    // the documented, headerless `curl`-and-CLI management API (see
+    // `docs/runbooks/`), not a surface Vantage renders an HTML `<form>`
+    // against.
+    let same_origin = middleware::from_fn(crate::same_origin::require_same_origin);
 
     Router::new()
         .route("/workflows", get(list_workflows))
@@ -5046,11 +5059,15 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         )
         .route(
             "/dead-letters/replay",
-            post(bulk_replay_dead_letters_handler).route_layer(require_admin.clone()),
+            post(bulk_replay_dead_letters_handler)
+                .route_layer(require_admin.clone())
+                .route_layer(same_origin.clone()),
         )
         .route(
             "/dead-letters/discard",
-            post(bulk_discard_dead_letters_handler).route_layer(require_admin.clone()),
+            post(bulk_discard_dead_letters_handler)
+                .route_layer(require_admin.clone())
+                .route_layer(same_origin),
         )
         .route(
             "/dead-letters/{id}/replay",
@@ -34062,8 +34079,15 @@ async fn set_start_throttle_pacing_override(
     // finding 1). A missing pool for an expected shard is now a fan-out
     // failure. It is folded into `shard_errors` like any other unreachable
     // shard.
+    //
+    // Pass the `runtime` already validated above, not `api_state`.
+    // `expected_shards` re-reads `api_state.runtime()` on its own. Plugin
+    // shutdown clears `runtime` and `storage_pool` as two separate locks.
+    // A second, independent re-read here could race that clear. It would
+    // then quietly fall back to pool-only shards for this one request --
+    // reopening finding 1 in that window (issue #1229 review).
     let pools = crate::shard_fanout::pools_by_shard(&api_state);
-    let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
+    let expected = crate::shard_fanout::expected_shards_for(Some(&runtime), &pools);
 
     let mut any_success = false;
     let mut shard_errors: Vec<String> = Vec::new();
@@ -34281,7 +34305,7 @@ async fn clear_start_throttle_pacing_override(
     // finding 1). See the identical comment in
     // `set_start_throttle_pacing_override`.
     let pools = crate::shard_fanout::pools_by_shard(&api_state);
-    let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
+    let expected = crate::shard_fanout::expected_shards_for(Some(&runtime), &pools);
 
     let mut any_success = false;
     let mut shard_errors: Vec<String> = Vec::new();
@@ -35279,7 +35303,7 @@ async fn set_rate_limit_pacing_override(
     // finding 1). See the identical comment in
     // `set_start_throttle_pacing_override`.
     let pools = crate::shard_fanout::pools_by_shard(&api_state);
-    let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
+    let expected = crate::shard_fanout::expected_shards_for(Some(&runtime), &pools);
 
     let mut any_success = false;
     let mut shard_errors: Vec<String> = Vec::new();
@@ -35496,7 +35520,7 @@ async fn clear_rate_limit_pacing_override(
     // finding 1). See the identical comment in
     // `set_start_throttle_pacing_override`.
     let pools = crate::shard_fanout::pools_by_shard(&api_state);
-    let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
+    let expected = crate::shard_fanout::expected_shards_for(Some(&runtime), &pools);
 
     let mut any_success = false;
     let mut shard_errors: Vec<String> = Vec::new();

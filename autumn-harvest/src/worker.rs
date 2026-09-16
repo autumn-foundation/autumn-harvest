@@ -4053,7 +4053,8 @@ const fn effective_workflow_task_timeout(configured: Duration, local_cap: Durati
 /// `workflow` row still `RUNNING` past that budget already stopped
 /// processing. The only question is whether its reset call
 /// (`reset_timed_out_workflow_task`) landed. That reset retries a bounded
-/// ~2.7 seconds of pool-connection backoff before giving up.
+/// ~32 seconds of pool-connection backoff before giving up
+/// (`RESET_POOL_RETRY_BACKOFF_MS`).
 ///
 /// Four times the budget plus a flat 30-second margin is generous headroom
 /// past both. It is wide enough that a merely slow, not stuck, decision
@@ -5569,8 +5570,11 @@ pub fn capability_miss_fleet_stale_secs(heartbeat_interval: Duration) -> i64 {
 /// real shard reads as flatlined (which the dashboard panel shows as
 /// *starvation*). Debug builds assert; release builds keep the pre-existing
 /// `unwrap_or(0)` convention rather than panicking a live poll loop.
+///
+/// `pub(crate)` so every metric-emitting module shares one shard-label
+/// convention rather than growing its own fallback (issue #1307).
 #[must_use]
-fn shard_metric_label(shard: crate::types::ShardId) -> u16 {
+pub(crate) fn shard_metric_label(shard: crate::types::ShardId) -> u16 {
     let raw = shard.as_i32();
     debug_assert!(
         u16::try_from(raw).is_ok(),
@@ -28128,10 +28132,17 @@ impl Worker {
         let registry = Arc::clone(&self.registry);
         let task_id = task.id;
         let task_type = task.task_type.clone();
-        // The `crash_strikes` this dispatch claimed the row at. It is the claim
+        // The `crash_strikes` this dispatch claimed the row at. It is one claim
         // epoch, so a release can apply to this claim and not merely to this
-        // worker. Only `poison_pill::requeue_orphan` changes it.
+        // worker. `poison_pill::requeue_orphan` changes it.
         let claim_crash_strikes = task.crash_strikes;
+        // The `attempt` this dispatch claimed the row at (issue #1459): the
+        // second claim epoch. `claim_task` bumps `attempt` on every claim.
+        // It also catches a re-claim that `crash_strikes` alone would miss.
+        // `poison_pill::requeue_stuck_task` deliberately leaves `crash_strikes`
+        // untouched, since being stuck is not a crash, so it needs its own
+        // discriminator. See `reset_timed_out_workflow_task`'s doc comment.
+        let claim_attempt = task.attempt;
         let worker_id = self.config.worker_id.clone();
         let build_id = self.config.build_id.clone();
         let cancellation_grace_period = self.config.cancellation_grace_period;
@@ -28348,6 +28359,7 @@ impl Worker {
                                 task_id,
                                 &worker_id,
                                 claim_crash_strikes,
+                                claim_attempt,
                             )
                             .await;
                         }
@@ -28443,6 +28455,7 @@ impl Worker {
                                     task_id,
                                     &worker_id,
                                     claim_crash_strikes,
+                                    claim_attempt,
                                 )
                                 .await;
                             }
@@ -28506,6 +28519,7 @@ impl Worker {
                             task_id,
                             &worker_id,
                             claim_crash_strikes,
+                            claim_attempt,
                         )
                         .await;
                     }
@@ -29030,6 +29044,7 @@ pub async fn reset_timed_out_workflow_task(
     task_id: uuid::Uuid,
     worker_id: &str,
     claim_crash_strikes: i32,
+    claim_attempt: i32,
 ) {
     use crate::schema::harvest_task_queue::dsl;
 
@@ -29085,7 +29100,16 @@ pub async fn reset_timed_out_workflow_task(
             // A `(state, worker_id)` guard alone then matches that new claim.
             // This reset would re-`PENDING` a row whose replacement handler
             // already runs, and invite a second concurrent dispatch.
-            .filter(dsl::crash_strikes.eq(claim_crash_strikes)),
+            //
+            // Two discriminators, not one. `crash_strikes` alone is not
+            // enough. `poison_pill::requeue_stuck_task` (issue #1459's
+            // stuck-running backstop) also hands a row back to `PENDING` for
+            // re-claim. It deliberately leaves `crash_strikes` untouched --
+            // being stuck is not a crash. Its re-claim would then still match
+            // on `crash_strikes` alone. This reset must also check `attempt`,
+            // which `claim_task` bumps on every claim without exception.
+            .filter(dsl::crash_strikes.eq(claim_crash_strikes))
+            .filter(dsl::attempt.eq(claim_attempt)),
     )
     .set((
         dsl::state.eq("PENDING"),

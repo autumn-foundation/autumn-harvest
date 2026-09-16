@@ -15,7 +15,7 @@ use autumn_harvest::workers::WorkerRow;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::api::{HarvestApiState, PoolConn, acquire_conn};
+use crate::api::{HarvestApiRuntime, HarvestApiState, PoolConn, acquire_conn};
 
 /// Outcome of a single-shard query: either a successful row set or an error.
 #[derive(Debug)]
@@ -97,6 +97,29 @@ pub fn expected_shards(
     api_state: &HarvestApiState,
     pools: &BTreeMap<i32, DbPool>,
 ) -> BTreeSet<i32> {
+    expected_shards_for(api_state.runtime().ok().as_ref(), pools)
+}
+
+/// Like [`expected_shards`], but against a runtime the caller already holds.
+///
+/// A handler validates a request against `runtime` first -- an activity's
+/// declared rate limit, or a workflow's declared throttle. The handler
+/// must reuse that same `runtime` snapshot here. Do not pass `api_state`
+/// and let this function re-read it.
+///
+/// `HarvestApiState::runtime()` and `storage_pool()` guard independent
+/// locks. Plugin shutdown clears them one after the other
+/// (`HarvestApiState::clear()`).
+///
+/// A second, independent re-read here can race that clear. It can then
+/// fall back to pool-only shards, silently, for this one request. That
+/// resurrects the exact omission [`expected_shards`] exists to prevent
+/// (issue #1229 finding 1), only in that narrow window.
+#[must_use]
+pub fn expected_shards_for(
+    runtime: Option<&HarvestApiRuntime>,
+    pools: &BTreeMap<i32, DbPool>,
+) -> BTreeSet<i32> {
     // Delegates to the canonical core rule (issue #1146). The engine's own
     // by-business-key resolution
     // (`external_target_location::resolve_location_by_workflow_id`) fans out
@@ -105,8 +128,7 @@ pub fn expected_shards(
     // the same key. Keeping one definition removes that drift by construction,
     // the way `select_resolved_run` already does for the ranking.
     let pool_shards: Vec<ShardId> = pools.keys().copied().map(ShardId::new).collect();
-    let runtime = api_state.runtime().ok();
-    let router_parts = runtime.as_ref().map(|runtime| {
+    let router_parts = runtime.map(|runtime| {
         let router = runtime.router();
         (router.readable_shards(), router.default_shard())
     });
@@ -306,7 +328,75 @@ pub fn collect_fanout_rows<R>(observations: Vec<ShardObservation<R>>) -> FanoutR
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use autumn_harvest::RetentionConfig;
+    use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
+    use autumn_harvest::shard::ShardRouter;
+    use autumn_harvest::worker::HandlerRegistry;
+
     use super::*;
+    use crate::api::HarvestRetentionRuntime;
+
+    // ── expected_shards_for (issue #1229 review) ────────────────────────────
+
+    /// A `DbPool` that never connects. Standing in for a real pool is enough
+    /// here -- these tests only check which shard ids `expected_shards_for`
+    /// selects, never the pool's connections.
+    fn unreachable_test_pool() -> DbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://user:pass@127.0.0.1:1/db");
+        deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("failed to build unreachable test pool")
+    }
+
+    fn runtime_with_router(router: ShardRouter) -> HarvestApiRuntime {
+        HarvestApiRuntime::new(
+            Arc::new(HandlerRegistry::new(Vec::new(), Vec::new())),
+            Arc::new(DagCatalog::default()),
+            Arc::new(Vec::new()),
+            None,
+            Vec::new(),
+            SchedulerMonitor::offline(),
+            HarvestRetentionRuntime::disabled(RetentionConfig::default()),
+            router,
+        )
+    }
+
+    #[test]
+    fn expected_shards_for_adds_router_known_shard_with_no_pool() {
+        // The router already advertises shard 0, but this process has no
+        // pool for it (issue #1229 finding 1). Uses `ShardRouter::single()`,
+        // not a distinct multi-shard router. `HarvestApiRuntime::new`
+        // installs its router into the process-global `GLOBAL_SHARD_ROUTER`.
+        // That is a real side effect. A `cargo test` run shares this global
+        // across every concurrently running test in this crate. `single()`
+        // is the same router every other such test in this crate already
+        // installs, so this test adds no new cross-test hazard.
+        let runtime = runtime_with_router(ShardRouter::single());
+        let pools: BTreeMap<i32, DbPool> = BTreeMap::new();
+
+        let expected = expected_shards_for(Some(&runtime), &pools);
+
+        assert_eq!(expected, BTreeSet::from([0]));
+    }
+
+    #[test]
+    fn expected_shards_for_falls_back_to_pool_shards_without_a_runtime() {
+        // A caller with no runtime snapshot at all (mirrors the old
+        // `api_state.runtime()` lookup failing) still sees its own pools.
+        // Builds no `HarvestApiRuntime`, so this test installs no global
+        // router.
+        let mut pools: BTreeMap<i32, DbPool> = BTreeMap::new();
+        pools.insert(0, unreachable_test_pool());
+
+        let expected = expected_shards_for(None, &pools);
+
+        assert_eq!(expected, BTreeSet::from([0]));
+    }
 
     // ── acquire_shard_conn (characterizes the prelude previously hand-copied
     //    into canary.rs, status_summary.rs, usage.rs, workflow_count.rs,

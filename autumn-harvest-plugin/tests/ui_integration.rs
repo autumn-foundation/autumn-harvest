@@ -247,6 +247,10 @@ async fn post_form(
                 .method("POST")
                 .uri(uri)
                 .header("content-type", "application/x-www-form-urlencoded")
+                // issue #1278: the same-origin guard requires this evidence on
+                // every mutating request; a real browser sends it on every
+                // same-origin form submission.
+                .header("sec-fetch-site", "same-origin")
                 .body(Body::from(body.into()))
                 .expect("valid form request"),
         )
@@ -1095,6 +1099,83 @@ async fn ui_dead_letters_invalid_shard_id_redisplays_form_instead_of_aborting_pa
     );
 }
 
+/// RED (was): `page`/`limit` were still typed `Option<i64>` directly on
+/// `DeadLetterListParams`. That is the same mechanism #1540/#1560 already
+/// fixed on the Workflows and Workers pages, and the one this page's own
+/// `shard_id`/`task_kind`/`failed_after`/`failed_before` fixes left over.
+/// `?limit=not-a-number` failed axum's own query deserialization with a
+/// bare 400 before `list_dead_letters_ui` ever ran, discarding the
+/// `workflow_name` filter the operator had already typed alongside it.
+///
+/// GREEN (this commit): the request still renders the DLQ page (`200`)
+/// and preserves the other filter. It surfaces a `role="alert"` message
+/// naming the bad value next to the "Per page" field.
+#[tokio::test]
+async fn ui_dead_letters_invalid_limit_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(
+        &app,
+        "/dead-letters?limit=not-a-number&workflow_name=invoice_workflow",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid limit must not abort the whole DLQ page: {html}"
+    );
+    assert!(
+        html.contains("value=\"invoice_workflow\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+}
+
+/// Same fix, the `page` field. No form field backs it; it drives the
+/// Previous/Next links instead, a distinct code path. Covered
+/// independently here rather than assumed symmetric with `limit`,
+/// matching the Workflows/Workers pages' own `page` coverage.
+#[tokio::test]
+async fn ui_dead_letters_invalid_page_redisplays_list_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(
+        &app,
+        "/dead-letters?page=not-a-number&workflow_name=invoice_workflow",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid page must not abort the whole DLQ page: {html}"
+    );
+    assert!(
+        html.contains("value=\"invoice_workflow\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the pagination controls: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+    assert!(
+        html.contains("Page 1"),
+        "falls back to page 1 (zero-based page 0) instead of guessing: {html}"
+    );
+}
+
 /// DLQ Summary toggle (issue #385): the aggregation view groups entries,
 /// reports counts merged across shards, and links back into the filtered list.
 #[tokio::test]
@@ -1398,6 +1479,76 @@ async fn ui_workers_unknown_status_value_redisplays_form_instead_of_aborting_pag
         html.contains("option value=\"zombie\" selected"),
         "the Status select must echo the invalid value back as its selected \
          option, not silently revert to 'All' (Codex review, #1378 P2): {html}"
+    );
+}
+
+/// RED (was): `page`/`limit` were still typed `Option<i64>` directly on
+/// `WorkerListParams` — the two fields left over after status/stale/shard
+/// above got this fix. `?limit=not-a-number` failed axum's own query
+/// deserialization with a bare 400 before `list_workers_ui` ever ran,
+/// discarding the `build_id` filter the operator had already typed
+/// alongside it. Same mechanism as the Workflows page's
+/// `invalid_limit_redisplays_form_instead_of_aborting_page` (#1540).
+///
+/// GREEN (this commit): the request still renders the Workers page
+/// (`200`) and preserves the other filter. It surfaces a `role="alert"`
+/// message naming the bad value next to the "Per page" field.
+#[tokio::test]
+async fn ui_workers_invalid_limit_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/workers?limit=not-a-number&build_id=abc123").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid limit must not abort the whole Workers page: {html}"
+    );
+    assert!(
+        html.contains("value=\"abc123\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+}
+
+/// Same fix, the `page` field. No form field backs it; it drives the
+/// Previous/Next links instead, a distinct code path. Covered
+/// independently here rather than assumed symmetric with `limit`,
+/// matching the Workflows page's
+/// `invalid_page_redisplays_list_instead_of_aborting_page`.
+#[tokio::test]
+async fn ui_workers_invalid_page_redisplays_list_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/workers?page=not-a-number&build_id=abc123").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid page must not abort the whole Workers page: {html}"
+    );
+    assert!(
+        html.contains("value=\"abc123\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the pagination controls: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+    assert!(
+        html.contains("Page 1"),
+        "falls back to page 1 (zero-based page 0) instead of guessing: {html}"
     );
 }
 
@@ -5582,6 +5733,45 @@ fn envelope_608(plain: &Value) -> Value {
     encoded["data"]["output"].clone()
 }
 
+/// Undo the identity codec's collision-escape nesting (issue #1253) on one
+/// stored event's payload field, restoring it to `encoded_value` exactly as
+/// given.
+///
+/// Both `start_or_load_workflow_execution` and `store::append_events`
+/// always encode through identity codecs. Suppose a caller hands either an
+/// already-envelope-shaped payload field, to simulate a foreign
+/// codec-encrypting write. The escape guard then sees a collision and
+/// wraps it a second time. That is correct for a real caller, whose
+/// plaintext coincidentally looks like an envelope. Here it is a test
+/// artifact: this fixture wants the SINGLE codec-encoded shape a real
+/// deployment stores, not identity's defensive double wrap. This patches
+/// the stored event back to that shape.
+async fn reset_event_field(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    event_id: i32,
+    field: &str,
+    encoded_value: Value,
+) {
+    let mut event_data: Value = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_events::event_id.eq(event_id))
+        .select(harvest_events::event_data)
+        .first(&mut *conn)
+        .await
+        .expect("load event row");
+    event_data["data"][field] = encoded_value;
+    diesel::update(
+        harvest_events::table
+            .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+            .filter(harvest_events::event_id.eq(event_id)),
+    )
+    .set(harvest_events::event_data.eq(event_data))
+    .execute(&mut *conn)
+    .await
+    .expect("restore event field");
+}
+
 /// Single-shard API+UI app with read-path decoding enabled (issue #608):
 /// admin boundary + codec registry mirrored + the opt-in flag set.
 fn build_decode_enabled_api_with_ui_app(database_url: &str) -> axum::Router {
@@ -5758,6 +5948,7 @@ async fn workflow_detail_ui_renders_decoded_input() {
     )
     .await
     .expect("workflow insert should succeed");
+    reset_event_field(&mut conn, exec_id, 0, "input", input_envelope.clone()).await;
 
     // Blocked-on panel + timeline fixtures (issue #608, AC4): an
     // envelope-bearing timeline event, a pending activity whose stored
@@ -5776,19 +5967,29 @@ async fn workflow_detail_ui_renders_decoded_input() {
         let history = autumn_harvest::store::load_history_undecoded(&mut conn, exec_id)
             .await
             .expect("load history");
+        let timeline_event_id = history.next_event_id;
+        let timeline_input = envelope_608(&json!({"card": "pii-detail-event"}));
         autumn_harvest::store::append_events(
             &mut conn,
             exec_id,
             &[autumn_harvest::WorkflowEvent::ActivityScheduled {
                 activity_id: autumn_harvest::types::ActivityExecId::new(),
                 name: "charge_card".to_string(),
-                input: envelope_608(&json!({"card": "pii-detail-event"})),
+                input: timeline_input.clone(),
                 queue: "default".to_string(),
             }],
-            history.next_event_id,
+            timeline_event_id,
         )
         .await
         .expect("append timeline event");
+        reset_event_field(
+            &mut conn,
+            exec_id,
+            timeline_event_id,
+            "input",
+            timeline_input,
+        )
+        .await;
 
         let mut params = autumn_harvest::queue::EnqueueParams::new(
             "default",
@@ -7166,4 +7367,54 @@ async fn ui_timeline_200_steps_under_1s() {
         elapsed < Duration::from_secs(1),
         "200-step timeline renders server-side in < 1s (took {elapsed:?})"
     );
+}
+
+// ── Cross-site mutation rejection (issue #1278) ─────────────────────────────
+//
+// One representative route per family named in the issue's acceptance
+// criteria: workflow, DLQ, gate, build-routing, DAG, schedule. Every request
+// below carries neither `Origin` nor `Sec-Fetch-Site`. That is the exact
+// shape a hostile page's `<form>` submit arrives as, so this one test also
+// covers the "neither header present" acceptance criterion. The guard runs
+// ahead of routing and admin checks. A placeholder UUID in each path is
+// enough; no seeded row and no database are needed for a rejected request.
+#[tokio::test]
+async fn vantage_and_dlq_mutations_reject_cross_site_post() {
+    let api_state = HarvestApiState::new();
+    let app = autumn_harvest_plugin::harvest_api_router(api_state.clone())
+        .nest("/ui", harvest_ui_router(api_state))
+        .with_state(test_app_state_without_database());
+
+    let placeholder = uuid::Uuid::nil();
+    let targets: [(&str, String); 6] = [
+        ("workflow", format!("/ui/workflows/{placeholder}/cancel")),
+        ("dlq", "/dead-letters/replay".to_string()),
+        ("gate", format!("/ui/admin/gates/{placeholder}/lift")),
+        ("build-routing", "/ui/build-routing/set-policy".to_string()),
+        (
+            "dag",
+            format!("/ui/dags/echo_workflow/runs/{placeholder}/retry"),
+        ),
+        ("schedule", format!("/ui/schedules/{placeholder}/pause")),
+    ];
+
+    for (family, uri) in targets {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::empty())
+                    .expect("valid cross-site request"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{family} mutation ({uri}) must reject a request with no same-origin evidence"
+        );
+    }
 }

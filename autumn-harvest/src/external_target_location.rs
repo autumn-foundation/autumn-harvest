@@ -99,15 +99,51 @@ use crate::shard::{ShardRouter, ShardedDbPool};
 use crate::types::ShardId;
 use crate::worker::DbPool;
 
+/// Why a shard could not be inspected, as a bounded label a metric can carry
+/// (issue #1307).
+///
+/// `#[non_exhaustive]`: a probe fails in exactly these three ways today. A new
+/// failure shape must slot in as a new variant, not force a caller to guess
+/// from `reason`'s prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UninspectedReasonKind {
+    /// This process has no configured pool for the shard.
+    NoPool,
+    /// A connection could not be acquired, or the probe did not answer, in
+    /// time.
+    AcquireTimeout,
+    /// The connection was acquired but the resolution query itself failed.
+    QueryError,
+}
+
+impl UninspectedReasonKind {
+    /// The bounded metric-label value for this kind (issue #1307).
+    ///
+    /// Per ADR-0001 §7, only low-cardinality values may label a metric. This
+    /// is that value, kept separate from [`std::fmt::Display`] so a future
+    /// operator-facing rendering of `self` does not silently change a metric
+    /// label.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::NoPool => "no_pool",
+            Self::AcquireTimeout => "acquire_timeout",
+            Self::QueryError => "query_error",
+        }
+    }
+}
+
 /// A shard a by-business-key fan-out expected to inspect but could not.
 ///
 /// Its presence in a [`TargetLocation::Indeterminate`] is the reason the
 /// resolution is being reported as inconclusive rather than as an answer.
 ///
-/// `#[non_exhaustive]` deliberately: `reason` is prose for an operator log line
-/// today, and the obvious next addition is a machine-readable discriminant
-/// (no-pool vs. acquisition-timeout vs. query-error) that callers can act on
-/// differently. Adding it must not be a breaking change.
+/// `#[non_exhaustive]` deliberately: `reason` is prose for an operator log
+/// line. [`Self::kind`] is its machine-readable twin (issue #1307). A caller
+/// that must act differently on a no-pool vs. a timed-out vs. a failed-query
+/// shard uses `kind`. The log line still reads `reason`. Adding a third
+/// field must not be a breaking change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct UninspectedShard {
@@ -116,6 +152,8 @@ pub struct UninspectedShard {
     /// Why it could not be queried (no configured pool, connection failure,
     /// query failure), for the operator-facing log line.
     pub reason: String,
+    /// The bounded discriminant behind `reason`, for metrics (issue #1307).
+    pub kind: UninspectedReasonKind,
 }
 
 /// Where a `(workflow_name, workflow_id)`-addressed target actually lives.
@@ -190,6 +228,28 @@ pub enum TargetLocation {
         /// The shards that could not be inspected, ascending by shard id.
         uninspected: Vec<UninspectedShard>,
     },
+    /// A keyed signal already landed on `shard`, found while fanning out for
+    /// the current run (issue #1318).
+    ///
+    /// Only ever produced when the caller passed an `idempotency_key`. Each
+    /// per-shard probe this fan-out already runs also checks for a prior
+    /// delivery of that key. The check runs on the same connection, so it
+    /// costs no extra connection. It short-circuits the fan-out the instant
+    /// it finds a hit — unlike [`Self::NotFound`], a positive answer does not
+    /// need every shard to agree.
+    ///
+    /// `shard` names where the PRIOR delivery landed, which is deliberately
+    /// not "the current run's shard": that is the whole gap this closes. A
+    /// continue-as-new or a terminate-and-restart can cross shards between
+    /// two delivery attempts. That moves the current run, but a signal
+    /// already queued under this key must still dedupe. This closes what
+    /// [`crate::signal::resolve_and_signal_by_workflow_id`]'s own
+    /// shard-local pre-check cannot see across a shard boundary.
+    #[non_exhaustive]
+    AlreadyDelivered {
+        /// The shard the earlier delivery's signal row lives on.
+        shard: ShardId,
+    },
 }
 
 impl TargetLocation {
@@ -198,7 +258,11 @@ impl TargetLocation {
     pub const fn found_shard(&self) -> Option<ShardId> {
         match self {
             Self::Found { shard, .. } => Some(*shard),
-            _ => None,
+            // `AlreadyDelivered` names where a PRIOR delivery landed, not a
+            // shard to deliver to now (code review, issue #1318). Answering
+            // `None` here keeps that distinction so a future caller of
+            // `found_shard` cannot mistake it for a deliverable location.
+            Self::AlreadyDelivered { .. } | Self::NotFound | Self::Indeterminate { .. } => None,
         }
     }
 
@@ -251,7 +315,12 @@ impl TargetLocation {
                 ..
             } => uninspected.is_empty() && other_live.is_empty(),
             Self::NotFound => true,
-            Self::Indeterminate { .. } => false,
+            // `AlreadyDelivered` answers a delivery-dedup question, not a
+            // key-state one. It is never produced on the cancel path, the
+            // only caller of this method, since cancel carries no
+            // idempotency key. `false` is the conservative default
+            // regardless.
+            Self::Indeterminate { .. } | Self::AlreadyDelivered { .. } => false,
         }
     }
 }
@@ -331,10 +400,19 @@ pub fn fanout_shards_from_parts(
 ///   (`not_running` failure vs. delivery).
 /// * **No candidates at all with a shard missed is `Indeterminate`**, never
 ///   `NotFound`.
+/// * **A `keyed` request with a shard missed is always `Indeterminate`**,
+///   live winner or not (issue #1318, code review on PR #1593). The
+///   idempotency-key check this fan-out runs alongside run resolution only
+///   covers the shards it actually reached. A shard it could not reach might
+///   hold the prior delivery the key names. Delivering fresh to a live
+///   winner found elsewhere would then double-deliver. `keyed` is `false` for
+///   a cancel (no idempotency-key concept) and for an unkeyed signal, so
+///   neither loses the live-winner-wins rule above.
 #[must_use]
 pub fn merge_locations(
     candidates: Vec<(ShardId, ResolvedRun)>,
     uninspected: Vec<UninspectedShard>,
+    keyed: bool,
 ) -> TargetLocation {
     let runs: Vec<ResolvedRun> = candidates.iter().map(|(_, run)| run.clone()).collect();
     let Some(winner) = select_resolved_run(runs) else {
@@ -345,7 +423,7 @@ pub fn merge_locations(
         };
     };
 
-    if !uninspected.is_empty() && crate::erase::is_terminal_state(&winner.state) {
+    if !uninspected.is_empty() && (keyed || crate::erase::is_terminal_state(&winner.state)) {
         return TargetLocation::Indeterminate { uninspected };
     }
 
@@ -475,7 +553,9 @@ pub const FANOUT_PEER_BOUND: std::time::Duration = std::time::Duration::from_sec
 /// very next sweep.
 #[derive(Clone, Debug, Default)]
 pub struct UninspectableShards {
-    shards: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<ShardId, String>>>,
+    shards: std::sync::Arc<
+        std::sync::Mutex<std::collections::BTreeMap<ShardId, (String, UninspectedReasonKind)>>,
+    >,
 }
 
 impl UninspectableShards {
@@ -485,9 +565,10 @@ impl UninspectableShards {
         Self::default()
     }
 
-    /// The recorded reason `shard` could not be inspected earlier in this sweep.
+    /// The recorded reason and kind `shard` could not be inspected earlier in
+    /// this sweep.
     #[must_use]
-    pub fn recorded(&self, shard: ShardId) -> Option<String> {
+    pub fn recorded(&self, shard: ShardId) -> Option<(String, UninspectedReasonKind)> {
         self.shards
             .lock()
             .ok()
@@ -496,9 +577,9 @@ impl UninspectableShards {
 
     /// Record that `shard` could not be inspected. The first reason wins, so the
     /// log names the original failure rather than a later re-derivation of it.
-    pub fn record(&self, shard: ShardId, reason: String) {
+    pub fn record(&self, shard: ShardId, reason: String, kind: UninspectedReasonKind) {
         if let Ok(mut guard) = self.shards.lock() {
-            guard.entry(shard).or_insert(reason);
+            guard.entry(shard).or_insert((reason, kind));
         }
     }
 }
@@ -516,7 +597,8 @@ pub async fn resolve_location_by_workflow_id(
     workflow_name: &str,
     workflow_id: &str,
 ) -> TargetLocation {
-    resolve_location_by_workflow_id_with(pool, router, workflow_name, workflow_id, None, None).await
+    resolve_location_by_workflow_id_with(pool, router, workflow_name, workflow_id, None, None, None)
+        .await
 }
 
 /// Resolve where `(workflow_name, workflow_id)` actually lives, reusing a
@@ -546,6 +628,13 @@ pub async fn resolve_location_by_workflow_id(
 ///
 /// The fan-out is **sequential**, and holds at most one connection beyond the
 /// caller's own at a time. Read-only: no row is locked and nothing is written.
+///
+/// `idempotency_key`, when `Some`, is checked on every shard this fan-out
+/// already visits, before that shard's run-resolution query. A prior
+/// delivery short-circuits the whole fan-out with
+/// [`TargetLocation::AlreadyDelivered`] (issue #1318). Pass `None` for a
+/// cancel (which has no such key) or an unkeyed signal.
+#[allow(clippy::too_many_lines)]
 pub async fn resolve_location_by_workflow_id_with(
     pool: &ShardedDbPool,
     router: Option<&ShardRouter>,
@@ -553,7 +642,12 @@ pub async fn resolve_location_by_workflow_id_with(
     workflow_id: &str,
     mut held: Option<(ShardId, &mut AsyncPgConnection)>,
     memo: Option<&UninspectableShards>,
+    idempotency_key: Option<&str>,
 ) -> TargetLocation {
+    // Empty-string normalizes to "no key", matching `send_signal_idempotent`
+    // (issue #521). An empty key is never stored -- it becomes `NULL` --
+    // so a check for it would run a query that can never match.
+    let idempotency_key = idempotency_key.filter(|k| !k.is_empty());
     let expected = fanout_shards(&pool.shard_ids(), router);
     let mut candidates: Vec<(ShardId, ResolvedRun)> = Vec::new();
     let mut uninspected: Vec<UninspectedShard> = Vec::new();
@@ -600,6 +694,38 @@ pub async fn resolve_location_by_workflow_id_with(
             let Some((_, conn)) = held.as_mut() else {
                 unreachable!("held_here implies held is Some")
             };
+            // The idempotency-key check runs FIRST, on the same held
+            // connection, before the run-resolution query below (issue
+            // #1318). A hit ends the fan-out immediately: the caller must
+            // record delivery, not resolve a shard to deliver against.
+            if let Some(key) = idempotency_key {
+                match crate::execution::lookup_idempotent_signal_dedupe(
+                    conn,
+                    workflow_name,
+                    workflow_id,
+                    key,
+                )
+                .await
+                {
+                    Ok(Some(_)) => return TargetLocation::AlreadyDelivered { shard },
+                    Ok(None) => {}
+                    Err(e) => {
+                        // Same abort hazard as the run-resolution query's own
+                        // error arm below. A failed statement on the HELD
+                        // connection aborts the caller's whole transaction.
+                        // Stop here rather than run the next statement on it.
+                        uninspected.push(UninspectedShard {
+                            shard,
+                            reason: format!(
+                                "idempotency-key lookup failed on the caller's own connection, \
+                                 aborting its transaction: {e}"
+                            ),
+                            kind: UninspectedReasonKind::QueryError,
+                        });
+                        return TargetLocation::Indeterminate { uninspected };
+                    }
+                }
+            }
             match crate::execution::resolve_execution_id_by_workflow_id(
                 conn,
                 workflow_name,
@@ -641,6 +767,7 @@ pub async fn resolve_location_by_workflow_id_with(
                         reason: format!(
                             "resolution query failed on the caller's own connection,                              aborting its transaction: {e}"
                         ),
+                        kind: UninspectedReasonKind::QueryError,
                     });
                     return TargetLocation::Indeterminate { uninspected };
                 }
@@ -650,8 +777,12 @@ pub async fn resolve_location_by_workflow_id_with(
 
         // 2. Already known bad this sweep: report it without paying the bound
         //    a second time. (Recorded already, so it does not re-memoize.)
-        if let Some(reason) = memo.and_then(|m| m.recorded(shard)) {
-            uninspected.push(UninspectedShard { shard, reason });
+        if let Some((reason, kind)) = memo.and_then(|m| m.recorded(shard)) {
+            uninspected.push(UninspectedShard {
+                shard,
+                reason,
+                kind,
+            });
             continue;
         }
 
@@ -661,6 +792,7 @@ pub async fn resolve_location_by_workflow_id_with(
                 memo,
                 shard,
                 "no storage pool configured in this process".to_string(),
+                UninspectedReasonKind::NoPool,
             );
             continue;
         };
@@ -683,14 +815,17 @@ pub async fn resolve_location_by_workflow_id_with(
         probed.push(shard_pool);
 
         // 3. The peer probe, entirely inside its own budget.
-        match probe_peer_shard(shard_pool, workflow_name, workflow_id).await {
-            Ok(Some(run)) => candidates.push((shard, run)),
-            Ok(None) => {}
-            Err(reason) => mark_uninspected(&mut uninspected, memo, shard, reason),
+        match probe_peer_shard(shard_pool, workflow_name, workflow_id, idempotency_key).await {
+            Ok(ProbeOutcome::AlreadyDelivered) => {
+                return TargetLocation::AlreadyDelivered { shard };
+            }
+            Ok(ProbeOutcome::Run(Some(run))) => candidates.push((shard, run)),
+            Ok(ProbeOutcome::Run(None)) => {}
+            Err((reason, kind)) => mark_uninspected(&mut uninspected, memo, shard, reason, kind),
         }
     }
 
-    let placement = merge_locations(candidates, uninspected.clone());
+    let placement = merge_locations(candidates, uninspected.clone(), idempotency_key.is_some());
 
     // A `Found` reached over an incomplete fan-out is an answer with a caveat:
     // shard-local uniqueness means the shard we could not read might hold a
@@ -729,8 +864,24 @@ pub(crate) fn same_underlying_pool(a: &DbPool, b: &DbPool) -> bool {
     std::ptr::eq(a.manager(), b.manager())
 }
 
+/// What one shard probe found (issue #1146; extended issue #1318).
+enum ProbeOutcome {
+    /// The run-resolution query's answer for this shard — `None` when the
+    /// shard holds no run under this key.
+    Run(Option<ResolvedRun>),
+    /// The idempotency-key lookup, run first when a key is given, found a
+    /// prior delivery on this shard. The run-resolution query never runs —
+    /// this outcome makes it moot (issue #1318).
+    AlreadyDelivered,
+}
+
 /// Probe one **peer** shard for `(workflow_name, workflow_id)`, entirely inside
 /// a bounded budget.
+///
+/// When `idempotency_key` is `Some`, the SAME connection first checks for a
+/// prior delivery of that key on this shard (issue #1318). That costs an
+/// extra query, not an extra connection. It is skipped entirely for an
+/// unkeyed signal or a cancel, which never supplies one.
 ///
 /// `Err` is the single "this shard could not be inspected" outcome, carrying the
 /// operator-facing reason — a failed or timed-out acquisition, a failed query,
@@ -751,28 +902,64 @@ async fn probe_peer_shard(
     shard_pool: &DbPool,
     workflow_name: &str,
     workflow_id: &str,
-) -> Result<Option<ResolvedRun>, String> {
+    idempotency_key: Option<&str>,
+) -> Result<ProbeOutcome, (String, UninspectedReasonKind)> {
     let probe = tokio::time::timeout(FANOUT_PEER_BOUND, async {
         let acquire_bound = peer_acquire_bound(shard_pool);
         let mut conn = match tokio::time::timeout(acquire_bound, shard_pool.get()).await {
             Ok(Ok(conn)) => conn,
-            Ok(Err(e)) => return Err(format!("could not acquire a connection: {e}")),
+            Ok(Err(e)) => {
+                return Err((
+                    format!("could not acquire a connection: {e}"),
+                    UninspectedReasonKind::AcquireTimeout,
+                ));
+            }
             Err(_elapsed) => {
-                return Err(format!(
-                    "no connection available within {acquire_bound:?} (pool busy or \
-                 unreachable)"
+                return Err((
+                    format!(
+                        "no connection available within {acquire_bound:?} (pool busy or \
+                     unreachable)"
+                    ),
+                    UninspectedReasonKind::AcquireTimeout,
                 ));
             }
         };
+        if let Some(key) = idempotency_key {
+            let hit = crate::execution::lookup_idempotent_signal_dedupe(
+                &mut conn,
+                workflow_name,
+                workflow_id,
+                key,
+            )
+            .await
+            .map_err(|e| {
+                (
+                    format!("idempotency-key lookup failed: {e}"),
+                    UninspectedReasonKind::QueryError,
+                )
+            })?;
+            if hit.is_some() {
+                return Ok(ProbeOutcome::AlreadyDelivered);
+            }
+        }
         crate::execution::resolve_execution_id_by_workflow_id(&mut conn, workflow_name, workflow_id)
             .await
-            .map_err(|e| format!("resolution query failed: {e}"))
+            .map(ProbeOutcome::Run)
+            .map_err(|e| {
+                (
+                    format!("resolution query failed: {e}"),
+                    UninspectedReasonKind::QueryError,
+                )
+            })
     })
     .await;
 
     match probe {
         Ok(result) => result,
-        Err(_elapsed) => Err(format!("shard did not answer within {FANOUT_PEER_BOUND:?}")),
+        Err(_elapsed) => Err((
+            format!("shard did not answer within {FANOUT_PEER_BOUND:?}"),
+            UninspectedReasonKind::AcquireTimeout,
+        )),
     }
 }
 
@@ -823,11 +1010,16 @@ fn mark_uninspected(
     memo: Option<&UninspectableShards>,
     shard: ShardId,
     reason: String,
+    kind: UninspectedReasonKind,
 ) {
     if let Some(memo) = memo {
-        memo.record(shard, reason.clone());
+        memo.record(shard, reason.clone(), kind);
     }
-    uninspected.push(UninspectedShard { shard, reason });
+    uninspected.push(UninspectedShard {
+        shard,
+        reason,
+        kind,
+    });
 }
 
 /// May a delivery to `target` be attempted **inline** (issue #1146)?
@@ -947,16 +1139,21 @@ mod tests {
     }
 
     fn uninspected(shard: i32) -> UninspectedShard {
+        uninspected_with_kind(shard, UninspectedReasonKind::QueryError)
+    }
+
+    fn uninspected_with_kind(shard: i32, kind: UninspectedReasonKind) -> UninspectedShard {
         UninspectedShard {
             shard: ShardId::new(shard),
             reason: "test".to_string(),
+            kind,
         }
     }
 
     #[test]
     fn a_complete_fanout_that_finds_nothing_is_not_found() {
         assert_eq!(
-            merge_locations(Vec::new(), Vec::new()),
+            merge_locations(Vec::new(), Vec::new(), false),
             TargetLocation::NotFound
         );
     }
@@ -964,7 +1161,7 @@ mod tests {
     #[test]
     fn an_incomplete_fanout_that_finds_nothing_is_indeterminate() {
         assert_eq!(
-            merge_locations(Vec::new(), vec![uninspected(2)]),
+            merge_locations(Vec::new(), vec![uninspected(2)], false),
             TargetLocation::Indeterminate {
                 uninspected: vec![uninspected(2)]
             }
@@ -975,7 +1172,11 @@ mod tests {
     fn a_terminal_winner_with_an_uninspected_shard_is_indeterminate() {
         let terminal = run(0, "COMPLETED", 1);
         assert_eq!(
-            merge_locations(vec![(ShardId::new(0), terminal)], vec![uninspected(1)]),
+            merge_locations(
+                vec![(ShardId::new(0), terminal)],
+                vec![uninspected(1)],
+                false
+            ),
             TargetLocation::Indeterminate {
                 uninspected: vec![uninspected(1)]
             }
@@ -986,22 +1187,22 @@ mod tests {
     fn an_answer_reports_whether_it_is_authoritative_for_the_whole_key() {
         let live = run(0, "RUNNING", 1);
         assert!(
-            merge_locations(vec![(ShardId::new(0), live.clone())], Vec::new())
+            merge_locations(vec![(ShardId::new(0), live.clone())], Vec::new(), false)
                 .is_authoritative_for_key(),
             "every shard answered and exactly one live run exists"
         );
         assert!(
-            !merge_locations(vec![(ShardId::new(0), live)], vec![uninspected(1)])
+            !merge_locations(vec![(ShardId::new(0), live)], vec![uninspected(1)], false)
                 .is_authoritative_for_key(),
             "a live run found over a PARTIAL view — the un-inspected shard MAY hold \
              another live run of the same key, since uniqueness is shard-local"
         );
         assert!(
-            merge_locations(Vec::new(), Vec::new()).is_authoritative_for_key(),
+            merge_locations(Vec::new(), Vec::new(), false).is_authoritative_for_key(),
             "`NotFound` is only ever reached from a complete fan-out"
         );
         assert!(
-            !merge_locations(Vec::new(), vec![uninspected(1)]).is_authoritative_for_key(),
+            !merge_locations(Vec::new(), vec![uninspected(1)], false).is_authoritative_for_key(),
             "`Indeterminate` never is"
         );
     }
@@ -1020,6 +1221,7 @@ mod tests {
         let merged = merge_locations(
             vec![(ShardId::new(0), older), (ShardId::new(1), newer)],
             Vec::new(),
+            false,
         );
         assert_eq!(
             merged.found_shard(),
@@ -1050,7 +1252,8 @@ mod tests {
         assert!(
             merge_locations(
                 vec![(ShardId::new(0), dead), (ShardId::new(1), live)],
-                Vec::new()
+                Vec::new(),
+                false
             )
             .is_authoritative_for_key()
         );
@@ -1060,13 +1263,38 @@ mod tests {
     fn a_live_winner_settles_the_question_despite_an_uninspected_shard() {
         let live = run(0, "RUNNING", 1);
         assert_eq!(
-            merge_locations(vec![(ShardId::new(0), live.clone())], vec![uninspected(1)]),
+            merge_locations(
+                vec![(ShardId::new(0), live.clone())],
+                vec![uninspected(1)],
+                false
+            ),
             TargetLocation::Found {
                 shard: ShardId::new(0),
                 run: live,
                 uninspected: vec![uninspected(1)],
                 other_live: Vec::new()
             }
+        );
+    }
+
+    #[test]
+    fn a_keyed_request_never_trusts_a_live_winner_over_an_uninspected_shard() {
+        // Code review finding (PR #1593, issue #1318). The uninspected
+        // shard's idempotency-key check never ran. It might hold the prior
+        // delivery the key names. Delivering fresh to the live winner found
+        // elsewhere would then double-deliver. So `keyed = true` must NOT
+        // take the "live winner settles it" shortcut. The sibling test
+        // above proves that shortcut for an unkeyed signal and for a
+        // cancel.
+        let live = run(0, "RUNNING", 1);
+        assert_eq!(
+            merge_locations(vec![(ShardId::new(0), live)], vec![uninspected(1)], true),
+            TargetLocation::Indeterminate {
+                uninspected: vec![uninspected(1)]
+            },
+            "a keyed request must retry rather than risk delivering fresh to a \
+             winner found while another shard -- possibly the one already \
+             holding this key -- went uninspected"
         );
     }
 
@@ -1080,7 +1308,8 @@ mod tests {
                     (ShardId::new(0), recent_terminal),
                     (ShardId::new(1), live.clone()),
                 ],
-                Vec::new()
+                Vec::new(),
+                false
             ),
             TargetLocation::Found {
                 shard: ShardId::new(1),
@@ -1102,7 +1331,7 @@ mod tests {
             started_at: chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("valid"),
         };
         assert_eq!(
-            merge_locations(vec![(ShardId::new(3), unencoded)], Vec::new()).found_shard(),
+            merge_locations(vec![(ShardId::new(3), unencoded)], Vec::new(), false).found_shard(),
             Some(ShardId::new(3))
         );
     }
@@ -1191,8 +1420,15 @@ mod tests {
     fn the_memo_reports_back_a_shard_it_recorded() {
         let memo = UninspectableShards::new();
         assert_eq!(memo.recorded(ShardId::new(1)), None);
-        memo.record(ShardId::new(1), "no pool".to_string());
-        assert_eq!(memo.recorded(ShardId::new(1)), Some("no pool".to_string()));
+        memo.record(
+            ShardId::new(1),
+            "no pool".to_string(),
+            UninspectedReasonKind::NoPool,
+        );
+        assert_eq!(
+            memo.recorded(ShardId::new(1)),
+            Some(("no pool".to_string(), UninspectedReasonKind::NoPool))
+        );
         assert_eq!(
             memo.recorded(ShardId::new(2)),
             None,
@@ -1201,19 +1437,39 @@ mod tests {
     }
 
     #[test]
-    fn the_memo_keeps_the_first_reason_it_was_given() {
+    fn the_memo_keeps_the_first_reason_and_kind_it_was_given() {
         // The short-circuit path deliberately does not re-record, so an operator
         // sees the original diagnosis rather than a later re-derivation of it.
         let memo = UninspectableShards::new();
         memo.record(
             ShardId::new(1),
             "could not acquire a connection".to_string(),
+            UninspectedReasonKind::AcquireTimeout,
         );
-        memo.record(ShardId::new(1), "something later and vaguer".to_string());
+        memo.record(
+            ShardId::new(1),
+            "something later and vaguer".to_string(),
+            UninspectedReasonKind::QueryError,
+        );
         assert_eq!(
             memo.recorded(ShardId::new(1)),
-            Some("could not acquire a connection".to_string())
+            Some((
+                "could not acquire a connection".to_string(),
+                UninspectedReasonKind::AcquireTimeout
+            ))
         );
+    }
+
+    #[test]
+    fn uninspected_reason_kind_has_a_bounded_metric_label_per_variant() {
+        // issue #1307: the label is the metric-facing value, kept distinct from
+        // any future Display/Debug rendering.
+        assert_eq!(UninspectedReasonKind::NoPool.as_label(), "no_pool");
+        assert_eq!(
+            UninspectedReasonKind::AcquireTimeout.as_label(),
+            "acquire_timeout"
+        );
+        assert_eq!(UninspectedReasonKind::QueryError.as_label(), "query_error");
     }
 
     #[test]
@@ -1227,6 +1483,7 @@ mod tests {
         let merged = merge_locations(
             vec![(ShardId::new(0), only.clone()), (ShardId::new(1), only)],
             Vec::new(),
+            false,
         );
         assert!(
             merged.is_authoritative_for_key(),
@@ -1256,5 +1513,78 @@ mod tests {
             FANOUT_PEER_BOUND,
             "an unopened pool must be allowed to finish its handshake"
         );
+    }
+
+    // ── UninspectedReasonKind classification (issue #1307) ─────────────────
+
+    fn unreachable_pool() -> DbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://unused:unused@127.0.0.1:1/unused");
+        deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds")
+    }
+
+    #[tokio::test]
+    async fn a_shard_with_no_configured_pool_is_classified_as_no_pool() {
+        // `ShardedDbPool` requires at least one configured pool. Shard 0
+        // carries one (unreachable), but this test is about shard 1, for
+        // which no pool is configured at all. The router's fan-out is the
+        // union of the pool's shards and its own. So shard 0 is unavoidably
+        // probed too. That classification is covered by
+        // `a_peer_shard_whose_connection_cannot_be_acquired_is_classified_as_acquire_timeout`.
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(ShardId::new(0), unreachable_pool());
+        let pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+        let router = ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(0),
+        );
+
+        let placement = resolve_location_by_workflow_id_with(
+            &pool,
+            Some(&router),
+            "wf",
+            "id",
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        match placement {
+            TargetLocation::Indeterminate { uninspected } => {
+                let shard_1 = uninspected
+                    .iter()
+                    .find(|u| u.shard == ShardId::new(1))
+                    .expect("shard 1 has no configured pool and must be reported uninspected");
+                assert_eq!(shard_1.kind, UninspectedReasonKind::NoPool);
+            }
+            other => panic!("expected Indeterminate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_shard_whose_connection_cannot_be_acquired_is_classified_as_acquire_timeout() {
+        // A pool that CANNOT hand over a connection (nothing listens on the
+        // configured address) must be reported `AcquireTimeout`, never
+        // `QueryError` — no query ever ran.
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(ShardId::new(0), unreachable_pool());
+        let pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+        let placement =
+            resolve_location_by_workflow_id_with(&pool, None, "wf", "id", None, None, None).await;
+
+        match placement {
+            TargetLocation::Indeterminate { uninspected } => {
+                assert_eq!(uninspected.len(), 1);
+                assert_eq!(uninspected[0].kind, UninspectedReasonKind::AcquireTimeout);
+            }
+            other => panic!("expected Indeterminate, got {other:?}"),
+        }
     }
 }

@@ -57,12 +57,10 @@ fn init_sql() -> Vec<u8> {
     autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
-/// Capturing recorder for `record_rate_limit_buckets_deleted` (issue #1127)
-/// plus the end-of-iteration liveness tick used to await a whole tick.
+/// Capturing recorder for `record_rate_limit_buckets_deleted` (issue #1127).
 #[derive(Default)]
 struct CapturingMetrics {
     buckets_deleted: Mutex<Vec<(String, u64)>>,
-    completed_ticks: Mutex<u64>,
 }
 
 impl CapturingMetrics {
@@ -77,10 +75,6 @@ impl CapturingMetrics {
         }
         out
     }
-
-    fn completed_ticks(&self) -> u64 {
-        *self.completed_ticks.lock().unwrap()
-    }
 }
 
 impl MetricsRecorder for CapturingMetrics {
@@ -91,9 +85,7 @@ impl MetricsRecorder for CapturingMetrics {
             .push((family.to_string(), count));
     }
 
-    fn record_scanner_tick(&self, _scanner: &str, _shard: &str) {
-        *self.completed_ticks.lock().unwrap() += 1;
-    }
+    fn record_scanner_tick(&self, _scanner: &str, _shard: &str) {}
 }
 
 async fn setup_db() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -367,23 +359,28 @@ async fn run_one_tick_on(
     .expect("retention runtime should spawn when the bucket GC is active");
     runtime.run_now();
 
-    // The end-of-iteration liveness tick (#797) is unconditional and runs last,
-    // so observing it is exactly "the whole iteration completed" — waiting on
-    // `ran_at` would race the passes that run after the history phase.
-    let baseline = metrics.completed_ticks();
+    // Wait for the bucket-GC outcome itself, not for a scanner-tick count.
+    // `RetentionRuntime::spawn` runs a startup partition-maintenance pass
+    // before the main loop's first iteration. It records a liveness tick
+    // for that pass, even when partitioning is off. The pass's own
+    // per-shard ticks never fire in that case. That startup tick shares
+    // the counter with the main loop's end-of-iteration tick. Waiting on
+    // "the counter moved" can therefore observe the harmless startup
+    // tick. The snapshot read then races `run_now()`'s own iteration,
+    // which has not yet populated this field.
     let mut result = None;
     for _ in 0..400 {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        if metrics.completed_ticks() <= baseline {
-            continue;
-        }
         let snap = runtime.monitor().snapshot();
         // `.iter().find(...)`, never `.first()`: diesel's blanket `RunQueryDsl`
         // impl shadows `Vec::first` in a diesel-importing scope.
-        if let Some(r) = snap.per_shard.iter().find(|r| r.shard == 0) {
+        let Some(r) = snap.per_shard.iter().find(|r| r.shard == 0) else {
+            continue;
+        };
+        if r.rate_limit_bucket_gc.is_some() {
             result = Some(r.clone());
+            break;
         }
-        break;
     }
     runtime.shutdown();
     result.expect("retention tick did not complete in time")
@@ -412,15 +409,18 @@ async fn run_one_tick_snapshot(
     )
     .expect("retention runtime should spawn when the bucket GC is active");
     runtime.run_now();
-    let baseline = metrics.completed_ticks();
+    // See `run_one_tick_on`: wait for every shard's bucket-GC outcome to be
+    // populated. Do not wait for a scanner-tick count. The startup
+    // partition-maintenance pass can move that counter before this tick's
+    // own iteration runs.
     let mut snap = Vec::new();
     for _ in 0..400 {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        if metrics.completed_ticks() <= baseline {
-            continue;
+        let candidate = runtime.monitor().snapshot().per_shard;
+        if !candidate.is_empty() && candidate.iter().all(|r| r.rate_limit_bucket_gc.is_some()) {
+            snap = candidate;
+            break;
         }
-        snap = runtime.monitor().snapshot().per_shard;
-        break;
     }
     runtime.shutdown();
     assert!(!snap.is_empty(), "retention tick did not complete in time");
@@ -1732,4 +1732,89 @@ async fn a_shard_whose_sweep_fails_reports_the_failure_instead_of_a_silent_zero(
 
     // ...and one shard's failure never stops another shard's collection.
     assert!(!bucket_exists(&mut conn, "dyn-rate:t:healthy").await);
+}
+
+/// Restores a table hidden by a rename when the case ends, panic or not.
+///
+/// The database is shared across cases (issue #1316). A panic while the
+/// table is hidden — inside the tick driver, not only a later `assert!` —
+/// would otherwise leave the table missing. Every later case would then
+/// fail too.
+struct HiddenTableGuard {
+    url: String,
+    hidden_name: &'static str,
+    real_name: &'static str,
+}
+
+impl Drop for HiddenTableGuard {
+    fn drop(&mut self) {
+        let url = self.url.clone();
+        let hidden_name = self.hidden_name;
+        let real_name = self.real_name;
+        // `Drop` is not async, and the current runtime may already be
+        // stopping. A short-lived thread with its own runtime answers both.
+        let restored = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async move {
+                let Ok(mut conn) = AsyncPgConnection::establish(&url).await else {
+                    return;
+                };
+                let _ =
+                    diesel::sql_query(format!("ALTER TABLE {hidden_name} RENAME TO {real_name}"))
+                        .execute(&mut conn)
+                        .await;
+            });
+        })
+        .join();
+        assert!(restored.is_ok(), "the table-restore guard panicked");
+    }
+}
+
+#[tokio::test]
+async fn a_failed_dry_run_pass_still_reports_dry_run_true() {
+    // Issue #1316: `RateLimitBucketGcOutcome::failed` filled every field but
+    // `error` from `Default`, so a failed DRY-RUN preview reported
+    // `dry_run: false` — indistinguishable from a failed REAL pass. An
+    // operator would read that as "a destructive pass errored partway",
+    // when in fact the tick was a preview and deleted nothing.
+    //
+    // The sibling test above provokes the connection-acquisition `failed()`
+    // call site. This one provokes the OTHER call site: the sweep/preview
+    // query itself, on an otherwise-healthy connection.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    diesel::sql_query(
+        "ALTER TABLE harvest_rate_limit_buckets RENAME TO harvest_rate_limit_buckets_1316_hidden",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("hide the table to provoke the sweep query's own failure");
+    let _restore_table = HiddenTableGuard {
+        url: url.clone(),
+        hidden_name: "harvest_rate_limit_buckets_1316_hidden",
+        real_name: "harvest_rate_limit_buckets",
+    };
+
+    let pools = ShardedDbPool::single(build_pool(&url));
+    let config = RetentionConfig {
+        dry_run: true,
+        ..gc_only(WINDOW)
+    };
+    let result = run_one_tick_on(pools, config, Arc::new(CapturingMetrics::default())).await;
+
+    assert!(
+        gc(&result).error.is_some(),
+        "the hidden table must surface as a failure"
+    );
+    assert!(
+        gc(&result).dry_run,
+        "a failed dry-run preview must still report dry_run: true"
+    );
 }
