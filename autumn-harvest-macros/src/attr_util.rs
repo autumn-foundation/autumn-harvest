@@ -121,7 +121,7 @@ pub fn returns_result(output: &syn::ReturnType) -> bool {
 /// `query.rs` and `update.rs` each hard-coded this exact derivation as
 /// `build_input_type_hint`. `signal.rs` hard-coded the same body as
 /// `build_arg_type_hint`. All three attribute macros publish the result on
-/// their handler-info struct, each field documented with the same phrase:
+/// their handler-info struct. Each field is documented with the same phrase:
 /// "Best-effort Rust type name for the input" or "for the payload". Commit
 /// `dfee5fce` (issue #346) added the first two copies together. Commit
 /// `12b3ab24` (issue #610) copied the same body into `signal.rs` under a new
