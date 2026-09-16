@@ -1,20 +1,23 @@
-//! Regression test for issue #1317 review: `signal-with-start` (and the
+//! Regression test for issue #1317 review. `signal-with-start` (and the
 //! identical `update-with-start` scan) must place a genuinely fresh
-//! post-reconciliation run on the business key's canonically-routed shard,
-//! never on whatever shard happens to hold a dead, terminal predecessor.
+//! post-reconciliation run on the business key's canonically-routed shard.
+//! Never on whatever shard happens to hold a dead, terminal predecessor.
 //!
 //! `pool.iter_shards()`'s prescan can encounter a terminal
 //! (`COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`) row for `(workflow_name,
-//! workflow_id)` on a shard OTHER than the one `ShardRouter::pick_for_new_workflow`
-//! would route a plain `start_workflow` to -- this happens whenever an
-//! execution's physical shard has drifted from its hash-routed shard, whether
-//! via a completed shard rebalance (the migrated-seal-reconciliation feature,
-//! issue #1317) or a writable-subset change. `replace_execution` seals and
-//! inserts on the SAME connection, so treating that stale row as the replace
-//! target anchors the fresh run to the WRONG shard. A later plain
-//! `start_workflow` for the same key then routes to the canonical shard, finds
-//! nothing occupying it, and inserts a SECOND live run for the same business
-//! key -- the two-shard duplicate this test proves cannot happen.
+//! workflow_id)` on a shard OTHER than the one
+//! `ShardRouter::pick_for_new_workflow` would route a plain `start_workflow`
+//! to. This happens whenever an execution's physical shard has drifted from
+//! its hash-routed shard. The drift can come from a completed shard
+//! rebalance (the migrated-seal-reconciliation feature, issue #1317), or
+//! from a writable-subset change. `replace_execution` seals and inserts on
+//! the SAME connection. So treating that stale row as the replace target
+//! anchors the fresh run to the WRONG shard.
+//!
+//! A later plain `start_workflow` for the same key then routes to the
+//! canonical shard and finds nothing occupying it. It inserts a SECOND live
+//! run for the same business key -- the two-shard duplicate this test
+//! proves cannot happen.
 //!
 //! Dual-mode like the sibling multi-shard suites: uses
 //! `HARVEST_TEST_DATABASE_URL` when set, else boots two fresh testcontainers
@@ -208,10 +211,21 @@ async fn post_json(app: &HarvestApiApp, uri: &str, body: Value) -> (StatusCode, 
 }
 
 /// Seed a COMPLETED row for `(workflow_name, workflow_id)` directly on
-/// `shard`'s database -- standing in for a terminal predecessor left behind
-/// by a completed shard rebalance (or a writable-subset drift), without
-/// needing to replay the full migration/reconciliation state machine.
+/// `shard`'s database. Stands in for a terminal predecessor left behind by a
+/// completed shard rebalance (or a writable-subset drift). Skips replaying
+/// the full migration/reconciliation state machine.
 async fn seed_completed(database_url: &str, shard: ShardId, workflow_id: &str) -> ExecutionId {
+    seed_with_state(database_url, shard, workflow_id, "COMPLETED").await
+}
+
+/// As [`seed_completed`], but for an arbitrary state -- e.g. `PAUSED`, to
+/// stand in for a live-but-suspended run left off its hash-routed shard.
+async fn seed_with_state(
+    database_url: &str,
+    shard: ShardId,
+    workflow_id: &str,
+    state: &str,
+) -> ExecutionId {
     let exec_id = ExecutionId::new_for_shard(shard);
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
@@ -267,10 +281,12 @@ async fn seed_completed(database_url: &str, shard: ShardId, workflow_id: &str) -
     .await
     .expect("seed row");
 
+    let completed_at =
+        matches!(state, "COMPLETED" | "FAILED" | "CANCELLED" | "TIMED_OUT").then(chrono::Utc::now);
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
-            harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::state.eq(state),
+            harvest_workflow_executions::completed_at.eq(completed_at),
         ))
         .execute(&mut conn)
         .await
@@ -280,16 +296,138 @@ async fn seed_completed(database_url: &str, shard: ShardId, workflow_id: &str) -
 
 /// Count RUNNING rows for this business key on the given shard database.
 async fn running_count(database_url: &str, workflow_id: &str) -> i64 {
+    state_count(database_url, workflow_id, "RUNNING").await
+}
+
+/// Count rows in `state` for this business key on the given shard database.
+async fn state_count(database_url: &str, workflow_id: &str, state: &str) -> i64 {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
         .expect("connect to count");
     harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
-        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .filter(harvest_workflow_executions::state.eq(state))
         .count()
         .get_result(&mut conn)
         .await
         .expect("count")
+}
+
+/// A `workflow_id` whose `pick_for_new_workflow` canonical shard is `target`
+/// -- brute forced, since the router's hash has no closed-form inverse.
+fn workflow_id_routed_to(router: &ShardRouter, target: ShardId) -> String {
+    (0..10_000)
+        .map(|i| format!("routed-{i}"))
+        .find(|id| router.pick_for_new_workflow("onboarding", id) == target)
+        .expect("a matching workflow_id within 10,000 tries")
+}
+
+#[tokio::test]
+async fn signal_with_start_finds_and_attaches_to_a_paused_run_off_its_routed_shard() {
+    // Issue #1317 review. A live-but-PAUSED run found on a non-canonical
+    // shard (a writable-subset artifact, independent of migration) must
+    // never be treated as a dead row to skip past. `PAUSED` is the real
+    // persisted name for a suspended run (`is_active_conflict_state`), not
+    // `SUSPENDED`. Skipping it would abandon the paused row in place.
+    // It would also create an unrelated fresh run on the canonical shard:
+    // two rows for the same business key.
+    //
+    // A `PAUSED` prior under the default `AllowDuplicate` policy attaches
+    // (the signal buffers for delivery on resume, like a direct
+    // `send_signal` -- see `resolve_effective_signal_with_start_policy`,
+    // issue #383). It does not seal-and-replace like a terminal prior does.
+    let ((url_a, url_b), _guard) = setup_two_shard_databases().await;
+    let (app, router) = build_app(&url_a, &url_b);
+
+    let workflow_id = "paused-off-route-key";
+    let canonical = router.pick_for_new_workflow("onboarding", workflow_id);
+    let (canonical_url, other_url, other_shard) = if canonical == ShardId::new(SHARD_A) {
+        (&url_a, &url_b, ShardId::new(SHARD_B))
+    } else {
+        (&url_b, &url_a, ShardId::new(SHARD_A))
+    };
+
+    let _paused = seed_with_state(other_url, other_shard, workflow_id, "PAUSED").await;
+
+    let (status, body) = post_json(
+        &app,
+        "/workflows/onboarding/signal-with-start",
+        json!({
+            "workflow_id": workflow_id,
+            "start_input": {},
+            "signal_name": "wake",
+            "signal_payload": {}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["started_fresh"],
+        json!(false),
+        "the paused row must be found and attached to, not skipped past"
+    );
+    assert_eq!(body["signal_delivered"], json!(true));
+
+    // The paused row is live: it must be found on ITS OWN shard, never
+    // abandoned in favor of an unrelated fresh run elsewhere.
+    assert_eq!(
+        state_count(other_url, workflow_id, "PAUSED").await,
+        1,
+        "the paused row must still be the one and only row for this key"
+    );
+    assert_eq!(
+        running_count(canonical_url, workflow_id).await,
+        0,
+        "no unrelated fresh run must appear on the canonical shard"
+    );
+}
+
+#[tokio::test]
+async fn signal_with_start_keeps_scanning_past_a_dead_canonical_row_for_a_live_run_elsewhere() {
+    // Issue #1317 review. A dead, terminal row on the CANONICAL shard must
+    // be kept only as a fallback, not treated as decisive the moment it is
+    // seen. A live run for the same key can still exist on a later,
+    // non-canonical shard (a writable-subset artifact). That is exactly the
+    // reason this cross-shard scan exists at all. It must win.
+    let ((url_a, url_b), _guard) = setup_two_shard_databases().await;
+    let (app, router) = build_app(&url_a, &url_b);
+
+    // Shards iterate in ascending id order. Pin the canonical shard to
+    // SHARD_A (visited first) -- otherwise the dead row would never be
+    // reached before the live one, regardless of this fix.
+    let workflow_id = workflow_id_routed_to(&router, ShardId::new(SHARD_A));
+
+    let _dead = seed_completed(&url_a, ShardId::new(SHARD_A), &workflow_id).await;
+    let _live = seed_with_state(&url_b, ShardId::new(SHARD_B), &workflow_id, "RUNNING").await;
+
+    let (status, body) = post_json(
+        &app,
+        "/workflows/onboarding/signal-with-start",
+        json!({
+            "workflow_id": workflow_id,
+            "start_input": {},
+            "signal_name": "wake",
+            "signal_payload": {}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["started_fresh"],
+        json!(false),
+        "the live run on shard B must be attached to, not shadowed by the \
+         dead row the scan meets first on the canonical shard"
+    );
+    assert_eq!(
+        running_count(&url_b, &workflow_id).await,
+        1,
+        "the original live run must be untouched"
+    );
+    assert_eq!(
+        running_count(&url_a, &workflow_id).await,
+        0,
+        "the dead canonical row must not have spawned a second live run"
+    );
 }
 
 #[tokio::test]
@@ -311,9 +449,9 @@ async fn signal_with_start_routes_a_fresh_run_past_a_stale_terminal_copy_to_the_
     };
 
     // A dead, terminal predecessor sits on the NON-canonical shard, with
-    // nothing at all on the canonical shard -- the state left behind once a
-    // migrated-and-reconciled seal is excluded from occupancy (issue #1317)
-    // and its live copy has since itself completed.
+    // nothing at all on the canonical shard. That is the state left behind
+    // once a migrated-and-reconciled seal is excluded from occupancy (issue
+    // #1317) and its live copy has since itself completed.
     let _stale = seed_completed(other_url, other_shard, workflow_id).await;
 
     let (status, body) = post_json(
@@ -335,7 +473,7 @@ async fn signal_with_start_routes_a_fresh_run_past_a_stale_terminal_copy_to_the_
     );
 
     // The fresh run must land on the CANONICAL shard -- the one a plain
-    // `start_workflow` for this key would also use -- not on the shard that
+    // `start_workflow` for this key would also use. Not on the shard that
     // merely happened to hold the dead predecessor.
     assert_eq!(
         running_count(canonical_url, workflow_id).await,
@@ -349,7 +487,7 @@ async fn signal_with_start_routes_a_fresh_run_past_a_stale_terminal_copy_to_the_
     );
 
     // End-to-end: a plain start for the same key must see the fresh run on
-    // the canonical shard and refuse to create a second one, proving the
+    // the canonical shard and refuse to create a second one. This proves the
     // two-shard duplicate this fix closes cannot happen.
     let (status, body) = post_json(
         &app,

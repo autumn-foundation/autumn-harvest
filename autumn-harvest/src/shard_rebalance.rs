@@ -1970,10 +1970,9 @@ mod db {
             });
         }
 
-        let fingerprint = match (
-            crate::store::load_history_with_codecs(source, exec_id, codecs).await,
-            crate::store::load_history_with_codecs(target, exec_id, codecs).await,
-        ) {
+        let source_result = crate::store::load_history_with_codecs(source, exec_id, codecs).await;
+        let target_result = crate::store::load_history_with_codecs(target, exec_id, codecs).await;
+        let fingerprint = match (source_result, target_result) {
             (Ok(source_history), Ok(target_history)) => {
                 let source_fingerprint = history_fingerprint(&source_history.events);
                 let target_fingerprint = history_fingerprint(&target_history.events);
@@ -2001,17 +2000,26 @@ mod db {
             // already proved the raw rows byte-identical; that is the
             // verification this call can still perform without the
             // application's own codec.
+            //
+            // The OTHER side must be `Ok` or itself an allowed unknown-codec
+            // error. A genuine failure there -- a database error, a malformed
+            // payload -- must still propagate. Matching it with a wildcard
+            // would report successful raw verification over a history read
+            // that actually failed.
             (
+                Ok(_)
+                | Err(
+                    HarvestError::UnknownCodecKey { .. } | HarvestError::UnknownPayloadCodec { .. },
+                ),
                 Err(
                     HarvestError::UnknownCodecKey { .. } | HarvestError::UnknownPayloadCodec { .. },
                 ),
-                _,
             )
             | (
-                _,
                 Err(
                     HarvestError::UnknownCodecKey { .. } | HarvestError::UnknownPayloadCodec { .. },
                 ),
+                Ok(_),
             ) => {
                 format!("raw:{}", raw_history_fingerprint(&source_raw))
             }

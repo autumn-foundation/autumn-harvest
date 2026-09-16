@@ -20905,6 +20905,12 @@ pub(crate) async fn signal_with_start_workflow(
         .router
         .pick_for_new_workflow(&workflow_name, &workflow_id);
     let mut found_shard: Option<(ShardId, PoolConn, ExecutionId, bool)> = None;
+    // A dead, non-live prior found on the canonical shard (issue #1317 review).
+    // Recorded rather than used immediately. A live row on a LATER shard (a
+    // writable-subset artifact, independent of migration) must still win. So
+    // the scan keeps going instead of stopping here. Used only as a fallback
+    // once the full scan confirms no live row exists anywhere.
+    let mut canonical_dead: Option<(ShardId, PoolConn, ExecutionId)> = None;
     let mut seal_only: Option<ShardId> = None;
     for (candidate_shard, shard_pool) in pool.iter_shards() {
         let mut shard_conn = match acquire_conn(shard_pool).await {
@@ -20957,40 +20963,41 @@ pub(crate) async fn signal_with_start_workflow(
                 seal_only = Some(candidate_shard);
                 continue;
             }
-            // A dead, non-live prior (COMPLETED/FAILED/CANCELLED/TIMED_OUT) found
-            // on a non-canonical shard is a former migration target or a
-            // writable-subset artifact, not a run needing action. Anchoring
-            // `replace_execution` to it would create the fresh run off the
-            // routed shard (see the comment above the loop). Skip it and keep
-            // scanning, so the loop falls through to `canonical_shard` below —
-            // the same shard a plain `start_workflow` would use. A RUNNING or
-            // SUSPENDED row is never skipped: it needs attaching or terminating
-            // wherever it actually lives.
-            if !matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED")
-                && candidate_shard != canonical_shard
-            {
-                continue;
+            // `PAUSED` is the persisted name for a suspended run
+            // (`is_active_conflict_state`); `SUSPENDED` is kept alongside it
+            // for parity with the other live-state checks in this file. Both
+            // are live wherever they are found. Attach (RUNNING only), or
+            // route through `replace_execution` on THEIR OWN shard. Never
+            // skipped: a business key has at most one live row, so nothing
+            // later in the scan can outrank it.
+            if matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED" | "PAUSED") {
+                let will_attach = existing_state == "RUNNING"
+                    && matches!(
+                        reuse_policy,
+                        WorkflowIdReusePolicy::AllowDuplicate
+                            | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+                    );
+                let exec_id = if will_attach {
+                    ExecutionId::from_uuid(existing_uuid)
+                } else {
+                    ExecutionId::new_for_shard(candidate_shard)
+                };
+                found_shard = Some((candidate_shard, shard_conn, exec_id, will_attach));
+                break;
             }
-            // Attach (reuse UUID) only when the prior is live AND the policy
-            // expects to attach. Every other path goes through replace_execution
-            // and needs a fresh exec_id keyed for the same shard.
-            // Only a RUNNING execution under a non-rejecting policy is a true
-            // attach (signal delivered, start_input ignored). SUSPENDED is
-            // upgraded to TerminateIfRunning by resolve_effective_signal_with_start_policy,
-            // which writes a fresh execution using start_input — so validation must run.
-            let will_attach = existing_state == "RUNNING"
-                && matches!(
-                    reuse_policy,
-                    WorkflowIdReusePolicy::AllowDuplicate
-                        | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
-                );
-            let exec_id = if will_attach {
-                ExecutionId::from_uuid(existing_uuid)
-            } else {
-                ExecutionId::new_for_shard(candidate_shard)
-            };
-            found_shard = Some((candidate_shard, shard_conn, exec_id, will_attach));
-            break;
+            // A dead, non-live prior (COMPLETED/FAILED/CANCELLED/TIMED_OUT).
+            // `replace_execution` seals and inserts on the same connection.
+            // So this can anchor a fresh run only when it sits on the
+            // canonical shard — the routed shard a plain `start_workflow`
+            // would also use. Record it as a fallback and keep scanning; a
+            // live row found later still wins (see the `canonical_dead` comment).
+            if candidate_shard == canonical_shard {
+                canonical_dead = Some((
+                    candidate_shard,
+                    shard_conn,
+                    ExecutionId::new_for_shard(candidate_shard),
+                ));
+            }
         }
     }
 
@@ -21012,6 +21019,8 @@ pub(crate) async fn signal_with_start_workflow(
 
     let (shard, mut conn, exec_id, _will_attach) = if let Some(tuple) = found_shard {
         tuple
+    } else if let Some((shard, conn, exec_id)) = canonical_dead {
+        (shard, conn, exec_id, false)
     } else {
         let conn = match db_conn_for_shard(&api_state, canonical_shard).await {
             Ok(c) => c,
@@ -21656,6 +21665,8 @@ async fn update_with_start_workflow(
             .router
             .pick_for_new_workflow(&workflow_name, &workflow_id);
         let mut found_shard: Option<(ShardId, PoolConn, ExecutionId)> = None;
+        // See the matching `canonical_dead` in the signal-with-start handler.
+        let mut canonical_dead: Option<(ShardId, PoolConn, ExecutionId)> = None;
         let mut seal_only: Option<ShardId> = None;
         for (candidate_shard, shard_pool) in pool.iter_shards() {
             let mut shard_conn = match acquire_conn(shard_pool).await {
@@ -21699,33 +21710,41 @@ async fn update_with_start_workflow(
                     seal_only = Some(candidate_shard);
                     continue;
                 }
-                // A dead, non-live prior found on a non-canonical shard — see
-                // the matching check in the signal-with-start handler. Skip it
-                // so the loop falls through to `canonical_shard`, the same
-                // shard a plain `start_workflow` would use.
-                if !matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED")
-                    && candidate_shard != canonical_shard
-                {
-                    continue;
+                // `PAUSED` and `SUSPENDED` are live wherever found, exactly
+                // like `RUNNING` — see the matching check in the
+                // signal-with-start handler. Never skipped: `replace_execution`
+                // must run on THEIR OWN shard. A business key has at most
+                // one live row, so nothing later in the scan can outrank it.
+                if matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED" | "PAUSED") {
+                    // Reuse the execution UUID only when attaching to a live RUNNING
+                    // run under a non-rejecting policy. All other paths (terminal
+                    // prior, PAUSED, TerminateIfRunning) go through replace_execution
+                    // and need a fresh exec_id to avoid a primary-key conflict.
+                    let will_attach = existing_state == "RUNNING"
+                        && matches!(
+                            reuse_policy,
+                            WorkflowIdReusePolicy::AllowDuplicate
+                                | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+                        );
+                    let exec_id = if will_attach {
+                        ExecutionId::from_uuid(existing_uuid)
+                    } else {
+                        ExecutionId::new_for_shard(candidate_shard)
+                    };
+                    found_shard = Some((candidate_shard, shard_conn, exec_id));
+                    break;
                 }
-                // Reuse the execution UUID only when attaching to a live RUNNING or
-                // SUSPENDED run under a non-rejecting policy. All other paths
-                // (terminal prior, PAUSED, TerminateIfRunning) go through
-                // replace_execution and need a fresh exec_id to avoid a
-                // primary-key conflict.
-                let will_attach = matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED")
-                    && matches!(
-                        reuse_policy,
-                        WorkflowIdReusePolicy::AllowDuplicate
-                            | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
-                    );
-                let exec_id = if will_attach {
-                    ExecutionId::from_uuid(existing_uuid)
-                } else {
-                    ExecutionId::new_for_shard(candidate_shard)
-                };
-                found_shard = Some((candidate_shard, shard_conn, exec_id));
-                break;
+                // A dead, non-live prior (COMPLETED/FAILED/CANCELLED/TIMED_OUT) —
+                // see the matching check in the signal-with-start handler. Record
+                // it as a fallback only when on the canonical shard, and keep
+                // scanning; a live row found later still wins.
+                if candidate_shard == canonical_shard {
+                    canonical_dead = Some((
+                        candidate_shard,
+                        shard_conn,
+                        ExecutionId::new_for_shard(candidate_shard),
+                    ));
+                }
             }
         }
 
@@ -21733,7 +21752,9 @@ async fn update_with_start_workflow(
             tuple
         } else if let Some(seal_shard) = seal_only {
             // Held by a run rebalanced onto a shard this node cannot reach.
-            // Starting fresh would duplicate the business key.
+            // Starting fresh would duplicate the business key. Even if a dead
+            // canonical row was also seen, an unreachable seal means an
+            // active run elsewhere cannot be ruled out.
             return AutumnError::service_unavailable_msg(format!(
                 "workflow_id '{workflow_id}' is held by an execution that was rebalanced \
                  off shard {}; its live copy is not reachable from this node, so the \
@@ -21741,6 +21762,8 @@ async fn update_with_start_workflow(
                 seal_shard.as_i32()
             ))
             .into_response();
+        } else if let Some((shard, conn, exec_id)) = canonical_dead {
+            (shard, conn, exec_id)
         } else {
             let conn = match db_conn_for_shard(&api_state, canonical_shard).await {
                 Ok(c) => c,
