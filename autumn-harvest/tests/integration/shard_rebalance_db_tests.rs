@@ -3244,3 +3244,52 @@ async fn a_migrated_cancel_target_s_unfinished_handler_check_reuses_the_held_con
         "the unfinished-handler check must run and find the pending update; got: {calls:?}"
     );
 }
+
+// `resolve_execution_shard_holding` itself (issue #1324): a forwarded hop
+// must fail closed when its named shard has no pool here. Checking
+// `on_held` with `pool_for` instead of `exact_pool_for` lets that hop
+// alias onto the default shard's pool by coincidence. The default may
+// also be the held shard. The hop then reads on `conn` -- a database the
+// execution has no row on at all. It finds nothing, and reports the
+// unconfigured hop resolved instead of unreachable.
+#[tokio::test]
+async fn a_forward_to_an_unconfigured_shard_fails_closed_not_via_the_held_pools_default() {
+    let shards = setup_two_shards().await;
+    // TARGET is both the held shard and the pool's default -- the exact
+    // condition that makes the fallback alias an unconfigured hop onto it.
+    let pool = ShardedDbPool::from_map(
+        [
+            (SOURCE, build_pool(&shards.source_url)),
+            (TARGET, build_pool(&shards.target_url)),
+        ]
+        .into_iter()
+        .collect(),
+        TARGET,
+    );
+
+    let mut source = shards.source().await;
+    let exec_id = insert_execution(&mut source, "1324c_flow", "1324c-fwd").await;
+    diesel::sql_query("UPDATE harvest_workflow_executions SET migrated_to_shard = 2 WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut source)
+        .await
+        .expect("fabricate a forward to an unconfigured shard");
+    drop(source);
+
+    let mut held_conn = shards.target().await;
+    let err = autumn_harvest::shard_rebalance::resolve_execution_shard_holding(
+        &mut held_conn,
+        &pool,
+        exec_id,
+        TARGET,
+    )
+    .await
+    .expect_err(
+        "an unconfigured forwarded hop must fail closed, not resolve through the held pool's default fallback",
+    );
+
+    assert!(
+        matches!(err, HarvestError::ShardUnavailable { shard_id: 2, .. }),
+        "expected ShardUnavailable naming the unconfigured shard 2, got {err:?}"
+    );
+}

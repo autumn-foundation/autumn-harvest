@@ -55,6 +55,17 @@ out, mirroring how `resolve_target_shard_holding` already does this for a
 `WorkflowId` target. `execution_id_residence` and the deferred-check
 residence lookup both call it now instead of the bare hop-walk.
 
+The first cut of that fix carried its own defect, also caught by the
+Codex PR reviewer: `on_held` checked a hop's pool with `pool_for`, which
+falls back to the default shard for a shard this process has no pool for.
+A forwarding pointer naming such a shard could then alias onto the held
+pool's default by coincidence, get read on `conn` — a database the
+execution has no row on — find nothing, and report that unconfigured hop
+resolved instead of unreachable. Fixed by using `exact_pool_for` for
+every hop after the tolerant origin one, matching `resolve_execution_shard`'s
+own `checkout`/`checkout_entry` split exactly, so an unconfigured
+forwarded hop now returns `ShardUnavailable` instead of a wrong answer.
+
 **Test evidence.**
 `shard_rebalance_db_tests::a_rebalanced_caller_self_shard_cancel_reuses_the_held_connection`
 reproduces the first instance against two real shard databases, with the
@@ -79,7 +90,15 @@ passes in under 2 seconds, records `("1324b_target_flow", 1)` on a spy
 `MetricsRecorder` (confirming the unfinished-handler check ran, not just
 that the sweep returned), and leaves the target `CANCELLED`.
 
-The full `shard_rebalance_db_tests` suite (50 tests) and
+`shard_rebalance_db_tests::a_forward_to_an_unconfigured_shard_fails_closed_not_via_the_held_pools_default`
+covers the fail-closed defect in the first cut of the third fix: a
+fabricated forward to shard id 2 (never configured) from an origin that
+differs from the held shard, with the held shard also set as the pool's
+default. Confirmed red on the first cut (`Ok(ShardId(2))`, silently
+wrong) and green on the corrected version
+(`Err(ShardUnavailable { shard_id: 2, .. })`).
+
+The full `shard_rebalance_db_tests` suite (51 tests) and
 `workflow_id_targeted_tests` suite (26 tests) pass with no regressions,
 as does the crate's full unit-test suite (3593 tests, 1 pre-existing
 ignore) and `cargo clippy --features testing --tests -- -D warnings`.
