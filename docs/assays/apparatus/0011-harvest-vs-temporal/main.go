@@ -36,12 +36,27 @@ import (
 )
 
 const (
-	taskQueue    = "assay11"
-	inputPayload = "0123456789abcdef0123456789abcdef"
+	taskQueue = "assay11"
 
 	workflowSlots = 8
 	activitySlots = 16
 )
+
+// okResult is what each activity returns.
+//
+// The harvest activity returns {"ok": true}, so an equivalent result keeps
+// the persisted activity-completion payloads the same size on both arms.
+// Found by review on PR #1617.
+type okResult struct {
+	Ok bool `json:"ok"`
+}
+
+// emptyInput is the workflow input both arms seed.
+//
+// The canonical harness seeds an empty object, and the harvest arm now does
+// too. The workflow ignores it, but it is persisted in history and re-read on
+// every workflow-task replay, so it has to match. Found by review on PR #1617.
+type emptyInput struct{}
 
 // activityRuns is the correctness ledger, matching the harvest arm's counter.
 var activityRuns atomic.Uint64
@@ -52,12 +67,12 @@ var activityRuns atomic.Uint64
 // input would have Temporal serialize and persist that payload into every
 // activity-completion history event, a cost the harvest arm never pays, and
 // the registered shape says both arms are inert. Found by review on PR #1617.
-func Step1(ctx context.Context) error { activityRuns.Add(1); return nil }
-func Step2(ctx context.Context) error { activityRuns.Add(1); return nil }
-func Step3(ctx context.Context) error { activityRuns.Add(1); return nil }
+func Step1(ctx context.Context) (okResult, error) { activityRuns.Add(1); return okResult{true}, nil }
+func Step2(ctx context.Context) (okResult, error) { activityRuns.Add(1); return okResult{true}, nil }
+func Step3(ctx context.Context) (okResult, error) { activityRuns.Add(1); return okResult{true}, nil }
 
 // BenchWorkflow runs the three steps in sequence, matching wf_three_activities.
-func BenchWorkflow(ctx workflow.Context, in string) (string, error) {
+func BenchWorkflow(ctx workflow.Context, _ emptyInput) (okResult, error) {
 	opts := workflow.ActivityOptions{
 		StartToCloseTimeout: 30 * time.Second,
 		// The harvest arm's activities carry no retry policy and inert bodies
@@ -74,10 +89,10 @@ func BenchWorkflow(ctx workflow.Context, in string) (string, error) {
 	// Found by review on PR #1617.
 	for _, act := range []any{Step1, Step2, Step3} {
 		if err := workflow.ExecuteActivity(ctx, act).Get(ctx, nil); err != nil {
-			return "", err
+			return okResult{}, err
 		}
 	}
-	return "", nil
+	return okResult{true}, nil
 }
 
 func envInt(key string, fallback int) int {
@@ -161,7 +176,7 @@ func runRep(c client.Client, rep, workflows, capSecs int) (float64, bool) {
 			run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
 				ID:        fmt.Sprintf("a11-r%d-%d", rep, i),
 				TaskQueue: taskQueue,
-			}, BenchWorkflow, inputPayload)
+			}, BenchWorkflow, emptyInput{})
 			if err != nil {
 				log.Printf("seed %d: %v", i, err)
 				return
@@ -204,7 +219,7 @@ func runRep(c client.Client, rep, workflows, capSecs int) (float64, bool) {
 		wg.Add(1)
 		go func(run client.WorkflowRun) {
 			defer wg.Done()
-			var out string
+			var out okResult
 			if err := run.Get(waitCtx, &out); err == nil {
 				completed.Add(1)
 			}

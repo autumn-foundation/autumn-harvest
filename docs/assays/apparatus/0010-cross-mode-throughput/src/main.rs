@@ -84,8 +84,14 @@ const VISIBILITY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Lifetime of a dedupe marker.
 const DEDUPE_TTL: Duration = Duration::from_secs(600);
 
-/// A ~40-byte workflow input. The payload is inert.
-const INPUT_PAYLOAD: &str = "0123456789abcdef0123456789abcdef";
+/// The workflow input the canonical harness seeds.
+///
+/// `start_params` in the published harness seeds an empty object. The handler
+/// ignores its input. The input is still persisted in history, and it is
+/// re-read on every workflow-task replay, four times per run at this shape. A
+/// larger payload would therefore change the measured work even though
+/// nothing reads it. Found by review on PR #1617.
+const INPUT_JSON: &str = "{}";
 
 // ---------------------------------------------------------------------------
 // Environment knobs. Every default is the pre-registered value.
@@ -227,10 +233,13 @@ fn wf_three_activities(ctx: &WorkflowContext, _input: serde_json::Value) -> BoxF
 /// An inert activity body for the Postgres arms.
 ///
 /// It performs no input or output. The counter is the correctness ledger.
+/// The result is `{"ok": true}`, which is what the canonical `bench_activity`
+/// returns. Returning JSON null instead would store a different completion
+/// result on all three activities of every run. Found by review on PR #1617.
 fn act_inert(_ctx: &autumn_harvest::ActivityContext, _input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move {
         ACTIVITY_RUNS.fetch_add(1, Ordering::Relaxed);
-        Ok(serde_json::Value::Null)
+        Ok(serde_json::json!({ "ok": true }))
     })
 }
 
@@ -587,7 +596,7 @@ impl Pool {
 // ---------------------------------------------------------------------------
 
 fn workflow_input() -> serde_json::Value {
-    serde_json::json!({ "p": INPUT_PAYLOAD })
+    serde_json::from_str(INPUT_JSON).expect("the canonical input should parse")
 }
 
 async fn start_one(conn: &mut AsyncPgConnection, workflow_id: &str) -> bool {
