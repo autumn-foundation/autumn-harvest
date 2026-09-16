@@ -267,7 +267,18 @@ async fn drain_workflow_start_outbox_batch(
             };
             tokio::select! {
                 result = &mut dispatch_fut => break result,
-                () = tokio::time::sleep(remaining), if outbox_mark_flush_due(pending, elapsed) => {
+                // `select!` evaluates this guard once, when this loop
+                // iteration's call starts, not on every poll (issue #1620
+                // review, Codex, fourth round). Guarding on
+                // `outbox_mark_flush_due` -- true only once due -- would
+                // disable the timer branch for iterations where nothing
+                // is due YET. It could then never wake this select! to
+                // notice a deadline that arrives while still disabled.
+                // Guarding on `pending > 0` instead keeps the branch
+                // armed whenever there is anything to flush. `remaining`
+                // (0 if already due, otherwise time left) decides WHEN
+                // the timer fires.
+                () = tokio::time::sleep(remaining), if pending > 0 => {
                     delivered += flush_outbox_marks(
                         &mut app_conn,
                         &claimant,

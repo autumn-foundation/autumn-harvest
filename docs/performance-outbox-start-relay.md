@@ -287,11 +287,16 @@ is independently confirmed against the distinct top-statement listing.)
 | `total_calls` @ n=50 | 55 | 7 | **-87.3%** |
 | `total_buffers` @ n=50 | 1236 | 1078 | **-12.8%** |
 
-**`mark_calls` goes from `n` to the claim-round count at every swept
-size** -- the O(n) → O(1) statement-count shape, demonstrated at three
-input sizes. This alone clears the impact floor. **`mark_buffers` also
-drops 26.9%** at n=50, independently clearing the 20%-buffers floor for a
-statement that was 46.0% of the workload's buffers.
+**For the single end-of-batch-flush shape this table measured, `mark_calls`
+went from `n` to the claim-round count at every swept size** -- an O(n) →
+O(1) statement-count shape for THAT shape, demonstrated at three input
+sizes, which would have cleared the impact floor on its own. That shape
+is not what shipped; see the note below the table. **`mark_buffers` also
+dropped 26.9%** at n=50 for this same historical shape, independently
+clearing the 20%-buffers floor for a statement that was 46.0% of the
+workload's buffers. The buffer-reduction floor criterion is the one that
+still clears for the shipped, chunked shape -- see
+`after-sweep-chunked.txt`, not this table, for its numbers.
 
 Tool: `pg_stat_statements` (`calls`, `shared_blks_hit + shared_blks_read`),
 captured via `pg_stat_statements_reset(0, dbid, 0)` immediately before each
