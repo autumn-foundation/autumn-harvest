@@ -29,13 +29,17 @@ each row, dispatches the workflow start, then records the outcome.
   outcome (delivered, failed) per drain, instead of one call per row.
   `UNNEST` keeps the statement text fixed regardless of batch size, so this
   stays one prepared-statement shape.
-* **Mark-step statement count goes from `n` to exactly the number of claim
-  rounds** (1, except when `n` exceeds `batch_size` and `flush_workflow_start_outbox`
-  loops) -- the textbook O(n) → O(1) shape, demonstrated at three input
-  sizes (5, 20, 50). This alone clears the impact floor.
-* **The mark statement's own buffers also drop 26.9%** at n=50 (568 → 415),
-  independently clearing the "≥20% reduction in buffers for a statement
-  that is ≥5% of the workload" floor too.
+* **Mark-step statement count goes from `n` to `ceil(n / 8)` per claim
+  round** (`OUTBOX_MARK_FLUSH_EVERY`), not exactly one call per round --
+  see the Fix section's correction 3 for why a single end-of-batch flush
+  regressed claim-release latency and how chunking bounds it. Still the
+  textbook O(n) → O(n/k) shape for a fixed k=8, measured at three input
+  sizes: 1, 3, and 7 mark calls at n=5, 20, 50
+  ([`after-sweep-chunked.txt`](perf-artifacts/outbox-start-relay/after-sweep-chunked.txt)).
+  This alone clears the impact floor.
+* **The mark statement's own buffers also drop 28.2%** at n=50 (568 →
+  408), independently clearing the "≥20% reduction in buffers for a
+  statement that is ≥5% of the workload" floor too.
 * **No new index, no schema change, no migration.** No write-cost section
   beyond the statement-count/WAL numbers already reported.
 * **The exactly-once "outbox" admission-bypass gate (issue #618) is
@@ -120,7 +124,8 @@ for row in rows {
 
 ```rust
 // After: dispatch still runs per row (it cannot batch), but the outcomes
-// are collected and marked in one batched UPDATE per outcome, after the loop.
+// are collected and marked in chunked batched UPDATEs, one per outcome
+// per chunk, instead of once per row.
 for row in rows {
     match dispatch_workflow_start_request(state, &row.request()).await {
         Ok(exec_id) => delivered_marks.push((row.id, exec_id)),
@@ -129,20 +134,23 @@ for row in rows {
             failed_marks.push((row.id, error.to_string(), deadline));
         }
     }
+    if delivered_marks.len() + failed_marks.len() >= OUTBOX_MARK_FLUSH_EVERY {
+        delivered += flush_outbox_marks(&mut app_conn, &claimant, &mut delivered_marks, &mut failed_marks, outbox_metrics.as_ref()).await?;
+    }
 }
-let marked_ids = mark_outbox_rows_delivered_batch(&mut app_conn, &claimant, &delivered_marks).await?;
-// Bypass metrics recorded HERE, right after the delivered mark commits and
-// before the fallible failed mark below -- see Equivalence.
-mark_outbox_rows_failed_batch(&mut app_conn, &claimant, &failed_marks).await?;
+delivered += flush_outbox_marks(&mut app_conn, &claimant, &mut delivered_marks, &mut failed_marks, outbox_metrics.as_ref()).await?;
 ```
 
-`mark_outbox_rows_delivered_batch` and `mark_outbox_rows_failed_batch` bind
-one array per column and join via `FROM UNNEST($1::bigint[], $2::text[],
-...) AS v(id, ...)`, instead of a literal `VALUES (...), (...), ...` list
-whose text would grow a distinct shape per batch size.
+`mark_outbox_rows_delivered_batch` and `mark_outbox_rows_failed_batch`, both
+called from `flush_outbox_marks`, bind one array per column and join via
+`FROM UNNEST($1::bigint[], $2::text[], ...) AS v(id, ...)`, instead of a
+literal `VALUES (...), (...), ...` list whose text would grow a distinct
+shape per batch size.
 
-Two review-round corrections (Codex, on the PR) landed after the numbers
-above were captured, neither changing statement count or buffers:
+Three review-round corrections (Codex, on the PR) landed after the numbers
+above were captured. The first two do not change statement count or
+buffers; the third does, at batch sizes above `OUTBOX_MARK_FLUSH_EVERY` --
+see below.
 
 1. The admission-bypass metric is recorded right after the delivered
    batch mark commits, not after both marks have run. The two marks are
@@ -156,15 +164,33 @@ above were captured, neither changing statement count or buffers:
    that failed early in a batch whose later dispatches ran slowly would
    get a retry deadline skewed later by however long the rest of the
    batch took, instead of its own configured backoff.
+3. The marks flush every `OUTBOX_MARK_FLUSH_EVERY` (8) dispatch outcomes,
+   not only once after the whole batch has dispatched. Deferring every
+   mark to the end of the batch meant a row's claim -- unreachable by any
+   relay's reclaim, and for a failed row, unreachable for its own retry --
+   stayed held until the slowest dispatch in the *entire* batch finished,
+   not just its own. That regressed the pre-batching behavior, where each
+   row released immediately after its own dispatch. Chunking bounds the
+   wait to a handful of dispatches, at the cost of more mark-step calls
+   per claim round once a round exceeds 8 rows. The `baseline-sweep.txt`
+   / `after-sweep.txt` captures above predate this change and no longer
+   match the checked-out code at n=20 and n=50; re-measured post-chunking
+   numbers are in
+   [`after-sweep-chunked.txt`](perf-artifacts/outbox-start-relay/after-sweep-chunked.txt):
+   mark calls go from 1/1/2 (n=5/20/50, single end-of-batch flush) to
+   1/3/7 (chunked). n=5 is unaffected -- its one 5-row round never
+   reaches the 8-outcome threshold. Both floor criteria from the
+   single-flush measurement still clear at every swept size; see that
+   file for the recomputed deltas.
 
-Deferring the mark to after the whole batch has dispatched is safe under
-the same idempotency the relay already relies on. A crash between dispatch
-and the batched mark leaves the affected rows reclaimable past
+Flushing every chunk, rather than waiting for the whole batch, is safe
+under the same idempotency the relay already relies on. A crash between
+dispatch and a chunk's mark leaves that chunk's rows reclaimable past
 `claim_ttl_ms`. `dispatch_workflow_start_request`'s `start_or_load` path
 already returns the same existing execution on that retry -- its own doc
 comment already names this exact recovery path for a single failed mark.
-Batching only widens how many rows share that same recovery path on a
-crash mid-batch; it does not introduce a new failure mode.
+Batching only widens how many rows in one chunk share that same recovery
+path on a crash mid-chunk; it does not introduce a new failure mode.
 
 ## Plan
 
@@ -234,6 +260,13 @@ statement that was 46.0% of the workload's buffers.
 Tool: `pg_stat_statements` (`calls`, `shared_blks_hit + shared_blks_read`),
 captured via `pg_stat_statements_reset(0, dbid, 0)` immediately before each
 measured call.
+
+**This table predates the Fix section's correction 3** (chunked
+flushing, `OUTBOX_MARK_FLUSH_EVERY=8`) and no longer matches the
+checked-out code's `mark_calls` at n=20 and n=50 -- both floor criteria
+still clear post-chunking, but at different numbers. See
+[`after-sweep-chunked.txt`](perf-artifacts/outbox-start-relay/after-sweep-chunked.txt)
+for the re-measurement.
 
 ## Equivalence
 

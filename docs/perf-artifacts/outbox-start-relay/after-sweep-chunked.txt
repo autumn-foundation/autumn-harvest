@@ -1,0 +1,53 @@
+-- outbox start relay, pg_stat_statements sweep (AFTER CHUNKING: marks flush
+   every OUTBOX_MARK_FLUSH_EVERY=8 dispatch outcomes instead of once per
+   whole batch -- issue #1620 review, Codex) --
+   Captured with: HARVEST_TEST_DATABASE_URL set to a local Postgres 16 with
+   pg_stat_statements preloaded; cargo test -p autumn-harvest-plugin
+   --test outbox_start_relay_perf -- --ignored --nocapture
+   zz_capture_outbox_start_relay_perf_evidence
+
+n	delivered	claim_calls	mark_calls	mark_buffers	total_calls	total_buffers
+5	5	1	1	41	4	103
+20	20	1	3	167	6	396
+50	50	2	7	408	12	1073
+
+(mark_calls is now ceil(rows_in_round / 8) summed across claim rounds, not
+1 per round. n=5 stays at 1 call: the loop's single 5-row round never
+reaches the 8-outcome flush threshold, so only the post-loop flush runs.
+n=20's one 20-row round flushes at 8, 16, then the remaining 4: 3 calls.
+n=50 splits into a 32-row round (flushes at 8/16/24/32: 4 calls) and an
+18-row round (flushes at 8/16, then the remaining 2: 3 calls), 7 total.)
+
+-- n=50, top statements by calls --
+calls=   7 ( 58.3%)  buffers=  408 ( 38.0%)  UPDATE harvest_workflow_outbox AS outbox SET delivery_attempts = delivery_attempts + $4, last_error ...
+calls=   2 ( 16.7%)  buffers=  665 ( 62.0%)  WITH due AS ( SELECT id FROM harvest_workflow_outbox WHERE delivered_at IS NULL AND next_attempt_at ...
+calls=   1 (  8.3%)  buffers=    0 (  0.0%)  SELECT $1
+calls=   1 (  8.3%)  buffers=    0 (  0.0%)  SET CLIENT_ENCODING TO 'UTF8'
+calls=   1 (  8.3%)  buffers=    0 (  0.0%)  SET TIME ZONE 'UTC'
+
+-- delta vs after-sweep.txt (single end-of-batch flush) --
+n	mark_calls (single-flush -> chunked)	total_calls (single-flush -> chunked)
+5	1 -> 1   (unchanged, under the chunk size)	4 -> 4   (unchanged)
+20	1 -> 3   (+2 calls)	4 -> 6   (+2 calls)
+50	2 -> 7   (+5 calls)	7 -> 12  (+5 calls)
+
+-- delta vs baseline-sweep.txt (one mark per row, pre-#1620) --
+n	total_calls (before -> chunked)	total_buffers (before -> chunked)
+5	8 -> 4   (-50.0%)	117 -> 103  (-12.0%)
+20	23 -> 6   (-73.9%)	451 -> 396  (-12.2%)
+50	55 -> 12  (-78.2%)	1236 -> 1073 (-13.2%)
+
+mark statement alone, n=50: 50 calls -> 7 calls (-86.0%), 568 buffers ->
+408 buffers (-28.2%).
+
+Chunking trades some of the single-flush shape's round-trip reduction for a
+bound on claim-hold latency (see docs/performance-outbox-start-relay.md,
+"Fix", correction 3). Both floor criteria from the single-flush measurement
+still clear at every swept size:
+  - "Elimination of an N+1": mark-step statement count is O(n / 8), not
+    O(n) -- 7 instead of 50 at n=50, not the single-flush shape's O(claim
+    rounds), but still far below one call per row.
+  - "≥20% reduction in total buffers for a statement that is ≥5% of the
+    workload's buffers": the mark statement is still 58.3% of calls in the
+    chunked shape and drops 28.2% on its own buffer count (568 -> 408 at
+    n=50), clearing the 20% floor.
