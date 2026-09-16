@@ -194,6 +194,11 @@ diesel::table! {
         /// deletion; this column carries the fact separately so that
         /// protection stays intact.
         migrated_run_terminal_at -> Nullable<Timestamptz>,
+        /// The state a shard-rebalance staging vacate sealed over (issue
+        /// #1317 review). Non-NULL only while the migration that vacated
+        /// this row is still in flight. An abort restores `state` to this
+        /// value and clears it; a successful cutover just clears it.
+        staging_vacated_state -> Nullable<Text>,
     }
 }
 

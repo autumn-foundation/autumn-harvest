@@ -595,6 +595,85 @@ async fn staging_vacates_a_retained_terminal_prior_for_the_same_key_on_the_targe
         Some("CONTINUED_AS_NEW"),
         "the stale prior must be sealed off the active-uniqueness slot, not left COMPLETED"
     );
+
+    // A successful migration is the point of no return for the vacate
+    // (issue #1317 review, P1). Nothing will abort this migration again,
+    // so its restore marker must be dropped rather than carried forever.
+    let stale_marker: ScalarText = diesel::sql_query(
+        "SELECT staging_vacated_state AS value FROM harvest_workflow_executions WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(stale_id)
+    .get_result(&mut target)
+    .await
+    .expect("query the stale row's restore marker");
+    assert_eq!(
+        stale_marker.value, None,
+        "a successful migration must clear the restore marker, not leave it dangling"
+    );
+}
+
+/// Issue #1317 review, P1 (companion to the vacate test above): staging can
+/// succeed and still have the whole migration abort later, in verification
+/// or cutover. The vacated prior must come back exactly as it was -- not
+/// stay misreported as a continuation that never happened.
+#[tokio::test]
+async fn aborting_after_staging_restores_the_vacated_terminal_prior() {
+    let shards = setup_two_shards().await;
+
+    let mut target = shards.target().await;
+    let stale_id = Uuid::new_v4();
+    target
+        .batch_execute(&format!(
+            "INSERT INTO harvest_workflow_executions \
+               (id, workflow_name, workflow_id, run_id, shard_id, state, input, \
+                started_at, created_at, completed_at) \
+             VALUES \
+               ('{stale_id}', 'entity_flow', 'abort-restore-me', gen_random_uuid(), 1, \
+                'FAILED', '{{}}', now(), now(), now())"
+        ))
+        .await
+        .expect("seed the stale terminal prior on the target");
+
+    let exec_id = quiescent_fixture(&shards, "abort-restore-me").await;
+
+    let mut source = shards.source().await;
+    let mut target = shards.target().await;
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin migration");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("staging must vacate the stale prior and succeed");
+
+    // Staging succeeded; abort anyway, exactly as `migrate_execution` does
+    // when a LATER step (verification, cutover) fails.
+    abort_migration(&mut source, &mut target, exec_id, "forced for this test")
+        .await
+        .expect("abort");
+
+    let mut target = shards.target().await;
+    let restored: ScalarText =
+        diesel::sql_query("SELECT state AS value FROM harvest_workflow_executions WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(stale_id)
+            .get_result(&mut target)
+            .await
+            .expect("query the restored row's state");
+    assert_eq!(
+        restored.value.as_deref(),
+        Some("FAILED"),
+        "an abort must restore the vacated prior to its original state"
+    );
+    let marker: ScalarText = diesel::sql_query(
+        "SELECT staging_vacated_state AS value FROM harvest_workflow_executions WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(stale_id)
+    .get_result(&mut target)
+    .await
+    .expect("query the restored row's marker");
+    assert_eq!(
+        marker.value, None,
+        "the restore marker must be cleared once the row is restored"
+    );
 }
 
 /// Issue #1317 review, P1 (companion to the vacate test above). A same-key

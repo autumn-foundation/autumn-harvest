@@ -1193,6 +1193,16 @@ mod db {
         value: Option<String>,
     }
 
+    #[derive(diesel::QueryableByName)]
+    struct StagedKeyRow {
+        #[diesel(sql_type = Text)]
+        state: String,
+        #[diesel(sql_type = Text)]
+        workflow_name: String,
+        #[diesel(sql_type = Text)]
+        workflow_id: String,
+    }
+
     async fn read_json(
         conn: &mut AsyncPgConnection,
         sql: &str,
@@ -1344,7 +1354,17 @@ mod db {
             // Vacate it exactly like a fresh start replacing a terminal
             // prior does elsewhere (`replace_execution`): seal it
             // `CONTINUED_AS_NEW`. That drops it out of the partial index
-            // without touching this migration's own row.
+            // without touching this migration's own row or its completion
+            // timestamp.
+            //
+            // The seal must be reversible (issue #1317 review, P1).
+            // Staging can succeed while verification or cutover later
+            // aborts. The vacated row must then return to exactly the
+            // state it had, not stay misreported as a continuation that
+            // never happened. `staging_vacated_state` carries that prior
+            // state so `discard_staged_copy_restoring_seal` can restore it
+            // on abort. A successful `activate_target` just clears the
+            // marker, leaving the seal in place.
             //
             // A row that is genuinely live here (RUNNING, PAUSED,
             // MIGRATING, or an unreleased MIGRATED seal) is left untouched.
@@ -1373,10 +1393,11 @@ mod db {
             {
                 diesel::sql_query(
                     "UPDATE harvest_workflow_executions \
-                      SET state = 'CONTINUED_AS_NEW', completed_at = NOW() \
+                      SET state = 'CONTINUED_AS_NEW', staging_vacated_state = $2 \
                       WHERE id = $1",
                 )
                 .bind::<SqlUuid, _>(stale.id)
+                .bind::<Text, _>(&stale.state)
                 .execute(&mut *conn)
                 .await
                 .map_err(database_error)?;
@@ -1500,14 +1521,18 @@ mod db {
         // `MIGRATED` seal, untouched, is not a staged copy. `stage_copy` can
         // fail before its target transaction commits. Deleting the history
         // and the row below would then destroy a real, untouched seal.
-        let row: Option<TextRow> = diesel::sql_query(
-            "SELECT state AS value FROM harvest_workflow_executions WHERE id = $1",
+        let row: Option<StagedKeyRow> = diesel::sql_query(
+            "SELECT state, workflow_name, workflow_id FROM harvest_workflow_executions \
+              WHERE id = $1",
         )
         .bind::<SqlUuid, _>(exec_id.as_uuid())
         .get_result(&mut *conn)
         .await
         .optional_row()?;
-        if row.and_then(|r| r.value).as_deref() != Some("MIGRATING") {
+        let Some(row) = row else {
+            return Ok(());
+        };
+        if row.state != "MIGRATING" {
             return Ok(());
         }
 
@@ -1542,6 +1567,32 @@ mod db {
             .await
             .map_err(database_error)?;
         }
+
+        // Restore an unrelated same-key row `stage_copy` vacated to make
+        // room for this copy (issue #1317 review, P1). The vacate and this
+        // staged row's insert committed in the same transaction. So if the
+        // staged row existed, at most one other row can carry a pending
+        // marker for this business key, and it is this migration's.
+        //
+        // This runs LAST, after the staged row above is gone or sealed
+        // back to `MIGRATED`. Both states already free this business
+        // key's slot in the active-uniqueness index once. Restoring the
+        // vacated row any earlier would briefly hold two active rows for
+        // the same key at once. That fails against the very index this
+        // whole scheme exists to respect.
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions \
+              SET state = staging_vacated_state, staging_vacated_state = NULL \
+              WHERE workflow_name = $1 AND workflow_id = $2 AND id != $3 \
+                AND staging_vacated_state IS NOT NULL",
+        )
+        .bind::<Text, _>(&row.workflow_name)
+        .bind::<Text, _>(&row.workflow_id)
+        .bind::<SqlUuid, _>(exec_id.as_uuid())
+        .execute(&mut *conn)
+        .await
+        .map_err(database_error)?;
+
         Ok(())
     }
 
@@ -2478,6 +2529,29 @@ mod db {
                 )
                 .bind::<SqlUuid, _>(exec_id.as_uuid())
                 .bind::<Integer, _>(source_shard)
+                .execute(&mut *conn)
+                .await
+                .map_err(database_error)?;
+
+                // Staging can have vacated an unrelated same-key row to free
+                // the target's active-uniqueness slot for this copy (issue
+                // #1317 review, P1). Activation is the point of no return
+                // for that seal. Drop its restore marker rather than carry
+                // it forever: nothing will ever abort this migration again
+                // to need it. Idempotent, like the update above -- a
+                // repeat activation finds nothing left to clear.
+                diesel::sql_query(
+                    "UPDATE harvest_workflow_executions \
+                      SET staging_vacated_state = NULL \
+                      WHERE staging_vacated_state IS NOT NULL AND id != $1 \
+                        AND workflow_name = \
+                            (SELECT workflow_name FROM harvest_workflow_executions \
+                              WHERE id = $1) \
+                        AND workflow_id = \
+                            (SELECT workflow_id FROM harvest_workflow_executions \
+                              WHERE id = $1)",
+                )
+                .bind::<SqlUuid, _>(exec_id.as_uuid())
                 .execute(&mut *conn)
                 .await
                 .map_err(database_error)?;
