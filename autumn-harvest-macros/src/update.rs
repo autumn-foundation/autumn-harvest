@@ -134,7 +134,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
-    let input_type_hint = build_input_type_hint(&params);
+    let input_type_hint = crate::attr_util::arg_type_hint(&params);
     let output_type_hint = crate::extract_ok_type_hint(&func.sig.output);
 
     let dispatch = build_update_dispatch(fn_name, &param_names);
@@ -480,72 +480,6 @@ fn build_update_dispatch(fn_name: &syn::Ident, param_names: &[&syn::Ident]) -> T
                     ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
                 })
         }
-    }
-}
-
-fn build_input_type_hint(params: &[&syn::FnArg]) -> String {
-    if params.is_empty() {
-        return "()".to_string();
-    }
-    if params.len() == 1
-        && let syn::FnArg::Typed(pt) = params[0]
-    {
-        return crate::type_name_hint(&pt.ty);
-    }
-    let parts: Vec<_> = params
-        .iter()
-        .filter_map(|arg| {
-            if let syn::FnArg::Typed(pt) = arg {
-                Some(crate::type_name_hint(&pt.ty))
-            } else {
-                None
-            }
-        })
-        .collect();
-    format!("({})", parts.join(", "))
-}
-
-// Clone-class characterization tests (Echo). `build_input_type_hint` here and
-// in `query.rs` is byte-identical, and `signal.rs`'s `build_arg_type_hint`
-// is the same body under a different name. These tests pin this copy's
-// current behavior before it moves to a shared `attr_util::arg_type_hint`.
-#[cfg(test)]
-mod build_input_type_hint_pinned_tests {
-    use super::build_input_type_hint;
-
-    /// Parses a bare parameter list into owned `syn::FnArg` values, mirroring
-    /// how `update_macro` slices `func.sig.inputs` after skipping `ctx`.
-    fn params_from(sig: &str) -> Vec<syn::FnArg> {
-        let f: syn::ItemFn = syn::parse_str(&format!("fn f({sig}) {{}}")).unwrap();
-        f.sig.inputs.into_iter().collect()
-    }
-
-    #[test]
-    fn no_params_hints_unit() {
-        let owned = params_from("");
-        let refs: Vec<_> = owned.iter().collect();
-        assert_eq!(build_input_type_hint(&refs), "()");
-    }
-
-    #[test]
-    fn one_param_hints_the_bare_type_name() {
-        let owned = params_from("x: String");
-        let refs: Vec<_> = owned.iter().collect();
-        assert_eq!(build_input_type_hint(&refs), "String");
-    }
-
-    #[test]
-    fn one_generic_param_hints_the_inner_type_too() {
-        let owned = params_from("x: Option<String>");
-        let refs: Vec<_> = owned.iter().collect();
-        assert_eq!(build_input_type_hint(&refs), "Option<String>");
-    }
-
-    #[test]
-    fn multiple_params_hint_as_a_tuple() {
-        let owned = params_from("a: u32, b: bool");
-        let refs: Vec<_> = owned.iter().collect();
-        assert_eq!(build_input_type_hint(&refs), "(u32, bool)");
     }
 }
 
