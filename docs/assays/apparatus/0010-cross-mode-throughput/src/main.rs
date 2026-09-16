@@ -417,19 +417,26 @@ impl RedisProbe {
     }
 
     /// Delete only the keys under this run's own prefix. Never `FLUSHALL`.
-    async fn clear(&self) {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .expect("redis connection");
-        let keys: Vec<String> = conn
-            .keys(format!("{}*", self.prefix))
-            .await
-            .unwrap_or_default();
+    ///
+    /// Returns false when the cleanup could not be completed. The run prefix
+    /// is deterministic, so a rerun after an interrupted assay can meet stale
+    /// entries under it. Swallowing a `KEYS` or `DEL` error here would seed
+    /// and time a repetition against a contaminated prefix. An old entry can
+    /// then be consumed inside the measured window. The final residue still
+    /// reads clean. Found by review on PR #1617.
+    async fn clear(&self) -> bool {
+        let Ok(mut conn) = self.client.get_multiplexed_async_connection().await else {
+            return false;
+        };
+        let Ok(keys) = conn.keys::<_, Vec<String>>(format!("{}*", self.prefix)).await else {
+            return false;
+        };
         for key in keys {
-            let _: i64 = conn.del(&key).await.unwrap_or(0);
+            if conn.del::<_, i64>(&key).await.is_err() {
+                return false;
+            }
         }
+        true
     }
 
     /// Count stream entries, pending entries and dedupe markers after a drain.
@@ -532,12 +539,26 @@ impl Pool {
         Self { workers, handles }
     }
 
+    /// Stop every worker, and abort any that overruns the shutdown timeout.
+    ///
+    /// Dropping a timed-out `JoinHandle` detaches the task rather than
+    /// cancelling it. A detached worker keeps polling while the next
+    /// repetition drops and recreates the database. It can also still run an
+    /// activity body. That body would add to the counter this arm resets per
+    /// repetition. The canonical bench fleet keeps an abort handle for the
+    /// same reason. Found by review on PR #1617.
     async fn stop(self) {
         for worker in &self.workers {
             worker.shutdown();
         }
         for handle in self.handles {
-            let _ = tokio::time::timeout(Duration::from_secs(20), handle).await;
+            let abort = handle.abort_handle();
+            if tokio::time::timeout(Duration::from_secs(20), handle)
+                .await
+                .is_err()
+            {
+                abort.abort();
+            }
         }
     }
 }
@@ -689,7 +710,11 @@ async fn run_postgres_arm(settings: &Settings, arm: Arm, rep: usize) -> RepOutco
         .await
         .expect("redis dispatch should connect");
         let probe = RedisProbe::connect(&settings.redis_url, &prefix).await;
-        probe.clear().await;
+        assert!(
+            probe.clear().await,
+            "the redis prefix must be cleared before seeding; a contaminated \
+             prefix would be timed as if it were empty"
+        );
         autumn_harvest::dispatch::install(
             Arc::new(dispatch),
             DispatchSettings {
@@ -742,7 +767,7 @@ async fn run_postgres_arm(settings: &Settings, arm: Arm, rep: usize) -> RepOutco
     let (residue, probe_failed) = match &probe {
         Some(probe) => {
             let residue = probe.residue().await;
-            probe.clear().await;
+            let _ = probe.clear().await;
             (residue, residue.is_none())
         }
         None => (None, false),
