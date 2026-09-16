@@ -206,18 +206,18 @@ async fn drain_workflow_start_outbox_batch(
     // The retry deadline is captured as a monotonic `Instant`, not a
     // duration, right when each row's own dispatch fails (issue #1620
     // review). A later row's dispatch can still be running at that
-    // point. Computing the deadline here, rather than a fixed delay
-    // applied when the batched mark finally runs below, keeps this
-    // row's actual backoff close to `retry_delay_ms`, instead of that
-    // delay starting only once every other row in the batch has also
-    // finished dispatching.
+    // point. The batched mark below computes the deadline once every
+    // row has finished dispatching. Capturing it here instead keeps
+    // this row's actual backoff close to `retry_delay_ms`. Otherwise
+    // the delay would start only once the whole batch finishes.
     let mut failed_marks: Vec<(i64, String, std::time::Instant)> = Vec::new();
     for row in rows {
         match dispatch_workflow_start_request(state, &row.request()).await {
             Ok(exec_id) => delivered_marks.push((row.id, exec_id)),
             Err(error) => {
                 let delay_ms = retry_delay_ms(&config, &row);
-                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(delay_ms);
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(delay_ms);
                 failed_marks.push((row.id, error.to_string(), deadline));
             }
         }
@@ -574,8 +574,9 @@ async fn mark_outbox_rows_delivered_batch(
 /// `delivery_attempts`, so batching does not change the per-row backoff
 /// amount. `deadline` is a monotonic `Instant`, captured when that row's
 /// own dispatch failed, not when this function runs. Re-deriving the
-/// remaining delay from it here keeps a row's actual retry time close to
-/// its configured backoff, even when a later row's dispatch is slow.
+/// remaining delay from it here keeps a row's actual retry time close
+/// to its configured backoff. That holds even when a later row's
+/// dispatch is slow.
 async fn mark_outbox_rows_failed_batch(
     conn: &mut AsyncPgConnection,
     claimant: &str,
