@@ -1051,7 +1051,15 @@ async fn main() {
     // as assay #11 does with its own registered payload, is a different
     // workload. Printing an L1 verdict for it would grade one assay's run
     // against another assay's band. Found by review on PR #1622.
-    if settings.input_json != INPUT_JSON {
+    //
+    // The comparison is on the PARSED value, not the raw text. The knob takes
+    // JSON, so `{ }` and `{}` are the same workload and only one of them is
+    // the exact canonical spelling. A raw string test would suppress every
+    // verdict for a run that is in fact canonical. Found by review on
+    // PR #1622.
+    let canonical_input: serde_json::Value =
+        serde_json::from_str(INPUT_JSON).expect("the canonical input should parse");
+    if workflow_input(&settings) != canonical_input {
         println!(
             "* **Not graded.** `ASSAY10_INPUT_JSON` is `{}`, not the canonical `{INPUT_JSON}`. \
              L1 compares this arm against a published figure taken at the canonical input, so \
