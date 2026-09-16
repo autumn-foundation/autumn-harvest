@@ -49,16 +49,52 @@ alone). **0/15 carry the activity-timeout signature**, in either window.
 **This is not the rerun campaign issue #1558 asked for** — it is
 frequency-in-the-wild evidence over calendar time and a shifting set of
 branches, not N identical-commit reruns, and per this role's own Tier
-distinctions it does not by itself confirm the fix. But it is a genuine data
+distinctions it does not by itself confirm the fix. It is a genuine data
 point the prior reports didn't have: roughly nineteen and a half hours of
-real CI traffic post-fix, across ten unrelated branches' worth of failures,
-produced zero recurrences of a signature that had appeared 3 times in a
-comparable ~17-hour window one day earlier (the 09-14 report's census). No
-same-commit rerun was run this session — Docker is unavailable in this
-session's sandbox, and dispatching 20 real GitHub-hosted-runner executions of
-`test-db-linux` (11 shards) solely to rerun one test is the kind of ambient,
-suite-level spend this role's own charter asks to route through **Ask
-before** rather than do unilaterally.
+real CI traffic post-fix produced zero recurrences of a signature that had
+appeared 3 times in a comparable ~17-hour window one day earlier (the 09-14
+report's census). **Correction (post-review):** an earlier draft of this
+report described that traffic as spanning "ten unrelated branches' worth of
+failures" — false. The 10 post-merge failures came from only **5 distinct
+branches**: `claude/hopeful-pascal-tbijcf` alone accounts for half of them
+(5 of 10, all successive commits on one PR as it iterated through review),
+with `claude/gifted-mccarthy-25ztga` contributing 2 and three other branches
+contributing 1 each. That materially narrows the independence of this
+evidence — five branches iterating, one of them repeatedly, is a much
+smaller draw than ten unrelated ones — though it does not overlap with item
+1's headline claim itself, since none of those 10 failures (from any branch)
+carried the activity-timeout signature regardless of how the branches
+cluster. No same-commit rerun was run this session — Docker is unavailable
+in this session's sandbox, and dispatching 20 real GitHub-hosted-runner
+executions of `test-db-linux` (11 shards) solely to rerun one test is the
+kind of ambient, suite-level spend this role's own charter asks to route
+through **Ask before** rather than do unilaterally.
+
+**Correction (post-review) — the cancelled-run gap.** A Codex review on
+this PR correctly flagged that the headline "0/15" figure only covers the
+15 runs whose *overall* conclusion was `failure`, leaving the window's 55
+`cancelled` runs unaudited — and this role's own 09-06/09-11 reports
+already established that a cancelled run's overall conclusion can absorb a
+real job-level failure underneath it (4/10 and 15/54 hit rates in those
+samples). Job-logged a sample of 8 of the 19 post-merge cancelled runs at
+job level (`list_workflow_jobs`, `perPage=100`, checking every job's own
+`conclusion`, not just the run's):
+
+| Run | Branch | Hidden job failures | Signature |
+|---|---|---:|---|
+| `35072771791` | `claude/hopeful-pascal-tbijcf` | 9 (`Test DB (linux, shard 0/1/2/3/4/7/8/9/10)`) | `FAILED SUITES: ctx_info_tests, mixed_suspension_tests, quota_supersede_ordering_tests` (shard 1) — a missing-column defect (`harvest_workflow_executions.migrated_run_terminal_at` absent from the hand-maintained `INIT_SQL`/`LEGACY_INIT_SQL` test bundles), self-diagnosed and fixed by this same branch's very next commit (`36791bfff0`, visible in this session's own fresh `ci.yml` query) |
+| `35060658370` | `claude/hopeful-pascal-tbijcf` | 3 (`Test (windows/ubuntu/macos-latest)`) | `migration_hygiene::every_release_migration_is_in_the_upgrade_guide` — the identical missing-migration-row signature already counted as an explicit failure at run `35063499036` on the same branch 40 minutes later; a precursor occurrence of an already-counted defect, not a new one |
+| 6 others | mixed | 0 | clean cancellations (matrix jobs show `cancelled`, not `failure`) |
+
+**Neither hidden failure carries the activity-timeout signature**, and both
+trace to defects already accounted for elsewhere in this report or
+self-fixed on the same branch. But this is a sample, not a census: 11 of
+19 post-merge cancelled runs and all 36 pre-merge cancelled runs remain
+unaudited at job level. The headline "0/15" claim is therefore better
+stated as "0 occurrences among the runs actually inspected" (15 explicit
+failures plus this 8-run cancelled sample, 23 runs total) — directionally
+consistent with the fix holding, but not the exhaustive census an earlier
+draft of this report implied by calling the 100-run page complete.
 
 ### 2. `sqlite_feasibility_docs::derived_totals_agree_with_the_table_and_the_tree`'s panic message still shows the same number on both sides, and it blocked one branch three commits in a row this window
 
@@ -102,17 +138,35 @@ not actioned as a rate.
 
 ### 4. Remaining 11 failures: deterministic, own-branch defects
 
-`comment-hygiene.py` Tier B (1, `shard_rebalance.rs` sentence-length), a
-`cargo fmt` diff (`workflow_filter_integration.rs`/`shard_rebalance_db_tests.rs`),
-clippy `map_unwrap_or` / `doc_markdown` / `redundant_clone` / dead-code
-(4, all `autumn-harvest-verify` or `autumn-harvest-sqlite`), an E0433
-`diesel` compile error under a `#[cfg(feature = "db")]` gate (2 occurrences,
-both on branch `claude/bold-lovelace-agnczk`, same root cause both times —
-`partition.rs` using `diesel::` unconditionally while the re-export is
-feature-gated), and `corpus::seeded_corpus_is_clean_under_the_syntactic_layer`
-(1, `autumn-harvest-verify`'s determinism-analysis gate). Each traces to that
-commit's or branch's own diff; no suite-state interaction, no timing
-component, no order dependence.
+**Correction (post-review):** an earlier draft of this section named five
+signature buckets that summed to 9, not 11 — undercounting the `cargo fmt`
+diffs (only one was mentioned; there were three separate occurrences) and
+omitting `migration_hygiene` entirely. Corrected, with every one of the 11
+runs named:
+
+| Run | Signature |
+|---|---|
+| `34891219422` | clippy `redundant_clone` (`payload_codec.rs`) |
+| `34891509704` | clippy dead-code (`partition.rs`'s `DISABLE_RENAME_SUFFIX`) **and**, in a second failed job on the same run, `corpus::seeded_corpus_is_clean_under_the_syntactic_layer` |
+| `34924353340` | E0433 `diesel` compile error (2 failed jobs, same signature) |
+| `34925551916` | E0433 `diesel` compile error (2 failed jobs, same signature — same root cause as `34924353340`, same branch `claude/bold-lovelace-agnczk`) |
+| `34933650236` | `comment-hygiene.py` Tier B (`shard_rebalance.rs` sentence-length) |
+| `34986559913` | `cargo fmt` diff (`resolve_fixtures.rs`) |
+| `34988937190` | clippy `doc_markdown` (`analysis_fixtures.rs`) |
+| `35034267335` | `cargo fmt` diff (`shard_rebalance_db_tests.rs`, `workflow_rerun_integration.rs`) |
+| `35045856467` | `cargo fmt` diff (`shard_rebalance_db_tests.rs`, `autumn-harvest-cli/src/lib.rs`, `workflow_filter_integration.rs`) |
+| `35060937048` | clippy `map_unwrap_or` (`analyze_profile.rs`) |
+| `35063499036` | `migration_hygiene::every_release_migration_is_in_the_upgrade_guide` (missing inventory row) |
+
+By signature: comment-hygiene (1 run), `cargo fmt` (3 runs, not 1 as an
+earlier draft implied), clippy (4 runs: `redundant_clone`, dead-code,
+`doc_markdown`, `map_unwrap_or`), E0433 `diesel` (2 runs, one root cause),
+`corpus` determinism (0 additional runs — same run as the dead-code clippy
+finding), `migration_hygiene` (1 run, previously unmentioned). 1+3+4+2+0+1 =
+11 runs, matching the section heading. The two `diesel`/E0433 occurrences
+are the same commit-family defect counted once in the diagnosis below, not
+two independent findings. Each traces to that commit's or branch's own
+diff; no suite-state interaction, no timing component, no order dependence.
 
 ## 🔍 Diagnosis
 
@@ -137,6 +191,13 @@ mechanism recovered, not clustered.
 `diesel`/E0433 occurrences are the same commit-family defect counted once,
 not two independent findings.
 
+**Correction (post-review):** item 3's own text already states the actual
+`quota_enforcement_tests` panic was not recoverable from the available logs
+and that no mechanism was identified — so it is **classified**, not
+**root-caused**. An earlier draft's 🔧/📊 sections below said "15/15
+root-caused," which contradicts item 3's own finding; corrected to 14/15
+root-caused plus 1/15 classified as a single, unexplained occurrence.
+
 ## 🔧 Treatment
 
 None shipped. Nothing found clears the impact floor this round: no flaky test
@@ -159,6 +220,12 @@ Items carried forward, unchanged from the 09-08/09-14/09-15 reports:
 4. **`sqlite_feasibility_docs`'s self-contradicting panic message** (item 2)
    — now with a concrete cost (3 CI round-trips on one branch), still a
    one-line fix someone should pick up.
+5. **The remaining cancelled-run population** — 11 of 19 post-merge and all
+   36 pre-merge cancelled runs in this window are still unaudited at job
+   level. This role's own 09-06/09-11 reports already flagged that building
+   a scheduled harness for this (pulling every job's conclusion for every
+   completed run, cancelled or not) is the correct fix for the gap rather
+   than repeated manual sampling; still not built by any session.
 
 ## 📊 Measurement
 
@@ -170,10 +237,17 @@ Items carried forward, unchanged from the 09-08/09-14/09-15 reports:
 - **Item 2:** 3/3 occurrences on one branch confirmed identical panic text
   (`"**107 migrations**"` on both sides) via direct job-log inspection.
 - **Item 3:** 1/1, not a rate.
-- **Item 4:** 11/11 root-caused via job-log inspection; 0 suite-attributable
-  flakes among them.
-- **Combined:** 15/15 of this window's failures root-caused; 0/15 suite-level
-  flakes; 0/15 the previously-tracked activity-timeout signature.
+- **Item 4:** 11/11 root-caused via job-log inspection (see the corrected
+  run-to-signature table above); 0 suite-attributable flakes among them.
+- **Cancelled-run sample:** 8/19 post-merge cancelled runs job-logged; 2/8
+  hid a real job-level failure (9 shards on one run, 3 jobs on another);
+  0/2 hidden failures carry the activity-timeout signature; 11/19
+  post-merge and 36/36 pre-merge cancelled runs remain unaudited.
+- **Combined:** 14/15 of this window's explicit failures root-caused, 1/15
+  (`quota_enforcement_tests`) classified as a single occurrence with no
+  mechanism recovered; 0/15 suite-level flakes; 0/15 the previously-tracked
+  activity-timeout signature; 0/2 hidden cancelled-run failures carry it
+  either, in the 8-run sample actually inspected.
 
 ## 🔬 Reproduce
 
@@ -223,4 +297,18 @@ print('post-merge:', len(post), Counter(r['conclusion'] for r in post))
 # ToolSearch("actions cache usage github") this session -- neither tool
 # is present in the available GitHub MCP surface, unchanged from prior
 # reports.
+
+# Cancelled-run job-level audit (8 of 19 post-merge cancelled runs):
+# list_workflow_jobs(resource_id=<run_id>, perPage=100) for each of
+#   35080087437 35072771791 35070284413 35063265350 35062316533
+#   35062123078 35060658370 35040749722
+# then filter jobs whose own "conclusion" is "failure" (not the run's
+# overall conclusion). Found on 35072771791 (9 Test DB shards) and
+# 35060658370 (3 Test <os> jobs); the other 6 were clean cancellations.
+# get_job_logs(job_id=104728768074, return_content=true, tail_lines=80)
+#   and get_job_logs(job_id=104687245341, return_content=true,
+#   tail_lines=60) confirm the signatures in the table above. Neither
+# matches worker_fails_workflow_when_activity_start_to_close_timeout_elapses.
+# Remaining 11 post-merge and all 36 pre-merge cancelled runs: not audited
+# this session.
 ```
