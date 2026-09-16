@@ -87,9 +87,10 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 fn mir_dir() -> PathBuf {
-    std::env::var_os("ANALYZE_PROFILE_MIR_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("analyze-profile-mir"))
+    std::env::var_os("ANALYZE_PROFILE_MIR_DIR").map_or_else(
+        || std::env::temp_dir().join("analyze-profile-mir"),
+        PathBuf::from,
+    )
 }
 
 /// The exact real-crate shape `docs/rnd/determinism-static-analysis.md`'s
