@@ -118,26 +118,23 @@ would carry accuracy and staleness this project cannot vouch for. A comparison
 worth trusting re-runs both engines on the same hardware, which is why this
 suite ships in the repo — see [Reproducing](#reproducing).
 
-**One such comparison has now been run, and Harvest lost it.** Assay ledger
-[#11](assays/0011-harvest-vs-temporal-single-box.md) put Harvest and Temporal
-on one 4-core box, against the same PostgreSQL server, at this page's own
-3-activity workflow. Temporal sustained more throughput **at every backlog
-depth tested**: roughly **1.5x to 2x** against Harvest's best-configured mode,
-and up to **7.91x** against its default Postgres mode at a 2,000-row backlog
-(43.29 against 5.47 workflows/sec). It did so
-in the configuration that suits it least, with all four of its services
-co-resident on cores they shared with their own database.
+**One such comparison has now been run on this page's own workflow, and
+Harvest lost it.** It is reported in the assay ledger rather than here, and
+the engine is deliberately not named on this page: issue #1309's acceptance
+criterion is that no competitor figure appears on it, and
+`benchmarks_docs.rs` enforces that. See
+[the assay ledger](assays/README.md), entries 10 and 11, for the measured
+numbers, the pre-registration that fixed in advance what they may not be read
+to mean, and the depth diagnostic that separates a known claim-path defect
+from an architectural gap.
 
-Two things bound that result rather than soften it. It is one shape, one box,
-one version, and a Temporal configuration at documented defaults rather than
-tuned by someone who operates it — a tuned arm would widen the gap, not close
-it. And most of the *widening* part of the margin is one known, fixable defect
-rather than an architectural gap: the `#786`/`#1177` claim path, whose
-scan-and-sort makes Harvest's default mode fall 4.2x between a 500-row and a
-2,000-row backlog while Temporal shows no comparable collapse. Ledger
-[#10](assays/0010-cross-mode-throughput.md) measures the same collapse from the
-other side, and finds the Redis dispatch channel flat across that range because
-it routes around exactly that path.
+Two things about that result belong here, because they bear on this page's
+own numbers rather than on any other engine. The first is that the margin
+widened sharply with backlog depth, which is the `#786`/`#1177` claim path
+this page already cross-references: the Postgres arm fell 4.2x between a
+500-row and a 2,000-row backlog. The second is that the Redis dispatch
+channel did not fall at all over the same range, which is what an operator
+choosing between the two modes actually needs to know.
 
 ### Results by release
 
