@@ -13,31 +13,32 @@
 //! # Workload
 //!
 //! The realistic workload this crate's own CI gate names is `harvest-verify
-//! -p autumn-harvest --all-examples` (`.github/workflows/ci.yml`'s
+//! -p autumn-harvest --all-examples`. See `.github/workflows/ci.yml`'s
 //! `harvest-verify` job, documented at
-//! `docs/rnd/determinism-static-analysis.md`'s "Row 6": 43 example targets, 57
-//! `#[workflow]` functions, a warm-cache gate measured at 16.9s wall clock).
-//! This harness reproduces exactly that shape rather than a synthetic MIR
-//! fixture invented to flatter a particular change.
+//! `docs/rnd/determinism-static-analysis.md`'s "Row 6": 43 example targets,
+//! 57 `#[workflow]` functions, a warm-cache gate measured at 16.9s wall
+//! clock. This harness reproduces exactly that shape rather than a
+//! synthetic MIR fixture invented to flatter a particular change.
 //!
-//! `pipeline::run` (via the public `verify` entry point) does two things that
-//! must not be conflated: it asks cargo to build the target and emit MIR (a
-//! `rustc` subprocess -- real work, but not this crate's own code, and wildly
-//! non-deterministic under callgrind since it depends on the installed
-//! toolchain and cargo's own cache state), and then it parses/resolves/
-//! analyzes that MIR (this crate's entire reason to exist). Only the second
-//! half is admissible evidence for a change to *this* crate.
+//! `pipeline::run` (via the public `verify` entry point) does two things
+//! that must not be conflated. First, it asks cargo to build the target and
+//! emit MIR: a `rustc` subprocess, real work, but not this crate's own
+//! code. That step is wildly non-deterministic under callgrind, since it
+//! depends on the installed toolchain and cargo's own cache state. Second,
+//! it parses, resolves and analyzes that MIR -- this crate's entire reason
+//! to exist. Only the second half is admissible evidence for a change to
+//! *this* crate.
 //!
 //! # Two-phase mode (`prepare` / `run`)
 //!
 //! `ANALYZE_PROFILE_MODE=prepare` runs the cargo/rustc emission step once,
 //! unprofiled, and leaves the `.mir` files on disk under
 //! `ANALYZE_PROFILE_MIR_DIR`. `ANALYZE_PROFILE_MODE=run` then skips cargo
-//! entirely -- `Options.mir_paths` points `verify` at the pre-emitted
+//! entirely: `Options.mir_paths` points `verify` at the pre-emitted
 //! directory, so `pipeline::run` takes the `--mir`-only branch and never
-//! spawns cargo -- and calls `verify` `ANALYZE_PROFILE_REPS` times, mirroring
-//! how a long-lived CI runner or a developer re-running the gate after a small
-//! source edit re-analyzes a fixed MIR shape repeatedly.
+//! spawns cargo. It then calls `verify` `ANALYZE_PROFILE_REPS` times,
+//! mirroring a long-lived CI runner re-analyzing a fixed MIR shape
+//! repeatedly across separate gate runs.
 //!
 //! ```text
 //! export ANALYZE_PROFILE_MIR_DIR=/tmp/analyze-profile-mir
@@ -57,13 +58,13 @@
 //! valgrind --tool=dhat --dhat-out-file=dhat.json env ANALYZE_PROFILE_MODE=run "$BIN"
 //! ```
 //!
-//! `ANALYZE_PROFILE_MODE` (default `full`, when unset) selects the mode:
-//! `prepare` (emit MIR only), `run` (analyze a pre-populated
-//! `ANALYZE_PROFILE_MIR_DIR` only, no cargo invocation -- both modes require
-//! `ANALYZE_PROFILE_MIR_DIR` to be set to the same path), or the default
-//! `full` (emit + analyze once, in one process -- a convenience smoke-test
-//! mode, NOT the mode to point a profiler at). Any other value panics rather
-//! than silently falling back to `full`.
+//! `ANALYZE_PROFILE_MODE` (default `full`, when unset) selects the mode.
+//! `prepare` emits MIR only. `run` analyzes a pre-populated
+//! `ANALYZE_PROFILE_MIR_DIR` only, with no cargo invocation. The default,
+//! `full`, emits and analyzes once, in one process. Both `prepare` and
+//! `run` require `ANALYZE_PROFILE_MIR_DIR` to name the same path. `full` is
+//! a convenience smoke-test mode, not the mode to point a profiler at. Any
+//! other value panics rather than silently falling back to `full`.
 //!
 //! `ANALYZE_PROFILE_REPS` (default `20`) sets how many times the fixed,
 //! pre-emitted MIR is analyzed in `run` mode.
