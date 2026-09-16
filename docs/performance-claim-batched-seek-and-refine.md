@@ -21,11 +21,11 @@ scan at this backlog depth -- both plan as a full `Seq Scan` feeding a
 At the 256-key hot-contention scenario (same backlog, 2,000 `RUNNING` rows
 spread across the same keys), the batch candidate fetch costs slightly
 FEWER buffers than the single-row scan (10,077 against 10,410) and far
-less wall-clock: 26.2ms against 122.6ms in an isolated
+less wall-clock: 23.4ms against 154.3ms in an isolated
 `EXPLAIN (ANALYZE, BUFFERS)`. A real end-to-end drive of the compiled
 `claim_task` and `claim_task_batched` functions against the same fixture
-shows the same direction, at a similar margin: mean 850.7ms per batched
-claim against 1,717.3ms per single-row claim (2.02x), over 400 real
+shows the same direction, at a similar margin: mean 828.2ms per batched
+claim against 1,677.6ms per single-row claim (2.03x), over 400 real
 claims each.
 
 The mechanism: the single-row path always evaluates
@@ -41,13 +41,25 @@ open.** Both queries plan as a full scan at this fixture depth; the win
 measured here is the concurrency-key aggregate's cost, not a `LIMIT`
 pushdown. See [What this does not establish](#what-this-does-not-establish).
 
-These numbers are measured AFTER a review finding on this PR: the first
-draft's per-candidate walk debited a rate-limit token for every candidate
-tried, including one the concurrency gate always rejected. An adversarial
-batch sharing a saturated `concurrency_key` and a `rate_limit_key` could
-have leaked far more than the single-row path's documented one-token
-bound. `queue::claim_batched_candidate_concurrency_probe_query` closes
-that gap with a cheap, read-only concurrency check that runs first, adding
+These numbers are measured AFTER every review finding on this PR,
+regenerated from the final SQL rather than an earlier draft (review
+finding: the first regeneration predated the deadline-recheck and
+`now_ts` fixes below, so it measured code the page no longer describes).
+`claim_batched_candidate_attempt_query()` now carries a `now_ts` CTE and
+`schedule_to_close_at` deadline checks on every successful claim; this
+fixture sets no `rate_limit_key` and no deadline, so `now_ts`'s forced
+bucket lock never runs and both deadline checks are no-ops, but the
+extra CTE and predicate text are present in the measured query either
+way. The direction and magnitude are unchanged from the prior capture,
+since none of those fixes touch the concurrency-gate path this fixture
+exercises.
+
+The first draft's per-candidate walk debited a rate-limit token for
+every candidate tried, including one the concurrency gate always
+rejected. An adversarial batch sharing a saturated `concurrency_key` and
+a `rate_limit_key` could have leaked far more than the single-row path's
+documented one-token bound. `queue::claim_batched_candidate_concurrency_probe_query`
+closes that gap with a cheap, read-only concurrency check that runs first, adding
 one small round trip for a concurrency-keyed candidate that passes it. The
 numbers above already include that extra round trip.
 
