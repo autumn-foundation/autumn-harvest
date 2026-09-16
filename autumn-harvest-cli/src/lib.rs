@@ -10157,7 +10157,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             let after = after_migrated_at
                 .zip(*after_execution_id)
                 .map(|(at, id)| (at, autumn_harvest::types::ExecutionId::from_uuid(id)));
-            let (reconciled, next_cursor) =
+            let (reconciled, failures, next_cursor) =
                 autumn_harvest::shard_rebalance::reconcile_migrated_seals_after(
                     &pool,
                     ShardId::new(*from),
@@ -10172,6 +10172,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "reconciled": reconciled,
+                        "failures": failures,
                         "next_scan_cursor": next_cursor.map(|(at, id)| serde_json::json!({
                             "migrated_at": at.to_rfc3339(),
                             "execution_id": id.as_uuid(),
@@ -10181,6 +10182,9 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
                 );
             } else {
                 println!("reconciled {reconciled} seal(s) on shard {from}");
+                for failure in &failures {
+                    println!("  failed    {}  ({})", failure.execution_id, failure.reason);
+                }
                 if let Some((at, id)) = next_cursor {
                     println!(
                         "more may remain past this window; resume with:\n  \

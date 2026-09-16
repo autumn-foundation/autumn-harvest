@@ -629,8 +629,8 @@ pub fn raw_history_fingerprint(raw: &serde_json::Value) -> String {
 #[cfg(feature = "db")]
 pub use db::{
     MigrationBatchReport, MigrationOutcome, MigrationRecord, MigrationScanCursor,
-    ShardMigrationCandidate, abort_migration, activate_target, assert_schema_parity,
-    begin_migration, commit_cutover, conn_for_execution_forwarded,
+    SealReconciliationFailure, ShardMigrationCandidate, abort_migration, activate_target,
+    assert_schema_parity, begin_migration, commit_cutover, conn_for_execution_forwarded,
     conn_for_execution_forwarded_with_shard, conn_for_live_shard, conn_for_shard,
     forward_of_held_row, list_migration_candidates, load_migration, migrate_execution,
     migrate_quiescent_executions, migrate_quiescent_executions_after, observe_quiescence,
@@ -1713,6 +1713,21 @@ mod db {
         migrated_at: DateTime<Utc>,
     }
 
+    /// A seal a reconciliation sweep could not resolve (issue #1317 review).
+    ///
+    /// Distinct from a seal that simply is not yet terminal: this is a
+    /// database or unreachable-target error. It is the same class
+    /// `resume_incomplete_migrations` already reports per-record rather
+    /// than losing. An operator advancing `next_scan_cursor` alone would
+    /// otherwise never revisit this seal once the cursor moves past it.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct SealReconciliationFailure {
+        /// The seal that could not be resolved.
+        pub execution_id: ExecutionId,
+        /// What went wrong, in operator-readable words.
+        pub reason: String,
+    }
+
     /// Sweep `shard` for `MIGRATED` seals whose live copy may have finished,
     /// and reconcile each one (issue #1317).
     ///
@@ -1720,7 +1735,9 @@ mod db {
     /// `resume_incomplete_migrations` already learned: a per-row failure is
     /// recorded and the sweep continues.
     ///
-    /// Returns the number of seals newly marked observed-terminal.
+    /// Returns the number of seals newly marked observed-terminal. Per-seal
+    /// failures are discarded here; call [`reconcile_migrated_seals_after`]
+    /// directly to see them.
     ///
     /// # Errors
     ///
@@ -1732,22 +1749,23 @@ mod db {
     ) -> HarvestResult<usize> {
         reconcile_migrated_seals_after(pool, shard, limit, None)
             .await
-            .map(|(reconciled, _)| reconciled)
+            .map(|(reconciled, _, _)| reconciled)
     }
 
-    /// [`reconcile_migrated_seals`], resuming the scan past `after` (issue
-    /// #1317 review).
+    /// [`reconcile_migrated_seals`], resuming the scan past `after` and
+    /// reporting per-seal failures (issue #1317 review).
     ///
-    /// Without this, a shard whose oldest `limit` seals are still live, or
-    /// point to an unreachable target, fills the whole window on every
-    /// call. Later seals whose live copies already finished are never
-    /// reached -- the same permanently-blocked-prefix problem
+    /// Without the cursor, a shard whose oldest `limit` seals are still
+    /// live, or point to an unreachable target, fills the whole window on
+    /// every call. Later seals whose live copies already finished are
+    /// never reached -- the same permanently-blocked-prefix problem
     /// [`migrate_quiescent_executions_after`] exists to fix for migration
     /// candidates.
     ///
-    /// Returns the number newly marked observed-terminal. Also returns a
-    /// cursor to pass as `after` on the next call when the window was full
-    /// (there may be more).
+    /// Returns the number newly marked observed-terminal. Returns the
+    /// seals a database or unreachable-target error left unresolved.
+    /// Returns a cursor to pass as `after` on the next call when the
+    /// window was full (there may be more).
     ///
     /// # Errors
     ///
@@ -1757,7 +1775,11 @@ mod db {
         shard: ShardId,
         limit: i64,
         after: Option<MigrationScanCursor>,
-    ) -> HarvestResult<(usize, Option<MigrationScanCursor>)> {
+    ) -> HarvestResult<(
+        usize,
+        Vec<SealReconciliationFailure>,
+        Option<MigrationScanCursor>,
+    )> {
         let mut source = checkout(pool, shard).await?;
         let (cursor_at, cursor_id): (Option<DateTime<Utc>>, Option<Uuid>) = match after {
             Some((at, id)) => (Some(at), Some(id.as_uuid())),
@@ -1787,21 +1809,26 @@ mod db {
             .flatten();
 
         let mut reconciled = 0usize;
+        let mut failures = Vec::new();
         for row in rows {
             let exec_id = ExecutionId::from_uuid(row.id);
-            // `Ok(false)`: not yet terminal, try again next sweep. `Err`: a
-            // single unreachable target names a database problem, not this
-            // seal's. Skip it and let the next sweep retry (issue #1317).
-            // This mirrors `resume_incomplete_migrations`'s per-record
-            // handling. Both are a silent no-op here, same as each other.
-            if matches!(
-                reconcile_migrated_seal_terminality(&mut source, pool, exec_id).await,
-                Ok(true)
-            ) {
-                reconciled += 1;
+            // `Ok(false)`: not yet terminal, try again next sweep, a silent
+            // no-op. `Err`: a single unreachable target names a database
+            // problem, not this seal's (issue #1317). It must not stop the
+            // sweep -- the same lesson `resume_incomplete_migrations`
+            // learned. Reporting it is what lets an operator notice and
+            // retry, rather than trusting a cursor that has already moved
+            // past it.
+            match reconcile_migrated_seal_terminality(&mut source, pool, exec_id).await {
+                Ok(true) => reconciled += 1,
+                Ok(false) => {}
+                Err(e) => failures.push(SealReconciliationFailure {
+                    execution_id: exec_id,
+                    reason: e.to_string(),
+                }),
             }
         }
-        Ok((reconciled, next_cursor))
+        Ok((reconciled, failures, next_cursor))
     }
 
     // ── Phase 2: replay verification ─────────────────────────────────────────
@@ -3646,6 +3673,17 @@ mod db {
         // where the pool map and the router legitimately disagree) is
         // unchanged.
         let origin = pool.routed_shard_for_execution(exec_id);
+        // `pool_for` (issue #1317 review) silently substitutes the default
+        // shard's pool when `origin` has none configured. The returned
+        // shard must name the pool the connection actually comes from, not
+        // `origin`. Otherwise a caller attributing this connection to a
+        // shard (an audit log, say) mislabels every row it writes during
+        // the fallback.
+        let checkout_shard = if pool.exact_pool_for(origin).is_some() {
+            origin
+        } else {
+            pool.default_shard()
+        };
         let mut conn = pool.pool_for_execution(exec_id).get().await.map_err(|e| {
             HarvestError::ShardUnavailable {
                 shard_id: origin.as_i32(),
@@ -3654,10 +3692,10 @@ mod db {
         })?;
 
         if pool.len() <= 1 {
-            return Ok((conn, origin));
+            return Ok((conn, checkout_shard));
         }
 
-        let mut current = origin;
+        let mut current = checkout_shard;
         for _ in 0..MAX_FORWARD_HOPS {
             let Some(next) = read_forward(&mut conn, exec_id).await? else {
                 return Ok((conn, current));
@@ -3665,7 +3703,7 @@ mod db {
             current = next;
             conn = checkout(pool, current).await?;
         }
-        resolve_forward_chain(origin, |_| Some(current)).map(|_| (conn, current))
+        resolve_forward_chain(checkout_shard, |_| Some(current)).map(|_| (conn, current))
     }
 
     #[derive(diesel::QueryableByName)]

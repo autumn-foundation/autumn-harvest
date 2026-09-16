@@ -48,8 +48,8 @@ use autumn_harvest::shard_rebalance::{
     assess_quiescence, begin_migration, commit_cutover, conn_for_execution_forwarded_with_shard,
     history_fingerprint, list_migration_candidates, load_migration, migrate_execution,
     migrate_quiescent_executions, migrate_quiescent_executions_after, observe_quiescence,
-    reconcile_migrated_seal_terminality, residence_chain, resolve_execution_shard,
-    resume_incomplete_migrations, stage_copy, verify_target_copy,
+    reconcile_migrated_seal_terminality, reconcile_migrated_seals_after, residence_chain,
+    resolve_execution_shard, resume_incomplete_migrations, stage_copy, verify_target_copy,
 };
 use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
@@ -2392,6 +2392,41 @@ async fn a_seal_whose_live_copy_never_finished_is_not_reconciled() {
 }
 
 #[tokio::test]
+async fn a_sweep_reports_a_seal_whose_target_is_unreachable_as_a_failure_not_a_silent_skip() {
+    // Issue #1317 review: `Err` (a database or unreachable-target problem)
+    // used to be treated exactly like `Ok(false)` (not yet terminal) --
+    // both a silent no-op. An operator following `next_scan_cursor` alone
+    // would then never revisit this seal once the cursor moves past it.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "unreachable-target").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    // A pool that only knows about the source: the seal's forwarding
+    // pointer names TARGET, which this pool has no entry for at all.
+    let source_only_pool = ShardedDbPool::from_map(
+        std::collections::BTreeMap::from([(SOURCE, build_pool(&shards.source_url))]),
+        SOURCE,
+    );
+
+    let (reconciled, failures, _next_cursor) =
+        reconcile_migrated_seals_after(&source_only_pool, SOURCE, 10, None)
+            .await
+            .expect("the candidate scan itself must still succeed");
+    assert_eq!(
+        reconciled, 0,
+        "the unreachable seal must not count as reconciled"
+    );
+    assert_eq!(
+        failures.len(),
+        1,
+        "the failure must be reported, not dropped"
+    );
+    assert_eq!(failures[0].execution_id, exec_id);
+}
+
+#[tokio::test]
 async fn a_terminate_if_running_start_creates_a_fresh_run_once_the_migrated_prior_finishes() {
     // Before issue #1317's fix, `MIGRATED` was an active conflict FOREVER.
     // Nothing ever noticed the live copy had finished. So this same start
@@ -3058,6 +3093,50 @@ async fn single_pool_resolves_an_execution_whose_id_encodes_another_shard() {
         chain,
         vec![foreign],
         "a run that never migrated has a one-shard residence chain"
+    );
+}
+
+#[tokio::test]
+async fn conn_for_execution_forwarded_with_shard_reports_the_actual_fallback_shard() {
+    // Issue #1317 review: `pool_for` silently substitutes the default
+    // shard's pool when the id's encoded origin has no configured pool.
+    // That gap can be a mid-rollout config, or -- as here -- a genuinely
+    // single-pool deployment. The returned shard must name the pool the
+    // connection actually comes from. A caller attributing this
+    // connection to a shard (an audit log, say) would otherwise mislabel
+    // every row it writes during the fallback.
+    let (url, _guard) = setup_isolated_db().await;
+    let pool = ShardedDbPool::single(build_pool(&url));
+
+    // The only pool is at ShardId(0); this id says it belongs to shard 7.
+    let foreign = ShardId::new(7);
+    let exec_id = {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+            .await
+            .expect("connect");
+        insert_execution_with_id(
+            &mut conn,
+            "entity",
+            "with-shard-foreign-id",
+            ExecutionId::new_for_shard(foreign),
+            SOURCE,
+        )
+        .await
+    };
+
+    let (mut conn, shard) = conn_for_execution_forwarded_with_shard(&pool, exec_id)
+        .await
+        .expect("the single configured pool must answer");
+    assert_eq!(
+        shard,
+        pool.default_shard(),
+        "the connection actually came from the default shard's pool, not \
+         the id's unconfigured origin"
+    );
+    assert_eq!(
+        autumn_harvest::shard_rebalance::shard_of_held_row(&mut conn, exec_id).await,
+        Some(pool.default_shard()),
+        "the returned connection must be checked out from the shard just reported"
     );
 }
 
