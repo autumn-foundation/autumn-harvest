@@ -2478,7 +2478,7 @@ async fn awaits_outbox_does_not_wait_on_a_peer_shard_whose_only_connection_is_bu
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn cancel_outbox_deferred_check_does_not_wait_on_a_peer_shard_whose_only_connection_is_busy()
- {
+{
     let _guard = TEST_MUTEX.lock().await;
     let shards = TwoShards::start().await;
     let router = two_shard_router();
@@ -2506,7 +2506,13 @@ async fn cancel_outbox_deferred_check_does_not_wait_on_a_peer_shard_whose_only_c
     let caller = ExecutionId::new_for_shard(ShardId::new(0));
     {
         let mut seed = shards.conn(ShardId::new(0)).await;
-        insert_running_row(&mut seed, "cancel_target_1323", "cancel-target-1323", target).await;
+        insert_running_row(
+            &mut seed,
+            "cancel_target_1323",
+            "cancel-target-1323",
+            target,
+        )
+        .await;
         store::append_events(
             &mut seed,
             target,
