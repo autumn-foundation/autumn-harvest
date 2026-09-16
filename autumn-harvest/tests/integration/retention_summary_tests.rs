@@ -1090,6 +1090,67 @@ async fn legal_held_execution_is_not_summarized_until_released() {
     assert_eq!(count_summaries(&mut conn).await, 1, "now summarized");
 }
 
+// Issue #1317 review, P1 follow-up. `stage_copy` can seal a row
+// `CONTINUED_AS_NEW` mid-flight to vacate its business key. That row then
+// carries a non-NULL `staging_vacated_state`, the real prior state a
+// migration abort restores. Retention must not delete it out from under
+// an in-flight migration. The abort path could never restore it, and any
+// summary would record the transient `CONTINUED_AS_NEW` instead of the
+// run's real outcome.
+#[tokio::test]
+async fn staging_vacated_row_is_not_summarized_until_the_marker_clears() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let old = Utc::now() - chrono::Duration::days(2);
+    let exec_id = insert_completed(&mut conn, "staged_wf", "s1", old).await;
+    // Seal it exactly as `stage_copy`'s vacate does: CONTINUED_AS_NEW with
+    // the real prior state carried in `staging_vacated_state`.
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions
+         SET state = 'CONTINUED_AS_NEW', staging_vacated_state = 'COMPLETED'
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(&mut conn)
+    .await
+    .expect("seal as an in-flight staging vacate");
+
+    let config = history_only(Some(Duration::from_secs(86_400)))
+        .with_summary_retention(SummaryPolicy::for_days(30));
+    let metrics = Arc::new(CapturingMetrics::default());
+    run_one_tick(pool.clone(), config.clone(), Arc::clone(&metrics)).await;
+
+    assert_eq!(
+        count_executions(&mut conn).await,
+        1,
+        "staging-vacated row not deleted"
+    );
+    assert_eq!(
+        count_summaries(&mut conn).await,
+        0,
+        "staging-vacated row not summarized"
+    );
+
+    // The migration settles (success or abort both clear the marker), tick
+    // again.
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET staging_vacated_state = NULL WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(&mut conn)
+    .await
+    .expect("clear the marker");
+
+    let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
+    assert_eq!(result.deleted_count, 1);
+    assert_eq!(result.summarized_count, 1);
+    assert_eq!(count_executions(&mut conn).await, 0, "now deleted");
+    assert_eq!(count_summaries(&mut conn).await, 1, "now summarized");
+}
+
 // AC6 (child-summary erase cascade, issue #752 review): a TERMINAL child is
 // independently retention-eligible, so it is demoted into a summary (with its
 // PII captured) and its execution row deleted BEFORE the parent is erased.

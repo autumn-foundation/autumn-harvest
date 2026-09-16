@@ -2654,6 +2654,23 @@ async fn run_shard_tick(
                     .await?;
                     continue;
                 }
+                Ok(CandidateDeleteOutcome::SkippedStaging) => {
+                    // A shard-rebalance staging vacate landed after selection
+                    // (issue #1317 review, P1): the delete-tx FOR UPDATE
+                    // re-check found `staging_vacated_state` set and aborted
+                    // the delete. Treat exactly like a routine skip, for the
+                    // same reason as `SkippedHeld` above.
+                    routine_skip_candidate(
+                        &mut conn,
+                        candidate.id,
+                        candidate_cursor,
+                        has_failed,
+                        &mut outcome,
+                        &guard.active_ids,
+                    )
+                    .await?;
+                    continue;
+                }
                 Ok(CandidateDeleteOutcome::Deleted { summarized }) => {
                     // A summary row was written in the delete tx (issue #752).
                     if summarized {
@@ -2735,6 +2752,11 @@ enum CandidateDeleteOutcome {
     /// execution row, no summary). The caller treats this exactly like a
     /// routine skip.
     SkippedHeld,
+    /// A shard-rebalance staging vacate was found in flight under the
+    /// delete-tx row lock (`staging_vacated_state` set). The delete was
+    /// aborted and NOTHING was touched, for the same reason as
+    /// [`Self::SkippedHeld`] (issue #1317 review, P1).
+    SkippedStaging,
 }
 
 /// The two legal-hold timestamp columns `(legal_hold_set_at, legal_hold_until)`.
@@ -2837,6 +2859,7 @@ async fn delete_candidate_execution(
                 harvest_workflow_executions::search_attrs,
                 harvest_workflow_executions::parent_id,
                 harvest_workflow_executions::migrated_from_shards,
+                harvest_workflow_executions::staging_vacated_state,
             ))
             .for_update()
             .first::<SummarySourceRow>(conn)
@@ -2861,10 +2884,26 @@ async fn delete_candidate_execution(
             search_attrs,
             parent_id,
             migrated_from_shards,
+            staging_vacated_state,
         )) = row
         {
             if legal_hold_active(set_at, until, now) {
                 return Ok(CandidateDeleteOutcome::SkippedHeld);
+            }
+            // A shard-rebalance staging vacate re-check under the SAME row
+            // lock (issue #1317 review, P1). `stage_copy` can seal this row
+            // `CONTINUED_AS_NEW` mid-flight to free its business key for a
+            // copy being staged elsewhere. It records the row's real prior
+            // state in `staging_vacated_state`, so an abort can restore it.
+            // The candidate SELECT that chose this row for deletion ran
+            // before that vacate, released its lock, and never saw it. If
+            // the delete proceeded here, the row would vanish before
+            // `discard_staged_copy_restoring_seal` could restore it on
+            // abort. Any summary would record the transient
+            // `CONTINUED_AS_NEW` instead of the run's real outcome.
+            // Abort exactly like an active legal hold: touch nothing.
+            if staging_vacated_state.is_some() {
+                return Ok(CandidateDeleteOutcome::SkippedStaging);
             }
             let was_ever_migrated_here = migrated_from_shards
                 .as_ref()
@@ -3060,6 +3099,7 @@ type SummarySourceRow = (
     Option<serde_json::Value>, // search_attrs
     Option<uuid::Uuid>,        // parent_id
     Option<serde_json::Value>, // migrated_from_shards
+    Option<String>,            // staging_vacated_state
 );
 
 /// Garbage-collect execution summaries older than the summary horizon (issue

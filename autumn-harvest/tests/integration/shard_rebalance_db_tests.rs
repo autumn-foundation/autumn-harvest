@@ -2782,6 +2782,75 @@ async fn a_failed_target_is_not_reconciled_until_it_becomes_unresettable() {
 }
 
 #[tokio::test]
+async fn a_failed_target_reconciles_once_retention_demotes_it_to_a_summary() {
+    // Issue #1317 review, P1 follow-up (companion to the test above). A
+    // FAILED/CANCELLED/TIMED_OUT target holds the seal open because
+    // `reset.rs` can still fork a fresh run from it. That stops being true
+    // once retention deletes the execution row and leaves only a
+    // `harvest_execution_summaries` tombstone. `reset.rs`'s
+    // `load_source_execution` loads a full `WorkflowExecution` row and
+    // returns `NotFound` on a summary-only row. Nothing can ever reset it
+    // again. The seal must release once the row itself is gone, not
+    // stay blocked by a stored state that can no longer be acted on.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "failed-then-summarised").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("fail the migrated run");
+
+    let mut source = shards.source().await;
+    let reconciled_while_row_exists =
+        reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+            .await
+            .expect("reconcile must not fail merely because the target failed");
+    assert!(
+        !reconciled_while_row_exists,
+        "a FAILED target remains resettable while its execution row exists"
+    );
+
+    // Demote the live copy exactly as retention does: a summary row
+    // carrying its last state, and no execution row.
+    diesel::sql_query(
+        "INSERT INTO harvest_execution_summaries \
+             (execution_id, workflow_name, workflow_id, state, started_at, completed_at, \
+              duration_ms, shard_id, search_attrs, result, error, parent_id, \
+              migrated_from_shards) \
+         SELECT e.id, e.workflow_name, e.workflow_id, 'FAILED', e.started_at, NOW(), 0, \
+                e.shard_id, e.search_attrs, NULL, NULL, e.parent_id, e.migrated_from_shards \
+           FROM harvest_workflow_executions e WHERE e.id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("summarise");
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut target)
+        .await
+        .expect("retention-delete the execution row");
+
+    let reconciled_after_summarised =
+        reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+            .await
+            .expect("reconcile must not fail once only a summary remains");
+    assert!(
+        reconciled_after_summarised,
+        "once retention demotes a FAILED target to a summary, nothing can \
+         reset it again, so the seal must release"
+    );
+}
+
+#[tokio::test]
 async fn a_reconciled_migrated_successor_no_longer_blocks_its_predecessors_seal() {
     // Issue #1317: a successor that is itself migrated and reconciled stays
     // `MIGRATED` forever. Reconciliation records `migrated_run_terminal_at`.

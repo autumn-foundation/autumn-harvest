@@ -1706,6 +1706,8 @@ mod db {
         workflow_name: String,
         #[diesel(sql_type = Text)]
         workflow_id: String,
+        #[diesel(sql_type = Bool)]
+        from_execution_row: bool,
     }
 
     #[derive(diesel::QueryableByName)]
@@ -1792,7 +1794,8 @@ mod db {
         let row: Option<LiveStateRow> = diesel::sql_query(
             "SELECT COALESCE(e.state, s.state) AS state, \
                     COALESCE(e.workflow_name, s.workflow_name) AS workflow_name, \
-                    COALESCE(e.workflow_id, s.workflow_id) AS workflow_id \
+                    COALESCE(e.workflow_id, s.workflow_id) AS workflow_id, \
+                    (e.id IS NOT NULL) AS from_execution_row \
                FROM (SELECT $1::uuid AS id) k \
                LEFT JOIN harvest_workflow_executions e ON e.id = k.id \
                LEFT JOIN harvest_execution_summaries s ON s.execution_id = k.id \
@@ -1820,8 +1823,20 @@ mod db {
         // succeeding there. Only `COMPLETED`/`TERMINATED` (rejected by
         // `validate_source_execution` as "nothing to retry") are genuinely
         // final, so this predicate waits for one of those instead.
+        //
+        // That resettability rationale only holds while an execution row
+        // still exists (issue #1317 review, P1 follow-up). `reset.rs`'s
+        // `load_source_execution` loads a full `WorkflowExecution` row and
+        // returns `NotFound` on a summary-only tombstone; it cannot reset
+        // one. Once retention has demoted this row to a summary, a stored
+        // `FAILED`/`CANCELLED`/`TIMED_OUT` state can never be reset again.
+        // `from_execution_row` gates the hold on that: it no longer blocks
+        // release once the row itself is gone. Without this gate,
+        // retention deleting the row would strand the seal on the source
+        // shard forever, since a summary's `state` never changes either.
         if row.state == "MIGRATED"
-            || matches!(row.state.as_str(), "FAILED" | "CANCELLED" | "TIMED_OUT")
+            || (row.from_execution_row
+                && matches!(row.state.as_str(), "FAILED" | "CANCELLED" | "TIMED_OUT"))
             || !crate::erase::is_terminal_state(&row.state)
         {
             return Ok(false);
