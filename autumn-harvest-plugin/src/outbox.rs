@@ -198,6 +198,45 @@ fn outbox_mark_flush_due(pending: usize, since_last_flush: std::time::Duration) 
         && (pending >= OUTBOX_MARK_FLUSH_EVERY || since_last_flush >= OUTBOX_MARK_FLUSH_MAX_DELAY)
 }
 
+/// Margin subtracted from `claim_ttl_ms` before computing the claim
+/// deadline (issue #1620 review, Codex, seventh round). Waking the flush
+/// timer exactly at claim expiry leaves no time for the mark query's own
+/// round trip. A concurrent relay can win a reclaim race in that gap.
+/// Ten percent of the TTL, capped at one second, trades a small part of
+/// the claim window for headroom.
+fn claim_flush_margin_ms(claim_ttl_ms: u64) -> u64 {
+    (claim_ttl_ms / 10).min(1_000)
+}
+
+/// How long the drain loop's inner `select!` should sleep before waking
+/// to recheck whether pending marks are due. Pairs with
+/// `outbox_mark_flush_due`, which makes the same due/not-due call from
+/// an elapsed duration instead of absolute deadlines. `deadline` is the
+/// soonest of three candidates (issue #1620 review, Codex, fifth round).
+/// The fixed `last_flush + OUTBOX_MARK_FLUSH_MAX_DELAY` bound. Any failed
+/// row's own configured retry deadline -- a short `base_retry_delay_ms`
+/// must not wait behind the fixed bound. `claim_deadline`, while
+/// anything is pending, so a row flushes before its claim goes stale.
+fn outbox_mark_flush_remaining(
+    now: std::time::Instant,
+    pending: usize,
+    last_flush: std::time::Instant,
+    earliest_failed_deadline: Option<std::time::Instant>,
+    claim_deadline: std::time::Instant,
+) -> Duration {
+    if pending >= OUTBOX_MARK_FLUSH_EVERY {
+        return Duration::ZERO;
+    }
+    let mut deadline = last_flush + OUTBOX_MARK_FLUSH_MAX_DELAY;
+    if let Some(earliest_failed) = earliest_failed_deadline {
+        deadline = deadline.min(earliest_failed);
+    }
+    if pending > 0 {
+        deadline = deadline.min(claim_deadline);
+    }
+    deadline.saturating_duration_since(now)
+}
+
 async fn drain_workflow_start_outbox_batch(
     state: &AppState,
     limit: i64,
@@ -237,7 +276,14 @@ async fn drain_workflow_start_outbox_batch(
     // must not run later than this. A row whose claim is close to
     // expiring could otherwise sit flushed-but-not-yet-due past
     // `claim_ttl_ms`, while a slower row's dispatch is still pending.
-    let claim_deadline = claim_started_at + Duration::from_millis(config.claim_ttl_ms);
+    // `claim_flush_margin_ms` backs this off further, so the flush query
+    // itself has room to run before the real database expiry.
+    let claim_deadline = claim_started_at
+        + Duration::from_millis(
+            config
+                .claim_ttl_ms
+                .saturating_sub(claim_flush_margin_ms(config.claim_ttl_ms)),
+        );
 
     // issue #618, F-round8: the metrics recorder for the exempt-with-bypass-counter
     // "outbox" producer. Fetched once; the bypass is counted per row only AFTER the
@@ -275,27 +321,14 @@ async fn drain_workflow_start_outbox_batch(
         let dispatch_fut = dispatch_workflow_start_request(state, &request);
         tokio::pin!(dispatch_fut);
         let outcome = loop {
-            let now = std::time::Instant::now();
             let pending = delivered_marks.len() + failed_marks.len();
-            // The flush deadline is the soonest of three candidates
-            // (issue #1620 review, Codex, fifth round). The fixed time
-            // bound. Any failed row's own configured retry deadline -- a
-            // short `base_retry_delay_ms` must not wait behind the fixed
-            // 250ms. This batch's claim deadline, while anything is
-            // pending -- a row must flush before its claim, not just its
-            // mark, goes stale.
-            let mut deadline = last_flush + OUTBOX_MARK_FLUSH_MAX_DELAY;
-            if let Some(earliest_failed) = failed_marks.iter().map(|(_, _, d)| *d).min() {
-                deadline = deadline.min(earliest_failed);
-            }
-            if pending > 0 {
-                deadline = deadline.min(claim_deadline);
-            }
-            let remaining = if pending >= OUTBOX_MARK_FLUSH_EVERY {
-                Duration::ZERO
-            } else {
-                deadline.saturating_duration_since(now)
-            };
+            let remaining = outbox_mark_flush_remaining(
+                std::time::Instant::now(),
+                pending,
+                last_flush,
+                failed_marks.iter().map(|(_, _, d)| *d).min(),
+                claim_deadline,
+            );
             tokio::select! {
                 result = &mut dispatch_fut => break result,
                 // `select!` evaluates this guard once, when this loop
@@ -821,6 +854,62 @@ mod tests {
         assert!(
             outbox_mark_flush_due(1, OUTBOX_MARK_FLUSH_MAX_DELAY),
             "time threshold reached: due even with only one outcome pending"
+        );
+    }
+
+    /// `outbox_mark_flush_remaining` picks the soonest of its three
+    /// candidate deadlines (issue #1620 review, Codex, fifth round). The
+    /// fixed bound, the earliest failed-row deadline, and the claim
+    /// deadline -- the last one only while something is pending.
+    #[test]
+    fn outbox_mark_flush_remaining_picks_the_soonest_candidate() {
+        use std::time::Duration;
+
+        let now = std::time::Instant::now();
+        let last_flush = now;
+        let far_future = now + Duration::from_secs(3600);
+
+        assert_eq!(
+            outbox_mark_flush_remaining(now, 0, last_flush, None, far_future),
+            OUTBOX_MARK_FLUSH_MAX_DELAY,
+            "nothing pending: only the fixed bound applies, claim deadline ignored"
+        );
+        assert_eq!(
+            outbox_mark_flush_remaining(now, OUTBOX_MARK_FLUSH_EVERY, last_flush, None, far_future),
+            Duration::ZERO,
+            "count threshold met: due now regardless of any deadline"
+        );
+        let near_failed_deadline = now + Duration::from_millis(10);
+        assert_eq!(
+            outbox_mark_flush_remaining(now, 1, last_flush, Some(near_failed_deadline), far_future),
+            Duration::from_millis(10),
+            "a failed row's own deadline beats the fixed 250ms bound when sooner"
+        );
+        let near_claim_deadline = now + Duration::from_millis(5);
+        assert_eq!(
+            outbox_mark_flush_remaining(now, 1, last_flush, None, near_claim_deadline),
+            Duration::from_millis(5),
+            "the claim deadline beats the fixed bound when sooner, and pending > 0"
+        );
+    }
+
+    /// Ten percent of the TTL, capped at one second (issue #1620 review,
+    /// Codex, seventh round). Never more than the TTL itself, so
+    /// `claim_ttl_ms.saturating_sub(margin)` never underflows to a
+    /// deadline before `claim_started_at`.
+    #[test]
+    fn claim_flush_margin_ms_is_a_tenth_of_ttl_capped_at_one_second() {
+        assert_eq!(claim_flush_margin_ms(30_000), 1_000, "default TTL: capped");
+        assert_eq!(claim_flush_margin_ms(5_000), 500, "under the cap: a tenth");
+        assert_eq!(
+            claim_flush_margin_ms(5),
+            0,
+            "a tenth rounds down to zero for a tiny TTL, never exceeding it"
+        );
+        assert_eq!(
+            claim_flush_margin_ms(1),
+            0,
+            "the minimum valid TTL: zero margin, not underflow"
         );
     }
 

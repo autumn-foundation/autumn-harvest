@@ -1895,5 +1895,8 @@ standalone note rather than part of the claim-path attribution table above:
   `outbox::drain_workflow_start_outbox_batch`, the workflow-start outbox
   relay's periodic drain (issue #1620), batched into one
   `UPDATE ... FROM UNNEST(...)` call per outcome (delivered, failed) per
-  drain instead of one call per row (`mark_calls` n → claim-round count at
-  every swept size; `mark_buffers` -26.9% at n=50).
+  chunk of `OUTBOX_MARK_FLUSH_EVERY` outcomes, not one call per row and
+  not one call per drain (review-round correction: chunking, not a single
+  end-of-drain flush, bounds how long a row's claim stays held;
+  `mark_calls` n → 1/3/7 at n=5/20/50, an eightfold constant-factor
+  reduction, not a complexity-class one; `mark_buffers` -28.2% at n=50).
