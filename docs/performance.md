@@ -1883,7 +1883,10 @@ standalone note rather than part of the claim-path attribution table above:
   `shard_rebalance::history_fingerprint`, the replay-determinism check a
   shard migration runs on both sides of a copy (`docs/sharding.md`), fixed
   by reusing one buffer across events (alloc bytes -16.45%).
-* [`docs/performance-lineage.md`](performance-lineage.md) — the per-level and
-  per-node vecs in `lineage::LineageWalk`/`LineageTreeReport::finish`, the
-  in-memory half of `GET /workflows/{id}/lineage` (issue #621), pre-sized
-  instead of grown from empty (instructions -12.89%, allocs -35.25%).
+* [`docs/performance-lineage.md`](performance-lineage.md) — the `visited`/
+  `next`/`node.children` vecs in `lineage::LineageWalk`/
+  `LineageTreeReport::finish`, the in-memory half of
+  `GET /workflows/{id}/lineage` (issue #621), pre-sized from what each level
+  actually admits; `nodes` and `by_parent` stay growing from empty after a
+  post-review correction (instructions -2.37%, alloc bytes -27.12%, this
+  fix's final fifth-round-corrected numbers).
