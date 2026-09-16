@@ -386,6 +386,22 @@ async fn completed_executions(conn: &mut AsyncPgConnection) -> i64 {
 // Redis probe.
 // ---------------------------------------------------------------------------
 
+/// What the dispatch key space still holds after a drain.
+///
+/// All three counts must be zero for the pre-registered Redis precondition.
+#[derive(Clone, Copy)]
+struct Residue {
+    entries: i64,
+    pending: i64,
+    markers: i64,
+}
+
+impl Residue {
+    const fn is_drained(self) -> bool {
+        self.entries == 0 && self.pending == 0 && self.markers == 0
+    }
+}
+
 /// Reads the dispatch key space so a run can prove the channel drained.
 struct RedisProbe {
     client: redis::Client,
@@ -416,8 +432,13 @@ impl RedisProbe {
         }
     }
 
-    /// Count stream entries and pending entries left behind after a drain.
-    async fn residue(&self) -> (i64, i64) {
+    /// Count stream entries, pending entries and dedupe markers after a drain.
+    ///
+    /// The pre-registration requires an empty stream, an empty PEL **and** an
+    /// empty marker set. An earlier version counted only stream keys, so a
+    /// leaked marker whose stream entry was acknowledged would have graded as
+    /// correct. Found by review on PR #1617.
+    async fn residue(&self) -> Residue {
         let mut conn = self
             .client
             .get_multiplexed_async_connection()
@@ -429,7 +450,13 @@ impl RedisProbe {
             .unwrap_or_default();
         let mut entries = 0_i64;
         let mut pending = 0_i64;
+        let mut markers = 0_i64;
+        let marker_prefix = format!("{}:dispatch:marker:", self.prefix);
         for key in keys {
+            if key.starts_with(&marker_prefix) {
+                markers += 1;
+                continue;
+            }
             let kind: String = redis::cmd("TYPE")
                 .arg(&key)
                 .query_async(&mut conn)
@@ -459,7 +486,7 @@ impl RedisProbe {
                 pending += *count;
             }
         }
-        (entries, pending)
+        Residue { entries, pending, markers }
     }
 }
 
@@ -613,7 +640,7 @@ struct RepOutcome {
     elapsed_secs: f64,
     completed: i64,
     activity_runs: u64,
-    residue: Option<(i64, i64)>,
+    residue: Option<Residue>,
     truncated: bool,
 }
 
@@ -624,9 +651,7 @@ impl RepOutcome {
         !self.truncated
             && self.completed == expected as i64
             && self.activity_runs == expected_activities
-            && self.residue.is_none_or(|(entries, pending)| {
-                entries == 0 && pending == 0
-            })
+            && self.residue.is_none_or(Residue::is_drained)
     }
 }
 
@@ -636,18 +661,19 @@ async fn run_postgres_arm(settings: &Settings, arm: Arm, rep: usize) -> RepOutco
     reset_database(settings).await;
     ACTIVITY_RUNS.store(0, Ordering::Relaxed);
 
-    let seeded = seed(
-        &settings.database_url,
-        &run,
-        settings.workflows,
-        settings.seeders,
-    )
-    .await;
-    assert_eq!(seeded, settings.workflows, "every start should be accepted");
-
+    // Install the dispatch channel BEFORE seeding, never after.
+    //
+    // `queue::enqueue` publishes a hint only when a channel is installed
+    // (`queue.rs`, guarded on `dispatch::is_installed`). A backlog seeded
+    // first therefore carries no hint at all, and the worker can discover it
+    // only through the reconcile sweep. That sweep is capped at
+    // `DEFAULT_DISPATCH_RECONCILE_BATCH` rows per `reconcile_interval`, which
+    // is 1000 rows per second at this configuration. The Redis arm would then
+    // measure a forced recovery path bounded by that cap, not the dispatch
+    // path L2 asks about. Found by review on PR #1617.
     autumn_harvest::dispatch::uninstall();
     let probe = if arm == Arm::RedisPg {
-        let prefix = format!("assay10:{run}:");
+        let prefix = format!("assay10:{run}");
         let dispatch = RedisDispatch::connect(
             &settings.redis_url,
             RedisDispatchConfig {
@@ -673,6 +699,15 @@ async fn run_postgres_arm(settings: &Settings, arm: Arm, rep: usize) -> RepOutco
     } else {
         None
     };
+
+    let seeded = seed(
+        &settings.database_url,
+        &run,
+        settings.workflows,
+        settings.seeders,
+    )
+    .await;
+    assert_eq!(seeded, settings.workflows, "every start should be accepted");
 
     let pool = build_pool(&settings.database_url, POOL_SIZE);
     let mut conn = connect(&settings.database_url).await;
@@ -866,8 +901,10 @@ async fn main() {
                 if correct { "PASS" } else { "FAIL" },
                 if outcome.truncated { ", TRUNCATED" } else { "" },
                 match outcome.residue {
-                    Some((entries, pending)) =>
-                        format!(", residue entries={entries} pending={pending}"),
+                    Some(r) => format!(
+                        ", residue entries={} pending={} markers={}",
+                        r.entries, r.pending, r.markers
+                    ),
                     None => String::new(),
                 }
             );

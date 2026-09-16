@@ -28,6 +28,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/worker"
@@ -201,7 +202,17 @@ func runRep(c client.Client, rep, workflows, capSecs int) (float64, bool) {
 	done := completed.Load()
 	acts := activityRuns.Load()
 	truncated := waitCtx.Err() != nil
-	correct := !truncated && done == int64(workflows) && acts == uint64(workflows*3)
+
+	// The pre-registration's third correctness clause: no workflow task
+	// failures. A transient failure that Temporal later retries still lets
+	// run.Get succeed with an exact activity count, so neither of the other
+	// two clauses can see it, and the repetition would be timed with extra
+	// retry work in it. Scanned after the measured window closes, so this
+	// costs the rate nothing. Found by review on PR #1617.
+	taskFailures := countWorkflowTaskFailures(ctx, c, runs)
+
+	correct := !truncated && done == int64(workflows) &&
+		acts == uint64(workflows*3) && taskFailures == 0
 
 	rate := 0.0
 	if elapsed > 0 {
@@ -215,7 +226,39 @@ func runRep(c client.Client, rep, workflows, capSecs int) (float64, bool) {
 	if truncated {
 		trunc = ", TRUNCATED"
 	}
-	fmt.Printf("rep %d: %.2f workflows/sec (%d completed in %.2f s, %d activity runs, correctness %s%s)\n",
-		rep, rate, done, elapsed, acts, status, trunc)
+	fmt.Printf("rep %d: %.2f workflows/sec (%d completed in %.2f s, %d activity runs, %d workflow task failures, correctness %s%s)\n",
+		rep, rate, done, elapsed, acts, taskFailures, status, trunc)
 	return rate, correct
+}
+
+// countWorkflowTaskFailures scans every execution's history for a
+// WorkflowTaskFailed event and returns how many executions carry at least one.
+//
+// It runs after the measured window, never inside it.
+func countWorkflowTaskFailures(ctx context.Context, c client.Client, runs []client.WorkflowRun) int64 {
+	var failures atomic.Int64
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 16)
+	for _, run := range runs {
+		wg.Add(1)
+		go func(run client.WorkflowRun) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			iter := c.GetWorkflowHistory(ctx, run.GetID(), run.GetRunID(),
+				false, enumspb.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT)
+			for iter.HasNext() {
+				event, err := iter.Next()
+				if err != nil {
+					return
+				}
+				if event.GetEventType() == enumspb.EVENT_TYPE_WORKFLOW_TASK_FAILED {
+					failures.Add(1)
+					return
+				}
+			}
+		}(run)
+	}
+	wg.Wait()
+	return failures.Load()
 }
