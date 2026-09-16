@@ -26,8 +26,7 @@
 #![allow(clippy::too_many_lines)]
 
 use autumn_harvest_plugin::{
-    HarvestDbPool, WorkflowStartRequest, enqueue_workflow_start_outbox,
-    flush_workflow_start_outbox,
+    HarvestDbPool, WorkflowStartRequest, enqueue_workflow_start_outbox, flush_workflow_start_outbox,
 };
 use autumn_web::AppState;
 use autumn_web::config::DatabaseConfig;
@@ -90,10 +89,7 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4().simple())
 }
 
-fn build_pool(
-    database_url: &str,
-    pool_size: usize,
-) -> deadpool::Pool<AsyncPgConnection> {
+fn build_pool(database_url: &str, pool_size: usize) -> deadpool::Pool<AsyncPgConnection> {
     autumn_web::db::create_pool(&DatabaseConfig {
         url: Some(database_url.to_owned()),
         pool_size,
@@ -168,7 +164,9 @@ fn is_mark_statement(row: &StatRow) -> bool {
 
 fn is_claim_statement(row: &StatRow) -> bool {
     let q = row.query.to_ascii_lowercase();
-    q.contains("update") && q.contains("harvest_workflow_outbox") && q.contains("claimed_at")
+    q.contains("update")
+        && q.contains("harvest_workflow_outbox")
+        && q.contains("claimed_at")
         && !q.contains("delivery_attempts")
 }
 

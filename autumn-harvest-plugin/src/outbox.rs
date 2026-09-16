@@ -517,7 +517,10 @@ async fn mark_outbox_rows_delivered_batch(
         return Ok(Vec::new());
     }
     let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
-    let exec_ids: Vec<String> = rows.iter().map(|(_, exec_id)| exec_id.to_string()).collect();
+    let exec_ids: Vec<String> = rows
+        .iter()
+        .map(|(_, exec_id)| exec_id.to_string())
+        .collect();
 
     let marked: Vec<MarkedIdRow> = diesel::sql_query(
         r"
@@ -669,11 +672,6 @@ mod tests {
         use diesel_async::AsyncConnection;
 
         #[derive(diesel::QueryableByName)]
-        struct IdRow {
-            #[diesel(sql_type = diesel::sql_types::BigInt)]
-            id: i64,
-        }
-        #[derive(diesel::QueryableByName)]
         struct DeliveredRow {
             #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
             delivered_execution_id: Option<String>,
@@ -689,7 +687,11 @@ mod tests {
             .await
             .expect("connect to test DB");
 
-        async fn insert_claimed(conn: &mut AsyncPgConnection, workflow_id: &str, claimant: &str) -> i64 {
+        async fn insert_claimed(
+            conn: &mut AsyncPgConnection,
+            workflow_id: &str,
+            claimant: &str,
+        ) -> i64 {
             #[derive(diesel::QueryableByName)]
             struct IdRow {
                 #[diesel(sql_type = diesel::sql_types::BigInt)]
