@@ -188,16 +188,6 @@ const OUTBOX_MARK_FLUSH_EVERY: usize = 8;
 /// `tokio::select!`. See `OUTBOX_MARK_FLUSH_EVERY`.
 const OUTBOX_MARK_FLUSH_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Whether pending marks should flush now. Checked right after each
-/// dispatch returns, and periodically while a dispatch is still in
-/// flight. The drain loop's `tokio::select!` races a flush-deadline timer
-/// against the dispatch future for that second case. `pending` is 0 when
-/// nothing has accumulated, which is never due.
-fn outbox_mark_flush_due(pending: usize, since_last_flush: std::time::Duration) -> bool {
-    pending > 0
-        && (pending >= OUTBOX_MARK_FLUSH_EVERY || since_last_flush >= OUTBOX_MARK_FLUSH_MAX_DELAY)
-}
-
 /// Margin subtracted from `claim_ttl_ms` before computing the claim
 /// deadline (issue #1620 review, Codex, seventh round). Waking the flush
 /// timer exactly at claim expiry leaves no time for the mark query's own
@@ -208,15 +198,19 @@ fn claim_flush_margin_ms(claim_ttl_ms: u64) -> u64 {
     (claim_ttl_ms / 10).min(1_000)
 }
 
-/// How long the drain loop's inner `select!` should sleep before waking
-/// to recheck whether pending marks are due. Pairs with
-/// `outbox_mark_flush_due`, which makes the same due/not-due call from
-/// an elapsed duration instead of absolute deadlines. `deadline` is the
-/// soonest of three candidates (issue #1620 review, Codex, fifth round).
-/// The fixed `last_flush + OUTBOX_MARK_FLUSH_MAX_DELAY` bound. Any failed
-/// row's own configured retry deadline -- a short `base_retry_delay_ms`
-/// must not wait behind the fixed bound. `claim_deadline`, while
-/// anything is pending, so a row flushes before its claim goes stale.
+/// How long the drain loop should wait before pending marks are due to
+/// flush. `Duration::ZERO` means due now. Called from the flush check
+/// right after a dispatch returns. Also called, as a sleep duration,
+/// from the inner `select!` that races a flush deadline against a still
+/// in-flight dispatch. `tokio::select!` picks arbitrarily among branches
+/// ready at the same time. So the post-dispatch check cannot rely on the
+/// timer branch alone ever winning (issue #1620 review, Codex, eighth
+/// round). `deadline` is the soonest of three candidates
+/// (issue #1620 review, Codex, fifth round). The fixed `last_flush +
+/// OUTBOX_MARK_FLUSH_MAX_DELAY` bound. Any failed row's own configured
+/// retry deadline -- a short `base_retry_delay_ms` must not wait behind
+/// the fixed bound. `claim_deadline`, while anything is pending, so a
+/// row flushes before its claim goes stale.
 fn outbox_mark_flush_remaining(
     now: std::time::Instant,
     pending: usize,
@@ -235,6 +229,29 @@ fn outbox_mark_flush_remaining(
         deadline = deadline.min(claim_deadline);
     }
     deadline.saturating_duration_since(now)
+}
+
+/// Whether pending marks are due to flush right now -- the post-dispatch
+/// check's own yes/no form of `outbox_mark_flush_remaining` (issue #1620
+/// review, Codex, eighth round). See that function's doc comment for why
+/// this check cannot rely on the inner loop's `select!` timer branch
+/// alone.
+fn outbox_mark_flush_due_now(
+    now: std::time::Instant,
+    pending: usize,
+    last_flush: std::time::Instant,
+    earliest_failed_deadline: Option<std::time::Instant>,
+    claim_deadline: std::time::Instant,
+) -> bool {
+    pending > 0
+        && outbox_mark_flush_remaining(
+            now,
+            pending,
+            last_flush,
+            earliest_failed_deadline,
+            claim_deadline,
+        )
+        .is_zero()
 }
 
 async fn drain_workflow_start_outbox_batch(
@@ -257,27 +274,16 @@ async fn drain_workflow_start_outbox_batch(
         .get()
         .await
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
-    // Captured BEFORE issuing the claim query, not after it returns
-    // (issue #1620 review, Codex, sixth round). Postgres sets
-    // `claimed_at = NOW()` inside that query, strictly before this
-    // `await` resolves. A post-return Instant is already later than the
-    // real database claim time. A deadline computed from it would run
-    // later than the actual expiry it is meant to stay clear of. A
-    // pre-call Instant is <= the real claim time instead. A deadline
-    // derived from it is always at or before the true expiry --
-    // conservative in the safe direction, never the unsafe one.
+    // Captured BEFORE the claim query, not after (issue #1620 review,
+    // Codex, sixth round). Postgres sets `claimed_at = NOW()` inside
+    // that query. A pre-call Instant is always <= the real claim time.
     let claim_started_at = std::time::Instant::now();
     let rows = claim_due_outbox_rows(&mut app_conn, limit.max(1), &claimant, &config)
         .await
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
-    // Every row in this batch got `claimed_at` set in that one claim
-    // query. One deadline stands in for all of their claim times (issue
-    // #1620 review, Codex, fifth round). The drain loop's flush deadline
-    // must not run later than this. A row whose claim is close to
-    // expiring could otherwise sit flushed-but-not-yet-due past
-    // `claim_ttl_ms`, while a slower row's dispatch is still pending.
-    // `claim_flush_margin_ms` backs this off further, so the flush query
-    // itself has room to run before the real database expiry.
+    // One claim query sets `claimed_at` for every row in this batch.
+    // One deadline stands in for all of them (issue #1620 review, Codex,
+    // fifth and seventh rounds). See `claim_flush_margin_ms`.
     let claim_deadline = claim_started_at
         + Duration::from_millis(
             config
@@ -311,12 +317,10 @@ async fn drain_workflow_start_outbox_batch(
     let mut failed_marks: Vec<(i64, String, std::time::Instant)> = Vec::new();
     let mut last_flush = std::time::Instant::now();
     for row in rows {
-        // `dispatch_workflow_start_request` gets its own connection from
-        // `HarvestDbPool` (issue #1620 review, Codex, third round).
-        // `app_conn` above is idle for the whole call. Race the dispatch
-        // future against a periodic flush deadline. A flush that becomes
-        // due while this row's dispatch is still in flight then runs
-        // right then, on `app_conn`, not after dispatch returns.
+        // `dispatch_workflow_start_request` uses its own `HarvestDbPool`
+        // connection (issue #1620 review, Codex, third round). So
+        // `app_conn` is idle for the whole call. Race the dispatch
+        // future against a periodic flush deadline below.
         let request = row.request();
         let dispatch_fut = dispatch_workflow_start_request(state, &request);
         tokio::pin!(dispatch_fut);
@@ -331,27 +335,20 @@ async fn drain_workflow_start_outbox_batch(
             );
             tokio::select! {
                 result = &mut dispatch_fut => break result,
-                // `select!` evaluates this guard once, when this loop
-                // iteration's call starts, not on every poll (issue #1620
-                // review, Codex, fourth round). Guarding on
-                // `outbox_mark_flush_due` -- true only once due -- would
-                // disable the timer branch for iterations where nothing
-                // is due YET. It could then never wake this select! to
-                // notice a deadline that arrives while still disabled.
-                // Guarding on `pending > 0` instead keeps the branch
-                // armed whenever there is anything to flush. `remaining`
-                // (0 if already due, otherwise time left) decides WHEN
-                // the timer fires.
+                // Guard on `pending > 0`, not "already due". `select!`
+                // evaluates a guard once per call, not on every poll
+                // (issue #1620 review, Codex, fourth round). A
+                // not-yet-due guard would disable this branch for the
+                // rest of the call. `remaining` decides WHEN it fires.
                 () = tokio::time::sleep(remaining), if pending > 0 => {
-                    delivered += flush_outbox_marks(
+                    delivered += flush_outbox_marks_or_err(
                         &mut app_conn,
                         &claimant,
                         &mut delivered_marks,
                         &mut failed_marks,
                         outbox_metrics.as_ref(),
                     )
-                    .await
-                    .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+                    .await?;
                     last_flush = std::time::Instant::now();
                 }
             }
@@ -366,29 +363,36 @@ async fn drain_workflow_start_outbox_batch(
             }
         }
 
+        // See `outbox_mark_flush_due_now` (issue #1620 review, Codex,
+        // eighth round) for why this cannot be a simpler check.
         let pending = delivered_marks.len() + failed_marks.len();
-        if outbox_mark_flush_due(pending, last_flush.elapsed()) {
-            delivered += flush_outbox_marks(
+        let flush_due = outbox_mark_flush_due_now(
+            std::time::Instant::now(),
+            pending,
+            last_flush,
+            failed_marks.iter().map(|(_, _, d)| *d).min(),
+            claim_deadline,
+        );
+        if flush_due {
+            delivered += flush_outbox_marks_or_err(
                 &mut app_conn,
                 &claimant,
                 &mut delivered_marks,
                 &mut failed_marks,
                 outbox_metrics.as_ref(),
             )
-            .await
-            .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+            .await?;
             last_flush = std::time::Instant::now();
         }
     }
-    delivered += flush_outbox_marks(
+    delivered += flush_outbox_marks_or_err(
         &mut app_conn,
         &claimant,
         &mut delivered_marks,
         &mut failed_marks,
         outbox_metrics.as_ref(),
     )
-    .await
-    .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    .await?;
 
     Ok(OutboxDrainStats { claimed, delivered })
 }
@@ -451,6 +455,28 @@ async fn flush_outbox_marks(
     failed_marks.clear();
 
     Ok(delivered)
+}
+
+/// `flush_outbox_marks`, converting its error and propagating with `?`.
+/// Three call sites in the drain loop below need exactly this; factored
+/// out so each is one line instead of repeating the same `.await
+/// .map_err(...)` boilerplate.
+async fn flush_outbox_marks_or_err(
+    conn: &mut AsyncPgConnection,
+    claimant: &str,
+    delivered_marks: &mut Vec<(i64, ExecutionId)>,
+    failed_marks: &mut Vec<(i64, String, std::time::Instant)>,
+    outbox_metrics: Option<&std::sync::Arc<dyn autumn_harvest::telemetry::MetricsRecorder>>,
+) -> Result<usize, AutumnError> {
+    flush_outbox_marks(
+        conn,
+        claimant,
+        delivered_marks,
+        failed_marks,
+        outbox_metrics,
+    )
+    .await
+    .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))
 }
 
 /// Drain all currently due workflow-start outbox rows.
@@ -820,43 +846,6 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
-    /// This is the pure decision `outbox_mark_flush_due` makes. The drain
-    /// loop's `tokio::select!` lets a flush run on it while a dispatch
-    /// is still in flight (issue #1620 review, Codex, second and third
-    /// rounds). Count alone cannot bound wall time -- a fixed
-    /// outcome-count threshold says nothing about how long reaching it
-    /// takes.
-    #[test]
-    fn outbox_mark_flush_due_bounds_by_count_or_by_elapsed_time() {
-        use std::time::Duration;
-
-        assert!(
-            !outbox_mark_flush_due(0, Duration::from_secs(3600)),
-            "nothing pending is never due, however long it has been"
-        );
-        assert!(
-            !outbox_mark_flush_due(OUTBOX_MARK_FLUSH_EVERY - 1, Duration::ZERO),
-            "under the count threshold and no time elapsed: not due"
-        );
-        assert!(
-            outbox_mark_flush_due(OUTBOX_MARK_FLUSH_EVERY, Duration::ZERO),
-            "count threshold reached: due regardless of elapsed time"
-        );
-        assert!(
-            !outbox_mark_flush_due(
-                1,
-                OUTBOX_MARK_FLUSH_MAX_DELAY
-                    .checked_sub(Duration::from_millis(1))
-                    .expect("OUTBOX_MARK_FLUSH_MAX_DELAY is well over 1ms")
-            ),
-            "under the time threshold and under the count threshold: not due"
-        );
-        assert!(
-            outbox_mark_flush_due(1, OUTBOX_MARK_FLUSH_MAX_DELAY),
-            "time threshold reached: due even with only one outcome pending"
-        );
-    }
-
     /// `outbox_mark_flush_remaining` picks the soonest of its three
     /// candidate deadlines (issue #1620 review, Codex, fifth round). The
     /// fixed bound, the earliest failed-row deadline, and the claim
@@ -890,6 +879,38 @@ mod tests {
             outbox_mark_flush_remaining(now, 1, last_flush, None, near_claim_deadline),
             Duration::from_millis(5),
             "the claim deadline beats the fixed bound when sooner, and pending > 0"
+        );
+        assert_eq!(
+            outbox_mark_flush_remaining(now, 1, last_flush, None, far_future),
+            OUTBOX_MARK_FLUSH_MAX_DELAY,
+            "under every candidate: not due yet, remaining is the fixed bound itself"
+        );
+    }
+
+    /// The post-dispatch check's yes/no form of the same decision (issue
+    /// #1620 review, Codex, eighth round).
+    #[test]
+    fn outbox_mark_flush_due_now_matches_zero_remaining() {
+        use std::time::Duration;
+
+        let now = std::time::Instant::now();
+        let far_future = now + Duration::from_secs(3600);
+
+        assert!(
+            !outbox_mark_flush_due_now(now, 0, now, None, far_future),
+            "nothing pending is never due"
+        );
+        assert!(
+            !outbox_mark_flush_due_now(now, 1, now, None, far_future),
+            "under every candidate: not due yet"
+        );
+        assert!(
+            outbox_mark_flush_due_now(now, OUTBOX_MARK_FLUSH_EVERY, now, None, far_future),
+            "count threshold met: due now"
+        );
+        assert!(
+            outbox_mark_flush_due_now(now, 1, now, None, now),
+            "claim deadline already reached: due now"
         );
     }
 

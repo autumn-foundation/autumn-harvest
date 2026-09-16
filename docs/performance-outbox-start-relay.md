@@ -153,10 +153,11 @@ called from `flush_outbox_marks`, bind one array per column and join via
 literal `VALUES (...), (...), ...` list whose text would grow a distinct
 shape per batch size.
 
-Four review-round corrections (Codex, on the PR) landed after the numbers
+Five review-round corrections (Codex, on the PR) landed after the numbers
 above were captured. The first two do not change statement count or
 buffers; the third does, at batch sizes above `OUTBOX_MARK_FLUSH_EVERY`;
-the fourth changes a wall-clock bound the numbers cannot see -- see below.
+the fourth and fifth change a wall-clock bound the numbers cannot see --
+see below.
 
 1. The admission-bypass metric is recorded right after the delivered
    batch mark commits, not after both marks have run. The two marks are
@@ -211,13 +212,23 @@ the fourth changes a wall-clock bound the numbers cannot see -- see below.
    wall-clock bound, invisible to `pg_stat_statements`'s call/buffer
    counts under this harness's fast, un-delayed dispatch -- the
    `after-sweep-chunked.txt` numbers above are unaffected by it. The
-   flush/no-flush decision itself (`outbox_mark_flush_due`) is covered by
-   a pure unit test,
-   `outbox_mark_flush_due_bounds_by_count_or_by_elapsed_time`; the
-   `tokio::select!` race that lets a flush run on that decision mid-dispatch
-   is exercised indirectly by the `admission_gate_authoritative_localpg`
-   suite's real, fast-dispatch drains, not by a dedicated slow-dispatch
-   test -- this module has no seam to inject an artificial dispatch delay.
+   `tokio::select!` race that lets a flush run mid-dispatch is exercised
+   indirectly by the `admission_gate_authoritative_localpg` suite's real,
+   fast-dispatch drains, not by a dedicated slow-dispatch test -- this
+   module has no seam to inject an artificial dispatch delay.
+5. `tokio::select!` picks arbitrarily among branches that are ready at
+   the same time, so a dispatch resolving exactly when the inner loop's
+   timer branch would also fire is not guaranteed to lose that race
+   (issue #1620 review, Codex, eighth round). The post-dispatch flush
+   check, run right after `match outcome`, used to fall back to a
+   simpler count/fixed-delay-only decision that never looked at
+   `claim_deadline` or `failed_marks`' own deadlines -- so a run of
+   dispatches that each happened to win the race against the timer
+   branch could starve a flush past the claim deadline, with nothing
+   left to catch it. Both call sites now share one pure function,
+   `outbox_mark_flush_remaining`, covered by
+   `outbox_mark_flush_remaining_picks_the_soonest_candidate` (the
+   now-redundant `outbox_mark_flush_due` and its own test were removed).
 
 Flushing every chunk, rather than waiting for the whole batch, is safe
 under the same idempotency the relay already relies on. A crash between
