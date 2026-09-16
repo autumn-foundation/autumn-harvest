@@ -57,6 +57,15 @@ stays a soft, frozen-`NOW()` pre-filter, and
 `claim_batched_candidate_attempt_query()` gains an authoritative
 `clock_timestamp()` recheck at claim time.
 
+Codex then caught a sixth bug, against that fifth fix: the new
+`clock_timestamp()` recheck only gated `claimed`, the CTE that performs
+the state update. `rate_limit_debit` is a separate, data-modifying CTE
+in the same query, and Postgres runs it regardless of whether `claimed`
+uses its result. An expired-but-rate-limited candidate still spent a
+token — the same leak shape the third bug fixed, recreated on the
+deadline path instead of the concurrency path. Fixed by adding the same
+deadline check to `rate_limit_debit`'s own `WHERE` clause.
+
 **Not wired into the default claim path.** `claim_task`/`claim_task_on_shard`
 are unchanged. Issue #1340 is explicit that no query change should land
 against it without sign-off from someone with full context on `queue.rs`'s
@@ -65,7 +74,7 @@ tested, measured building block for that review, not a switch of default
 production behavior. It also does not implement the cross-region DR fence
 (#954) or the by-id claim (#1312) the single-row path carries.
 
-**Test evidence.** `tests/integration/claim_batched_tests.rs` (11 DB-backed
+**Test evidence.** `tests/integration/claim_batched_tests.rs` (12 DB-backed
 tests, red-then-green): equivalence with the single-row path on a plain
 backlog, an adversarial saturated-concurrency-key fixture matching ledger
 #4/#5's own shape, a multi-batch fixture with tied sort keys spanning a
@@ -76,18 +85,21 @@ green), a regression test for the deadline-recheck bug above (also
 verified red against the pre-fix code -- drives
 `claim_batched_candidate_attempt_query()` directly with an injected
 `pg_sleep` so the real-time-vs-frozen-`NOW()` gap is deterministic, not
-timing-dependent), sticky routing and a capability-routed-activity gate
-exercised end-to-end through the real function (not just SQL-text
-checks), and — the gap ledger #5's own single-session apparatus
-explicitly could not close — real concurrent Tokio claimers racing a
-capped concurrency key, asserting the cap is never exceeded. `queue.rs`'s
-`mod tests` gains 8 SQL-shape unit tests pinning the query text
-(concurrency gate omitted from the batch scan, every other gate preserved
-byte-for-byte including both capability-label branches, the cursor's
-four-column `OR`-chain, the authoritative recheck's exact shape, the
-concurrency probe's shape, the deadline recheck's use of
-`clock_timestamp()` and not `NOW()`, the shared rate-limit-formula helper
-used instead of a fourth hand-copied literal).
+timing-dependent), a regression test for the rate-limit-debit-leak-on-
+deadline bug above (same `pg_sleep` technique, asserts the bucket is
+untouched, also verified red then green), sticky routing and a
+capability-routed-activity gate exercised end-to-end through the real
+function (not just SQL-text checks), and — the gap ledger #5's own
+single-session apparatus explicitly could not close — real concurrent
+Tokio claimers racing a capped concurrency key, asserting the cap is
+never exceeded. `queue.rs`'s `mod tests` gains 9 SQL-shape unit tests
+pinning the query text (concurrency gate omitted from the batch scan,
+every other gate preserved byte-for-byte including both capability-label
+branches, the cursor's four-column `OR`-chain, the authoritative
+recheck's exact shape, the concurrency probe's shape, the deadline
+recheck's use of `clock_timestamp()` and not `NOW()` on both the debit
+and the claim, the shared rate-limit-formula helper used instead of a
+fourth hand-copied literal).
 
 **Measurement.** `docs/performance-claim-batched-seek-and-refine.md`,
 regenerated from a single run of

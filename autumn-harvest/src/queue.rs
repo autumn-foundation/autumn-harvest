@@ -6030,6 +6030,15 @@ pub async fn pending_queue_demand_by_queue_name(
 /// fresh `clock_timestamp()` recheck at claim time, the same
 /// soft-filter-plus-authoritative-recheck shape the concurrency gate uses.
 ///
+/// A fifth bug, caught by the same reviewer against the fourth bug's own
+/// fix. The new `clock_timestamp()` recheck only gated `claimed`, the CTE
+/// that performs the update. `rate_limit_debit` is a separate,
+/// data-modifying CTE in the same query. Postgres runs it regardless of
+/// whether `claimed` uses its result. So an expired-but-rate-limited
+/// candidate still spent a token, recreating the third bug's leak on the
+/// deadline path instead of the concurrency path. The fix adds the same
+/// `$9` deadline check to `rate_limit_debit`'s own `WHERE` clause.
+///
 /// # What this is not
 ///
 /// This is **not** wired into [`claim_task`] or [`claim_task_on_shard`].
@@ -6235,6 +6244,13 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
 /// This is the same shape the concurrency gate already uses: a soft
 /// filter in the scan, plus an authoritative recheck at claim time.
 ///
+/// The SAME `$9` check also gates `rate_limit_debit` (review finding,
+/// not present in the first deadline-recheck draft). A data-modifying
+/// CTE runs whether or not a later CTE uses its result. So without this,
+/// an expired candidate would still debit a token even though `claimed`
+/// always rejects it, recreating the leak
+/// [`claim_batched_candidate_concurrency_probe_query`] exists to close.
+///
 /// Binds: `$1` worker id, `$2` candidate row id, `$3` concurrency key,
 /// `$4` concurrency cap, `$5` task type. Also `$6` rate limit key, `$7`
 /// activity name, `$8` circuit-breaker-tracked activities, `$9` schedule-
@@ -6251,6 +6267,7 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
                  WHERE b.key = $6 \
                    AND NOT ($7 = ANY($8)) \
                    AND {rate_limit_available} >= 1.0 \
+                   AND ($9::timestamptz IS NULL OR $9::timestamptz > clock_timestamp()) \
                  RETURNING b.key AS debited_key \
              ), \
              claimed AS ( \
@@ -7342,10 +7359,33 @@ mod tests {
         );
         assert_eq!(
             sql.matches("clock_timestamp()").count(),
-            1,
-            "clock_timestamp() must appear exactly once, in the deadline \
-             recheck alone -- every other time-sensitive predicate in this \
-             query is deliberately frozen NOW(); got:\n{sql}"
+            2,
+            "clock_timestamp() must appear exactly twice: once in \
+             rate_limit_debit's own WHERE, once in claimed's -- both \
+             writes must skip an expired candidate, or the debit leaks a \
+             token the claim itself always rejects; got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR. A data-modifying
+    /// CTE runs even when nothing selects its result. So
+    /// `rate_limit_debit` must carry its own deadline recheck, not just
+    /// rely on `claimed`'s, or an expired-but-rate-limited candidate
+    /// still spends a token.
+    #[test]
+    fn claim_batched_candidate_attempt_query_gates_the_rate_limit_debit_on_the_deadline_too() {
+        let sql = claim_batched_candidate_attempt_query();
+        let debit_clause = sql
+            .split("rate_limit_debit AS (")
+            .nth(1)
+            .and_then(|rest| rest.split("RETURNING b.key AS debited_key").next())
+            .unwrap_or_default();
+        assert!(
+            debit_clause.contains("$9::timestamptz IS NULL")
+                && debit_clause.contains("$9::timestamptz > clock_timestamp()"),
+            "the debit CTE's own WHERE must recheck the deadline against \
+             clock_timestamp(), not rely solely on claimed rejecting the \
+             row afterward; got:\n{sql}"
         );
     }
 
