@@ -218,18 +218,26 @@ async fn drain_workflow_start_outbox_batch(
         .get()
         .await
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    // Captured BEFORE issuing the claim query, not after it returns
+    // (issue #1620 review, Codex, sixth round). Postgres sets
+    // `claimed_at = NOW()` inside that query, strictly before this
+    // `await` resolves. A post-return Instant is already later than the
+    // real database claim time. A deadline computed from it would run
+    // later than the actual expiry it is meant to stay clear of. A
+    // pre-call Instant is <= the real claim time instead. A deadline
+    // derived from it is always at or before the true expiry --
+    // conservative in the safe direction, never the unsafe one.
+    let claim_started_at = std::time::Instant::now();
     let rows = claim_due_outbox_rows(&mut app_conn, limit.max(1), &claimant, &config)
         .await
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
     // Every row in this batch got `claimed_at` set in that one claim
-    // query. One Instant, taken right after it returns, stands in for
-    // all of their claim times (issue #1620 review, Codex, fifth round).
-    // The drain loop's flush deadline must not run later than this.
-    // Otherwise a row whose claim is close to expiring could sit
-    // flushed-but-not-yet-due past `claim_ttl_ms`, while a slower row's
-    // dispatch is still pending.
-    let batch_claimed_at = std::time::Instant::now();
-    let claim_deadline = batch_claimed_at + Duration::from_millis(config.claim_ttl_ms);
+    // query. One deadline stands in for all of their claim times (issue
+    // #1620 review, Codex, fifth round). The drain loop's flush deadline
+    // must not run later than this. A row whose claim is close to
+    // expiring could otherwise sit flushed-but-not-yet-due past
+    // `claim_ttl_ms`, while a slower row's dispatch is still pending.
+    let claim_deadline = claim_started_at + Duration::from_millis(config.claim_ttl_ms);
 
     // issue #618, F-round8: the metrics recorder for the exempt-with-bypass-counter
     // "outbox" producer. Fetched once; the bypass is counted per row only AFTER the
