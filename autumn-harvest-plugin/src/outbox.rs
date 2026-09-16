@@ -193,9 +193,14 @@ const OUTBOX_MARK_FLUSH_MAX_DELAY: std::time::Duration = std::time::Duration::fr
 /// timer exactly at claim expiry leaves no time for the mark query's own
 /// round trip. A concurrent relay can win a reclaim race in that gap.
 /// Ten percent of the TTL, capped at one second, trades a small part of
-/// the claim window for headroom.
+/// the claim window for headroom. `.max(1)` keeps that trade real for
+/// every validated TTL (`claim_ttl_ms >= 1`). Plain integer division
+/// truncates a tenth of anything under 10ms to zero (issue #1620 review,
+/// Codex, ninth round), silently dropping the margin back to none. The
+/// final `.min(claim_ttl_ms)` caps it at the TTL itself, so a 1ms TTL
+/// reserves its own whole window rather than a margin bigger than it.
 fn claim_flush_margin_ms(claim_ttl_ms: u64) -> u64 {
-    (claim_ttl_ms / 10).min(1_000)
+    (claim_ttl_ms / 10).max(1).min(claim_ttl_ms).min(1_000)
 }
 
 /// How long the drain loop should wait before pending marks are due to
@@ -915,7 +920,9 @@ mod tests {
     }
 
     /// Ten percent of the TTL, capped at one second (issue #1620 review,
-    /// Codex, seventh round). Never more than the TTL itself, so
+    /// Codex, seventh round). At least 1ms whenever `claim_ttl_ms >= 1`
+    /// (ninth round): plain integer division truncates a tenth of
+    /// anything under 10ms to zero. Never more than the TTL itself, so
     /// `claim_ttl_ms.saturating_sub(margin)` never underflows to a
     /// deadline before `claim_started_at`.
     #[test]
@@ -924,13 +931,13 @@ mod tests {
         assert_eq!(claim_flush_margin_ms(5_000), 500, "under the cap: a tenth");
         assert_eq!(
             claim_flush_margin_ms(5),
-            0,
-            "a tenth rounds down to zero for a tiny TTL, never exceeding it"
+            1,
+            "under 10ms: a tenth would round down to zero, so the floor of 1ms applies"
         );
         assert_eq!(
             claim_flush_margin_ms(1),
-            0,
-            "the minimum valid TTL: zero margin, not underflow"
+            1,
+            "the minimum valid TTL: the whole 1ms is margin, not zero"
         );
     }
 
