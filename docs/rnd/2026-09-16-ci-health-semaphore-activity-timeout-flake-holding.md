@@ -1,5 +1,6 @@
-# 🚦 Semaphore CI health — activity-timeout flake holds at 0/23 runs actually
-# inspected (not a full census) spanning PR #1563's merge, and a stale
+# 🚦 Semaphore CI health — activity-timeout flake holds at 0/3 confirmed
+# shard-8 executions (not 0/15, not 0/23 — most job-logged failures never
+# ran the tracked test at all) spanning PR #1563's merge, and a stale
 # migration count blocked one branch three commits running (its panic
 # message's own self-contradiction is a separate, unrelated bug)
 
@@ -7,7 +8,7 @@
 the series in `docs/rnd/2026-09-0[3-8]-ci-health-semaphore*.md` through
 `docs/rnd/2026-09-15-ci-health-semaphore-window-census.md`.
 
-**Corrected six times after review** (Codex on PR #1599): the initial
+**Corrected seven times after review** (Codex on PR #1599): the initial
 draft overclaimed a full 100-run job-level census when only 23 runs were
 actually job-logged (restated twice more after later drafts reintroduced
 the same "full census" wording at other locations); overstated branch
@@ -19,12 +20,21 @@ panic-message bug rather than the stale doc that actually caused them
 (also reintroduced and refixed at a second location, including in this
 report's own section heading); claimed the tracked event-history
 assertion could no longer fire post-#1563, when the source still has a
-catch-all panic arm; and, in item 3, conflated two entirely different
-branches, crediting one branch's later unrelated failures to a different
-branch's single, isolated occurrence. Each correction is called out inline
-below at the point it applies, verified against source or raw job logs
-rather than taken on faith — the pattern this series' own prior reports
-already follow.
+catch-all panic arm; conflated two entirely different branches in item 3,
+crediting one branch's later unrelated failures to a different branch's
+single, isolated occurrence; and, most substantively, treated "job-logged"
+as equivalent to "actually ran the tracked test" — `test-db-linux` needs
+`[lint, changes]` and is skipped, not run, whenever `lint` fails, which it
+did in 13 of the 15 explicit failures this report counted. Rechecking
+which runs actually executed shard 8 (where the tracked test lives) found
+only 3 in the entire window, not 15 or 23 — one clean pass, two failures
+via one unrelated already-fixed defect, also uncovering that one of those
+runs (`35063499036`) had been mischaracterized as a single-signature
+failure when it actually carried 12 failed jobs across two unrelated
+defects. Each correction is called out inline below at the point it
+applies, verified against source, raw job logs, or direct `curl` of signed
+log URLs rather than taken on faith — the pattern this series' own prior
+reports already follow.
 
 ## 🎯 Verdict path
 
@@ -72,6 +82,50 @@ own prior findings. Split the 15 explicit failures at the merge instant:
 
 All 15 failures were individually job-logged (not inferred from branch/message
 alone). **0/15 carry the activity-timeout signature**, in either window.
+
+**Correction (post-review) — most of those 15 runs never gave the tracked
+test a chance to run at all.** A Codex review correctly pointed out that
+"0/15" (and this report's later "0/23") measures how many *job-logged
+failures* carry the signature, not how many runs actually **executed**
+the test — and those are very different denominators here.
+`test-db-linux` (`ci.yml:948-950`) declares `needs: [lint, changes]`, and
+GitHub Actions skips a job when a `needs` job fails (no `always()`
+override is present for this job). Checked directly via
+`list_workflow_jobs` on run `34891219422` (a `Lint`-only failure): its
+`Test DB (linux, shard N)` legs all show `conclusion: "skipped"`, not
+`"failure"` or `"success"` — confirming the mechanism. Of the 15 explicit
+failures, **13 failed inside the `Lint` job itself** (comment-hygiene,
+clippy, `cargo fmt`, `sqlite_feasibility_docs`) — for every one of these,
+shard 8 (where `integration_e2e.rs`, and thus the tracked test, actually
+runs — see the shard-sharding math below) never executed. Those 13 runs
+say nothing about whether the tracked signature recurred; they are not
+zero-evidence-for-the-flake, they are **no-evidence-at-all**.
+
+Only **2 of the 15** explicit failures had `Lint` succeed and `test-db-linux`
+actually run: `35034838493` and `35063499036`. Fetched both runs' shard-8
+logs directly (`get_job_logs(..., return_content=false)` for the signed
+URL, `curl`, `grep`) to check the tracked test's own outcome, not just the
+run's overall conclusion:
+
+| Run | Shard 8 outcome | Tracked test (`worker_fails_workflow_when_activity_start_to_close_timeout_elapses`) |
+|---|---|---|
+| `35034838493` (2026-09-15T23:15:28Z, post-merge) | failed (`quota_enforcement_tests`, item 3) | **`... ok`** — passed cleanly |
+| `35063499036` (2026-09-16T06:23:34Z, post-merge) | failed (12 jobs total — see item 4's correction) | failed, but via `DatabaseError(..., "column harvest_workflow_executions.migrated_run_terminal_at does not exist")` at `integration_e2e.rs:729:10`, the same missing-column defect as `35072771791` below — **not** the tracked signature |
+
+Combined with the cancelled-run audit's `35072771791` (shard 8 also ran,
+also hit the identical missing-column defect, not the tracked signature —
+see below), this window's **actually-confirmed shard-8 executions total
+3, not 15 or 23**: one clean pass, two failures via one unrelated,
+already-diagnosed, since-fixed defect. Notably all three are the *same
+branch*'s (`claude/hopeful-pascal-tbijcf`) successive commits — the clean
+pass predates that branch's schema regression, the two failures postdate
+it and predate its fix. This is a much thinner evidentiary base than "0/23"
+implied: most of the window's 100 runs (all 13 `Lint`-failing explicit
+failures, most of the 55 cancelled runs per the audit below, and all 30
+successful runs — unverified this session whether their `test-db-linux`
+step actually executed rather than being skipped as docs-only) give no
+information either way about whether the tracked signature recurred. The
+honest statement is 0/3 confirmed executions, not 0/15 or 0/23.
 
 **This is not the rerun campaign issue #1558 asked for** — it is
 frequency-in-the-wild evidence over calendar time and a shifting set of
@@ -245,12 +299,15 @@ runs named:
 | `35034267335` | `cargo fmt` diff (`shard_rebalance_db_tests.rs`, `workflow_rerun_integration.rs`) |
 | `35045856467` | `cargo fmt` diff (`shard_rebalance_db_tests.rs`, `autumn-harvest-cli/src/lib.rs`, `workflow_filter_integration.rs`) |
 | `35060937048` | clippy `map_unwrap_or` (`analyze_profile.rs`) |
-| `35063499036` | `migration_hygiene::every_release_migration_is_in_the_upgrade_guide` (missing inventory row) |
+| `35063499036` | `migration_hygiene::every_release_migration_is_in_the_upgrade_guide` (missing inventory row) on `Test (macos/windows/ubuntu-latest)` — **correction (post-review):** this run has 12 failed jobs total, not 1. `Lint` itself succeeded on this run (unlike the other 13 rows in this table), which let `test-db-linux` actually execute — and 8 of its shards (including shard 8) then failed on the unrelated missing-column defect from the cancelled-run audit below, confirmed by direct log inspection of shard 8. Counted once here for `migration_hygiene` (the `Lint`-adjacent `Test (<os>)` jobs' signature); the missing-column failures on this same run are the same defect as `35072771791`'s, not a new signature |
 
 By signature: comment-hygiene (1 run), `cargo fmt` (3 runs, not 1 as an
 earlier draft implied), clippy (4 runs: `redundant_clone`, dead-code,
 `doc_markdown`, `map_unwrap_or`), E0433 `diesel` (2 runs, one root cause),
-`migration_hygiene` (1 run, previously unmentioned). 1+3+4+2+1 = 11 runs,
+`migration_hygiene` (1 run, previously unmentioned — though that run also
+independently carries the missing-column defect on 8 other jobs, not
+counted as a 12th run since it's the same run already in this table).
+1+3+4+2+1 = 11 runs,
 matching the section heading. The two `diesel`/E0433 occurrences are the
 same commit-family defect counted once in the diagnosis below, not two
 independent findings.
@@ -280,18 +337,23 @@ suite-state interaction, no timing component, no order dependence.
 ## 🔍 Diagnosis
 
 **Item 1** is not yet a rendered verdict on PR #1563's fix — that still
-requires the rerun campaign issue #1558 asked for and never got — but the
-frequency-in-the-wild evidence has moved from "unconfirmed" toward
-"holding": zero recurrences across the 23 runs actually inspected (15
-explicit failures plus an 8-run cancelled-run sample), versus 3
-occurrences the day before. **Correction (post-review):** an earlier
-draft of this sentence called the window a "full (not sampled) two-day
-failure census," which the Symptom section above already corrects — 47 of
-55 cancelled runs in this window were never job-logged, and this report's
-own cancelled-run audit found real hidden failures elsewhere in that
-population, so "full census" overstates what was actually checked. The
-result holds only for the population inspected. Recorded as a data point
-for whoever next has the ability to run the actual rerun campaign, not
+requires the rerun campaign issue #1558 asked for and never got.
+**Correction (post-review), superseding two earlier drafts of this
+sentence:** the first draft called the window a "full (not sampled)
+two-day failure census"; the second walked that back to "23 runs actually
+inspected." Both overstate the evidence. The real denominator is not
+"runs job-logged," it is "runs where `test-db-linux` actually executed" —
+and per the Symptom section's correction above, only 3 runs in this
+entire window are confirmed to have done that (`35034838493`,
+`35063499036`, and the cancelled run `35072771791`), all three on the
+same branch's successive commits. Of those 3: one passed the tracked test
+cleanly, two failed via one unrelated, already-diagnosed, since-fixed
+schema defect. **0/3, not 0/15 and not 0/23.** That is directionally
+consistent with the fix holding — no occurrence contradicts it — but it
+is a far thinner base than the frequency-in-the-wild framing this report
+originally claimed, and nowhere near issue #1558's own ≥20x rerun-campaign
+bar. Recorded as a data point for whoever next has the ability to run
+the actual rerun campaign, not
 claimed as a Tier-1 confirmation.
 
 **Item 2** is the doc-sync gate working as designed: three round-trips in
@@ -365,20 +427,26 @@ Items carried forward, unchanged from the 09-08/09-14/09-15 reports:
 
 ## 📊 Measurement
 
-- **Item 1: correction (post-review).** An earlier draft of this line
-  claimed "100/100 runs... individually job-logged (full census)." False —
-  `list_workflow_runs` *enumerated* all 100 runs' conclusions, but only the
-  15 explicit-failure runs plus an 8-run cancelled-run sample (23 runs
-  total) were actually job-logged. The other 77 runs (30 success, 47
-  cancelled-and-unaudited) were never inspected below the run level. Stated
-  correctly: of the **23 runs actually job-logged**, 0/23 carry the
-  activity-timeout signature (15 explicit failures — 5 in 18h14m pre-merge,
-  10 in 19h33m post-merge — plus 2/8 sampled cancelled runs that hid a
-  real job failure, neither matching the signature). This is evidence from
-  the population actually inspected, not a census of the full window; the
-  remaining 77 runs, including 47 cancelled ones, could in principle hide
-  an occurrence. Not a same-commit rerun — no revert check applies, since
-  no fix was made or verified this session.
+- **Item 1: correction (post-review), third pass.** Two earlier drafts of
+  this line claimed first "100/100 runs... individually job-logged (full
+  census)," then "23 runs actually job-logged, 0/23 carry the signature."
+  Both overstate the evidence: `job-logged` is not the same as `actually
+  executed the tracked test`. `test-db-linux` needs `[lint, changes]`
+  (`ci.yml:948-950`) and is skipped, not run, when `lint` fails —
+  confirmed directly via `list_workflow_jobs` on run `34891219422`, whose
+  `Test DB` legs all show `conclusion: "skipped"`. Of the 15 explicit
+  failures, 13 failed inside `lint` itself, so shard 8 (where the tracked
+  test lives) never ran in any of them. Only 3 runs in the entire window
+  are confirmed to have actually executed shard 8: `35034838493` (tracked
+  test passed — `... ok`, confirmed by direct log grep),
+  `35063499036`, and the cancelled run `35072771791` (both of the latter
+  failed via the same unrelated, already-diagnosed, since-fixed
+  missing-column defect, not the tracked signature). **The correct figure
+  is 0/3, not 0/15 and not 0/23.** The 30 successful runs and the
+  remaining 47 unaudited cancelled runs in this window were not checked
+  for whether `test-db-linux` actually executed versus was skipped, so
+  they add no confirmed exposure either way. Not a same-commit rerun — no
+  revert check applies, since no fix was made or verified this session.
 - **Item 2:** 3/3 occurrences on one branch confirmed identical panic text
   (`"**107 migrations**"` on both sides) via direct job-log inspection.
 - **Item 3:** 1/1, not a rate.
@@ -414,8 +482,11 @@ Items carried forward, unchanged from the 09-08/09-14/09-15 reports:
   root-caused failures carry the previously-tracked activity-timeout
   signature, and neither unclassified failure's assertion text matches it
   either. 0/2 hidden cancelled-run failures (of the 8-run sample actually
-  inspected) carry it
-  either.
+  inspected) carry it either. **None of this changes item 1's own
+  denominator correction above**: these 15/2 counts are over runs that
+  failed for *some* reason, not runs that actually executed the tracked
+  test — the operative figure for "did the flake recur" is item 1's 0/3
+  confirmed shard-8 executions, not any count phrased in fifteenths.
 
 ## 🔬 Reproduce
 
@@ -507,4 +578,23 @@ grep -n "seeded_corpus_is_clean_under_the_syntactic_layer" \
 
 # Remaining 11 post-merge and all 36 pre-merge cancelled runs: not audited
 # this session.
+
+# The "job-logged != actually ran" denominator check (the Codex-flagged
+# gap): confirm test-db-linux's needs graph, then verify skip-on-failure
+# directly on one Lint-only failure:
+grep -n "needs:" .github/workflows/ci.yml
+sed -n '940,955p' .github/workflows/ci.yml   # test-db-linux: needs: [lint, changes]
+# list_workflow_jobs(resource_id=34891219422, perPage=100) -> every
+#   "Test DB (linux, shard N)" leg shows conclusion "skipped", confirming
+#   Lint failures give zero exposure to the tracked test.
+# Repeated the same list_workflow_jobs check for the other 12 Lint-failing
+# runs of this report's 15 explicit failures (all skip test-db-linux the
+# same way); the only 2 explicit failures where Lint succeeded and
+# test-db-linux actually ran are 35034838493 and 35063499036.
+# get_job_logs(job_id=104609028589, return_content=false) -> shard 8 of
+#   35034838493; curl + grep "worker_fails_workflow_when_activity_start_to_close_timeout_elapses"
+#   -> "... ok" (clean pass).
+# get_job_logs(job_id=104694905315, return_content=false) -> shard 8 of
+#   35063499036; curl + grep "does not exist" -> same missing-column
+#   defect as 35072771791, 106 occurrences in the log.
 ```
