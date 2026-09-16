@@ -172,7 +172,32 @@ pub async fn drain_workflow_start_outbox_once(
 /// a handful of dispatches. The alternative, flushing only once after
 /// the whole batch has dispatched, bounds it to the rest of the batch
 /// instead (issue #1620 review, Codex).
+///
+/// This bound is on outcome COUNT, not elapsed time. Dispatch is
+/// sequential, not concurrent, so nothing can flush pending marks while
+/// one dispatch is still in flight. One long-running dispatch still
+/// holds every row already queued in its chunk. It holds them for that
+/// whole call's duration (issue #1620 review, Codex, second round).
+/// `OUTBOX_MARK_FLUSH_MAX_DELAY` below bounds that case too. The loop
+/// also flushes as soon as a dispatch returns, once enough wall time has
+/// passed since the last flush. A slow dispatch then no longer also
+/// waits on `OUTBOX_MARK_FLUSH_EVERY` more outcomes on top of its own
+/// delay.
 const OUTBOX_MARK_FLUSH_EVERY: usize = 8;
+
+/// How much wall time may pass since the last flush before the next
+/// dispatch's return flushes pending marks regardless of outcome count.
+/// See `OUTBOX_MARK_FLUSH_EVERY`.
+const OUTBOX_MARK_FLUSH_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Whether pending marks should flush now, checked right after each
+/// dispatch returns. `pending` is 0 when nothing has accumulated (the
+/// previous dispatch's outcome was flushed immediately before this one
+/// started), which is never due.
+fn outbox_mark_flush_due(pending: usize, since_last_flush: std::time::Duration) -> bool {
+    pending > 0
+        && (pending >= OUTBOX_MARK_FLUSH_EVERY || since_last_flush >= OUTBOX_MARK_FLUSH_MAX_DELAY)
+}
 
 async fn drain_workflow_start_outbox_batch(
     state: &AppState,
@@ -222,6 +247,7 @@ async fn drain_workflow_start_outbox_batch(
     // here instead keeps this row's actual backoff close to
     // `retry_delay_ms`, whatever the rest of the chunk took.
     let mut failed_marks: Vec<(i64, String, std::time::Instant)> = Vec::new();
+    let mut last_flush = std::time::Instant::now();
     for row in rows {
         match dispatch_workflow_start_request(state, &row.request()).await {
             Ok(exec_id) => delivered_marks.push((row.id, exec_id)),
@@ -233,7 +259,8 @@ async fn drain_workflow_start_outbox_batch(
             }
         }
 
-        if delivered_marks.len() + failed_marks.len() >= OUTBOX_MARK_FLUSH_EVERY {
+        let pending = delivered_marks.len() + failed_marks.len();
+        if outbox_mark_flush_due(pending, last_flush.elapsed()) {
             delivered += flush_outbox_marks(
                 &mut app_conn,
                 &claimant,
@@ -243,6 +270,7 @@ async fn drain_workflow_start_outbox_batch(
             )
             .await
             .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+            last_flush = std::time::Instant::now();
         }
     }
     delivered += flush_outbox_marks(
@@ -684,6 +712,37 @@ fn retry_delay_ms(config: &HarvestOutboxConfig, row: &HarvestWorkflowOutboxRow) 
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    /// A slow dispatch bounds the flush wait to `OUTBOX_MARK_FLUSH_MAX_DELAY`,
+    /// not `OUTBOX_MARK_FLUSH_EVERY` more outcomes (issue #1620 review,
+    /// Codex, second round). Count alone cannot bound wall time: dispatch
+    /// is sequential, so nothing can flush while one dispatch is still in
+    /// flight.
+    #[test]
+    fn outbox_mark_flush_due_bounds_by_count_or_by_elapsed_time() {
+        use std::time::Duration;
+
+        assert!(
+            !outbox_mark_flush_due(0, Duration::from_secs(3600)),
+            "nothing pending is never due, however long it has been"
+        );
+        assert!(
+            !outbox_mark_flush_due(OUTBOX_MARK_FLUSH_EVERY - 1, Duration::ZERO),
+            "under the count threshold and no time elapsed: not due"
+        );
+        assert!(
+            outbox_mark_flush_due(OUTBOX_MARK_FLUSH_EVERY, Duration::ZERO),
+            "count threshold reached: due regardless of elapsed time"
+        );
+        assert!(
+            !outbox_mark_flush_due(1, OUTBOX_MARK_FLUSH_MAX_DELAY - Duration::from_millis(1)),
+            "under the time threshold and under the count threshold: not due"
+        );
+        assert!(
+            outbox_mark_flush_due(1, OUTBOX_MARK_FLUSH_MAX_DELAY),
+            "time threshold reached: due even with only one outcome pending"
+        );
+    }
 
     #[test]
     fn retry_delay_caps_growth() {

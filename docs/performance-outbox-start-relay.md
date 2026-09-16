@@ -147,10 +147,10 @@ called from `flush_outbox_marks`, bind one array per column and join via
 literal `VALUES (...), (...), ...` list whose text would grow a distinct
 shape per batch size.
 
-Three review-round corrections (Codex, on the PR) landed after the numbers
+Four review-round corrections (Codex, on the PR) landed after the numbers
 above were captured. The first two do not change statement count or
-buffers; the third does, at batch sizes above `OUTBOX_MARK_FLUSH_EVERY` --
-see below.
+buffers; the third does, at batch sizes above `OUTBOX_MARK_FLUSH_EVERY`;
+the fourth changes a wall-clock bound the numbers cannot see -- see below.
 
 1. The admission-bypass metric is recorded right after the delivered
    batch mark commits, not after both marks have run. The two marks are
@@ -182,6 +182,19 @@ see below.
    reaches the 8-outcome threshold. Both floor criteria from the
    single-flush measurement still clear at every swept size; see that
    file for the recomputed deltas.
+4. `OUTBOX_MARK_FLUSH_EVERY` alone only bounds outcome COUNT: dispatch is
+   sequential, so nothing can flush pending marks while one dispatch is
+   still in flight. One dispatch that itself runs long still holds every
+   row already queued in its chunk, for that whole call's duration
+   (issue #1620 review, Codex, second round). The loop now also flushes
+   as soon as a dispatch returns if `OUTBOX_MARK_FLUSH_MAX_DELAY` (250ms)
+   has passed since the last flush, so a slow dispatch no longer waits on
+   `OUTBOX_MARK_FLUSH_EVERY` more outcomes on top of its own delay. This
+   is a wall-clock bound, invisible to `pg_stat_statements`'s call/buffer
+   counts under this harness's fast, un-delayed dispatch -- the
+   `after-sweep-chunked.txt` numbers above are unaffected by it. The
+   decision itself (`outbox_mark_flush_due`) is covered by a pure unit
+   test, `outbox_mark_flush_due_bounds_by_count_or_by_elapsed_time`.
 
 Flushing every chunk, rather than waiting for the whole batch, is safe
 under the same idempotency the relay already relies on. A crash between
