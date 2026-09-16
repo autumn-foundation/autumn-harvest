@@ -1814,6 +1814,7 @@ impl WorkflowHandle {
             return Ok(None);
         }
 
+        let mut listener_shard = self.shard().await?;
         let mut listener = self.connect_listener().await?;
 
         loop {
@@ -1827,27 +1828,48 @@ impl WorkflowHandle {
                 return Ok(None);
             }
             let remaining = deadline.saturating_duration_since(now);
-            match listener.wait_for_notification_timeout(remaining).await? {
+
+            // Shard-residence rebind (issue #1317 review, P1 follow-up),
+            // the same mechanism `result_raw` uses via
+            // `RESULT_WAIT_SAFETY_NET`. A listener stays bound to whichever
+            // shard it resolved at connect time. A mid-wait migration
+            // would otherwise go unnoticed for this call's entire
+            // (potentially very long) caller-supplied timeout.
+            let current_shard = self.shard().await?;
+            if current_shard != listener_shard {
+                listener = self.connect_listener().await?;
+                listener_shard = current_shard;
+            }
+            let wait_for = remaining.min(Self::RESULT_WAIT_SAFETY_NET);
+
+            match listener.wait_for_notification_timeout(wait_for).await? {
                 WorkflowEventWaitOutcome::Notification(_payload) => {}
                 WorkflowEventWaitOutcome::TimedOut => {
-                    let snapshot =
-                        WorkflowResult::from_execution(&self.load_effective_execution().await?);
-                    return if snapshot.is_terminal() {
-                        Ok(Some(snapshot))
-                    } else {
-                        Ok(None)
-                    };
+                    // Distinguish the safety-net tick from the caller's
+                    // real deadline: only the latter ends the wait.
+                    if Instant::now() >= deadline {
+                        let snapshot =
+                            WorkflowResult::from_execution(&self.load_effective_execution().await?);
+                        return if snapshot.is_terminal() {
+                            Ok(Some(snapshot))
+                        } else {
+                            Ok(None)
+                        };
+                    }
                 }
                 WorkflowEventWaitOutcome::ChannelClosed => {
                     listener = self.connect_listener().await?;
+                    listener_shard = self.shard().await?;
                 }
             }
         }
     }
 
-    /// Upper bound on how long [`result_raw`](Self::result_raw) blocks on one
-    /// listener tick before re-checking residence and terminal state on its
-    /// own (issue #1317 review, P1).
+    /// Upper bound on how long each of [`result_raw`](Self::result_raw),
+    /// [`result_raw_with_timeout`](Self::result_raw_with_timeout), and
+    /// [`result_snapshot_with_wait`](Self::result_snapshot_with_wait)
+    /// blocks on one listener tick. Each re-checks residence and terminal
+    /// state on its own before continuing (issue #1317 review, P1).
     ///
     /// This is the whole mechanism, not merely a fallback. The shard-change
     /// check that rebinds the listener only runs BETWEEN ticks, never while
@@ -1947,6 +1969,7 @@ impl WorkflowHandle {
             return Err(wait_timeout_error(&execution));
         }
 
+        let mut listener_shard = self.shard().await?;
         let mut listener = self.connect_listener().await?;
 
         loop {
@@ -1962,19 +1985,40 @@ impl WorkflowHandle {
                 return Err(wait_timeout_error(&execution));
             }
             let remaining = deadline.saturating_duration_since(now);
-            match listener.wait_for_notification_timeout(remaining).await? {
+
+            // Shard-residence rebind (issue #1317 review, P1 follow-up),
+            // the same mechanism `result_raw` uses via
+            // `RESULT_WAIT_SAFETY_NET`. Without it a mid-wait migration
+            // would go unnoticed for this call's entire caller-supplied
+            // timeout, which can run minutes or hours.
+            let current_shard = self.shard().await?;
+            if current_shard != listener_shard {
+                listener = self.connect_listener().await?;
+                listener_shard = current_shard;
+            }
+            let wait_for = remaining.min(Self::RESULT_WAIT_SAFETY_NET);
+
+            match listener.wait_for_notification_timeout(wait_for).await? {
                 WorkflowEventWaitOutcome::Notification(_payload) => {}
                 WorkflowEventWaitOutcome::TimedOut => {
-                    let execution = self.load_effective_execution().await?;
-                    if let Some(result) = terminal_raw_result(&execution) {
-                        return self
-                            .enrich_terminal_result(ExecutionId::from_uuid(execution.id), result)
-                            .await;
+                    // Distinguish the safety-net tick from the caller's
+                    // real deadline: only the latter ends the wait.
+                    if Instant::now() >= deadline {
+                        let execution = self.load_effective_execution().await?;
+                        if let Some(result) = terminal_raw_result(&execution) {
+                            return self
+                                .enrich_terminal_result(
+                                    ExecutionId::from_uuid(execution.id),
+                                    result,
+                                )
+                                .await;
+                        }
+                        return Err(wait_timeout_error(&execution));
                     }
-                    return Err(wait_timeout_error(&execution));
                 }
                 WorkflowEventWaitOutcome::ChannelClosed => {
                     listener = self.connect_listener().await?;
+                    listener_shard = self.shard().await?;
                 }
             }
         }

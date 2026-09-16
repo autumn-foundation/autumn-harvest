@@ -43242,9 +43242,36 @@ async fn stream_execution_events(
             // ── 3. Live-tail: LISTEN/NOTIFY loop ─────────────────────────────
             let mut last_seen_id = backfill.last().map_or(last_row_id, |r| r.id);
             let mut listener = listener;
+            let mut listener_shard = shard;
             let buf_limit = i64::try_from(api_clone.sse_buffer_depth()).ok();
 
             'notify: loop {
+                // Shard-residence rebind (issue #1317 review, P2 follow-up).
+                // The listener stays bound to whichever shard it resolved
+                // at connect time. If the execution migrates mid-stream,
+                // that connection stays healthy -- no `ChannelClosed` -- so
+                // nothing wakes it again on its own. The periodic
+                // `TimedOut` poll below still finds new rows, because its
+                // own DB read follows the forwarding pointer fresh every
+                // time. Only the listener itself stays pinned to the stale
+                // shard. Without this rebind the stream would silently
+                // degrade from event-driven to poll-only delivery for the
+                // rest of its life once a migration happens.
+                if let Ok(pool) = api_clone.storage_pool()
+                    && let Ok(current_shard) =
+                        ::autumn_harvest::shard_rebalance::resolve_execution_shard(
+                            pool.sharded_pool(),
+                            exec_id,
+                        )
+                        .await
+                    && current_shard != listener_shard
+                    && let Ok(url) = api_clone.sse_notification_url(current_shard)
+                    && let Ok(l) = WorkflowEventListener::connect(&url).await
+                {
+                    listener = l;
+                    listener_shard = current_shard;
+                }
+
                 // Use 2× keepalive as notification timeout so the KeepAlive wrapper
                 // has time to send its ping before this loop wakes and re-checks
                 let wait_timeout = keepalive_interval.saturating_mul(2);
@@ -43344,7 +43371,16 @@ async fn stream_execution_events(
                     Ok(WorkflowEventWaitOutcome::ChannelClosed) => {
                         // LISTEN connection dropped; reconnect and backfill any events
                         // that may have been committed while the connection was down.
-                        let Ok(l) = WorkflowEventListener::connect(&notification_url).await else {
+                        // Reconnect to `listener_shard`, not the original
+                        // `notification_url` (issue #1317 review, P2
+                        // follow-up). The shard-rebind check above this
+                        // match may have already moved the listener this
+                        // very tick. Reconnecting to the stale URL would
+                        // silently undo that.
+                        let Ok(url) = api_clone.sse_notification_url(listener_shard) else {
+                            break 'notify;
+                        };
+                        let Ok(l) = WorkflowEventListener::connect(&url).await else {
                             break 'notify;
                         };
                         listener = l;
@@ -43635,7 +43671,32 @@ async fn stream_workflow_progress(
             };
 
             let mut listener = listener;
+            let mut listener_shard = shard;
             loop {
+                // Shard-residence rebind (issue #1317 review, P2 follow-up).
+                // Unlike the events stream above, this loop had no rebind
+                // and no fallback. `ChannelClosed` just ends the stream.
+                // The terminal-state poll below only detects the workflow
+                // finishing, not new chunks published elsewhere. A
+                // migration mid-stream would silently and permanently
+                // stop chunk delivery until the workflow finished on its
+                // new shard. Re-resolving here before every wait catches
+                // that promptly instead.
+                if let Ok(pool) = api_clone.storage_pool()
+                    && let Ok(current_shard) =
+                        ::autumn_harvest::shard_rebalance::resolve_execution_shard(
+                            pool.sharded_pool(),
+                            exec_id,
+                        )
+                        .await
+                    && current_shard != listener_shard
+                    && let Ok(url) = api_clone.sse_notification_url(current_shard)
+                    && let Ok(l) = WorkflowProgressListener::connect(&url, exec_id.as_uuid()).await
+                {
+                    listener = l;
+                    listener_shard = current_shard;
+                }
+
                 match listener.wait_for_progress_timeout(keepalive).await {
                     Ok(ProgressWaitOutcome::Chunk(payload)) => {
                         if !emit_chunk(&mut tx, payload) {
