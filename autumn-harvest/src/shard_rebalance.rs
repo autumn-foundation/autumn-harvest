@@ -1699,7 +1699,22 @@ mod db {
                  execution row nor its summary exists there"
             )));
         };
-        if row.state == "MIGRATED" || !crate::erase::is_terminal_state(&row.state) {
+        // `FAILED`/`CANCELLED`/`TIMED_OUT` are terminal for erasure purposes
+        // (issue #495's `is_terminal_state`) but NOT final here (issue
+        // #1317 review). `reset.rs`'s `validate_source_execution` permits
+        // resetting a row in any of those three states. A reset forks a
+        // fresh same-key execution, at an arbitrary future time, and only
+        // then seals the old row `TERMINATED`. Releasing this seal while
+        // the target sits at one of them would leave a standing window.
+        // A later reset creates a live fork on the target shard. No seal
+        // is left on the source shard to stop a normal start from also
+        // succeeding there. Only `COMPLETED`/`TERMINATED` (rejected by
+        // `validate_source_execution` as "nothing to retry") are genuinely
+        // final, so this predicate waits for one of those instead.
+        if row.state == "MIGRATED"
+            || matches!(row.state.as_str(), "FAILED" | "CANCELLED" | "TIMED_OUT")
+            || !crate::erase::is_terminal_state(&row.state)
+        {
             return Ok(false);
         }
         // A terminal row's OWN state is not the whole answer (issue #1317
@@ -1933,6 +1948,65 @@ mod db {
     /// say) still fails verification: only [`HarvestError::UnknownCodecKey`]
     /// and [`HarvestError::UnknownPayloadCodec`] trigger this.
     ///
+    /// Resolve check 2 (identical replay) into the agreed fingerprint, given
+    /// each side's codec-decoded history. Split out of [`verify_target_copy`]
+    /// to keep that function under clippy's line-count lint.
+    ///
+    /// `codecs` not registering a payload's codec or key at all (issue
+    /// #1317) degrades to the raw fingerprint of `source_raw`. See
+    /// [`verify_target_copy`]'s own doc comment for the full rationale.
+    /// The OTHER side must be `Ok` or itself an allowed unknown-codec
+    /// error. A genuine failure there -- a database error, a malformed
+    /// payload -- still propagates. Matching it with a wildcard would
+    /// report successful raw verification over a history read that
+    /// actually failed.
+    fn resolve_migration_fingerprint(
+        exec_id: ExecutionId,
+        source_result: HarvestResult<crate::store::EventHistory>,
+        target_result: HarvestResult<crate::store::EventHistory>,
+        source_raw: &Value,
+    ) -> HarvestResult<String> {
+        match (source_result, target_result) {
+            (Ok(source_history), Ok(target_history)) => {
+                let source_fingerprint = history_fingerprint(&source_history.events);
+                let target_fingerprint = history_fingerprint(&target_history.events);
+                if source_fingerprint != target_fingerprint {
+                    return Err(HarvestError::NonDeterministic {
+                        reason: format!(
+                            "shard migration of {exec_id} failed replay verification: the \
+                             copied history replays to a different next-command state \
+                             (source {source_fingerprint}, target {target_fingerprint})"
+                        ),
+                        details: Box::new(crate::error::NonDeterministicDetails {
+                            event_index: None,
+                            expected: Some(source_fingerprint),
+                            actual: Some(target_fingerprint),
+                            workflow_type: None,
+                            build_id: None,
+                        }),
+                    });
+                }
+                Ok(source_fingerprint)
+            }
+            (
+                Ok(_)
+                | Err(
+                    HarvestError::UnknownCodecKey { .. } | HarvestError::UnknownPayloadCodec { .. },
+                ),
+                Err(
+                    HarvestError::UnknownCodecKey { .. } | HarvestError::UnknownPayloadCodec { .. },
+                ),
+            )
+            | (
+                Err(
+                    HarvestError::UnknownCodecKey { .. } | HarvestError::UnknownPayloadCodec { .. },
+                ),
+                Ok(_),
+            ) => Ok(format!("raw:{}", raw_history_fingerprint(source_raw))),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        }
+    }
+
     /// Returns the agreed fingerprint. A failure aborts the migration with the
     /// source untouched.
     ///
@@ -1972,59 +2046,8 @@ mod db {
 
         let source_result = crate::store::load_history_with_codecs(source, exec_id, codecs).await;
         let target_result = crate::store::load_history_with_codecs(target, exec_id, codecs).await;
-        let fingerprint = match (source_result, target_result) {
-            (Ok(source_history), Ok(target_history)) => {
-                let source_fingerprint = history_fingerprint(&source_history.events);
-                let target_fingerprint = history_fingerprint(&target_history.events);
-                if source_fingerprint != target_fingerprint {
-                    return Err(HarvestError::NonDeterministic {
-                        reason: format!(
-                            "shard migration of {exec_id} failed replay verification: the \
-                             copied history replays to a different next-command state \
-                             (source {source_fingerprint}, target {target_fingerprint})"
-                        ),
-                        details: Box::new(crate::error::NonDeterministicDetails {
-                            event_index: None,
-                            expected: Some(source_fingerprint),
-                            actual: Some(target_fingerprint),
-                            workflow_type: None,
-                            build_id: None,
-                        }),
-                    });
-                }
-                source_fingerprint
-            }
-            // `codecs` does not register whatever encoded this deployment's
-            // payloads -- a keyed codec (`UnknownCodecKey`) or a plain custom
-            // one (`UnknownPayloadCodec`) (issue #1317). Check 1 above
-            // already proved the raw rows byte-identical; that is the
-            // verification this call can still perform without the
-            // application's own codec.
-            //
-            // The OTHER side must be `Ok` or itself an allowed unknown-codec
-            // error. A genuine failure there -- a database error, a malformed
-            // payload -- must still propagate. Matching it with a wildcard
-            // would report successful raw verification over a history read
-            // that actually failed.
-            (
-                Ok(_)
-                | Err(
-                    HarvestError::UnknownCodecKey { .. } | HarvestError::UnknownPayloadCodec { .. },
-                ),
-                Err(
-                    HarvestError::UnknownCodecKey { .. } | HarvestError::UnknownPayloadCodec { .. },
-                ),
-            )
-            | (
-                Err(
-                    HarvestError::UnknownCodecKey { .. } | HarvestError::UnknownPayloadCodec { .. },
-                ),
-                Ok(_),
-            ) => {
-                format!("raw:{}", raw_history_fingerprint(&source_raw))
-            }
-            (Err(e), _) | (_, Err(e)) => return Err(e),
-        };
+        let fingerprint =
+            resolve_migration_fingerprint(exec_id, source_result, target_result, &source_raw)?;
 
         // Stamp the high-water mark of THE HISTORY THIS CALL ACTUALLY VERIFIED,
         // derived from `source_raw` — the very rows the byte-identity check

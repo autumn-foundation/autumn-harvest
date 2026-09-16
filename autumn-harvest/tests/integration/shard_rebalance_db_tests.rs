@@ -2459,6 +2459,61 @@ async fn a_continued_as_new_target_with_a_live_successor_is_not_reconciled() {
 }
 
 #[tokio::test]
+async fn a_failed_target_is_not_reconciled_until_it_becomes_unresettable() {
+    // Issue #1317 review. `FAILED`/`CANCELLED`/`TIMED_OUT` are terminal for
+    // the row, but `reset.rs`'s `validate_source_execution` permits
+    // resetting a row in any of those three states. A reset can fork a
+    // fresh same-key execution at an arbitrary future time, only then
+    // sealing the old row `TERMINATED`. Releasing this seal while the
+    // target sits at one of those three states would leave a standing
+    // window. A later reset could fork a live run on the target shard. No
+    // seal is left on the source shard to stop a normal start from also
+    // succeeding there. The seal must wait for a genuinely final state.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "resettable-target").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("fail the migrated run");
+
+    let mut source = shards.source().await;
+    let reconciled =
+        reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+            .await
+            .expect("reconcile must not fail merely because the target failed");
+    assert!(
+        !reconciled,
+        "a FAILED target remains resettable into a fresh live run; the seal must not release"
+    );
+
+    // A reset seals the source row TERMINATED once it forks (`reset.rs`).
+    // TERMINATED is rejected as a reset source ("nothing to retry"), so it
+    // is genuinely final -- the seal may now release.
+    diesel::sql_query("UPDATE harvest_workflow_executions SET state = 'TERMINATED' WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut target)
+        .await
+        .expect("seal the failed run terminated, as a real reset would");
+    let reconciled_after_terminated =
+        reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+            .await
+            .expect("reconcile");
+    assert!(
+        reconciled_after_terminated,
+        "once the target is genuinely unresettable, the seal must release"
+    );
+}
+
+#[tokio::test]
 async fn a_reconciled_migrated_successor_no_longer_blocks_its_predecessors_seal() {
     // Issue #1317: a successor that is itself migrated and reconciled stays
     // `MIGRATED` forever. Reconciliation records `migrated_run_terminal_at`.
