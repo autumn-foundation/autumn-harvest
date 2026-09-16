@@ -184,7 +184,8 @@ Three things this separates, none of which the registered line could:
    the depth where its claim path is worst.
 3. **The widening margin against plain Postgres is one known, fixable defect**,
    not a general architectural gap. Harvest's Postgres arm falls 4.2x from 500
-   to 2,000 rows of depth while Temporal stays flat, which is the
+   to 2,000 rows of depth while Temporal shows no comparable collapse, which
+   is the
    `#786`/`#1177` claim-path behaviour `docs/performance.md` already documents:
    a non-indexable `ORDER BY` forcing a scan-and-sort on every claim. The Redis
    dispatch channel routes around it, which is why that arm is flat.

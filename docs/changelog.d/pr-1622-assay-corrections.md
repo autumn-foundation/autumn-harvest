@@ -45,10 +45,14 @@
   the single re-run cell that the curve was unaffected; review caught that as
   an overreach, since the corrections are asymmetric (one adds persisted
   payloads to Temporal only) and the shallowest cell had the narrowest margin.
-  Re-measuring **strengthened** the result: Temporal's 250-row cell moved from
-  28.85 to 36.17, taking the shallowest margin from 1.22x to 1.53x. The cells
-  are single repetitions against an arm with ~25% spread, so they support a
-  range (~1.5x-2x against harvest's best mode) rather than a trend.
+  The re-measured 250-row cell reads 36.17 against 28.85 before, so the
+  shallowest margin reads 1.53x where it read 1.22x. That difference is **not
+  attributed to the correction**: both are single repetitions and the gap is
+  about the size of this arm's own ~25% spread, so run-to-run variation alone
+  explains it. The cells support a range (~1.5x-2x against harvest's best
+  mode) rather than a trend, and Temporal's own cells span about 33%, which is
+  too noisy to call flat. What holds is that Temporal wins at every depth
+  tested and shows no counterpart to harvest's 4.2x collapse.
 
   **Zero engine impact.** No `WorkflowEvent` variant, no migration, no
   behaviour or public-API change. `registered-sweep.md` is kept unedited with

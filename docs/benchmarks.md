@@ -134,7 +134,7 @@ tuned by someone who operates it — a tuned arm would widen the gap, not close
 it. And most of the *widening* part of the margin is one known, fixable defect
 rather than an architectural gap: the `#786`/`#1177` claim path, whose
 scan-and-sort makes Harvest's default mode fall 4.2x between a 500-row and a
-2,000-row backlog while Temporal stays flat. Ledger
+2,000-row backlog while Temporal shows no comparable collapse. Ledger
 [#10](assays/0010-cross-mode-throughput.md) measures the same collapse from the
 other side, and finds the Redis dispatch channel flat across that range because
 it routes around exactly that path.
