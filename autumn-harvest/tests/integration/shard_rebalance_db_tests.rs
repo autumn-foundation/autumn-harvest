@@ -2621,6 +2621,102 @@ async fn rolling_back_the_seal_column_refuses_once_a_key_has_both_a_seal_and_a_r
     );
 }
 
+fn signal_with_start_allow_duplicate<'a>(
+    workflow_name: &'a str,
+    workflow_id: &'a str,
+    signal_name: &'a str,
+) -> autumn_harvest::execution::SignalWithStartParams<'a> {
+    autumn_harvest::execution::SignalWithStartParams {
+        workflow_name,
+        workflow_id,
+        exec_id: ExecutionId::new_for_shard(SOURCE),
+        input: json!({"seed": 2}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        memo: None,
+        search_attrs: None,
+        reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::AllowDuplicate,
+        trace_context: None,
+        max_execution_timeout_ceiling: None,
+        chain_execution_timeout: None,
+        max_workflow_chain_timeout_ceiling: None,
+        concurrency_key: None,
+        concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+        signal_name,
+        signal_payload: json!({"woke": true}),
+        idempotency_key: None,
+        max_workflow_input_bytes: 0,
+        max_signal_payload_bytes: 0,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        workflow_retry_policy: None,
+        max_workflow_attempts_ceiling: None,
+        reject_fresh_if_debounced: false,
+        workflow_info: None,
+        start_source_override: None,
+        start_source_ref_override: None,
+    }
+}
+
+#[tokio::test]
+async fn a_signal_with_start_attaches_to_the_active_run_not_the_released_seal() {
+    // Issue #1317 review: `resolve_effective_signal_with_start_policy`'s own
+    // active-key lookup shares the released-seal-vs-live-row ambiguity
+    // `load_workflow_execution_by_key_for_update` guards against. If it
+    // locks the seal instead of the live replacement, it wrongly reads a
+    // non-RUNNING prior. It then upgrades `AllowDuplicate` to
+    // `TerminateIfRunning`, and replaces the active run instead of
+    // attaching to it.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "swap-signal").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("complete the migrated run");
+
+    let mut source = shards.source().await;
+    reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id)
+        .await
+        .expect("reconcile");
+
+    let first = autumn_harvest::execution::signal_with_start_workflow_execution(
+        &mut source,
+        signal_with_start_allow_duplicate("entity_flow", "swap-signal", "wake"),
+    )
+    .await
+    .expect("first signal-with-start creates a fresh run over the reconciled seal");
+    assert!(first.started_fresh, "no live prior, so this must be fresh");
+
+    let second = autumn_harvest::execution::signal_with_start_workflow_execution(
+        &mut source,
+        signal_with_start_allow_duplicate("entity_flow", "swap-signal", "wake-again"),
+    )
+    .await
+    .expect("second signal-with-start must attach to the now-active fresh run");
+    assert!(
+        !second.started_fresh,
+        "must attach to the live run, not mistake the released seal for no prior"
+    );
+    assert_eq!(
+        second.exec_id, first.exec_id,
+        "must be the SAME execution as the first call created"
+    );
+}
+
 #[tokio::test]
 async fn a_business_key_target_resolves_through_the_seal_to_the_live_copy() {
     // A `WorkflowId` target hashes to a fixed shard, and that shard is exactly

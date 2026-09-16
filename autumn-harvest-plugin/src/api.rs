@@ -20901,6 +20901,16 @@ pub(crate) async fn signal_with_start_workflow(
             .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
             .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
             .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
+            // A released `MIGRATED` seal and a fresh replacement row can both
+            // match this filter at once, on the SAME shard (issue #1317
+            // review). A same-key restart after reconciliation lands here via
+            // `pick_for_new_workflow`'s stable hash. Prefer the live row, or
+            // the seal shadows it and this loop reports no live copy at all.
+            .order(
+                harvest_workflow_executions::migrated_run_terminal_at
+                    .is_null()
+                    .desc(),
+            )
             .select((
                 harvest_workflow_executions::id,
                 harvest_workflow_executions::state,
@@ -21623,6 +21633,15 @@ async fn update_with_start_workflow(
                 .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
                 .filter(
                     harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
+                )
+                // A released `MIGRATED` seal and a fresh replacement row can
+                // both match this filter at once, on the SAME shard (issue
+                // #1317 review). Prefer the live row, or the seal shadows it
+                // and this loop reports no live copy at all.
+                .order(
+                    harvest_workflow_executions::migrated_run_terminal_at
+                        .is_null()
+                        .desc(),
                 )
                 .select((
                     harvest_workflow_executions::id,
@@ -40230,16 +40249,17 @@ pub(crate) async fn load_workflows(
         // `MIGRATING` has the identical hazard during the staging window
         // (issue #1317). The source still holds the live `RUNNING`/`PAUSED`
         // row, while the target holds a staged `MIGRATING` copy with the
-        // same `id` and `created_at`. Left in, the default listing
-        // double-counts a migration in progress the same way it used to
-        // double-count a finished one. Excluded here for the same reason,
-        // with the same diagnostic escape hatch via an explicit
-        // `state=MIGRATING` filter.
-        query = query.filter(
-            harvest_workflow_executions::state
-                .ne("MIGRATED")
-                .and(harvest_workflow_executions::state.ne("MIGRATING")),
-        );
+        // same `id` and `created_at`. It is NOT excluded here, unlike
+        // `MIGRATED` (review). If the process crashes between
+        // `commit_cutover` and `activate_target`, the source is already
+        // `MIGRATED` and excluded, leaving the `MIGRATING` target as the
+        // SOLE copy. Excluding it too would make the execution invisible
+        // for as long as that repairable window lasts. The staging-window
+        // duplicate this would otherwise double-count is instead collapsed
+        // post-merge, in `build_workflow_fanout_page`. It can tell a real
+        // duplicate (a live counterpart is also in the page) from an
+        // orphaned sole copy (it is not).
+        query = query.filter(harvest_workflow_executions::state.ne("MIGRATED"));
     } else {
         query = query.filter(harvest_workflow_executions::state.eq_any(filters.states.clone()));
     }
@@ -40517,6 +40537,7 @@ pub(crate) async fn load_workflows_from_shards(
         observations,
         filters.order,
         filters.limit,
+        filters.states.is_empty(),
     ))
 }
 
@@ -40533,6 +40554,28 @@ pub(crate) struct WorkflowFanoutPage {
     pub(crate) unavailable_shards: Vec<UnavailableShard>,
 }
 
+/// Collapse a staging-window migration's source/target pair to the live row
+/// (issue #1317 review).
+///
+/// `load_workflows`'s default-listing predicate excludes `MIGRATED` but not
+/// `MIGRATING`. A mid-migration execution can therefore appear twice in
+/// this merged page. It shows once as the source's live `RUNNING`/`PAUSED`
+/// row, once as the target's staged `MIGRATING` copy, both sharing the
+/// same `id`. Drop the `MIGRATING` one, but ONLY when its live counterpart
+/// is also present in this page. A `MIGRATING` row with no such
+/// counterpart is the SOLE surviving copy. The source has already sealed
+/// to `MIGRATED` and was excluded upstream. It must stay visible.
+fn dedupe_staging_migration_pairs(rows: Vec<WorkflowExecution>) -> Vec<WorkflowExecution> {
+    let live_ids: std::collections::HashSet<uuid::Uuid> = rows
+        .iter()
+        .filter(|row| row.state != "MIGRATING")
+        .map(|row| row.id)
+        .collect();
+    rows.into_iter()
+        .filter(|row| row.state != "MIGRATING" || !live_ids.contains(&row.id))
+        .collect()
+}
+
 /// Merge, sort, and paginate per-shard workflow observations (pure, no DB).
 ///
 /// Ordering, keyset cursor, and truncation are applied over the union of
@@ -40544,12 +40587,17 @@ pub(crate) fn build_workflow_fanout_page(
     observations: Vec<ShardObservation<WorkflowExecution>>,
     order: WorkflowSortOrder,
     limit_raw: i64,
+    dedupe_staging_pairs: bool,
 ) -> WorkflowFanoutPage {
     let FanoutRows {
         mut rows,
         status,
         unavailable_shards,
     } = collect_fanout_rows(observations);
+
+    if dedupe_staging_pairs {
+        rows = dedupe_staging_migration_pairs(rows);
+    }
 
     // Sort by the requested direction; tie-break on id for total ordering.
     match order {
@@ -56480,7 +56528,7 @@ mod tests {
                 error: Some("connection refused".to_string()),
             },
         ];
-        let page = build_workflow_fanout_page(obs, WorkflowSortOrder::Desc, 2);
+        let page = build_workflow_fanout_page(obs, WorkflowSortOrder::Desc, 2, true);
         // (a) desc order by created_at (newest first), (b) truncated to limit.
         assert_eq!(page.executions.len(), 2, "truncated to limit=2");
         assert_eq!(page.executions[0].created_at, t, "newest first");
@@ -56491,6 +56539,72 @@ mod tests {
         assert_eq!(page.status, FanoutStatus::Partial);
         assert_eq!(page.unavailable_shards.len(), 1);
         assert_eq!(page.unavailable_shards[0].shard_id, 1);
+    }
+
+    #[test]
+    fn a_staging_pair_collapses_to_the_live_row_by_default() {
+        // Issue #1317 review: the default per-shard predicate excludes
+        // `MIGRATED` but not `MIGRATING`. A mid-migration execution can
+        // therefore reach this merge step twice under the SAME id -- the
+        // source's live row and the target's staged copy. The default
+        // listing must show it once, as the live row.
+        let t = chrono::Utc::now();
+        let mut live = exec_at(1, t);
+        live.state = "RUNNING".to_string();
+        let mut staged = exec_at(1, t);
+        staged.state = "MIGRATING".to_string();
+        let obs = vec![ShardObservation {
+            shard_id: 0,
+            rows: vec![live, staged],
+            error: None,
+        }];
+        let page = build_workflow_fanout_page(obs, WorkflowSortOrder::Desc, 10, true);
+        assert_eq!(page.executions.len(), 1, "the pair collapses to one row");
+        assert_eq!(page.executions[0].state, "RUNNING", "the live row wins");
+    }
+
+    #[test]
+    fn an_orphaned_migrating_copy_stays_visible_with_no_live_counterpart() {
+        // Issue #1317 review: if the process crashes between `commit_cutover`
+        // and `activate_target`, the source has already sealed to `MIGRATED`
+        // (excluded upstream). The target is the SOLE surviving copy, still
+        // `MIGRATING`. It must not also be dropped here, or the execution
+        // becomes invisible for as long as that window lasts.
+        let t = chrono::Utc::now();
+        let mut staged = exec_at(1, t);
+        staged.state = "MIGRATING".to_string();
+        let obs = vec![ShardObservation {
+            shard_id: 0,
+            rows: vec![staged],
+            error: None,
+        }];
+        let page = build_workflow_fanout_page(obs, WorkflowSortOrder::Desc, 10, true);
+        assert_eq!(page.executions.len(), 1, "the sole copy must stay visible");
+        assert_eq!(page.executions[0].state, "MIGRATING");
+    }
+
+    #[test]
+    fn an_explicit_state_filter_skips_the_staging_dedupe() {
+        // The dedupe is scoped to the default listing (issue #1317 review).
+        // An operator who explicitly asked for both states wants to see
+        // both rows. This mirrors the diagnostic `state=MIGRATED` escape
+        // hatch already preserved for the sealed-source case.
+        let t = chrono::Utc::now();
+        let mut live = exec_at(1, t);
+        live.state = "RUNNING".to_string();
+        let mut staged = exec_at(1, t);
+        staged.state = "MIGRATING".to_string();
+        let obs = vec![ShardObservation {
+            shard_id: 0,
+            rows: vec![live, staged],
+            error: None,
+        }];
+        let page = build_workflow_fanout_page(obs, WorkflowSortOrder::Desc, 10, false);
+        assert_eq!(
+            page.executions.len(),
+            2,
+            "an explicit filter must see both rows"
+        );
     }
 
     #[test]
