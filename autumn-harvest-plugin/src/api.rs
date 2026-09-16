@@ -20894,6 +20894,16 @@ pub(crate) async fn signal_with_start_workflow(
     // The 4th element records whether this is a pure attach (existing RUNNING/SUSPENDED +
     // AllowDuplicate*). Used below to skip start_input schema validation on attach requests
     // where start_input is never written (mirrors the payload-cap deferral from issue #252).
+    // The shard a fresh start would land on (issue #1317 review). A terminal,
+    // non-live prior found on any OTHER shard must not anchor `replace_execution`
+    // there. That call seals and inserts on `candidate_shard`'s own connection.
+    // A reconciled predecessor left on its former migration target would then
+    // place the new run there. A subsequent plain `start_workflow` for the same
+    // key routes straight to this shard. It finds nothing to stop it there, and
+    // admits a second live run for the same key on two shards.
+    let canonical_shard = runtime
+        .router
+        .pick_for_new_workflow(&workflow_name, &workflow_id);
     let mut found_shard: Option<(ShardId, PoolConn, ExecutionId, bool)> = None;
     let mut seal_only: Option<ShardId> = None;
     for (candidate_shard, shard_pool) in pool.iter_shards() {
@@ -20947,6 +20957,20 @@ pub(crate) async fn signal_with_start_workflow(
                 seal_only = Some(candidate_shard);
                 continue;
             }
+            // A dead, non-live prior (COMPLETED/FAILED/CANCELLED/TIMED_OUT) found
+            // on a non-canonical shard is a former migration target or a
+            // writable-subset artifact, not a run needing action. Anchoring
+            // `replace_execution` to it would create the fresh run off the
+            // routed shard (see the comment above the loop). Skip it and keep
+            // scanning, so the loop falls through to `canonical_shard` below —
+            // the same shard a plain `start_workflow` would use. A RUNNING or
+            // SUSPENDED row is never skipped: it needs attaching or terminating
+            // wherever it actually lives.
+            if !matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED")
+                && candidate_shard != canonical_shard
+            {
+                continue;
+            }
             // Attach (reuse UUID) only when the prior is live AND the policy
             // expects to attach. Every other path goes through replace_execution
             // and needs a fresh exec_id keyed for the same shard.
@@ -20989,14 +21013,16 @@ pub(crate) async fn signal_with_start_workflow(
     let (shard, mut conn, exec_id, _will_attach) = if let Some(tuple) = found_shard {
         tuple
     } else {
-        let shard = runtime
-            .router
-            .pick_for_new_workflow(&workflow_name, &workflow_id);
-        let conn = match db_conn_for_shard(&api_state, shard).await {
+        let conn = match db_conn_for_shard(&api_state, canonical_shard).await {
             Ok(c) => c,
             Err(e) => return e.into_response(),
         };
-        (shard, conn, ExecutionId::new_for_shard(shard), false)
+        (
+            canonical_shard,
+            conn,
+            ExecutionId::new_for_shard(canonical_shard),
+            false,
+        )
     };
 
     // issue #377: check admission gates unconditionally.
@@ -21624,6 +21650,11 @@ async fn update_with_start_workflow(
         };
         (hit_exec_id.shard(), conn, hit_exec_id)
     } else {
+        // The shard a fresh start would land on (issue #1317 review) — see the
+        // matching comment in the signal-with-start handler.
+        let canonical_shard = runtime
+            .router
+            .pick_for_new_workflow(&workflow_name, &workflow_id);
         let mut found_shard: Option<(ShardId, PoolConn, ExecutionId)> = None;
         let mut seal_only: Option<ShardId> = None;
         for (candidate_shard, shard_pool) in pool.iter_shards() {
@@ -21668,6 +21699,15 @@ async fn update_with_start_workflow(
                     seal_only = Some(candidate_shard);
                     continue;
                 }
+                // A dead, non-live prior found on a non-canonical shard — see
+                // the matching check in the signal-with-start handler. Skip it
+                // so the loop falls through to `canonical_shard`, the same
+                // shard a plain `start_workflow` would use.
+                if !matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED")
+                    && candidate_shard != canonical_shard
+                {
+                    continue;
+                }
                 // Reuse the execution UUID only when attaching to a live RUNNING or
                 // SUSPENDED run under a non-rejecting policy. All other paths
                 // (terminal prior, PAUSED, TerminateIfRunning) go through
@@ -21702,14 +21742,15 @@ async fn update_with_start_workflow(
             ))
             .into_response();
         } else {
-            let shard = runtime
-                .router
-                .pick_for_new_workflow(&workflow_name, &workflow_id);
-            let conn = match db_conn_for_shard(&api_state, shard).await {
+            let conn = match db_conn_for_shard(&api_state, canonical_shard).await {
                 Ok(c) => c,
                 Err(e) => return e.into_response(),
             };
-            (shard, conn, ExecutionId::new_for_shard(shard))
+            (
+                canonical_shard,
+                conn,
+                ExecutionId::new_for_shard(canonical_shard),
+            )
         }
     };
 
