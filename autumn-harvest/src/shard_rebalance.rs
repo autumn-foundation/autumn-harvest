@@ -1835,10 +1835,17 @@ mod db {
         // business key is still live under a successor. Confirm no active
         // occupant remains for `(workflow_name, workflow_id)` here first.
         //
-        // "Active" mirrors `is_active_conflict_state` exactly, not the
-        // widened uniqueness index. A COMPLETED/FAILED/CANCELLED/TIMED_OUT
-        // successor still occupies that index -- an `AllowDuplicate` start
-        // attaches to it. That is not a reason to keep this seal held.
+        // "Active" is close to `is_active_conflict_state`, but not
+        // identical (issue #1317 review, P1 follow-up). A COMPLETED
+        // successor is genuinely final, so it does not occupy this check.
+        // A FAILED/CANCELLED/TIMED_OUT successor is different: it still
+        // occupies, for exactly the reason the own-row check above holds
+        // the seal on those same three states. `reset.rs`'s
+        // `validate_source_execution` permits resetting a row in any of
+        // them. A reset forks a fresh same-key execution on the
+        // successor's shard at an arbitrary future time. Releasing this
+        // seal first would leave no guard on the source shard against an
+        // ordinary start succeeding there too, once that reset lands.
         // A `MIGRATED` successor counts as active while UNRECONCILED, so
         // this seal waits for that seal's own reconciliation rather than
         // racing it. Once that successor's `migrated_run_terminal_at` is
@@ -1851,7 +1858,8 @@ mod db {
                  SELECT 1 FROM harvest_workflow_executions \
                   WHERE workflow_name = $1 AND workflow_id = $2 \
                     AND ( \
-                        state IN ('RUNNING', 'PAUSED', 'MIGRATING') \
+                        state IN ('RUNNING', 'PAUSED', 'MIGRATING', \
+                                  'FAILED', 'CANCELLED', 'TIMED_OUT') \
                         OR (state = 'MIGRATED' AND migrated_run_terminal_at IS NULL) \
                     ) \
              ) AS value",
