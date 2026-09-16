@@ -82,19 +82,51 @@ job level (`list_workflow_jobs`, `perPage=100`, checking every job's own
 
 | Run | Branch | Hidden job failures | Signature |
 |---|---|---:|---|
-| `35072771791` | `claude/hopeful-pascal-tbijcf` | 9 (`Test DB (linux, shard 0/1/2/3/4/7/8/9/10)`) | `FAILED SUITES: ctx_info_tests, mixed_suspension_tests, quota_supersede_ordering_tests` (shard 1) — a missing-column defect (`harvest_workflow_executions.migrated_run_terminal_at` absent from the hand-maintained `INIT_SQL`/`LEGACY_INIT_SQL` test bundles), self-diagnosed and fixed by this same branch's very next commit (`36791bfff0`, visible in this session's own fresh `ci.yml` query) |
+| `35072771791` | `claude/hopeful-pascal-tbijcf` | 9 (`Test DB (linux, shard 0/1/2/3/4/7/8/9/10)`) | a missing-column defect (`harvest_workflow_executions.migrated_run_terminal_at` absent from the hand-maintained `INIT_SQL`/`LEGACY_INIT_SQL` test bundles), self-diagnosed and fixed by this same branch's very next commit (`36791bfff0`, visible in this session's own fresh `ci.yml` query) — see below for shard 8 specifically |
 | `35060658370` | `claude/hopeful-pascal-tbijcf` | 3 (`Test (windows/ubuntu/macos-latest)`) | `migration_hygiene::every_release_migration_is_in_the_upgrade_guide` — the identical missing-migration-row signature already counted as an explicit failure at run `35063499036` on the same branch 40 minutes later; a precursor occurrence of an already-counted defect, not a new one |
 | 6 others | mixed | 0 | clean cancellations (matrix jobs show `cancelled`, not `failure`) |
 
-**Neither hidden failure carries the activity-timeout signature**, and both
-trace to defects already accounted for elsewhere in this report or
-self-fixed on the same branch. But this is a sample, not a census: 11 of
-19 post-merge cancelled runs and all 36 pre-merge cancelled runs remain
-unaudited at job level. The headline "0/15" claim is therefore better
-stated as "0 occurrences among the runs actually inspected" (15 explicit
-failures plus this 8-run cancelled sample, 23 runs total) — directionally
-consistent with the fix holding, but not the exhaustive census an earlier
-draft of this report implied by calling the 100-run page complete.
+**Correction (post-review) — shard 8 needed checking directly, not
+assumed.** A Codex review correctly pointed out that `35072771791`'s
+9-shard failure table above named only shard 1's signature (fetched from
+its job log) and did not check whether the activity-timeout *test itself*
+ran on one of the other 8 failed shards. Per `.github/ci/run-suites.sh`'s
+`row_ordinal % SHARD_COUNT` sharding rule and `integration_e2e`'s row
+position in `.github/ci/integration-suites.txt` (row ordinal 30 among
+`linux`-class rows, `30 % 11 = 8`), `integration_e2e` — the file containing
+`worker_fails_workflow_when_activity_start_to_close_timeout_elapses` —
+runs on shard 8, which **is** among the 9 failed shards. Fetched shard 8's
+full log directly (`get_job_logs(..., return_content=false)` for the
+signed URL, then `curl` and `grep`, since the module's ~2800 tests exceed
+any reasonable `tail_lines`): `worker_fails_workflow_when_activity_start_to_close_timeout_elapses`
+did fail in this run — but at `integration_e2e.rs:729:10`, panicking with
+`failed to reload workflow execution: DatabaseError(Unknown, "column
+harvest_workflow_executions.migrated_run_terminal_at does not exist")` —
+the same missing-column defect that cascaded through essentially every
+test in that shard's run (dozens of other tests fail at the identical
+line and message in the same log). This is **not** the tracked
+event-history-mismatch signature (which panics inside the test's own
+`matches!`/`match` assertion, not in a shared setup helper on a DB error),
+and it could not be: PR #1563 changed the test's own assertion to accept
+either event shape, so the only way this specific test fails post-merge is
+through something outside that assertion entirely — exactly what happened
+here. Confirmed by direct log inspection, not inferred from the shard-1
+sample alone as an earlier draft did.
+
+Restated precisely: of the 9 hidden `Test DB` failures in `35072771791`,
+one (shard 8) happens to include the tracked test by name, but its failure
+mode is the same schema-mismatch defect as the other 8 shards, not the
+race PR #1563 addressed — so it still does not count as a recurrence of
+the *tracked signature*, but "neither hidden failure carries it" (an
+earlier draft's wording) glossed over needing to check that directly
+rather than assume it from an adjacent shard's log. This is a sample, not
+a census: 11 of 19 post-merge cancelled runs and all 36 pre-merge
+cancelled runs remain unaudited at job level. The headline "0/15" claim is
+therefore better stated as "0 occurrences of the tracked signature among
+the runs actually inspected" (15 explicit failures plus this 8-run
+cancelled sample, 23 runs total) — directionally consistent with the fix
+holding, but not the exhaustive census an earlier draft of this report
+implied by calling the 100-run page complete.
 
 ### 2. `sqlite_feasibility_docs::derived_totals_agree_with_the_table_and_the_tree`'s panic message still shows the same number on both sides, and it blocked one branch three commits in a row this window
 
@@ -153,7 +185,7 @@ runs named:
 | Run | Signature |
 |---|---|
 | `34891219422` | clippy `redundant_clone` (`payload_codec.rs`) |
-| `34891509704` | clippy dead-code (`partition.rs`'s `DISABLE_RENAME_SUFFIX`) **and**, in a second failed job on the same run, `corpus::seeded_corpus_is_clean_under_the_syntactic_layer` |
+| `34891509704` | clippy dead-code (`partition.rs`'s `DISABLE_RENAME_SUFFIX`) — root-caused. A second failed job on this same run, `corpus::seeded_corpus_is_clean_under_the_syntactic_layer`, is **not** root-caused here (see correction below) |
 | `34924353340` | E0433 `diesel` compile error (2 failed jobs, same signature) |
 | `34925551916` | E0433 `diesel` compile error (2 failed jobs, same signature — same root cause as `34924353340`, same branch `claude/bold-lovelace-agnczk`) |
 | `34933650236` | `comment-hygiene.py` Tier B (`shard_rebalance.rs` sentence-length) |
@@ -167,12 +199,32 @@ runs named:
 By signature: comment-hygiene (1 run), `cargo fmt` (3 runs, not 1 as an
 earlier draft implied), clippy (4 runs: `redundant_clone`, dead-code,
 `doc_markdown`, `map_unwrap_or`), E0433 `diesel` (2 runs, one root cause),
-`corpus` determinism (0 additional runs — same run as the dead-code clippy
-finding), `migration_hygiene` (1 run, previously unmentioned). 1+3+4+2+0+1 =
-11 runs, matching the section heading. The two `diesel`/E0433 occurrences
-are the same commit-family defect counted once in the diagnosis below, not
-two independent findings. Each traces to that commit's or branch's own
-diff; no suite-state interaction, no timing component, no order dependence.
+`migration_hygiene` (1 run, previously unmentioned). 1+3+4+2+1 = 11 runs,
+matching the section heading. The two `diesel`/E0433 occurrences are the
+same commit-family defect counted once in the diagnosis below, not two
+independent findings.
+
+**Correction (post-review) — the `corpus` failure on `34891509704` is not
+root-caused.** An earlier draft of this section named
+`corpus::seeded_corpus_is_clean_under_the_syntactic_layer` alongside the
+dead-code clippy finding as if diagnosing the clippy lint also accounted
+for it. It does not — they are two independent failed jobs on the same
+run, and this report never established a mechanism for the `corpus`
+failure. Checking this series' own prior work: the immediately preceding
+report, `docs/rnd/2026-09-15-ci-health-semaphore-window-census.md:141-144`,
+already found this exact signature recurring across 3 of 5 pushes on this
+branch (`34891509704` among them) and explicitly logged it as **"not
+otherwise diagnosed"** — so this is not a new occurrence this session
+found, it is the same still-undiagnosed recurring failure surfacing again
+in this window's sample, carried forward rather than freshly root-caused.
+Because it has now recurred at least 3 times without a known mechanism, it
+is the closest thing in this report's window to a suite-attributable-flake
+candidate — though 3 occurrences (all from the 09-15 report, none newly
+observed here) is still short of this role's own ≥20-rerun bar for a
+measured rate, and no session has yet run the rerun protocol or
+signature-clustering work needed to say more. Each of the other 10 runs
+in this section traces cleanly to that commit's or branch's own diff; no
+suite-state interaction, no timing component, no order dependence.
 
 ## 🔍 Diagnosis
 
@@ -193,16 +245,22 @@ flake), but the cost is no longer zero.
 **Item 3** is explicitly not claimed as a flake — one occurrence, no
 mechanism recovered, not clustered.
 
-**Item 4** is the suite working correctly, not a CI-health defect. The two
-`diesel`/E0433 occurrences are the same commit-family defect counted once,
-not two independent findings.
+**Item 4** is the suite working correctly for 10 of its 11 runs, not a
+CI-health defect. The two `diesel`/E0433 occurrences are the same
+commit-family defect counted once, not two independent findings. The
+11th run's second failed job (`corpus` on `34891509704`) is not
+root-caused — see the correction in that section — and is grouped with
+item 3 below as unclassified.
 
 **Correction (post-review):** item 3's own text already states the actual
 `quota_enforcement_tests` panic was not recoverable from the available logs
 and that no mechanism was identified — so it is **classified**, not
-**root-caused**. An earlier draft's 🔧/📊 sections below said "15/15
-root-caused," which contradicts item 3's own finding; corrected to 14/15
-root-caused plus 1/15 classified as a single, unexplained occurrence.
+**root-caused**. The same is true of the `corpus` failure on `34891509704`
+(item 4's correction). An earlier draft's 🔧/📊 sections below said "15/15
+root-caused," which contradicts both findings; corrected to 13/15 fully
+root-caused and 2/15 with at least one unclassified, unexplained failure
+(`quota_enforcement_tests`, and `34891509704`'s `corpus` job alongside its
+otherwise-explained clippy failure).
 
 ## 🔧 Treatment
 
@@ -233,6 +291,14 @@ Items carried forward, unchanged from the 09-08/09-14/09-15 reports:
    a scheduled harness for this (pulling every job's conclusion for every
    completed run, cancelled or not) is the correct fix for the gap rather
    than repeated manual sampling; still not built by any session.
+6. **`corpus::seeded_corpus_is_clean_under_the_syntactic_layer`** — still
+   undiagnosed after recurring at least 3 times (per
+   `docs/rnd/2026-09-15-ci-health-semaphore-window-census.md`, one of
+   which resurfaced in this window's own sample). The closest thing in
+   this report's data to a suite-attributable-flake candidate, but at 3
+   occurrences it is well short of this role's own ≥20-rerun bar for a
+   measured rate; no session has yet run the rerun protocol or
+   signature-clustering work this would need.
 
 ## 📊 Measurement
 
@@ -253,32 +319,47 @@ Items carried forward, unchanged from the 09-08/09-14/09-15 reports:
 - **Item 2:** 3/3 occurrences on one branch confirmed identical panic text
   (`"**107 migrations**"` on both sides) via direct job-log inspection.
 - **Item 3:** 1/1, not a rate.
-- **Item 4:** 11/11 root-caused via job-log inspection (see the corrected
-  run-to-signature table above); 0 suite-attributable flakes among them.
+- **Item 4: correction (post-review).** 10/11 runs fully root-caused via
+  job-log inspection (see the corrected run-to-signature table above);
+  the 11th (`34891509704`) has one root-caused job (clippy dead-code) and
+  one unclassified job (`corpus`, recurring per the 09-15 report, still
+  undiagnosed). 0 confirmed suite-attributable flakes among the
+  root-caused failures; `corpus` is an open candidate, not confirmed
+  either way.
 - **Cancelled-run sample:** 8/19 post-merge cancelled runs job-logged; 2/8
-  hid a real job-level failure (9 shards on one run, 3 jobs on another);
-  0/2 hidden failures carry the activity-timeout signature; 11/19
-  post-merge and 36/36 pre-merge cancelled runs remain unaudited.
+  hid a real job-level failure (9 shards on one run, 3 jobs on another).
+  Of the 9 hidden shard failures in the larger run, one (shard 8) included
+  the tracked test by name but failed via the same missing-column defect
+  as the other 8 shards, confirmed by direct log inspection — not the
+  tracked event-history-mismatch signature, and not possible to be, since
+  PR #1563's fix means that signature can no longer occur on this test at
+  all. 0/9 hidden shard failures and 0/3 hidden job failures (the other
+  cancelled run) carry the tracked signature. 11/19 post-merge and 36/36
+  pre-merge cancelled runs remain unaudited.
 - **Combined: correction (post-review).** An earlier draft's "0/15
-  suite-level flakes" contradicted item 3's own text, which says
-  `quota_enforcement_tests`'s panic and mechanism were never recovered — a
-  single unclassified occurrence is insufficient evidence to call it a
-  flake, but equally insufficient to rule one out. Stated correctly: 14/15
-  of this window's explicit failures root-caused and confirmed
-  non-suite-level; 1/15 (`quota_enforcement_tests`) unclassified — neither
-  confirmed a flake nor confirmed not one; 0/14 classified failures carry
-  the previously-tracked activity-timeout signature; 0/2 hidden
-  cancelled-run failures (of the 8-run sample actually inspected) carry it
+  suite-level flakes" contradicted item 3's and item 4's own text, both of
+  which say a failure's mechanism was never recovered — a single
+  unclassified occurrence is insufficient evidence to call it a flake, but
+  equally insufficient to rule one out. Stated correctly: 13/15 of this
+  window's explicit failures fully root-caused and confirmed
+  non-suite-level; 2/15 have at least one unclassified, unexplained
+  failure (`quota_enforcement_tests`; `34891509704`'s `corpus` job); 0/13
+  root-caused failures carry the previously-tracked activity-timeout
+  signature, and neither unclassified failure's assertion text matches it
+  either. 0/2 hidden cancelled-run failures (of the 8-run sample actually
+  inspected) carry it
   either.
 
 ## 🔬 Reproduce
 
 ```sh
-# Full census (not a sample): actions_list(method="list_workflow_runs",
-#   resource_id="ci.yml", workflow_runs_filter={event:"pull_request",
-#   status:"completed"}, perPage=100) on autumn-foundation/autumn-harvest,
-# captured 2026-09-16 — one page covered 2026-09-14T19:46:25Z through
-# 2026-09-16T09:33:24Z (100 runs: 55 cancelled, 30 success, 15 failure).
+# Run-conclusion enumeration (not a job-level census -- see corrections
+# above): actions_list(method="list_workflow_runs", resource_id="ci.yml",
+#   workflow_runs_filter={event:"pull_request", status:"completed"},
+#   perPage=100) on autumn-foundation/autumn-harvest, captured 2026-09-16 --
+# one page covered 2026-09-14T19:46:25Z through 2026-09-16T09:33:24Z (100
+# runs: 55 cancelled, 30 success, 15 failure). Only the 15 failures plus an
+# 8-run cancelled sample (23 of 100) were job-logged below the run level.
 
 # PR #1563 merge instant (pull_request_read on PR #1563): merged_at =
 # 2026-09-15T14:00:13Z. Split the 100-run sample at that instant:
@@ -329,8 +410,34 @@ print('post-merge:', len(post), Counter(r['conclusion'] for r in post))
 # 35060658370 (3 Test <os> jobs); the other 6 were clean cancellations.
 # get_job_logs(job_id=104728768074, return_content=true, tail_lines=80)
 #   and get_job_logs(job_id=104687245341, return_content=true,
-#   tail_lines=60) confirm the signatures in the table above. Neither
-# matches worker_fails_workflow_when_activity_start_to_close_timeout_elapses.
+#   tail_lines=60) confirm the shard-1 and Test-<os> signatures.
+
+# Shard-8 direct check (the Codex-flagged gap): confirm which shard
+# integration_e2e.rs actually runs on, rather than assuming from shard 1's
+# log:
+awk '$1=="linux"{c++} $0 ~ /integration_e2e/ && $1=="linux"{print c-1}' \
+  .github/ci/integration-suites.txt   # -> 30 (0-indexed row ordinal)
+python3 -c "print(30 % 11)"           # -> 8 (SEMAPHORE_SHARD_COUNT=11)
+# Then, since the ~2800-test module exceeds any reasonable tail_lines:
+# get_job_logs(job_id=104728768233, return_content=false) for the signed
+#   logs_url, curl it directly, and grep:
+grep -n "worker_fails_workflow_when_activity_start_to_close_timeout_elapses" shard8.log
+grep -n "panicked at\|does not exist" shard8.log
+# -> panics at integration_e2e.rs:729:10 with the same
+#    "column harvest_workflow_executions.migrated_run_terminal_at does not
+#    exist" DatabaseError shared by dozens of other tests in the same log --
+#    the missing-column defect, not the tracked event-history assertion.
+
+# corpus::seeded_corpus_is_clean_under_the_syntactic_layer prior-occurrence
+# check (the Codex-flagged root-cause gap):
+grep -n "seeded_corpus_is_clean_under_the_syntactic_layer" \
+  docs/rnd/2026-09-15-ci-health-semaphore-window-census.md
+# -> that report's own text (lines 141-144) already found this signature
+#    recurring across 3 pushes, including run 34891509704, and explicitly
+#    logged it as "not otherwise diagnosed" -- confirming this session's
+#    occurrence is the same still-open item, not independently root-caused
+#    by this report's clippy finding on the same run.
+
 # Remaining 11 post-merge and all 36 pre-merge cancelled runs: not audited
 # this session.
 ```
