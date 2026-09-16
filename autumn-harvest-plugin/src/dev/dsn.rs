@@ -15,6 +15,11 @@
 //! two modules over already knew that span was a password value. One scanner,
 //! two callers.
 //!
+//! A fourth fact lives here too, for `banner` alone.
+//! [`is_connection_keyword`] says whether a scanned token is a real libpq
+//! keyword. A keyword-shaped typo cannot smuggle a password past redaction
+//! this way (issue #1322).
+//!
 //! # What this is not
 //!
 //! It is **not** a DSN parser, and nothing here decides what gets connected to.
@@ -389,7 +394,10 @@ pub(super) fn percent_decoded(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_uri_dsn, keyword_options, percent_decoded, query_start, uri_query_parameters};
+    use super::{
+        is_connection_keyword, is_uri_dsn, keyword_options, percent_decoded, query_start,
+        uri_query_parameters,
+    };
 
     /// `(key, unescaped value, the value exactly as written)` for every option.
     fn options(dsn: &str) -> Vec<(&str, String, &str)> {
@@ -673,5 +681,72 @@ mod tests {
         assert_eq!(percent_decoded("%4"), "%4");
         assert_eq!(percent_decoded("%"), "%");
         assert_eq!(percent_decoded("plain"), "plain");
+    }
+
+    #[test]
+    fn every_libpq_keyword_is_recognized() {
+        // Kept in step with `is_connection_keyword` in
+        // `autumn-harvest-cli/src/lib.rs` (issue #1322).
+        for keyword in [
+            "application_name",
+            "channel_binding",
+            "client_encoding",
+            "connect_timeout",
+            "dbname",
+            "fallback_application_name",
+            "gssdelegation",
+            "gssencmode",
+            "gsslib",
+            "host",
+            "hostaddr",
+            "keepalives",
+            "keepalives_count",
+            "keepalives_idle",
+            "keepalives_interval",
+            "krbsrvname",
+            "load_balance_hosts",
+            "options",
+            "passfile",
+            "password",
+            "port",
+            "replication",
+            "require_auth",
+            "requirepeer",
+            "requiressl",
+            "scram_client_key",
+            "scram_server_key",
+            "service",
+            "ssl_max_protocol_version",
+            "ssl_min_protocol_version",
+            "sslcert",
+            "sslcertmode",
+            "sslcompression",
+            "sslcrl",
+            "sslcrldir",
+            "sslkey",
+            "sslmode",
+            "sslnegotiation",
+            "sslpassword",
+            "sslrootcert",
+            "sslsni",
+            "target_session_attrs",
+            "tcp_user_timeout",
+            "user",
+        ] {
+            assert!(is_connection_keyword(keyword), "{keyword}");
+            assert!(
+                is_connection_keyword(&keyword.to_uppercase()),
+                "libpq keywords are case-insensitive: {keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_keyword_shaped_token_that_is_not_a_keyword_is_refused() {
+        // The motivating case from issue #1322: a mistyped URL that lost its
+        // `://` scans as the "keyword" `postgres`.
+        for token in ["postgres", "postgresql", "notakeyword", "", "hostx", "ssl"] {
+            assert!(!is_connection_keyword(token), "{token}");
+        }
     }
 }

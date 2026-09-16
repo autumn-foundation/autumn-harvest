@@ -179,8 +179,9 @@ pub fn render_banner(inputs: &BannerInputs) -> String {
 ///
 /// **A keyword-shaped token that is not a keyword withholds the whole DSN.**
 /// `postgres` in `postgres=//alice:hunter2@db` scans as an "option" with no
-/// `password=` key, so nothing here would ever look at its value. Printing
-/// it as examined would be worse than not printing it (issue #1322).
+/// `password=` key, so nothing here would ever look at its value. Printing a
+/// value the scanner never checked would be worse than printing nothing
+/// (issue #1322).
 #[must_use]
 pub fn redact_dsn(dsn: &str) -> String {
     if !dsn::is_uri_dsn(dsn) {
@@ -252,12 +253,20 @@ fn redact_userinfo(base: &str) -> String {
 /// scanner meets a token that is not a real libpq keyword. Such a token
 /// carries no `password=` option for this function to find. Echoing the
 /// rest back would print a string that was never examined (issue #1322).
+///
+/// Withholds a non-blank DSN the same way when the scanner finds no option
+/// at all. `alice:hunter2@db` is a dropped scheme with no `=` anywhere. The
+/// loop below never runs, so it never gets the chance to withhold. A DSN
+/// with nothing recognizable earns no more trust than one with a bad
+/// keyword.
 fn redact_keyword_value(dsn: &str) -> String {
     const WITHHELD: &str = "<redacted dsn>";
 
     let mut out = String::with_capacity(dsn.len());
     let mut copied = 0;
+    let mut saw_option = false;
     for option in dsn::keyword_options(dsn) {
+        saw_option = true;
         if !dsn::is_connection_keyword(option.key) {
             return WITHHELD.to_owned();
         }
@@ -273,6 +282,9 @@ fn redact_keyword_value(dsn: &str) -> String {
         out.push_str(&dsn[copied..option.value_span.start]);
         out.push_str("***");
         copied = option.value_span.end;
+    }
+    if !saw_option && !dsn.trim().is_empty() {
+        return WITHHELD.to_owned();
     }
     out.push_str(&dsn[copied..]);
     out
