@@ -12,8 +12,9 @@
 // The pool construction and the Redis probe follow
 // `docs/assays/apparatus/0008-redis-dispatch-integrated/src/main.rs`. The
 // workload constants are ported by value from
-// `autumn-harvest/tests/integration/e2e_bench_support.rs`, because ledger #2
-// failed twice on an apparatus that resembled its control and did not match it.
+// `autumn-harvest/tests/integration/e2e_bench_support.rs`. Ledger #2 failed
+// twice on an apparatus that only resembled its control. A port by value is
+// what stops that failure here.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -182,10 +183,10 @@ impl Arm {
 /// Counts activity body executions across every arm.
 ///
 /// The pre-registration words the correctness precondition as a side-effect
-/// row count. This counter replaces the row, on every arm equally, for a
-/// parity reason recorded in the report: the embedded backend runs activity
-/// bodies inline on the thread that holds its single writer, so a body that
-/// wrote a row would contend with the runtime's own writer. Charging the
+/// row count. This counter replaces the row, on every arm equally. The reason
+/// is parity, and the report records it. The embedded backend runs activity
+/// bodies inline on the thread that holds its single writer. A body that wrote
+/// a row would therefore contend with the runtime's own writer. Charging the
 /// Postgres arms for a write the embedded arm cannot perform would bias the
 /// comparison the assay exists to make. The intent of the precondition is
 /// unchanged. An exact count still proves no activity ran twice and none was
