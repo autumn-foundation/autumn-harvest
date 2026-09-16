@@ -200,6 +200,9 @@ const ALLOWLIST_CHAOS_REASON: &str = "chaos-feature-gated (issue #940): DOES run
      workflow_dispatch + nightly job (.github/workflows/chaos.yml) that runs the suite with >=5 distinct \
      seeds — NOT the manifest's `test` job (chaos is `#[cfg(feature = \"chaos\")]`, off by default and \
      seed-driven/slower, so it is deliberately not part of every PR run). Not a coverage gap.";
+const ALLOWLIST_PERF_EVIDENCE_REASON: &str = "manual pg_stat_statements perf-evidence generator (issue #1620): its \
+     one test is #[ignore]d by design, run by hand per docs/performance-outbox-start-relay.md's `Reproduce` \
+     section against a real local Postgres — no CI run should execute it automatically. Not a coverage gap.";
 
 const ALLOWLIST: &[(&str, &str)] = &[
     // ── core (autumn-harvest/tests/integration) ──
@@ -262,6 +265,7 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("plugin:history_export_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:mcp_tools_integration", ALLOWLIST_MCP_IGNORED_REASON),
     ("plugin:outbox_integration", ALLOWLIST_DEBT_REASON),
+    ("plugin:outbox_start_relay_perf", ALLOWLIST_PERF_EVIDENCE_REASON),
     ("plugin:preflight_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:replay_canary_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:retirement_check_integration", ALLOWLIST_DEBT_REASON),
