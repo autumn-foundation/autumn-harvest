@@ -122,9 +122,9 @@ suite ships in the repo — see [Reproducing](#reproducing).
 [#11](assays/0011-harvest-vs-temporal-single-box.md) put Harvest and Temporal
 on one 4-core box, against the same PostgreSQL server, at this page's own
 3-activity workflow. Temporal sustained more throughput **at every backlog
-depth tested**: roughly **1.7x** against Harvest's best-configured mode, and up
-to **7.92x** against its default Postgres mode at a 2,000-row backlog
-(43.30 against 5.47 workflows/sec). It did so
+depth tested**: roughly **1.5x to 2x** against Harvest's best-configured mode,
+and up to **7.91x** against its default Postgres mode at a 2,000-row backlog
+(43.29 against 5.47 workflows/sec). It did so
 in the configuration that suits it least, with all four of its services
 co-resident on cores they shared with their own database.
 

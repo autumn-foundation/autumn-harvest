@@ -1,4 +1,4 @@
-# ⛏️ Prospect: does harvest match Temporal's throughput on one box, at one shape? (kill: 5.47 against 43.30 workflows/sec, ledger #11)
+# ⛏️ Prospect: does harvest match Temporal's throughput on one box, at one shape? (kill: 5.47 against 43.29 workflows/sec, ledger #11)
 
 > Status: **measured.** The Pre-registration lives in
 > [`docs/rnd/2026-09-16-harvest-vs-temporal-single-box-preregistration.md`](../rnd/2026-09-16-harvest-vs-temporal-single-box-preregistration.md)
@@ -52,7 +52,7 @@ on why these numbers replace an earlier pair.
 
 | arm | mean workflows/sec | per rep | valid reps | correctness |
 |:--|--:|:--|--:|:--|
-| `temporal_go` | **43.30** | 48.95 / 39.28 / 41.66 | 3 | PASS |
+| `temporal_go` | **43.29** | 48.95 / 39.28 / 41.66 | 3 | PASS |
 | `harvest_pg` | **5.47** | 5.64 / 5.38 / 5.40 | 3 | PASS |
 
 Every Temporal repetition completed all 2,000 executions with exactly 6,000
@@ -79,8 +79,11 @@ payload. The same round found the Temporal arm persisting **no** activity input
 payload where harvest persists an explicit JSON null — 6,000 smaller history
 records per repetition, in Temporal's favour.
 
-The first reported pair was 44.31 against 5.58, a ratio of 7.9x. The corrected
-pair is 43.30 against 5.47, a ratio of **7.92x**. The corrections moved the
+The first reported pair was 44.31 against 5.58. The corrected pair is 43.29
+against 5.47, a ratio of **7.91x** computed from the unrounded means
+(43.2943 / 5.47184 = 7.9122). An earlier revision printed 7.92x by dividing
+the rounded display values, which is double-rounding; the error was caught in
+review and is noted here rather than silently fixed. The corrections moved the
 headline by nothing measurable. Both facts belong in the record: the first
 numbers came from an apparatus with known defects, *and* they happened to be
 right. The first is why the re-run was necessary; the second is not a
@@ -98,8 +101,8 @@ numbers and invisible in the mean.
 
 ## 🏁 Verdict
 
-**KILL on L1, decisively and against harvest, by 7.92x.** `harvest_pg`
-sustained 5.47 workflows/sec against `temporal_go`'s 43.30 at the registered
+**KILL on L1, decisively and against harvest, by 7.91x.** `harvest_pg`
+sustained 5.47 workflows/sec against `temporal_go`'s 43.29 at the registered
 shape and the registered payload. The pre-registration called this outcome a genuine and publishable
 negative result, and it is reported as one.
 
@@ -126,28 +129,41 @@ cell sits at a backlog depth where assay #10 independently found the harvest
 Postgres arm collapsing, and reporting a single ratio from that depth alone
 would attribute a specific, documented defect to the engine as a whole.
 
-**These cells were taken before the payload corrections above**, so harvest ran
-at the canonical empty object and Temporal persisted no activity input. Both
-corrections slow both arms slightly, and at the registered cell they moved the
-ratio from 7.9x to 7.92x, so the shape of the curve is unaffected. The cells
-are left as measured rather than re-run, and are read for their shape rather
-than their exact values.
+Every cell below was **re-measured after the payload corrections**, at this
+assay's registered payload on both arms. An earlier revision kept the
+pre-correction cells and argued from the one re-run cell that the curve was
+unaffected. Review caught that as an overreach, and it was: the corrections
+are not symmetric, since one of them adds persisted activity payloads to
+Temporal only, and the shallowest cell had the narrowest margin of all of
+them. The cell least able to detect a problem was the one being used to rule
+one out.
 
 | backlog depth | harvest `postgres` | harvest `redis_pg` | `temporal_go` | Temporal / best harvest |
 |--:|--:|--:|--:|--:|
-| 250 | 23.65 | 22.41 | 28.85 | 1.22x |
-| 500 | 23.90 | 22.21 | 41.10 | 1.72x |
-| 1,000 | 14.54 | 22.53 | 38.54 | 1.71x |
-| 2,000 | 5.63 | 22.18 | 39.02 | 1.76x |
+| 250 | 23.64 | 22.60 | 36.17 | 1.53x |
+| 500 | 23.90 | 21.82 | 34.56 | 1.45x |
+| 1,000 | 13.93 | 22.58 | 45.80 | 2.03x |
+| 2,000 | 5.60 | 21.84 | 43.29 | 1.98x |
+
+Re-measuring **strengthened** the result rather than softening it. The old
+250-row cell read 28.85 for Temporal and now reads 36.17, so the shallowest
+margin moves from 1.22x to 1.53x: the pre-correction cells were understating
+Temporal, not flattering it.
+
+**These are single repetitions against a Temporal arm whose spread over three
+repetitions was about 25%.** The ratios are therefore coarse, and the 1.45x
+and 1.53x cells are not meaningfully different from each other. What the
+column supports is a range, not a trend: roughly **1.5x to 2x** against
+harvest's best-configured mode across this depth range.
 
 Three things this separates, none of which the registered line could:
 
 1. **Temporal is faster at every depth measured, including the shallowest.**
    There is no depth in this range where harvest wins. The registered kill is
    not an artifact of the depth chosen.
-2. **Against harvest's *best* mode the margin is stable and roughly 1.7x**, not
-   7.9x. The 7.9x figure is the margin against harvest's *default* mode at the
-   depth where its claim path is worst.
+2. **Against harvest's *best* mode the margin runs roughly 1.5x to 2x**, not
+   7.91x. The 7.91x figure is the margin against harvest's *default* mode at
+   the depth where its claim path is worst.
 3. **The widening margin against plain Postgres is one known, fixable defect**,
    not a general architectural gap. Harvest's Postgres arm falls 4.2x from 500
    to 2,000 rows of depth while Temporal stays flat, which is the
@@ -166,8 +182,9 @@ cells flatter harvest, and the true 1.22x is narrower still.
 ### What this does and does not license
 
 It licenses: *on one 4-core box, at a 3-activity workflow, Temporal sustained
-higher throughput than harvest at every backlog depth tested, by roughly 1.7x
-against harvest's best-configured mode and up to 7.9x against its default.*
+higher throughput than harvest at every backlog depth tested, by roughly 1.5x
+to 2x against harvest's best-configured mode and up to 7.91x against its
+default.*
 
 It does not license a general claim that Temporal is faster than harvest. One
 shape, one box, one version, one workload, no fan-out, no child workflows, no
@@ -197,12 +214,26 @@ may assume without evidence.
 
 ## Reproduce
 
+The Temporal arm:
+
 ```bash
 cd docs/assays/apparatus/0011-harvest-vs-temporal
 go build -o assay11 . && ./run.sh
 ```
 
 `run.sh` starts and removes the Temporal container itself and resets its
-persistence before every repetition. Run the harvest arm separately, never
-concurrently, per
-[`apparatus/0010-cross-mode-throughput/README.md`](apparatus/0010-cross-mode-throughput/README.md).
+persistence before every repetition.
+
+The harvest arm, **separately and never concurrently**. It needs
+`ASSAY10_INPUT_JSON` set to this assay's registered payload, because the
+apparatus defaults to the canonical empty object that assay #10's L1 requires.
+Without it the run reproduces #10's cell, not the 5.47 above:
+
+```bash
+ASSAY10_ARMS=postgres \
+ASSAY10_WORKFLOWS=2000 \
+ASSAY10_REPS=3 \
+ASSAY10_INPUT_JSON='{"p":"0123456789abcdef0123456789abcdef"}' \
+  cargo run --release --manifest-path \
+  docs/assays/apparatus/0010-cross-mode-throughput/Cargo.toml
+```

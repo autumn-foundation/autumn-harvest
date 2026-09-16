@@ -19,8 +19,10 @@
   `{"ok": true}` — the embedded backend runs a caller-supplied callback rather
   than `ActivityInfo::handler`, so the earlier fix never reached it.
 
-  Corrected figures: assay #11 is **43.30 against 5.47 workflows/sec**, a
-  **7.92x** kill against harvest, replacing 44.31 against 5.58. Assay #10's
+  Corrected figures: assay #11 is **43.29 against 5.47 workflows/sec**, a
+  **7.91x** kill against harvest (computed from the unrounded means; a first
+  revision printed 7.92x by dividing rounded display values, caught in review),
+  replacing 44.31 against 5.58. Assay #10's
   embedded arm is **3.19**, replacing 3.20. The corrections moved neither
   headline measurably. Both facts are recorded: the withdrawn numbers came
   from an apparatus with known defects, *and* they happened to be right.
@@ -37,6 +39,16 @@
   Also newly reported rather than smoothed away: Temporal's spread across three
   repetitions (39.28-48.95, about 25%) is far wider than harvest's (about 5%),
   which three repetitions cannot characterise and this assay does not try to.
+
+  **Every depth-diagnostic cell was re-measured** after the payload
+  corrections. A first revision kept the pre-correction cells and argued from
+  the single re-run cell that the curve was unaffected; review caught that as
+  an overreach, since the corrections are asymmetric (one adds persisted
+  payloads to Temporal only) and the shallowest cell had the narrowest margin.
+  Re-measuring **strengthened** the result: Temporal's 250-row cell moved from
+  28.85 to 36.17, taking the shallowest margin from 1.22x to 1.53x. The cells
+  are single repetitions against an arm with ~25% spread, so they support a
+  range (~1.5x-2x against harvest's best mode) rather than a trend.
 
   **Zero engine impact.** No `WorkflowEvent` variant, no migration, no
   behaviour or public-API change. `registered-sweep.md` is kept unedited with
