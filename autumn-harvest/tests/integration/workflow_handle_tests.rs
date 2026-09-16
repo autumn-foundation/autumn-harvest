@@ -257,13 +257,15 @@ async fn result_raw_wakes_on_harvest_events_notification() {
 }
 
 /// Issue #1317 review, P1: a listener stays bound to whichever shard it
-/// resolved at connect time. If the execution migrates to a different shard
-/// while `result_raw` is waiting, the old connection stays healthy -- no
-/// `ChannelClosed` -- so nothing wakes it again unless it rebinds on its
-/// own. This models the RESULT of a migration directly (copy the row onto
-/// the new shard, seal the old one with a forwarding pointer) rather than
-/// running the full staging/verification/cutover machinery, which is
-/// orthogonal to the listener-rebind behavior under test.
+/// resolved at connect time. If the execution migrates to a different
+/// shard while `result_raw` is waiting, the old connection stays healthy,
+/// with no `ChannelClosed`. Nothing wakes it again unless it rebinds on
+/// its own.
+///
+/// This models the RESULT of a migration directly: copy the row onto the
+/// new shard, seal the old one with a forwarding pointer. It skips the
+/// full staging/verification/cutover machinery, which is orthogonal to
+/// the listener-rebind behavior under test.
 #[tokio::test]
 async fn result_raw_rebinds_its_listener_after_a_migration() {
     #[derive(diesel::QueryableByName)]

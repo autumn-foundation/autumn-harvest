@@ -641,7 +641,7 @@ async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
 /// Issue #1317 review, P1 follow-up: a reconciled `MIGRATED` seal
 /// (`migrated_run_terminal_at` set) no longer represents anything current
 /// for this business key. It must be excluded from the terminal fallback
-/// outright, not merely lose an ordinary `started_at` tie-break -- the seal
+/// outright, not merely lose an ordinary `started_at` tie-break. The seal
 /// can be the ONLY row for this key on this shard, with no newer run to
 /// naturally outrank it.
 #[tokio::test]
