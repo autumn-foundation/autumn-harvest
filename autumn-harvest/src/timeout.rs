@@ -4036,8 +4036,20 @@ pub async fn enforce_external_cancels_outbox(
                         .zip(residence)
                         .and_then(|(p, shard)| p.exact_pool_for(shard))
                     {
-                        match pool.get().await {
-                            Ok(mut target_conn) => {
+                        // Bounded like the cross-shard delivery acquisitions
+                        // above (issue #1323, issue #1146). This check
+                        // reaches a peer pool while still holding a
+                        // connection from another pool in the same process.
+                        // This check is best-effort already: it logs its own
+                        // errors instead of propagating them. It logs a
+                        // timed-out acquisition and skips it the same way.
+                        match tokio::time::timeout(
+                            crate::external_target_location::peer_acquire_bound(pool),
+                            pool.get(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(mut target_conn)) => {
                                 if let Err(e) = check_and_report_unfinished_handlers(
                                     &mut target_conn,
                                     exec_id,
@@ -4053,11 +4065,17 @@ pub async fn enforce_external_cancels_outbox(
                                     );
                                 }
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 tracing::error!(
                                     exec_id = %exec_id,
                                     error = %e,
                                     "cancel outbox sweep: failed to acquire target-shard connection for unfinished-handler check"
+                                );
+                            }
+                            Err(_elapsed) => {
+                                tracing::warn!(
+                                    exec_id = %exec_id,
+                                    "cancel outbox sweep: no connection available for the target shard's unfinished-handler check; skipping"
                                 );
                             }
                         }
@@ -4298,10 +4316,28 @@ pub async fn enforce_external_awaits_outbox(
                         );
                         return Ok(Some((false, Some(row.id))));
                     };
-                    let mut target_conn = match pool.get().await {
-                        Ok(c) => c,
-                        Err(e) => {
+                    // Bounded like the cross-shard delivery acquisitions
+                    // above (issue #1323, issue #1146). This read reaches a
+                    // peer pool while still holding a connection from
+                    // another pool in the same process. One timeout checker
+                    // runs per assigned shard. See
+                    // `external_target_location::peer_acquire_bound`.
+                    let mut target_conn = match tokio::time::timeout(
+                        crate::external_target_location::peer_acquire_bound(pool),
+                        pool.get(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(c)) => c,
+                        Ok(Err(e)) => {
                             tracing::error!(error = %e, "await outbox sweep: failed to acquire target connection");
+                            return Ok(Some((false, Some(row.id))));
+                        }
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                target_shard = %target_residence,
+                                "await outbox sweep: no connection available for the target shard; leaving pending"
+                            );
                             return Ok(Some((false, Some(row.id))));
                         }
                     };
