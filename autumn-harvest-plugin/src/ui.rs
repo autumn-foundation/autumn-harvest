@@ -8160,10 +8160,16 @@ type ShardScheduleResult = (ShardId, Result<Vec<HarvestSchedule>, String>);
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ScheduleListParams {
+    // `page`/`limit` are `String`, not `i64` — same fix as
+    // `WorkerListParams`, `WorkflowListParams` and `DeadLetterListParams`
+    // (#1540/#1560/#1588). An `i64`-typed field fails axum's query
+    // deserialization on non-numeric text with a bare 400 before this
+    // handler ever runs. That discards every other filter already on the
+    // URL.
     #[serde(default)]
-    page: Option<i64>,
+    page: Option<String>,
     #[serde(default)]
-    limit: Option<i64>,
+    limit: Option<String>,
     #[serde(default)]
     target: Option<String>,
     /// "Workflow", "Dag", or empty/absent for All.
@@ -8684,11 +8690,15 @@ async fn list_schedules_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Query(params): Query<ScheduleListParams>,
 ) -> Result<Markup, AutumnError> {
-    let limit = params
-        .limit
-        .unwrap_or(DEFAULT_SCHEDULE_PAGE_SIZE)
-        .clamp(1, MAX_PAGE_SIZE);
-    let page = params.page.unwrap_or(0).max(0);
+    // `page`/`limit` used to `?`-propagate a bare 400 on a non-numeric
+    // value. That aborted the whole request before the filter form ever
+    // rendered. It is the same mechanism #1540/#1560/#1588 already fixed
+    // on the Workflows, Workers and DLQ pages. Degrade to a default and
+    // report the bad value inline instead, matching those pages' own
+    // `parse_page_query_field`/`parse_limit_query_field` use.
+    let (limit, limit_raw, limit_error) =
+        parse_limit_query_field(params.limit.as_deref(), DEFAULT_SCHEDULE_PAGE_SIZE);
+    let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
     let offset = page.saturating_mul(limit);
 
     // The page used to `?`-propagate each of these on a bad value. That
@@ -8777,12 +8787,15 @@ async fn list_schedules_ui(
         &decisions,
         page,
         limit,
+        &limit_raw,
         has_next,
         total_filtered,
         &unhealthy_summary,
         &distribution,
         params.refresh,
         params.flash.as_deref(),
+        limit_error.as_deref(),
+        page_error.as_deref(),
     ))
 }
 
@@ -9690,9 +9703,10 @@ fn schedule_return_to_path(
     filters: &ScheduleUiFilters,
     filter_raw: &ScheduleUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
     refresh: Option<u64>,
 ) -> String {
-    let query = build_schedule_query_string(limit, filters, filter_raw, refresh);
+    let query = build_schedule_query_string(limit, limit_raw, filters, filter_raw, refresh);
     if query.is_empty() {
         "../schedules".to_string()
     } else {
@@ -9733,6 +9747,7 @@ fn render_schedules_page(
     decisions: &std::collections::HashMap<uuid::Uuid, Vec<ScheduleDecision>>,
     page: i64,
     limit: i64,
+    limit_raw: &str,
     has_next: bool,
     total_filtered: usize,
     // Unhealthy counts over the whole *filtered* set, not just this page: the
@@ -9742,6 +9757,8 @@ fn render_schedules_page(
     distribution: &str,
     refresh: Option<u64>,
     flash: Option<&str>,
+    limit_error: Option<&str>,
+    page_error: Option<&str>,
 ) -> Markup {
     // The "show only unhealthy" link forces `health=Unhealthy`, so it clears
     // any stale health error the same way it clears the parsed override.
@@ -9762,14 +9779,14 @@ fn render_schedules_page(
                 strong { "Needs attention: " }
                 (unhealthy_summary)
                 " — "
-                a href={ "schedules?health=Unhealthy" (PreEscaped(&build_schedule_query_string(limit, &ScheduleUiFilters { health: ScheduleHealthFilter::All, ..filters.clone() }, &unhealthy_link_raw, refresh))) } {
+                a href={ "schedules?health=Unhealthy" (PreEscaped(&build_schedule_query_string(limit, limit_raw, &ScheduleUiFilters { health: ScheduleHealthFilter::All, ..filters.clone() }, &unhealthy_link_raw, refresh))) } {
                     "show only unhealthy"
                 }
             }
         }
 
-        (render_schedule_filters(filters, filter_raw, limit, refresh))
-        (render_schedule_bulk_actions(filters, filter_raw, limit, refresh, total_filtered, distribution))
+        (render_schedule_filters(filters, filter_raw, limit, limit_raw, limit_error, refresh))
+        (render_schedule_bulk_actions(filters, filter_raw, limit, limit_raw, refresh, total_filtered, distribution))
 
         @if rows.is_empty() && shard_errors.is_empty() {
             div.card.empty {
@@ -9795,7 +9812,7 @@ fn render_schedules_page(
             div."table-scroll" { (render_schedule_table(rows, is_multi_shard, decisions)) }
         }
 
-        (render_schedule_pagination(page, limit, has_next, filters, filter_raw, refresh))
+        (render_schedule_pagination(page, limit, limit_raw, has_next, filters, filter_raw, refresh, page_error))
     };
 
     // Auto-refresh must keep the operator on the page they were reading,
@@ -9805,7 +9822,7 @@ fn render_schedules_page(
     // back on page 0 without harm; a repeating reload cannot).
     let refresh_target = format!(
         "schedules?page={page}{}",
-        build_schedule_query_string(limit, filters, filter_raw, refresh)
+        build_schedule_query_string(limit, limit_raw, filters, filter_raw, refresh)
     );
     layout_schedules("Schedules · Vantage", &body, refresh, "", &refresh_target)
 }
@@ -9814,10 +9831,21 @@ fn render_schedule_filters(
     filters: &ScheduleUiFilters,
     filter_raw: &ScheduleUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
+    limit_error: Option<&str>,
     refresh: Option<u64>,
 ) -> Markup {
     let target_val = filters.target.as_deref().unwrap_or("");
     let refresh_value = refresh.map(|s| s.to_string()).unwrap_or_default();
+    // Echo exactly what the operator typed on a parse failure, matching the
+    // Workflows/Workers/DLQ pages' own `render_filters`/
+    // `render_worker_filters`/`render_dead_letter_filters`. Falls back to
+    // the resolved value when the field was absent or valid.
+    let limit_value = if limit_raw.is_empty() {
+        limit.to_string()
+    } else {
+        limit_raw.to_string()
+    };
 
     html! {
         form.filters method="get" action="schedules" {
@@ -9876,7 +9904,15 @@ fn render_schedule_filters(
             }
             label {
                 "Per page"
-                input type="number" name="limit" min="1" max=(MAX_PAGE_SIZE) value=(limit);
+                // `type="text"`, not `type="number"`. A number input
+                // sanitizes an invalid value (e.g. "not-a-number") to blank
+                // at render time. The operator could then never see or
+                // correct their own bad input. Matches the Workflows,
+                // Workers and DLQ pages' "Per page" fields.
+                input type="text" inputmode="numeric" pattern="[0-9]*" name="limit" value=(limit_value);
+                @if let Some(error) = limit_error {
+                    span.field-error role="alert" { (error) }
+                }
             }
             label {
                 "Refresh"
@@ -9899,12 +9935,13 @@ fn render_schedule_bulk_actions(
     filters: &ScheduleUiFilters,
     filter_raw: &ScheduleUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
     refresh: Option<u64>,
     total_matching: usize,
     distribution: &str,
 ) -> Markup {
-    let return_qs = build_schedule_query_string(limit, filters, filter_raw, refresh);
-    let return_to = schedule_return_to_path(filters, filter_raw, limit, refresh);
+    let return_qs = build_schedule_query_string(limit, limit_raw, filters, filter_raw, refresh);
+    let return_to = schedule_return_to_path(filters, filter_raw, limit, limit_raw, refresh);
     let dist_suffix = if distribution.is_empty() {
         String::new()
     } else {
@@ -10285,16 +10322,22 @@ fn schedule_state_badge(is_paused: bool) -> Markup {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_schedule_pagination(
     page: i64,
     limit: i64,
+    limit_raw: &str,
     has_next: bool,
     filters: &ScheduleUiFilters,
     filter_raw: &ScheduleUiFilterRaw,
     refresh: Option<u64>,
+    page_error: Option<&str>,
 ) -> Markup {
-    let base = build_schedule_query_string(limit, filters, filter_raw, refresh);
+    let base = build_schedule_query_string(limit, limit_raw, filters, filter_raw, refresh);
     html! {
+        @if let Some(error) = page_error {
+            span.field-error role="alert" { (error) }
+        }
         div.pagination {
             @if page > 0 {
                 a href={ "schedules?page=" (page - 1) (PreEscaped(&base)) } {
@@ -10317,12 +10360,20 @@ fn render_schedule_pagination(
 
 fn build_schedule_query_string(
     limit: i64,
+    limit_raw: &str,
     filters: &ScheduleUiFilters,
     filter_raw: &ScheduleUiFilterRaw,
     refresh: Option<u64>,
 ) -> String {
     let mut out = String::new();
-    if limit != DEFAULT_SCHEDULE_PAGE_SIZE {
+    // `limit_raw` is non-empty only on a genuine parse failure (see
+    // `parse_limit_query_field`), never for a valid-but-clamped value. An
+    // invalid limit the operator has not yet corrected must not silently
+    // vanish from a Next/Previous link. Same as the Workflows/Workers/DLQ
+    // pages' own query-string builders.
+    if !limit_raw.is_empty() {
+        let _ = write!(out, "&limit={}", url_encode(limit_raw));
+    } else if limit != DEFAULT_SCHEDULE_PAGE_SIZE {
         let _ = write!(out, "&limit={limit}");
     }
     if let Some(ref target) = filters.target {
@@ -13302,7 +13353,13 @@ mod tests {
         let filters = ScheduleUiFilters::default();
         let filter_raw = ScheduleUiFilterRaw::default();
         assert_eq!(
-            build_schedule_query_string(DEFAULT_SCHEDULE_PAGE_SIZE, &filters, &filter_raw, None),
+            build_schedule_query_string(
+                DEFAULT_SCHEDULE_PAGE_SIZE,
+                "",
+                &filters,
+                &filter_raw,
+                None
+            ),
             ""
         );
     }
@@ -13323,7 +13380,7 @@ mod tests {
             shard_id: "2".to_string(),
             ..ScheduleUiFilterRaw::default()
         };
-        let q = build_schedule_query_string(10, &filters, &filter_raw, Some(30));
+        let q = build_schedule_query_string(10, "", &filters, &filter_raw, Some(30));
         assert!(q.contains("health=Unhealthy"), "missing health: {q}");
         assert!(q.contains("limit=10"), "missing limit: {q}");
         assert!(q.contains("target=payment"), "missing target: {q}");
@@ -13348,8 +13405,13 @@ mod tests {
             shard_id_error: Some("bad shard_id".to_string()),
             ..ScheduleUiFilterRaw::default()
         };
-        let q =
-            build_schedule_query_string(DEFAULT_SCHEDULE_PAGE_SIZE, &filters, &filter_raw, None);
+        let q = build_schedule_query_string(
+            DEFAULT_SCHEDULE_PAGE_SIZE,
+            "",
+            &filters,
+            &filter_raw,
+            None,
+        );
         assert!(
             q.contains("kind=zombie"),
             "an invalid kind must still round-trip through pagination: {q}"
@@ -13357,6 +13419,29 @@ mod tests {
         assert!(
             q.contains("shard_id=north"),
             "an invalid shard_id must still round-trip through pagination: {q}"
+        );
+    }
+
+    /// Same fix as the Workflows/Workers/DLQ pages' own
+    /// `build_query_string_preserves_invalid_limit_text_for_pagination`/
+    /// `build_worker_query_string_preserves_invalid_limit_text_for_pagination`/
+    /// `build_dead_letter_query_string_preserves_invalid_limit_text_for_pagination`:
+    /// `limit_raw` is non-empty only on a genuine parse failure. It must
+    /// override the resolved `limit` in the Next/Previous link instead of
+    /// being silently dropped alongside it.
+    #[test]
+    fn build_schedule_query_string_preserves_invalid_limit_text_for_pagination() {
+        let filters = ScheduleUiFilters::default();
+        let filter_raw = ScheduleUiFilterRaw::default();
+        assert_eq!(
+            build_schedule_query_string(
+                DEFAULT_SCHEDULE_PAGE_SIZE,
+                "not-a-number",
+                &filters,
+                &filter_raw,
+                None
+            ),
+            "&limit=not-a-number"
         );
     }
 
@@ -13423,17 +13508,76 @@ mod tests {
             &std::collections::HashMap::new(),
             2,
             50,
+            "",
             false,
             0,
             "",
             "",
             Some(30),
             None,
+            None,
+            None,
         )
         .into_string();
         assert!(
             html.contains("url=schedules?page=2"),
             "refresh target must preserve page=2: {html}"
+        );
+    }
+
+    /// Same fix as the DLQ page's own
+    /// `render_dead_letter_pagination_shows_page_error`. An invalid `page`
+    /// value must render its error inline, above the Previous/Next
+    /// controls. This page has no backing form field for `page`.
+    #[test]
+    fn render_schedule_pagination_shows_page_error() {
+        let filters = ScheduleUiFilters::default();
+        let filter_raw = ScheduleUiFilterRaw::default();
+        let html = render_schedule_pagination(
+            0,
+            DEFAULT_SCHEDULE_PAGE_SIZE,
+            "",
+            false,
+            &filters,
+            &filter_raw,
+            None,
+            Some("Invalid page 'nope'; expected a whole number. Showing page 1."),
+        )
+        .into_string();
+        assert!(
+            html.contains("field-error") && html.contains("Invalid page 'nope'"),
+            "the page error must render inline: {html}"
+        );
+    }
+
+    /// Same "browser sanitizes an invalid number input to blank" defect the
+    /// Workflows/Workers/DLQ pages already fixed
+    /// (`per_page_input_is_a_text_control_that_can_hold_invalid_text`). The
+    /// Schedules page's "Per page" field must be a text control too.
+    #[test]
+    fn schedule_per_page_input_is_a_text_control_that_can_hold_invalid_text() {
+        let filters = ScheduleUiFilters::default();
+        let filter_raw = ScheduleUiFilterRaw::default();
+        let html = render_schedule_filters(
+            &filters,
+            &filter_raw,
+            DEFAULT_SCHEDULE_PAGE_SIZE,
+            "not-a-number",
+            Some("invalid limit 'not-a-number'"),
+            None,
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"input type="text" inputmode="numeric" pattern="[0-9]*" name="limit""#),
+            "the Per page field must be a text control, not type=\"number\": {html}"
+        );
+        assert!(
+            html.contains("value=\"not-a-number\""),
+            "the operator's invalid input must be preserved: {html}"
+        );
+        assert!(
+            html.contains("field-error") && html.contains("invalid limit"),
+            "the limit error must render inline: {html}"
         );
     }
 
@@ -17273,7 +17417,8 @@ mod tests {
             kind_error: Some("bad kind".to_string()),
             ..ScheduleUiFilterRaw::default()
         };
-        let path = schedule_return_to_path(&filters, &filter_raw, DEFAULT_SCHEDULE_PAGE_SIZE, None);
+        let path =
+            schedule_return_to_path(&filters, &filter_raw, DEFAULT_SCHEDULE_PAGE_SIZE, "", None);
         assert_eq!(path, "../schedules?kind=zombie");
     }
 
@@ -17281,7 +17426,8 @@ mod tests {
     fn schedule_return_to_path_is_bare_schedules_when_no_filters_are_set() {
         let filters = ScheduleUiFilters::default();
         let filter_raw = ScheduleUiFilterRaw::default();
-        let path = schedule_return_to_path(&filters, &filter_raw, DEFAULT_SCHEDULE_PAGE_SIZE, None);
+        let path =
+            schedule_return_to_path(&filters, &filter_raw, DEFAULT_SCHEDULE_PAGE_SIZE, "", None);
         assert_eq!(path, "../schedules");
     }
 
@@ -17296,6 +17442,7 @@ mod tests {
             &filters,
             &filter_raw,
             DEFAULT_SCHEDULE_PAGE_SIZE,
+            "",
             None,
             3,
             "3 Workflow",
@@ -17460,6 +17607,7 @@ mod tests {
         };
         let qs = build_schedule_query_string(
             DEFAULT_SCHEDULE_PAGE_SIZE,
+            "",
             &ScheduleUiFilters {
                 health: ScheduleHealthFilter::All,
                 ..filters

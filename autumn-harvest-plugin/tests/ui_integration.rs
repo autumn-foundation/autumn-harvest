@@ -2152,6 +2152,75 @@ async fn ui_schedules_invalid_shard_id_redisplays_form_instead_of_aborting_page(
     );
 }
 
+/// RED (was): `page`/`limit` were still typed `Option<i64>` directly on
+/// `ScheduleListParams`. That is the same mechanism #1540/#1560/#1588
+/// already fixed on the Workflows, Workers and DLQ pages, and the one this
+/// page's own `kind`/`paused`/`health`/`shard_id` fixes left over.
+/// `?limit=not-a-number` failed axum's own query deserialization with a
+/// bare 400 before `list_schedules_ui` ever ran, discarding the `target`
+/// filter the operator had already typed alongside it.
+///
+/// GREEN (this commit): the request still renders the Schedules page
+/// (`200`) and preserves the other filter. It surfaces a `role="alert"`
+/// message naming the bad value next to the "Per page" field.
+#[tokio::test]
+async fn ui_schedules_invalid_limit_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/schedules?limit=not-a-number&target=billing").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid limit must not abort the whole Schedules page: {html}"
+    );
+    assert!(
+        html.contains("value=\"billing\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+}
+
+/// Same fix, the `page` field. No form field backs it; it drives the
+/// Previous/Next links instead, a distinct code path. Covered
+/// independently here rather than assumed symmetric with `limit`,
+/// matching the Workflows/Workers/DLQ pages' own `page` coverage.
+#[tokio::test]
+async fn ui_schedules_invalid_page_redisplays_list_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/schedules?page=not-a-number&target=billing").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid page must not abort the whole Schedules page: {html}"
+    );
+    assert!(
+        html.contains("value=\"billing\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the pagination controls: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+    assert!(
+        html.contains("Page 1"),
+        "falls back to page 1 (zero-based page 0) instead of guessing: {html}"
+    );
+}
+
 /// Filter `paused=Paused` shows only paused rows.
 #[tokio::test]
 async fn ui_schedules_filter_by_paused() {
