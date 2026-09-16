@@ -5971,6 +5971,524 @@ pub async fn pending_queue_demand_by_queue_name(
 }
 
 // ---------------------------------------------------------------------------
+// Batched seek-and-refine claim (issue #1340)
+// ---------------------------------------------------------------------------
+
+/// A batched, seek-and-refine alternative to [`claim_task_query`]'s
+/// single-row form, for the per-key concurrency gate specifically.
+///
+/// # Scope
+///
+/// Issue #1177 found that any residual `WHERE` predicate on the claim
+/// candidate scan defeats index sort-elision. Each one forces a
+/// full-backlog scan per claim. Issue #1340 tracks the architectural fix:
+/// fetch a small ordered batch of candidates instead of the single best
+/// row. Apply the expensive gate to the batch, and retry with the next
+/// batch on exhaustion.
+///
+/// This module implements that shape for one gate: the per-key concurrency
+/// check (issue #247). It is the single most expensive residual predicate
+/// measured (`docs/performance.md`: +644% even at low contention). Every
+/// other gate in [`claim_task_query`] stays in the batch scan unchanged --
+/// pause, sticky, session, build routing, workflow pause, capability
+/// labels, rate limiting.
+/// `docs/assays/0005-claim-batched-seek-and-refine.md`
+/// (ledger #5) prototyped and killed one version of this shape. The kill
+/// was a pre-registration fencepost bug, not a mechanism defect: wall-clock
+/// cleared every line by 2.9x-190x. Two real correctness bugs surfaced
+/// there in review. Both are fixed here from the start:
+///
+/// 1. The winning candidate must be picked by the SAME per-candidate
+///    `pg_try_advisory_xact_lock` + fresh `COUNT` recheck the single-row
+///    path already uses. It must never use a batch-wide snapshot taken
+///    before any lock. [`claim_batched_candidate_attempt_query`] is that
+///    recheck, applied to one already-locked row at a time.
+/// 2. The keyset cursor between batches must break ties on `id`, not just
+///    on the sort key. `scheduled_at` and priority commonly collide across
+///    many rows. A 3-column cursor silently drops tied rows past a batch
+///    boundary. The cursor here carries `(sticky_rank, effective_priority,
+///    scheduled_at, id)` and compares with an explicit `OR` chain, since
+///    the columns sort in mixed directions.
+///
+/// # What this is not
+///
+/// This is **not** wired into [`claim_task`] or [`claim_task_on_shard`].
+/// Batching locks up to `batch_size` rows per attempt instead of one.
+/// `tests/integration/claim_batched_tests.rs` measures real
+/// concurrent-claimer correctness under that shape, not merely a stub.
+/// Unlike ledger #5's single-session apparatus, this crate's tests drive
+/// real concurrent Tokio tasks against a real Postgres. They assert no
+/// saturated key is ever over-claimed. What those tests do NOT cover is
+/// fleet-scale throughput under contention, only correctness. That gap is
+/// what issue #1340 flags before this could become the default claim path.
+/// Making this the default claim path needs sign-off from someone with
+/// full context on `queue.rs`'s exactly-once-claim and lock-ordering
+/// invariants, per issue #1340's own scope.
+///
+/// This variant also does not implement the cross-region DR fence (issue
+/// #954). Nor does it implement the by-id claim (issue #1312) that
+/// [`claim_task_query_fenced`] and [`claim_task_by_id_query`] add to the
+/// single-row path. A deployment using either would need those ported here
+/// first.
+// The body is one SQL string literal; the line count is the query's, not
+// control flow's -- the same allow `claim_task_query` carries.
+#[allow(clippy::too_many_lines)]
+#[must_use]
+pub fn claim_task_batched_candidates_query() -> &'static str {
+    static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let rate_limit_available = effective_available_tokens_expr("b");
+        format!(
+            "WITH worker_info AS ( \
+                 SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{{}}'::jsonb) AS labels \
+             ), \
+             paused_queues AS MATERIALIZED ( \
+                 SELECT COALESCE(array_agg(queue_name), ARRAY[]::text[]) AS names \
+                 FROM harvest_queue_pauses \
+                 WHERE queue_name = ANY($2) \
+             ), \
+             paused_activities AS MATERIALIZED ( \
+                 SELECT COALESCE(array_agg(activity_name), ARRAY[]::text[]) AS names \
+                 FROM harvest_activity_pauses \
+             ) \
+             SELECT \
+                 id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name, \
+                 scheduled_at, \
+                 CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END AS sticky_rank, \
+                 CASE \
+                     WHEN $4::BIGINT IS NOT NULL AND $4::BIGINT > 0 \
+                     THEN priority + FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / $4::BIGINT)::INT \
+                     ELSE priority \
+                 END AS effective_priority \
+             FROM harvest_task_queue \
+             CROSS JOIN worker_info \
+             CROSS JOIN paused_queues \
+             CROSS JOIN paused_activities \
+             WHERE queue_name = ANY($2) \
+               AND state = 'PENDING' \
+               AND scheduled_at <= NOW() \
+               AND NOT (harvest_task_queue.queue_name = ANY(paused_queues.names)) \
+               AND ( \
+                   schedule_to_close_at IS NULL \
+                   OR schedule_to_close_at > NOW() \
+               ) \
+               AND ( \
+                   sticky_worker_id IS NULL \
+                   OR sticky_worker_id = $1 \
+                   OR sticky_until IS NULL \
+                   OR sticky_until <= NOW() \
+               ) \
+               AND ( \
+                   session_id IS NULL \
+                   OR sticky_worker_id = $1 \
+               ) \
+               AND ( \
+                   required_build_id IS NULL \
+                   OR $3 = '' \
+                   OR required_build_id = $3 \
+                   OR EXISTS ( \
+                       SELECT 1 FROM harvest_build_compat \
+                       WHERE build_id = $3 \
+                         AND compatible_with = harvest_task_queue.required_build_id \
+                   ) \
+               ) \
+               AND ( \
+                   task_type <> 'workflow' \
+                   OR workflow_exec_id IS NULL \
+                   OR NOT EXISTS ( \
+                       SELECT 1 FROM harvest_workflow_executions e \
+                       WHERE e.id = harvest_task_queue.workflow_exec_id \
+                         AND e.state = 'PAUSED' \
+                   ) \
+               ) \
+               AND ( \
+                   task_type != 'activity' \
+                   OR activity_name IS NULL \
+                   OR required_capabilities IS NOT NULL \
+                   OR NOT (activity_name = ANY($6)) \
+               ) \
+               AND ( \
+                   task_type != 'activity' \
+                   OR activity_name IS NULL \
+                   OR NOT (activity_name = ANY(paused_activities.names)) \
+               ) \
+               AND ( \
+                   required_capabilities IS NULL \
+                   OR NOT EXISTS ( \
+                       SELECT 1 \
+                       FROM jsonb_array_elements(required_capabilities) AS r(value) \
+                       WHERE ( \
+                           r.value ? 'Exact' AND ( \
+                               worker_info.labels->>(r.value->'Exact'->>'key') IS NULL \
+                               OR worker_info.labels->>(r.value->'Exact'->>'key') != (r.value->'Exact'->>'value') \
+                           ) \
+                       ) OR ( \
+                           r.value ? 'In' AND ( \
+                               worker_info.labels->>(r.value->'In'->>'key') IS NULL \
+                               OR NOT ( \
+                                   (r.value->'In'->'values') @> jsonb_build_array(worker_info.labels->>(r.value->'In'->>'key')) \
+                               ) \
+                           ) \
+                       ) \
+                   ) \
+               ) \
+               AND ( \
+                   rate_limit_key IS NULL \
+                   OR harvest_task_queue.activity_name = ANY($5) \
+                   OR EXISTS ( \
+                       SELECT 1 FROM harvest_rate_limit_buckets b \
+                       WHERE b.key = harvest_task_queue.rate_limit_key \
+                         AND {rate_limit_available} >= 1.0 \
+                   ) \
+               ) \
+               AND ( \
+                   $7::BOOL = FALSE \
+                   OR (CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END) < $8 \
+                   OR ( \
+                       (CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END) = $8 \
+                       AND (CASE \
+                           WHEN $4::BIGINT IS NOT NULL AND $4::BIGINT > 0 \
+                           THEN priority + FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / $4::BIGINT)::INT \
+                           ELSE priority \
+                       END) < $9 \
+                   ) \
+                   OR ( \
+                       (CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END) = $8 \
+                       AND (CASE \
+                           WHEN $4::BIGINT IS NOT NULL AND $4::BIGINT > 0 \
+                           THEN priority + FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / $4::BIGINT)::INT \
+                           ELSE priority \
+                       END) = $9 \
+                       AND scheduled_at > $10 \
+                   ) \
+                   OR ( \
+                       (CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END) = $8 \
+                       AND (CASE \
+                           WHEN $4::BIGINT IS NOT NULL AND $4::BIGINT > 0 \
+                           THEN priority + FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / $4::BIGINT)::INT \
+                           ELSE priority \
+                       END) = $9 \
+                       AND scheduled_at = $10 AND id > $11 \
+                   ) \
+               ) \
+             ORDER BY sticky_rank DESC, effective_priority DESC, scheduled_at ASC, id ASC \
+             LIMIT $12::BIGINT \
+             FOR UPDATE SKIP LOCKED"
+        )
+    });
+    &QUERY
+}
+
+/// The authoritative per-candidate claim attempt for [`claim_task_batched`].
+///
+/// Applied to one row [`claim_task_batched_candidates_query`] already
+/// locked via `FOR UPDATE SKIP LOCKED`. Matches 0 rows when the
+/// concurrency-key advisory lock is lost, the freshly-rechecked cap is now
+/// saturated, or the rate-limit bucket has no token. In every such case the
+/// caller moves on to the next candidate in the batch. This mirrors
+/// [`claim_task_query`]'s `claimed` CTE exactly, scoped to one known row
+/// instead of joined through a `candidate` CTE.
+///
+/// Binds: `$1` worker id, `$2` candidate row id, `$3` concurrency key,
+/// `$4` concurrency cap, `$5` task type. Also `$6` rate limit key, `$7`
+/// activity name, `$8` circuit-breaker-tracked activities.
+#[must_use]
+pub fn claim_batched_candidate_attempt_query() -> &'static str {
+    static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let rate_limit_available = effective_available_tokens_expr("b");
+        format!(
+            "WITH rate_limit_debit AS ( \
+                 UPDATE harvest_rate_limit_buckets b \
+                 SET tokens = {rate_limit_available} - 1.0, \
+                     last_refilled_at = NOW() \
+                 WHERE b.key = $6 \
+                   AND NOT ($7 = ANY($8)) \
+                   AND {rate_limit_available} >= 1.0 \
+                 RETURNING b.key AS debited_key \
+             ), \
+             claimed AS ( \
+                 UPDATE harvest_task_queue \
+                 SET state = 'RUNNING', worker_id = $1, started_at = NOW(), attempt = attempt + 1, \
+                     wake_requested = FALSE \
+                 WHERE id = $2 \
+                   AND ( \
+                       $3::text IS NULL \
+                       OR ( \
+                           pg_try_advisory_xact_lock(hashtext($3)::bigint) \
+                           AND ( \
+                               $4::int IS NULL \
+                               OR ( \
+                                   SELECT COUNT(*) FROM harvest_task_queue recheck \
+                                   WHERE recheck.concurrency_key = $3 \
+                                     AND recheck.task_type = $5 \
+                                     AND recheck.state = 'RUNNING' \
+                                     AND recheck.worker_id IS NOT NULL \
+                               ) < $4 \
+                           ) \
+                       ) \
+                   ) \
+                   AND ( \
+                       $6::text IS NULL \
+                       OR $7 = ANY($8) \
+                       OR EXISTS (SELECT 1 FROM rate_limit_debit WHERE debited_key = $6) \
+                   ) \
+                 RETURNING harvest_task_queue.* \
+             ) \
+             SELECT * FROM claimed"
+        )
+    });
+    &QUERY
+}
+
+/// One row from [`claim_task_batched_candidates_query`]: the columns needed
+/// to walk the batch and attempt a claim. Also carries the sort key used to
+/// resume from a keyset cursor on the next batch.
+#[derive(diesel::QueryableByName, Debug, Clone)]
+struct BatchedClaimCandidate {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: Uuid,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    task_type: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    concurrency_key: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+    concurrency_cap: Option<i32>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    rate_limit_key: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    activity_name: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    scheduled_at: DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    sticky_rank: i32,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    effective_priority: i32,
+}
+
+/// Keyset cursor resuming [`claim_task_batched_candidates_query`] just past
+/// the last row of an exhausted batch.
+///
+/// Four columns, not three: `scheduled_at` and `effective_priority` commonly
+/// tie across many rows in the same fixture (shared enqueue timestamp,
+/// shared priority). A cursor without `id` as a final tiebreak silently
+/// drops every row tied with the batch's own last row. That drop is not
+/// just once, but from every later batch too
+/// (`docs/assays/0005-claim-batched-seek-and-refine.md`, post-review item
+/// 1).
+#[derive(Debug, Clone, Copy)]
+struct BatchCursor {
+    sticky_rank: i32,
+    effective_priority: i32,
+    scheduled_at: DateTime<Utc>,
+    id: Uuid,
+}
+
+impl From<&BatchedClaimCandidate> for BatchCursor {
+    fn from(row: &BatchedClaimCandidate) -> Self {
+        Self {
+            sticky_rank: row.sticky_rank,
+            effective_priority: row.effective_priority,
+            scheduled_at: row.scheduled_at,
+            id: row.id,
+        }
+    }
+}
+
+/// Tuning knobs for [`claim_task_batched`] (issue #1340).
+///
+/// Both fields are stubs, not principled bounds. They are picked to match
+/// `docs/assays/0005-claim-batched-seek-and-refine.md`'s own fixed `B=50`,
+/// so a follow-up measurement stays comparable -- not because 50 is proven
+/// optimal. A bigger batch amortizes round trips further, but locks more
+/// rows per attempt. A smaller one locks fewer rows, but needs more
+/// batches against a deep adversarial backlog. `max_batches` bounds how
+/// far one claim attempt searches before giving up. It then leaves the
+/// remaining rows for the next poll cycle. This is the "seek and refine"
+/// trade issue #1340 names. No single claim is guaranteed the best
+/// eligible row across the whole backlog any more, only across
+/// `batch_size * max_batches` of it.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchedClaimConfig {
+    /// Candidate rows fetched per batch.
+    pub batch_size: i64,
+    /// Batches searched before this claim attempt gives up and returns
+    /// `None`, leaving every unvisited row `PENDING` for the next poll.
+    pub max_batches: u32,
+}
+
+impl Default for BatchedClaimConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 50,
+            max_batches: 20,
+        }
+    }
+}
+
+/// Fetch one ordered batch of claim candidates, optionally resuming past
+/// `cursor`. See [`claim_task_batched_candidates_query`] for the predicate.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_claim_batch(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    aging_secs_i64: Option<i64>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    cursor: Option<BatchCursor>,
+    batch_size: i64,
+) -> HarvestResult<Vec<BatchedClaimCandidate>> {
+    diesel::sql_query(claim_task_batched_candidates_query())
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+        .bind::<diesel::sql_types::Text, _>(worker_build_id)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(aging_secs_i64)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(ineligible_activities)
+        .bind::<diesel::sql_types::Bool, _>(cursor.is_some())
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(
+            cursor.map(|c| c.sticky_rank),
+        )
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(
+            cursor.map(|c| c.effective_priority),
+        )
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+            cursor.map(|c| c.scheduled_at),
+        )
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Uuid>, _>(cursor.map(|c| c.id))
+        .bind::<diesel::sql_types::BigInt, _>(batch_size)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// Attempt to claim one already-locked candidate.
+///
+/// `Ok(None)` means the authoritative recheck failed: the lock was lost,
+/// the cap is now saturated, or there is no rate token. That is not an
+/// error, just "try the next candidate in the batch".
+async fn try_claim_batched_candidate(
+    conn: &mut AsyncPgConnection,
+    candidate: &BatchedClaimCandidate,
+    worker_id: &str,
+    circuit_breaker_activities: &[String],
+) -> HarvestResult<Option<TaskQueueItem>> {
+    let mut rows: Vec<TaskQueueItem> = diesel::sql_query(claim_batched_candidate_attempt_query())
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .bind::<diesel::sql_types::Uuid, _>(candidate.id)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+            candidate.concurrency_key.as_deref(),
+        )
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(
+            candidate.concurrency_cap,
+        )
+        .bind::<diesel::sql_types::Text, _>(&candidate.task_type)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+            candidate.rate_limit_key.as_deref(),
+        )
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+            candidate.activity_name.as_deref(),
+        )
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(rows.pop())
+}
+
+/// Batched seek-and-refine claim (issue #1340).
+///
+/// See the module doc above [`claim_task_batched_candidates_query`] for
+/// scope, the mechanism, and what remains unmeasured before this could
+/// become the default claim path.
+///
+/// Same transaction shape as [`claim_task_on_shard`]: one `READ COMMITTED`
+/// transaction. A mid-flight re-check failure rolls the claim back, instead
+/// of stranding a `RUNNING` row no worker holds. Every batch fetch and
+/// every candidate attempt runs inside it. So `NOW()` -- and therefore
+/// every candidate's `effective_priority` -- is the same value across every
+/// batch this attempt fetches. Postgres freezes `NOW()` at transaction
+/// start, not per statement. Priority aging therefore cannot drift the
+/// keyset cursor's sort key between batches of the same attempt.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[allow(clippy::too_many_arguments)]
+pub async fn claim_task_batched(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    config: BatchedClaimConfig,
+) -> HarvestResult<Option<TaskQueueItem>> {
+    let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
+    let batch_size = config.batch_size.max(1);
+    let max_batches = config.max_batches.max(1);
+
+    let mut tx = conn.build_transaction().read_committed();
+    let outcome: ClaimOutcome = tx
+        .run(
+            async |conn: &mut AsyncPgConnection| -> HarvestResult<ClaimOutcome> {
+                let mut cursor: Option<BatchCursor> = None;
+                for _ in 0..max_batches {
+                    let batch = fetch_claim_batch(
+                        conn,
+                        queues,
+                        worker_id,
+                        worker_build_id,
+                        aging_secs_i64,
+                        circuit_breaker_activities,
+                        ineligible_activities,
+                        cursor,
+                        batch_size,
+                    )
+                    .await?;
+                    let fetched = batch.len();
+
+                    for candidate in &batch {
+                        if let Some(task) = try_claim_batched_candidate(
+                            conn,
+                            candidate,
+                            worker_id,
+                            circuit_breaker_activities,
+                        )
+                        .await?
+                        {
+                            return apply_post_claim_rechecks(conn, task, worker_id).await;
+                        }
+                    }
+
+                    let Some(last) = batch.last() else {
+                        // Empty batch: no PENDING row anywhere past the cursor.
+                        return Ok(ClaimOutcome::Empty);
+                    };
+                    cursor = Some(BatchCursor::from(last));
+                    if fetched < usize::try_from(batch_size).unwrap_or(usize::MAX) {
+                        // A short batch means the scan reached the end of the
+                        // matching backlog -- no next batch to fetch.
+                        return Ok(ClaimOutcome::Empty);
+                    }
+                }
+                Ok(ClaimOutcome::Empty)
+            },
+        )
+        .await?;
+
+    match outcome {
+        ClaimOutcome::Claimed(task) => Ok(Some(*task)),
+        ClaimOutcome::Released(task_id) => {
+            record_pending_hints(conn, &[task_id]).await;
+            Ok(None)
+        }
+        ClaimOutcome::Empty => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -6533,6 +7051,157 @@ mod tests {
             "concurrency_running_counts: one CTE definition + one reference \
              from the candidate-side COALESCE lookup; got:\n{sql}"
         );
+    }
+
+    // ── Batched seek-and-refine claim (issue #1340) ──────────────────────────
+
+    /// The batch scan must drop the concurrency-key soft filter entirely.
+    /// That is the whole point of moving the gate to a per-candidate
+    /// authoritative recheck, instead of a batch-wide predicate.
+    #[test]
+    fn claim_task_batched_candidates_query_omits_the_concurrency_gate() {
+        let sql = claim_task_batched_candidates_query();
+        assert!(
+            !sql.contains("concurrency_pending_keys"),
+            "the batch scan must not pre-filter or aggregate concurrency \
+             keys -- that work belongs in the per-candidate recheck; got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("concurrency_running_counts"),
+            "the batch scan must not aggregate RUNNING counts; got:\n{sql}"
+        );
+        assert!(
+            // The paren is part of the needle, not decoration. A bare
+            // "advisory_xact_lock" substring confuses
+            // `queue_pause::tests::queue_pause_owns_the_two_argument_advisory_keyspace`'s
+            // source scanner. It then mis-attributes this file's own next
+            // unrelated call as the advisory-lock call.
+            !sql.contains("pg_try_advisory_xact_lock("),
+            "the advisory lock belongs only in the per-candidate attempt \
+             query, never in the batch scan; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("concurrency_key, concurrency_cap"),
+            "the batch scan must still SELECT the concurrency columns, so \
+             the per-candidate recheck has them without a second lookup; \
+             got:\n{sql}"
+        );
+    }
+
+    /// Every OTHER gate in [`claim_task_query`] must still appear, byte for
+    /// byte, in the batch scan. This module is scoped to moving ONE gate
+    /// (concurrency). It does not drop any of the rest.
+    #[test]
+    fn claim_task_batched_candidates_query_preserves_every_other_gate() {
+        let sql = claim_task_batched_candidates_query();
+        for clause in [
+            "paused_queues AS MATERIALIZED",
+            "paused_activities AS MATERIALIZED",
+            "NOT (harvest_task_queue.queue_name = ANY(paused_queues.names))",
+            "schedule_to_close_at IS NULL",
+            "sticky_worker_id IS NULL",
+            "session_id IS NULL",
+            "required_build_id IS NULL",
+            "task_type <> 'workflow'",
+            "NOT (activity_name = ANY($6))",
+            "NOT (activity_name = ANY(paused_activities.names))",
+            "required_capabilities IS NULL",
+            "rate_limit_key IS NULL",
+        ] {
+            assert!(
+                sql.contains(clause),
+                "batch scan must preserve the unrelated gate clause {clause:?}; \
+                 got:\n{sql}"
+            );
+        }
+    }
+
+    /// The keyset cursor must carry all four sort columns. It must compare
+    /// them with an explicit `OR` chain. A plain row comparison cannot
+    /// express `ORDER BY ... DESC, ... DESC, ... ASC, ... ASC`'s mixed
+    /// directions. A 3-column cursor also silently drops ties past a batch
+    /// boundary (`docs/assays/0005-claim-batched-seek-and-refine.md`,
+    /// post-review item 1).
+    #[test]
+    fn claim_task_batched_candidates_query_cursor_covers_all_four_sort_columns() {
+        let sql = claim_task_batched_candidates_query();
+        assert!(
+            sql.contains("$7::BOOL = FALSE"),
+            "the cursor must be optional -- the first batch of an attempt \
+             has no predecessor row to resume past; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("scheduled_at = $10 AND id > $11"),
+            "the cursor's final tiebreak must compare id, not just \
+             scheduled_at, or tied rows are silently skipped; got:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("scheduled_at > $10").count()
+                + sql.matches("scheduled_at = $10").count(),
+            2,
+            "the cursor OR-chain must have exactly one 'strictly after' \
+             branch and one 'tied, break on id' branch for scheduled_at; \
+             got:\n{sql}"
+        );
+    }
+
+    /// The per-candidate attempt query must reuse the exact production
+    /// concurrency-gate recheck mechanism -- one advisory lock, one fresh
+    /// `COUNT`, applied to a single known row.
+    #[test]
+    fn claim_batched_candidate_attempt_query_matches_the_authoritative_recheck() {
+        let sql = claim_batched_candidate_attempt_query();
+        assert_eq!(
+            sql.matches("pg_try_advisory_xact_lock").count(),
+            1,
+            "exactly one advisory-lock guard, on the single candidate this \
+             query targets; got:\n{sql}"
+        );
+        assert!(
+            sql.contains(
+                "SELECT COUNT(*) FROM harvest_task_queue recheck \
+                 WHERE recheck.concurrency_key = $3 \
+                   AND recheck.task_type = $5 \
+                   AND recheck.state = 'RUNNING' \
+                   AND recheck.worker_id IS NOT NULL"
+            ),
+            "the recheck must be the same fresh correlated COUNT the \
+             single-row claim path uses, scoped to this candidate's own \
+             key/task_type; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("WHERE id = $2"),
+            "the claim UPDATE must target exactly the one candidate row \
+             already locked by the batch fetch; got:\n{sql}"
+        );
+    }
+
+    /// The rate-limit debit/recheck formula must come from the shared
+    /// helper, not a fourth hand-copied literal. This query is not a
+    /// `const fn`. So it has no excuse to duplicate what
+    /// [`claim_task_query_honors_the_effective_rate_limit_override`] already
+    /// drift-locks for the single-row path.
+    #[test]
+    fn claim_batched_candidate_attempt_query_honors_the_effective_rate_limit_override() {
+        let sql = claim_batched_candidate_attempt_query();
+        let effective = effective_available_tokens_expr("b");
+        assert_eq!(
+            sql.matches(&effective).count(),
+            2,
+            "the debit SET and its own WHERE re-check must both use the \
+             shared formula; got:\n{sql}"
+        );
+    }
+
+    /// [`BatchedClaimConfig::default`] matches
+    /// `docs/assays/0005-claim-batched-seek-and-refine.md`'s own fixed
+    /// `B=50`, so a follow-up measurement against that report's numbers
+    /// compares like with like.
+    #[test]
+    fn batched_claim_config_default_matches_the_assay_batch_size() {
+        let config = BatchedClaimConfig::default();
+        assert_eq!(config.batch_size, 50);
+        assert!(config.max_batches >= 1);
     }
 
     // ── TTL'd rate-limit override drift locks (issue #945) ──────────────────
