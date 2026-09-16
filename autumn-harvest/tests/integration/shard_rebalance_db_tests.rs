@@ -2393,6 +2393,68 @@ async fn a_seal_whose_live_copy_never_finished_is_not_reconciled() {
 }
 
 #[tokio::test]
+async fn a_continued_as_new_target_with_a_live_successor_is_not_reconciled() {
+    // Issue #1317 review: `CONTINUED_AS_NEW` is terminal for the ROW, but
+    // continuing as new inserts a successor under the same business key in
+    // the same transaction. The seal must not release while that successor
+    // is still live. Otherwise a normal start on the source can insert a
+    // second live run for the same key.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "chained-continuation").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'CONTINUED_AS_NEW', \
+                completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("seal the predecessor as continued");
+    let successor = insert_execution_with_id(
+        &mut target,
+        "entity_flow",
+        "chained-continuation",
+        ExecutionId::new_for_shard(TARGET),
+        TARGET,
+    )
+    .await;
+
+    let mut source = shards.source().await;
+    let reconciled =
+        reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+            .await
+            .expect("reconcile must not fail merely because a successor is live");
+    assert!(
+        !reconciled,
+        "the business key is still live under the successor; the seal must not release"
+    );
+
+    // Once the successor itself finishes with no further chain, the whole
+    // logical run is genuinely done and the seal may release.
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(successor.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("complete the successor");
+    let reconciled_after_successor_completes =
+        reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+            .await
+            .expect("reconcile");
+    assert!(
+        reconciled_after_successor_completes,
+        "once the successor also finishes, the seal must release"
+    );
+}
+
+#[tokio::test]
 async fn a_hop_that_loops_back_to_the_held_shard_is_refused_not_deadlocked() {
     // Issue #1317 review: the committed window of a reverse migration
     // forwards through the shard reconciliation already holds. A -> B

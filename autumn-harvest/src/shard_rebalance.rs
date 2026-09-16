@@ -1593,6 +1593,16 @@ mod db {
     struct LiveStateRow {
         #[diesel(sql_type = Text)]
         state: String,
+        #[diesel(sql_type = Text)]
+        workflow_name: String,
+        #[diesel(sql_type = Text)]
+        workflow_id: String,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct ExistsRow {
+        #[diesel(sql_type = Bool)]
+        value: bool,
     }
 
     /// Has the live copy behind a forwarding seal reached a real terminal
@@ -1671,7 +1681,9 @@ mod db {
             });
         };
         let row: Option<LiveStateRow> = diesel::sql_query(
-            "SELECT COALESCE(e.state, s.state) AS state \
+            "SELECT COALESCE(e.state, s.state) AS state, \
+                    COALESCE(e.workflow_name, s.workflow_name) AS workflow_name, \
+                    COALESCE(e.workflow_id, s.workflow_id) AS workflow_id \
                FROM (SELECT $1::uuid AS id) k \
                LEFT JOIN harvest_workflow_executions e ON e.id = k.id \
                LEFT JOIN harvest_execution_summaries s ON s.execution_id = k.id \
@@ -1687,7 +1699,39 @@ mod db {
                  execution row nor its summary exists there"
             )));
         };
-        Ok(row.state != "MIGRATED" && crate::erase::is_terminal_state(&row.state))
+        if row.state == "MIGRATED" || !crate::erase::is_terminal_state(&row.state) {
+            return Ok(false);
+        }
+        // A terminal row's OWN state is not the whole answer (issue #1317
+        // review). `CONTINUED_AS_NEW` is terminal for this row, but its
+        // continuation inserts a successor under the SAME business key in
+        // the same transaction. That successor can itself run, migrate, or
+        // continue again. Releasing the seal on this row's state alone
+        // would drop the only cross-shard uniqueness guard while the
+        // business key is still live under a successor. Confirm no active
+        // occupant remains for `(workflow_name, workflow_id)` here first.
+        //
+        // "Active" mirrors `is_active_conflict_state` exactly, not the
+        // widened uniqueness index. A COMPLETED/FAILED/CANCELLED/TIMED_OUT
+        // successor still occupies that index -- an `AllowDuplicate` start
+        // attaches to it. That is not a reason to keep this seal held.
+        // A `MIGRATED` successor counts as active unconditionally, even
+        // when already observed-terminal itself. That is deliberately
+        // conservative, so this seal waits for that seal's own
+        // reconciliation rather than racing it.
+        let occupied: ExistsRow = diesel::sql_query(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM harvest_workflow_executions \
+                  WHERE workflow_name = $1 AND workflow_id = $2 \
+                    AND state IN ('RUNNING', 'PAUSED', 'MIGRATED', 'MIGRATING') \
+             ) AS value",
+        )
+        .bind::<Text, _>(&row.workflow_name)
+        .bind::<Text, _>(&row.workflow_id)
+        .get_result(&mut *conn)
+        .await
+        .map_err(database_error)?;
+        Ok(!occupied.value)
     }
 
     /// Release a rebalanced source seal's uniqueness slot once its live copy
