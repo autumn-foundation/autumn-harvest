@@ -4027,8 +4027,27 @@ pub async fn enforce_external_cancels_outbox(
                         }
                         None => None,
                     };
+                    // `residence`, not `exact_pool_for_execution(exec_id)`
+                    // (issue #1324). The bits-based lookup ignores the
+                    // forwarding-aware resolution just above. It can report
+                    // the target's stale origin pool instead. A rebalanced
+                    // target then reads as cross-pool from a caller it is
+                    // actually co-located with. The `else` branch below then
+                    // acquires a second connection from the pool `conn`
+                    // already holds one from.
+                    //
+                    // No isolated DB test reproduces this one directly. Any
+                    // real migration that makes `residence` differ from
+                    // `entry` above needs `resolve_execution_shard`'s own
+                    // hop-walk. That walk checks out a connection on the
+                    // destination shard regardless of this bug. Under the
+                    // pool-size-1 setup that would expose this defect, the
+                    // walk hits its own, pre-existing hazard first. Covered
+                    // by inspection, and by the sibling fix above in
+                    // `resolve_delivery_route`, which this mirrors.
                     let same_pool_as_caller = outer_sharded_pool.as_ref().is_none_or(|pool| {
-                        pool.exact_pool_for_execution(exec_id)
+                        residence
+                            .and_then(|shard| pool.exact_pool_for(shard))
                             .is_some_and(|e_pool| {
                                 crate::external_target_location::same_underlying_pool(
                                     e_pool,

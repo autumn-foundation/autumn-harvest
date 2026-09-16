@@ -27,6 +27,19 @@ belt-and-braces guard: if `caller_shard` itself has no configured pool,
 reason immediately, instead of letting the routing decision fall through to
 `pool_for`'s silent default-shard fallback.
 
+A second, independent instance of the same defect sat one step further
+down the same sweep, in `enforce_external_cancels_outbox`'s post-commit
+deferred unfinished-update-handler check. It already computed a
+forwarding-aware `residence` for the checked execution, but its
+`same_pool_as_caller` decision still compared `exact_pool_for_execution`,
+the same stale, bits-based lookup. Unlike the first instance this one is
+not bound by a peer-acquisition timeout: the fallback branch calls a raw
+`pool.get()`, so a migrated cancel target sharing its checker's shard
+could wedge the checker indefinitely, not just leave a row pending. Fixed
+the same way, by comparing pools through `residence` instead. Found
+independently by two reviewers: a Claude code-review subagent during this
+PR's own multi-angle review, and the repository's Codex PR reviewer.
+
 **Test evidence.**
 `shard_rebalance_db_tests::a_rebalanced_caller_self_shard_cancel_reuses_the_held_connection`
 reproduces the bug against two real shard databases, with the target
@@ -41,5 +54,15 @@ The full `shard_rebalance_db_tests` suite (49 tests) and
 `workflow_id_targeted_tests` suite (26 tests) still pass with no
 regressions, as does `cargo clippy --features testing --tests -- -D
 warnings`.
+
+The second instance has no isolated DB regression test. Reproducing it
+needs a real cross-shard migration for the checked execution, so
+`residence` genuinely differs from its encoded shard. Resolving that
+always calls `shard_rebalance::resolve_execution_shard`, which checks out
+its own connection on the destination shard regardless of this bug. Under
+the pool-size-1 setup that would expose this defect, that unrelated,
+pre-existing checkout hazard fires first and masks the signal. Verified
+by inspection instead: the fix mirrors the first instance exactly, over
+the same `residence` value the surrounding code already computes.
 
 **No schema change, no new `WorkflowEvent` variant, no migration.**
