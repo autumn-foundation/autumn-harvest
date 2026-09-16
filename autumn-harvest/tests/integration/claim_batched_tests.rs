@@ -1094,6 +1094,116 @@ async fn batched_claim_attempt_rejects_a_deadline_that_passes_while_waiting_on_t
     );
 }
 
+/// Regression test for a review finding on this PR, against the ninth
+/// bug's own `now_ts` fix. `rate_limit_debit` never touches the bucket
+/// row for a circuit-breaker-bypassed activity. `now_ts`'s forced lock
+/// must skip it too. A bypassed claim is meant to run at full speed,
+/// past rate limiting entirely. Without this, it serializes behind an
+/// unrelated transaction holding that bucket row for an unrelated
+/// activity.
+///
+/// Proven with a real lock held by a separate connection, not a
+/// `pg_sleep` stand-in. A bypassed claim must complete quickly despite
+/// contention it has no reason to wait on.
+#[tokio::test(flavor = "multi_thread")]
+async fn batched_claim_attempt_skips_the_bucket_lock_for_a_circuit_breaker_activity() {
+    use diesel_async::RunQueryDsl;
+
+    let (url, mut conn, _container) = setup_db().await;
+    let bucket_key = format!("bucket-{}", Uuid::new_v4().simple());
+    queue::ensure_rate_limit_bucket(&mut conn, &bucket_key, 0.0, 100.0)
+        .await
+        .expect("ensure bucket");
+
+    let queue = unique_queue("batched-breaker-no-block");
+    let exec_id = insert_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id);
+    params.activity_name = Some("breaker-bypassed".to_string());
+    params.activity_id = Some(Uuid::new_v4());
+    params.rate_limit_key = Some(bucket_key.clone());
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+    let locker_bucket_key = bucket_key.clone();
+    let locker_url = url.clone();
+    let locker = tokio::spawn(async move {
+        let mut locker_conn = connect(&locker_url).await;
+        let mut tx = locker_conn.build_transaction().read_committed();
+        tx.run(
+            async |conn: &mut AsyncPgConnection| -> Result<(), diesel::result::Error> {
+                diesel::sql_query(
+                    "SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1 FOR UPDATE",
+                )
+                .bind::<diesel::sql_types::Text, _>(&locker_bucket_key)
+                .execute(conn)
+                .await?;
+                diesel::sql_query("SELECT pg_sleep(1.5)")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
+        .expect("locker transaction");
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    #[derive(diesel::QueryableByName)]
+    struct ClaimedId {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+    }
+
+    let start = std::time::Instant::now();
+    let mut tx = conn.build_transaction().read_committed();
+    let claimed: Option<Uuid> = tx
+        .run(
+            async |conn: &mut AsyncPgConnection| -> Result<Option<Uuid>, diesel::result::Error> {
+                let rows: Vec<ClaimedId> =
+                    diesel::sql_query(queue::claim_batched_candidate_attempt_query())
+                        .bind::<diesel::sql_types::Text, _>("breaker-no-block-tester")
+                        .bind::<diesel::sql_types::Uuid, _>(task_id)
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                            None::<String>,
+                        )
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(
+                            None::<i32>,
+                        )
+                        .bind::<diesel::sql_types::Text, _>("activity")
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(Some(
+                            bucket_key.clone(),
+                        ))
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(Some(
+                            "breaker-bypassed".to_string(),
+                        ))
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&vec![
+                            "breaker-bypassed".to_string(),
+                        ])
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+                            None::<chrono::DateTime<chrono::Utc>>,
+                        )
+                        .load(conn)
+                        .await?;
+                Ok(rows.into_iter().next().map(|r| r.id))
+            },
+        )
+        .await
+        .expect("transaction");
+    let elapsed = start.elapsed();
+
+    locker.await.expect("locker joined");
+
+    assert_eq!(claimed, Some(task_id));
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "a circuit-breaker-bypassed claim must not wait on the bucket \
+         lock at all -- the locker holds it for 1.5s, so any wait on it \
+         would show up here; elapsed={elapsed:?}"
+    );
+    assert_eq!(task_state(&mut conn, task_id).await, "RUNNING");
+}
+
 // ── Other preserved gates, exercised end-to-end (not just SQL-shape) ───────
 
 /// Sticky routing, exercised through a real `claim_task_batched` call, not

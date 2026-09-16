@@ -6074,6 +6074,17 @@ pub async fn pending_queue_demand_by_queue_name(
 /// `rate_limit_debit` locks next. So `now_ts` cannot resolve before
 /// that wait ends.
 ///
+/// A tenth bug, caught by the same reviewer against the ninth bug's own
+/// fix. The forced lock above gated only on `$6::text IS NOT NULL`,
+/// missing `rate_limit_debit`'s own `NOT ($7 = ANY($8))` circuit-breaker
+/// exclusion. `rate_limit_debit` never touches the bucket row for a
+/// circuit-breaker-bypassed activity, so that claim has no reason to
+/// wait on it. Without the same exclusion, `now_ts` forced it to wait
+/// anyway. That serializes a claim meant to run at full speed behind an
+/// unrelated transaction, risking a missed deadline on a lock the claim
+/// never needed. The fix adds the same `NOT ($7 = ANY($8))` gate to
+/// `now_ts`'s forced lock.
+///
 /// # What this is not
 ///
 /// This is **not** wired into [`claim_task`] or [`claim_task_on_shard`].
@@ -6301,6 +6312,12 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
 /// the captured time stale. The forced lock removes that gap: `now_ts`
 /// cannot finish before the same wait `rate_limit_debit` would face.
 ///
+/// That forced lock skips circuit-breaker-tracked activities, via the
+/// same `NOT ($7 = ANY($8))` gate `rate_limit_debit`'s own `WHERE`
+/// already uses (review finding, not present in the first forced-lock
+/// draft). `rate_limit_debit` never touches the bucket row for such an
+/// activity, so a bypassed claim has no reason to wait on it either.
+///
 /// Binds: `$1` worker id, `$2` candidate row id, `$3` concurrency key,
 /// `$4` concurrency cap, `$5` task type. Also `$6` rate limit key, `$7`
 /// activity name, `$8` circuit-breaker-tracked activities, `$9` schedule-
@@ -6315,7 +6332,7 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
                  FROM (SELECT 1 AS one) base \
                  LEFT JOIN ( \
                      SELECT 1 AS x FROM harvest_rate_limit_buckets b \
-                     WHERE $6::text IS NOT NULL AND b.key = $6 \
+                     WHERE $6::text IS NOT NULL AND NOT ($7 = ANY($8)) AND b.key = $6 \
                      FOR UPDATE \
                  ) locked ON TRUE \
              ), \
@@ -7484,6 +7501,33 @@ mod tests {
                 && now_ts_clause.contains("b.key = $6"),
             "now_ts's forced lock must target the exact row \
              rate_limit_debit locks next, keyed by the same $6 bind; \
+             got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR, against the
+    /// `now_ts` fix above. `rate_limit_debit` never touches the bucket
+    /// row for a circuit-breaker-bypassed activity: its own `WHERE`
+    /// gates on `NOT ($7 = ANY($8))`. `now_ts`'s forced lock must gate
+    /// on the SAME exclusion. A bypassed claim is meant to run at full
+    /// speed, past rate limiting entirely. Without this, it would still
+    /// serialize behind an unrelated transaction holding that bucket
+    /// row. It could even miss its own deadline waiting on a lock its
+    /// own claim never needed.
+    #[test]
+    fn claim_batched_candidate_attempt_query_now_ts_skips_the_lock_for_circuit_breaker_activities()
+    {
+        let sql = claim_batched_candidate_attempt_query();
+        let now_ts_clause = sql
+            .split("WITH now_ts AS (")
+            .nth(1)
+            .and_then(|rest| rest.split("rate_limit_debit AS (").next())
+            .unwrap_or_default();
+        assert!(
+            now_ts_clause.contains("NOT ($7 = ANY($8))"),
+            "now_ts's forced lock must skip circuit-breaker-tracked \
+             activities, matching rate_limit_debit's own exclusion, or a \
+             bypassed claim serializes behind a lock it never needed; \
              got:\n{sql}"
         );
     }

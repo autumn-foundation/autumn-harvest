@@ -100,6 +100,18 @@ giving `now_ts` its own `FOR UPDATE` lock attempt on the exact bucket
 row `rate_limit_debit` locks next, so `now_ts` cannot resolve before
 that same wait ends.
 
+Codex then caught a tenth bug, against the ninth bug's own fix: the
+forced lock gated only on `$6::text IS NOT NULL`, missing
+`rate_limit_debit`'s own `NOT ($7 = ANY($8))` circuit-breaker exclusion.
+`rate_limit_debit` never touches the bucket row for a
+circuit-breaker-bypassed activity, so such a claim has no reason to
+wait on it — but `now_ts`'s forced lock made it wait anyway, serializing
+a claim meant to run at full speed behind an unrelated transaction, and
+risking a missed deadline on a lock it never needed. Fixed by adding
+the same circuit-breaker exclusion to `now_ts`'s forced lock. Verified
+with a regression test proving a bypassed claim completes quickly
+despite a real, separately-held lock on the bucket row it never needs.
+
 **Not wired into the default claim path.** `claim_task`/`claim_task_on_shard`
 are unchanged. Issue #1340 is explicit that no query change should land
 against it without sign-off from someone with full context on `queue.rs`'s
@@ -108,7 +120,7 @@ tested, measured building block for that review, not a switch of default
 production behavior. It also does not implement the cross-region DR fence
 (#954) or the by-id claim (#1312) the single-row path carries.
 
-**Test evidence.** `tests/integration/claim_batched_tests.rs` (14 DB-backed
+**Test evidence.** `tests/integration/claim_batched_tests.rs` (15 DB-backed
 tests, red-then-green): equivalence with the single-row path on a plain
 backlog, an adversarial saturated-concurrency-key fixture matching ledger
 #4/#5's own shape, a multi-batch fixture with tied sort keys spanning a
@@ -130,12 +142,16 @@ that drives two genuinely concurrent connections rather than a
 task's deadline, the other attempts the claim blocked on that exact
 lock, and the test asserts the resulting claim and debit both correctly
 reflect the deadline having passed (verified red against the pre-fix
-code against a real Postgres instance, then green), sticky routing and a
+code against a real Postgres instance, then green), a regression test
+for the tenth bug above that holds the bucket row's lock from a separate
+connection while a circuit-breaker-bypassed claim runs, asserting it
+completes quickly rather than serializing behind a lock it never needed
+(also verified red then green), sticky routing and a
 capability-routed-activity gate exercised end-to-end through the real
 function (not just SQL-text checks), and — the gap ledger #5's own
 single-session apparatus explicitly could not close — real concurrent
 Tokio claimers racing a capped concurrency key, asserting the cap is
-never exceeded. `queue.rs`'s `mod tests` gains 12 SQL-shape unit tests
+never exceeded. `queue.rs`'s `mod tests` gains 13 SQL-shape unit tests
 pinning the query text (concurrency gate omitted from the batch scan,
 every other gate preserved byte-for-byte including both capability-label
 branches, the cursor's four-column `OR`-chain, the authoritative
@@ -145,9 +161,10 @@ and the claim, the shared rate-limit-formula helper used instead of a
 fourth hand-copied literal, the seventh-bug fix that `rate_limit_debit`
 and `claimed` read one shared `now_ts` value rather than calling
 `clock_timestamp()` twice, the eighth-bug fix that `started_at` reads
-that same shared value instead of the frozen `NOW()`, and the ninth-bug
-fix that `now_ts` itself takes a `FOR UPDATE` lock on the same bucket
-row `rate_limit_debit` locks next).
+that same shared value instead of the frozen `NOW()`, the ninth-bug fix
+that `now_ts` itself takes a `FOR UPDATE` lock on the same bucket row
+`rate_limit_debit` locks next, and the tenth-bug fix that this forced
+lock also skips circuit-breaker-tracked activities).
 
 **Measurement.** `docs/performance-claim-batched-seek-and-refine.md`,
 regenerated from a single run of
