@@ -265,7 +265,10 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("plugin:history_export_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:mcp_tools_integration", ALLOWLIST_MCP_IGNORED_REASON),
     ("plugin:outbox_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:outbox_start_relay_perf", ALLOWLIST_PERF_EVIDENCE_REASON),
+    (
+        "plugin:outbox_start_relay_perf",
+        ALLOWLIST_PERF_EVIDENCE_REASON,
+    ),
     ("plugin:preflight_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:replay_canary_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:retirement_check_integration", ALLOWLIST_DEBT_REASON),
