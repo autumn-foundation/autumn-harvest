@@ -1,11 +1,24 @@
-# 🚦 Semaphore CI health — activity-timeout flake holds at 0/15 across a full
-# 38-hour failure census spanning PR #1563's merge, and the stale-migration-
-# count doc-sync gate's self-contradicting panic message blocked one branch
-# three commits running
+# 🚦 Semaphore CI health — activity-timeout flake holds at 0/23 runs actually
+# inspected (not a full census) spanning PR #1563's merge, and a stale
+# migration count blocked one branch three commits running (its panic
+# message's own self-contradiction is a separate, unrelated bug)
 
 **Status:** health report — no PR opened against `ci.yml` or any test. Continues
 the series in `docs/rnd/2026-09-0[3-8]-ci-health-semaphore*.md` through
 `docs/rnd/2026-09-15-ci-health-semaphore-window-census.md`.
+
+**Corrected five times after review** (Codex on PR #1599): the initial
+draft overclaimed a full 100-run job-level census when only 23 runs were
+actually job-logged; overstated branch diversity in the post-merge
+failures; miscounted item 4's failure signatures (9 vs. 11) and omitted
+`migration_hygiene`; counted a truncated, mechanism-unknown failure as
+root-caused; attributed CI round-trips to a panic-message bug rather than
+the stale doc that actually caused them; and claimed the tracked
+event-history assertion could no longer fire post-#1563, when the source
+still has a catch-all panic arm. Each correction is called out inline
+below at the point it applies, verified against source or raw job logs
+rather than taken on faith — the pattern this series' own prior reports
+already follow.
 
 ## 🎯 Verdict path
 
@@ -33,10 +46,18 @@ engine behavior, not a product bug. The issue's own last comment (2026-09-15,
 same-commit rerun campaign (≥20x)... which this session did not run" — no
 rerun campaign was ever posted before the issue closed.
 
-This session job-logged **all 100** of the most recent completed
-`pull_request`-event `ci.yml` runs (not a sample — every run in the page), for
-2026-09-14T19:46:25Z through 2026-09-16T09:33:24Z: 55 cancelled, 30 success,
-**15 failure**. Split at the merge instant:
+**Correction (post-review):** this paragraph originally claimed all 100 of
+the most recent completed `pull_request`-event `ci.yml` runs were
+job-logged. False, and this role's own 09-06/09-11 reports already
+established why that matters: `list_workflow_runs` enumerated all 100
+runs' overall conclusions (55 cancelled, 30 success, 15 failure, for
+2026-09-14T19:46:25Z through 2026-09-16T09:33:24Z), but only the 15
+explicit-failure runs plus an 8-run cancelled-run sample (23 of 100) were
+actually job-logged — see the cancelled-run audit below. The other 77
+runs, including 47 cancelled ones never inspected at job level, could in
+principle hide a failure this census would miss; a cancelled run's overall
+conclusion can absorb a real job failure underneath it, per this series'
+own prior findings. Split the 15 explicit failures at the merge instant:
 
 | Window | Span | Runs | Failures |
 |---|---|---:|---:|
@@ -247,11 +268,16 @@ the merge, versus 3 occurrences the day before. Recorded as a data point for
 whoever next has the ability to run the actual rerun campaign, not claimed as
 a Tier-1 confirmation.
 
-**Item 2** is the doc-sync gate working as designed, with a message-quality
-bug that has now cost one branch three CI round-trips in a single window
-rather than the hypothetical single instance in the 09-08 report. Still below
-this role's own bar for a unilateral fix PR (not a suite-health defect, not a
-flake), but the cost is no longer zero.
+**Item 2** is the doc-sync gate working as designed: three round-trips in
+one window, caused by the branch leaving the documented count stale across
+three commits, not by the message wording. **Correction (post-review):**
+an earlier draft of this paragraph attributed the three round-trips to the
+message-quality bug itself — wrong, as the section above already
+corrects; repeated here for consistency. The message bug's actual cost is
+diagnostic clarity (the panic quotes the live count on both sides of its
+sentence, so a reader can't tell from it alone that the doc is stale), not
+the failure count. Still below this role's own bar for a unilateral fix PR
+(not a suite-health defect, not a flake).
 
 **Item 3** is explicitly not claimed as a flake — one occurrence, no
 mechanism recovered, not clustered.
