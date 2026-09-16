@@ -39,6 +39,74 @@ pub(super) fn is_uri_dsn(dsn: &str) -> bool {
     trimmed.starts_with("postgresql://") || trimmed.starts_with("postgres://")
 }
 
+/// Whether `key` is a libpq connection keyword.
+///
+/// The list is a superset of what `tokio_postgres` accepts. A missing
+/// keyword only costs a withheld DSN instead of a redacted one. That is
+/// safe.
+///
+/// A keyword-*shaped* token that is not a keyword must never pass. A
+/// mistyped URL like `postgres=//alice:hunter2@db` scans as the harmless
+/// option `postgres`. It has no `password=` key, so the caller has nothing
+/// to blank out (issue #1322).
+///
+/// `autumn-harvest-cli` solves the same problem for migration-target labels.
+/// See `is_connection_keyword` in `autumn-harvest-cli/src/lib.rs`. Keep this
+/// list in step with that one.
+pub(super) fn is_connection_keyword(key: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "application_name",
+        "channel_binding",
+        "client_encoding",
+        "connect_timeout",
+        "dbname",
+        "fallback_application_name",
+        "gssdelegation",
+        "gssencmode",
+        "gsslib",
+        "host",
+        "hostaddr",
+        "keepalives",
+        "keepalives_count",
+        "keepalives_idle",
+        "keepalives_interval",
+        "krbsrvname",
+        "load_balance_hosts",
+        "options",
+        "passfile",
+        "password",
+        "port",
+        "replication",
+        "require_auth",
+        "requirepeer",
+        "requiressl",
+        "scram_client_key",
+        "scram_server_key",
+        "service",
+        "ssl_max_protocol_version",
+        "ssl_min_protocol_version",
+        "sslcert",
+        "sslcertmode",
+        "sslcompression",
+        "sslcrl",
+        "sslcrldir",
+        "sslkey",
+        "sslmode",
+        "sslnegotiation",
+        "sslpassword",
+        "sslrootcert",
+        "sslsni",
+        "target_session_attrs",
+        "tcp_user_timeout",
+        "user",
+    ];
+    // libpq keywords are lowercase. Compare case-insensitively, so `Host=db`
+    // keeps its normal handling instead of being withheld.
+    KEYWORDS
+        .iter()
+        .any(|keyword| key.eq_ignore_ascii_case(keyword))
+}
+
 /// One `keyword = value` option of a libpq keyword/value connection string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct KeywordOption<'a> {

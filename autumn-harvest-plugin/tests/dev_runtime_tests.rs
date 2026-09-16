@@ -2540,3 +2540,40 @@ fn the_getting_started_chapter_leads_with_the_zero_setup_path() {
         "deliberately not --release: on a fresh clone the compile dominates the metric"
     );
 }
+
+// ---------------------------------------------------------------------------
+// issue #1322 — a keyword-shaped token that is not a keyword
+// ---------------------------------------------------------------------------
+
+#[test]
+fn redaction_withholds_a_keyword_shaped_token_that_is_not_a_keyword() {
+    // A mistyped URL that lost its `://` scans as the "keyword" `postgres`. It
+    // has no `password=` option, so a scanner that accepts any token as a
+    // keyword lets the whole string through, credential included.
+    for dsn in [
+        "postgres=//alice:hunter2@db/harvest",
+        "postgresql=//alice:hunter2@db/harvest",
+        "notakeyword=alice:hunter2@db",
+    ] {
+        let redacted = redact_dsn(dsn);
+        assert!(
+            !redacted.contains("hunter2"),
+            "the password survived redaction: {dsn} -> {redacted}"
+        );
+        assert_ne!(
+            redacted, dsn,
+            "an unrecognized keyword must not be echoed back whole: {dsn}"
+        );
+    }
+}
+
+#[test]
+fn redaction_still_accepts_every_recognized_keyword() {
+    // The withholding above must not swallow a legitimate keyword DSN.
+    let dsn = "host=localhost dbname=app user=u password=hunter2 sslmode=disable";
+    let redacted = redact_dsn(dsn);
+    assert!(!redacted.contains("hunter2"), "{redacted}");
+    assert!(redacted.contains("host=localhost"), "{redacted}");
+    assert!(redacted.contains("dbname=app"), "{redacted}");
+    assert!(redacted.contains("sslmode=disable"), "{redacted}");
+}
