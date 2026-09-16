@@ -538,6 +538,110 @@ async fn a_timer_parked_execution_migrates_end_to_end() {
     assert_eq!(attrs.value.as_deref(), Some("acme"));
 }
 
+/// Issue #1317 review, P1: a retained terminal copy of an UNRELATED
+/// execution can already occupy the target's active-uniqueness slot for
+/// this business key. Reconciliation lets a fresh run start on the shard a
+/// seal was released on. An old terminal row for the same key can still
+/// stay behind on a shard the key visited earlier. This test models
+/// exactly that shard directly, rather than via a full
+/// reconcile-then-restart dance. Migrating the fresh run onward to that
+/// old row's shard must not collide with it.
+#[tokio::test]
+async fn staging_vacates_a_retained_terminal_prior_for_the_same_key_on_the_target() {
+    let shards = setup_two_shards().await;
+
+    // TARGET already holds a COMPLETED, unrelated execution for this
+    // business key. This models an earlier run of "rebalance-me" that
+    // lived out its whole life there before the current run ever existed.
+    let mut target = shards.target().await;
+    let stale_id = Uuid::new_v4();
+    target
+        .batch_execute(&format!(
+            "INSERT INTO harvest_workflow_executions \
+               (id, workflow_name, workflow_id, run_id, shard_id, state, input, \
+                started_at, created_at, completed_at) \
+             VALUES \
+               ('{stale_id}', 'entity_flow', 'rebalance-me', gen_random_uuid(), 1, \
+                'COMPLETED', '{{}}', now(), now(), now())"
+        ))
+        .await
+        .expect("seed the stale terminal prior on the target");
+
+    // SOURCE holds the run actually being migrated, same business key.
+    let exec_id = quiescent_fixture(&shards, "rebalance-me").await;
+
+    let outcome = migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migration must not error");
+    assert!(
+        matches!(outcome, MigrationOutcome::Migrated { .. }),
+        "the stale terminal prior must not block the migration, got {outcome:?}"
+    );
+
+    let mut target = shards.target().await;
+    assert_eq!(
+        state_of(&mut target, exec_id).await.as_deref(),
+        Some("RUNNING"),
+        "the migrated run must be live on the target"
+    );
+    let stale_state: ScalarText =
+        diesel::sql_query("SELECT state AS value FROM harvest_workflow_executions WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(stale_id)
+            .get_result(&mut target)
+            .await
+            .expect("query the stale row's state");
+    assert_eq!(
+        stale_state.value.as_deref(),
+        Some("CONTINUED_AS_NEW"),
+        "the stale prior must be sealed off the active-uniqueness slot, not left COMPLETED"
+    );
+}
+
+/// Issue #1317 review, P1 (companion to the vacate test above). A same-key
+/// row on the target that is genuinely LIVE, not stale history, must never
+/// be silently displaced. Staging must still fail loudly against it.
+#[tokio::test]
+async fn staging_still_refuses_a_genuinely_live_same_key_row_on_the_target() {
+    let shards = setup_two_shards().await;
+
+    let mut target = shards.target().await;
+    let live_id = Uuid::new_v4();
+    target
+        .batch_execute(&format!(
+            "INSERT INTO harvest_workflow_executions \
+               (id, workflow_name, workflow_id, run_id, shard_id, state, input, \
+                started_at, created_at) \
+             VALUES \
+               ('{live_id}', 'entity_flow', 'rebalance-live-conflict', gen_random_uuid(), 1, \
+                'RUNNING', '{{}}', now(), now())"
+        ))
+        .await
+        .expect("seed a genuinely live conflicting row on the target");
+
+    let exec_id = quiescent_fixture(&shards, "rebalance-live-conflict").await;
+
+    let outcome = migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migration must not error");
+    assert!(
+        matches!(outcome, MigrationOutcome::Aborted { .. }),
+        "a genuinely live conflicting row must abort the migration, got {outcome:?}"
+    );
+
+    let mut target = shards.target().await;
+    let live_state: ScalarText =
+        diesel::sql_query("SELECT state AS value FROM harvest_workflow_executions WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(live_id)
+            .get_result(&mut target)
+            .await
+            .expect("query the live row's state");
+    assert_eq!(
+        live_state.value.as_deref(),
+        Some("RUNNING"),
+        "a genuinely live conflicting row must be left untouched"
+    );
+}
+
 #[tokio::test]
 async fn the_copy_is_byte_identical_and_replay_verified() {
     let shards = setup_two_shards().await;

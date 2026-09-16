@@ -1180,6 +1180,14 @@ mod db {
     }
 
     #[derive(diesel::QueryableByName)]
+    struct StaleTargetRow {
+        #[diesel(sql_type = SqlUuid)]
+        id: Uuid,
+        #[diesel(sql_type = Text)]
+        state: String,
+    }
+
+    #[derive(diesel::QueryableByName)]
     struct TextRow {
         #[diesel(sql_type = Nullable<Text>)]
         value: Option<String>,
@@ -1324,6 +1332,55 @@ mod db {
             // on its origin shard at all: an id that resolves nowhere.
             let prior_seal = existing_seal(&mut *conn, exec_id).await?;
             discard_staged_copy(&mut *conn, exec_id).await?;
+
+            // A retained terminal copy of an UNRELATED execution can already
+            // hold the target's active-uniqueness slot for this business key
+            // (issue #1317 review, P1). Reconciliation lets a fresh run
+            // start on a shard the key was released on. An old terminal row
+            // for the same key can still stay behind on a shard the key
+            // visited earlier. Migrating that fresh run onward to the old
+            // row's shard must not collide with it.
+            //
+            // Vacate it exactly like a fresh start replacing a terminal
+            // prior does elsewhere (`replace_execution`): seal it
+            // `CONTINUED_AS_NEW`. That drops it out of the partial index
+            // without touching this migration's own row.
+            //
+            // A row that is genuinely live here (RUNNING, PAUSED,
+            // MIGRATING, or an unreleased MIGRATED seal) is left untouched.
+            // That is a real conflict, not stale history. The insert below
+            // fails loudly against it instead of silently displacing a live
+            // run.
+            let stale_target_row: Option<StaleTargetRow> = diesel::sql_query(
+                "SELECT id, state FROM harvest_workflow_executions \
+                  WHERE workflow_name = $1 AND workflow_id = $2 AND id != $3 \
+                    AND state NOT IN ('CONTINUED_AS_NEW', 'TERMINATED') \
+                    AND migrated_run_terminal_at IS NULL \
+                  FOR UPDATE",
+            )
+            .bind::<Text, _>(execution["workflow_name"].as_str().unwrap_or_default())
+            .bind::<Text, _>(execution["workflow_id"].as_str().unwrap_or_default())
+            .bind::<SqlUuid, _>(exec_id.as_uuid())
+            .get_result(&mut *conn)
+            .await
+            .optional_row()?;
+
+            if let Some(stale) = stale_target_row
+                && !matches!(
+                    stale.state.as_str(),
+                    "RUNNING" | "PAUSED" | "MIGRATING" | "MIGRATED"
+                )
+            {
+                diesel::sql_query(
+                    "UPDATE harvest_workflow_executions \
+                      SET state = 'CONTINUED_AS_NEW', completed_at = NOW() \
+                      WHERE id = $1",
+                )
+                .bind::<SqlUuid, _>(stale.id)
+                .execute(&mut *conn)
+                .await
+                .map_err(database_error)?;
+            }
 
             diesel::sql_query(
                 "INSERT INTO harvest_workflow_executions \
