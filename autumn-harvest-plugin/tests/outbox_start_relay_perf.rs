@@ -155,15 +155,15 @@ async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec
     )
 }
 
-/// Whether `row` is the per-row delivery-mark `UPDATE` this investigation
-/// targets. Matches both `mark_outbox_row_delivered` (sets
-/// `delivered_execution_id`) and `mark_outbox_row_failed` (sets
-/// `next_attempt_at`) -- both are `UPDATE harvest_workflow_outbox ...
-/// WHERE id = $1 AND claimed_by = $2` and both are the statement the fix
-/// would batch, one for delivered rows and one for failed rows.
+/// Whether `row` is the delivery-mark `UPDATE` this investigation targets.
+/// Matches both the delivered-mark (sets `delivered_execution_id`) and the
+/// failed-mark (sets `next_attempt_at`) shapes -- both set
+/// `delivery_attempts`, which the claim statement never touches, so this
+/// predicate cannot also match the claim statement (both statements set
+/// `claimed_by`/`claimed_at`, so matching on those alone double-counts).
 fn is_mark_statement(row: &StatRow) -> bool {
     let q = row.query.to_ascii_lowercase();
-    q.contains("update") && q.contains("harvest_workflow_outbox") && q.contains("claimed_by")
+    q.contains("update") && q.contains("harvest_workflow_outbox") && q.contains("delivery_attempts")
 }
 
 fn is_claim_statement(row: &StatRow) -> bool {
