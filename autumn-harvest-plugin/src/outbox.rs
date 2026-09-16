@@ -173,27 +173,26 @@ pub async fn drain_workflow_start_outbox_once(
 /// the whole batch has dispatched, bounds it to the rest of the batch
 /// instead (issue #1620 review, Codex).
 ///
-/// This bound is on outcome COUNT, not elapsed time. Dispatch is
-/// sequential, not concurrent, so nothing can flush pending marks while
-/// one dispatch is still in flight. One long-running dispatch still
-/// holds every row already queued in its chunk. It holds them for that
-/// whole call's duration (issue #1620 review, Codex, second round).
-/// `OUTBOX_MARK_FLUSH_MAX_DELAY` below bounds that case too. The loop
-/// also flushes as soon as a dispatch returns, once enough wall time has
-/// passed since the last flush. A slow dispatch then no longer also
-/// waits on `OUTBOX_MARK_FLUSH_EVERY` more outcomes on top of its own
-/// delay.
+/// This bound alone is on outcome COUNT, not elapsed time. Dispatch does
+/// not touch `app_conn`. A flush CAN run while one dispatch is still in
+/// flight -- see the `tokio::select!` in the drain loop below. Without
+/// that race, a single long-running dispatch would hold every row already
+/// queued in its chunk. It would hold them for that whole call's duration
+/// (issue #1620 review, Codex, second and third rounds).
+/// `OUTBOX_MARK_FLUSH_MAX_DELAY` below bounds that case too.
 const OUTBOX_MARK_FLUSH_EVERY: usize = 8;
 
-/// How much wall time may pass since the last flush before the next
-/// dispatch's return flushes pending marks regardless of outcome count.
-/// See `OUTBOX_MARK_FLUSH_EVERY`.
+/// How much wall time may pass since the last flush before pending marks
+/// flush, regardless of outcome count. Checked between dispatches, and
+/// also while a dispatch is still in flight via the drain loop's
+/// `tokio::select!`. See `OUTBOX_MARK_FLUSH_EVERY`.
 const OUTBOX_MARK_FLUSH_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Whether pending marks should flush now, checked right after each
-/// dispatch returns. `pending` is 0 when nothing has accumulated (the
-/// previous dispatch's outcome was flushed immediately before this one
-/// started), which is never due.
+/// Whether pending marks should flush now. Checked right after each
+/// dispatch returns, and periodically while a dispatch is still in
+/// flight. The drain loop's `tokio::select!` races a flush-deadline timer
+/// against the dispatch future for that second case. `pending` is 0 when
+/// nothing has accumulated, which is never due.
 fn outbox_mark_flush_due(pending: usize, since_last_flush: std::time::Duration) -> bool {
     pending > 0
         && (pending >= OUTBOX_MARK_FLUSH_EVERY || since_last_flush >= OUTBOX_MARK_FLUSH_MAX_DELAY)
@@ -249,7 +248,40 @@ async fn drain_workflow_start_outbox_batch(
     let mut failed_marks: Vec<(i64, String, std::time::Instant)> = Vec::new();
     let mut last_flush = std::time::Instant::now();
     for row in rows {
-        match dispatch_workflow_start_request(state, &row.request()).await {
+        // `dispatch_workflow_start_request` gets its own connection from
+        // `HarvestDbPool` (issue #1620 review, Codex, third round).
+        // `app_conn` above is idle for the whole call. Race the dispatch
+        // future against a periodic flush deadline. A flush that becomes
+        // due while this row's dispatch is still in flight then runs
+        // right then, on `app_conn`, not after dispatch returns.
+        let request = row.request();
+        let dispatch_fut = dispatch_workflow_start_request(state, &request);
+        tokio::pin!(dispatch_fut);
+        let outcome = loop {
+            let elapsed = last_flush.elapsed();
+            let pending = delivered_marks.len() + failed_marks.len();
+            let remaining = if pending >= OUTBOX_MARK_FLUSH_EVERY {
+                Duration::ZERO
+            } else {
+                OUTBOX_MARK_FLUSH_MAX_DELAY.saturating_sub(elapsed)
+            };
+            tokio::select! {
+                result = &mut dispatch_fut => break result,
+                () = tokio::time::sleep(remaining), if outbox_mark_flush_due(pending, elapsed) => {
+                    delivered += flush_outbox_marks(
+                        &mut app_conn,
+                        &claimant,
+                        &mut delivered_marks,
+                        &mut failed_marks,
+                        outbox_metrics.as_ref(),
+                    )
+                    .await
+                    .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+                    last_flush = std::time::Instant::now();
+                }
+            }
+        };
+        match outcome {
             Ok(exec_id) => delivered_marks.push((row.id, exec_id)),
             Err(error) => {
                 let delay_ms = retry_delay_ms(&config, &row);
@@ -713,11 +745,12 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
-    /// A slow dispatch bounds the flush wait to `OUTBOX_MARK_FLUSH_MAX_DELAY`,
-    /// not `OUTBOX_MARK_FLUSH_EVERY` more outcomes (issue #1620 review,
-    /// Codex, second round). Count alone cannot bound wall time: dispatch
-    /// is sequential, so nothing can flush while one dispatch is still in
-    /// flight.
+    /// This is the pure decision `outbox_mark_flush_due` makes. The drain
+    /// loop's `tokio::select!` lets a flush run on it while a dispatch
+    /// is still in flight (issue #1620 review, Codex, second and third
+    /// rounds). Count alone cannot bound wall time -- a fixed
+    /// outcome-count threshold says nothing about how long reaching it
+    /// takes.
     #[test]
     fn outbox_mark_flush_due_bounds_by_count_or_by_elapsed_time() {
         use std::time::Duration;

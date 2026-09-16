@@ -194,19 +194,30 @@ the fourth changes a wall-clock bound the numbers cannot see -- see below.
    both delivered AND failed outcomes issues up to 2 mark calls, so a
    mixed-outcome production batch can see up to double the stated
    per-chunk count.
-4. `OUTBOX_MARK_FLUSH_EVERY` alone only bounds outcome COUNT: dispatch is
-   sequential, so nothing can flush pending marks while one dispatch is
-   still in flight. One dispatch that itself runs long still holds every
-   row already queued in its chunk, for that whole call's duration
-   (issue #1620 review, Codex, second round). The loop now also flushes
-   as soon as a dispatch returns if `OUTBOX_MARK_FLUSH_MAX_DELAY` (250ms)
-   has passed since the last flush, so a slow dispatch no longer waits on
-   `OUTBOX_MARK_FLUSH_EVERY` more outcomes on top of its own delay. This
-   is a wall-clock bound, invisible to `pg_stat_statements`'s call/buffer
+4. `OUTBOX_MARK_FLUSH_EVERY` alone only bounds outcome COUNT, not elapsed
+   time -- added `OUTBOX_MARK_FLUSH_MAX_DELAY` (250ms) so pending marks
+   also flush once that much wall time has passed since the last flush
+   (issue #1620 review, Codex, second round). The first version of this
+   only checked the new time bound right after a dispatch returned, so it
+   could not actually flush while a dispatch was still in flight -- a
+   single dispatch that itself ran long still held every row already
+   queued in its chunk for that whole call's duration, the same failure
+   mode as before this correction (issue #1620 review, Codex, third
+   round). Fixed by racing the dispatch future against the flush deadline
+   with `tokio::select!`: `dispatch_workflow_start_request` gets its own
+   connection from `HarvestDbPool`, so `app_conn` is idle for the whole
+   dispatch call and a flush can run on it the moment the deadline is
+   reached, whether or not dispatch has returned yet. This is a
+   wall-clock bound, invisible to `pg_stat_statements`'s call/buffer
    counts under this harness's fast, un-delayed dispatch -- the
    `after-sweep-chunked.txt` numbers above are unaffected by it. The
-   decision itself (`outbox_mark_flush_due`) is covered by a pure unit
-   test, `outbox_mark_flush_due_bounds_by_count_or_by_elapsed_time`.
+   flush/no-flush decision itself (`outbox_mark_flush_due`) is covered by
+   a pure unit test,
+   `outbox_mark_flush_due_bounds_by_count_or_by_elapsed_time`; the
+   `tokio::select!` race that lets a flush run on that decision mid-dispatch
+   is exercised indirectly by the `admission_gate_authoritative_localpg`
+   suite's real, fast-dispatch drains, not by a dedicated slow-dispatch
+   test -- this module has no seam to inject an artificial dispatch delay.
 
 Flushing every chunk, rather than waiting for the whole batch, is safe
 under the same idempotency the relay already relies on. A crash between
