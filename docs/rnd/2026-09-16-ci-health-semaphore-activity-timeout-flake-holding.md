@@ -9,7 +9,7 @@
 the series in `docs/rnd/2026-09-0[3-8]-ci-health-semaphore*.md` through
 `docs/rnd/2026-09-15-ci-health-semaphore-window-census.md`.
 
-**Corrected nine times after review** (Codex on PR #1599): the initial
+**Corrected eleven times after review** (Codex on PR #1599): the initial
 draft overclaimed a full 100-run job-level census when only 23 runs were
 actually job-logged (restated twice more after later drafts reintroduced
 the same "full census" wording at other locations); overstated branch
@@ -39,8 +39,10 @@ both survived every prior fix: this report had itself downloaded and
 `curl`'d item 3's full failure log (to check item 1's tracked test) without
 ever grepping that same log for `quota_enforcement_tests`'s own panic —
 which was sitting there the whole time (`quota_enforcement_tests.rs:3329:9`,
-a 10-second poll-loop timing out on a background outbox-retry sweep, a
-genuine named mechanism, not an unrecoverable truncation). Each correction
+an unexplained 10-second target-row timeout, not an unrecoverable
+truncation — though a tenth round then caught this report overreaching
+past that recovered text into an unverified "the sweep didn't fire"
+claim the log doesn't actually support). Each correction
 is called out inline below at the point it applies, verified against
 source, raw job logs, or direct `curl` of signed log URLs rather than
 taken on faith — the pattern this series' own prior reports already
@@ -288,7 +290,7 @@ but qualitative, not the quantified "three round-trips" an earlier draft
 claimed. Still below this role's bar to open a fix PR on its own (a
 one-line diagnostic fix on a docs-only test, not a suite-health defect).
 
-### 3. `quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded`: a genuine polling-timeout mechanism, one occurrence, not clustered
+### 3. `quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded`: an unexplained 10-second target-row timeout, one occurrence, not clustered
 
 Run `35034838493` (`Test DB (linux, shard 8)`, 00:16:31Z) ended with `FAILED
 SUITES: autumn-harvest/integration (linux) -- quota_enforcement_tests` after
@@ -298,28 +300,41 @@ module (`tail_lines` ending before the actual panic for a large serial run).
 Re-fetched at `tail_lines=200`; the actual failure output was still not in
 the visible window.
 
-**Correction (post-review) — the mechanism was recoverable, and this
-session already had the data.** A Codex review pointed out that this
-report separately downloaded and `curl`'d this exact run's shard-8 full
-log (job `104609028589`, to verify the tracked test's outcome for item 1)
-without checking that same log for `quota_enforcement_tests`'s own
-failure. Grepping it: `quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded`
+**Correction (post-review), two passes.** First: a Codex review pointed
+out that this report separately downloaded and `curl`'d this exact run's
+shard-8 full log (job `104609028589`, to verify the tracked test's
+outcome for item 1) without checking that same log for
+`quota_enforcement_tests`'s own failure. Grepping it:
+`quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded`
 panics at `quota_enforcement_tests.rs:3329:9` with `"target row was never
 created by the outbox retry; last count was 1"`. Reading the test source
 (`quota_enforcement_tests.rs:3313-3330`): after freeing a quota slot, the
 test polls every 50ms, up to a 10-second deadline, for a background
 `enforce_completion_triggers_outbox` sweep (folded into the worker's
 timeout-checker loop, ticking every `poll_interval`) to retry a deferred
-completion trigger and create the target row. The panic means that sweep
-had not fired within 10 seconds on this run. **This has a real mechanism,
-not an unknown one**: a wait-loop racing a background timer, the same
-general category (timing/polling dependency) as the tracked activity-
-timeout flake and the codebase's other wait-loop tests. One occurrence is
-not a rate, and this report does not render a test-vs-product verdict on
-it — that would need the same rerun-campaign rigor this report already
-declined to substitute for on item 1 — but it is a named, plausible
-mechanism, not "mechanism unknown," and should be tracked as such rather
-than dismissed as an unclassifiable truncation artifact.
+completion trigger and create the target row.
+
+Second: a follow-up Codex review correctly caught that the first pass
+overreached. The recovered panic proves only that the target-row count
+stayed at 1 until the deadline — `quota_enforcement_tests.rs:3323-3333`
+never observes whether the sweep itself ran. The log this session has is
+`cargo test`'s own stdout (test names and panic text only; checked
+directly — no worker/tracing output is captured for this run), so there
+is no evidence either way about whether the sweep executed and failed to
+create the row, executed and no-op'd, or never ran at all. Calling this
+"a background timer that did not fire" promoted a symptom (the row count
+never reached 2) into an unverified mechanism. **The honest description
+is an unexplained 10-second target-row timeout** — a real, reproducible
+symptom with a real deadline and polling structure, but not yet a
+confirmed mechanism. One occurrence is not a rate, and this report does
+not render a test-vs-product verdict on it — that would need both the
+rerun-campaign rigor this report already declined to substitute for on
+item 1, and worker/outbox-level logging this session did not have. It is
+a symptom with a plausible timing-category candidate mechanism (a
+wait-loop's deadline racing an unobserved background sweep), not
+"mechanism unknown" in the sense of a truncated, unrecoverable log — the
+failure text and test structure are fully recovered — but it should be
+tracked as an open, unverified candidate, not a confirmed root cause.
 
 **Correction (post-review):** an earlier draft of this paragraph said "the
 same branch (`claude/hopeful-pascal-tbijcf`) went on to fail three more
@@ -335,7 +350,8 @@ branch to say anything about, "not pursued further" or otherwise.
 same window on unrelated gates — item 4's table and the fmt/sqlite/
 migration_hygiene entries — but that is a different branch's story, not
 evidence about whether `quota_enforcement_tests` recurred.) Corrected: one
-occurrence, a named polling-timeout mechanism (above), no branch history
+occurrence, an unexplained 10-second target-row timeout (above, not a
+confirmed mechanism), no branch history
 to compare it against, not clustered with anything else in this sample —
 recorded per this role's own admissibility rules so a repeat is
 recognized as a repeat, not actioned as a rate.
@@ -432,15 +448,18 @@ sentence, so a reader can't tell from it alone that the doc is stale), not
 the failure count. Still below this role's own bar for a unilateral fix PR
 (not a suite-health defect, not a flake).
 
-**Item 3** is explicitly not claimed as a flake — one occurrence, though
-**correction (post-review):** it does have a named mechanism (above,
-found by checking a log this session had already downloaded but not
-searched for this signature) — a wait-loop polling for a background
-outbox-retry sweep, timing out at 10 seconds. Named-mechanism-but-
-single-occurrence is not the same as root-caused-and-confirmed-
-deterministic (the doc-sync and lint-category defects below are); it is
-also not "no mechanism" as an earlier draft of this paragraph said. Not
-clustered with anything else in this sample.
+**Item 3** is explicitly not claimed as a flake — one occurrence.
+**Correction (post-review), two passes:** the failure text was
+recoverable (above, found by checking a log this session had already
+downloaded but not searched for this signature) — a wait-loop polling up
+to a 10-second deadline for a background outbox-retry sweep, timing out.
+But a second pass caught that recovering the failure text is not the
+same as confirming a mechanism: the log proves the target row count
+stayed at 1, not that the sweep failed to run. This is correctly an
+unexplained target-row timeout with a plausible timing-category
+candidate — not "no mechanism" as one earlier draft said, and not a
+confirmed mechanism as a later draft overclaimed either. Not clustered
+with anything else in this sample.
 
 **Item 4** is the suite working correctly for 10 of its 11 runs, not a
 CI-health defect. The two `diesel`/E0433 occurrences are the same
@@ -451,16 +470,18 @@ genuinely has no mechanism recovered (this series' own 09-15 report
 already tried and came up empty across 3 occurrences).
 
 **Correction (post-review):** item 3's own text originally said the
-`quota_enforcement_tests` panic's mechanism was unrecoverable — since
-corrected above, it does have a named mechanism, just not a rendered
-verdict at n=1. The `corpus` failure on `34891509704` (item 4's
-correction) genuinely has no mechanism. Neither is "root-caused" in the
-sense the 13 deterministic defects below are. An earlier draft's 🔧/📊
-sections below said "15/15 root-caused," which is wrong either way;
-corrected to 13/15 fully root-caused and 2/15 with at least one failure
-that isn't (`quota_enforcement_tests` — named mechanism, no verdict;
-`34891509704`'s `corpus` job — no mechanism at all — alongside its
-otherwise-explained clippy failure).
+`quota_enforcement_tests` panic's mechanism was unrecoverable, then
+(overreaching) that it was a confirmed background-timer-didn't-fire
+mechanism; corrected above to an unexplained target-row timeout with a
+plausible but unconfirmed candidate. The `corpus` failure on
+`34891509704` (item 4's correction) genuinely has no mechanism, confirmed
+or candidate. Neither is "root-caused" in the sense the 13 deterministic
+defects below are. An earlier draft's 🔧/📊 sections below said "15/15
+root-caused," which is wrong either way; corrected to 13/15 fully
+root-caused and 2/15 with at least one failure that isn't
+(`quota_enforcement_tests` — unexplained timeout, no confirmed
+mechanism, no verdict; `34891509704`'s `corpus` job — no mechanism at
+all — alongside its otherwise-explained clippy failure).
 
 ## 🔧 Treatment
 
@@ -530,10 +551,14 @@ Items carried forward, unchanged from the 09-08/09-14/09-15 reports:
   verified this session.
 - **Item 2:** 3/3 occurrences on one branch confirmed identical panic text
   (`"**107 migrations**"` on both sides) via direct job-log inspection.
-- **Item 3: correction (post-review).** 1/1, not a rate — but a named
-  mechanism (a wait-loop timing out on a background outbox-retry sweep),
-  found by re-checking a log this session already had, not "mechanism
-  unknown" as an earlier draft said.
+- **Item 3: correction (post-review), two passes.** 1/1, not a rate. The
+  failure text and test structure were recovered by re-checking a log
+  this session already had (not "mechanism unknown" as an earlier draft
+  said), but a second pass caught that the recovered text only proves the
+  target-row count stayed at 1 for 10 seconds — it does not show whether
+  the background sweep ran. Correctly stated as an unexplained 10-second
+  target-row timeout with a plausible timing-category candidate, not a
+  confirmed "sweep didn't fire" mechanism.
 - **Item 4: correction (post-review).** 10/11 runs fully root-caused via
   job-log inspection (see the corrected run-to-signature table above);
   the 11th (`34891509704`) has one root-caused job (clippy dead-code) and
@@ -561,9 +586,9 @@ Items carried forward, unchanged from the 09-08/09-14/09-15 reports:
   call it a flake, but equally insufficient to rule one out. Stated
   correctly: 13/15 of this window's explicit failures fully root-caused
   and confirmed non-suite-level; 2/15 have at least one failure short of
-  that bar (`quota_enforcement_tests` — a named polling-timeout mechanism,
-  no rendered verdict; `34891509704`'s `corpus` job — no mechanism at
-  all); 0/13 root-caused failures carry the previously-tracked
+  that bar (`quota_enforcement_tests` — an unexplained target-row timeout,
+  no confirmed mechanism, no rendered verdict; `34891509704`'s `corpus`
+  job — no mechanism at all); 0/13 root-caused failures carry the previously-tracked
   activity-timeout signature, and neither of the other two failures'
   assertion text matches it either. 0/2 hidden cancelled-run failures (of
   the 8-run sample actually inspected) carry it either. **None of this
@@ -623,7 +648,11 @@ grep -n "completion_trigger_defers_to_outbox_when_target_quota_exceeded" \
   /tmp/run35034838493_shard8.log
 # -> panics at quota_enforcement_tests.rs:3329:9, "target row was never
 #    created by the outbox retry; last count was 1" -- a 10s poll-loop
-#    timing out on a background sweep. Source: quota_enforcement_tests.rs:3313-3330.
+#    that never observed count reach 2. Source: quota_enforcement_tests.rs:3313-3330.
+# NOTE: this log is cargo test's own stdout only (checked directly --
+# no worker/tracing output captured), so it proves the row count stayed
+# at 1, not whether the background sweep itself ran. Do not overclaim a
+# confirmed "sweep didn't fire" mechanism from this alone.
 
 # Branch-protection / cache-usage tool availability: re-checked via
 # ToolSearch("branch protection rules github") and
