@@ -438,16 +438,16 @@ impl RedisProbe {
     /// empty marker set. An earlier version counted only stream keys, so a
     /// leaked marker whose stream entry was acknowledged would have graded as
     /// correct. Found by review on PR #1617.
-    async fn residue(&self) -> Residue {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .expect("redis connection");
-        let keys: Vec<String> = conn
-            .keys(format!("{}*", self.prefix))
-            .await
-            .unwrap_or_default();
+    /// A probe error returns `None`, never an empty residue.
+    ///
+    /// Every command below used to fall back to a default on error, so a
+    /// transient disconnect produced zero entries, zero pending and zero
+    /// markers. That reads as a clean drain the run never actually verified.
+    /// An unverified drain now invalidates the repetition. Found by review on
+    /// PR #1617.
+    async fn residue(&self) -> Option<Residue> {
+        let mut conn = self.client.get_multiplexed_async_connection().await.ok()?;
+        let keys: Vec<String> = conn.keys(format!("{}*", self.prefix)).await.ok()?;
         let mut entries = 0_i64;
         let mut pending = 0_i64;
         let mut markers = 0_i64;
@@ -461,7 +461,7 @@ impl RedisProbe {
                 .arg(&key)
                 .query_async(&mut conn)
                 .await
-                .unwrap_or_default();
+                .ok()?;
             if kind != "stream" {
                 continue;
             }
@@ -469,13 +469,13 @@ impl RedisProbe {
                 .arg(&key)
                 .query_async::<i64>(&mut conn)
                 .await
-                .unwrap_or(0);
+                .ok()?;
             let summary: redis::Value = redis::cmd("XPENDING")
                 .arg(&key)
                 .arg(CONSUMER_GROUP)
                 .query_async(&mut conn)
                 .await
-                .unwrap_or(redis::Value::Nil);
+                .ok()?;
             // Match on a slice pattern rather than calling `first`. Diesel's
             // `RunQueryDsl` is in scope here and its own `first` shadows the
             // slice method on this `Vec`. Same hazard the sibling apparatus
@@ -486,7 +486,7 @@ impl RedisProbe {
                 pending += *count;
             }
         }
-        Residue { entries, pending, markers }
+        Some(Residue { entries, pending, markers })
     }
 }
 
@@ -641,6 +641,8 @@ struct RepOutcome {
     completed: i64,
     activity_runs: u64,
     residue: Option<Residue>,
+    /// True when the Redis arm could not read its own key space.
+    probe_failed: bool,
     truncated: bool,
 }
 
@@ -649,6 +651,7 @@ impl RepOutcome {
     fn correct(&self, expected: usize) -> bool {
         let expected_activities = expected as u64 * ACTIVITIES.len() as u64;
         !self.truncated
+            && !self.probe_failed
             && self.completed == expected as i64
             && self.activity_runs == expected_activities
             && self.residue.is_none_or(Residue::is_drained)
@@ -732,13 +735,13 @@ async fn run_postgres_arm(settings: &Settings, arm: Arm, rep: usize) -> RepOutco
     autumn_harvest::dispatch::uninstall();
 
     let completed = completed_executions(&mut conn).await;
-    let residue = match &probe {
+    let (residue, probe_failed) = match &probe {
         Some(probe) => {
             let residue = probe.residue().await;
             probe.clear().await;
-            Some(residue)
+            (residue, residue.is_none())
         }
-        None => None,
+        None => (None, false),
     };
 
     RepOutcome {
@@ -751,6 +754,7 @@ async fn run_postgres_arm(settings: &Settings, arm: Arm, rep: usize) -> RepOutco
         completed,
         activity_runs: counter(&ACTIVITY_RUNS),
         residue,
+        probe_failed,
         truncated,
     }
 }
@@ -801,11 +805,19 @@ async fn run_sqlite_arm(settings: &Settings, rep: usize) -> RepOutcome {
                 )
             })
             .count();
-        if done >= settings.workflows {
+        // Check the cap BEFORE accepting completion, never after.
+        //
+        // One `run_until_idle` call normally drives the whole fleet, so a
+        // single call can overrun the cap and still return with every
+        // execution complete. Testing completion first would then keep and
+        // grade a repetition whose elapsed time exceeds the cap this
+        // apparatus advertises. Found by review on PR #1617.
+        let over_cap = started.elapsed().as_secs() >= settings.cap_secs;
+        if over_cap {
+            truncated = true;
             break;
         }
-        if started.elapsed().as_secs() >= settings.cap_secs {
-            truncated = true;
+        if done >= settings.workflows {
             break;
         }
     }
@@ -831,6 +843,7 @@ async fn run_sqlite_arm(settings: &Settings, rep: usize) -> RepOutcome {
         completed,
         activity_runs: counter(&ACTIVITY_RUNS),
         residue: None,
+        probe_failed: false,
         truncated,
     }
 }
