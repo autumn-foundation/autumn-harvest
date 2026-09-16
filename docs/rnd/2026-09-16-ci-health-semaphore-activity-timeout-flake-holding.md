@@ -112,13 +112,19 @@ fourth commit on the same branch fixed the underlying doc gap and a fifth hit
 doc/code-sync gate class described in the 09-08 report, correctly firing on a
 branch that added migrations without updating the frozen count in
 `docs/rnd/sqlite-feasibility.md` — not a flake, and each occurrence traces to
-that branch's own then-current diff. But the message bug means whoever reads
-the panic cannot tell from it alone that the doc is stale; they have to know
-to distrust the sentence. Three round-trips through CI on one branch is a
-real, if small, cost of that message bug. Still below this role's bar to open
-a fix PR on its own (a one-line diagnostic fix on a docs-only test, not a
-suite-health defect), but now recorded with a concrete cost instead of as a
-hypothetical.
+that branch's own then-current diff. **Correction (post-review):** an
+earlier draft of this section attributed the three CI round-trips
+themselves to the message bug. That overstates it — the three failures
+happened because the branch left the documented count stale across three
+commits, not because of how the panic message is worded; the assertion
+would have failed the same three times with a correctly-worded message.
+What the message bug actually costs is diagnostic clarity: whoever reads
+the panic cannot tell from it alone that the doc is stale, since it quotes
+the same live count on both sides of the sentence, so they have to know to
+distrust the sentence rather than being told directly. That cost is real
+but qualitative, not the quantified "three round-trips" an earlier draft
+claimed. Still below this role's bar to open a fix PR on its own (a
+one-line diagnostic fix on a docs-only test, not a suite-health defect).
 
 ### 3. One truncated `FAILED SUITES` line, one occurrence, not clustered
 
@@ -218,7 +224,8 @@ Items carried forward, unchanged from the 09-08/09-14/09-15 reports:
    session; this report's frequency-in-the-wild data is supporting evidence
    for prioritizing it, not a substitute.
 4. **`sqlite_feasibility_docs`'s self-contradicting panic message** (item 2)
-   — now with a concrete cost (3 CI round-trips on one branch), still a
+   — a diagnostic-clarity cost, not a root cause of the 3 failures
+   themselves (those were the stale doc, unfixed across 3 commits); still a
    one-line fix someone should pick up.
 5. **The remaining cancelled-run population** — 11 of 19 post-merge and all
    36 pre-merge cancelled runs in this window are still unaudited at job
@@ -229,11 +236,20 @@ Items carried forward, unchanged from the 09-08/09-14/09-15 reports:
 
 ## 📊 Measurement
 
-- **Item 1:** 100/100 completed `pull_request`-event `ci.yml` runs in the
-  sample individually job-logged (full census of this page, not a sample);
-  15/15 failures classified; 0/15 carry the activity-timeout signature, 5 in
-  18h14m pre-merge and 10 in 19h33m post-merge. Not a same-commit rerun — no
-  revert check applies, since no fix was made or verified this session.
+- **Item 1: correction (post-review).** An earlier draft of this line
+  claimed "100/100 runs... individually job-logged (full census)." False —
+  `list_workflow_runs` *enumerated* all 100 runs' conclusions, but only the
+  15 explicit-failure runs plus an 8-run cancelled-run sample (23 runs
+  total) were actually job-logged. The other 77 runs (30 success, 47
+  cancelled-and-unaudited) were never inspected below the run level. Stated
+  correctly: of the **23 runs actually job-logged**, 0/23 carry the
+  activity-timeout signature (15 explicit failures — 5 in 18h14m pre-merge,
+  10 in 19h33m post-merge — plus 2/8 sampled cancelled runs that hid a
+  real job failure, neither matching the signature). This is evidence from
+  the population actually inspected, not a census of the full window; the
+  remaining 77 runs, including 47 cancelled ones, could in principle hide
+  an occurrence. Not a same-commit rerun — no revert check applies, since
+  no fix was made or verified this session.
 - **Item 2:** 3/3 occurrences on one branch confirmed identical panic text
   (`"**107 migrations**"` on both sides) via direct job-log inspection.
 - **Item 3:** 1/1, not a rate.
@@ -243,11 +259,17 @@ Items carried forward, unchanged from the 09-08/09-14/09-15 reports:
   hid a real job-level failure (9 shards on one run, 3 jobs on another);
   0/2 hidden failures carry the activity-timeout signature; 11/19
   post-merge and 36/36 pre-merge cancelled runs remain unaudited.
-- **Combined:** 14/15 of this window's explicit failures root-caused, 1/15
-  (`quota_enforcement_tests`) classified as a single occurrence with no
-  mechanism recovered; 0/15 suite-level flakes; 0/15 the previously-tracked
-  activity-timeout signature; 0/2 hidden cancelled-run failures carry it
-  either, in the 8-run sample actually inspected.
+- **Combined: correction (post-review).** An earlier draft's "0/15
+  suite-level flakes" contradicted item 3's own text, which says
+  `quota_enforcement_tests`'s panic and mechanism were never recovered — a
+  single unclassified occurrence is insufficient evidence to call it a
+  flake, but equally insufficient to rule one out. Stated correctly: 14/15
+  of this window's explicit failures root-caused and confirmed
+  non-suite-level; 1/15 (`quota_enforcement_tests`) unclassified — neither
+  confirmed a flake nor confirmed not one; 0/14 classified failures carry
+  the previously-tracked activity-timeout signature; 0/2 hidden
+  cancelled-run failures (of the 8-run sample actually inspected) carry it
+  either.
 
 ## 🔬 Reproduce
 
