@@ -113,10 +113,30 @@ notification, per
 [the configuration these numbers were taken at](#the-configuration-these-numbers-were-taken-at).
 
 Neither point says whether Harvest is faster or slower than anything else.
-This suite has not run another engine's benchmark, and a competitor's own
-published figure would carry accuracy and staleness this project cannot vouch
-for. A comparison worth trusting re-runs both engines on the same hardware,
-which is why this suite ships in the repo — see [Reproducing](#reproducing).
+This suite still runs no competitor, and a competitor's own published figure
+would carry accuracy and staleness this project cannot vouch for. A comparison
+worth trusting re-runs both engines on the same hardware, which is why this
+suite ships in the repo — see [Reproducing](#reproducing).
+
+**One such comparison has now been run, and Harvest lost it.** Assay ledger
+[#11](assays/0011-harvest-vs-temporal-single-box.md) put Harvest and Temporal
+on one 4-core box, against the same PostgreSQL server, at this page's own
+3-activity workflow. Temporal sustained more throughput **at every backlog
+depth tested**: roughly **1.7x** against Harvest's best-configured mode, and up
+to **7.9x** against its default Postgres mode at a 2,000-row backlog. It did so
+in the configuration that suits it least, with all four of its services
+co-resident on cores they shared with their own database.
+
+Two things bound that result rather than soften it. It is one shape, one box,
+one version, and a Temporal configuration at documented defaults rather than
+tuned by someone who operates it — a tuned arm would widen the gap, not close
+it. And most of the *widening* part of the margin is one known, fixable defect
+rather than an architectural gap: the `#786`/`#1177` claim path, whose
+scan-and-sort makes Harvest's default mode fall 4.2x between a 500-row and a
+2,000-row backlog while Temporal stays flat. Ledger
+[#10](assays/0010-cross-mode-throughput.md) measures the same collapse from the
+other side, and finds the Redis dispatch channel flat across that range because
+it routes around exactly that path.
 
 ### Results by release
 
