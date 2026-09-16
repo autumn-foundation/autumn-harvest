@@ -824,21 +824,22 @@ impl ShardRouter {
 /// shard has been drained out of `writable_shards` since the workflow was
 /// placed, which moves where the same key re-hashes.
 ///
-/// Its remaining callers — `worker::reject_cross_shard_continue_as_new` and the
-/// deprecated [`ShardedDbPool::exact_pool_for_target`] — use it as a proxy for a
-/// *third* question: "which shard would a shard-local uniqueness check for this
-/// key run on?" (`execution`'s re-run `workflow_id`-override guard asks the same
-/// question, but reaches `pick_for_new_workflow` directly rather than through
-/// this function.) Those guards create the new run on an **existing** run's shard (the
-/// predecessor's, the re-run source's), never on the hashed one, and both refuse
-/// the operation when the two differ — because the uniqueness index they rely on
-/// lives on one shard and cannot see a live run of the key on another. That
-/// makes the hash the right input for them, but for a narrower reason than
-/// "placing new work", and it means both are stricter than they have to be: a
-/// residency-pinned run whose key hashes elsewhere is refused even though the
-/// new run would be residency-correct and (since this issue) perfectly
-/// reachable. Loosening either into a real cross-shard occupancy check is a
-/// follow-up that #1146's fan-out now makes possible.
+/// Its remaining callers are `worker::reject_cross_shard_continue_as_new` and
+/// the deprecated [`ShardedDbPool::exact_pool_for_target`]. Both use it as a
+/// proxy for a *third* question: "which shard would a shard-local uniqueness
+/// check for this key run on?"
+///
+/// `execution`'s re-run `workflow_id`-override guard asks the same question.
+/// It reaches `pick_for_new_workflow` directly, though, rather than through
+/// this function. Those guards create the new run on an **existing** run's
+/// shard (the predecessor's, the re-run source's), never on the hashed one.
+///
+/// A divergent hash used to be refused outright. Issue #1308 replaced that
+/// with a real occupancy check
+/// ([`crate::external_target_location::check_cross_shard_occupancy`]) over
+/// #1146's fan-out. So a divergent key that is not actually occupied on the
+/// hashed shard may now proceed. A residency-pinned run (issue #697) whose key
+/// hashes elsewhere is no longer refused for that reason alone.
 ///
 /// To find where an existing business key actually **lives** — which is what a
 /// `workflow_id`-addressed signal/cancel delivery needs — use

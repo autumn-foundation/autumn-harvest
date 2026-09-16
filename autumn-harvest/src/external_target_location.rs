@@ -40,6 +40,14 @@
 //! shared implementation. Converging the two is worth doing and is not done
 //! here.
 //!
+//! Issue #1308 reuses the same fan-out for a second question, via
+//! [`check_cross_shard_occupancy`]: not "where does this key live", but "is
+//! this key occupied anywhere". Two cross-shard uniqueness guards
+//! (`worker::reject_cross_shard_continue_as_new`, `execution`'s re-run
+//! `workflow_id`-override guard) used a hash-based prediction for that
+//! question. They refused whenever it diverged. Observing the real answer
+//! lets them refuse only when the key is genuinely occupied.
+//!
 //! Two properties are load-bearing and are what a naive fan-out gets wrong:
 //!
 //! * **No first-hit short circuit.** A stale terminal run of the same key on
@@ -634,8 +642,94 @@ pub async fn resolve_location_by_workflow_id(
 /// delivery short-circuits the whole fan-out with
 /// [`TargetLocation::AlreadyDelivered`] (issue #1318). Pass `None` for a
 /// cancel (which has no such key) or an unkeyed signal.
-#[allow(clippy::too_many_lines)]
 pub async fn resolve_location_by_workflow_id_with(
+    pool: &ShardedDbPool,
+    router: Option<&ShardRouter>,
+    workflow_name: &str,
+    workflow_id: &str,
+    held: Option<(ShardId, &mut AsyncPgConnection)>,
+    memo: Option<&UninspectableShards>,
+    idempotency_key: Option<&str>,
+) -> TargetLocation {
+    let (candidates, uninspected) = match fan_out_candidates(
+        pool,
+        router,
+        workflow_name,
+        workflow_id,
+        held,
+        memo,
+        idempotency_key,
+    )
+    .await
+    {
+        Ok(FanOutOutcome::Candidates(candidates, uninspected)) => (candidates, uninspected),
+        Ok(FanOutOutcome::AlreadyDelivered { shard }) => {
+            return TargetLocation::AlreadyDelivered { shard };
+        }
+        Err(uninspected) => return TargetLocation::Indeterminate { uninspected },
+    };
+
+    let placement = merge_locations(candidates, uninspected.clone(), idempotency_key.is_some());
+
+    // A `Found` reached over an incomplete fan-out is an answer with a caveat:
+    // shard-local uniqueness means the shard we could not read might hold a
+    // newer live run of the same key. Delivering to the run in hand is the right
+    // call (see `merge_locations`), but the ambiguity must not be silent.
+    if !uninspected.is_empty()
+        && let Some(shard) = placement.found_shard()
+    {
+        tracing::warn!(
+            workflow_name,
+            workflow_id,
+            resolved_shard = %shard,
+            uninspected = %uninspected
+                .iter()
+                .map(|u| format!("{} ({})", u.shard, u.reason))
+                .collect::<Vec<_>>()
+                .join(", "),
+            "by-id target resolved over an incomplete shard fan-out"
+        );
+    }
+
+    placement
+}
+
+/// The success-path outcome of [`fan_out_candidates`].
+///
+/// `AlreadyDelivered` only ever arises when the caller passed an
+/// `idempotency_key`. So [`check_cross_shard_occupancy`] — which never does —
+/// cannot observe it (issue #1308 review finding; issue #1318 added the
+/// variant).
+enum FanOutOutcome {
+    /// Every candidate the fan-out found, plus every shard it could not
+    /// inspect. Delivery reduces this via [`merge_locations`]; occupancy
+    /// reduces it via [`classify_occupancy_from_candidates`].
+    Candidates(Vec<(ShardId, ResolvedRun)>, Vec<UninspectedShard>),
+    /// A keyed signal already landed on `shard` (issue #1318). The fan-out
+    /// stopped the instant it found this — see the inline comment where it
+    /// is produced below.
+    AlreadyDelivered {
+        /// The shard the earlier delivery's signal row lives on.
+        shard: ShardId,
+    },
+}
+
+/// The raw per-shard fan-out behind two different reductions.
+/// [`resolve_location_by_workflow_id_with`] reduces it to a single winning
+/// run via [`merge_locations`], for delivery.
+/// [`check_cross_shard_occupancy`] asks a different question over the same
+/// raw candidates instead. Does ANY of them still occupy the key, not which
+/// one wins (issue #1308 review finding).
+///
+/// `Err(uninspected)` is the held-connection-failed case: the caller's own
+/// transaction is now aborted, so the fan-out stops immediately rather than
+/// touching `conn` again. See the inline comment on that arm below.
+///
+/// `Ok` carries every candidate the fan-out found and every shard it could
+/// not inspect, for either reduction to use. Unless it short-circuited on a
+/// prior delivery of `idempotency_key` first (issue #1318).
+#[allow(clippy::too_many_lines)]
+async fn fan_out_candidates(
     pool: &ShardedDbPool,
     router: Option<&ShardRouter>,
     workflow_name: &str,
@@ -643,7 +737,7 @@ pub async fn resolve_location_by_workflow_id_with(
     mut held: Option<(ShardId, &mut AsyncPgConnection)>,
     memo: Option<&UninspectableShards>,
     idempotency_key: Option<&str>,
-) -> TargetLocation {
+) -> Result<FanOutOutcome, Vec<UninspectedShard>> {
     // Empty-string normalizes to "no key", matching `send_signal_idempotent`
     // (issue #521). An empty key is never stored -- it becomes `NULL` --
     // so a check for it would run a query that can never match.
@@ -707,7 +801,7 @@ pub async fn resolve_location_by_workflow_id_with(
                 )
                 .await
                 {
-                    Ok(Some(_)) => return TargetLocation::AlreadyDelivered { shard },
+                    Ok(Some(_)) => return Ok(FanOutOutcome::AlreadyDelivered { shard }),
                     Ok(None) => {}
                     Err(e) => {
                         // Same abort hazard as the run-resolution query's own
@@ -722,7 +816,7 @@ pub async fn resolve_location_by_workflow_id_with(
                             ),
                             kind: UninspectedReasonKind::QueryError,
                         });
-                        return TargetLocation::Indeterminate { uninspected };
+                        return Err(uninspected);
                     }
                 }
             }
@@ -769,7 +863,7 @@ pub async fn resolve_location_by_workflow_id_with(
                         ),
                         kind: UninspectedReasonKind::QueryError,
                     });
-                    return TargetLocation::Indeterminate { uninspected };
+                    return Err(uninspected);
                 }
             }
             continue;
@@ -817,7 +911,7 @@ pub async fn resolve_location_by_workflow_id_with(
         // 3. The peer probe, entirely inside its own budget.
         match probe_peer_shard(shard_pool, workflow_name, workflow_id, idempotency_key).await {
             Ok(ProbeOutcome::AlreadyDelivered) => {
-                return TargetLocation::AlreadyDelivered { shard };
+                return Ok(FanOutOutcome::AlreadyDelivered { shard });
             }
             Ok(ProbeOutcome::Run(Some(run))) => candidates.push((shard, run)),
             Ok(ProbeOutcome::Run(None)) => {}
@@ -825,29 +919,113 @@ pub async fn resolve_location_by_workflow_id_with(
         }
     }
 
-    let placement = merge_locations(candidates, uninspected.clone(), idempotency_key.is_some());
+    Ok(FanOutOutcome::Candidates(candidates, uninspected))
+}
 
-    // A `Found` reached over an incomplete fan-out is an answer with a caveat:
-    // shard-local uniqueness means the shard we could not read might hold a
-    // newer live run of the same key. Delivering to the run in hand is the right
-    // call (see `merge_locations`), but the ambiguity must not be silent.
-    if !uninspected.is_empty()
-        && let Some(shard) = placement.found_shard()
+/// Whether a `(workflow_name, workflow_id)` key is held by a live run
+/// anywhere. For a caller deciding whether a cross-shard operation on that
+/// key is safe (issue #1308).
+///
+/// Replaces a hash-based *prediction* of where the key would resolve. Uses an
+/// *observation* of where it actually lives instead, via the same fan-out
+/// [`resolve_location_by_workflow_id_with`] uses for by-id delivery.
+///
+/// `#[non_exhaustive]`: [`TargetLocation`] may grow an ambiguous-live-runs
+/// verdict (see its own doc comment). A caller that must react to it
+/// differently from [`Self::Occupied`] should not compile silently once it
+/// does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CrossShardOccupancy {
+    /// No shard holds a run of the key in a state that still occupies it —
+    /// see [`crate::execution::workflow_id_slot_is_released`]. The caller's
+    /// operation may proceed.
+    Free,
+    /// A run of the key already occupies the uniqueness slot, on `shard`.
+    /// Not only a live run: an ordinary terminal one (`COMPLETED`, `FAILED`,
+    /// `CANCELLED`, `TIMED_OUT`) occupies it too, matching
+    /// `resolve_successor_slot` and the re-run `RejectDuplicate` check. Only
+    /// `CONTINUED_AS_NEW` and `TERMINATED` release it. The caller must not
+    /// create a second row under this key.
+    Occupied {
+        /// The shard holding the occupying run.
+        shard: ShardId,
+    },
+    /// A shard could not be inspected, so occupancy is unknown. The caller
+    /// must fail closed — matching the pre-#1308 hash-based rejection —
+    /// rather than risk two runs sharing one business key.
+    Indeterminate {
+        /// The shards that could not be inspected.
+        uninspected: Vec<UninspectedShard>,
+    },
+}
+
+/// Pure decision behind [`check_cross_shard_occupancy`], split out so it is
+/// unit-testable without a database.
+///
+/// Deliberately does NOT go through [`merge_locations`]'s single-winner
+/// ranking. Delivery asks "which run is the current one", so picking the
+/// most recently started candidate is correct there. Occupancy asks a
+/// different question: "does ANY candidate still occupy the key". Answering
+/// that from the ranked winner alone is wrong. A newer *released* row on one
+/// shard (issue #1308 review finding) can outrank an older *unreleased* one
+/// on another. That hides the very occupant this check exists to find. So
+/// this scans every candidate directly, using
+/// [`crate::execution::workflow_id_slot_is_released`]. That is narrower than
+/// [`crate::erase::is_terminal_state`], which governs replay and delivery,
+/// not uniqueness.
+///
+/// An unreleased candidate settles the question immediately: `Occupied`, even
+/// over an incomplete fan-out, since occupancy is already proven. Only when
+/// every candidate found is released does an uninspected shard matter — it
+/// might hold an unreleased one — so that case is `Indeterminate`.
+#[must_use]
+fn classify_occupancy_from_candidates(
+    candidates: &[(ShardId, ResolvedRun)],
+    uninspected: Vec<UninspectedShard>,
+) -> CrossShardOccupancy {
+    if let Some(shard) = candidates
+        .iter()
+        .find(|(_, run)| !crate::execution::workflow_id_slot_is_released(&run.state))
+        .map(|(shard, _)| *shard)
     {
-        tracing::warn!(
-            workflow_name,
-            workflow_id,
-            resolved_shard = %shard,
-            uninspected = %uninspected
-                .iter()
-                .map(|u| format!("{} ({})", u.shard, u.reason))
-                .collect::<Vec<_>>()
-                .join(", "),
-            "by-id target resolved over an incomplete shard fan-out"
-        );
+        return CrossShardOccupancy::Occupied { shard };
     }
+    if uninspected.is_empty() {
+        CrossShardOccupancy::Free
+    } else {
+        CrossShardOccupancy::Indeterminate { uninspected }
+    }
+}
 
-    placement
+/// Check whether `(workflow_name, workflow_id)` is held by an occupying run
+/// on any expected shard, reusing a connection the caller already holds
+/// (issue #1308).
+///
+/// A thin wrapper over [`fan_out_candidates`] and
+/// [`classify_occupancy_from_candidates`] — see both for the fan-out's
+/// connection-budget rules and the free/occupied/indeterminate decision.
+/// Built for a caller that today rejects on a hash mismatch alone
+/// ([`crate::shard::external_target_owning_shard`]) and wants to reject only
+/// when the key is genuinely occupied.
+pub async fn check_cross_shard_occupancy(
+    pool: &ShardedDbPool,
+    router: Option<&ShardRouter>,
+    workflow_name: &str,
+    workflow_id: &str,
+    held: Option<(ShardId, &mut AsyncPgConnection)>,
+) -> CrossShardOccupancy {
+    match fan_out_candidates(pool, router, workflow_name, workflow_id, held, None, None).await {
+        Ok(FanOutOutcome::Candidates(candidates, uninspected)) => {
+            classify_occupancy_from_candidates(&candidates, uninspected)
+        }
+        Ok(FanOutOutcome::AlreadyDelivered { .. }) => {
+            unreachable!(
+                "this call passes idempotency_key = None, so AlreadyDelivered cannot occur"
+            )
+        }
+        Err(uninspected) => CrossShardOccupancy::Indeterminate { uninspected },
+    }
 }
 
 /// Are these two handles the **same underlying pool** — clones sharing one
@@ -1586,5 +1764,148 @@ mod tests {
             }
             other => panic!("expected Indeterminate, got {other:?}"),
         }
+    }
+
+    // -- classify_occupancy_from_candidates (issue #1308) ------------------
+
+    #[test]
+    fn no_candidates_and_nothing_uninspected_is_free() {
+        assert_eq!(
+            classify_occupancy_from_candidates(&[], Vec::new()),
+            CrossShardOccupancy::Free
+        );
+    }
+
+    #[test]
+    fn an_ordinary_terminal_candidate_still_occupies_the_key() {
+        // COMPLETED/FAILED/CANCELLED/TIMED_OUT are terminal but NOT released
+        // (issue #1308 review finding). `resolve_successor_slot` and the
+        // re-run `RejectDuplicate` check both reject on a same-shard row in
+        // any of these states. So a cross-shard one must not be Free either.
+        for state in ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"] {
+            let candidates = [(ShardId::new(0), run(0, state, 1))];
+            assert_eq!(
+                classify_occupancy_from_candidates(&candidates, Vec::new()),
+                CrossShardOccupancy::Occupied {
+                    shard: ShardId::new(0)
+                },
+                "state {state} must still occupy the key"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sealed_candidate_is_free() {
+        // Only CONTINUED_AS_NEW and TERMINATED release the uniqueness slot.
+        for state in ["CONTINUED_AS_NEW", "TERMINATED"] {
+            let candidates = [(ShardId::new(0), run(0, state, 1))];
+            assert_eq!(
+                classify_occupancy_from_candidates(&candidates, Vec::new()),
+                CrossShardOccupancy::Free,
+                "state {state} must release the key"
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_candidate_is_occupied_on_its_shard() {
+        let candidates = [(ShardId::new(0), run(0, "RUNNING", 1))];
+        assert_eq!(
+            classify_occupancy_from_candidates(&candidates, Vec::new()),
+            CrossShardOccupancy::Occupied {
+                shard: ShardId::new(0)
+            }
+        );
+    }
+
+    #[test]
+    fn a_live_candidate_is_occupied_even_over_an_incomplete_fanout() {
+        // A live run in hand is a real, certain occupant. An unrelated shard
+        // being unreachable does not make that less true. This mirrors the
+        // delivery-side rule: a live winner is not withheld for that reason
+        // either.
+        let candidates = [(ShardId::new(0), run(0, "RUNNING", 1))];
+        assert_eq!(
+            classify_occupancy_from_candidates(&candidates, vec![uninspected(1)]),
+            CrossShardOccupancy::Occupied {
+                shard: ShardId::new(0)
+            }
+        );
+    }
+
+    #[test]
+    fn an_older_unreleased_candidate_is_not_masked_by_a_newer_released_one() {
+        // Issue #1308 review finding: `merge_locations`' delivery ranking
+        // picks the most recently started candidate. So a newer
+        // CONTINUED_AS_NEW/TERMINATED row can outrank an older
+        // COMPLETED/FAILED/CANCELLED/TIMED_OUT one. Occupancy must not reuse
+        // that ranking. The older row still occupies the key on ITS shard,
+        // regardless of what a newer, unrelated, released row exists
+        // elsewhere.
+        let older_unreleased = run(1, "COMPLETED", 1);
+        let newer_released = run(0, "CONTINUED_AS_NEW", 2);
+        let candidates = [
+            (ShardId::new(1), older_unreleased),
+            (ShardId::new(0), newer_released),
+        ];
+        assert_eq!(
+            classify_occupancy_from_candidates(&candidates, Vec::new()),
+            CrossShardOccupancy::Occupied {
+                shard: ShardId::new(1)
+            },
+            "the older COMPLETED row on shard 1 must still occupy the key, \
+             even though shard 0's newer CONTINUED_AS_NEW row would win \
+             merge_locations' delivery ranking"
+        );
+    }
+
+    #[test]
+    fn several_live_candidates_are_occupied_on_the_first_found() {
+        let candidates = [
+            (ShardId::new(1), run(1, "RUNNING", 1)),
+            (ShardId::new(0), run(0, "RUNNING", 2)),
+        ];
+        assert_eq!(
+            classify_occupancy_from_candidates(&candidates, Vec::new()),
+            CrossShardOccupancy::Occupied {
+                shard: ShardId::new(1)
+            }
+        );
+    }
+
+    #[test]
+    fn an_uninspected_shard_with_no_candidates_is_indeterminate() {
+        assert_eq!(
+            classify_occupancy_from_candidates(&[], vec![uninspected(1)]),
+            CrossShardOccupancy::Indeterminate {
+                uninspected: vec![uninspected(1)]
+            }
+        );
+    }
+
+    #[test]
+    fn a_released_candidate_with_an_uninspected_shard_is_indeterminate() {
+        // A released candidate does not settle the question when another
+        // shard could not be checked. That shard might hold an unreleased
+        // row of the same key.
+        let candidates = [(ShardId::new(0), run(0, "COMPLETED", 1))];
+        assert_eq!(
+            classify_occupancy_from_candidates(&candidates, vec![uninspected(1)]),
+            CrossShardOccupancy::Occupied {
+                shard: ShardId::new(0)
+            },
+            "COMPLETED is unreleased, so this must be Occupied regardless of \
+             the uninspected shard"
+        );
+
+        let candidates = [(ShardId::new(0), run(0, "TERMINATED", 1))];
+        assert_eq!(
+            classify_occupancy_from_candidates(&candidates, vec![uninspected(1)]),
+            CrossShardOccupancy::Indeterminate {
+                uninspected: vec![uninspected(1)]
+            },
+            "TERMINATED releases shard 0, so the uninspected shard is what \
+             decides this: Indeterminate, not Free"
+        );
     }
 }
