@@ -290,6 +290,50 @@ fn build_input_type_hint(params: &[&syn::FnArg]) -> String {
     format!("({})", parts.join(", "))
 }
 
+// Clone-class characterization tests (Echo). `build_input_type_hint` here and
+// in `update.rs` is byte-identical, and `signal.rs`'s `build_arg_type_hint`
+// is the same body under a different name. These tests pin this copy's
+// current behavior before it moves to a shared `attr_util::arg_type_hint`.
+#[cfg(test)]
+mod build_input_type_hint_pinned_tests {
+    use super::build_input_type_hint;
+
+    /// Parses a bare parameter list into owned `syn::FnArg` values, mirroring
+    /// how `query_macro` slices `func.sig.inputs` after skipping `ctx`.
+    fn params_from(sig: &str) -> Vec<syn::FnArg> {
+        let f: syn::ItemFn = syn::parse_str(&format!("fn f({sig}) {{}}")).unwrap();
+        f.sig.inputs.into_iter().collect()
+    }
+
+    #[test]
+    fn no_params_hints_unit() {
+        let owned = params_from("");
+        let refs: Vec<_> = owned.iter().collect();
+        assert_eq!(build_input_type_hint(&refs), "()");
+    }
+
+    #[test]
+    fn one_param_hints_the_bare_type_name() {
+        let owned = params_from("x: String");
+        let refs: Vec<_> = owned.iter().collect();
+        assert_eq!(build_input_type_hint(&refs), "String");
+    }
+
+    #[test]
+    fn one_generic_param_hints_the_inner_type_too() {
+        let owned = params_from("x: Option<String>");
+        let refs: Vec<_> = owned.iter().collect();
+        assert_eq!(build_input_type_hint(&refs), "Option<String>");
+    }
+
+    #[test]
+    fn multiple_params_hint_as_a_tuple() {
+        let owned = params_from("a: u32, b: bool");
+        let refs: Vec<_> = owned.iter().collect();
+        assert_eq!(build_input_type_hint(&refs), "(u32, bool)");
+    }
+}
+
 // ── Characterization tests ──────────────────────────────────────────────────
 //
 // `query_macro` generates the typed-stub `#method_name` twice: once for the
