@@ -518,6 +518,19 @@ async fn seed_signal_caller(
     target_name: &str,
     target_id: &str,
 ) -> ExternalSignalId {
+    seed_signal_caller_with_key(conn, caller, caller_id, target_name, target_id, None).await
+}
+
+/// [`seed_signal_caller`], with an opt-in idempotency key on the recorded
+/// `ExternalSignalRequested` (issue #1318).
+async fn seed_signal_caller_with_key(
+    conn: &mut AsyncPgConnection,
+    caller: ExecutionId,
+    caller_id: &str,
+    target_name: &str,
+    target_id: &str,
+    idempotency_key: Option<&str>,
+) -> ExternalSignalId {
     insert_running_row(conn, "by_id_caller", caller_id, caller).await;
     let signal_id = ExternalSignalId::new();
     store::append_events(
@@ -533,7 +546,7 @@ async fn seed_signal_caller(
                 },
                 signal_name: "ping".to_string(),
                 payload: serde_json::json!({"hello": "world"}),
-                idempotency_key: None,
+                idempotency_key: idempotency_key.map(str::to_string),
             },
         ],
         1,
@@ -2165,5 +2178,112 @@ async fn outbox_by_id_resolves_when_the_caller_holds_the_higher_aliased_shard() 
         "and reported: an alias that sorts BEFORE the held shard must be \
          recognised as already-inspected too — otherwise the ordering alone \
          decides whether the cancel ever completes"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 11. Issue #1318: a keyed signal must dedupe across a shard-crossing
+//     continue-as-new, not just within one shard
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn outbox_signal_by_id_keyed_retry_does_not_double_deliver_across_a_shard_crossing_continue_as_new()
+ {
+    // `resolve_and_signal_by_workflow_id`'s own idempotency pre-check
+    // (`execution::lookup_idempotent_signal_dedupe`) only ever sees the
+    // shard of the connection it runs on. A keyed retry whose predecessor
+    // delivery landed on a DIFFERENT shard can defeat it. That shard change
+    // is reachable when a continue-as-new (or a terminate-and-restart)
+    // crosses shards between the first delivery attempt and a retry. The
+    // retry then resolves to the successor's shard, finds no prior row
+    // THERE, and would insert a second, duplicate signal. The by-id location
+    // fan-out now checks every shard it already visits for the key too. This
+    // must dedupe exactly like the same-shard case already proven in
+    // `workflow_id_targeted_tests::resolver_signal_keyed_retry_after_continue_as_new_does_not_double_deliver`.
+    let _guard = TEST_MUTEX.lock().await;
+    let shards = TwoShards::start().await;
+    let router = two_shard_router();
+    autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
+
+    let workflow_id = "cross-shard-keyed-1";
+    let key = "cross-shard-key-1";
+
+    // Attempt 1 already landed on the predecessor, on shard 0.
+    let predecessor = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut conn0 = shards.conn(ShardId::new(0)).await;
+    insert_running_row(&mut conn0, "keyed_wf", workflow_id, predecessor).await;
+    let delivered = autumn_harvest::signal::send_signal_idempotent(
+        &mut conn0,
+        predecessor,
+        "ping",
+        serde_json::json!({"hello": "world"}),
+        Some(key),
+    )
+    .await
+    .expect("first delivery should succeed");
+    assert!(delivered, "first delivery must be a fresh insert");
+
+    // The predecessor continues-as-new to a successor on a DIFFERENT shard,
+    // before the caller-side outbox ever records `ExternalSignalDelivered`.
+    diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
+        .set(harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"))
+        .execute(&mut conn0)
+        .await
+        .expect("seal predecessor CONTINUED_AS_NEW");
+
+    let successor = ExecutionId::new_for_shard(ShardId::new(1));
+    let mut conn1 = shards.conn(ShardId::new(1)).await;
+    insert_running_row(&mut conn1, "keyed_wf", workflow_id, successor).await;
+
+    // The caller lives on shard 1 too. The predecessor's shard 0 is
+    // therefore reached only as a PEER probe, exercising the peer-probe half
+    // of the fix, not just the held-connection half.
+    let caller = ExecutionId::new_for_shard(ShardId::new(1));
+    let mut caller_conn = shards.conn(ShardId::new(1)).await;
+    seed_signal_caller_with_key(
+        &mut caller_conn,
+        caller,
+        "cross-shard-caller-1",
+        "keyed_wf",
+        workflow_id,
+        Some(key),
+    )
+    .await;
+
+    let metrics = autumn_harvest::telemetry::NoOpMetrics;
+    autumn_harvest::timeout::enforce_external_signals_outbox(
+        &mut caller_conn,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool()),
+        &[ShardId::new(1)],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("signal outbox sweep should succeed");
+
+    assert!(
+        history_event_types(&mut caller_conn, caller)
+            .await
+            .contains(&"ExternalSignalDelivered".to_string()),
+        "the retry must report delivered -- the request was already \
+         fulfilled against the predecessor"
+    );
+    assert!(
+        autumn_harvest::signal::load_pending_signals(&mut conn1, successor)
+            .await
+            .expect("load pending on shard 1")
+            .is_empty(),
+        "the retry must NOT insert a second, duplicate signal against the \
+         shard-crossing successor -- the key was already delivered on shard 0"
+    );
+    assert_eq!(
+        autumn_harvest::signal::load_pending_signals(&mut conn0, predecessor)
+            .await
+            .expect("load pending on shard 0")
+            .len(),
+        1,
+        "the original delivery against the predecessor must be untouched"
     );
 }

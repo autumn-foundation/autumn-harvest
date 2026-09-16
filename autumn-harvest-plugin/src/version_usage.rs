@@ -89,6 +89,19 @@ pub struct VersionUsageShardInspection {
 
 type ShardObservation = shard_fanout::ShardObservation<VersionUsageShardRow>;
 
+/// Clone-class note. `VersionUsageKey`, `VersionUsageAccumulator`, and their
+/// `merge_row`/`accumulator_from_row` helpers below near-duplicate
+/// `RetirementKey`, `RetirementAccumulator`, and their helpers in
+/// `version_gate_retirement.rs`. [`build_version_usage_report`]'s
+/// shard-aggregation body near-duplicates
+/// [`build_retirement_check_report`](crate::version_gate_retirement::build_retirement_check_report)
+/// the same way. PR #223 (this file) came first. PR #228
+/// (`version_gate_retirement.rs`) reused its shard-aggregation shape the same
+/// day for a retirement-specific read model. The two copies have diverged.
+/// `version_gate_retirement.rs`'s accumulator also tracks sample execution
+/// ids, so operators can look up specific blocking runs. This report has no
+/// need for that field. Apply a fix to the shared aggregation shape to both
+/// files. Do not add sample-id tracking here to match the other copy.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct VersionUsageKey {
     workflow_name: String,
