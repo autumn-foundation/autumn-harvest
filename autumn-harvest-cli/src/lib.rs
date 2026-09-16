@@ -5083,6 +5083,11 @@ fn redact_keyword_dsn(dsn: &str) -> Option<String> {
     })
 }
 
+/// The char starting at byte offset `i`, or `None` past the end of `dsn`.
+fn peek_char(dsn: &str, i: usize) -> Option<char> {
+    dsn[i..].chars().next()
+}
+
 /// Scan a libpq keyword/value DSN, replacing the values `replace` returns
 /// `Some` for and copying every other byte verbatim.
 ///
@@ -5091,6 +5096,12 @@ fn redact_keyword_dsn(dsn: &str) -> Option<String> {
 /// the next character in either form. A whitespace split cannot see quoting, so
 /// `password='abc sslmode=verify-full def'` would otherwise have the text
 /// *inside the password* rewritten.
+///
+/// "Whitespace" is Unicode `White_Space` (`char::is_whitespace`), matching
+/// `tokio_postgres::config`'s own `skip_ws` — not ASCII only. The client
+/// treats a no-break space or a vertical tab as an option separator, so this
+/// scan must too, or it reads two options as one and misses a `password` key
+/// hiding past the separator (issue #1321).
 ///
 /// Returns `None` for a DSN this cannot scan — an unterminated quote, a missing
 /// `=`, a value that never arrives — leaving the caller to pass the original
@@ -5105,10 +5116,18 @@ fn scan_keyword_dsn(
     let mut i = 0;
 
     while i < bytes.len() {
-        // Whitespace between options, copied verbatim.
+        // Whitespace between options, copied verbatim. Unicode `White_Space`
+        // (`char::is_whitespace`), not ASCII: the client separates options the
+        // same way (`tokio_postgres::config`'s `skip_ws`), and a scan that
+        // only knew ASCII read a no-break-space-separated `password=...` as
+        // part of the previous value, so no `password` key was ever found to
+        // redact (issue #1321).
         let start = i;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
+        while let Some(c) = peek_char(dsn, i) {
+            if !c.is_whitespace() {
+                break;
+            }
+            i += c.len_utf8();
         }
         out.push_str(&dsn[start..i]);
         if i >= bytes.len() {
@@ -5117,8 +5136,11 @@ fn scan_keyword_dsn(
 
         // Keyword, then `=` with optional whitespace on either side.
         let key_start = i;
-        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
-            i += 1;
+        while let Some(c) = peek_char(dsn, i) {
+            if c == '=' || c.is_whitespace() {
+                break;
+            }
+            i += c.len_utf8();
         }
         let key = &dsn[key_start..i];
         // The key must be a keyword libpq actually recognizes, not merely
@@ -5133,15 +5155,21 @@ fn scan_keyword_dsn(
             return None;
         }
         let spacing_start = i;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
+        while let Some(c) = peek_char(dsn, i) {
+            if !c.is_whitespace() {
+                break;
+            }
+            i += c.len_utf8();
         }
         if i >= bytes.len() || bytes[i] != b'=' {
             return None;
         }
         i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
+        while let Some(c) = peek_char(dsn, i) {
+            if !c.is_whitespace() {
+                break;
+            }
+            i += c.len_utf8();
         }
         // A DSN that ends after `=` (`host=db password=`) has no value to read;
         // indexing here would panic before tokio-postgres could say so.
@@ -5183,7 +5211,7 @@ fn scan_keyword_dsn(
                 }
             }
         } else {
-            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            while peek_char(dsn, i).is_some_and(|c| !c.is_whitespace()) {
                 if bytes[i] == b'\\' && i + 1 < bytes.len() {
                     let escaped = dsn[i + 1..].chars().next().unwrap_or_default();
                     value.push(escaped);
@@ -18744,6 +18772,49 @@ mod migrate_cli_tests {
         let second = migrate_target_label("host=db password='unterminated", 2);
         assert_eq!(first, "<unparseable dsn> #1");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn keyword_separators_use_unicode_whitespace_like_the_client_does() {
+        // `tokio_postgres` skips option separators with `char::is_whitespace` --
+        // the Unicode `White_Space` property, not ASCII (issue #1321). A scan
+        // that knows only ASCII reads the whole tail as ONE option whose value
+        // contains the text `password=hunter2`, finds no `password` key, and
+        // returns the DSN whole, credential included.
+        for separator in [
+            '\u{0009}', // tab
+            '\u{000b}', // vertical tab -- ASCII, but not `is_ascii_whitespace`
+            '\u{0085}', // next line
+            '\u{00a0}', // no-break space
+            '\u{1680}', // ogham space mark
+            '\u{2003}', // em space
+            '\u{202f}', // narrow no-break space
+            '\u{3000}', // ideographic space
+        ] {
+            let dsn =
+                format!("host=db.internal{separator}password=hunter2{separator}dbname=harvest");
+            let label = migrate_target_label(&dsn, 1);
+            assert!(
+                !label.contains("hunter2"),
+                "credential leaked for {separator:?}: {label}"
+            );
+            assert!(label.contains("host=db.internal"), "{separator:?}: {label}");
+            assert!(label.contains("dbname=harvest"), "{separator:?}: {label}");
+        }
+    }
+
+    #[test]
+    fn a_no_break_space_separated_dsn_redacts_to_the_exact_expected_label() {
+        // An exact match catches a span slip that leaks the edge of a
+        // credential, not just a substring check missing it.
+        let label = migrate_target_label(
+            "host=db.internal\u{a0}password=hunter2\u{a0}dbname=harvest",
+            1,
+        );
+        assert_eq!(
+            label,
+            "host=db.internal\u{a0}password=***\u{a0}dbname=harvest"
+        );
     }
 
     // ── credential hygiene ──────────────────────────────────────────────────
