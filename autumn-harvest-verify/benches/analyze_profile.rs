@@ -139,6 +139,14 @@ fn run() {
     let mut total_workflows = 0usize;
     for _ in 0..reps {
         let report = verify(&build, &opts).unwrap_or_else(|e| panic!("verify() failed: {e}"));
+        // A stale or emptied ANALYZE_PROFILE_MIR_DIR does not error here.
+        // `verify` just reports zero workflows, so a profile run against it
+        // would silently measure nothing instead of the intended workload.
+        assert!(
+            !report.discovery_failed && !report.workflows.is_empty(),
+            "analyzed 0 workflows -- ANALYZE_PROFILE_MIR_DIR does not hold the \
+             expected fixture; re-run ANALYZE_PROFILE_MODE=prepare"
+        );
         total_workflows = std::hint::black_box(report.workflows.len());
     }
     eprintln!("analyzed {total_workflows} workflow(s) per rep, {reps} rep(s)");
