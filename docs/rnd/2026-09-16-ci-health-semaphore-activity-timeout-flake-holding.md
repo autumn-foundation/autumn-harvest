@@ -7,15 +7,21 @@
 the series in `docs/rnd/2026-09-0[3-8]-ci-health-semaphore*.md` through
 `docs/rnd/2026-09-15-ci-health-semaphore-window-census.md`.
 
-**Corrected five times after review** (Codex on PR #1599): the initial
+**Corrected six times after review** (Codex on PR #1599): the initial
 draft overclaimed a full 100-run job-level census when only 23 runs were
-actually job-logged; overstated branch diversity in the post-merge
-failures; miscounted item 4's failure signatures (9 vs. 11) and omitted
-`migration_hygiene`; counted a truncated, mechanism-unknown failure as
-root-caused; attributed CI round-trips to a panic-message bug rather than
-the stale doc that actually caused them; and claimed the tracked
-event-history assertion could no longer fire post-#1563, when the source
-still has a catch-all panic arm. Each correction is called out inline
+actually job-logged (restated twice more after later drafts reintroduced
+the same "full census" wording at other locations); overstated branch
+diversity in the post-merge failures; miscounted item 4's failure
+signatures (9 vs. 11) and omitted `migration_hygiene`; counted a
+truncated, mechanism-unknown failure and a separately-recurring
+`corpus` failure as root-caused; attributed CI round-trips to a
+panic-message bug rather than the stale doc that actually caused them
+(also reintroduced and refixed at a second location, including in this
+report's own section heading); claimed the tracked event-history
+assertion could no longer fire post-#1563, when the source still has a
+catch-all panic arm; and, in item 3, conflated two entirely different
+branches, crediting one branch's later unrelated failures to a different
+branch's single, isolated occurrence. Each correction is called out inline
 below at the point it applies, verified against source or raw job logs
 rather than taken on faith — the pattern this series' own prior reports
 already follow.
@@ -160,7 +166,7 @@ cancelled sample, 23 runs total) — directionally consistent with the fix
 holding, but not the exhaustive census an earlier draft of this report
 implied by calling the 100-run page complete.
 
-### 2. `sqlite_feasibility_docs::derived_totals_agree_with_the_table_and_the_tree`'s panic message still shows the same number on both sides, and it blocked one branch three commits in a row this window
+### 2. A stale migration count blocked one branch three commits in a row this window, and its panic message still shows the same number on both sides (a separate, unrelated bug)
 
 The 09-08 report (`docs/rnd/2026-09-08-ci-health-semaphore-rerun-census.md:139-145`)
 first noted this test's panic message quotes the live migration count on
@@ -198,13 +204,26 @@ every individually-named suite in the visible tail passed — the same
 tail-truncation gap the 09-14 report hit on `integration_e2e`'s ~2800-test
 module (`tail_lines` ending before the actual panic for a large serial run).
 Re-fetched at `tail_lines=200`; the actual `quota_enforcement_tests` failure
-output was still not in the visible window. Not pursued further: the same
-branch (`claude/hopeful-pascal-tbijcf`) went on to fail three more times on
-unrelated deterministic gates (item 2, `migration_hygiene`) and never
-reproduced this signature again in this window. One occurrence, no
-mechanism, not clustered with anything else in this sample — recorded per
-this role's own admissibility rules so a repeat is recognized as a repeat,
-not actioned as a rate.
+output was still not in the visible window.
+
+**Correction (post-review):** an earlier draft of this paragraph said "the
+same branch (`claude/hopeful-pascal-tbijcf`) went on to fail three more
+times on unrelated deterministic gates... and never reproduced this
+signature again" — factually wrong on two counts, verified against this
+session's own raw data. First, `35034838493` runs on branch
+`claude/too-many-lines-followup`, not `claude/hopeful-pascal-tbijcf` — a
+different branch entirely; the two were conflated. Second,
+`claude/too-many-lines-followup` has exactly one run in this 100-run
+sample (`35034838493` itself), so there is no later activity on *that*
+branch to say anything about, "not pursued further" or otherwise.
+(`claude/hopeful-pascal-tbijcf` did separately fail 5 times later in this
+same window on unrelated gates — item 4's table and the fmt/sqlite/
+migration_hygiene entries — but that is a different branch's story, not
+evidence about whether `quota_enforcement_tests` recurred.) Corrected: one
+occurrence, no mechanism, no branch history to compare it against, not
+clustered with anything else in this sample — recorded per this role's
+own admissibility rules so a repeat is recognized as a repeat, not
+actioned as a rate.
 
 ### 4. Remaining 11 failures: deterministic, own-branch defects
 
@@ -262,11 +281,18 @@ suite-state interaction, no timing component, no order dependence.
 
 **Item 1** is not yet a rendered verdict on PR #1563's fix — that still
 requires the rerun campaign issue #1558 asked for and never got — but the
-frequency-in-the-wild evidence has moved from "unconfirmed" toward "holding":
-zero recurrences across a full (not sampled) two-day failure census straddling
-the merge, versus 3 occurrences the day before. Recorded as a data point for
-whoever next has the ability to run the actual rerun campaign, not claimed as
-a Tier-1 confirmation.
+frequency-in-the-wild evidence has moved from "unconfirmed" toward
+"holding": zero recurrences across the 23 runs actually inspected (15
+explicit failures plus an 8-run cancelled-run sample), versus 3
+occurrences the day before. **Correction (post-review):** an earlier
+draft of this sentence called the window a "full (not sampled) two-day
+failure census," which the Symptom section above already corrects — 47 of
+55 cancelled runs in this window were never job-logged, and this report's
+own cancelled-run audit found real hidden failures elsewhere in that
+population, so "full census" overstates what was actually checked. The
+result holds only for the population inspected. Recorded as a data point
+for whoever next has the ability to run the actual rerun campaign, not
+claimed as a Tier-1 confirmation.
 
 **Item 2** is the doc-sync gate working as designed: three round-trips in
 one window, caused by the branch leaving the documented count stale across
