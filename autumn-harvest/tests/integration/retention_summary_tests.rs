@@ -391,12 +391,13 @@ async fn summary_disabled_deletes_and_writes_no_summary() {
     assert_eq!(count_summaries(&mut conn).await, 0, "no summary row");
 }
 
-/// Issue #1317 review, P1: a row this shard EVER received via shard-rebalance
-/// migration can still be the un-reconciled forwarding target of a `MIGRATED`
-/// seal on another shard. Deleting it with no trace at all, even under the
-/// default `summary: None` policy, would make that seal's reconciliation
-/// error forever. So this one case gets a minimal, payload-free tombstone
-/// summary even though summary retention is otherwise off.
+/// Issue #1317 review, P1. A row this shard EVER received via
+/// shard-rebalance migration can still be the un-reconciled forwarding
+/// target of a `MIGRATED` seal on another shard. Deleting it with no trace
+/// at all, even under the default `summary: None` policy, would make that
+/// seal's reconciliation error forever. So this one case gets a minimal,
+/// payload-free tombstone summary even though summary retention is
+/// otherwise off.
 #[tokio::test]
 async fn summary_disabled_still_tombstones_a_row_that_was_ever_a_migration_target() {
     let (url, _c) = setup_db().await;
@@ -405,7 +406,17 @@ async fn summary_disabled_still_tombstones_a_row_that_was_ever_a_migration_targe
     scrub(&mut conn).await;
 
     let old = Utc::now() - chrono::Duration::days(2);
-    let exec_id = insert_completed(&mut conn, "wf", "migrated-target", old).await;
+    let exec_id = insert_completed_full(
+        &mut conn,
+        "wf",
+        "migrated-target",
+        "COMPLETED",
+        old,
+        None,
+        None,
+        Some(serde_json::json!({"tenant": "acme"})),
+    )
+    .await;
     diesel::sql_query(
         "UPDATE harvest_workflow_executions SET migrated_from_shards = '[0]'::jsonb \
           WHERE id = $1",
@@ -437,6 +448,11 @@ async fn summary_disabled_still_tombstones_a_row_that_was_ever_a_migration_targe
     assert_eq!(s.state, "COMPLETED");
     assert!(s.result.is_none(), "the tombstone never captures a payload");
     assert!(s.error.is_none(), "the tombstone never captures a payload");
+    assert!(
+        s.search_attrs.is_none(),
+        "a forced no-policy tombstone must never carry search attrs -- \
+         they can hold plaintext business/PII data"
+    );
 }
 
 // AC2 + AC3: a summary row is written in the same delete transaction, carrying
@@ -631,6 +647,58 @@ async fn summary_gc_deletes_expired_and_emits_metric() {
         metrics.summary_deleted(),
         vec![("gc_wf".to_string(), 2)],
         "summary GC emits the per-workflow deletion count"
+    );
+}
+
+/// Issue #1317 review, P1 follow-up. A summary demoted from a row that was
+/// EVER a shard-rebalance migration target can still be the only surviving
+/// evidence an un-reconciled seal elsewhere needs.
+///
+/// A bounded `SummaryPolicy` must not GC it past its horizon like an
+/// ordinary summary. That would reopen the exact "seal blocked forever"
+/// gap on a delay instead of immediately.
+#[tokio::test]
+async fn summary_gc_never_deletes_a_migration_target_summary() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let now = Utc::now();
+    // An ordinary old summary (GC-eligible) and a migration-target summary
+    // just as old (must survive regardless of age).
+    let ordinary = insert_summary(&mut conn, "gc_wf", "g1", now - chrono::Duration::days(2)).await;
+    let migrated_id: uuid::Uuid = diesel::sql_query(
+        "INSERT INTO harvest_execution_summaries
+            (execution_id, workflow_name, workflow_id, state, started_at,
+             completed_at, duration_ms, shard_id, migrated_from_shards)
+         VALUES (gen_random_uuid(), 'gc_wf', 'g2', 'COMPLETED', $1, $1, 5000, 0,
+                 '[0]'::jsonb)
+         RETURNING execution_id AS id",
+    )
+    .bind::<Timestamptz, _>(now - chrono::Duration::days(2))
+    .get_result::<IdRow>(&mut conn)
+    .await
+    .expect("insert migration-target summary")
+    .id;
+
+    let config = history_only(Some(Duration::from_secs(86_400)))
+        .with_summary_retention(SummaryPolicy::for_duration(Duration::from_secs(3_600)));
+    let metrics = Arc::new(CapturingMetrics::default());
+    run_one_tick(pool, config, Arc::clone(&metrics)).await;
+
+    assert!(
+        load_summary(&mut conn, ordinary).await.is_none(),
+        "an ordinary old summary is still GC'd normally"
+    );
+    assert!(
+        load_summary(&mut conn, migrated_id).await.is_some(),
+        "a migration-target summary must survive its configured horizon"
+    );
+    assert_eq!(
+        count_summaries(&mut conn).await,
+        1,
+        "only the migration-target summary remains"
     );
 }
 

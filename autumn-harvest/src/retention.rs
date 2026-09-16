@@ -2791,20 +2791,25 @@ async fn delete_candidate_execution(
         // The row read and hold re-check are unconditional (issue #1317
         // review, P1): whether a summary gets written now has TWO
         // independent triggers, not one. Summary retention being
-        // configured is the original (#752) trigger. The other is new:
-        // `migrated_from_shards` non-empty means this row was itself the
-        // TARGET of a shard-rebalance migration at some point, so a source
-        // shard elsewhere can still hold a `MIGRATED` seal whose forwarding
-        // chain resolves here, not yet observed terminal
-        // (`reconcile_migrated_seal_terminality` / `live_copy_is_terminal`).
-        // Hard-deleting this row with no trace at all would make every
-        // future reconciliation attempt for that seal fail with "neither
-        // its execution row nor its summary exists" forever, leaving the
-        // seal's business key blocked past any operator's reach. So this
-        // one case gets a minimal, payload-free summary even when summary
-        // retention is otherwise disabled -- just enough for reconciliation
-        // to read a terminal state. Every other row's behavior, and this
-        // row's own retention age/eligibility, is unchanged.
+        // configured is the original (#752) trigger.
+        //
+        // The other trigger is new. `migrated_from_shards` non-empty means
+        // this row was itself the TARGET of a shard-rebalance migration at
+        // some point. A source shard elsewhere can still hold a `MIGRATED`
+        // seal whose forwarding chain resolves here, not yet observed
+        // terminal (`reconcile_migrated_seal_terminality` /
+        // `live_copy_is_terminal`).
+        //
+        // Hard-deleting this row with no trace at all breaks reconciliation
+        // for that seal permanently. Every future attempt would fail with
+        // "neither its execution row nor its summary exists" forever. The
+        // seal's business key would stay blocked past any operator's reach.
+        //
+        // So this one case gets a minimal, payload-free summary even when
+        // summary retention is otherwise disabled. That is just enough for
+        // reconciliation to read a terminal state. Every other row's
+        // behavior, and this row's own retention age/eligibility, is
+        // unchanged.
         let row: Option<SummarySourceRow> = harvest_workflow_executions::table
             .find(candidate_id)
             .select((
@@ -2881,6 +2886,21 @@ async fn delete_candidate_execution(
                 // encryption-at-rest is preserved: the longer-retained
                 // summary tier can never hold plaintext that the event
                 // history encrypts.
+                //
+                // The forced migration-target tombstone (no `SummaryPolicy`
+                // configured) drops `search_attrs` too, not just the
+                // result/error payload above (issue #1317 review, P1
+                // follow-up). Those attributes can carry plaintext
+                // business/PII data. This row's whole purpose is to be the
+                // minimum an un-reconciled seal needs -- identity, state,
+                // and timing. An explicit policy's own choice to capture
+                // search attrs is unaffected; this only strips the forced
+                // case that never opted into anything.
+                let search_attrs = if summary.is_some() {
+                    search_attrs
+                } else {
+                    None
+                };
                 let new_summary = NewExecutionSummary {
                     execution_id: candidate_id,
                     workflow_name,
@@ -3054,6 +3074,22 @@ pub(crate) async fn purge_expired_summaries(
         workflow_name: String,
     }
 
+    // Issue #1317 review, P1 follow-up. A summary demoted from a row that
+    // was EVER a shard-rebalance migration target
+    // (`migrated_from_shards` non-empty) is excluded from this horizon
+    // entirely, not merely scheduled later.
+    //
+    // It can still be the only surviving evidence a source shard's
+    // un-reconciled `MIGRATED` seal needs to resolve
+    // (`live_copy_is_terminal`). GC'ing it past an operator's configured
+    // horizon reopens the exact "seal blocked forever" gap the retention
+    // fix above exists to close. That happens on a delay instead of
+    // immediately. This mirrors the codebase's existing rule for the row
+    // itself: retention already never hard-deletes a `MIGRATED` seal row
+    // outright, for the identical reason.
+    const NOT_A_MIGRATION_TARGET: &str =
+        "(migrated_from_shards IS NULL OR jsonb_array_length(migrated_from_shards) = 0)";
+
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     let Ok(chrono_age) = chrono::Duration::from_std(summary_age) else {
         // Unrepresentable age (unreachable for validated horizons, bounded by
@@ -3065,9 +3101,10 @@ pub(crate) async fn purge_expired_summaries(
     let batch = i64::try_from(batch_size).unwrap_or(i64::MAX).max(1);
 
     if dry_run {
-        let rows = diesel::sql_query(
-            "SELECT workflow_name FROM harvest_execution_summaries WHERE completed_at < $1",
-        )
+        let rows = diesel::sql_query(format!(
+            "SELECT workflow_name FROM harvest_execution_summaries \
+              WHERE completed_at < $1 AND {NOT_A_MIGRATION_TARGET}"
+        ))
         .bind::<Timestamptz, _>(cutoff)
         .load::<NameRow>(conn)
         .await
@@ -3079,16 +3116,16 @@ pub(crate) async fn purge_expired_summaries(
     }
 
     loop {
-        let rows = diesel::sql_query(
+        let rows = diesel::sql_query(format!(
             "DELETE FROM harvest_execution_summaries
              WHERE execution_id IN (
                  SELECT execution_id FROM harvest_execution_summaries
-                 WHERE completed_at < $1
+                 WHERE completed_at < $1 AND {NOT_A_MIGRATION_TARGET}
                  ORDER BY completed_at ASC, execution_id ASC
                  LIMIT $2
              )
-             RETURNING workflow_name",
-        )
+             RETURNING workflow_name"
+        ))
         .bind::<Timestamptz, _>(cutoff)
         .bind::<BigInt, _>(batch)
         .load::<NameRow>(conn)
