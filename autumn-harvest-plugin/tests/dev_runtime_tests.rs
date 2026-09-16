@@ -2605,8 +2605,8 @@ fn redaction_of_a_keyword_dsn_with_no_password_round_trips_byte_for_byte() {
 
 #[test]
 fn redaction_withholds_a_dsn_with_no_option_at_all() {
-    // A DSN with no `=` anywhere yields zero options from the scanner, so the
-    // withholding loop never runs and the string used to come back whole. A
+    // A DSN with no `=` anywhere yields zero options from the scanner. The
+    // withholding loop never runs, so the string used to come back whole. A
     // dropped scheme is at least as easy a typo as a keyword-shaped one.
     for dsn in [
         "alice:hunter2@db",
