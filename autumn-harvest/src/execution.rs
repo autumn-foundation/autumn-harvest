@@ -6919,10 +6919,22 @@ async fn load_workflow_execution_by_key_for_update(
     workflow_name: &str,
     workflow_id: &str,
 ) -> HarvestResult<WorkflowExecution> {
+    // A reconciled `MIGRATED` seal (`migrated_run_terminal_at` set) and a
+    // fresh replacement row can both match this filter at once (issue
+    // #1317 review). The seal is excluded from the active partial index.
+    // It is not excluded from this non-sealed filter, which only excludes
+    // `CONTINUED_AS_NEW`/`TERMINATED`. Order the released seal LAST so a
+    // live replacement always wins the `for_update` lock. The seal is
+    // only ever returned when it is the sole match.
     harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
         .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
+        .order(
+            harvest_workflow_executions::migrated_run_terminal_at
+                .is_null()
+                .desc(),
+        )
         .select(WorkflowExecution::as_select())
         .for_update()
         .first(conn)

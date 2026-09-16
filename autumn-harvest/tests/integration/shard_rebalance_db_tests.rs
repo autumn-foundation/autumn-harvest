@@ -1710,6 +1710,74 @@ async fn repeating_the_batch_command_advances_past_a_blocked_prefix() {
 }
 
 #[tokio::test]
+async fn the_resume_cursor_names_the_last_processed_row_not_the_last_fetched_one() {
+    // Issue #1317 review: `moved >= limit` can break the loop before every
+    // fetched candidate is examined. A cursor taken from the fetched
+    // window's last row (instead of the last row the loop actually
+    // reached) then skips every row in between. That gap is never
+    // re-examined on the next call.
+    let shards = setup_two_shards().await;
+    let mut ids = Vec::new();
+    for n in 0..5 {
+        ids.push(quiescent_fixture(&shards, &format!("cursor-{n}")).await);
+        // Force a distinct `created_at` per row so the scan's ASC order is
+        // deterministic even at sub-millisecond fixture creation speed.
+        let mut source = shards.source().await;
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions \
+                SET created_at = NOW() - ($2::bigint * INTERVAL '1 second') \
+              WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(ids[n].as_uuid())
+        .bind::<diesel::sql_types::BigInt, _>(4 - i64::try_from(n).unwrap())
+        .execute(&mut source)
+        .await
+        .expect("backdate");
+    }
+
+    // `limit = 1` and 5 eligible rows means `scan_limit` (4x) fetches the
+    // oldest 4. The loop breaks after the very first one. Rows 2-4 of the
+    // window are fetched but never examined this call.
+    let first =
+        migrate_quiescent_executions(&shards.pool, SOURCE, TARGET, 1, true, "tester", &codecs())
+            .await
+            .expect("first dry run");
+    assert_eq!(first.examined, 4);
+    assert_eq!(first.would_migrate(), 1);
+    match &first.outcomes[0] {
+        MigrationOutcome::WouldMigrate { execution_id } => {
+            assert_eq!(*execution_id, ids[0], "the oldest row is examined first");
+        }
+        other => panic!("expected WouldMigrate, got {other:?}"),
+    }
+    let cursor = first
+        .next_scan_cursor
+        .expect("a break on `moved >= limit` still leaves more to examine");
+
+    // The resumed call must pick up the SECOND row next, not skip straight
+    // past the whole first window to the fifth.
+    let resumed = migrate_quiescent_executions_after(
+        &shards.pool,
+        SOURCE,
+        TARGET,
+        1,
+        true,
+        "tester",
+        &codecs(),
+        Some(cursor),
+    )
+    .await
+    .expect("resumed dry run");
+    assert_eq!(resumed.would_migrate(), 1);
+    match &resumed.outcomes[0] {
+        MigrationOutcome::WouldMigrate { execution_id } => {
+            assert_eq!(*execution_id, ids[1], "row 2 must not be skipped over");
+        }
+        other => panic!("expected WouldMigrate, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn a_batch_to_the_same_shard_is_refused() {
     let shards = setup_two_shards().await;
     let error =
@@ -2366,6 +2434,32 @@ async fn a_terminate_if_running_start_creates_a_fresh_run_once_the_migrated_prio
         !reconciled_again,
         "reconciling an already-marked seal is a no-op"
     );
+
+    // The released seal and the fresh active run both match this load's
+    // `state NOT IN (CONTINUED_AS_NEW, TERMINATED)` filter (issue #1317
+    // review). A third start must reach the ACTIVE run and terminate-replace
+    // it. It must not mistake the released seal for "no conflict" and
+    // attempt a second insert that collides with the real active-row
+    // constraint.
+    let started_again = autumn_harvest::execution::start_or_load_workflow_execution(
+        &mut source,
+        terminate_if_running_start("entity_flow", "run-me-again"),
+        None,
+    )
+    .await
+    .expect("a third start must reach the active fresh run, not the released seal");
+    assert!(
+        started_again.created,
+        "TerminateIfRunning replaces the active run with a fresh one"
+    );
+    assert_ne!(
+        started_again.exec_id, started.exec_id,
+        "the replacement must be a new execution, not the fresh run reused"
+    );
+    assert_ne!(
+        started_again.exec_id, exec_id,
+        "the replacement must not be the migrated seal itself"
+    );
 }
 
 fn terminate_if_running_start<'a>(
@@ -2428,6 +2522,60 @@ async fn an_allow_duplicate_start_creates_a_fresh_run_too_once_the_seal_is_recon
         state_of(&mut source, exec_id).await.as_deref(),
         Some("MIGRATED"),
         "the seal's state must stay MIGRATED"
+    );
+}
+
+#[tokio::test]
+async fn rolling_back_the_seal_column_refuses_once_a_key_has_both_a_seal_and_a_replacement() {
+    // Issue #1317 review: once reconciliation releases a seal and a fresh
+    // same-key run is admitted, both rows satisfy the pre-fix migration's
+    // narrower `state NOT IN (...)` predicate. Recreating that unique index
+    // then fails on the duplicate pair. The down migration must refuse with
+    // a clear message instead of surfacing a raw constraint violation.
+    let shards = setup_two_shards().await;
+    let mut source = shards.source().await;
+    let down_sql =
+        include_str!("../../migrations/20260915231809_harvest_migrated_seal_terminal_at/down.sql");
+
+    // A reconciled seal and its live replacement, same business key.
+    source
+        .batch_execute(
+            "INSERT INTO harvest_workflow_executions \
+               (id, workflow_name, workflow_id, run_id, shard_id, state, input, \
+                started_at, created_at, migrated_run_terminal_at, migrated_to_shard, migrated_at) \
+             VALUES \
+               (gen_random_uuid(), 'wf', 'down-migration-dup', gen_random_uuid(), 0, \
+                'MIGRATED', '{}', now(), now(), now(), 1, now()), \
+               (gen_random_uuid(), 'wf', 'down-migration-dup', gen_random_uuid(), 0, \
+                'RUNNING', '{}', now(), now(), NULL, NULL, NULL)",
+        )
+        .await
+        .expect("seed the duplicate-key scenario");
+
+    let err = Box::pin(
+        source.transaction::<(), diesel::result::Error, _>(async |conn| {
+            conn.batch_execute(down_sql).await
+        }),
+    )
+    .await
+    .expect_err("the guard must refuse before the unique index rebuild can fail raw");
+    assert!(
+        err.to_string().contains("cannot roll back"),
+        "expected the guard's own message, got {err}"
+    );
+
+    // The refusal must not leave the column or the widened index touched.
+    let column_still_present: ScalarCount = diesel::sql_query(
+        "SELECT count(*)::BIGINT AS value FROM information_schema.columns \
+          WHERE table_name = 'harvest_workflow_executions' \
+            AND column_name = 'migrated_run_terminal_at'",
+    )
+    .get_result(&mut source)
+    .await
+    .expect("check column presence");
+    assert_eq!(
+        column_still_present.value, 1,
+        "an aborted rollback must leave the column in place"
     );
 }
 

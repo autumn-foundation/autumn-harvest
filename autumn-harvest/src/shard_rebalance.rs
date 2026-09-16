@@ -634,8 +634,9 @@ pub use db::{
     conn_for_shard, forward_of_held_row, list_migration_candidates, load_migration,
     migrate_execution, migrate_quiescent_executions, migrate_quiescent_executions_after,
     observe_quiescence, reconcile_migrated_seal_terminality, reconcile_migrated_seals,
-    residence_chain, resolve_execution_shard, resolve_target_shard, resolve_target_shard_holding,
-    resume_incomplete_migrations, shard_of_held_row, stage_copy, verify_target_copy,
+    reconcile_migrated_seals_after, residence_chain, resolve_execution_shard, resolve_target_shard,
+    resolve_target_shard_holding, resume_incomplete_migrations, shard_of_held_row, stage_copy,
+    verify_target_copy,
 };
 
 #[cfg(feature = "db")]
@@ -1610,15 +1611,46 @@ mod db {
     /// # Errors
     ///
     /// [`HarvestError::ShardUnavailable`] when the live shard has no pool
-    /// here. [`HarvestError::Database`] when neither the execution row nor
-    /// its summary exists there. A seal whose live copy is simply absent
-    /// is a different bug. It must not be silently reported terminal.
+    /// here, or the forwarding chain exceeds [`MAX_FORWARD_HOPS`].
+    /// [`HarvestError::Database`] when neither the execution row nor its
+    /// summary exists there. A seal whose live copy is simply absent is a
+    /// different bug. It must not be silently reported terminal.
+    ///
+    /// `first_hop` is the shard `source`'s own forwarding pointer already
+    /// named (issue #1317 review). Starting there, instead of
+    /// re-deriving `exec_id`'s origin shard via [`resolve_execution_shard`]
+    /// and re-checking it out, never checks out `source`'s own pool again.
+    /// On a pool-size-one shard, re-checking it out would deadlock against
+    /// the connection the caller still holds.
     async fn live_copy_is_terminal(
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
+        first_hop: ShardId,
     ) -> HarvestResult<bool> {
-        let live_shard = resolve_execution_shard(pool, exec_id).await?;
-        let mut conn = checkout(pool, live_shard).await?;
+        let mut current = first_hop;
+        let mut conn = checkout(pool, current).await?;
+        let mut resolved = None::<ShardId>;
+        for _ in 1..MAX_FORWARD_HOPS {
+            match read_forward(&mut conn, exec_id).await? {
+                None => {
+                    resolved = Some(current);
+                    break;
+                }
+                Some(next) => {
+                    current = next;
+                    conn = checkout(pool, current).await?;
+                }
+            }
+        }
+        let Some(live_shard) = resolved else {
+            return Err(HarvestError::ShardUnavailable {
+                shard_id: current.as_i32(),
+                reason: format!(
+                    "execution forwarding chain for {exec_id} exceeded {MAX_FORWARD_HOPS} \
+                     hops; this is a forwarding cycle or an unresolvably long migration chain"
+                ),
+            });
+        };
         let row: Option<LiveStateRow> = diesel::sql_query(
             "SELECT COALESCE(e.state, s.state) AS state \
                FROM (SELECT $1::uuid AS id) k \
@@ -1655,10 +1687,10 @@ mod db {
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
     ) -> HarvestResult<bool> {
-        if existing_seal(source, exec_id).await?.is_none() {
+        let Some((forward, _)) = existing_seal(source, exec_id).await? else {
             return Ok(false);
-        }
-        if !live_copy_is_terminal(pool, exec_id).await? {
+        };
+        if !live_copy_is_terminal(pool, exec_id, ShardId::new(forward)).await? {
             return Ok(false);
         }
         let updated = diesel::sql_query(
@@ -1677,6 +1709,8 @@ mod db {
     struct SealCandidateRow {
         #[diesel(sql_type = SqlUuid)]
         id: Uuid,
+        #[diesel(sql_type = Timestamptz)]
+        migrated_at: DateTime<Utc>,
     }
 
     /// Sweep `shard` for `MIGRATED` seals whose live copy may have finished,
@@ -1696,18 +1730,61 @@ mod db {
         shard: ShardId,
         limit: i64,
     ) -> HarvestResult<usize> {
+        reconcile_migrated_seals_after(pool, shard, limit, None)
+            .await
+            .map(|(reconciled, _)| reconciled)
+    }
+
+    /// [`reconcile_migrated_seals`], resuming the scan past `after` (issue
+    /// #1317 review).
+    ///
+    /// Without this, a shard whose oldest `limit` seals are still live, or
+    /// point to an unreachable target, fills the whole window on every
+    /// call. Later seals whose live copies already finished are never
+    /// reached -- the same permanently-blocked-prefix problem
+    /// [`migrate_quiescent_executions_after`] exists to fix for migration
+    /// candidates.
+    ///
+    /// Returns the number newly marked observed-terminal. Also returns a
+    /// cursor to pass as `after` on the next call when the window was full
+    /// (there may be more).
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError::Database`] on the candidate scan itself.
+    pub async fn reconcile_migrated_seals_after(
+        pool: &ShardedDbPool,
+        shard: ShardId,
+        limit: i64,
+        after: Option<MigrationScanCursor>,
+    ) -> HarvestResult<(usize, Option<MigrationScanCursor>)> {
         let mut source = checkout(pool, shard).await?;
+        let (cursor_at, cursor_id): (Option<DateTime<Utc>>, Option<Uuid>) = match after {
+            Some((at, id)) => (Some(at), Some(id.as_uuid())),
+            None => (None, None),
+        };
         let rows: Vec<SealCandidateRow> = diesel::sql_query(
-            "SELECT id FROM harvest_workflow_executions \
+            "SELECT id, migrated_at FROM harvest_workflow_executions \
               WHERE state = 'MIGRATED' AND migrated_to_shard IS NOT NULL \
                 AND migrated_run_terminal_at IS NULL \
-              ORDER BY migrated_at ASC \
+                AND ($2::timestamptz IS NULL OR (migrated_at, id) > ($2, $3)) \
+              ORDER BY migrated_at ASC, id ASC \
               LIMIT $1",
         )
         .bind::<BigInt, _>(limit)
+        .bind::<Nullable<Timestamptz>, _>(cursor_at)
+        .bind::<Nullable<SqlUuid>, _>(cursor_id)
         .load(&mut *source)
         .await
         .map_err(database_error)?;
+
+        let examined = rows.len();
+        let next_cursor = (examined == usize::try_from(limit).unwrap_or(usize::MAX))
+            .then(|| {
+                rows.last()
+                    .map(|r| (r.migrated_at, ExecutionId::from_uuid(r.id)))
+            })
+            .flatten();
 
         let mut reconciled = 0usize;
         for row in rows {
@@ -1724,7 +1801,7 @@ mod db {
                 reconciled += 1;
             }
         }
-        Ok(reconciled)
+        Ok((reconciled, next_cursor))
     }
 
     // ── Phase 2: replay verification ─────────────────────────────────────────
@@ -2772,19 +2849,23 @@ mod db {
         };
 
         let examined = candidates.len();
-        // A full window means there may be more past the last row this scan
-        // saw. A short one means the scan reached the end of the shard's
-        // `RUNNING` population, at least as of this call (issue #1317).
-        let next_scan_cursor = (examined == usize::try_from(scan_limit).unwrap_or(usize::MAX))
-            .then(|| candidates.last().map(|c| (c.created_at, c.execution_id)))
-            .flatten();
         let mut outcomes = Vec::new();
         let mut moved = 0usize;
+        // The cursor for the NEXT call must name the last candidate this one
+        // actually produced an outcome for. It must not be the last row of
+        // the fetched window (issue #1317 review). `moved >= limit` below
+        // can break the loop before the window is exhausted. A cursor
+        // taken from the window's end would then skip every unexamined row
+        // in between.
+        let mut last_examined: Option<MigrationScanCursor> = None;
+        let mut broke_early = false;
 
         for candidate in candidates {
             if moved >= limit {
+                broke_early = true;
                 break;
             }
+            last_examined = Some((candidate.created_at, candidate.execution_id));
             if !candidate.is_eligible() {
                 let outcome = MigrationOutcome::Skipped {
                     execution_id: candidate.execution_id,
@@ -2856,6 +2937,14 @@ mod db {
             }
             outcomes.push(outcome);
         }
+
+        // A full window means there may be more past the last row this scan
+        // saw. Breaking early on `moved >= limit` means the same, even over
+        // a short window (issue #1317).
+        let next_scan_cursor = (broke_early
+            || examined == usize::try_from(scan_limit).unwrap_or(usize::MAX))
+        .then_some(last_examined)
+        .flatten();
 
         Ok(MigrationBatchReport {
             source_shard,
