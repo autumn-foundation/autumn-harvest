@@ -66,6 +66,15 @@ token — the same leak shape the third bug fixed, recreated on the
 deadline path instead of the concurrency path. Fixed by adding the same
 deadline check to `rate_limit_debit`'s own `WHERE` clause.
 
+Codex then caught a seventh bug, against that sixth fix: `clock_timestamp()`
+is volatile, so the two direct calls the sixth fix added — one per CTE —
+could return two different real times. A deadline falling between those
+reads could let `rate_limit_debit` commit its spend in the same statement
+where `claimed` rejects the row for that same deadline. Fixed by adding a
+leading `now_ts` CTE that calls `clock_timestamp()` exactly once; both
+`rate_limit_debit` and `claimed` now read that one materialized value, so
+they always agree on the deadline decision.
+
 **Not wired into the default claim path.** `claim_task`/`claim_task_on_shard`
 are unchanged. Issue #1340 is explicit that no query change should land
 against it without sign-off from someone with full context on `queue.rs`'s
@@ -92,14 +101,16 @@ capability-routed-activity gate exercised end-to-end through the real
 function (not just SQL-text checks), and — the gap ledger #5's own
 single-session apparatus explicitly could not close — real concurrent
 Tokio claimers racing a capped concurrency key, asserting the cap is
-never exceeded. `queue.rs`'s `mod tests` gains 9 SQL-shape unit tests
+never exceeded. `queue.rs`'s `mod tests` gains 10 SQL-shape unit tests
 pinning the query text (concurrency gate omitted from the batch scan,
 every other gate preserved byte-for-byte including both capability-label
 branches, the cursor's four-column `OR`-chain, the authoritative
 recheck's exact shape, the concurrency probe's shape, the deadline
 recheck's use of `clock_timestamp()` and not `NOW()` on both the debit
 and the claim, the shared rate-limit-formula helper used instead of a
-fourth hand-copied literal).
+fourth hand-copied literal, and the seventh-bug fix that
+`rate_limit_debit` and `claimed` read one shared `now_ts` value rather
+than calling `clock_timestamp()` twice).
 
 **Measurement.** `docs/performance-claim-batched-seek-and-refine.md`,
 regenerated from a single run of

@@ -6039,6 +6039,17 @@ pub async fn pending_queue_demand_by_queue_name(
 /// deadline path instead of the concurrency path. The fix adds the same
 /// `$9` deadline check to `rate_limit_debit`'s own `WHERE` clause.
 ///
+/// A sixth bug, caught by the same reviewer against the fifth bug's own
+/// fix. `clock_timestamp()` is volatile: unlike `NOW()`, Postgres does
+/// not freeze it, so two separate calls in one query can return two
+/// different real times. The fifth fix called it once per CTE. A
+/// deadline that falls between those two reads could let
+/// `rate_limit_debit` commit its token spend while `claimed` rejects the
+/// same row in the same statement. The fix adds a leading `now_ts` CTE
+/// that calls `clock_timestamp()` once. Both `rate_limit_debit` and
+/// `claimed` read that one materialized value, so they always agree on
+/// the deadline decision.
+///
 /// # What this is not
 ///
 /// This is **not** wired into [`claim_task`] or [`claim_task_on_shard`].
@@ -6251,6 +6262,14 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
 /// always rejects it, recreating the leak
 /// [`claim_batched_candidate_concurrency_probe_query`] exists to close.
 ///
+/// Both checks read `now_ts`, a leading CTE that calls
+/// `clock_timestamp()` exactly once (review finding, not present in the
+/// first two-CTE draft). `clock_timestamp()` is volatile, so two direct
+/// calls could return two different real times. That gap could let
+/// `rate_limit_debit` commit a spend for a deadline `claimed` then
+/// rejects, in the same statement. One materialized read removes the
+/// gap: both writers see the identical value.
+///
 /// Binds: `$1` worker id, `$2` candidate row id, `$3` concurrency key,
 /// `$4` concurrency cap, `$5` task type. Also `$6` rate limit key, `$7`
 /// activity name, `$8` circuit-breaker-tracked activities, `$9` schedule-
@@ -6260,14 +6279,17 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
     static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         let rate_limit_available = effective_available_tokens_expr("b");
         format!(
-            "WITH rate_limit_debit AS ( \
+            "WITH now_ts AS ( \
+                 SELECT clock_timestamp() AS ts \
+             ), \
+             rate_limit_debit AS ( \
                  UPDATE harvest_rate_limit_buckets b \
                  SET tokens = {rate_limit_available} - 1.0, \
                      last_refilled_at = NOW() \
                  WHERE b.key = $6 \
                    AND NOT ($7 = ANY($8)) \
                    AND {rate_limit_available} >= 1.0 \
-                   AND ($9::timestamptz IS NULL OR $9::timestamptz > clock_timestamp()) \
+                   AND ($9::timestamptz IS NULL OR $9::timestamptz > (SELECT ts FROM now_ts)) \
                  RETURNING b.key AS debited_key \
              ), \
              claimed AS ( \
@@ -6298,7 +6320,7 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
                    ) \
                    AND ( \
                        $9::timestamptz IS NULL \
-                       OR $9::timestamptz > clock_timestamp() \
+                       OR $9::timestamptz > (SELECT ts FROM now_ts) \
                    ) \
                  RETURNING harvest_task_queue.* \
              ) \
@@ -7352,18 +7374,24 @@ mod tests {
              defaults to NULL); got:\n{sql}"
         );
         assert!(
-            sql.contains("$9::timestamptz > clock_timestamp()"),
-            "the deadline recheck must compare against clock_timestamp(), \
-             not NOW(), or it inherits the same staleness the batch scan's \
-             own soft filter has; got:\n{sql}"
+            sql.contains("$9::timestamptz > (SELECT ts FROM now_ts)"),
+            "the deadline recheck must compare against a materialized \
+             clock_timestamp() read, not NOW(), or it inherits the same \
+             staleness the batch scan's own soft filter has; got:\n{sql}"
         );
         assert_eq!(
             sql.matches("clock_timestamp()").count(),
+            1,
+            "clock_timestamp() must appear exactly once, in the now_ts \
+             CTE -- both WHERE clauses read that one materialized value, \
+             or two separate volatile reads could straddle the deadline \
+             instant and let the debit and the claim disagree; got:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("SELECT ts FROM now_ts").count(),
             2,
-            "clock_timestamp() must appear exactly twice: once in \
-             rate_limit_debit's own WHERE, once in claimed's -- both \
-             writes must skip an expired candidate, or the debit leaks a \
-             token the claim itself always rejects; got:\n{sql}"
+            "both rate_limit_debit and claimed must read the SAME \
+             materialized timestamp; got:\n{sql}"
         );
     }
 
@@ -7382,10 +7410,27 @@ mod tests {
             .unwrap_or_default();
         assert!(
             debit_clause.contains("$9::timestamptz IS NULL")
-                && debit_clause.contains("$9::timestamptz > clock_timestamp()"),
-            "the debit CTE's own WHERE must recheck the deadline against \
-             clock_timestamp(), not rely solely on claimed rejecting the \
-             row afterward; got:\n{sql}"
+                && debit_clause.contains("$9::timestamptz > (SELECT ts FROM now_ts)"),
+            "the debit CTE's own WHERE must recheck the deadline, not \
+             rely solely on claimed rejecting the row afterward; \
+             got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR. `clock_timestamp()`
+    /// is volatile: two separate calls in one query can return different
+    /// values. `rate_limit_debit` and `claimed` must read ONE materialized
+    /// timestamp, from the leading `now_ts` CTE. A deadline that falls
+    /// between two otherwise-independent reads cannot then let the debit
+    /// commit while the claim it was for rejects the row.
+    #[test]
+    fn claim_batched_candidate_attempt_query_shares_one_timestamp_between_debit_and_claim() {
+        let sql = claim_batched_candidate_attempt_query();
+        assert!(
+            sql.trim_start()
+                .starts_with("WITH now_ts AS ( SELECT clock_timestamp() AS ts )"),
+            "now_ts must be the query's first CTE, so both later writers \
+             see the same already-materialized value; got:\n{sql}"
         );
     }
 
