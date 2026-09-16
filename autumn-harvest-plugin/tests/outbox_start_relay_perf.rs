@@ -1,27 +1,31 @@
-//! Ledger performance investigation: the workflow-start outbox relay's
-//! per-row delivery-mark round trip.
+//! Ledger performance investigation (issue #1620): the workflow-start
+//! outbox relay's per-row delivery-mark round trip.
 //!
 //! `drain_workflow_start_outbox_batch` (`autumn-harvest-plugin/src/outbox.rs`)
-//! claims one batch of due `harvest_workflow_outbox` rows (default
-//! `batch_size` 32) and, for each row, calls `dispatch_workflow_start_request`
-//! then immediately `mark_outbox_row_delivered` (or `mark_outbox_row_failed`
-//! on error). `dispatch_workflow_start_request` genuinely differs per row --
-//! it starts a distinct workflow execution and cannot be batched. The mark
-//! call is a single fixed-shape `UPDATE ... WHERE id = $1 AND claimed_by = $2`
-//! that differs only in its bound values, issued once per row instead of
-//! once per batch.
+//! claims one batch of due `harvest_workflow_outbox` rows -- default
+//! `batch_size` 32 -- and calls `dispatch_workflow_start_request` for each
+//! one. `dispatch_workflow_start_request` genuinely differs per row: it
+//! starts a distinct workflow execution and cannot be batched. The mark
+//! that records each row's outcome is a single fixed-shape `UPDATE ...
+//! WHERE id = $1 AND claimed_by = $2`, differing only in its bound values.
+//! Before this investigation's fix, that mark ran once per row. At a
+//! 50-row batch drain, it was 90.9% of the drain's own statement calls
+//! and 46.0% of its buffers. The fix batches it into one `UPDATE ... FROM
+//! UNNEST(...)` call per outcome (delivered, failed) per drain.
 //!
 //! This file captures the `pg_stat_statements` profile of a full drain
-//! (`flush_workflow_start_outbox`) to establish what share of the relay's
-//! own statement count and buffer cost the per-row mark actually holds,
-//! before forming a batching hypothesis. Evidence is `pg_stat_statements`
-//! call and buffer counts, never wall-clock -- wall-clock is not admissible
-//! on a shared-vCPU machine. This harness follows the same shape as
-//! `completion_trigger_outbox_queue_perf.rs`: a fresh, uniquely-named,
-//! fully-migrated pair of databases (app + harvest, mirroring the relay's
-//! real split-database deployment) per measurement point, with
-//! `pg_stat_statements` reset immediately before the measured call and
-//! snapshotted immediately after it.
+//! (`flush_workflow_start_outbox`), against whatever mark shape the
+//! checked-out code currently uses. Evidence is `pg_stat_statements` call
+//! and buffer counts, never wall-clock. Wall-clock is not admissible on a
+//! shared-vCPU machine. This harness follows the same shape as
+//! `completion_trigger_outbox_queue_perf.rs`. Each measurement point gets
+//! a fresh, uniquely-named, fully-migrated pair of databases (app and
+//! harvest), mirroring the relay's real split-database deployment.
+//! `pg_stat_statements` is reset immediately before the measured call and
+//! snapshotted immediately after it. See
+//! `docs/perf-artifacts/outbox-start-relay/` for the before/after capture
+//! this file produced and `docs/performance-outbox-start-relay.md` for the
+//! full writeup.
 
 #![allow(clippy::too_many_lines)]
 
@@ -40,7 +44,7 @@ const OUTBOX_INIT_SQL: &str =
 // ── DB bootstrap (mirrors completion_trigger_outbox_queue_perf.rs, adapted
 //    for the outbox relay's real two-database split) ───────────────────────
 
-async fn admin_url() -> String {
+fn admin_url() -> String {
     std::env::var("HARVEST_TEST_DATABASE_URL")
         .expect("HARVEST_TEST_DATABASE_URL must point at a reachable Postgres admin role")
 }
@@ -107,6 +111,7 @@ fn build_test_state(app_url: &str, harvest_url: &str) -> AppState {
 
 // ── pg_stat_statements capture (mirrors completion_trigger_outbox_queue_perf.rs) ──
 
+#[allow(dead_code)] // Row mirrors the full pg_stat_statements snapshot; not every column feeds a computed total.
 #[derive(diesel::QueryableByName, Debug)]
 struct StatRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -153,10 +158,10 @@ async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec
 
 /// Whether `row` is the delivery-mark `UPDATE` this investigation targets.
 /// Matches both the delivered-mark (sets `delivered_execution_id`) and the
-/// failed-mark (sets `next_attempt_at`) shapes -- both set
-/// `delivery_attempts`, which the claim statement never touches, so this
-/// predicate cannot also match the claim statement (both statements set
-/// `claimed_by`/`claimed_at`, so matching on those alone double-counts).
+/// failed-mark (sets `next_attempt_at`) shapes. Both set
+/// `delivery_attempts`, which the claim statement never touches. So this
+/// predicate cannot also match the claim statement. Both statements set
+/// `claimed_by`/`claimed_at`, so matching on those alone double-counts.
 fn is_mark_statement(row: &StatRow) -> bool {
     let q = row.query.to_ascii_lowercase();
     q.contains("update") && q.contains("harvest_workflow_outbox") && q.contains("delivery_attempts")
@@ -276,8 +281,9 @@ async fn measure_one_batch(admin: &str, n: usize) -> SizePoint {
 #[tokio::test]
 #[ignore = "evidence generator, not a CI assertion -- run manually against \
             HARVEST_TEST_DATABASE_URL"]
+#[allow(clippy::cast_precision_loss)]
 async fn zz_capture_outbox_start_relay_perf_evidence() {
-    let admin = admin_url().await;
+    let admin = admin_url();
 
     for n in [5_usize, 20, 50] {
         let point = measure_one_batch(&admin, n).await;

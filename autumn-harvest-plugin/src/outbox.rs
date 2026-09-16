@@ -195,12 +195,12 @@ async fn drain_workflow_start_outbox_batch(
         .extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>()
         .map(|registry| std::sync::Arc::clone(&registry.telemetry().metrics));
 
-    // Dispatch is the one part of this loop that genuinely cannot batch --
-    // each row starts a distinct workflow execution. The mark that follows
-    // dispatch is a single fixed-shape `UPDATE ... WHERE id = $1 AND
-    // claimed_by = $2` that differed only in its bound values, so it is
-    // collected here and issued once per batch (per outcome) below instead
-    // of once per row (issue #1601, Ledger).
+    // Dispatch is the one part of this loop that cannot batch. Each row
+    // starts a distinct workflow execution. The mark that follows dispatch
+    // is a single fixed-shape `UPDATE ... WHERE id = $1 AND claimed_by =
+    // $2`. It differs only in its bound values. This collects the marks
+    // here and issues them once per batch, per outcome, below, instead of
+    // once per row (issue #1620, Ledger).
     let claimed = rows.len();
     let mut delivered_marks: Vec<(i64, ExecutionId)> = Vec::new();
     let mut failed_marks: Vec<(i64, String, u64)> = Vec::new();
@@ -222,20 +222,19 @@ async fn drain_workflow_start_outbox_batch(
         .await
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
 
-    // issue #618, F-round8 + F-round11: count the "outbox" bypass EXACTLY
-    // ONCE per row, gated on THIS claimant actually, durably marking that
-    // row delivered — i.e. the batched mark's `RETURNING outbox.id`
-    // included it. F-round8 gated on the mark returning `Ok`, but the
-    // mark's `WHERE claimed_by = $N` can affect a row not present in that
-    // set when a concurrent relay reclaimed it past `claim_ttl_ms`;
-    // counting a row absent from `RETURNING` would let both this claimant
-    // AND the reclaimer that actually delivers count the same committed
-    // start. Gating on set membership makes exactly the claimant whose
-    // mark wins the row count it, so one committed outbox start is one
-    // bypass across concurrent reclaims. Mirrors round 6/7's "gate the
-    // count on the delete/UPDATE actually affecting the row" -- batching
-    // moves the gate from a per-row affected-row count to a per-row
-    // membership check against one batched `RETURNING` set, same meaning.
+    // issue #618: count the "outbox" bypass EXACTLY ONCE per row. The
+    // gate is THIS claimant durably marking that row delivered, i.e. the
+    // batched mark's `RETURNING outbox.id` includes it. An earlier,
+    // per-row form of this gate checked the mark's own affected-row
+    // count instead. That count can be zero: the mark's `WHERE
+    // claimed_by = $N` matches nothing when a concurrent relay reclaimed
+    // the row past `claim_ttl_ms`. Counting a row absent from
+    // `RETURNING` would let both this claimant AND the reclaimer that
+    // actually delivers count the same committed start. Gating on set
+    // membership keeps that same exactly-once guarantee for a batched
+    // mark: exactly the claimant whose mark wins the row counts it. One
+    // committed outbox start is one bypass, even across concurrent
+    // reclaims.
     if let Some(metrics) = outbox_metrics.as_ref() {
         let marked_id_set: std::collections::HashSet<i64> = marked_ids.into_iter().collect();
         for (id, _) in &delivered_marks {
@@ -497,17 +496,19 @@ struct MarkedIdRow {
 }
 
 /// Marks every delivered row in `rows` (`(id, exec_id)` pairs) in one round
-/// trip via `UNNEST`, instead of one `UPDATE` per row (issue #1601, Ledger).
-/// `UNNEST` keeps the statement text fixed regardless of batch size, so this
-/// stays one prepared-statement shape rather than growing a distinct shape
-/// per batch size the way a literal `VALUES (...), (...), ...` list would.
+/// trip via `UNNEST`, instead of one `UPDATE` per row (issue #1620, Ledger).
+/// `UNNEST` keeps the statement text fixed regardless of batch size. This
+/// stays one prepared-statement shape. A literal `VALUES (...), (...), ...`
+/// list would instead grow a distinct shape per batch size.
 ///
-/// Returns the ids the `UPDATE` actually affected. A row is absent from that
-/// set only when this claimant lost it to a concurrent reclaim past
-/// `claim_ttl_ms` (the `WHERE claimed_by = $3` guard no longer matches for
-/// that id) — the same case the old per-row mark reported as `0` affected
-/// rows. Surfaced so the caller can gate the "outbox" bypass counter on an
-/// actual durable delivery, not on a mark that updated nothing for that row.
+/// Returns the ids the `UPDATE` actually affected. A row is absent from
+/// that set only in one case. This claimant lost it to a concurrent
+/// reclaim past `claim_ttl_ms`. The `WHERE claimed_by = $3` guard then no
+/// longer matches for that id. An earlier, per-row form of this mark
+/// reported that same case as `0` affected rows. The caller uses the
+/// returned set to gate the "outbox" bypass counter. That counter must
+/// reflect an actual durable delivery, not a mark that updated nothing
+/// for that row.
 async fn mark_outbox_rows_delivered_batch(
     conn: &mut AsyncPgConnection,
     claimant: &str,
@@ -548,9 +549,9 @@ async fn mark_outbox_rows_delivered_batch(
 
 /// Marks every failed row in `rows` (`(id, error, retry_delay_ms)` triples)
 /// in one round trip via `UNNEST`, instead of one `UPDATE` per row (issue
-/// #1601, Ledger). Each row keeps its own already-computed retry delay
-/// ([`retry_delay_ms`] depends on that row's own `delivery_attempts`), so
-/// batching changes only the round-trip count, not the per-row backoff.
+/// #1620, Ledger). Each row keeps its own already-computed retry delay.
+/// [`retry_delay_ms`] depends on that row's own `delivery_attempts`.
+/// Batching changes only the round-trip count, not the per-row backoff.
 async fn mark_outbox_rows_failed_batch(
     conn: &mut AsyncPgConnection,
     claimant: &str,
@@ -656,20 +657,46 @@ mod tests {
         );
     }
 
-    /// F-round11 (DB), carried forward to the batched mark (issue #1601, Ledger):
-    /// `mark_outbox_rows_delivered_batch` surfaces the ids it actually affected so
-    /// the caller can gate the bypass counter on an actual durable delivery. A row
-    /// claimed by a different claimant (a concurrent reclaimer took it past
-    /// `claim_ttl_ms`) is absent from that set; an owned row is present. This also
-    /// proves the batch doesn't cross-contaminate: two rows in the SAME call, one
-    /// owned and one not, must resolve independently -- and two OWNED rows in the
-    /// same call must each keep their own `exec_id`, not the other's (the risk a
-    /// naive `UNNEST` row-pairing bug would introduce). Runs against
-    /// `HARVEST_TEST_DATABASE_URL` when set (skips otherwise); executed against a
-    /// real local Postgres in CI's Docker-backed step.
+    /// DB test for the batched mark (issue #618, issue #1620, Ledger).
+    /// `mark_outbox_rows_delivered_batch` surfaces the ids it actually
+    /// affected. The caller gates the bypass counter on that set, so it
+    /// reflects an actual durable delivery. A row claimed by a different
+    /// claimant is absent from that set. A concurrent reclaimer took it
+    /// past `claim_ttl_ms`. An owned row is present. This also proves the
+    /// batch does not cross-contaminate. Two rows in the SAME call, one
+    /// owned and one not, must resolve independently. Two OWNED rows in
+    /// the same call must each keep their own `exec_id`. Neither may take
+    /// the other's -- the risk a naive `UNNEST` row-pairing bug would
+    /// introduce. Runs against `HARVEST_TEST_DATABASE_URL` when set, and
+    /// skips otherwise. Executed against a real local Postgres in CI's
+    /// Docker-backed step.
     #[tokio::test]
     async fn mark_outbox_rows_delivered_batch_reports_affected_ids_and_keeps_rows_distinct() {
         use diesel_async::AsyncConnection;
+
+        async fn insert_claimed(
+            conn: &mut AsyncPgConnection,
+            workflow_id: &str,
+            claimant: &str,
+        ) -> i64 {
+            #[derive(diesel::QueryableByName)]
+            struct IdRow {
+                #[diesel(sql_type = diesel::sql_types::BigInt)]
+                id: i64,
+            }
+            diesel::sql_query(
+                "INSERT INTO harvest_workflow_outbox
+                    (workflow_name, workflow_id, queue_name, input, claimed_by, claimed_at)
+                 VALUES ('r1620_wf', $1, 'default', '{}'::jsonb, $2, NOW())
+                 RETURNING id",
+            )
+            .bind::<diesel::sql_types::Text, _>(workflow_id)
+            .bind::<diesel::sql_types::Text, _>(claimant)
+            .get_result::<IdRow>(conn)
+            .await
+            .expect("insert claimed outbox row")
+            .id
+        }
 
         #[derive(diesel::QueryableByName)]
         struct DeliveredRow {
@@ -687,33 +714,9 @@ mod tests {
             .await
             .expect("connect to test DB");
 
-        async fn insert_claimed(
-            conn: &mut AsyncPgConnection,
-            workflow_id: &str,
-            claimant: &str,
-        ) -> i64 {
-            #[derive(diesel::QueryableByName)]
-            struct IdRow {
-                #[diesel(sql_type = diesel::sql_types::BigInt)]
-                id: i64,
-            }
-            diesel::sql_query(
-                "INSERT INTO harvest_workflow_outbox
-                    (workflow_name, workflow_id, queue_name, input, claimed_by, claimed_at)
-                 VALUES ('r1601_wf', $1, 'default', '{}'::jsonb, $2, NOW())
-                 RETURNING id",
-            )
-            .bind::<diesel::sql_types::Text, _>(workflow_id)
-            .bind::<diesel::sql_types::Text, _>(claimant)
-            .get_result::<IdRow>(conn)
-            .await
-            .expect("insert claimed outbox row")
-            .id
-        }
-
         // Two rows: one owned by worker-A, one claimed by a concurrent worker-B.
-        let owned_id = insert_claimed(&mut conn, "r1601-owned", "worker-A").await;
-        let lost_id = insert_claimed(&mut conn, "r1601-lost", "worker-B").await;
+        let owned_id = insert_claimed(&mut conn, "r1620-owned", "worker-A").await;
+        let lost_id = insert_claimed(&mut conn, "r1620-lost", "worker-B").await;
 
         let owned_exec = ExecutionId::new();
         let lost_exec = ExecutionId::new();
@@ -770,13 +773,32 @@ mod tests {
             .expect("cleanup");
     }
 
-    /// Companion to the delivered-batch test above, for the failed path: two
-    /// owned rows in the SAME batched call must each keep their own `error`
-    /// and their own `retry_delay_ms`, not the other row's (issue #1601,
-    /// Ledger).
+    /// Companion to the delivered-batch test above, for the failed path.
+    /// Two owned rows in the SAME batched call must each keep their own
+    /// `error` and their own `retry_delay_ms`, not the other row's
+    /// (issue #1620, Ledger).
     #[tokio::test]
     async fn mark_outbox_rows_failed_batch_keeps_rows_distinct() {
         use diesel_async::AsyncConnection;
+
+        async fn insert_claimed(conn: &mut AsyncPgConnection, workflow_id: &str) -> i64 {
+            #[derive(diesel::QueryableByName)]
+            struct IdRow {
+                #[diesel(sql_type = diesel::sql_types::BigInt)]
+                id: i64,
+            }
+            diesel::sql_query(
+                "INSERT INTO harvest_workflow_outbox
+                    (workflow_name, workflow_id, queue_name, input, claimed_by, claimed_at)
+                 VALUES ('r1620_wf', $1, 'default', '{}'::jsonb, 'worker-A', NOW())
+                 RETURNING id",
+            )
+            .bind::<diesel::sql_types::Text, _>(workflow_id)
+            .get_result::<IdRow>(conn)
+            .await
+            .expect("insert claimed outbox row")
+            .id
+        }
 
         #[derive(diesel::QueryableByName)]
         struct FailedRow {
@@ -794,27 +816,8 @@ mod tests {
             .await
             .expect("connect to test DB");
 
-        async fn insert_claimed(conn: &mut AsyncPgConnection, workflow_id: &str) -> i64 {
-            #[derive(diesel::QueryableByName)]
-            struct IdRow {
-                #[diesel(sql_type = diesel::sql_types::BigInt)]
-                id: i64,
-            }
-            diesel::sql_query(
-                "INSERT INTO harvest_workflow_outbox
-                    (workflow_name, workflow_id, queue_name, input, claimed_by, claimed_at)
-                 VALUES ('r1601_wf', $1, 'default', '{}'::jsonb, 'worker-A', NOW())
-                 RETURNING id",
-            )
-            .bind::<diesel::sql_types::Text, _>(workflow_id)
-            .get_result::<IdRow>(conn)
-            .await
-            .expect("insert claimed outbox row")
-            .id
-        }
-
-        let short_id = insert_claimed(&mut conn, "r1601-short-delay").await;
-        let long_id = insert_claimed(&mut conn, "r1601-long-delay").await;
+        let short_id = insert_claimed(&mut conn, "r1620-short-delay").await;
+        let long_id = insert_claimed(&mut conn, "r1620-long-delay").await;
 
         mark_outbox_rows_failed_batch(
             &mut conn,

@@ -1890,3 +1890,10 @@ standalone note rather than part of the claim-path attribution table above:
   actually admits; `nodes` and `by_parent` stay growing from empty after a
   post-review correction (instructions -2.37%, alloc bytes -27.12%, this
   fix's final fifth-round-corrected numbers).
+* [`docs/performance-outbox-start-relay.md`](performance-outbox-start-relay.md)
+  — the per-row delivery-mark N+1 in
+  `outbox::drain_workflow_start_outbox_batch`, the workflow-start outbox
+  relay's periodic drain (issue #1620), batched into one
+  `UPDATE ... FROM UNNEST(...)` call per outcome (delivered, failed) per
+  drain instead of one call per row (`mark_calls` n → claim-round count at
+  every swept size; `mark_buffers` -26.9% at n=50).
