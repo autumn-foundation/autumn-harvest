@@ -6477,9 +6477,7 @@ async fn try_claim_batched_candidate(
     worker_id: &str,
     circuit_breaker_activities: &[String],
 ) -> HarvestResult<Option<TaskQueueItem>> {
-    if candidate.concurrency_key.is_some()
-        && !concurrency_probe_passes(conn, candidate).await?
-    {
+    if candidate.concurrency_key.is_some() && !concurrency_probe_passes(conn, candidate).await? {
         return Ok(None);
     }
 
@@ -7247,8 +7245,7 @@ mod tests {
              scheduled_at, or tied rows are silently skipped; got:\n{sql}"
         );
         assert_eq!(
-            sql.matches("scheduled_at > $10").count()
-                + sql.matches("scheduled_at = $10").count(),
+            sql.matches("scheduled_at > $10").count() + sql.matches("scheduled_at = $10").count(),
             2,
             "the cursor OR-chain must have exactly one 'strictly after' \
              branch and one 'tied, break on id' branch for scheduled_at; \

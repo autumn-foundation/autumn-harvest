@@ -51,9 +51,9 @@ mod child_policy_tests;
 mod child_timeout_tests;
 mod ci_run_coverage;
 mod circuit_breaker_wiring_tests;
-mod claim_bench_support;
 #[cfg(feature = "db")]
 mod claim_batched_tests;
+mod claim_bench_support;
 #[cfg(feature = "db")]
 mod claim_budget_tests;
 #[cfg(all(feature = "db", feature = "testing"))]

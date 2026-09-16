@@ -154,10 +154,19 @@ async fn batched_claim_one(
     worker_id: &str,
     config: BatchedClaimConfig,
 ) -> Option<Uuid> {
-    claim_task_batched(conn, &[queue.to_string()], worker_id, "", None, &[], &[], config)
-        .await
-        .expect("batched claim")
-        .map(|t| t.id)
+    claim_task_batched(
+        conn,
+        &[queue.to_string()],
+        worker_id,
+        "",
+        None,
+        &[],
+        &[],
+        config,
+    )
+    .await
+    .expect("batched claim")
+    .map(|t| t.id)
 }
 
 // ── Equivalence with the single-row claim path ──────────────────────────────
@@ -189,10 +198,18 @@ async fn batched_claim_picks_the_same_row_the_single_row_path_would() {
         }
     }
 
-    let single_claimed = claim_task(&mut conn, std::slice::from_ref(&queue_a), "w1", "", None, &[], &[])
-        .await
-        .expect("single claim")
-        .expect("a row was claimable");
+    let single_claimed = claim_task(
+        &mut conn,
+        std::slice::from_ref(&queue_a),
+        "w1",
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("single claim")
+    .expect("a row was claimable");
     let batched_claimed_id =
         batched_claim_one(&mut conn, &queue_b, "w1", BatchedClaimConfig::default())
             .await
@@ -577,12 +594,13 @@ async fn batched_claim_respects_the_rate_limit_bucket() {
         #[diesel(sql_type = diesel::sql_types::Double)]
         tokens: f64,
     }
-    let remaining = diesel::sql_query("SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1")
-        .bind::<diesel::sql_types::Text, _>(&bucket_key)
-        .get_result::<Tokens>(&mut conn)
-        .await
-        .expect("tokens")
-        .tokens;
+    let remaining =
+        diesel::sql_query("SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1")
+            .bind::<diesel::sql_types::Text, _>(&bucket_key)
+            .get_result::<Tokens>(&mut conn)
+            .await
+            .expect("tokens")
+            .tokens;
     assert!(
         remaining.abs() < 1e-9,
         "exactly one token must be debited; got {remaining}"
@@ -659,12 +677,13 @@ async fn batched_claim_never_debits_rate_limit_for_a_concurrency_rejected_candid
         #[diesel(sql_type = diesel::sql_types::Double)]
         tokens: f64,
     }
-    let remaining = diesel::sql_query("SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1")
-        .bind::<diesel::sql_types::Text, _>(&bucket_key)
-        .get_result::<Tokens>(&mut conn)
-        .await
-        .expect("tokens")
-        .tokens;
+    let remaining =
+        diesel::sql_query("SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1")
+            .bind::<diesel::sql_types::Text, _>(&bucket_key)
+            .get_result::<Tokens>(&mut conn)
+            .await
+            .expect("tokens")
+            .tokens;
     assert!(
         (remaining - 100.0).abs() < 1e-9,
         "none of the 10 poisoned rows may debit a token -- the winning row \
@@ -694,17 +713,26 @@ async fn batched_claim_honors_sticky_routing() {
     params.sticky_timeout = Some(std::time::Duration::from_secs(300));
     let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
 
-    let claimed_by_other =
-        batched_claim_one(&mut conn, &queue, "not-the-owner", BatchedClaimConfig::default()).await;
+    let claimed_by_other = batched_claim_one(
+        &mut conn,
+        &queue,
+        "not-the-owner",
+        BatchedClaimConfig::default(),
+    )
+    .await;
     assert_eq!(
         claimed_by_other, None,
         "a live sticky pin must block every other worker"
     );
 
-    let claimed_by_owner =
-        batched_claim_one(&mut conn, &queue, "sticky-owner", BatchedClaimConfig::default())
-            .await
-            .expect("the pinned worker must be able to claim it");
+    let claimed_by_owner = batched_claim_one(
+        &mut conn,
+        &queue,
+        "sticky-owner",
+        BatchedClaimConfig::default(),
+    )
+    .await
+    .expect("the pinned worker must be able to claim it");
     assert_eq!(claimed_by_owner, task_id);
 }
 
@@ -726,7 +754,9 @@ async fn batched_claim_capability_routed_activity_bypasses_the_ineligible_gate()
     plain.workflow_exec_id = Some(exec_id);
     plain.activity_name = Some(poisoned_activity.to_string());
     plain.activity_id = Some(Uuid::new_v4());
-    queue::enqueue(&mut conn, &plain).await.expect("enqueue plain");
+    queue::enqueue(&mut conn, &plain)
+        .await
+        .expect("enqueue plain");
 
     let exec_id2 = insert_execution(&mut conn).await;
     let mut capability_routed =
