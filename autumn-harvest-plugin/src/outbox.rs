@@ -782,6 +782,18 @@ async fn mark_outbox_rows_delivered_batch(
     Ok(marked.into_iter().map(|row| row.id).collect())
 }
 
+/// A `Duration` rounded up to whole milliseconds, never truncated down
+/// (issue #1620 review, Codex, tenth round). `Duration::as_millis`
+/// truncates. A genuinely positive sub-millisecond remainder is possible
+/// whenever `base_retry_delay_ms` is configured near its 1ms validated
+/// minimum. Truncating it would silently become a 0ms retry delay --
+/// retrying an unexpired deadline immediately. `div_ceil` on nanoseconds
+/// still returns exactly 0 for `Duration::ZERO` (a deadline already at
+/// or past `now`), only rounding a positive remainder up.
+fn remaining_ms_rounded_up(remaining: std::time::Duration) -> i64 {
+    i64::try_from(remaining.as_nanos().div_ceil(1_000_000)).unwrap_or(i64::MAX)
+}
+
 /// Marks every failed row in `rows` (`(id, error, deadline)` triples) in
 /// one round trip via `UNNEST`, instead of one `UPDATE` per row (issue
 /// #1620, Ledger). Each row keeps its own already-computed retry
@@ -810,9 +822,7 @@ async fn mark_outbox_rows_failed_batch(
     let now = std::time::Instant::now();
     let delays: Vec<i64> = rows
         .iter()
-        .map(|(_, _, deadline)| {
-            i64::try_from(deadline.saturating_duration_since(now).as_millis()).unwrap_or(i64::MAX)
-        })
+        .map(|(_, _, deadline)| remaining_ms_rounded_up(deadline.saturating_duration_since(now)))
         .collect();
 
     diesel::sql_query(
@@ -938,6 +948,42 @@ mod tests {
             claim_flush_margin_ms(1),
             1,
             "the minimum valid TTL: the whole 1ms is margin, not zero"
+        );
+    }
+
+    /// Rounds up, never down (issue #1620 review, Codex, tenth round).
+    /// `Duration::as_millis` alone would truncate a positive
+    /// sub-millisecond remainder to 0. That retries an unexpired
+    /// deadline immediately when `base_retry_delay_ms` is close to its
+    /// 1ms floor.
+    #[test]
+    fn remaining_ms_rounded_up_never_truncates_a_positive_remainder() {
+        use std::time::Duration;
+
+        assert_eq!(
+            remaining_ms_rounded_up(Duration::ZERO),
+            0,
+            "an already-elapsed deadline stays exactly 0, not rounded up"
+        );
+        assert_eq!(
+            remaining_ms_rounded_up(Duration::from_nanos(1)),
+            1,
+            "any positive remainder, however small, rounds up to at least 1ms"
+        );
+        assert_eq!(
+            remaining_ms_rounded_up(Duration::from_micros(999)),
+            1,
+            "just under 1ms rounds up to 1ms, not down to 0"
+        );
+        assert_eq!(
+            remaining_ms_rounded_up(Duration::from_millis(1)),
+            1,
+            "an exact millisecond stays 1, not rounded up to 2"
+        );
+        assert_eq!(
+            remaining_ms_rounded_up(Duration::from_micros(1_001)),
+            2,
+            "just over 1ms rounds up to 2ms"
         );
     }
 
