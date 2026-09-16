@@ -38,6 +38,15 @@ import (
 const (
 	taskQueue = "assay11"
 
+	// The workflow payload assay #11's Shape table registers.
+	//
+	// Assay #10's harvest arm seeds the canonical empty object, because its L1
+	// compares against a published number taken that way. Assay #11 registered
+	// a ~40-byte payload for BOTH arms instead, so its runs use this and the
+	// harvest arm is re-run with ASSAY10_INPUT_JSON set to match. Found by
+	// review on PR #1617.
+	registeredPayload = "0123456789abcdef0123456789abcdef"
+
 	workflowSlots = 8
 	activitySlots = 16
 )
@@ -56,7 +65,9 @@ type okResult struct {
 // The canonical harness seeds an empty object, and the harvest arm now does
 // too. The workflow ignores it, but it is persisted in history and re-read on
 // every workflow-task replay, so it has to match. Found by review on PR #1617.
-type emptyInput struct{}
+type registeredInput struct {
+	P string `json:"p"`
+}
 
 // activityRuns is the correctness ledger, matching the harvest arm's counter.
 var activityRuns atomic.Uint64
@@ -67,12 +78,29 @@ var activityRuns atomic.Uint64
 // input would have Temporal serialize and persist that payload into every
 // activity-completion history event, a cost the harvest arm never pays, and
 // the registered shape says both arms are inert. Found by review on PR #1617.
-func Step1(ctx context.Context) (okResult, error) { activityRuns.Add(1); return okResult{true}, nil }
-func Step2(ctx context.Context) (okResult, error) { activityRuns.Add(1); return okResult{true}, nil }
-func Step3(ctx context.Context) (okResult, error) { activityRuns.Add(1); return okResult{true}, nil }
+// Each takes one nullable argument so the caller can pass an explicit null.
+//
+// The harvest handler calls execute_activity_raw with an explicit JSON null,
+// which harvest persists as the scheduled activity's input. Taking no argument
+// at all made Temporal persist no input payload, giving it smaller histories
+// than the arm it is matched against. Found by review on PR #1617.
+func Step1(ctx context.Context, _ *okResult) (okResult, error) {
+	activityRuns.Add(1)
+	return okResult{true}, nil
+}
+
+func Step2(ctx context.Context, _ *okResult) (okResult, error) {
+	activityRuns.Add(1)
+	return okResult{true}, nil
+}
+
+func Step3(ctx context.Context, _ *okResult) (okResult, error) {
+	activityRuns.Add(1)
+	return okResult{true}, nil
+}
 
 // BenchWorkflow runs the three steps in sequence, matching wf_three_activities.
-func BenchWorkflow(ctx workflow.Context, _ emptyInput) (okResult, error) {
+func BenchWorkflow(ctx workflow.Context, _ registeredInput) (okResult, error) {
 	opts := workflow.ActivityOptions{
 		StartToCloseTimeout: 30 * time.Second,
 		// The harvest arm's activities carry no retry policy and inert bodies
@@ -88,7 +116,7 @@ func BenchWorkflow(ctx workflow.Context, _ emptyInput) (okResult, error) {
 	// three activity-scheduled events per run that harvest never writes.
 	// Found by review on PR #1617.
 	for _, act := range []any{Step1, Step2, Step3} {
-		if err := workflow.ExecuteActivity(ctx, act).Get(ctx, nil); err != nil {
+		if err := workflow.ExecuteActivity(ctx, act, nil).Get(ctx, nil); err != nil {
 			return okResult{}, err
 		}
 	}
@@ -176,7 +204,7 @@ func runRep(c client.Client, rep, workflows, capSecs int) (float64, bool) {
 			run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
 				ID:        fmt.Sprintf("a11-r%d-%d", rep, i),
 				TaskQueue: taskQueue,
-			}, BenchWorkflow, emptyInput{})
+			}, BenchWorkflow, registeredInput{P: registeredPayload})
 			if err != nil {
 				log.Printf("seed %d: %v", i, err)
 				return

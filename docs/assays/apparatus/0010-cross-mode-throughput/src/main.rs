@@ -114,6 +114,12 @@ struct Settings {
     database_name: String,
     redis_url: String,
     sqlite_dir: String,
+    /// The seeded workflow input, as JSON text.
+    ///
+    /// Defaults to the canonical empty object, which is what assay #10's L1
+    /// requires. Assay #11 registered a ~40-byte payload instead, so its runs
+    /// override this. Found by review on PR #1617.
+    input_json: String,
     workflows: usize,
     reps: usize,
     seeders: usize,
@@ -139,6 +145,7 @@ impl Settings {
             database_name: env_string("ASSAY10_DB_NAME", "assay10"),
             redis_url: env_string("ASSAY10_REDIS_URL", "redis://127.0.0.1:6379"),
             sqlite_dir: env_string("ASSAY10_SQLITE_DIR", "/tmp/assay10-sqlite"),
+            input_json: env_string("ASSAY10_INPUT_JSON", INPUT_JSON),
             workflows: env_usize("ASSAY10_WORKFLOWS", 2_000),
             reps: env_usize("ASSAY10_REPS", 3),
             seeders: env_usize("ASSAY10_SEEDERS", 16),
@@ -595,18 +602,22 @@ impl Pool {
 // Workflow start.
 // ---------------------------------------------------------------------------
 
-fn workflow_input() -> serde_json::Value {
-    serde_json::from_str(INPUT_JSON).expect("the canonical input should parse")
+fn workflow_input(settings: &Settings) -> serde_json::Value {
+    serde_json::from_str(&settings.input_json).expect("the seeded input should parse")
 }
 
-async fn start_one(conn: &mut AsyncPgConnection, workflow_id: &str) -> bool {
+async fn start_one(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+    input: serde_json::Value,
+) -> bool {
     autumn_harvest::start_or_load_workflow_execution(
         conn,
         StartWorkflowParams {
             workflow_name: WORKFLOW,
             workflow_id,
             exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
-            input: workflow_input(),
+            input,
             parent_id: None,
             queue_name: QUEUE,
             execution_timeout: None,
@@ -654,18 +665,25 @@ async fn start_one(conn: &mut AsyncPgConnection, workflow_id: &str) -> bool {
 ///
 /// The starts run on `seeders` connections in parallel. The seed phase is not
 /// part of any measured window.
-async fn seed(url: &str, run: &str, count: usize, seeders: usize) -> usize {
+async fn seed(
+    url: &str,
+    run: &str,
+    count: usize,
+    seeders: usize,
+    input: serde_json::Value,
+) -> usize {
     let mut set = tokio::task::JoinSet::new();
     let lanes = seeders.max(1);
     for lane in 0..lanes {
         let url = url.to_string();
         let run = run.to_string();
+        let input = input.clone();
         set.spawn(async move {
             let mut conn = connect(&url).await;
             let mut started_here = 0_usize;
             let mut index = lane;
             while index < count {
-                if start_one(&mut conn, &format!("{run}-{index}")).await {
+                if start_one(&mut conn, &format!("{run}-{index}"), input.clone()).await {
                     started_here += 1;
                 }
                 index += lanes;
@@ -761,6 +779,7 @@ async fn run_postgres_arm(settings: &Settings, arm: Arm, rep: usize) -> RepOutco
         &run,
         settings.workflows,
         settings.seeders,
+        workflow_input(settings),
     )
     .await;
     assert_eq!(seeded, settings.workflows, "every start should be accepted");
@@ -831,9 +850,15 @@ async fn run_sqlite_arm(settings: &Settings, rep: usize) -> RepOutcome {
     let mut runtime = SqliteRuntime::open(&path).expect("the sqlite runtime should open");
     runtime.register_workflow(&workflow_info());
     for name in ACTIVITIES {
+        // Return the same result `act_inert` returns.
+        //
+        // The embedded backend runs this caller-supplied callback, never
+        // `ActivityInfo::handler`. A fix to `act_inert` alone therefore leaves
+        // this arm persisting a different activity result from the other two.
+        // Found by review on PR #1617.
         runtime.register_activity(&activity_info(name), |_input| {
             ACTIVITY_RUNS.fetch_add(1, Ordering::Relaxed);
-            Ok(serde_json::Value::Null)
+            Ok(serde_json::json!({ "ok": true }))
         });
     }
 
@@ -841,7 +866,7 @@ async fn run_sqlite_arm(settings: &Settings, rep: usize) -> RepOutcome {
     for _ in 0..settings.workflows {
         execs.push(
             runtime
-                .start_workflow(WORKFLOW, workflow_input())
+                .start_workflow(WORKFLOW, workflow_input(settings))
                 .expect("the start should be accepted"),
         );
     }
