@@ -1,4 +1,4 @@
-# ⛏️ Prospect: does harvest match Temporal's throughput on one box, at one shape? (kill: 5.58 against 44.31 workflows/sec, ledger #11)
+# ⛏️ Prospect: does harvest match Temporal's throughput on one box, at one shape? (kill: 5.47 against 43.30 workflows/sec, ledger #11)
 
 > Status: **measured.** The Pre-registration lives in
 > [`docs/rnd/2026-09-16-harvest-vs-temporal-single-box-preregistration.md`](../rnd/2026-09-16-harvest-vs-temporal-single-box-preregistration.md)
@@ -21,10 +21,12 @@ workflows/sec?
 ## 🔬 Apparatus
 
 [`apparatus/0011-harvest-vs-temporal/`](apparatus/0011-harvest-vs-temporal/).
-The harvest arm is assay #10's `postgres` arm, run unchanged, so the harvest
-number here and there is one measurement rather than two that might drift.
-The Temporal arm is Go, on `go.temporal.io/sdk` v1.36.0 and Go 1.24.7 as
-registered, against `temporalio/auto-setup:1.25.2`.
+The harvest arm is assay #10's `postgres` arm, run from the same binary but
+**at this assay's own registered payload**, which #10's L1 cannot use. An
+earlier revision reused #10's run unchanged and so measured the wrong
+workload; see the note in the Assay section. The Temporal arm is Go, on
+`go.temporal.io/sdk` v1.36.0 and Go 1.24.7 as registered, against
+`temporalio/auto-setup:1.25.2`.
 
 Both engines used **the same PostgreSQL 16.13 server**, in separate databases,
 so neither arm got a storage engine the other did not. The arms never ran
@@ -45,20 +47,60 @@ running against earlier ones' histories.
 Verbatim output in
 [`apparatus/0011-harvest-vs-temporal/results/`](apparatus/0011-harvest-vs-temporal/results/).
 
+Both arms at the **registered ~40-byte workflow payload**. See the note below
+on why these numbers replace an earlier pair.
+
 | arm | mean workflows/sec | per rep | valid reps | correctness |
 |:--|--:|:--|--:|:--|
-| `temporal_go` | **44.31** | 42.01 / 45.99 / 44.92 | 3 | PASS |
-| `harvest_pg` | **5.58** | 5.60 / 5.57 / 5.58 | 3 | PASS |
+| `temporal_go` | **43.30** | 48.95 / 39.28 / 41.66 | 3 | PASS |
+| `harvest_pg` | **5.47** | 5.64 / 5.38 / 5.40 | 3 | PASS |
 
 Every Temporal repetition completed all 2,000 executions with exactly 6,000
 activity runs, **zero workflow task failures** and **zero unread histories**,
 so the registered correctness precondition held in all three.
 
+**Temporal's spread is far wider than harvest's**: 39.28 to 48.95, about 25%,
+against harvest's 5.38 to 5.64, about 5%. Three repetitions cannot
+characterise that, and this assay does not try to. It is reported rather than
+smoothed into the mean, because a reader deciding on these numbers should see
+it.
+
+### These numbers replace an earlier pair, for two reasons
+
+A seventh review round (Codex, PR #1617) found that **this assay had never run
+its own registered workload**. Its Shape table registers a ~40-byte payload for
+both arms. Both had been changed to the canonical empty object so that assay
+#10's L1 could compare against a published figure taken that way, the deviation
+was disclosed, and this assay then reused #10's harvest arm unchanged.
+Disclosing a deviation is not the same as grading registered lines on the
+registered shape. The apparatus now takes `ASSAY10_INPUT_JSON`, so #10 keeps
+the empty object its L1 needs and #11 runs both arms at its own registered
+payload. The same round found the Temporal arm persisting **no** activity input
+payload where harvest persists an explicit JSON null — 6,000 smaller history
+records per repetition, in Temporal's favour.
+
+The first reported pair was 44.31 against 5.58, a ratio of 7.9x. The corrected
+pair is 43.30 against 5.47, a ratio of **7.92x**. The corrections moved the
+headline by nothing measurable. Both facts belong in the record: the first
+numbers came from an apparatus with known defects, *and* they happened to be
+right. The first is why the re-run was necessary; the second is not a
+justification for having skipped it.
+
+**A fourth harvest run was discarded before the one above.** Its repetitions
+read 5.39, 5.37 and 15.02 workflows/sec, and that single outlier dragged the
+mean to 8.60, which *passes* assay #10's L1 validity band that the same arm
+otherwise kills. The cause was this session running `git merge` and `git push`
+on the box mid-measurement, breaking the idleness precondition
+`docs/benchmarks.md` insists on. It is recorded because it is the most
+dangerous failure mode encountered in this work: a contaminated run that
+flipped a validity verdict from kill to pass, visible only in the per-repetition
+numbers and invisible in the mean.
+
 ## 🏁 Verdict
 
-**KILL on L1, decisively and against harvest, by 7.9x.** `harvest_pg`
-sustained 5.58 workflows/sec against `temporal_go`'s 44.31 at the registered
-shape. The pre-registration called this outcome a genuine and publishable
+**KILL on L1, decisively and against harvest, by 7.92x.** `harvest_pg`
+sustained 5.47 workflows/sec against `temporal_go`'s 43.30 at the registered
+shape and the registered payload. The pre-registration called this outcome a genuine and publishable
 negative result, and it is reported as one.
 
 **L2 passes.** Both arms drained inside the 900 s cap in every repetition, so
@@ -83,6 +125,13 @@ Not pre-registered. One repetition per cell. It exists because the registered
 cell sits at a backlog depth where assay #10 independently found the harvest
 Postgres arm collapsing, and reporting a single ratio from that depth alone
 would attribute a specific, documented defect to the engine as a whole.
+
+**These cells were taken before the payload corrections above**, so harvest ran
+at the canonical empty object and Temporal persisted no activity input. Both
+corrections slow both arms slightly, and at the registered cell they moved the
+ratio from 7.9x to 7.92x, so the shape of the curve is unaffected. The cells
+are left as measured rather than re-run, and are read for their shape rather
+than their exact values.
 
 | backlog depth | harvest `postgres` | harvest `redis_pg` | `temporal_go` | Temporal / best harvest |
 |--:|--:|--:|--:|--:|

@@ -50,14 +50,18 @@ workload-parity fixes above. Discarding them was cheaper than explaining them.
 ## 📐 Assay
 
 Verbatim output is in
-[`apparatus/0010-cross-mode-throughput/results/registered-sweep.md`](apparatus/0010-cross-mode-throughput/results/registered-sweep.md).
+[`apparatus/0010-cross-mode-throughput/results/`](apparatus/0010-cross-mode-throughput/results/).
+The `postgres` and `redis_pg` rows come from `registered-sweep.md`. The
+`sqlite` row comes from `sqlite-corrected.md`, a re-run explained below;
+`registered-sweep.md` still carries that arm's withdrawn 3.20, and is kept
+unedited rather than rewritten.
 
 Postgres durability this run: `fsync = off`, `synchronous_commit = off`.
 Embedded durability is fixed at `journal_mode = WAL`, `synchronous = FULL`.
 
 | arm | mean workflows/sec | per rep | valid reps | correctness |
 |:--|--:|:--|--:|:--|
-| `sqlite` | **3.20** | 3.20 / 3.20 / 3.20 | 3 | PASS |
+| `sqlite` | **3.19** | 3.19 / 3.19 / 3.19 | 3 | PASS |
 | `postgres` | **5.58** | 5.60 / 5.57 / 5.58 | 3 | PASS |
 | `redis_pg` | **22.07** | 21.70 / 22.16 / 22.35 | 3 | PASS |
 
@@ -138,10 +142,26 @@ more the deeper it gets.
 
 ### The embedded arm, and a durability asymmetry that must be stated
 
-`sqlite` read 3.20 workflows/sec, with the three repetitions landing within
-0.04% of each other (625.13 s, 625.27 s, 625.37 s). That stability is itself
+`sqlite` read 3.19 workflows/sec, with the three repetitions landing within
+0.07% of each other (626.06 s, 626.21 s, 626.50 s). That stability is itself
 informative: the arm is bounded by a hard serial constraint, not by anything
 noisy on the box.
+
+**This arm was measured twice, and the first number was withdrawn.** A sixth
+review round found that the embedded backend runs a caller-supplied callback
+rather than `ActivityInfo::handler`, so the earlier fix that made `act_inert`
+return the canonical `{"ok": true}` never reached this arm, which went on
+persisting JSON null. The first reported figure, 3.20 workflows/sec, therefore
+came from a workload that did not match the arms printed beside it. The
+re-run above uses the corrected callback. The difference is 0.3%, which is
+what a few bytes of payload are worth to an arm that fsyncs on every commit —
+but the size of the correction is not what made it necessary.
+
+That defect also survived the field-by-field workload diff this report
+describes above, and the reason is worth recording: the diff compared the
+*shared* definitions, and the embedded arm is precisely the one that does not
+use the shared activity handler. A systematic check missed the one arm its own
+method could not see.
 
 **It is not a like-for-like comparison against the Postgres arms, and L3 was
 registered without noticing that.** `autumn-harvest-sqlite` hard-codes
