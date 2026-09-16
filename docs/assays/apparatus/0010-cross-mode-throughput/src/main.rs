@@ -720,11 +720,15 @@ async fn run_postgres_arm(settings: &Settings, arm: Arm, rep: usize) -> RepOutco
 
     let mut truncated = false;
     loop {
-        if completed_executions(&mut conn).await >= settings.workflows as i64 {
-            break;
-        }
+        // Cap first, completion second, matching the embedded arm below. The
+        // count query and the sleep before it can both cross the cap. Testing
+        // completion first would then retain and grade a repetition whose
+        // elapsed time exceeds the cap. Found by review on PR #1617.
         if started.elapsed().as_secs() >= settings.cap_secs {
             truncated = true;
+            break;
+        }
+        if completed_executions(&mut conn).await >= settings.workflows as i64 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

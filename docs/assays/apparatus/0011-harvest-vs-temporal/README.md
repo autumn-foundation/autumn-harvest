@@ -38,19 +38,20 @@ The Temporal server and the harvest arm must never run at the same time.
 Four cores cannot host both engines at once without each becoming the other's
 noise, so the runner stops one before starting the other.
 
+**Use `run.sh`, not the binary directly.** The harvest arm resets its database
+before every repetition, so the Temporal arm has to start every repetition on
+an empty database too. Temporal has no in-process reset, so `run.sh` makes a
+repetition one whole process lifetime: it drops both Temporal databases, lets
+auto-setup rebuild them, and runs exactly one repetition, three times over.
+Running `./assay11` directly with the default three repetitions would leave
+repetitions 2 and 3 measuring a database that still holds the earlier ones.
+
 ```bash
-# Temporal server, against the SAME Postgres the harvest arm uses.
-docker run -d --name temporal-bench --network host \
-  -e DB=postgres12 -e DB_PORT=5432 \
-  -e POSTGRES_USER=postgres -e POSTGRES_PWD=postgres -e POSTGRES_SEEDS=127.0.0.1 \
-  -e DEFAULT_NAMESPACE=default \
-  temporalio/auto-setup:1.25.2
-
 go build -o assay11 .
-./assay11
+./run.sh
 
-# Then stop it before running the harvest arm.
-docker stop temporal-bench
+# It starts and removes the Temporal container itself, so nothing is left
+# running against the Postgres the harvest arm needs.
 ```
 
 | variable | default | meaning |

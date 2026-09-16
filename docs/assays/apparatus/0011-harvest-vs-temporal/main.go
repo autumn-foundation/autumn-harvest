@@ -188,7 +188,12 @@ func runRep(c client.Client, rep, workflows, capSecs int) (float64, bool) {
 
 	var completed atomic.Int64
 	var wg sync.WaitGroup
-	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(capSecs)*time.Second)
+	// Anchor the deadline to `started`, not to now. The measured clock starts
+	// before the worker is constructed, so a slow worker startup would
+	// otherwise let a repetition report an elapsed time over the cap while
+	// waitCtx.Err() stayed nil and correctness passed. Found by review on
+	// PR #1617.
+	waitCtx, cancel := context.WithDeadline(ctx, started.Add(time.Duration(capSecs)*time.Second))
 	defer cancel()
 	for _, run := range runs {
 		wg.Add(1)
