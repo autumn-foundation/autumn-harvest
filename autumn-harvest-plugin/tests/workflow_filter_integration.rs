@@ -417,17 +417,25 @@ async fn workflow_list_filters_match_expected_subsets() {
 }
 
 #[tokio::test]
-async fn workflow_list_excludes_a_staged_migration_by_default_but_finds_it_explicitly() {
-    // Issue #1317: the default listing already excluded `MIGRATED` (a
-    // sealed source, not a workflow) to avoid double-counting a FINISHED
-    // migration across shards. A migration IN PROGRESS has the identical
-    // shape. The source still holds the live `RUNNING` row, while the
-    // target holds a staged `MIGRATING` copy with the same id and
-    // `created_at`. Left in, the default listing would double-count that
-    // too. This single-database test cannot reproduce the cross-shard
-    // duplicate directly, but it pins the mechanism the real fix relies
-    // on. `MIGRATING` is invisible to the default listing, and still
-    // reachable through an explicit `state=MIGRATING` filter.
+async fn workflow_list_shows_an_orphaned_staged_migration_and_also_finds_it_explicitly() {
+    // Issue #1317: an earlier cut of this fix excluded `MIGRATING` at the
+    // query level. This is the same way the default listing already
+    // excludes `MIGRATED` (a sealed source, not a workflow). Review found
+    // a gap: it hides an execution entirely when the process crashes
+    // between `commit_cutover` and `activate_target`. The source is
+    // `MIGRATED` (also excluded) and the sole surviving copy is
+    // `MIGRATING`.
+    //
+    // The fix instead lets `MIGRATING` rows through the query. It
+    // deduplicates post-merge: a `MIGRATING` row is dropped only when a
+    // live row with the SAME id also appears in the page. That is the
+    // genuine staging-window duplicate a real cross-shard migration
+    // produces. This single-database test cannot construct that pair.
+    // Two rows cannot share a primary key in one database. So `staged`
+    // here is an ORPHAN copy: its own id, no live counterpart. That is
+    // exactly the committed-but-not-activated case the fix restores
+    // visibility for. It stays in the default listing, ordered by
+    // `created_at desc` same as any other row.
     let (database_url, _container) = setup_single_database().await;
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
@@ -456,8 +464,8 @@ async fn workflow_list_excludes_a_staged_migration_by_default_but_finds_it_expli
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         workflow_ids(&json),
-        vec!["wf-live".to_string()],
-        "a staged MIGRATING copy must not appear in the default listing"
+        vec!["wf-staged-migration".to_string(), "wf-live".to_string()],
+        "an orphaned MIGRATING copy with no live counterpart must stay visible"
     );
 
     let (_, json) = get_json(&app, "/workflows?state=MIGRATING").await;

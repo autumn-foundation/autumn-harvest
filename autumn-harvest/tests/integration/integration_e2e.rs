@@ -301,14 +301,15 @@ const INIT_SQL: &str = concat!(
     "\n",
     // issue #1317: migrated_run_terminal_at column on
     // harvest_workflow_executions. REQUIRED for the same reason as the
-    // #945/#964/#1127/#1227 columns above -- `WorkflowExecution::as_select()`
+    // #945/#964/#1127/#1227 columns above. `WorkflowExecution::as_select()`
     // names every column, so every read-back in this suite (and in every
-    // suite that borrows `setup_test_database_url_or_env` from here) fails
-    // with `column harvest_workflow_executions.migrated_run_terminal_at does
-    // not exist`, even for a plain root start with nothing to do with shard
-    // rebalancing. A local run with `HARVEST_TEST_DATABASE_URL` set does not
-    // catch this gap -- that path migrates from the full `migrations/`
-    // directory, not from this deliberately partial bundle.
+    // suite that borrows `setup_test_database_url_or_env` from here) fails.
+    // The failure names `column
+    // harvest_workflow_executions.migrated_run_terminal_at does not exist`,
+    // even for a plain root start with nothing to do with shard
+    // rebalancing. This gap goes uncaught locally with
+    // `HARVEST_TEST_DATABASE_URL` set, since that path migrates from the
+    // full `migrations/` directory, not from this partial bundle.
     include_str!("../../migrations/20260915231809_harvest_migrated_seal_terminal_at/up.sql")
 );
 
