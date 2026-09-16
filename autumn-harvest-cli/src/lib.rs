@@ -5088,6 +5088,16 @@ fn peek_char(dsn: &str, i: usize) -> Option<char> {
     dsn[i..].chars().next()
 }
 
+/// Advance `*i` past a run of Unicode whitespace, if any starts there.
+fn skip_whitespace(dsn: &str, i: &mut usize) {
+    while let Some(c) = peek_char(dsn, *i) {
+        if !c.is_whitespace() {
+            break;
+        }
+        *i += c.len_utf8();
+    }
+}
+
 /// Scan a libpq keyword/value DSN, replacing the values `replace` returns
 /// `Some` for and copying every other byte verbatim.
 ///
@@ -5117,21 +5127,10 @@ fn scan_keyword_dsn(
     let mut i = 0;
 
     while i < bytes.len() {
-        // Whitespace between options, copied verbatim. Unicode `White_Space`
-        // (`char::is_whitespace`), not ASCII.
-        //
-        // The client separates options the same way, via
-        // `tokio_postgres::config`'s `skip_ws`. A scan that only knew ASCII
-        // read a no-break-space-separated `password=...` as part of the
-        // previous value. No `password` key was ever found to redact
-        // (issue #1321).
+        // Whitespace between options, copied verbatim. See the Unicode
+        // whitespace note on this function's doc comment.
         let start = i;
-        while let Some(c) = peek_char(dsn, i) {
-            if !c.is_whitespace() {
-                break;
-            }
-            i += c.len_utf8();
-        }
+        skip_whitespace(dsn, &mut i);
         out.push_str(&dsn[start..i]);
         if i >= bytes.len() {
             break;
@@ -5158,22 +5157,12 @@ fn scan_keyword_dsn(
             return None;
         }
         let spacing_start = i;
-        while let Some(c) = peek_char(dsn, i) {
-            if !c.is_whitespace() {
-                break;
-            }
-            i += c.len_utf8();
-        }
+        skip_whitespace(dsn, &mut i);
         if i >= bytes.len() || bytes[i] != b'=' {
             return None;
         }
         i += 1;
-        while let Some(c) = peek_char(dsn, i) {
-            if !c.is_whitespace() {
-                break;
-            }
-            i += c.len_utf8();
-        }
+        skip_whitespace(dsn, &mut i);
         // A DSN that ends after `=` (`host=db password=`) has no value to read;
         // indexing here would panic before tokio-postgres could say so.
         if i >= bytes.len() {
