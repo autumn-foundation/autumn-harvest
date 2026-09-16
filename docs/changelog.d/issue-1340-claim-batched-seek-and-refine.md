@@ -85,6 +85,21 @@ so a stale stamp silently steals part of a task's timeout budget before
 it starts. Fixed by reusing `now_ts`: `started_at` reads the same
 materialized `clock_timestamp()` value the deadline checks already use.
 
+Codex then caught a ninth bug, against the seventh bug's own `now_ts`
+fix: `now_ts` had no `FROM` clause of its own, so Postgres could resolve
+it before `rate_limit_debit` even attempted its own row lock on the
+rate-limit bucket. A concurrent transaction holding that lock would then
+let `now_ts` capture a stale, pre-wait value that `rate_limit_debit`,
+`claimed`, and `started_at` all reuse — a deadline expiring during the
+wait would incorrectly still read as live. This one was confirmed
+against a real Postgres instance directly, not just reasoned about: the
+same query shape, driven by two genuinely concurrent connections (one
+holding the bucket row's lock, one blocked waiting on it), mis-claimed
+an expired row before the fix and correctly rejected it after. Fixed by
+giving `now_ts` its own `FOR UPDATE` lock attempt on the exact bucket
+row `rate_limit_debit` locks next, so `now_ts` cannot resolve before
+that same wait ends.
+
 **Not wired into the default claim path.** `claim_task`/`claim_task_on_shard`
 are unchanged. Issue #1340 is explicit that no query change should land
 against it without sign-off from someone with full context on `queue.rs`'s
@@ -93,7 +108,7 @@ tested, measured building block for that review, not a switch of default
 production behavior. It also does not implement the cross-region DR fence
 (#954) or the by-id claim (#1312) the single-row path carries.
 
-**Test evidence.** `tests/integration/claim_batched_tests.rs` (13 DB-backed
+**Test evidence.** `tests/integration/claim_batched_tests.rs` (14 DB-backed
 tests, red-then-green): equivalence with the single-row path on a plain
 backlog, an adversarial saturated-concurrency-key fixture matching ledger
 #4/#5's own shape, a multi-batch fixture with tied sort keys spanning a
@@ -109,12 +124,18 @@ deadline bug above (same `pg_sleep` technique, asserts the bucket is
 untouched, also verified red then green), a regression test for the
 `started_at`-backdating bug above (same `pg_sleep` technique, asserts
 `started_at` lands after the sleep rather than near transaction start,
-also verified red then green), sticky routing and a
+also verified red then green), a regression test for the ninth bug above
+that drives two genuinely concurrent connections rather than a
+`pg_sleep` stand-in -- one holds the rate-limit bucket row's lock past a
+task's deadline, the other attempts the claim blocked on that exact
+lock, and the test asserts the resulting claim and debit both correctly
+reflect the deadline having passed (verified red against the pre-fix
+code against a real Postgres instance, then green), sticky routing and a
 capability-routed-activity gate exercised end-to-end through the real
 function (not just SQL-text checks), and — the gap ledger #5's own
 single-session apparatus explicitly could not close — real concurrent
 Tokio claimers racing a capped concurrency key, asserting the cap is
-never exceeded. `queue.rs`'s `mod tests` gains 11 SQL-shape unit tests
+never exceeded. `queue.rs`'s `mod tests` gains 12 SQL-shape unit tests
 pinning the query text (concurrency gate omitted from the batch scan,
 every other gate preserved byte-for-byte including both capability-label
 branches, the cursor's four-column `OR`-chain, the authoritative
@@ -123,8 +144,10 @@ recheck's use of `clock_timestamp()` and not `NOW()` on both the debit
 and the claim, the shared rate-limit-formula helper used instead of a
 fourth hand-copied literal, the seventh-bug fix that `rate_limit_debit`
 and `claimed` read one shared `now_ts` value rather than calling
-`clock_timestamp()` twice, and the eighth-bug fix that `started_at`
-reads that same shared value instead of the frozen `NOW()`).
+`clock_timestamp()` twice, the eighth-bug fix that `started_at` reads
+that same shared value instead of the frozen `NOW()`, and the ninth-bug
+fix that `now_ts` itself takes a `FOR UPDATE` lock on the same bucket
+row `rate_limit_debit` locks next).
 
 **Measurement.** `docs/performance-claim-batched-seek-and-refine.md`,
 regenerated from a single run of

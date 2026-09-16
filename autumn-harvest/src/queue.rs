@@ -6060,6 +6060,20 @@ pub async fn pending_queue_demand_by_queue_name(
 /// The fix reuses `now_ts`: `started_at` reads the same materialized
 /// `clock_timestamp()` value the deadline checks already use.
 ///
+/// A ninth bug, caught by the same reviewer against the seventh bug's
+/// `now_ts` fix. `now_ts` had no `FROM` clause of its own, so Postgres
+/// could resolve it before `rate_limit_debit` even attempted its own row
+/// lock. A concurrent transaction holding that lock would then let
+/// `now_ts` capture a stale, pre-wait value that `rate_limit_debit`,
+/// `claimed`, and `started_at` all reuse. A deadline expiring DURING the
+/// wait would incorrectly still read as live. Confirmed against a real
+/// Postgres instance, not just reasoned about. The same query shape,
+/// run under genuine lock contention, mis-claimed an expired row before
+/// the fix and correctly rejected it after. The fix gives `now_ts` its
+/// own `FOR UPDATE` lock attempt on the exact bucket row
+/// `rate_limit_debit` locks next. So `now_ts` cannot resolve before
+/// that wait ends.
+///
 /// # What this is not
 ///
 /// This is **not** wired into [`claim_task`] or [`claim_task_on_shard`].
@@ -6280,6 +6294,13 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
 /// rejects, in the same statement. One materialized read removes the
 /// gap: both writers see the identical value.
 ///
+/// `now_ts` itself takes a `FOR UPDATE` lock on the same bucket row
+/// `rate_limit_debit` locks next (review finding, not present in the
+/// first `now_ts` draft). A plain, `FROM`-less `now_ts` could resolve
+/// before that row lock, letting a concurrent lock holder's wait make
+/// the captured time stale. The forced lock removes that gap: `now_ts`
+/// cannot finish before the same wait `rate_limit_debit` would face.
+///
 /// Binds: `$1` worker id, `$2` candidate row id, `$3` concurrency key,
 /// `$4` concurrency cap, `$5` task type. Also `$6` rate limit key, `$7`
 /// activity name, `$8` circuit-breaker-tracked activities, `$9` schedule-
@@ -6291,6 +6312,12 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
         format!(
             "WITH now_ts AS ( \
                  SELECT clock_timestamp() AS ts \
+                 FROM (SELECT 1 AS one) base \
+                 LEFT JOIN ( \
+                     SELECT 1 AS x FROM harvest_rate_limit_buckets b \
+                     WHERE $6::text IS NOT NULL AND b.key = $6 \
+                     FOR UPDATE \
+                 ) locked ON TRUE \
              ), \
              rate_limit_debit AS ( \
                  UPDATE harvest_rate_limit_buckets b \
@@ -7431,6 +7458,36 @@ mod tests {
         );
     }
 
+    /// Regression test for a review finding on this PR. `now_ts` has no
+    /// `FROM` clause of its own. Postgres can resolve it before
+    /// `rate_limit_debit` even attempts its row lock. A concurrent
+    /// claimer holding that lock then lets `now_ts` capture a stale,
+    /// pre-wait value that `rate_limit_debit`, `claimed`, and
+    /// `started_at` all reuse. `now_ts` must attempt the SAME lock
+    /// itself, so it cannot resolve before that wait is over.
+    #[test]
+    fn claim_batched_candidate_attempt_query_now_ts_waits_on_the_bucket_lock_first() {
+        let sql = claim_batched_candidate_attempt_query();
+        let now_ts_clause = sql
+            .split("WITH now_ts AS (")
+            .nth(1)
+            .and_then(|rest| rest.split("rate_limit_debit AS (").next())
+            .unwrap_or_default();
+        assert!(
+            now_ts_clause.contains("FOR UPDATE") && !now_ts_clause.contains("SKIP LOCKED"),
+            "now_ts must take a blocking FOR UPDATE lock on the bucket \
+             row rate_limit_debit will lock next, so its clock_timestamp() \
+             read cannot resolve before that lock wait ends; got:\n{sql}"
+        );
+        assert!(
+            now_ts_clause.contains("harvest_rate_limit_buckets b")
+                && now_ts_clause.contains("b.key = $6"),
+            "now_ts's forced lock must target the exact row \
+             rate_limit_debit locks next, keyed by the same $6 bind; \
+             got:\n{sql}"
+        );
+    }
+
     /// Regression test for a review finding on this PR. A data-modifying
     /// CTE runs even when nothing selects its result. So
     /// `rate_limit_debit` must carry its own deadline recheck, not just
@@ -7464,7 +7521,7 @@ mod tests {
         let sql = claim_batched_candidate_attempt_query();
         assert!(
             sql.trim_start()
-                .starts_with("WITH now_ts AS ( SELECT clock_timestamp() AS ts )"),
+                .starts_with("WITH now_ts AS ( SELECT clock_timestamp() AS ts"),
             "now_ts must be the query's first CTE, so both later writers \
              see the same already-materialized value; got:\n{sql}"
         );
