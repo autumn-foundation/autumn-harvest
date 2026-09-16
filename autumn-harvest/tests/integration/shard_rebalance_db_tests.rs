@@ -166,9 +166,13 @@ async fn setup_isolated_db() -> (String, Option<ContainerAsync<Postgres>>) {
 }
 
 fn swap_database(url: &str, db_name: &str) -> String {
-    let (base, _) = url.split_once('?').unwrap_or((url, ""));
+    let (base, query) = url.split_once('?').unwrap_or((url, ""));
     let cut = base.rfind('/').expect("a postgres URL has a database path");
-    format!("{}/{db_name}", &base[..cut])
+    if query.is_empty() {
+        format!("{}/{db_name}", &base[..cut])
+    } else {
+        format!("{}/{db_name}?{query}", &base[..cut])
+    }
 }
 
 fn build_pool(url: &str) -> autumn_harvest::worker::DbPool {
@@ -2451,6 +2455,84 @@ async fn a_continued_as_new_target_with_a_live_successor_is_not_reconciled() {
     assert!(
         reconciled_after_successor_completes,
         "once the successor also finishes, the seal must release"
+    );
+}
+
+#[tokio::test]
+async fn a_reconciled_migrated_successor_no_longer_blocks_its_predecessors_seal() {
+    // Issue #1317: a successor that is itself migrated and reconciled stays
+    // `MIGRATED` forever. Reconciliation records `migrated_run_terminal_at`.
+    // It never changes `state`. The occupancy check must stop treating that
+    // successor as an active occupant once it is observed-terminal.
+    // Otherwise the predecessor's seal blocks forever, even after the whole
+    // logical chain has genuinely finished.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "chained-then-migrated-successor").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'CONTINUED_AS_NEW', \
+                completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("seal the predecessor as continued");
+    let successor = insert_execution_with_id(
+        &mut target,
+        "entity_flow",
+        "chained-then-migrated-successor",
+        ExecutionId::new_for_shard(TARGET),
+        TARGET,
+    )
+    .await;
+
+    // The successor migrates again (to a third shard, out of scope for
+    // this fixture) and is sealed `MIGRATED` on the target, unreconciled.
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+            SET state = 'MIGRATED', migrated_to_shard = $2, migrated_at = NOW() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(successor.as_uuid())
+    .bind::<diesel::sql_types::Integer, _>(THIRD.as_i32())
+    .execute(&mut target)
+    .await
+    .expect("seal the successor as migrated");
+
+    let mut source = shards.source().await;
+    let reconciled_while_successor_unreconciled =
+        reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+            .await
+            .expect("reconcile must not fail merely because the successor is unreconciled");
+    assert!(
+        !reconciled_while_successor_unreconciled,
+        "an unreconciled MIGRATED successor still occupies the business key"
+    );
+
+    // The successor's own reconciliation observes its live copy terminal
+    // and records that here -- without touching `state`.
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET migrated_run_terminal_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(successor.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("mark the successor observed-terminal");
+
+    let reconciled_after_successor_reconciles =
+        reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+            .await
+            .expect("reconcile");
+    assert!(
+        reconciled_after_successor_reconciles,
+        "a reconciled MIGRATED successor no longer occupies the business key, \
+         so the predecessor's seal must release"
     );
 }
 

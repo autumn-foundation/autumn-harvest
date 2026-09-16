@@ -1715,15 +1715,21 @@ mod db {
         // widened uniqueness index. A COMPLETED/FAILED/CANCELLED/TIMED_OUT
         // successor still occupies that index -- an `AllowDuplicate` start
         // attaches to it. That is not a reason to keep this seal held.
-        // A `MIGRATED` successor counts as active unconditionally, even
-        // when already observed-terminal itself. That is deliberately
-        // conservative, so this seal waits for that seal's own
-        // reconciliation rather than racing it.
+        // A `MIGRATED` successor counts as active while UNRECONCILED, so
+        // this seal waits for that seal's own reconciliation rather than
+        // racing it. Once that successor's `migrated_run_terminal_at` is
+        // set, its own live copy has already been confirmed terminal. It no
+        // longer blocks this seal (issue #1317). Without this exclusion, a
+        // reconciled successor blocks its predecessor forever, since
+        // reconciliation never changes `state`.
         let occupied: ExistsRow = diesel::sql_query(
             "SELECT EXISTS ( \
                  SELECT 1 FROM harvest_workflow_executions \
                   WHERE workflow_name = $1 AND workflow_id = $2 \
-                    AND state IN ('RUNNING', 'PAUSED', 'MIGRATED', 'MIGRATING') \
+                    AND ( \
+                        state IN ('RUNNING', 'PAUSED', 'MIGRATING') \
+                        OR (state = 'MIGRATED' AND migrated_run_terminal_at IS NULL) \
+                    ) \
              ) AS value",
         )
         .bind::<Text, _>(&row.workflow_name)

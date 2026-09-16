@@ -18374,6 +18374,7 @@ pub(crate) async fn start_workflow(
                         harvest_workflow_executions::state
                             .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
                     )
+                    .filter(harvest_workflow_executions::migrated_run_terminal_at.is_null())
                     .select(harvest_workflow_executions::state)
                     .first::<String>(&mut conn)
                     .await
@@ -19446,6 +19447,9 @@ async fn batch_start_workflows(
                                 .filter(
                                     harvest_workflow_executions::state
                                         .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
+                                )
+                                .filter(
+                                    harvest_workflow_executions::migrated_run_terminal_at.is_null(),
                                 )
                                 .select(harvest_workflow_executions::state)
                                 .first::<String>(&mut pre_conn)
