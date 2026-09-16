@@ -3020,9 +3020,10 @@ async fn a_declined_cutover_reports_legal_hold_drift_not_a_wake() {
 // connection (`caller_shard`, the issue #964 fix). The final same-pool
 // decision must use that value. Instead it re-derived the caller's pool
 // from `caller_exec_id`'s ENCODED shard, which names where the run
-// STARTED, not where it now lives. A caller rebalanced onto its target's
-// own shard was then misjudged cross-shard. The delivery reached for a
-// second connection from the pool this transaction already holds one from.
+// STARTED, not where it now lives. The routing then misjudged a caller
+// rebalanced onto its target's own shard as cross-shard. The delivery
+// reached for a second connection from the pool this transaction already
+// holds one from.
 
 #[tokio::test]
 async fn a_rebalanced_caller_self_shard_cancel_reuses_the_held_connection() {
