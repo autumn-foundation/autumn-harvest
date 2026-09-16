@@ -630,13 +630,13 @@ pub fn raw_history_fingerprint(raw: &serde_json::Value) -> String {
 pub use db::{
     MigrationBatchReport, MigrationOutcome, MigrationRecord, MigrationScanCursor,
     ShardMigrationCandidate, abort_migration, activate_target, assert_schema_parity,
-    begin_migration, commit_cutover, conn_for_execution_forwarded, conn_for_live_shard,
-    conn_for_shard, forward_of_held_row, list_migration_candidates, load_migration,
-    migrate_execution, migrate_quiescent_executions, migrate_quiescent_executions_after,
-    observe_quiescence, reconcile_migrated_seal_terminality, reconcile_migrated_seals,
-    reconcile_migrated_seals_after, residence_chain, resolve_execution_shard, resolve_target_shard,
-    resolve_target_shard_holding, resume_incomplete_migrations, shard_of_held_row, stage_copy,
-    verify_target_copy,
+    begin_migration, commit_cutover, conn_for_execution_forwarded,
+    conn_for_execution_forwarded_with_shard, conn_for_live_shard, conn_for_shard,
+    forward_of_held_row, list_migration_candidates, load_migration, migrate_execution,
+    migrate_quiescent_executions, migrate_quiescent_executions_after, observe_quiescence,
+    reconcile_migrated_seal_terminality, reconcile_migrated_seals, reconcile_migrated_seals_after,
+    residence_chain, resolve_execution_shard, resolve_target_shard, resolve_target_shard_holding,
+    resume_incomplete_migrations, shard_of_held_row, stage_copy, verify_target_copy,
 };
 
 #[cfg(feature = "db")]
@@ -3615,6 +3615,32 @@ mod db {
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
     ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+        conn_for_execution_forwarded_with_shard(pool, exec_id)
+            .await
+            .map(|(conn, _)| conn)
+    }
+
+    /// [`conn_for_execution_forwarded`], also returning the shard the
+    /// connection was checked out from (issue #1317 review).
+    ///
+    /// A caller that must attribute the connection to a shard afterwards
+    /// (an audit log, say) would otherwise have to re-resolve it. It would
+    /// need a second call such as [`resolve_execution_shard`]. That call
+    /// checks out its own connection, and can deadlock a pool-size-one
+    /// shard against the one this call already holds. Returning the shard
+    /// here means the caller never checks out a second connection to
+    /// answer that question.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`conn_for_execution_forwarded`].
+    pub async fn conn_for_execution_forwarded_with_shard(
+        pool: &ShardedDbPool,
+        exec_id: ExecutionId,
+    ) -> HarvestResult<(
+        diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>,
+        ShardId,
+    )> {
         // The first hop keeps `pool_for_execution`'s default-shard fallback, so
         // every pre-#964 routing behaviour (including the mid-rollout cases
         // where the pool map and the router legitimately disagree) is
@@ -3628,18 +3654,18 @@ mod db {
         })?;
 
         if pool.len() <= 1 {
-            return Ok(conn);
+            return Ok((conn, origin));
         }
 
         let mut current = origin;
         for _ in 0..MAX_FORWARD_HOPS {
             let Some(next) = read_forward(&mut conn, exec_id).await? else {
-                return Ok(conn);
+                return Ok((conn, current));
             };
             current = next;
             conn = checkout(pool, current).await?;
         }
-        resolve_forward_chain(origin, |_| Some(current)).map(|_| conn)
+        resolve_forward_chain(origin, |_| Some(current)).map(|_| (conn, current))
     }
 
     #[derive(diesel::QueryableByName)]

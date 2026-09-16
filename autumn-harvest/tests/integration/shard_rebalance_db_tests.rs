@@ -45,11 +45,11 @@ use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool, install_global_router};
 use autumn_harvest::shard_rebalance::{
     MigrationOutcome, MigrationPhase, QuiescenceBlocker, abort_migration, activate_target,
-    assess_quiescence, begin_migration, commit_cutover, history_fingerprint,
-    list_migration_candidates, load_migration, migrate_execution, migrate_quiescent_executions,
-    migrate_quiescent_executions_after, observe_quiescence, reconcile_migrated_seal_terminality,
-    residence_chain, resolve_execution_shard, resume_incomplete_migrations, stage_copy,
-    verify_target_copy,
+    assess_quiescence, begin_migration, commit_cutover, conn_for_execution_forwarded_with_shard,
+    history_fingerprint, list_migration_candidates, load_migration, migrate_execution,
+    migrate_quiescent_executions, migrate_quiescent_executions_after, observe_quiescence,
+    reconcile_migrated_seal_terminality, residence_chain, resolve_execution_shard,
+    resume_incomplete_migrations, stage_copy, verify_target_copy,
 };
 use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
@@ -2284,6 +2284,48 @@ async fn the_caller_residence_is_read_from_the_held_row_not_decoded_from_its_id(
     assert_eq!(
         autumn_harvest::shard_rebalance::shard_of_held_row(&mut other, ExecutionId::new()).await,
         None
+    );
+}
+
+#[tokio::test]
+async fn conn_for_execution_forwarded_with_shard_names_the_connection_it_returns() {
+    // Issue #1317 review: a caller may need to attribute a connection to a
+    // shard (an audit log, say). It must read that off THIS call's own
+    // return value. A caller that instead re-resolves with a separate
+    // `resolve_execution_shard` call while still holding this connection can
+    // deadlock a pool-size-one shard against itself.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "with-shard").await;
+
+    let (mut conn, shard) = conn_for_execution_forwarded_with_shard(&shards.pool, exec_id)
+        .await
+        .expect("resolve before any migration");
+    assert_eq!(
+        shard, SOURCE,
+        "an un-migrated execution resolves to its origin"
+    );
+    assert_eq!(
+        autumn_harvest::shard_rebalance::shard_of_held_row(&mut conn, exec_id).await,
+        Some(SOURCE),
+        "the returned connection must actually be checked out from `shard`"
+    );
+    drop(conn);
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let (mut conn, shard) = conn_for_execution_forwarded_with_shard(&shards.pool, exec_id)
+        .await
+        .expect("resolve after migration");
+    assert_eq!(
+        shard, TARGET,
+        "the returned shard must follow the run across a migration"
+    );
+    assert_eq!(
+        autumn_harvest::shard_rebalance::shard_of_held_row(&mut conn, exec_id).await,
+        Some(TARGET),
+        "the returned connection must be checked out from the NEW shard, not the origin"
     );
 }
 

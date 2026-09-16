@@ -10998,7 +10998,7 @@ async fn get_workflow_history(
     // Read-path payload decoding (issue #608): decode-only-when-admin.
     let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
 
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let (mut conn, exec_shard) = db_conn_for_execution_with_shard(&api_state, exec_id).await?;
 
     // 404 when the execution doesn't exist — cheaper than a full-row load.
     if !autumn_harvest::store::check_execution_exists(&mut conn, exec_id)
@@ -11069,10 +11069,12 @@ async fn get_workflow_history(
             TARGET_WORKFLOW,
             Some(&target),
             "GET /workflows/{id}/history",
-            // The row's own residence, not the id's origin (issue #1317).
-            // No `execution` row is loaded on this cheap-existence-check
-            // path, so re-resolve rather than trust the id's origin bits.
-            resolve_shard_best_effort(&api_state, exec_id).await,
+            // The row's own residence, not the id's origin (issue #1317
+            // review). `exec_shard` above already resolved it, so `conn`
+            // stays the only checkout this handler ever makes. A second
+            // resolution here would deadlock a pool-size-one shard against
+            // the connection this call still holds.
+            Some(exec_shard),
             outcome,
             None,
         )
@@ -39793,6 +39795,28 @@ pub(crate) async fn db_conn_for_execution(
     ::autumn_harvest::shard_rebalance::conn_for_execution_forwarded(pool.sharded_pool(), exec_id)
         .await
         .map_err(|error| map_pool_error(&error))
+}
+
+/// [`db_conn_for_execution`], also returning the shard the connection was
+/// checked out from (issue #1317 review).
+///
+/// A caller that needs both a connection AND the shard to attribute it to
+/// must use this. This is for audit logging on a path with no row already
+/// loaded, say. It must not follow up with a separate
+/// [`resolve_shard_best_effort`] call. A second resolution checks out its
+/// own connection, which can deadlock a pool-size-one shard against the
+/// one already held here.
+pub(crate) async fn db_conn_for_execution_with_shard(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> Result<(PoolConn, ShardId), AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    ::autumn_harvest::shard_rebalance::conn_for_execution_forwarded_with_shard(
+        pool.sharded_pool(),
+        exec_id,
+    )
+    .await
+    .map_err(|error| map_pool_error(&error))
 }
 
 /// The shard `exec_id` currently lives on (issue #1317) — `None` on any
