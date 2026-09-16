@@ -2624,3 +2624,25 @@ fn redaction_withholds_a_dsn_with_no_option_at_all() {
         );
     }
 }
+
+#[test]
+fn redaction_withholds_a_bare_token_next_to_a_real_option() {
+    // A bare token is skipped by the lenient `keyword_options` scanner. That
+    // holds even when a real option follows it, so the token itself —
+    // credential included — was never checked (issue #1322).
+    for dsn in [
+        "alice:hunter2@db host=localhost",
+        "postgres//alice:hunter2@db host=localhost",
+    ] {
+        let redacted = redact_dsn(dsn);
+        assert!(
+            !redacted.contains("hunter2"),
+            "the password survived redaction: {dsn} -> {redacted}"
+        );
+        assert_ne!(
+            redacted, dsn,
+            "a bare token must not be echoed back whole just because a real \
+             option follows it: {dsn}"
+        );
+    }
+}

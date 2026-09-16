@@ -21,18 +21,31 @@ a string it never actually examined for a password.
 This is the second item of issue #1322; the first (a `?` before the URI
 userinfo's `@` moving the real query string) was already fixed in #1320.
 
-**A second gap found in review.** A DSN with no `=` anywhere —
-`alice:hunter2@db`, a dropped scheme rather than a mistyped one — yields
-*zero* options from the scanner. The withholding loop never runs, so it
-never gets the chance to withhold, and the string used to come back whole.
-`redact_keyword_value` now withholds a non-blank DSN the same way when it
-finds no option at all, not only when it finds a bad one.
+**A second gap, found by both an internal review pass and Codex's review of
+the first commit.** `dsn::keyword_options` silently skips a bare token — one
+with no `=` at all. That is safe for `safety`, which has `Config::from_str`
+refusing malformed input behind it either way. It is not safe for `banner`:
+`alice:hunter2@db` is one bare token and was never turned into an `Option`
+for `is_connection_keyword` to see, so it reached the output unexamined —
+whether it was the *only* token, or sat right next to a real option
+(`alice:hunter2@db host=localhost` still leaked, because the scanner just
+skipped past the bare token and kept going).
+
+**The fix for the second gap.** `dev::dsn::keyword_options`'s internal
+cursor is refactored into a shared `next_token` step, now used by two public
+readers instead of one: `keyword_options` keeps its exact existing lenient
+behaviour (bare tokens skipped, for `safety`), and a new `keyword_tokens`
+reports every token, bare ones included, as a `KeywordToken::Bare` variant.
+`banner::redact_keyword_value` reads through `keyword_tokens` and withholds
+the instant it sees a `Bare` token, wherever it sits in the string.
 
 **Test evidence.** New tests in
 `autumn-harvest-plugin/tests/dev_runtime_tests.rs`:
 `redaction_withholds_a_keyword_shaped_token_that_is_not_a_keyword` (the
 three DSNs from the issue and its CLI counterpart),
-`redaction_withholds_a_dsn_with_no_option_at_all` (the second gap),
+`redaction_withholds_a_dsn_with_no_option_at_all` and
+`redaction_withholds_a_bare_token_next_to_a_real_option` (the second gap, in
+both of its shapes),
 `redaction_still_accepts_every_recognized_keyword` (now exercising every
 keyword `is_connection_keyword` allows, not a handful), and
 `redaction_of_a_keyword_dsn_with_no_password_round_trips_byte_for_byte`.

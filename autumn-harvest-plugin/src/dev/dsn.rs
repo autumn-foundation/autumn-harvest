@@ -17,8 +17,10 @@
 //!
 //! A fourth fact lives here too, for `banner` alone.
 //! [`is_connection_keyword`] says whether a scanned token is a real libpq
-//! keyword. A keyword-shaped typo cannot smuggle a password past redaction
-//! this way (issue #1322).
+//! keyword. [`keyword_tokens`] reports a bare token, one [`keyword_options`]
+//! silently skips, instead of losing it. Together they close off the two
+//! ways a credential-shaped token used to reach the banner unexamined
+//! (issue #1322).
 //!
 //! # What this is not
 //!
@@ -151,6 +153,30 @@ pub(super) const fn keyword_options(dsn: &str) -> KeywordOptions<'_> {
     KeywordOptions { dsn, index: 0 }
 }
 
+/// One token of a keyword/value connection string, whether or not it turned
+/// out to be a recognized option.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum KeywordToken<'a> {
+    /// A `key=value` option, exactly what [`keyword_options`] yields.
+    Recognized(KeywordOption<'a>),
+    /// A token with no `=`. [`keyword_options`] skips it; [`keyword_tokens`]
+    /// does not.
+    Bare,
+}
+
+/// Read every token of a keyword/value connection string, one at a time.
+///
+/// [`keyword_options`] silently skips a bare token. That is safe for
+/// [`safety`](super::safety), which has `Config::from_str` refusing
+/// malformed input behind it either way. It is not safe for `banner`: a
+/// bare token can hide a whole credential (issue #1322). `banner` reads
+/// every token through [`keyword_tokens`] instead, which loses none of
+/// them.
+pub(super) fn keyword_tokens(dsn: &str) -> impl Iterator<Item = KeywordToken<'_>> {
+    let mut cursor = KeywordOptions { dsn, index: 0 };
+    std::iter::from_fn(move || cursor.next_token())
+}
+
 /// The options of a keyword/value connection string, in the order written.
 ///
 /// Yields non-overlapping [`KeywordOption::value_span`]s that only ever move
@@ -167,49 +193,64 @@ impl<'a> Iterator for KeywordOptions<'a> {
     type Item = KeywordOption<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // A token with no `=` is not an option, so keep going until one is —
-        // every pass consumes at least one character, so this terminates.
-        while self.index < self.dsn.len() {
-            self.skip_whitespace();
-            if self.index >= self.dsn.len() {
-                return None;
+        // A bare token is not an option, so keep going until a real one
+        // turns up or the scan ends. Every step consumes at least one
+        // token, so this terminates.
+        loop {
+            match self.next_token()? {
+                KeywordToken::Recognized(option) => return Some(option),
+                KeywordToken::Bare => {}
             }
-
-            // Keyword: up to the `=` or the whitespace that ends it.
-            let key_start = self.index;
-            while let Some(ch) = self.peek() {
-                if ch == '=' || ch.is_whitespace() {
-                    break;
-                }
-                self.index += ch.len_utf8();
-            }
-            let key = &self.dsn[key_start..self.index];
-
-            // libpq permits whitespace on either side of the `=`.
-            self.skip_whitespace();
-            if self.peek() != Some('=') {
-                // A bare token with no value. `self.index` is past `key_start`
-                // here — the loop above only stops on `=` (handled) or on
-                // whitespace it then consumed — so the scan still advances.
-                continue;
-            }
-            self.index += 1;
-            self.skip_whitespace();
-
-            let value_start = self.index;
-            let value = self.take_value();
-            return Some(KeywordOption {
-                key,
-                value,
-                value_span: value_start..self.index,
-            });
         }
-
-        None
     }
 }
 
-impl KeywordOptions<'_> {
+impl<'a> KeywordOptions<'a> {
+    /// Read one token from the cursor: a recognized option, a bare token, or
+    /// `None` at the end of the string.
+    ///
+    /// The single place both [`keyword_options`] and [`keyword_tokens`] read
+    /// from, so the two cannot disagree about a DSN. That disagreement is
+    /// precisely what this module exists to remove (see the module docs).
+    fn next_token(&mut self) -> Option<KeywordToken<'a>> {
+        if self.index >= self.dsn.len() {
+            return None;
+        }
+        self.skip_whitespace();
+        if self.index >= self.dsn.len() {
+            return None;
+        }
+
+        // Keyword: up to the `=` or the whitespace that ends it.
+        let key_start = self.index;
+        while let Some(ch) = self.peek() {
+            if ch == '=' || ch.is_whitespace() {
+                break;
+            }
+            self.index += ch.len_utf8();
+        }
+        let key = &self.dsn[key_start..self.index];
+
+        // libpq permits whitespace on either side of the `=`.
+        self.skip_whitespace();
+        if self.peek() != Some('=') {
+            // A bare token with no value. `self.index` is past `key_start`
+            // here — the loop above only stops on `=` (handled) or on
+            // whitespace it then consumed — so the scan still advances.
+            return Some(KeywordToken::Bare);
+        }
+        self.index += 1;
+        self.skip_whitespace();
+
+        let value_start = self.index;
+        let value = self.take_value();
+        Some(KeywordToken::Recognized(KeywordOption {
+            key,
+            value,
+            value_span: value_start..self.index,
+        }))
+    }
+
     /// The character at the cursor, without consuming it.
     fn peek(&self) -> Option<char> {
         self.dsn[self.index..].chars().next()

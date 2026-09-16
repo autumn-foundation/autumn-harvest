@@ -238,12 +238,13 @@ fn redact_userinfo(base: &str) -> String {
 
 /// Redact `password=` from a keyword/value connection string.
 ///
-/// Reads the string with the shared scanner ([`dsn::keyword_options`]) rather
-/// than tokenizing on whitespace, because libpq allows a value to be
-/// single-quoted and a quoted password may contain spaces: splitting
-/// `password='foo hunter2'` on whitespace redacts `password='foo` and leaves
-/// `hunter2'` standing in a string whose entire purpose is to be safe to paste
-/// into an issue.
+/// Reads the string with the shared scanner ([`dsn::keyword_tokens`]), not by
+/// tokenizing on whitespace. libpq allows a value to be single-quoted, and a
+/// quoted password may contain spaces.
+///
+/// Splitting `password='foo hunter2'` on whitespace is wrong. It redacts
+/// `password='foo` and leaves `hunter2'` standing. That string's entire
+/// purpose is to be safe to paste into an issue.
 ///
 /// Rewriting is a splice over each password value's byte span, so every byte
 /// the scanner did not identify as a password value is emitted unchanged — the
@@ -254,19 +255,21 @@ fn redact_userinfo(base: &str) -> String {
 /// carries no `password=` option for this function to find. Echoing the
 /// rest back would print a string that was never examined (issue #1322).
 ///
-/// Withholds a non-blank DSN the same way when the scanner finds no option
-/// at all. `alice:hunter2@db` is a dropped scheme with no `=` anywhere. The
-/// loop below never runs, so it never gets the chance to withhold. A DSN
-/// with nothing recognizable earns no more trust than one with a bad
-/// keyword.
+/// Withholds the same way for a **bare** token — one with no `=` at all,
+/// such as a dropped scheme (`alice:hunter2@db`). [`dsn::keyword_options`]
+/// silently skips a bare token, which would let its bytes, credential
+/// included, reach the output unexamined. [`dsn::keyword_tokens`] reports it
+/// instead, so nothing here is ever skipped past.
 fn redact_keyword_value(dsn: &str) -> String {
     const WITHHELD: &str = "<redacted dsn>";
 
     let mut out = String::with_capacity(dsn.len());
     let mut copied = 0;
-    let mut saw_option = false;
-    for option in dsn::keyword_options(dsn) {
-        saw_option = true;
+    for token in dsn::keyword_tokens(dsn) {
+        let option = match token {
+            dsn::KeywordToken::Bare => return WITHHELD.to_owned(),
+            dsn::KeywordToken::Recognized(option) => option,
+        };
         if !dsn::is_connection_keyword(option.key) {
             return WITHHELD.to_owned();
         }
@@ -282,9 +285,6 @@ fn redact_keyword_value(dsn: &str) -> String {
         out.push_str(&dsn[copied..option.value_span.start]);
         out.push_str("***");
         copied = option.value_span.end;
-    }
-    if !saw_option && !dsn.trim().is_empty() {
-        return WITHHELD.to_owned();
     }
     out.push_str(&dsn[copied..]);
     out
