@@ -262,11 +262,15 @@ The harvest arm, **separately and never concurrently**. It needs
 apparatus defaults to the canonical empty object that assay #10's L1 requires.
 Without it the run reproduces #10's cell, not the 5.47 above:
 
+The `cd` in the Temporal block above leaves the shell inside this apparatus
+directory, so the manifest path here is written relative to that, not to the
+repository root:
+
 ```bash
 ASSAY10_ARMS=postgres \
 ASSAY10_WORKFLOWS=2000 \
 ASSAY10_REPS=3 \
 ASSAY10_INPUT_JSON='{"p":"0123456789abcdef0123456789abcdef"}' \
   cargo run --release --manifest-path \
-  docs/assays/apparatus/0010-cross-mode-throughput/Cargo.toml
+  ../0010-cross-mode-throughput/Cargo.toml
 ```
