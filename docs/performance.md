@@ -1877,7 +1877,7 @@ standalone note rather than part of the claim-path attribution table above:
   self-referential re-serialization loop in `history_export::export_history`,
   the archival-export path `retention.rs`'s reclamation sweep calls per
   retiring execution (issue #524/#698/#772/#798), solved as an O(1) fixed
-  point (instructions -22.08%, allocs -19.89%).
+  point (instructions -22.08%, alloc bytes -19.89%).
 * [`docs/performance-history-fingerprint.md`](performance-history-fingerprint.md)
   — a per-event canonicalization buffer in
   `shard_rebalance::history_fingerprint`, the replay-determinism check a
