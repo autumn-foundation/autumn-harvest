@@ -87,6 +87,18 @@ future session in this series until the underlying tool defect is fixed:
 **page the unfiltered list and filter client-side; never trust the combined
 `event`+`status` filter's result as "the current window."**
 
+**Correction (post-review):** an earlier draft of the 🔧 Treatment section
+below also recommended the `status`-only filter as a lighter-weight
+alternative, on the strength of the single call in the isolation table
+above. A Codex review correctly caught that this overclaims: the combined
+filter's defect was only ever detectable by *repeating* an identical call,
+so a single passing `status`-only call is no evidence that it is
+deterministic — it could fail the same way on a second call, untested.
+Only the unfiltered-list path was actually repeated and cross-checked (the
+3-page pagination above, plus matching the 09-16 report's independently-
+gathered 15 failures), so it is the only method this report can actually
+recommend. Corrected below.
+
 This is not this repository's bug to fix — the defect is in the GitHub MCP
 server's `list_workflow_runs` tool, outside `autumn-harvest`'s own `ci.yml`
 or test suite, so no PR against this repo's harness applies. Recorded here
@@ -190,24 +202,39 @@ concrete instance this series has been missing to make the branch-protection
 gap actionable rather than abstract. Recorded here, not treated as
 confirmed policy failure.
 
-### 6. Cancelled-run sample this window: 6/7 job-logged, 0 hid a failure; 1/7 not inspected
+### 6. Cancelled-run sample this window: 7/8 job-logged, 1/7 hid a job-level failure; 1/8 not inspected
 
-Job-logged 7 of this window's 86 cancelled runs, spread across the window
-(`list_workflow_jobs`, `perPage=100`, checking every job's own `conclusion`):
-`35081223941`, `35087852092`, `35105355850`, `35117694170`, `35127884735`,
-`35136021958`, `35138666154`, `35141974598` — 8 attempted, 6 fully read
-(`35081223941`'s job list exceeded this session's inline tool-output limit
-and was not re-fetched via the signed-URL fallback this series has used
-before; not inspected). All 6 read runs show ordinary
-`concurrency.cancel-in-progress` behavior: every job cancelled at the same
-instant mid-step, consistent with a newer push superseding an
-in-progress run — including one run (`35105355850`) whose `Lint` job shows
-a genuine `cargo fmt` **failure** before the rest of the run was cancelled
-by a later push, which is a real, correctly-firing gate on that branch's
-own diff, not a hidden CI-health defect. 0/6 sampled cancelled runs hid an
-unrelated job-level failure this window, against 2/8 in the 09-16 report's
-sample — too small a sample on both sides to compare rates, and the
-remaining 79 of 86 cancelled runs in this window are unaudited.
+Attempted `list_workflow_jobs` (`perPage=100`, checking every job's own
+`conclusion`, not just the run's) on 8 of this window's 86 cancelled runs,
+spread across the window: `35081223941`, `35087852092`, `35105355850`,
+`35117694170`, `35127884735`, `35136021958`, `35138666154`, `35141974598`.
+**Correction (post-review):** an earlier draft of this section miscounted
+its own sample as "8 attempted, 6 fully read" — a Codex review correctly
+flagged the mismatch against the section heading and the 8 listed IDs.
+Rechecked directly against this session's own tool results: `35081223941`'s
+job list exceeded the inline tool-output size limit and was not re-fetched
+via the signed-URL fallback this series has used before (not inspected);
+the other **7** — not 6 — were fully read.
+
+Of those 7, 6 show ordinary `concurrency.cancel-in-progress` behavior:
+every job cancelled at the same instant mid-step, consistent with a newer
+push superseding an in-progress run, with no job-level `"failure"`
+conclusion anywhere in the run. **Correction (post-review):** an earlier
+draft additionally miscategorized the 7th, `35105355850`, as "not a
+hidden CI-health defect" because its `cargo fmt` failure was a real,
+correctly-firing gate on that branch's own diff — true on the merits, but
+beside the point this series' own 09-06/09-11 methodology actually tracks:
+a cancelled *run* with a `"failure"`-conclusion *job* underneath it is a
+hidden failure by that mechanical definition regardless of whether the
+failure is itself legitimate, because the run's own overall conclusion
+(`cancelled`) would otherwise hide it from any census that only reads run-
+level conclusions. Corrected: **1/7 sampled cancelled runs hid a job-level
+failure** (`35105355850`'s `Lint` job, `Check formatting` step, real and
+deterministic — not a suite-health defect, but a hidden failure by this
+series' own counting convention), against 2/8 in the 09-16 report's
+sample — both samples too small to compare rates. 79 of this window's 86
+cancelled runs remain unaudited (86 total minus the 7 actually read;
+`35081223941` counts as unaudited, not as a completed read).
 
 ## 🔍 Diagnosis
 
@@ -241,9 +268,12 @@ health-report item, not a fix PR, because the defect is already fixed on
 nothing left to fix. The branch-protection data point is exactly that: a
 data point, not a confirmed policy conclusion.
 
-**Item 6** is ordinary CI mechanics for the 6 runs actually inspected; too
-small and too narrow a sample to say anything about the other 79 cancelled
-runs this window.
+**Item 6** is ordinary CI mechanics for 6 of the 7 runs actually inspected,
+plus one real, correctly-firing `cargo fmt` gate hidden under a cancelled
+run's overall conclusion — a genuine hidden failure by this series' own
+counting convention, though not a suite-health defect on its own merits.
+Too small and too narrow a sample to say anything about the other 79
+cancelled runs this window.
 
 ## 🔧 Treatment
 
@@ -257,12 +287,13 @@ health report is the correct outcome.
 **The one recommendation this report does act on**, because it costs
 nothing and changes how every future session in this series gathers
 evidence: **stop using `list_workflow_runs`'s combined `{event, status}`
-filter for census work.** Page the unfiltered list (or the `status`-only
-filter, which stayed reliable in this session's testing) and filter
-client-side. This is a change in *how this role gathers evidence*, not a
-change to the repository's CI configuration, so it needs no PR — but it
-should be treated as binding methodology for the next session that opens
-one of these reports.
+filter for census work.** Page the unfiltered list and filter client-side —
+the only method this session actually repeated and cross-validated (see
+the correction above; the `status`-only filter is not recommended on the
+strength of a single untested call). This is a change in *how this role
+gathers evidence*, not a change to the repository's CI configuration, so it
+needs no PR — but it should be treated as binding methodology for the next
+session that opens one of these reports.
 
 Items carried forward, unchanged:
 
@@ -311,9 +342,10 @@ Items carried forward, unchanged:
   inferred from timing alone. 0/3 required a rerun — the fix already
   shipped upstream 4h13m after the defect was introduced; confirmed absent
   from the current `docs/benchmarks.md` by direct grep.
-- **Item 6:** 6/7 attempted cancelled-run job-logs read; 0/6 hid a failure
-  beyond one real, correctly-firing `cargo fmt` red already superseded by a
-  later push on the same branch.
+- **Item 6:** 7/8 attempted cancelled-run job-logs fully read; 1/7 hid a
+  job-level failure (`35105355850`'s real, correctly-firing `cargo fmt`
+  red, already superseded by a later push on the same branch — a hidden
+  failure by this series' counting convention, not a suite-health defect).
 - No revert check applies — no test or suite code was changed this session.
 
 ## 🔬 Reproduce
