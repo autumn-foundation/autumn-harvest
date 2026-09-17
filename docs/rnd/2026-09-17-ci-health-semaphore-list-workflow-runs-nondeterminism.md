@@ -1,8 +1,10 @@
 # 🚦 Semaphore CI health — the census tool itself is non-deterministic:
 # four identical `list_workflow_runs` calls returned four different
-# `total_count`s across 3 distinct date windows, while a single-run
-# lookup (repeated) and the unfiltered list (cross-validated) stayed
-# stable; today's audited population — 10 explicit failures and a 7-run
+# `total_count`s across 3 distinct date windows, while a repeated
+# single-run lookup stayed stable and the unfiltered list (untested for
+# call-to-call repetition, but internally consistent and content-
+# cross-validated) is this report's best provisional substitute; today's
+# audited population — 10 explicit failures and a 7-run
 # cancelled-run sample, not the full 109-run window — shows no recurrence
 # of the tracked activity-timeout, quota-enforcement, or `corpus`
 # signatures, plus a fully root-caused `benchmarks_docs` defect that left
@@ -74,24 +76,29 @@ the defect, **one call each** for the single-key filters:
 | `{event:"pull_request"}` only | 4783 | run 5631, 2026-09-16T20:07:37Z | stale but plausible (~11h old) |
 | `{event, status}` together | 1973–4854, varying per call | varying, up to 8 days stale | **confirmed non-deterministic (4 calls)** |
 
-**Correction (post-review):** an earlier draft of this section's closing
-sentence claimed "single-run lookups and the unfiltered list are reliable;
-only the combined `event`+`status` filter... is not" — phrasing that
-implicitly extended to the single-key filters too. A Codex review
-correctly caught that this overreaches: only the **combined** filter was
-called repeatedly (4 times) and only `get_workflow_run` was called
-repeatedly (2 times) and the **unfiltered** list was cross-validated
-(3-page internal consistency plus matching the 09-16 report's own
-independently-gathered data, below) — those three are the only ones this
-report can actually call confirmed. The `status`-only and `event`-only
-rows above are each **one call**, exactly the evidentiary gap that sank
-this same report's own first-draft recommendation of the `status`-only
-filter (see the correction further below): one passing call proves
-nothing about whether a filter is deterministic, since the combined
-filter's own defect was only detectable by repetition. Correctly stated:
+**Correction (post-review), two rounds.** An earlier draft of this
+section's closing sentence claimed "single-run lookups and the unfiltered
+list are reliable; only the combined `event`+`status` filter... is not" —
+phrasing that implicitly extended to the single-key filters too. A Codex
+review correctly caught that overreach for the single-key filters: only
+the **combined** filter was called repeatedly (4 times, confirmed broken)
+and only `get_workflow_run` was called repeatedly (2 times, confirmed
+reliable); the `status`-only and `event`-only rows above are each **one
+call**, exactly the evidentiary gap that sank this same report's own
+first-draft recommendation of the `status`-only filter (see the correction
+further below) — one passing call proves nothing about determinism, since
+the combined filter's own defect was only detectable by repetition. A
+second Codex review then caught that the fix still overclaimed the
+**unfiltered** list as equally "confirmed": paginating pages 1, 2, and 3 is
+three different requests, not one request repeated, so this session never
+actually tested whether an identical unfiltered call returns the same
+answer twice — see the fuller correction further below. Correctly stated:
 this session **confirms** the combined filter is broken and **confirms**
-`get_workflow_run` and the unfiltered list are reliable; it leaves the
-single-key filters' own determinism **untested**, not "reliable."
+`get_workflow_run` is reliable (both via genuine repetition); it leaves
+both the single-key filters' and the unfiltered list's own call-to-call
+determinism **untested** — the unfiltered list has other evidence in its
+favor (internal cross-page consistency, content cross-validation), just
+not that specific test.
 
 **This matters retroactively.** Every prior report in this series —
 09-03 through 09-16 — built its census with exactly this combined filter and
@@ -103,30 +110,47 @@ JSON snapshot and reasoned about it consistently — but the claim that the
 snapshot represented "the current census window" is unconfirmed for all of
 them, and demonstrably false for 3 of the 4 calls made this session alone.
 
-**Workaround verified and used for the rest of this report.** Paginating the
-*unfiltered* `list_workflow_runs` (3 pages, `perPage=100`, no
+**Workaround used for the rest of this report, provisionally.** Paginating
+the *unfiltered* `list_workflow_runs` (3 pages, `perPage=100`, no
 `workflow_runs_filter`) and filtering for `event=="pull_request" and
 status=="completed"` client-side in Python produced a set that: (a) has
 monotonically contiguous run numbers across all 3 pages with zero gaps or
 duplicates (5351–5650, 300 runs, `total_count: 5650` identical on every
 page), and (b) reconstructs the exact same 15 explicit-failure runs the
-09-16 report already found and named for the shared part of the window —
-cross-validated, not just internally consistent. Recommended for every
-future session in this series until the underlying tool defect is fixed:
-**page the unfiltered list and filter client-side; never trust the combined
-`event`+`status` filter's result as "the current window."**
+09-16 report already found and named for the shared part of the window.
+Recommended for every future session in this series until the underlying
+tool defect is fixed: **page the unfiltered list and filter client-side;
+never trust the combined `event`+`status` filter's result as "the current
+window."**
 
-**Correction (post-review):** an earlier draft of the 🔧 Treatment section
-below also recommended the `status`-only filter as a lighter-weight
-alternative, on the strength of the single call in the isolation table
-above. A Codex review correctly caught that this overclaims: the combined
-filter's defect was only ever detectable by *repeating* an identical call,
-so a single passing `status`-only call is no evidence that it is
-deterministic — it could fail the same way on a second call, untested.
-Only the unfiltered-list path was actually repeated and cross-checked (the
-3-page pagination above, plus matching the 09-16 report's independently-
-gathered 15 failures), so it is the only method this report can actually
-recommend. Corrected below.
+**Correction (post-review), two rounds.** An earlier draft of the 🔧
+Treatment section below also recommended the `status`-only filter as a
+lighter-weight alternative, on the strength of the single call in the
+isolation table above. A Codex review correctly caught that this
+overclaims: the combined filter's defect was only ever detectable by
+*repeating* an identical call, so a single passing `status`-only call is
+no evidence that it is deterministic — it could fail the same way on a
+second call, untested. A second Codex review then caught that the
+paragraph's own replacement reasoning — calling the unfiltered path
+"actually repeated and cross-checked" — overreaches by the same standard:
+`page=1`, `page=2`, and `page=3` are three *different* requests, not the
+same request repeated, so this session never actually tested whether
+calling `list_workflow_runs` with no filter and `page=1` twice returns the
+same answer twice. Points (a) and (b) above are real evidence, but of a
+different and weaker kind than the combined filter's 4-identical-calls
+test: (a) is internal cross-page consistency (which pagination has to
+satisfy to work at all, and which the combined filter's own broken
+behavior gives no reason to assume for free), and (b) shows this
+particular fetch's *content* isn't fabricated, not that a repeated
+identical unfiltered call reliably returns the same window — and the
+09-16 report it matches against was itself built with the defective
+combined filter, so matching it doesn't independently validate
+current-window selection either, only that the named failing runs are
+real. **Correctly stated: the unfiltered-list path is this report's
+best-evidenced option, not a confirmed-deterministic one** — recommended
+as the provisional default until a future session actually repeats
+identical unfiltered calls (or the underlying tool defect is fixed),
+not asserted as proven reliable.
 
 This is not this repository's bug to fix — the defect is in the GitHub MCP
 server's `list_workflow_runs` tool, outside `autumn-harvest`'s own `ci.yml`
@@ -191,11 +215,11 @@ fix PR (diagnostic clarity, not a suite-health defect).
 
 ### 5. New: `benchmarks_docs::the_doc_names_no_competitor_engine` — 3 occurrences, fully root-caused to a single ~4h13m window where trunk-dev itself failed its own committed gate
 
-| Run | When (UTC) | Branch | Job(s) |
+| Run | When (UTC) | Branch | Failed jobs (of 30 total) |
 |---|---|---|---|
-| `35129116518` | 17:35:18Z | `claude/fervent-einstein-92qrxx` ("Assays #10 and #11... harvest vs Temporal on one box") | `Test (ubuntu/windows/macos-latest)`, `Test (no-db, *, shard 0/3)` |
-| `35145049656` | 20:11:30Z | `claude/vigilant-hopper-moyhnr` ("Add batched seek-and-refine claim path") | same 7-job pattern |
-| `35152977594` | 21:32:46Z | `claude/magical-gauss-gn4qd2` ("Ledger: batch the outbox start relay") | same 6-job pattern |
+| `35129116518` | 17:35:18Z | `claude/fervent-einstein-92qrxx` ("Assays #10 and #11... harvest vs Temporal on one box") | **7**: `Test (ubuntu/windows/macos-latest)` (3), `Test (no-db, ubuntu/windows/macos-latest, shard 0)` (3), `Test (no-db, ubuntu-latest, shard 3)` (1) |
+| `35145049656` | 20:11:30Z | `claude/vigilant-hopper-moyhnr` ("Add batched seek-and-refine claim path") | **7**: `Test (ubuntu/windows/macos-latest)` (3), `Test (no-db, ubuntu-latest, shard 0)`, `Test (no-db, windows-latest, shard 0)`, `Test (no-db, ubuntu-latest, shard 3)`, `Test (no-db, macos-latest, shard 3)` |
+| `35152977594` | 21:32:46Z | `claude/magical-gauss-gn4qd2` ("Ledger: batch the outbox start relay") | **6**: `Test (ubuntu/windows/macos-latest)` (3), `Test (no-db, ubuntu/windows/macos-latest, shard 0)` (3) |
 
 All three carry the identical panic: `docs/benchmarks.md names a competitor
 engine (temporal); issue #1309 asks this page to explain the comparison
@@ -234,8 +258,11 @@ fixed there yet).
 
 **A concrete data point for the still-unconfirmed branch-protection gap.**
 Run `35129116518` was created at 17:35:18Z — **39 seconds before** `266ac9c`
-merged at 17:35:57Z — and it already shows this exact failure on `Test
-(ubuntu-latest)` and 5 other legs. If that run was PR #1617's own
+merged at 17:35:57Z — and it already shows this exact failure on 7 legs
+(**correction, post-review**: an earlier draft said "`Test (ubuntu-latest)`
+and 5 other legs," 6 total; a Codex review correctly caught that this
+contradicts the table above, which lists 7 failed jobs for this run — the
+full 7-job count is used consistently now). If that run was PR #1617's own
 pre-merge CI (plausible: same branch, same defect, right before merge), the
 PR merged into `trunk-dev` with this test failing on its own head commit or
 one immediately prior. This session cannot confirm branch-protection
@@ -336,12 +363,16 @@ health report is the correct outcome.
 nothing and changes how every future session in this series gathers
 evidence: **stop using `list_workflow_runs`'s combined `{event, status}`
 filter for census work.** Page the unfiltered list and filter client-side —
-the only method this session actually repeated and cross-validated (see
-the correction above; the `status`-only filter is not recommended on the
-strength of a single untested call). This is a change in *how this role
-gathers evidence*, not a change to the repository's CI configuration, so it
-needs no PR — but it should be treated as binding methodology for the next
-session that opens one of these reports.
+this session's best-evidenced option (internal cross-page consistency plus
+content cross-validation against the 09-16 report), though **not** proven
+deterministic under this report's own bar of repeating an identical call
+(see the correction above; the `status`-only filter is not recommended
+either, on the strength of a single untested call). This is a change in
+*how this role gathers evidence*, not a change to the repository's CI
+configuration, so it needs no PR — but it should be treated as the
+provisional default for the next session that opens one of these reports,
+until that session (or a future one) actually repeats an identical
+unfiltered call to confirm it, or the underlying tool defect is fixed.
 
 Items carried forward, unchanged:
 
@@ -375,16 +406,29 @@ Items carried forward, unchanged:
   `total_count` values (1973, 3911, 4854, 2301) across **3 distinct date
   windows** (corrected from an earlier draft's "4 distinct date windows" —
   calls 1 and 4 share the same newest/oldest run boundary, though their
-  `total_count`s still differ). 2/2 identical calls to `get_workflow_run`
-  for the same run ID returned identical data. 1/1 unfiltered paginated
-  fetch (3 pages) was internally consistent (`total_count: 5650` on every
-  page, contiguous run numbers 5351–5650, zero gaps/duplicates) and
-  reconstructed the exact same 15 failures the 09-16 report already named
-  for the overlapping portion of the window — cross-validated against a
-  prior, independently-gathered report, not just self-consistent. The
-  single-key `event`-only and `status`-only filters were each called once
-  and are **untested** for determinism, not confirmed reliable (corrected
-  from an earlier draft's stronger claim).
+  `total_count`s still differ) — confirmed non-deterministic by genuine
+  repetition. 2/2 identical calls to `get_workflow_run` for the same run ID
+  returned identical data — confirmed reliable by genuine repetition. 1/1
+  unfiltered paginated fetch (3 pages — 3 *different* requests, not one
+  repeated) was internally consistent (`total_count: 5650` on every page,
+  contiguous run numbers 5351–5650, zero gaps/duplicates) and reconstructed
+  the exact same 15 failures the 09-16 report already named for the
+  overlapping portion of the window. **Correction (post-review):** an
+  earlier draft called this "cross-validated... not just self-consistent"
+  and treated it as confirmed on a par with the combined filter's and
+  `get_workflow_run`'s repetition tests. A Codex review correctly caught
+  that paginating 3 different pages is not repeating an identical request,
+  so this session never tested whether the unfiltered list itself is
+  deterministic call-to-call — the evidence above is real but of a
+  different, weaker kind (internal consistency + content validation, not
+  repetition), and the 09-16 report it matches was itself built with the
+  defective combined filter, so the match validates that report's named
+  runs' authenticity, not "current-window selection." Corrected: the
+  unfiltered list is this session's best-evidenced option and this
+  report's provisional recommendation, **not** a confirmed-deterministic
+  one. The single-key `event`-only and `status`-only filters were each
+  called once and are **untested** for determinism, not confirmed reliable
+  either (corrected from an earlier draft's stronger claim).
 - **Items 1–3:** 0 occurrences each among the 10 explicit failures and the
   7-run cancelled sample actually audited this window (corrected from an
   earlier draft's "0 new occurrences... over a 109-run window" — the other
