@@ -12,10 +12,7 @@ use crate::runtime::{standalone_builder, standalone_runtime_config};
 ///
 /// Split out of [`run`] so a test can drive it with `tower::ServiceExt::oneshot`
 /// without binding a socket or starting a `HarvestRunner` (see `tests.rs`).
-pub fn build_router(
-    api_state: HarvestApiState,
-    web_state: autumn_web::AppState,
-) -> axum::Router {
+pub fn build_router(api_state: HarvestApiState, web_state: autumn_web::AppState) -> axum::Router {
     axum::Router::new()
         .route(
             "/",
