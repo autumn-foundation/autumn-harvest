@@ -334,6 +334,12 @@ const ALLOWED_HANDROLLED_MIGRATION_INCLUDES: &[&str] = &[
     // Separate plugin app-DB `harvest_workflow_outbox` migration — not part of
     // the core `migrations/` bundle that `test_init_sql()` emits.
     "autumn-harvest-plugin/tests/outbox_integration.rs",
+    // Same plugin app-DB `harvest_workflow_outbox` migration as
+    // `outbox_integration.rs` above, for the same reason. The manual
+    // `pg_stat_statements` perf-evidence harness for issue #1620 builds
+    // its own split app/Harvest database pair, not through
+    // `test_init_sql()`.
+    "autumn-harvest-plugin/tests/outbox_start_relay_perf.rs",
     // The three connector suites (issue #944) each build
     // `test_init_sql()` and then append the plugin-owned
     // `harvest_connector_dead_letters` migration, which likewise lives in

@@ -1,0 +1,41 @@
+-- outbox start relay, pg_stat_statements sweep (AFTER: batched UNNEST mark,
+   one UPDATE per outcome per drain instead of one per row) --
+   Captured with: HARVEST_TEST_DATABASE_URL set to a local Postgres 16 with
+   pg_stat_statements preloaded; cargo test -p autumn-harvest-plugin
+   --test outbox_start_relay_perf -- --ignored --nocapture --test-threads=1
+
+n	delivered	claim_calls	mark_calls	mark_buffers	total_calls	total_buffers
+5	5	1	1	41	4	103
+20	20	1	1	165	4	394
+50	50	2	2	415	7	1078
+
+(mark_calls == claim_calls at every size: each claim round's batch is marked
+in exactly one follow-up UPDATE, regardless of how many rows that round
+claimed. n=50 needs 2 claim rounds because THROTTLE-independent
+`HarvestOutboxConfig::default().batch_size` is 32, so 50 rows split into a
+32-row round and an 18-row round -- each still gets exactly 1 mark call.)
+
+-- n=50, top statements by calls --
+calls=   2 ( 28.6%)  buffers=  663 ( 61.5%)  WITH due AS ( SELECT id FROM harvest_workflow_outbox WHERE delivered_at IS NULL AND next_attempt_at ...
+calls=   2 ( 28.6%)  buffers=  415 ( 38.5%)  UPDATE harvest_workflow_outbox AS outbox SET delivery_attempts = delivery_attempts + $4, last_error ...
+calls=   1 ( 14.3%)  buffers=    0 (  0.0%)  SELECT $1
+calls=   1 ( 14.3%)  buffers=    0 (  0.0%)  SET CLIENT_ENCODING TO 'UTF8'
+calls=   1 ( 14.3%)  buffers=    0 (  0.0%)  SET TIME ZONE 'UTC'
+
+-- delta vs baseline-sweep.txt --
+n	total_calls (before -> after)	total_buffers (before -> after)
+5	8 -> 4   (-50.0%)	117 -> 103  (-12.0%)
+20	23 -> 4   (-82.6%)	451 -> 394  (-12.6%)
+50	55 -> 7   (-87.3%)	1236 -> 1078 (-12.8%)
+
+mark statement alone, n=50: 50 calls -> 2 calls (-96.0%), 568 buffers -> 415
+buffers (-26.9%).
+
+Two floor criteria are cleared independently, either one sufficient on its own:
+  - "Elimination of an N+1": mark-step statement count drops from O(n) to
+    O(claim rounds) -- 2 instead of 50 at n=50, demonstrated at 3 sizes
+    (n=5, 20, 50).
+  - "≥20% reduction in total buffers for a statement that is ≥5% of the
+    workload's buffers": the mark statement was 46.0% of buffers in the
+    baseline (well above the 5% eligibility bar) and drops 26.9% on its own
+    buffer count (568 -> 415 at n=50), clearing the 20% floor.
