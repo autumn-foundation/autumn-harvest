@@ -1890,3 +1890,8 @@ standalone note rather than part of the claim-path attribution table above:
   actually admits; `nodes` and `by_parent` stay growing from empty after a
   post-review correction (instructions -2.37%, alloc bytes -27.12%, this
   fix's final fifth-round-corrected numbers).
+* [`docs/performance-harvest-verify-split-top.md`](performance-harvest-verify-split-top.md)
+  — `autumn-harvest-verify`'s `util::split_top`, the balanced-delimiter
+  splitter every path/type decomposition in the MIR-level determinism
+  analyzer goes through (issue #962), guarded with a first-byte check
+  before its `starts_with` call (instructions -13.54%, PR #1597).
