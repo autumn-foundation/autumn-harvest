@@ -119,7 +119,7 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
-    let input_type_hint = build_input_type_hint(&params);
+    let input_type_hint = crate::attr_util::arg_type_hint(&params);
     let output_type_hint = crate::extract_ok_type_hint(&func.sig.output);
 
     let dispatch = build_query_dispatch(fn_name, &param_names);
@@ -264,30 +264,6 @@ fn build_query_dispatch(fn_name: &syn::Ident, param_names: &[&syn::Ident]) -> To
                 })
         }
     }
-}
-
-/// Returns a `String` describing the input parameters for `input_type_hint`.
-fn build_input_type_hint(params: &[&syn::FnArg]) -> String {
-    if params.is_empty() {
-        return "()".to_string();
-    }
-    if params.len() == 1
-        && let syn::FnArg::Typed(pt) = params[0]
-    {
-        return crate::type_name_hint(&pt.ty);
-    }
-    // Multiple params: show as tuple
-    let parts: Vec<_> = params
-        .iter()
-        .filter_map(|arg| {
-            if let syn::FnArg::Typed(pt) = arg {
-                Some(crate::type_name_hint(&pt.ty))
-            } else {
-                None
-            }
-        })
-        .collect();
-    format!("({})", parts.join(", "))
 }
 
 // ── Characterization tests ──────────────────────────────────────────────────
