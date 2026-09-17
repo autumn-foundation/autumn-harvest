@@ -262,18 +262,29 @@ branch (a `split_top` byte-check fix), correctly gated on that branch's own
 stale doc count — not a flake. Still below this role's bar for a unilateral
 fix PR (diagnostic clarity, not a suite-health defect).
 
-### 5. New: `benchmarks_docs::the_doc_names_no_competitor_engine` — 3 occurrences, fully root-caused to a single ~4h13m window where trunk-dev itself failed its own committed gate
+### 5. New: `benchmarks_docs::the_doc_names_no_competitor_engine` — 4 occurrences, fully root-caused to a single ~4h13m window where trunk-dev itself failed its own committed gate
+
+**Correction (post-review):** an earlier draft of this section counted only
+3 occurrences, omitting `35145054552` — the same run this report's item-1
+shard-8 check (above) had already pulled in and correctly labeled part of
+"the benchmarks_docs cluster" in a reply comment, without this section
+itself ever being updated to match. A Codex review caught the mismatch
+between that label and this table's own row count. Corrected to all 4,
+confirmed by directly grepping `35145054552`'s own job log for the
+signature (below).
 
 | Run | When (UTC) | Branch | Failed jobs (of 30 total) |
 |---|---|---|---|
 | `35129116518` | 17:35:18Z | `claude/fervent-einstein-92qrxx` ("Assays #10 and #11... harvest vs Temporal on one box") | **7**: `Test (ubuntu/windows/macos-latest)` (3), `Test (no-db, ubuntu/windows/macos-latest, shard 0)` (3), `Test (no-db, ubuntu-latest, shard 3)` (1) |
 | `35145049656` | 20:11:30Z | `claude/vigilant-hopper-moyhnr` ("Add batched seek-and-refine claim path") | **7**: `Test (ubuntu/windows/macos-latest)` (3), `Test (no-db, ubuntu-latest, shard 0)`, `Test (no-db, windows-latest, shard 0)`, `Test (no-db, ubuntu-latest, shard 3)`, `Test (no-db, macos-latest, shard 3)` |
+| `35145054552` | 20:11:33Z | `claude/hopeful-pascal-tbijcf` ("Fix shard-rebalancing follow-ups from issue #1317") | **9**: `Test (ubuntu/windows/macos-latest)` (3), `Test (no-db, ubuntu/windows/macos-latest, shard 0)` (3), `Test (no-db, ubuntu/windows/macos-latest, shard 3)` (3) |
 | `35152977594` | 21:32:46Z | `claude/magical-gauss-gn4qd2` ("Ledger: batch the outbox start relay") | **6**: `Test (ubuntu/windows/macos-latest)` (3), `Test (no-db, ubuntu/windows/macos-latest, shard 0)` (3) |
 
-All three carry the identical panic: `docs/benchmarks.md names a competitor
+All four carry the identical panic: `docs/benchmarks.md names a competitor
 engine (temporal); issue #1309 asks this page to explain the comparison
 methodology, never quote a competitor's own figure`
-(`benchmarks_docs.rs:231`).
+(`benchmarks_docs.rs:231`) — directly grepped from each run's own job log,
+not inferred from job names alone.
 
 Root cause, confirmed directly against source rather than inferred from the
 panic text alone:
@@ -295,13 +306,16 @@ those two merges. My local checkout (on `f01a448` and later) has zero
 "temporal" matches in `docs/benchmarks.md` today — the doc is currently
 clean.
 
-Two of the three occurrences (`35145049656`, `35152977594`) are on branches
-with nothing to do with the assay work — `vigilant-hopper-moyhnr`'s
-claim-path change and `magical-gauss-gn4qd2`'s outbox-batching change. Both
-inherited a real, deterministic, correctly-firing red purely from being
-based on `trunk-dev` during the broken window — the same "stale-branch
-echo of a defect in the base, not in the branch" pattern the 09-14 report
-first documented for the activity-timeout test's pre-hardening pair, here
+Three of the four occurrences (`35145049656`, `35145054552`,
+`35152977594`) are on branches with nothing to do with the assay work —
+`vigilant-hopper-moyhnr`'s claim-path change, `hopeful-pascal-tbijcf`'s
+shard-rebalancing follow-ups (the same branch this series' 09-16 report
+already tracked for 5 other, unrelated failures in this same window), and
+`magical-gauss-gn4qd2`'s outbox-batching change. All three inherited a
+real, deterministic, correctly-firing red purely from being based on
+`trunk-dev` during the broken window — the same "stale-branch echo of a
+defect in the base, not in the branch" pattern the 09-14 report first
+documented for the activity-timeout test's pre-hardening pair, here
 running the other direction (the defect was introduced on the base, not
 fixed there yet).
 
@@ -392,9 +406,9 @@ reason as every prior report.
 
 **Item 5** is a fully root-caused, deterministic, single-commit-window
 defect — not a suite flake. `trunk-dev` was briefly red against its own
-gate; a same-day follow-up fixed it. The two downstream "stale-branch echo"
-occurrences are not independent findings, they are the same root cause
-propagating to any branch built on the broken window. Filed here as a
+gate; a same-day follow-up fixed it. The three downstream "stale-branch
+echo" occurrences are not independent findings, they are the same root
+cause propagating to any branch built on the broken window. Filed here as a
 health-report item, not a fix PR, because the defect is already fixed on
 `trunk-dev` (confirmed by direct inspection of the current file) — there is
 nothing left to fix. The branch-protection data point is exactly that: a
@@ -500,9 +514,13 @@ Items carried forward, unchanged:
   79 cancelled runs were not checked). Not rerun-campaign confirmations.
 - **Item 4:** 1/1 occurrence this window, consistent with the known,
   unfixed defect.
-- **Item 5:** 3/3 occurrences confirmed to share one root cause via direct
-  commit inspection (`git show`, `git diff`, `git log --format=%cI`), not
-  inferred from timing alone. 0/3 required a rerun — the fix already
+- **Item 5:** 4/4 occurrences confirmed to share one root cause (corrected
+  from an earlier draft's 3/3 — a Codex review caught that `35145054552`
+  was omitted from this section despite already being named in this
+  report's own item-1 reply comment; its panic text was directly grepped
+  from its job log to confirm the same signature) via direct commit
+  inspection (`git show`, `git diff`, `git log --format=%cI`), not
+  inferred from timing alone. 0/4 required a rerun — the fix already
   shipped upstream 4h13m after the defect was introduced; confirmed absent
   from the current `docs/benchmarks.md` by direct grep.
 - **Item 6:** 7/8 attempted cancelled-run job-logs fully read; 1/7 hid a
@@ -581,6 +599,15 @@ git diff 266ac9c f01a448 -- docs/benchmarks.md | grep -i temporal
 git log -1 --format=%cI 266ac9c    # 2026-09-16T12:35:57-05:00
 git log -1 --format=%cI f01a448    # 2026-09-16T16:49:14-05:00
 grep -ni temporal docs/benchmarks.md   # current tree: no matches
+
+# Item 5's 4th occurrence (the one an earlier draft omitted): confirm
+# 35145054552 carries the identical signature, not just a structurally
+# similar job-name pattern:
+# get_job_logs(run_id=35145054552, failed_only=true, return_content=true)
+# -> job "Test (ubuntu-latest)" contains:
+#    "thread 'benchmarks_docs::the_doc_names_no_competitor_engine' ...
+#     panicked at autumn-harvest/tests/integration/benchmarks_docs.rs:231:9:
+#     docs/benchmarks.md names a competitor engine (temporal); ..."
 
 # Per-failure job logs, this window's 10 explicit failures:
 # get_job_logs(run_id=<id>, failed_only=true, return_content=true, tail_lines=50-60)
