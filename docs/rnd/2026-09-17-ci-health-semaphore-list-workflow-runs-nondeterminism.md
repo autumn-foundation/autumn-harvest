@@ -25,6 +25,26 @@ gap every prior report in this series has logged. Cache-usage API access is
 also still unavailable. Item **5** below adds a concrete data point to the
 branch-protection gap, not a resolution of it.
 
+**Base-branch coverage (post-review, Finding L).** `ci.yml`'s `pull_request`
+trigger fires against both `trunk` and `trunk-dev` (see the workflow's own
+`on:` block), and the census's `list_workflow_runs` rows carry no base-ref
+field, only an often-empty `pull_requests` array — so nothing in the raw
+data rules out a `trunk`-targeted release PR sitting inside the 109-run
+count. Checked, not assumed: every branch feeding this report's two
+load-bearing subsets — item 1's 13 shard-8 success-run branches and item
+5's 4 `benchmarks_docs`-failure branches — resolved to a PR (via
+`pull_request_read`, using `search_pull_requests(head:<branch>)` to recover
+the PR number where the run's own `pull_requests` array was empty), and
+every one of those 17 unique PRs has `base.ref: "trunk-dev"`. Zero target
+`trunk`. **Not checked**: the base branch of the 6 `Lint`-only-failure runs
+(the other 4 of the 10 explicit failures, excluded from item 5's cluster)
+or of the 7-run cancelled-run sample in item 6 — those runs' conclusions
+don't feed a load-bearing claim in this report, so they were left
+unverified rather than pulled in speculatively. The verdict path above
+should be read as confirmed for `trunk-dev` only insofar as the 17 checked
+PRs go; it is not a claim that every run in the 109-run window targeted
+`trunk-dev`.
+
 ## 🌡️ Symptom
 
 ### 0. The measurement instrument itself is non-deterministic — this is today's headline finding, and it bears on every prior report in this series
@@ -272,7 +292,7 @@ branch (a `split_top` byte-check fix), correctly gated on that branch's own
 stale doc count — not a flake. Still below this role's bar for a unilateral
 fix PR (diagnostic clarity, not a suite-health defect).
 
-### 5. New: `benchmarks_docs::the_doc_names_no_competitor_engine` — 4 occurrences, fully root-caused to a single ~4h13m window where trunk-dev itself failed its own committed gate
+### 5. New: `benchmarks_docs::the_doc_names_no_competitor_engine` — 4 occurrences among the runs audited, fully root-caused to a single ~4h13m window where trunk-dev itself failed its own committed gate
 
 **Correction (post-review):** an earlier draft of this section counted only
 3 occurrences, omitting `35145054552` — the same run this report's item-1
@@ -282,6 +302,19 @@ itself ever being updated to match. A Codex review caught the mismatch
 between that label and this table's own row count. Corrected to all 4,
 confirmed by directly grepping `35145054552`'s own job log for the
 signature (below).
+
+**Scope (post-review, Finding M): 4 is a count among the runs audited, not
+a claim of completeness.** The 4 rows below come from job-logging this
+window's 10 explicit failures — the only runs this report read at job
+level, other than the 7-run cancelled sample in item 6. The 4h13m broken
+window (17:35:57Z–21:49:14Z) also contains cancelled runs from this
+window's population of 86, and none of those were checked for this
+signature: a cancelled run can still hide a job-level failure underneath
+its overall `cancelled` conclusion (see item 6, where exactly that happened
+once in a 7-run sample), and 79 of the 86 cancelled runs in this window
+were never read at job level at all. So "4 occurrences" means 4 confirmed
+among the runs this report actually opened, not 4 total during the broken
+window — the true count during that window could be higher.
 
 | Run | When (UTC) | Branch | Failed jobs (of 30 total) |
 |---|---|---|---|
@@ -595,6 +628,13 @@ print('total_count (all pages):', total_counts[0])
 print('run_number range:', run_numbers[0], '-', run_numbers[-1], f'({len(run_numbers)} contiguous, no gaps, no duplicates)')
 
 runs = list(allruns.values())
+# Base-ref caveat (post-review, Finding L): this filter checks only
+# event and status. ci.yml triggers on pull requests against both trunk
+# and trunk-dev, and a run row carries no base-ref field, so this
+# population is not filtered to trunk-dev by construction. See the
+# Verdict path section above for which subsets of these 109 runs had
+# their PR base actually confirmed (17 checked, all trunk-dev) and which
+# did not.
 pr_completed = [r for r in runs if r['event']=='pull_request' and r['status']=='completed']
 cutoff = '2026-09-16T09:33:24Z'   # the 09-16 report's own cutoff
 new = [r for r in pr_completed if r['created_at'] > cutoff]
