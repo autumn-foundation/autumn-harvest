@@ -11745,6 +11745,112 @@ mod tests {
         );
     }
 
+    /// Snag QA finding (issue #1627): `WorkflowDetailParams.event_page`/
+    /// `jump_event` are still `Option<i64>`, not the `String` +
+    /// `parse_page_query_field` shape `WorkflowListParams`/`WorkerListParams`/
+    /// `DeadLetterListParams`/`ScheduleListParams` were fixed to in
+    /// #1540/#1560/#1588/#1619. This is the exact same defect class on the
+    /// Workflow Detail page: `Query<T>` (`autumn_web::extract::Query`)
+    /// deserializes through `autumn_web::query_string::from_query_str`, which
+    /// fails the whole request with `400 Bad Request` on a non-numeric field,
+    /// before `workflow_detail_ui` -- or its `log_level` filter, or anything
+    /// else on the page -- ever runs. Unlike the four fixed list pages, this
+    /// is the single-execution drill-down every one of them links into, so
+    /// the blast radius is the whole execution view (status, blocked-on
+    /// panel, activity attempts, signals, timeline), not just a pager.
+    ///
+    /// Characterization test: passes today and documents the current (bad)
+    /// behavior with a deterministic, DB-free repro. See the `#[ignore]`d
+    /// regression tests below for the intended, fixed behavior.
+    #[tokio::test]
+    async fn workflow_detail_params_rejects_non_numeric_event_page_before_handler_runs() {
+        let (mut parts, ()) = axum::http::Request::builder()
+            .uri("/workflows/abc?event_page=not-a-number&log_level=warn")
+            .body(())
+            .expect("request builds")
+            .into_parts();
+        let result =
+            <Query<WorkflowDetailParams> as axum::extract::FromRequestParts<()>>::from_request_parts(
+                &mut parts,
+                &(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a non-numeric event_page must not silently abort the whole detail page \
+             (it currently does, discarding the log_level filter too): {result:?}"
+        );
+    }
+
+    /// Same defect, `jump_event` side -- the "jump to event N" search box.
+    #[tokio::test]
+    async fn workflow_detail_params_rejects_non_numeric_jump_event_before_handler_runs() {
+        let (mut parts, ()) = axum::http::Request::builder()
+            .uri("/workflows/abc?jump_event=not-a-number")
+            .body(())
+            .expect("request builds")
+            .into_parts();
+        let result =
+            <Query<WorkflowDetailParams> as axum::extract::FromRequestParts<()>>::from_request_parts(
+                &mut parts,
+                &(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a non-numeric jump_event must not silently abort the whole detail page: {result:?}"
+        );
+    }
+
+    /// Quarantined regression test (issue #1627): the intended, fixed
+    /// behavior -- a non-numeric `event_page` must degrade gracefully (like
+    /// `WorkflowListParams.page` does via `parse_page_query_field`), not
+    /// 400-reject the whole request before the handler runs. `#[ignore]`d
+    /// because the fix is not implemented; un-ignore once `event_page` is
+    /// retyped off raw `Option<i64>`.
+    #[ignore = "issue #1627 not yet fixed: event_page still Option<i64>, aborts via Query extractor"]
+    #[tokio::test]
+    async fn workflow_detail_params_degrades_gracefully_on_non_numeric_event_page() {
+        let (mut parts, ()) = axum::http::Request::builder()
+            .uri("/workflows/abc?event_page=not-a-number&log_level=warn")
+            .body(())
+            .expect("request builds")
+            .into_parts();
+        let result =
+            <Query<WorkflowDetailParams> as axum::extract::FromRequestParts<()>>::from_request_parts(
+                &mut parts,
+                &(),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "a non-numeric event_page should degrade to a default page, not abort \
+             the whole detail page and discard log_level: {result:?}"
+        );
+    }
+
+    /// Quarantined regression test (issue #1627), `jump_event` side.
+    #[ignore = "issue #1627 not yet fixed: jump_event still Option<i64>, aborts via Query extractor"]
+    #[tokio::test]
+    async fn workflow_detail_params_degrades_gracefully_on_non_numeric_jump_event() {
+        let (mut parts, ()) = axum::http::Request::builder()
+            .uri("/workflows/abc?jump_event=not-a-number")
+            .body(())
+            .expect("request builds")
+            .into_parts();
+        let result =
+            <Query<WorkflowDetailParams> as axum::extract::FromRequestParts<()>>::from_request_parts(
+                &mut parts,
+                &(),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "a non-numeric jump_event should degrade to a default page, not abort \
+             the whole detail page: {result:?}"
+        );
+    }
+
     #[test]
     fn parse_page_query_field_blank_or_missing_is_not_an_error() {
         assert_eq!(parse_page_query_field(None), (0, String::new(), None));
