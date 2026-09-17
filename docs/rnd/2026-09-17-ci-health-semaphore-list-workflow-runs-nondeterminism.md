@@ -7,7 +7,7 @@
 # audited population — 10 explicit failures and a 7-run
 # cancelled-run sample, not the full 109-run window — shows no recurrence
 # of the tracked activity-timeout, quota-enforcement, or `corpus`
-# signatures, with 17 confirmed passing shard-8 executions as positive
+# signatures, with 15 confirmed passing shard-8 executions as positive
 # exposure evidence for the activity-timeout fix, plus a fully
 # root-caused `benchmarks_docs` defect that left trunk-dev red against
 # its own gate for 4h13m
@@ -193,20 +193,15 @@ independently on every non-draft, non-docs-only PR whose `Lint` job
 succeeds (`needs: [lint, changes]`, `fail-fast: false`) — a run's overall
 `success` conclusion says nothing by itself about whether shard 8 (where
 this test lives) ran and passed; it has to be checked directly. Checked
-directly: **all 13 of this window's `success`-conclusion runs ran `Test DB
-(linux, shard 8)`, and all 13 report `conclusion: "success"`** —
+directly: all 13 of this window's `success`-conclusion runs ran `Test DB
+(linux, shard 8)` with job-level `conclusion: "success"` —
 `35089473138`, `35100701044`, `35100891367`, `35105421682`,
 `35105776046`, `35108239864`, `35113095127`, `35122845094`,
 `35145046673`, `35149088615`, `35174612204`, `35188629910`,
-`35195626323`. A job-level `success` on this shard requires every suite
-`run-suites.sh run linux` executes there (including `integration_e2e.rs`,
-run with `--test-threads=1`) to have passed, since any test failure in that
-serial run would fail the step and the job. Directly log-verified for one
-of the 13 (`35105776046`, fetched via the job's signed log URL and
-`curl`ed): `test integration_e2e::worker_fails_workflow_when_activity_start_to_close_timeout_elapses
-... ok`. The other 12 are confirmed at the job-conclusion level (strong,
-but not individually log-grepped for this exact assertion the way
-`35105776046` and the 09-16 report's own `35034838493` were).
+`35195626323`. Directly log-verified for one of the 13 (`35105776046`,
+fetched via the job's signed log URL and `curl`ed):
+`test integration_e2e::worker_fails_workflow_when_activity_start_to_close_timeout_elapses
+... ok`.
 
 **A third Codex review then caught that this still undercounted**: the
 reproduction only ran `list_workflow_jobs` for the 13 `success`-conclusion
@@ -221,15 +216,30 @@ failures, `Lint` succeeded on exactly 4 — the `benchmarks_docs` cluster
 (item 5): `35129116518`, `35145049656`, `35145054552`, `35152977594`
 (the 6 others all failed inside `Lint` itself, which skips `test-db-linux`
 entirely, per the mechanism the 09-16 report first established). All 4
-of those ran `Test DB (linux, shard 8)` with `conclusion: "success"` —
-confirmed at the job level, not individually log-grepped.
+of those ran `Test DB (linux, shard 8)` with job-level `conclusion:
+"success"` too.
 
-Correctly stated: **17 confirmed passing shard-8 executions this window**
-(13 from `success`-conclusion runs, 1 of those log-verified to the exact
-assertion text; 4 more from `failure`-conclusion runs whose `Lint` job
-independently succeeded), plus zero occurrences of the tracked failure
-signature among the 10 explicit failures and the 7-run cancelled sample
-(item 6) — not a clean census of the full 109-run window, since the 79
+**A fourth Codex review then caught that a job-level `success` on this
+shard is not itself proof the suite ran.** `ci.yml`'s own docs-only-skip
+design (see the file's header comment) keeps the `Test DB (linux, shard N)`
+*job* present and green even when `needs.changes.outputs.code == 'false'`
+— it only gates the actual `Run Linux Docker-backed manifest suites
+(shard)` *step* inside that job. A docs-only PR's shard-8 job reports
+`success` having run nothing. Checked the step-level conclusion for all 17
+job-level successes above (the `steps` array `list_workflow_jobs` already
+returned, not a new fetch): **15 of the 17 show the suite step itself as
+`success`; 2 — `35089473138` (this series' own 09-16 report PR, a
+docs-only change) and `35188629910` (a Folio corpus-index change, also
+docs-only) — show the suite step as `skipped`.** Those 2 are trivial
+no-op passes, not executions, and do not belong in the exposure count.
+
+Correctly stated: **15 confirmed passing shard-8 *executions* this
+window** (11 from `success`-conclusion runs after excluding the 2
+docs-only no-ops, 1 of those 11 log-verified to the exact assertion text;
+4 more from `failure`-conclusion runs whose `Lint` job independently
+succeeded), plus zero occurrences of the tracked failure signature among
+the 10 explicit failures and the 7-run cancelled sample (item 6) — not a
+clean census of the full 109-run window, since the 79
 unaudited cancelled runs could still hide a shard-8 execution this report
 never checked (in either direction — pass or fail). This is real,
 positive exposure evidence for the fix holding, well beyond this report's
@@ -384,12 +394,14 @@ instrument every report in this series has relied on for its Tier-1
 than silently worked around.
 
 **Item 1** additionally has real positive exposure evidence, not just
-absence of failure: 17 confirmed passing shard-8 executions this window
-(1 log-verified, 16 job-conclusion-verified — 13 from the `success`-
-conclusion runs, 4 more from `failure`-conclusion runs whose `Lint` job
-independently succeeded), on top of zero occurrences among the 10
-explicit failures and the 7-run cancelled sample. **Items 1–3** together
-show continued absence of recurrence for three previously open items,
+absence of failure: 15 confirmed passing shard-8 *executions* this window
+(1 log-verified, 14 step-conclusion-verified — 11 from the `success`-
+conclusion runs after excluding 2 docs-only no-ops that reported job-level
+`success` having run nothing, plus 4 more from `failure`-conclusion runs
+whose `Lint` job independently succeeded), on top of zero occurrences
+among the 10 explicit failures and the 7-run cancelled sample. **Items
+1–3** together show continued absence of recurrence for three previously
+open items,
 among the population this session actually audited (10 explicit failures
 plus a 7-run cancelled sample, out of 109 runs in a provisionally-
 constructed ~22-hour window — "provisional" per item 0's own correction,
@@ -500,14 +512,15 @@ Items carried forward, unchanged:
   one. The single-key `event`-only and `status`-only filters were each
   called once and are **untested** for determinism, not confirmed reliable
   either (corrected from an earlier draft's stronger claim).
-- **Item 1:** 17/17 confirmed shard-8 executions ran and passed this
-  window (13/13 of the `success`-conclusion runs, 1 log-verified; plus
-  4/4 of the `failure`-conclusion runs whose own `Lint` job succeeded —
-  a second Codex-review catch, after the first one established that
+- **Item 1:** 15 confirmed shard-8 *executions* ran and passed this
+  window (11/13 of the `success`-conclusion runs — 2 excluded as
+  docs-only no-ops whose suite step was `skipped`, not run, a third
+  Codex-review catch on a job-level-only reading; 1 of the 11
+  log-verified; plus 4/4 of the `failure`-conclusion runs whose own
+  `Lint` job succeeded, a second catch after the first established that
   "zero opportunities" understated exposure by only counting the failure
-  side, and a follow-up caught that the fix itself still only checked the
-  success side). Plus 0/10 explicit failures and 0/7 cancelled sample
-  carry the failure signature.
+  side). Plus 0/10 explicit failures and 0/7 cancelled sample carry the
+  failure signature.
 - **Items 2–3:** 0 occurrences each among the 10 explicit failures and the
   7-run cancelled sample actually audited this window (corrected from an
   earlier draft's "0 new occurrences... over a 109-run window" — the other
@@ -639,6 +652,35 @@ grep "worker_fails_workflow_when_activity_start_to_close_timeout_elapses" \
 # then check the "Lint" job's own conclusion and the "Test DB (linux,
 # shard 8)" job's own conclusion -- all 4 show Lint: success and
 # shard 8: success.
+
+# Correction (post-review), a fourth pass: a job-level "success" on
+# "Test DB (linux, shard 8)" is not proof the suite ran -- ci.yml's
+# docs-only-skip design keeps the JOB green while gating only the
+# "Run Linux Docker-backed manifest suites (shard)" STEP inside it on
+# needs.changes.outputs.code == 'true'. Re-checked the steps[] array
+# already returned by the list_workflow_jobs calls above (no new fetch)
+# for all 17 job-level successes:
+python3 -c "
+import json
+files = {
+    35089473138: 'run1.json', 35100701044: 'run2.json', 35100891367: 'run3.json',
+    35105421682: 'run4.json', 35108239864: 'run5.json', 35113095127: 'run6.json',
+    35122845094: 'run7.json', 35145046673: 'run8.json', 35149088615: 'run9.json',
+    35174612204: 'run10.json', 35188629910: 'run11.json', 35195626323: 'run12.json',
+    35129116518: 'run13.json', 35145049656: 'run14.json', 35145054552: 'run15.json',
+    35152977594: 'run16.json',
+}  # saved list_workflow_jobs results, one file per run
+for run_id, path in files.items():
+    with open(path) as f:
+        jobs = json.load(f)['jobs']['jobs']
+    shard8 = next(j for j in jobs if 'shard 8' in j['name'] and 'DB' in j['name'])
+    step = next(s for s in shard8['steps'] if 'Run Linux Docker-backed manifest suites' in s['name'])
+    print(run_id, 'job:', shard8['conclusion'], '| suite step:', step['conclusion'])
+"
+# -> 15 of 17 show suite step "success" (a real execution); 35089473138
+#    (this series' own 09-16 report PR) and 35188629910 (a Folio
+#    corpus-index change) show "skipped" -- both docs-only, no-op passes,
+#    excluded from the exposure count.
 
 # Cancelled-run sample, this window:
 # actions_list(method="list_workflow_jobs", resource_id=<run_id>, perPage=100)
