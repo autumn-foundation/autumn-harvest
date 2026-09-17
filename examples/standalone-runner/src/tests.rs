@@ -1,9 +1,16 @@
 use autumn_harvest::{WorkflowEvent, WorkflowSimulator};
+use autumn_harvest_plugin::HarvestApiState;
 use autumn_harvest_plugin::prelude::HarvestMode;
+use autumn_web::AppState;
+use autumn_web::reexports::axum;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use serde_json::json;
+use tower::ServiceExt;
 
 use crate::domain::{RUNNER_QUEUE, StandaloneOrder};
 use crate::runtime::{standalone_builder, standalone_runtime_config};
+use crate::server::build_router;
 use crate::workflows;
 
 #[test]
@@ -76,4 +83,58 @@ async fn standalone_order_uses_version_gate_saga_and_child_workflow() {
         WorkflowEvent::ChildWorkflowStarted { workflow_name, .. }
             if workflow_name == "standalone_shipping"
     )));
+}
+
+/// HTTP-level coverage for the assembled router `server.rs` mounts (issue
+/// #1610). The three tests above assert only the workflow and config layer.
+/// Nothing before this exercised the router itself. That gap let two live
+/// defects go unnoticed until a real embedder hit them. The first was the
+/// `AppState::for_test()` call in the production entry point (issue #1607).
+/// The second was the always-`401` documented `preflight` step (issue
+/// #1609). No database is needed here. `HarvestApiState::new()` with
+/// nothing installed matches a router that has never received traffic. That
+/// is exactly the state these three routes must tolerate.
+fn router_under_test() -> axum::Router {
+    build_router(HarvestApiState::new(), AppState::for_test())
+}
+
+async fn get_status(app: axum::Router, uri: &str) -> StatusCode {
+    app.oneshot(
+        Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request should build"),
+    )
+    .await
+    .expect("router should serve the request")
+    .status()
+}
+
+#[tokio::test]
+async fn health_route_needs_no_database() {
+    assert_eq!(
+        get_status(router_under_test(), "/api/harvest/health").await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn openapi_document_is_ungated() {
+    assert_eq!(
+        get_status(router_under_test(), "/api/harvest/openapi.json").await,
+        StatusCode::OK
+    );
+}
+
+/// Pins issue #1609. The example's own README documents this exact request
+/// as the deployment preflight step. The example never declares a
+/// credential, so the admin gate fails closed. This assertion is a
+/// regression guard, not a fix. Flip it to `OK` once #1609 gives the
+/// example a credential to present.
+#[tokio::test]
+async fn preflight_without_a_credential_is_rejected() {
+    assert_eq!(
+        get_status(router_under_test(), "/api/harvest/admin/preflight").await,
+        StatusCode::UNAUTHORIZED
+    );
 }

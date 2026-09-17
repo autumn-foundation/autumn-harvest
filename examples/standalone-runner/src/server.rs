@@ -7,6 +7,21 @@ use serde_json::json;
 
 use crate::runtime::{standalone_builder, standalone_runtime_config};
 
+/// Assemble the raw Axum app the runner listens on: the runner health route
+/// plus `harvest_api_router` nested under `/api/harvest`.
+///
+/// Split out of [`run`] so a test can drive it with `tower::ServiceExt::oneshot`
+/// without binding a socket or starting a `HarvestRunner` (see `tests.rs`).
+pub fn build_router(api_state: HarvestApiState, web_state: autumn_web::AppState) -> axum::Router {
+    axum::Router::new()
+        .route(
+            "/",
+            get(|| async { Json(json!({ "service": "standalone-runner" })) }),
+        )
+        .nest("/api/harvest", harvest_api_router(api_state))
+        .with_state(web_state)
+}
+
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://runner:runner@localhost:5434/runner".to_owned());
@@ -31,13 +46,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     api_state.install(runner.api_runtime());
 
     let web_state = autumn_web::AppState::for_test().with_pool(pool);
-    let app = axum::Router::new()
-        .route(
-            "/",
-            get(|| async { Json(json!({ "service": "standalone-runner" })) }),
-        )
-        .nest("/api/harvest", harvest_api_router(api_state))
-        .with_state(web_state);
+    let app = build_router(api_state, web_state);
 
     let address = SocketAddr::from(([127, 0, 0, 1], 8082));
     tracing::info!(%address, "standalone Harvest runner listening");
