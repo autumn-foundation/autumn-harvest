@@ -11746,20 +11746,21 @@ mod tests {
     }
 
     /// Snag QA finding (issue #1627): `WorkflowDetailParams.event_page`/
-    /// `jump_event` are still `Option<i64>`, not the `String` +
-    /// `parse_page_query_field` shape `WorkflowListParams`/`WorkerListParams`/
-    /// `DeadLetterListParams`/`ScheduleListParams` were fixed to in
-    /// #1540/#1560/#1588/#1619. This is the exact same defect class on the
-    /// Workflow Detail page: `Query<T>` (`autumn_web::extract::Query`)
-    /// deserializes through `autumn_web::query_string::from_query_str`, which
-    /// fails the whole request with `400 Bad Request` on a non-numeric field,
-    /// before `workflow_detail_ui` -- or its `log_level` filter, or anything
-    /// else on the page -- ever runs. Unlike the four fixed list pages, this
-    /// is the single-execution drill-down every one of them links into, so
-    /// the blast radius is the whole execution view (status, blocked-on
-    /// panel, activity attempts, signals, timeline), not just a pager.
+    /// `jump_event` are still `Option<i64>`. `WorkflowListParams`/
+    /// `WorkerListParams`/`DeadLetterListParams`/`ScheduleListParams` were
+    /// fixed to a `String` + `parse_page_query_field` shape instead, in
+    /// #1540/#1560/#1588/#1619. This is the same defect class on the
+    /// Workflow Detail page. `Query<T>` (`autumn_web::extract::Query`)
+    /// deserializes through `autumn_web::query_string::from_query_str`.
+    /// A non-numeric field fails the whole request with `400 Bad Request`.
+    /// That happens before `workflow_detail_ui`, its `log_level` filter, or
+    /// anything else on the page ever runs. Unlike the four fixed list
+    /// pages, this is the single-execution drill-down every one of them
+    /// links into. The blast radius is the whole execution view (status,
+    /// blocked-on panel, activity attempts, signals, timeline), not just a
+    /// pager.
     ///
-    /// Characterization test: passes today and documents the current (bad)
+    /// Characterization test: passes today and documents the current, bad
     /// behavior with a deterministic, DB-free repro. See the `#[ignore]`d
     /// regression tests below for the intended, fixed behavior.
     #[tokio::test]
@@ -11803,10 +11804,10 @@ mod tests {
     }
 
     /// Quarantined regression test (issue #1627): the intended, fixed
-    /// behavior -- a non-numeric `event_page` must degrade gracefully (like
-    /// `WorkflowListParams.page` does via `parse_page_query_field`), not
-    /// 400-reject the whole request before the handler runs. `#[ignore]`d
-    /// because the fix is not implemented; un-ignore once `event_page` is
+    /// behavior. A non-numeric `event_page` must degrade gracefully, like
+    /// `WorkflowListParams.page` does via `parse_page_query_field`. It must
+    /// not 400-reject the whole request before the handler runs. `#[ignore]`d
+    /// because the fix is not implemented. Un-ignore once `event_page` is
     /// retyped off raw `Option<i64>`.
     #[ignore = "issue #1627 not yet fixed: event_page still Option<i64>, aborts via Query extractor"]
     #[tokio::test]
