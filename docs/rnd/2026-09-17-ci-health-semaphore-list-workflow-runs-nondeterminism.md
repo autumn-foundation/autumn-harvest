@@ -664,12 +664,19 @@ python3 -c "
 import json
 files = {
     35089473138: 'run1.json', 35100701044: 'run2.json', 35100891367: 'run3.json',
-    35105421682: 'run4.json', 35108239864: 'run5.json', 35113095127: 'run6.json',
+    35105421682: 'run4.json', 35105776046: 'run4b.json', 35108239864: 'run5.json',
+    35113095127: 'run6.json',
     35122845094: 'run7.json', 35145046673: 'run8.json', 35149088615: 'run9.json',
     35174612204: 'run10.json', 35188629910: 'run11.json', 35195626323: 'run12.json',
     35129116518: 'run13.json', 35145049656: 'run14.json', 35145054552: 'run15.json',
     35152977594: 'run16.json',
-}  # saved list_workflow_jobs results, one file per run
+}  # saved list_workflow_jobs results, one file per run -- 17 entries.
+# Correction (post-review): an earlier draft of this dict had only 16
+# entries, omitting 35105776046 (the log-verified run) -- a Codex review
+# correctly caught that running the script as written could only ever
+# report 14/16, not the 15/17 the text claims. 35105776046's own
+# list_workflow_jobs result (fetched while locating its shard-8 job id,
+# before the direct log grep) already carries steps[], added here.
 for run_id, path in files.items():
     with open(path) as f:
         jobs = json.load(f)['jobs']['jobs']
