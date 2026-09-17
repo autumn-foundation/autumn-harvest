@@ -6936,6 +6936,48 @@ async fn ui_dag_detail_invalid_refresh_redisplays_page_instead_of_aborting() {
     );
 }
 
+/// Codex review finding on this PR: a valid `refresh` alongside an invalid
+/// `node` used to still set a meta refresh. `layout_dag_detail` emits a
+/// bare `meta http-equiv`, with no target URL to drop the bad `node` from.
+/// The browser reloaded the same malformed URL forever. Each reload redid
+/// this page's DB reads. A valid `node` alongside an invalid `refresh`
+/// needs no such guard. `parse_refresh_query_field` already resolves an
+/// invalid `refresh` to no meta refresh on its own.
+#[tokio::test]
+async fn ui_dag_detail_invalid_node_suppresses_a_valid_refresh() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    let ia = autumn_harvest::ActivityExecId::new();
+    let exec_id = dag957_seed_run(
+        &url,
+        "dag957_linear",
+        "graph-invalid-node-valid-refresh",
+        vec![
+            dag957_sched("dag957_step_a", ia),
+            dag957_started(ia),
+            dag957_completed(ia),
+        ],
+        "RUNNING",
+    )
+    .await;
+
+    let (status, html) = fetch_html(
+        &app,
+        &format!("/dags/dag957_linear?run={exec_id}&node=not-a-number&refresh=30"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {html}");
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must be present: {html}"
+    );
+    assert!(
+        !html.contains("http-equiv=\"refresh\""),
+        "a valid refresh must not auto-reload a page carrying an invalid node: {html}"
+    );
+}
+
 // I-J — a real `skipped` node (via the #482 `dag_skip:` marker path, exactly as
 // `build_run_graph`/#690 read it) renders distinctly from a `pending` node end-
 // to-end, exercising #957 AC6 ("pending vs skipped visually distinct") through

@@ -884,7 +884,16 @@ async fn dag_detail_ui(
     };
 
     let (node, node_error) = parse_dag_node_query_field(params.node.as_deref());
-    let (refresh, refresh_error) = parse_refresh_query_field(params.refresh.as_deref());
+    let (mut refresh, refresh_error) = parse_refresh_query_field(params.refresh.as_deref());
+    // A valid `refresh` alongside an invalid `node` must not auto-reload.
+    // `layout_dag_detail` emits `refresh` as a bare `meta http-equiv`, with
+    // no target URL to drop the bad `node` from. Reloading the same URL
+    // would repeat the error forever, redoing this page's DB reads on
+    // every tick. Suppress refresh instead; the flash still names the bad
+    // value so the operator can fix the URL by hand.
+    if node_error.is_some() {
+        refresh = None;
+    }
 
     Ok(render_dag_detail(
         &dag_name,
