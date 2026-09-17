@@ -509,21 +509,47 @@ Items carried forward, unchanged:
 #   perPage=100, page=1)   # then page=2, page=3 — no workflow_runs_filter
 python3 -c "
 import json
+from collections import Counter
 pages = ['page1.json','page2.json','page3.json']  # saved tool-result files
+
+# Correction (post-review): an earlier draft of this script deduplicated
+# straight into a dict (allruns[r['id']] = r) without ever checking
+# whether a run repeated across a page boundary -- a Codex review
+# correctly caught that this would silently overwrite, not surface, the
+# exact pagination instability this workaround exists to guard against,
+# and that the script never actually asserted the invariants ('zero
+# gaps/duplicates', 'total_count identical on every page') the prose
+# cites as evidence. Rewritten to check the raw rows BEFORE deduplicating.
+total_counts = []
+raw_ids = []
 allruns = {}
 for p in pages:
     with open(p) as f:
         d = json.load(f)
+    total_counts.append(d['total_count'])
     for r in d['workflow_runs']:
+        raw_ids.append(r['id'])
         allruns[r['id']] = r
+
+assert len(set(total_counts)) == 1, f'total_count differs across pages: {total_counts}'
+dupes = {k: v for k, v in Counter(raw_ids).items() if v > 1}
+assert not dupes, f'duplicate run IDs across pages: {dupes}'
+run_numbers = sorted(r['run_number'] for r in allruns.values())
+assert run_numbers == list(range(run_numbers[0], run_numbers[-1] + 1)), 'run_number sequence has gaps'
+print('total_count (all pages):', total_counts[0])
+print('run_number range:', run_numbers[0], '-', run_numbers[-1], f'({len(run_numbers)} contiguous, no gaps, no duplicates)')
+
 runs = list(allruns.values())
 pr_completed = [r for r in runs if r['event']=='pull_request' and r['status']=='completed']
 cutoff = '2026-09-16T09:33:24Z'   # the 09-16 report's own cutoff
 new = [r for r in pr_completed if r['created_at'] > cutoff]
-from collections import Counter
 print(len(new), Counter(r['conclusion'] for r in new))
 "
-# -> 109 runs: {'cancelled': 86, 'success': 13, 'failure': 10}
+# -> total_count 5650 on all 3 pages; run_number range 5351-5650 (300
+#    contiguous, no gaps, no duplicates); 109 runs:
+#    {'cancelled': 86, 'success': 13, 'failure': 10}
+# Re-run against this session's own saved pages 2026-09-17: all three
+# assertions pass.
 
 # Item 5 — the benchmarks_docs root cause:
 git show 266ac9c:docs/benchmarks.md | grep -ni "temporal\|dbos\|cadence\|zeebe\|conductor\|restate"
