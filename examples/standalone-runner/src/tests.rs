@@ -86,14 +86,14 @@ async fn standalone_order_uses_version_gate_saga_and_child_workflow() {
 }
 
 /// HTTP-level coverage for the assembled router `server.rs` mounts (issue
-/// #1610). `runtime_config_uses_external_runner_mode_without_outbox` and its
-/// two siblings above assert the workflow/config layer; nothing before this
-/// exercised the router itself, which is how the `AppState::for_test()` call
-/// in the production entry point (issue #1607) and the always-`401`
-/// documented `preflight` step (issue #1609) both went unnoticed until a
-/// real embedder hit them. No database is needed: `HarvestApiState::new()`
-/// with nothing installed matches a router that has never received traffic,
-/// which is exactly the state these three routes must tolerate.
+/// #1610). The three tests above assert only the workflow and config layer.
+/// Nothing before this exercised the router itself. That gap let two live
+/// defects go unnoticed until a real embedder hit them. The first was the
+/// `AppState::for_test()` call in the production entry point (issue #1607).
+/// The second was the always-`401` documented `preflight` step (issue
+/// #1609). No database is needed here. `HarvestApiState::new()` with
+/// nothing installed matches a router that has never received traffic. That
+/// is exactly the state these three routes must tolerate.
 fn router_under_test() -> axum::Router {
     build_router(HarvestApiState::new(), AppState::for_test())
 }
@@ -126,10 +126,10 @@ async fn openapi_document_is_ungated() {
     );
 }
 
-/// Pins issue #1609: the example's own README documents this exact request
-/// as the deployment preflight step, but the example never declares a
-/// credential, so the admin gate fails closed. This assertion is the
-/// regression guard, not the fix — flip it to `OK` once #1609 gives the
+/// Pins issue #1609. The example's own README documents this exact request
+/// as the deployment preflight step. The example never declares a
+/// credential, so the admin gate fails closed. This assertion is a
+/// regression guard, not a fix. Flip it to `OK` once #1609 gives the
 /// example a credential to present.
 #[tokio::test]
 async fn preflight_without_a_credential_is_rejected() {
