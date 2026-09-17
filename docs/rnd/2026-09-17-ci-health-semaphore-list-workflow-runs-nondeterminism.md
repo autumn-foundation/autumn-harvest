@@ -7,7 +7,7 @@
 # audited population — 10 explicit failures and a 7-run
 # cancelled-run sample, not the full 109-run window — shows no recurrence
 # of the tracked activity-timeout, quota-enforcement, or `corpus`
-# signatures, with 13 confirmed passing shard-8 executions as positive
+# signatures, with 17 confirmed passing shard-8 executions as positive
 # exposure evidence for the activity-timeout fix, plus a fully
 # root-caused `benchmarks_docs` defect that left trunk-dev red against
 # its own gate for 4h13m
@@ -169,12 +169,13 @@ built the census for the window since the 09-16 report's cutoff
 13 success, 10 failure.**
 
 Job-logged all 10 explicit failures (`get_job_logs`, `failed_only=true`).
-None touched `test-db-linux` (shard 8, where `integration_e2e.rs` and this
-test live) at all — every one of the 10 failures this window was a `Lint`,
-`Test (<os>)`, or `Test (no-db, <os>, shard N)` job. Zero opportunities for
-the tracked signature to appear *as a failure* in the 10 explicit failures,
-and issue #1558 remains closed (`closed_at: 2026-09-15T14:00:25Z`, no
-reopening, confirmed via `issue_read` this session).
+None of the 10 failures' own **failed** jobs was `test-db-linux` — every
+one of the 10 was a `Lint`, `Test (<os>)`, or `Test (no-db, <os>, shard N)`
+job. Zero opportunities for the tracked signature to appear *as a
+failure* in the 10 explicit failures, and issue #1558 remains closed
+(`closed_at: 2026-09-15T14:00:25Z`, no reopening, confirmed via
+`issue_read` this session). **This does not mean shard 8 never ran in
+these 10 runs** — see the third correction below.
 
 **Correction (post-review), two rounds.** An earlier draft of this
 section's heading and this report's own title block said "zero new
@@ -207,17 +208,34 @@ of the 13 (`35105776046`, fetched via the job's signed log URL and
 but not individually log-grepped for this exact assertion the way
 `35105776046` and the 09-16 report's own `35034838493` were).
 
-Correctly stated: **13 confirmed passing shard-8 executions this window**
-(1 directly log-verified, 12 confirmed at job-conclusion level), plus zero
-occurrences of the tracked failure signature among the 10 explicit
-failures and the 7-run cancelled sample (item 6) — not a clean census of
-the full 109-run window, since the 79 unaudited cancelled runs could still
-hide a shard-8 execution this report never checked (in either direction —
-pass or fail). This is real, positive exposure evidence for the fix
-holding, well beyond this report's earlier "zero opportunities" framing,
-though still short of — and a much smaller sample than — the ≥20x
-same-commit rerun campaign issue #1558 originally asked for, which no
-session in this series has run.
+**A third Codex review then caught that this still undercounted**: the
+reproduction only ran `list_workflow_jobs` for the 13 `success`-conclusion
+runs, leaving the 10 `failure`-conclusion runs checked solely via
+`get_job_logs(..., failed_only=true)` — which shows only failed jobs, not
+whether `test-db-linux` ran independently and *passed* alongside the
+failure. Per the same `needs: [lint, changes]` / `fail-fast: false` wiring,
+a run whose overall conclusion is `failure` can still have run and passed
+`test-db-linux`, as long as `Lint` itself succeeded (the failure came from
+some other, independent job). Checked directly: of the 10 explicit
+failures, `Lint` succeeded on exactly 4 — the `benchmarks_docs` cluster
+(item 5): `35129116518`, `35145049656`, `35145054552`, `35152977594`
+(the 6 others all failed inside `Lint` itself, which skips `test-db-linux`
+entirely, per the mechanism the 09-16 report first established). All 4
+of those ran `Test DB (linux, shard 8)` with `conclusion: "success"` —
+confirmed at the job level, not individually log-grepped.
+
+Correctly stated: **17 confirmed passing shard-8 executions this window**
+(13 from `success`-conclusion runs, 1 of those log-verified to the exact
+assertion text; 4 more from `failure`-conclusion runs whose `Lint` job
+independently succeeded), plus zero occurrences of the tracked failure
+signature among the 10 explicit failures and the 7-run cancelled sample
+(item 6) — not a clean census of the full 109-run window, since the 79
+unaudited cancelled runs could still hide a shard-8 execution this report
+never checked (in either direction — pass or fail). This is real,
+positive exposure evidence for the fix holding, well beyond this report's
+earlier "zero opportunities" framing, though still short of — and a much
+smaller sample than — the ≥20x same-commit rerun campaign issue #1558
+originally asked for, which no session in this series has run.
 
 ### 2. `quota_enforcement_tests`'s unexplained 10-second target-row timeout (09-16 report item 3): not recurred among the runs audited
 
@@ -352,13 +370,17 @@ instrument every report in this series has relied on for its Tier-1
 than silently worked around.
 
 **Item 1** additionally has real positive exposure evidence, not just
-absence of failure: 13 confirmed passing shard-8 executions this window
-(1 log-verified, 12 job-conclusion-verified), on top of zero occurrences
-among the 10 explicit failures and the 7-run cancelled sample. **Items
-1–3** together show continued absence of recurrence for three previously
-open items, among the population this session actually audited (10
-explicit failures plus a 7-run cancelled sample, out of 109 runs in a
-reliably-constructed ~22-hour window). None of the three clears this
+absence of failure: 17 confirmed passing shard-8 executions this window
+(1 log-verified, 16 job-conclusion-verified — 13 from the `success`-
+conclusion runs, 4 more from `failure`-conclusion runs whose `Lint` job
+independently succeeded), on top of zero occurrences among the 10
+explicit failures and the 7-run cancelled sample. **Items 1–3** together
+show continued absence of recurrence for three previously open items,
+among the population this session actually audited (10 explicit failures
+plus a 7-run cancelled sample, out of 109 runs in a provisionally-
+constructed ~22-hour window — "provisional" per item 0's own correction,
+not a claim this construction method is itself confirmed reliable). None
+of the three clears this
 role's own bar for "confirmed holding" (no rerun campaign has ever been
 run for any of them), and none of the three is confirmed absent from the
 window's remaining 79 unaudited cancelled runs either — but none regressed
@@ -464,12 +486,14 @@ Items carried forward, unchanged:
   one. The single-key `event`-only and `status`-only filters were each
   called once and are **untested** for determinism, not confirmed reliable
   either (corrected from an earlier draft's stronger claim).
-- **Item 1:** 13/13 of this window's `success`-conclusion runs confirmed
-  shard 8 ran and passed (1 log-verified, 12 job-conclusion-verified) —
-  positive exposure evidence added after a Codex review correctly pointed
-  out that "zero opportunities" understated the fix's actual exposure this
-  window by only counting the failure side. Plus 0/10 explicit failures
-  and 0/7 cancelled sample carry the failure signature.
+- **Item 1:** 17/17 confirmed shard-8 executions ran and passed this
+  window (13/13 of the `success`-conclusion runs, 1 log-verified; plus
+  4/4 of the `failure`-conclusion runs whose own `Lint` job succeeded —
+  a second Codex-review catch, after the first one established that
+  "zero opportunities" understated exposure by only counting the failure
+  side, and a follow-up caught that the fix itself still only checked the
+  success side). Plus 0/10 explicit failures and 0/7 cancelled sample
+  carry the failure signature.
 - **Items 2–3:** 0 occurrences each among the 10 explicit failures and the
   7-run cancelled sample actually audited this window (corrected from an
   earlier draft's "0 new occurrences... over a 109-run window" — the other
@@ -575,6 +599,19 @@ grep -ni temporal docs/benchmarks.md   # current tree: no matches
 grep "worker_fails_workflow_when_activity_start_to_close_timeout_elapses" \
   /tmp/shard8_35105776046.log
 # -> "test integration_e2e::worker_fails_workflow_when_activity_start_to_close_timeout_elapses ... ok"
+
+# Correction (post-review), the same check extended to the 10 FAILURE-
+# conclusion runs: get_job_logs(..., failed_only=true) alone can't show a
+# job that ran and PASSED alongside an unrelated failure. Checked each of
+# the 10 for whether its own Lint job succeeded (test-db-linux needs
+# [lint, changes], so Lint failing skips it entirely -- 6 of the 10 fail
+# inside Lint itself, no opportunity). The other 4 (all benchmarks_docs,
+# item 5) have Lint succeeding:
+# actions_list(method="list_workflow_jobs", resource_id=<run_id>, perPage=100)
+#   35129116518 35145049656 35145054552 35152977594
+# then check the "Lint" job's own conclusion and the "Test DB (linux,
+# shard 8)" job's own conclusion -- all 4 show Lint: success and
+# shard 8: success.
 
 # Cancelled-run sample, this window:
 # actions_list(method="list_workflow_jobs", resource_id=<run_id>, perPage=100)
