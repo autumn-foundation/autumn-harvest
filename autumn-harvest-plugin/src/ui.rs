@@ -728,10 +728,16 @@ struct DagUiSummary {
 struct DagDetailParams {
     #[serde(default)]
     run: Option<String>,
+    // `node`/`refresh` are `String`, not `usize`/`u64` — same fix as
+    // `page`/`limit` on the Workflows, Workers, DLQ and Schedules pages
+    // (#1540/#1560/#1588/#1619). A numeric-typed field fails axum's query
+    // deserialization on non-numeric text with a bare 400 before this
+    // handler ever runs. That discards the selected run and every other
+    // query param already on the URL.
     #[serde(default)]
-    node: Option<usize>,
+    node: Option<String>,
     #[serde(default)]
-    refresh: Option<u64>,
+    refresh: Option<String>,
     #[serde(default)]
     flash: Option<String>,
 }
@@ -877,14 +883,28 @@ async fn dag_detail_ui(
         DagGraphView::NoRun
     };
 
+    let (node, node_error) = parse_dag_node_query_field(params.node.as_deref());
+    let (mut refresh, refresh_error) = parse_refresh_query_field(params.refresh.as_deref());
+    // A valid `refresh` alongside an invalid `node` must not auto-reload.
+    // `layout_dag_detail` emits `refresh` as a bare `meta http-equiv`, with
+    // no target URL to drop the bad `node` from. Reloading the same URL
+    // would repeat the error forever, redoing this page's DB reads on
+    // every tick. Suppress refresh instead; the flash still names the bad
+    // value so the operator can fix the URL by hand.
+    if node_error.is_some() {
+        refresh = None;
+    }
+
     Ok(render_dag_detail(
         &dag_name,
         &dag,
         &runs,
         selected_run,
-        params.node,
-        params.refresh,
+        node,
+        refresh,
         params.flash.as_deref(),
+        node_error.as_deref(),
+        refresh_error.as_deref(),
         view,
     ))
 }
@@ -1296,6 +1316,52 @@ fn parse_limit_query_field(raw: Option<&str>, default: i64) -> (i64, String, Opt
         // left empty rather than displayed alongside a different effective
         // value.
         |parsed| (parsed.clamp(1, MAX_PAGE_SIZE), String::new(), None),
+    )
+}
+
+/// Parses the DAG detail page's `node` query parameter — a 0-based index
+/// into the rendered run graph.
+///
+/// A non-numeric value falls back to no node selected and reports the bad
+/// value inline, instead of aborting the whole page (see
+/// `parse_page_query_field`). An out-of-range but well-formed index is left
+/// as-is: `render_dag_run_graph_section` already looks it up with
+/// `nodes.get(idx)` and renders no panel when it misses.
+fn parse_dag_node_query_field(raw: Option<&str>) -> (Option<usize>, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (None, None);
+    };
+    trimmed.parse::<usize>().map_or_else(
+        |_| {
+            (
+                None,
+                Some(format!(
+                    "Invalid node '{trimmed}'; expected a whole number. No node selected."
+                )),
+            )
+        },
+        |parsed| (Some(parsed), None),
+    )
+}
+
+/// Parses a page's `refresh` (auto-refresh interval, in seconds) query
+/// parameter. Same contract as [`parse_dag_node_query_field`]: a
+/// non-numeric value falls back to auto-refresh disabled and reports the
+/// bad value inline, instead of aborting the whole page.
+fn parse_refresh_query_field(raw: Option<&str>) -> (Option<u64>, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (None, None);
+    };
+    trimmed.parse::<u64>().map_or_else(
+        |_| {
+            (
+                None,
+                Some(format!(
+                    "Invalid refresh '{trimmed}'; expected a whole number of seconds. Auto-refresh disabled."
+                )),
+            )
+        },
+        |parsed| (Some(parsed), None),
     )
 }
 
@@ -7249,11 +7315,19 @@ fn render_dag_detail(
     selected_node: Option<usize>,
     refresh: Option<u64>,
     flash: Option<&str>,
+    node_error: Option<&str>,
+    refresh_error: Option<&str>,
     view: DagGraphView<'_>,
 ) -> Markup {
     let body = html! {
         @if let Some(message) = flash {
             div class="flash" role="status" tabindex="-1" autofocus { (message) }
+        }
+        @if let Some(error) = node_error {
+            span.field-error role="alert" { (error) }
+        }
+        @if let Some(error) = refresh_error {
+            span.field-error role="alert" { (error) }
         }
         h2 { "DAG " code { (dag_name) } " runs" }
         @if let Some(run_id) = selected_run {
@@ -11818,6 +11892,66 @@ mod tests {
         assert!(
             error.is_some_and(|message| message.contains(&DEFAULT_DLQ_PAGE_SIZE.to_string())),
             "the error should name the DLQ page's own default"
+        );
+    }
+
+    #[test]
+    fn parse_dag_node_query_field_accepts_valid_values() {
+        assert_eq!(parse_dag_node_query_field(Some("3")), (Some(3), None));
+        assert_eq!(parse_dag_node_query_field(Some("  7  ")), (Some(7), None));
+    }
+
+    #[test]
+    fn parse_dag_node_query_field_blank_or_missing_is_not_an_error() {
+        assert_eq!(parse_dag_node_query_field(None), (None, None));
+        assert_eq!(parse_dag_node_query_field(Some("   ")), (None, None));
+    }
+
+    /// GREEN -- the fix under test: a non-numeric `node` no longer aborts
+    /// the whole `/dags/{name}` response with axum's bare 400. It degrades
+    /// to no node selected while naming the bad value, matching
+    /// `parse_page_query_field`.
+    #[test]
+    fn parse_dag_node_query_field_rejects_non_numeric_text_without_erroring() {
+        let (node, error) = parse_dag_node_query_field(Some("not-a-number"));
+        assert_eq!(node, None, "an invalid node falls back to no selection");
+        let message = error.expect("an invalid node must carry a redisplayable error");
+        assert!(
+            message.contains("not-a-number") && message.contains("node"),
+            "the error names the bad value and the field: {message}"
+        );
+    }
+
+    /// A well-formed but out-of-range node index is left as-is, not
+    /// rejected. `render_dag_run_graph_section` already looks it up with
+    /// `nodes.get(idx)` and renders no panel on a miss.
+    #[test]
+    fn parse_dag_node_query_field_leaves_out_of_range_values_for_the_caller() {
+        assert_eq!(parse_dag_node_query_field(Some("9999")), (Some(9999), None));
+    }
+
+    #[test]
+    fn parse_refresh_query_field_accepts_valid_values() {
+        assert_eq!(parse_refresh_query_field(Some("30")), (Some(30), None));
+    }
+
+    #[test]
+    fn parse_refresh_query_field_blank_or_missing_is_not_an_error() {
+        assert_eq!(parse_refresh_query_field(None), (None, None));
+        assert_eq!(parse_refresh_query_field(Some("   ")), (None, None));
+    }
+
+    /// GREEN -- the fix under test: a non-numeric `refresh` no longer
+    /// aborts the whole `/dags/{name}` response with axum's bare 400. It
+    /// degrades to auto-refresh disabled while naming the bad value.
+    #[test]
+    fn parse_refresh_query_field_rejects_non_numeric_text_without_erroring() {
+        let (refresh, error) = parse_refresh_query_field(Some("not-a-number"));
+        assert_eq!(refresh, None, "an invalid refresh disables auto-refresh");
+        let message = error.expect("an invalid refresh must carry a redisplayable error");
+        assert!(
+            message.contains("not-a-number") && message.contains("refresh"),
+            "the error names the bad value and the field: {message}"
         );
     }
 
