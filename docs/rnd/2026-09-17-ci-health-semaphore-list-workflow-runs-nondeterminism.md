@@ -413,6 +413,23 @@ sample — both samples too small to compare rates. 79 of this window's 86
 cancelled runs remain unaudited (86 total minus the 7 actually read;
 `35081223941` counts as unaudited, not as a completed read).
 
+**Caveat (post-review): this 7-run check is conclusion-level, not
+log-level, and cannot rule out a signature that already printed before
+cancellation.** The method here reads each job's own `conclusion` field
+and flags anything other than `"cancelled"`/`"skipped"`/`"success"`. A job
+GitHub kills mid-step is recorded as `"cancelled"` regardless of what its
+process had already written to stdout — so a shard that printed the
+tracked activity-timeout, `quota_enforcement_tests`, or `corpus` failure
+and was cancelled a moment later (superseded by a newer push, the same
+`concurrency.cancel-in-progress` behavior 6 of these 7 runs already show)
+would read identically to a shard that was cancelled before running that
+test at all. None of the 7 runs' job logs were fetched and grepped for
+these signatures this session — only `35105355850`'s failing `Lint` step
+was inspected, because its `conclusion` was already `"failure"` and did
+not need a log to find. The "zero occurrences" claims below that cite this
+7-run sample (items 1–3) hold at the conclusion level checked, not as a
+log-content guarantee.
+
 ## 🔍 Diagnosis
 
 **Item 0** is a tooling defect external to this repository: the GitHub MCP
@@ -432,7 +449,9 @@ absence of failure: 15 confirmed passing shard-8 *executions* this window
 conclusion runs after excluding 2 docs-only no-ops that reported job-level
 `success` having run nothing, plus 4 more from `failure`-conclusion runs
 whose `Lint` job independently succeeded), on top of zero occurrences
-among the 10 explicit failures and the 7-run cancelled sample. **Items
+among the 10 explicit failures and the 7-run cancelled sample (the latter
+checked at job-conclusion level only, not log content — see item 6's
+caveat). **Items
 1–3** together show continued absence of recurrence for three previously
 open items,
 among the population this session actually audited (10 explicit failures
@@ -553,11 +572,14 @@ Items carried forward, unchanged:
   `Lint` job succeeded, a second catch after the first established that
   "zero opportunities" understated exposure by only counting the failure
   side). Plus 0/10 explicit failures and 0/7 cancelled sample carry the
-  failure signature.
+  failure signature (the cancelled sample at job-conclusion level only —
+  see item 6's caveat).
 - **Items 2–3:** 0 occurrences each among the 10 explicit failures and the
   7-run cancelled sample actually audited this window (corrected from an
   earlier draft's "0 new occurrences... over a 109-run window" — the other
-  79 cancelled runs were not checked). Not rerun-campaign confirmations.
+  79 cancelled runs were not checked, and the 7 that were checked were
+  read at job-conclusion level, not log content — item 6). Not
+  rerun-campaign confirmations.
 - **Item 4:** 1/1 occurrence this window, consistent with the known,
   unfixed defect.
 - **Item 5:** 4/4 occurrences confirmed to share one root cause (corrected
@@ -735,6 +757,9 @@ for run_id, path in files.items():
 #   35136021958 35138666154 35141974598
 # then filter for any job whose own "conclusion" is "failure" rather than
 # "cancelled"/"skipped"/"success".
+# Caveat (post-review): conclusion-only. No job log was fetched or grepped
+# for any of these 7 runs, so a tracked signature printed just before
+# cancellation would not be caught by this check -- see item 6.
 
 # Issue #1558 status check:
 # issue_read(owner="autumn-foundation", repo="autumn-harvest", issue_number=1558)
