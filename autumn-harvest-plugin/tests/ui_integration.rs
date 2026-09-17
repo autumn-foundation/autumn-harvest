@@ -6839,6 +6839,103 @@ async fn ui_dag_run_graph_unknown_run_returns_404_message() {
     );
 }
 
+/// GREEN -- the fix under test: a non-numeric `node` used to fail axum's
+/// query deserialization with a bare 400 before `dag_detail_ui` ever ran.
+/// That discarded the selected `?run=` along with everything else on the
+/// URL. Degrading to no node selected keeps the rest of the page intact.
+#[tokio::test]
+async fn ui_dag_detail_invalid_node_redisplays_page_instead_of_aborting() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    let ia = autumn_harvest::ActivityExecId::new();
+    let exec_id = dag957_seed_run(
+        &url,
+        "dag957_linear",
+        "graph-invalid-node",
+        vec![
+            dag957_sched("dag957_step_a", ia),
+            dag957_started(ia),
+            dag957_completed(ia),
+        ],
+        "RUNNING",
+    )
+    .await;
+
+    let (status, html) = fetch_html(
+        &app,
+        &format!("/dags/dag957_linear?run={exec_id}&node=not-a-number"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid node must not abort the whole DAG detail page: {html}"
+    );
+    assert!(
+        html.contains(&exec_id.to_string()),
+        "the selected run must survive an invalid node: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must be present: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+}
+
+/// Same fix, the `refresh` field. No form field backs `node` or `refresh`
+/// on this page. Both are link- or bookmark-driven only, so this is
+/// covered independently rather than assumed symmetric with `node`.
+#[tokio::test]
+async fn ui_dag_detail_invalid_refresh_redisplays_page_instead_of_aborting() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    let ia = autumn_harvest::ActivityExecId::new();
+    let exec_id = dag957_seed_run(
+        &url,
+        "dag957_linear",
+        "graph-invalid-refresh",
+        vec![
+            dag957_sched("dag957_step_a", ia),
+            dag957_started(ia),
+            dag957_completed(ia),
+        ],
+        "RUNNING",
+    )
+    .await;
+
+    let (status, html) = fetch_html(
+        &app,
+        &format!("/dags/dag957_linear?run={exec_id}&refresh=not-a-number"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid refresh must not abort the whole DAG detail page: {html}"
+    );
+    assert!(
+        html.contains(&exec_id.to_string()),
+        "the selected run must survive an invalid refresh: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must be present: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+    assert!(
+        !html.contains("http-equiv=\"refresh\""),
+        "an invalid refresh must not set a meta refresh: {html}"
+    );
+}
+
 // I-J — a real `skipped` node (via the #482 `dag_skip:` marker path, exactly as
 // `build_run_graph`/#690 read it) renders distinctly from a `pending` node end-
 // to-end, exercising #957 AC6 ("pending vs skipped visually distinct") through
