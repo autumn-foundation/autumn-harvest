@@ -7,8 +7,10 @@
 # audited population — 10 explicit failures and a 7-run
 # cancelled-run sample, not the full 109-run window — shows no recurrence
 # of the tracked activity-timeout, quota-enforcement, or `corpus`
-# signatures, plus a fully root-caused `benchmarks_docs` defect that left
-# trunk-dev red against its own gate for 4h13m
+# signatures, with 13 confirmed passing shard-8 executions as positive
+# exposure evidence for the activity-timeout fix, plus a fully
+# root-caused `benchmarks_docs` defect that left trunk-dev red against
+# its own gate for 4h13m
 
 **Status:** health report — no PR opened against `ci.yml` or any test. Continues
 the series from `docs/rnd/2026-09-16-ci-health-semaphore-activity-timeout-flake-holding.md`.
@@ -160,8 +162,9 @@ because every future census in this series depends on knowing it.
 
 ### 1. Activity-timeout flake (`worker_fails_workflow_when_activity_start_to_close_timeout_elapses`, issue #1558/PR #1563): no occurrence among the runs actually audited
 
-Using the reliable method, built the census for the window since the 09-16
-report's cutoff (2026-09-16T09:33:24Z) through this session's wall clock
+Using the provisional-but-best-evidenced unfiltered method (see item 0),
+built the census for the window since the 09-16 report's cutoff
+(2026-09-16T09:33:24Z) through this session's wall clock
 (2026-09-17T07:39:28Z): **109 `pull_request`+`completed` runs — 86 cancelled,
 13 success, 10 failure.**
 
@@ -169,24 +172,52 @@ Job-logged all 10 explicit failures (`get_job_logs`, `failed_only=true`).
 None touched `test-db-linux` (shard 8, where `integration_e2e.rs` and this
 test live) at all — every one of the 10 failures this window was a `Lint`,
 `Test (<os>)`, or `Test (no-db, <os>, shard N)` job. Zero opportunities for
-the tracked signature to appear in the 10 explicit failures, and issue
-#1558 remains closed (`closed_at: 2026-09-15T14:00:25Z`, no reopening,
-confirmed via `issue_read` this session). **Correction (post-review):** an
-earlier draft of this section's heading and this report's own title block
-said "zero new occurrences in today's window," language a Codex review
-correctly flagged as broader than what was actually checked — item 6 below
-shows cancelled runs can hide job-level failures behind their overall
-`cancelled` conclusion, and 79 of this window's 86 cancelled runs were
-never read at job level. The 13 `success`-conclusion runs are structurally
-clean (every job in a `success` run passed, so this signature could not
-have fired without also failing the run), but the unaudited 79 cancelled
-runs are not — any of them could in principle carry a job-level failure
-this report never saw. Correctly stated: **zero occurrences among the 10
-explicit failures and the 7-run cancelled sample (item 6) actually audited
-this window** — not a clean census of the full 109-run window. This is
-consistent with — not proof of — the fix holding; the ≥20x same-commit
-rerun campaign issue #1558 originally asked for has still never been run by
-any session in this series.
+the tracked signature to appear *as a failure* in the 10 explicit failures,
+and issue #1558 remains closed (`closed_at: 2026-09-15T14:00:25Z`, no
+reopening, confirmed via `issue_read` this session).
+
+**Correction (post-review), two rounds.** An earlier draft of this
+section's heading and this report's own title block said "zero new
+occurrences in today's window," language a Codex review correctly flagged
+as broader than what was actually checked — item 6 below shows cancelled
+runs can hide job-level failures behind their overall `cancelled`
+conclusion, and 79 of this window's 86 cancelled runs were never read at
+job level, so "zero occurrences" could only honestly cover the 10 explicit
+failures and the 7-run cancelled sample (item 6), not the full window.
+
+A second Codex review then made the more useful catch: reporting "zero
+opportunities" from the failure side alone materially understates the
+fix's actual exposure this window, because `test-db-linux` runs
+independently on every non-draft, non-docs-only PR whose `Lint` job
+succeeds (`needs: [lint, changes]`, `fail-fast: false`) — a run's overall
+`success` conclusion says nothing by itself about whether shard 8 (where
+this test lives) ran and passed; it has to be checked directly. Checked
+directly: **all 13 of this window's `success`-conclusion runs ran `Test DB
+(linux, shard 8)`, and all 13 report `conclusion: "success"`** —
+`35089473138`, `35100701044`, `35100891367`, `35105421682`,
+`35105776046`, `35108239864`, `35113095127`, `35122845094`,
+`35145046673`, `35149088615`, `35174612204`, `35188629910`,
+`35195626323`. A job-level `success` on this shard requires every suite
+`run-suites.sh run linux` executes there (including `integration_e2e.rs`,
+run with `--test-threads=1`) to have passed, since any test failure in that
+serial run would fail the step and the job. Directly log-verified for one
+of the 13 (`35105776046`, fetched via the job's signed log URL and
+`curl`ed): `test integration_e2e::worker_fails_workflow_when_activity_start_to_close_timeout_elapses
+... ok`. The other 12 are confirmed at the job-conclusion level (strong,
+but not individually log-grepped for this exact assertion the way
+`35105776046` and the 09-16 report's own `35034838493` were).
+
+Correctly stated: **13 confirmed passing shard-8 executions this window**
+(1 directly log-verified, 12 confirmed at job-conclusion level), plus zero
+occurrences of the tracked failure signature among the 10 explicit
+failures and the 7-run cancelled sample (item 6) — not a clean census of
+the full 109-run window, since the 79 unaudited cancelled runs could still
+hide a shard-8 execution this report never checked (in either direction —
+pass or fail). This is real, positive exposure evidence for the fix
+holding, well beyond this report's earlier "zero opportunities" framing,
+though still short of — and a much smaller sample than — the ≥20x
+same-commit rerun campaign issue #1558 originally asked for, which no
+session in this series has run.
 
 ### 2. `quota_enforcement_tests`'s unexplained 10-second target-row timeout (09-16 report item 3): not recurred among the runs audited
 
@@ -320,7 +351,11 @@ instrument every report in this series has relied on for its Tier-1
 "reproducible protocol" claim, so it is diagnosed and routed here rather
 than silently worked around.
 
-**Items 1–3** show continued absence of recurrence for three previously
+**Item 1** additionally has real positive exposure evidence, not just
+absence of failure: 13 confirmed passing shard-8 executions this window
+(1 log-verified, 12 job-conclusion-verified), on top of zero occurrences
+among the 10 explicit failures and the 7-run cancelled sample. **Items
+1–3** together show continued absence of recurrence for three previously
 open items, among the population this session actually audited (10
 explicit failures plus a 7-run cancelled sample, out of 109 runs in a
 reliably-constructed ~22-hour window). None of the three clears this
@@ -429,7 +464,13 @@ Items carried forward, unchanged:
   one. The single-key `event`-only and `status`-only filters were each
   called once and are **untested** for determinism, not confirmed reliable
   either (corrected from an earlier draft's stronger claim).
-- **Items 1–3:** 0 occurrences each among the 10 explicit failures and the
+- **Item 1:** 13/13 of this window's `success`-conclusion runs confirmed
+  shard 8 ran and passed (1 log-verified, 12 job-conclusion-verified) —
+  positive exposure evidence added after a Codex review correctly pointed
+  out that "zero opportunities" understated the fix's actual exposure this
+  window by only counting the failure side. Plus 0/10 explicit failures
+  and 0/7 cancelled sample carry the failure signature.
+- **Items 2–3:** 0 occurrences each among the 10 explicit failures and the
   7-run cancelled sample actually audited this window (corrected from an
   earlier draft's "0 new occurrences... over a 109-run window" — the other
   79 cancelled runs were not checked). Not rerun-campaign confirmations.
@@ -462,7 +503,8 @@ Items carried forward, unchanged:
 # actions_list(..., resource_id="ci.yml")                          # no filter — matches ground truth
 # actions_get(method="get_workflow_run", resource_id=35195626323)  # called 2x, identical both times
 
-# The reliable substitute used for this report's census:
+# The provisional (not proven call-to-call deterministic — see item 0)
+# substitute used for this report's census:
 # actions_list(method="list_workflow_runs", resource_id="ci.yml",
 #   perPage=100, page=1)   # then page=2, page=3 — no workflow_runs_filter
 python3 -c "
@@ -494,6 +536,19 @@ grep -ni temporal docs/benchmarks.md   # current tree: no matches
 # get_job_logs(run_id=<id>, failed_only=true, return_content=true, tail_lines=50-60)
 #   35096353603 35100756217 35117297810 35122304096 35129116518
 #   35132957731 35140963232 35145049656 35145054552 35152977594
+
+# Item 1's shard-8 positive-exposure check, this window's 13 success runs:
+# actions_list(method="list_workflow_jobs", resource_id=<run_id>, perPage=100)
+#   35089473138 35100701044 35100891367 35105421682 35105776046
+#   35108239864 35113095127 35122845094 35145046673 35149088615
+#   35174612204 35188629910 35195626323
+# then grep each job list for name contains "shard 8" and read its
+# "conclusion" -- all 13 report "success".
+# Log-verify one directly: get_job_logs(job_id=104835185301,
+#   return_content=false) for the signed logs_url, then curl it and grep:
+grep "worker_fails_workflow_when_activity_start_to_close_timeout_elapses" \
+  /tmp/shard8_35105776046.log
+# -> "test integration_e2e::worker_fails_workflow_when_activity_start_to_close_timeout_elapses ... ok"
 
 # Cancelled-run sample, this window:
 # actions_list(method="list_workflow_jobs", resource_id=<run_id>, perPage=100)
