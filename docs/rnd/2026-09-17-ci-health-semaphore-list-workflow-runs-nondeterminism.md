@@ -37,7 +37,7 @@ load-bearing subsets — item 1's 13 shard-8 success-run branches and item
 the PR number where the run's own `pull_requests` array was empty), and
 every one of those 17 unique PRs has `base.ref: "trunk-dev"`. Zero target
 `trunk`. **Not checked**: the base branch of the 6 `Lint`-only-failure runs
-(the other 4 of the 10 explicit failures, excluded from item 5's cluster)
+(the other 6 of the 10 explicit failures, excluded from item 5's cluster)
 or of the 7-run cancelled-run sample in item 6 — those runs' conclusions
 don't feed a load-bearing claim in this report, so they were left
 unverified rather than pulled in speculatively. The verdict path above
