@@ -11760,9 +11760,16 @@ mod tests {
     /// blocked-on panel, activity attempts, signals, timeline), not just a
     /// pager.
     ///
-    /// Characterization test: passes today and documents the current, bad
-    /// behavior with a deterministic, DB-free repro. See the `#[ignore]`d
-    /// regression tests below for the intended, fixed behavior.
+    /// Characterization test: documents the current, bad behavior with a
+    /// deterministic, DB-free repro. See the regression tests below for the
+    /// intended, fixed behavior.
+    ///
+    /// Quarantined like the regression tests, for the opposite reason
+    /// (Codex review on this PR). This asserts the *current buggy*
+    /// response, so a correct fix flips it from passing to failing. Delete
+    /// this test once issue #1627 is fixed. Do not un-ignore it; the
+    /// regression tests below are the permanent record.
+    #[ignore = "issue #1627: documents pre-fix behavior; delete, do not un-ignore, once fixed"]
     #[tokio::test]
     async fn workflow_detail_params_rejects_non_numeric_event_page_before_handler_runs() {
         let (mut parts, ()) = axum::http::Request::builder()
@@ -11784,6 +11791,9 @@ mod tests {
     }
 
     /// Same defect, `jump_event` side -- the "jump to event N" search box.
+    /// Quarantined for the same reason as the `event_page` characterization
+    /// test above: delete, do not un-ignore, once issue #1627 is fixed.
+    #[ignore = "issue #1627: documents pre-fix behavior; delete, do not un-ignore, once fixed"]
     #[tokio::test]
     async fn workflow_detail_params_rejects_non_numeric_jump_event_before_handler_runs() {
         let (mut parts, ()) = axum::http::Request::builder()
