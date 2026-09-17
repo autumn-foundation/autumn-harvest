@@ -11833,10 +11833,18 @@ mod tests {
                 &(),
             )
             .await;
-        assert!(
-            result.is_ok(),
+        let Query(params) = result.expect(
             "a non-numeric event_page should degrade to a default page, not abort \
-             the whole detail page and discard log_level: {result:?}"
+             the whole detail page and discard log_level",
+        );
+        // The extractor succeeding is necessary but not sufficient: it must
+        // also carry every other field through untouched. `log_level` is the
+        // field this bug drops today, so pin it explicitly, not just
+        // overall success.
+        assert_eq!(
+            params.log_level.as_deref(),
+            Some("warn"),
+            "log_level must survive alongside a degraded event_page"
         );
     }
 
