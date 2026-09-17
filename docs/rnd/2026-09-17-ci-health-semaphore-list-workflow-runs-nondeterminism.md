@@ -1,11 +1,12 @@
 # 🚦 Semaphore CI health — the census tool itself is non-deterministic:
 # four identical `list_workflow_runs` calls returned four different
-# 100-run samples spanning different multi-day windows, while the
-# unfiltered list and single-run lookups stayed stable; today's window
-# (09-16T09:33Z→09-17T07:39Z, gathered via the reliable method) shows
-# zero recurrence of the tracked activity-timeout, quota-enforcement, or
-# `corpus` signatures, plus a fully root-caused `benchmarks_docs` defect
-# that left trunk-dev red against its own gate for 4h13m
+# `total_count`s across 3 distinct date windows, while a single-run
+# lookup (repeated) and the unfiltered list (cross-validated) stayed
+# stable; today's audited population — 10 explicit failures and a 7-run
+# cancelled-run sample, not the full 109-run window — shows no recurrence
+# of the tracked activity-timeout, quota-enforcement, or `corpus`
+# signatures, plus a fully root-caused `benchmarks_docs` defect that left
+# trunk-dev red against its own gate for 4h13m
 
 **Status:** health report — no PR opened against `ci.yml` or any test. Continues
 the series from `docs/rnd/2026-09-16-ci-health-semaphore-activity-timeout-flake-holding.md`.
@@ -17,7 +18,7 @@ Same verdict path as the whole series: `ci.yml`'s `pull_request` trigger against
 Branch-protection status for these matrices and `openapi-client-smoke` remains
 unconfirmed — no branch-protection-read tool is exposed in this session, same
 gap every prior report in this series has logged. Cache-usage API access is
-also still unavailable. Item **g** below adds a concrete data point to the
+also still unavailable. Item **5** below adds a concrete data point to the
 branch-protection gap, not a resolution of it.
 
 ## 🌡️ Symptom
@@ -32,7 +33,7 @@ session, not inferred.
 
 Four back-to-back calls with **identical parameters** (same `owner`, `repo`,
 `resource_id="ci.yml"`, `perPage=100`, `page=1`, same filter object) returned
-four different result sets:
+four different `total_count`s:
 
 | Call | `total_count` | Newest run in page | Oldest run in page |
 |---|---:|---|---|
@@ -41,28 +42,56 @@ four different result sets:
 | 3 | 4854 | `35195626323` (run 5650, 2026-09-17T07:39:28Z) | run 5535, 2026-09-16T10:53:08Z |
 | 4 | 2301 | `34316264290` (run 4575, 2026-09-09T05:46:48Z) | run 4447, 2026-09-06T20:43:13Z |
 
+**Correction (post-review):** an earlier draft of this passage (and this
+report's own title block) described the 4 calls as returning "4 different
+100-run samples spanning different multi-day windows." A Codex review
+correctly caught that this overstates the date-window count: calls 1 and 4
+share the identical newest run (`34316264290`) and oldest run boundary
+(2026-09-06T20:43:13Z) — by that measure there are only **3 distinct date
+windows** across the 4 calls, not 4. What *is* still 4-for-4 different,
+and remains sufficient on its own to prove non-determinism, is
+`total_count`: 1973 and 2301 are different numbers despite calls 1 and 4
+reporting the same page boundaries, so those two calls were not proven to
+be identical samples either — only that their pages' min/max timestamps
+coincided. Restated precisely: **4 identical calls, 4 different
+`total_count`s, 3 distinct date windows** — not "4 different 100-run
+samples."
+
 Only call 3 lands anywhere near "now" (this session's wall clock is
 2026-09-17). Calls 1, 2 and 4 return **stale windows over a week old**, and
-call 1 and call 4 are near-identical to each other despite being separated by
-two other calls that returned completely different data — this is not
-monotonic drift or eventual pagination catch-up, it looks like the tool is
-drawing from a re-randomized or re-cached population each call.
+call 1 and call 4 share the same window despite being separated by two other
+calls that returned completely different windows — this is not monotonic
+drift or eventual pagination catch-up, it looks like the tool is drawing
+from a re-randomized or re-cached population each call.
 
-Isolated the cause by varying which filter keys were supplied, one call each:
+Varied which filter keys were supplied to see which combination triggers
+the defect, **one call each** for the single-key filters:
 
-| Filter | `total_count` | Newest run | Matches ground truth? |
+| Filter | `total_count` | Newest run | This one call's result |
 |---|---:|---|---|
-| none | 5650 | run 5650, 2026-09-17T07:39:28Z | yes |
-| `{status:"completed"}` only | 5645 | run 5650, 2026-09-17T07:39:28Z | yes |
+| none | 5650 | run 5650, 2026-09-17T07:39:28Z | matches ground truth |
+| `{status:"completed"}` only | 5645 | run 5650, 2026-09-17T07:39:28Z | matches ground truth |
 | `{event:"pull_request"}` only | 4783 | run 5631, 2026-09-16T20:07:37Z | stale but plausible (~11h old) |
-| `{event, status}` together | 1973–4854, varying per call | varying, up to 8 days stale | **no — non-deterministic** |
+| `{event, status}` together | 1973–4854, varying per call | varying, up to 8 days stale | **confirmed non-deterministic (4 calls)** |
 
-Ground truth confirmed independently: `get_workflow_run(resource_id=
-35195626323)`, called twice with identical arguments, returned identical,
-stable data both times (run 5650, `conclusion: "success"`, `created_at:
-2026-09-17T07:39:28Z`). Single-run lookups and the unfiltered list are
-reliable; only the **combined** `event`+`status` filter on
-`list_workflow_runs` is not.
+**Correction (post-review):** an earlier draft of this section's closing
+sentence claimed "single-run lookups and the unfiltered list are reliable;
+only the combined `event`+`status` filter... is not" — phrasing that
+implicitly extended to the single-key filters too. A Codex review
+correctly caught that this overreaches: only the **combined** filter was
+called repeatedly (4 times) and only `get_workflow_run` was called
+repeatedly (2 times) and the **unfiltered** list was cross-validated
+(3-page internal consistency plus matching the 09-16 report's own
+independently-gathered data, below) — those three are the only ones this
+report can actually call confirmed. The `status`-only and `event`-only
+rows above are each **one call**, exactly the evidentiary gap that sank
+this same report's own first-draft recommendation of the `status`-only
+filter (see the correction further below): one passing call proves
+nothing about whether a filter is deterministic, since the combined
+filter's own defect was only detectable by repetition. Correctly stated:
+this session **confirms** the combined filter is broken and **confirms**
+`get_workflow_run` and the unfiltered list are reliable; it leaves the
+single-key filters' own determinism **untested**, not "reliable."
 
 **This matters retroactively.** Every prior report in this series —
 09-03 through 09-16 — built its census with exactly this combined filter and
@@ -105,7 +134,7 @@ or test suite, so no PR against this repo's harness applies. Recorded here
 per this role's own "Ask before... adding CI plugins/dependencies" and
 because every future census in this series depends on knowing it.
 
-### 1. Activity-timeout flake (`worker_fails_workflow_when_activity_start_to_close_timeout_elapses`, issue #1558/PR #1563): zero new occurrences in today's window
+### 1. Activity-timeout flake (`worker_fails_workflow_when_activity_start_to_close_timeout_elapses`, issue #1558/PR #1563): no occurrence among the runs actually audited
 
 Using the reliable method, built the census for the window since the 09-16
 report's cutoff (2026-09-16T09:33:24Z) through this session's wall clock
@@ -116,23 +145,38 @@ Job-logged all 10 explicit failures (`get_job_logs`, `failed_only=true`).
 None touched `test-db-linux` (shard 8, where `integration_e2e.rs` and this
 test live) at all — every one of the 10 failures this window was a `Lint`,
 `Test (<os>)`, or `Test (no-db, <os>, shard N)` job. Zero opportunities for
-the tracked signature to appear in this window's explicit failures, and
-issue #1558 remains closed (`closed_at: 2026-09-15T14:00:25Z`, no reopening,
-confirmed via `issue_read` this session). This is consistent with — not
-proof of — the fix holding; the ≥20x same-commit rerun campaign issue #1558
-originally asked for has still never been run by any session in this series.
+the tracked signature to appear in the 10 explicit failures, and issue
+#1558 remains closed (`closed_at: 2026-09-15T14:00:25Z`, no reopening,
+confirmed via `issue_read` this session). **Correction (post-review):** an
+earlier draft of this section's heading and this report's own title block
+said "zero new occurrences in today's window," language a Codex review
+correctly flagged as broader than what was actually checked — item 6 below
+shows cancelled runs can hide job-level failures behind their overall
+`cancelled` conclusion, and 79 of this window's 86 cancelled runs were
+never read at job level. The 13 `success`-conclusion runs are structurally
+clean (every job in a `success` run passed, so this signature could not
+have fired without also failing the run), but the unaudited 79 cancelled
+runs are not — any of them could in principle carry a job-level failure
+this report never saw. Correctly stated: **zero occurrences among the 10
+explicit failures and the 7-run cancelled sample (item 6) actually audited
+this window** — not a clean census of the full 109-run window. This is
+consistent with — not proof of — the fix holding; the ≥20x same-commit
+rerun campaign issue #1558 originally asked for has still never been run by
+any session in this series.
 
-### 2. `quota_enforcement_tests`'s unexplained 10-second target-row timeout (09-16 report item 3): not recurred
+### 2. `quota_enforcement_tests`'s unexplained 10-second target-row timeout (09-16 report item 3): not recurred among the runs audited
 
-Zero occurrences among today's 10 job-logged failures or the 6 job-logged
-cancelled-run samples (below). Still 1/1 total across the series — not a
-rate, not clustered.
+Zero occurrences among today's 10 job-logged failures or the 7 job-logged
+cancelled-run samples (item 6 below) — not the full window; see item 1's
+correction above for why that distinction matters. Still 1/1 total across
+the series — not a rate, not clustered.
 
-### 3. `corpus::seeded_corpus_is_clean_under_the_syntactic_layer` (open candidate, 3 prior occurrences per the 09-15 report): not recurred
+### 3. `corpus::seeded_corpus_is_clean_under_the_syntactic_layer` (open candidate, 3 prior occurrences per the 09-15 report): not recurred among the runs audited
 
-Zero occurrences among today's 10 job-logged failures. Still short of this
-role's own ≥20-rerun bar for a measured rate; no session has yet run the
-rerun protocol this would need.
+Zero occurrences among today's 10 job-logged failures or the 7-run
+cancelled sample — again, the audited subset, not the full window. Still
+short of this role's own ≥20-rerun bar for a measured rate; no session has
+yet run the rerun protocol this would need.
 
 ### 4. `sqlite_feasibility_docs`'s self-contradicting panic message (09-08 report, diagnostic-quality issue): recurred once more, count now 108
 
@@ -250,9 +294,13 @@ instrument every report in this series has relied on for its Tier-1
 than silently worked around.
 
 **Items 1–3** show continued absence of recurrence for three previously
-open items, over a reliably-constructed ~22-hour window. None of the three
-clears this role's own bar for "confirmed holding" (no rerun campaign has
-ever been run for any of them), but none regressed either.
+open items, among the population this session actually audited (10
+explicit failures plus a 7-run cancelled sample, out of 109 runs in a
+reliably-constructed ~22-hour window). None of the three clears this
+role's own bar for "confirmed holding" (no rerun campaign has ever been
+run for any of them), and none of the three is confirmed absent from the
+window's remaining 79 unaudited cancelled runs either — but none regressed
+in what was checked.
 
 **Item 4** is the same known diagnostic-message defect recurring on
 schedule, as expected — not a new finding, not actioned for the same
@@ -324,17 +372,23 @@ Items carried forward, unchanged:
 ## 📊 Measurement
 
 - **Item 0:** 4/4 identical calls to the combined filter returned 4 distinct
-  `total_count` values (1973, 3911, 4854, 2301) and 4 distinct date windows,
-  one of which repeated near-identically after two intervening different
-  results. 2/2 identical calls to `get_workflow_run` for the same run ID
-  returned identical data. 1/1 unfiltered paginated fetch (3 pages) was
-  internally consistent (`total_count: 5650` on every page, contiguous run
-  numbers 5351–5650, zero gaps/duplicates) and reconstructed the exact same
-  15 failures the 09-16 report already named for the overlapping portion of
-  the window — cross-validated against a prior, independently-gathered
-  report, not just self-consistent.
-- **Items 1–3:** 0 new occurrences each, over a 109-run / ~22-hour window
-  built via the verified-reliable method. Not rerun-campaign confirmations.
+  `total_count` values (1973, 3911, 4854, 2301) across **3 distinct date
+  windows** (corrected from an earlier draft's "4 distinct date windows" —
+  calls 1 and 4 share the same newest/oldest run boundary, though their
+  `total_count`s still differ). 2/2 identical calls to `get_workflow_run`
+  for the same run ID returned identical data. 1/1 unfiltered paginated
+  fetch (3 pages) was internally consistent (`total_count: 5650` on every
+  page, contiguous run numbers 5351–5650, zero gaps/duplicates) and
+  reconstructed the exact same 15 failures the 09-16 report already named
+  for the overlapping portion of the window — cross-validated against a
+  prior, independently-gathered report, not just self-consistent. The
+  single-key `event`-only and `status`-only filters were each called once
+  and are **untested** for determinism, not confirmed reliable (corrected
+  from an earlier draft's stronger claim).
+- **Items 1–3:** 0 occurrences each among the 10 explicit failures and the
+  7-run cancelled sample actually audited this window (corrected from an
+  earlier draft's "0 new occurrences... over a 109-run window" — the other
+  79 cancelled runs were not checked). Not rerun-campaign confirmations.
 - **Item 4:** 1/1 occurrence this window, consistent with the known,
   unfixed defect.
 - **Item 5:** 3/3 occurrences confirmed to share one root cause via direct
