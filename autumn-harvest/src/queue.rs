@@ -6341,6 +6341,74 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
     &QUERY
 }
 
+/// The `required_build_id`/`required_capabilities` eligibility predicate
+/// [`claim_batched_candidate_attempt_query`] applies at three sites: the
+/// claim itself, the rate-limit debit, and the forced bucket lock.
+/// `row_ref` qualifies the row's own columns -- empty for `claimed`'s
+/// direct `UPDATE ... WHERE`, `t.` for a correlated `EXISTS` alias.
+/// `compat_ref` qualifies the one comparison against
+/// `harvest_build_compat.compatible_with`. `claimed` already spelled
+/// that one column with the full table name before this helper existed.
+/// It keeps that spelling here too. `labels_expr` supplies the worker's
+/// current labels. It is the shared `worker_info` CTE where that CTE is
+/// already in scope. Or it is an inline lookup, for a caller that must
+/// run before `worker_info` is defined.
+fn build_and_capability_eligibility_predicate(
+    row_ref: &str,
+    compat_ref: &str,
+    labels_expr: &str,
+) -> String {
+    format!(
+        "( \
+             {row_ref}required_build_id IS NULL \
+             OR $10 = '' \
+             OR {row_ref}required_build_id = $10 \
+             OR EXISTS ( \
+                 SELECT 1 FROM harvest_build_compat \
+                 WHERE build_id = $10 \
+                   AND compatible_with = {compat_ref}required_build_id \
+             ) \
+         ) \
+         AND ( \
+             {row_ref}required_capabilities IS NULL \
+             OR NOT EXISTS ( \
+                 SELECT 1 \
+                 FROM jsonb_array_elements({row_ref}required_capabilities) AS r(value) \
+                 WHERE ( \
+                     r.value ? 'Exact' AND ( \
+                         {labels_expr}->>(r.value->'Exact'->>'key') IS NULL \
+                         OR {labels_expr}->>(r.value->'Exact'->>'key') != (r.value->'Exact'->>'value') \
+                     ) \
+                 ) OR ( \
+                     r.value ? 'In' AND ( \
+                         {labels_expr}->>(r.value->'In'->>'key') IS NULL \
+                         OR NOT ( \
+                             (r.value->'In'->'values') @> jsonb_build_array({labels_expr}->>(r.value->'In'->>'key')) \
+                         ) \
+                     ) \
+                 ) \
+             ) \
+         )"
+    )
+}
+
+/// Wraps [`build_and_capability_eligibility_predicate`] in a correlated
+/// `EXISTS` against this candidate's own row (`$2`). This is for a site
+/// that has no `harvest_task_queue` row directly in scope.
+/// `rate_limit_debit`'s `UPDATE` targets `harvest_rate_limit_buckets`.
+/// The forced bucket lock has no `harvest_task_queue` reference at all
+/// otherwise.
+fn candidate_still_build_and_capability_eligible(labels_expr: &str) -> String {
+    format!(
+        "EXISTS ( \
+             SELECT 1 FROM harvest_task_queue t \
+             WHERE t.id = $2 \
+               AND {predicate} \
+         )",
+        predicate = build_and_capability_eligibility_predicate("t.", "t.", labels_expr)
+    )
+}
+
 /// The authoritative per-candidate claim attempt for [`claim_task_batched`].
 ///
 /// Applied to one row [`claim_task_batched_candidates_query`] already
@@ -6396,6 +6464,20 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
 /// draft). `rate_limit_debit` never touches the bucket row for such an
 /// activity, so a bypassed claim has no reason to wait on it either.
 ///
+/// The forced lock also gates on this candidate's own build-routing and
+/// capability eligibility (a sixteenth review finding, the same class as
+/// the circuit-breaker gate). `claimed` is certain to reject a
+/// build-incompatible or capability-mismatched candidate. Without this
+/// gate, the forced lock still waits on an unrelated transaction's
+/// bucket row first. That wait would stall the whole batch walk behind
+/// a lock the claim was never going to use.
+/// [`build_and_capability_eligibility_predicate`] builds the shared
+/// predicate `claimed` and `rate_limit_debit` also apply. This avoids a
+/// third hand-copied literal. The forced lock's own copy reads the
+/// worker's labels with an inline lookup, not the `worker_info` CTE. A
+/// CTE cannot reference one defined after it. `now_ts` must stay the
+/// query's leading CTE.
+///
 /// `rate_limit_available` (a further review finding) is
 /// [`effective_available_tokens_expr`]'s own formula with every `NOW()`
 /// replaced by `(SELECT ts FROM now_ts)`. The shared helper's `NOW()` is
@@ -6416,13 +6498,25 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
     static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         let rate_limit_available =
             effective_available_tokens_expr("b").replace("NOW()", "(SELECT ts FROM now_ts)");
+        let inline_worker_labels =
+            "COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb)";
+        let now_ts_eligibility =
+            candidate_still_build_and_capability_eligible(inline_worker_labels);
+        let debit_eligibility =
+            candidate_still_build_and_capability_eligible("(SELECT labels FROM worker_info)");
+        let claimed_eligibility = build_and_capability_eligibility_predicate(
+            "",
+            "harvest_task_queue.",
+            "(SELECT labels FROM worker_info)",
+        );
         format!(
             "WITH now_ts AS ( \
                  SELECT clock_timestamp() AS ts \
                  FROM (SELECT 1 AS one) base \
                  LEFT JOIN ( \
                      SELECT 1 AS x FROM harvest_rate_limit_buckets b \
-                     WHERE $6::text IS NOT NULL AND NOT ($7 = ANY($8)) AND b.key = $6 \
+                     WHERE $6::text IS NOT NULL AND NOT ($7 = ANY($8)) \
+                       AND {now_ts_eligibility} AND b.key = $6 \
                      FOR UPDATE \
                  ) locked ON TRUE \
              ), \
@@ -6437,40 +6531,7 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
                    AND NOT ($7 = ANY($8)) \
                    AND {rate_limit_available} >= 1.0 \
                    AND ($9::timestamptz IS NULL OR $9::timestamptz > (SELECT ts FROM now_ts)) \
-                   AND EXISTS ( \
-                       SELECT 1 FROM harvest_task_queue t \
-                       WHERE t.id = $2 \
-                         AND ( \
-                             t.required_build_id IS NULL \
-                             OR $10 = '' \
-                             OR t.required_build_id = $10 \
-                             OR EXISTS ( \
-                                 SELECT 1 FROM harvest_build_compat \
-                                 WHERE build_id = $10 \
-                                   AND compatible_with = t.required_build_id \
-                             ) \
-                         ) \
-                         AND ( \
-                             t.required_capabilities IS NULL \
-                             OR NOT EXISTS ( \
-                                 SELECT 1 \
-                                 FROM jsonb_array_elements(t.required_capabilities) AS r(value) \
-                                 WHERE ( \
-                                     r.value ? 'Exact' AND ( \
-                                         (SELECT labels FROM worker_info)->>(r.value->'Exact'->>'key') IS NULL \
-                                         OR (SELECT labels FROM worker_info)->>(r.value->'Exact'->>'key') != (r.value->'Exact'->>'value') \
-                                     ) \
-                                 ) OR ( \
-                                     r.value ? 'In' AND ( \
-                                         (SELECT labels FROM worker_info)->>(r.value->'In'->>'key') IS NULL \
-                                         OR NOT ( \
-                                             (r.value->'In'->'values') @> jsonb_build_array((SELECT labels FROM worker_info)->>(r.value->'In'->>'key')) \
-                                         ) \
-                                     ) \
-                                 ) \
-                             ) \
-                         ) \
-                   ) \
+                   AND {debit_eligibility} \
                  RETURNING b.key AS debited_key \
              ), \
              claimed AS ( \
@@ -6504,36 +6565,7 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
                        $9::timestamptz IS NULL \
                        OR $9::timestamptz > (SELECT ts FROM now_ts) \
                    ) \
-                   AND ( \
-                       required_build_id IS NULL \
-                       OR $10 = '' \
-                       OR required_build_id = $10 \
-                       OR EXISTS ( \
-                           SELECT 1 FROM harvest_build_compat \
-                           WHERE build_id = $10 \
-                             AND compatible_with = harvest_task_queue.required_build_id \
-                       ) \
-                   ) \
-                   AND ( \
-                       required_capabilities IS NULL \
-                       OR NOT EXISTS ( \
-                           SELECT 1 \
-                           FROM jsonb_array_elements(required_capabilities) AS r(value) \
-                           WHERE ( \
-                               r.value ? 'Exact' AND ( \
-                                   (SELECT labels FROM worker_info)->>(r.value->'Exact'->>'key') IS NULL \
-                                   OR (SELECT labels FROM worker_info)->>(r.value->'Exact'->>'key') != (r.value->'Exact'->>'value') \
-                               ) \
-                           ) OR ( \
-                               r.value ? 'In' AND ( \
-                                   (SELECT labels FROM worker_info)->>(r.value->'In'->>'key') IS NULL \
-                                   OR NOT ( \
-                                       (r.value->'In'->'values') @> jsonb_build_array((SELECT labels FROM worker_info)->>(r.value->'In'->>'key')) \
-                                   ) \
-                               ) \
-                           ) \
-                       ) \
-                   ) \
+                   AND {claimed_eligibility} \
                  RETURNING harvest_task_queue.* \
              ) \
              SELECT * FROM claimed"
@@ -7731,6 +7763,34 @@ mod tests {
              activities, matching rate_limit_debit's own exclusion, or a \
              bypassed claim serializes behind a lock it never needed; \
              got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR, the same class
+    /// as the circuit-breaker gate above. `claimed` is certain to reject
+    /// a candidate whose build compatibility was revoked or whose
+    /// required capability the worker no longer has. Without this gate,
+    /// the forced lock still waits on an unrelated transaction's bucket
+    /// row first. That wait stalls the whole batch walk behind a lock
+    /// this claim was never going to use. It also stalls every row the
+    /// walk still holds `FOR UPDATE SKIP LOCKED`.
+    #[test]
+    fn claim_batched_candidate_attempt_query_now_ts_skips_the_lock_for_an_ineligible_candidate() {
+        let sql = claim_batched_candidate_attempt_query();
+        let now_ts_clause = sql
+            .split("WITH now_ts AS (")
+            .nth(1)
+            .and_then(|rest| rest.split("rate_limit_debit AS (").next())
+            .unwrap_or_default();
+        assert!(
+            now_ts_clause.contains("FROM harvest_task_queue t")
+                && now_ts_clause.contains("t.id = $2")
+                && now_ts_clause.contains("FROM harvest_build_compat")
+                && now_ts_clause.contains("jsonb_array_elements(t.required_capabilities)"),
+            "now_ts's forced lock must re-check this candidate's own \
+             build-routing and capability eligibility before waiting on \
+             the bucket row, the same gate claimed and rate_limit_debit \
+             already apply; got:\n{sql}"
         );
     }
 

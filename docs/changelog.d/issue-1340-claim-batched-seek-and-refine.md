@@ -224,6 +224,27 @@ query's own re-check to pass) and a debit-leak test mirroring the
 build-routing one (a capability-mismatched candidate leaves the bucket
 untouched).
 
+Codex then caught a sixteenth bug (P2, the same liveness class as the
+tenth): `now_ts`'s forced bucket lock gated only on the rate-limit key
+and the circuit-breaker exclusion, not on whether this candidate was
+still build- or capability-eligible. `claimed` is certain to reject a
+build-incompatible or capability-mismatched candidate, yet the forced
+lock still waited on an unrelated transaction's bucket row first,
+stalling the whole batch walk behind a lock the claim was never going
+to use. Fixed by gating the forced lock on the SAME eligibility check
+`claimed` and `rate_limit_debit` apply. Extracted the shared predicate
+into `build_and_capability_eligibility_predicate` (and a wrapping
+`candidate_still_build_and_capability_eligible` for callers with no
+`harvest_task_queue` row directly in scope) rather than hand-copying it
+a third time. The forced lock's own copy reads the worker's labels with
+an inline lookup instead of the `worker_info` CTE: a CTE cannot
+reference one defined after it, and `now_ts` must stay the query's
+leading CTE for the seventh-bug fix above. Verified with a SQL-shape
+test pinning the new predicate inside `now_ts`'s own clause, and a
+DB-backed test mirroring the circuit-breaker skip test above (a real
+lock held by a separate connection; a build-incompatible claim must
+complete quickly despite contention it has no reason to wait on).
+
 **Not wired into the default claim path.** `claim_task`/`claim_task_on_shard`
 are unchanged. Issue #1340 is explicit that no query change should land
 against it without sign-off from someone with full context on `queue.rs`'s
@@ -232,7 +253,7 @@ tested, measured building block for that review, not a switch of default
 production behavior. It also does not implement the cross-region DR fence
 (#954) or the by-id claim (#1312) the single-row path carries.
 
-**Test evidence.** `tests/integration/claim_batched_tests.rs` (22 DB-backed
+**Test evidence.** `tests/integration/claim_batched_tests.rs` (23 DB-backed
 tests, red-then-green): equivalence with the single-row path on a plain
 backlog, an adversarial saturated-concurrency-key fixture matching ledger
 #4/#5's own shape, a multi-batch fixture with tied sort keys spanning a
@@ -286,7 +307,7 @@ capability-routed-activity gate exercised end-to-end through the real
 function (not just SQL-text checks), and — the gap ledger #5's own
 single-session apparatus explicitly could not close — real concurrent
 Tokio claimers racing a capped concurrency key, asserting the cap is
-never exceeded. `queue.rs`'s `mod tests` gains 19 SQL-shape unit tests
+never exceeded. `queue.rs`'s `mod tests` gains 20 SQL-shape unit tests
 pinning the query text (concurrency gate omitted from the batch scan,
 every other gate preserved byte-for-byte including both capability-label
 branches, the cursor's four-column `OR`-chain, the authoritative
@@ -305,9 +326,11 @@ of `NOW()`, the twelfth-bug fix that an already-expired candidate is
 rejected before any query at all, the thirteenth-bug fix that
 `claimed`'s `WHERE` re-runs the scan's own build-routing gate, its
 own follow-up fix that `rate_limit_debit`'s `WHERE` carries the same
-gate, and the fifteenth-bug fix that `claimed`'s `WHERE` re-runs the
+gate, the fifteenth-bug fix that `claimed`'s `WHERE` re-runs the
 scan's own capability-label gate too, with the same leak-prevention
-pattern applied to `rate_limit_debit`'s `WHERE` from the start).
+pattern applied to `rate_limit_debit`'s `WHERE` from the start, and the
+sixteenth-bug fix that `now_ts`'s own forced lock carries that same
+build-and-capability eligibility check).
 
 **Measurement.** `docs/performance-claim-batched-seek-and-refine.md`,
 regenerated from a single run of

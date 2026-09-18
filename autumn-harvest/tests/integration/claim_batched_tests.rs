@@ -1672,6 +1672,127 @@ async fn batched_claim_skips_the_bucket_lock_for_a_candidate_already_past_its_de
     assert_eq!(task_state(&mut conn, task_b).await, "PENDING");
 }
 
+/// Regression test for a review finding on this PR, the same class as
+/// the circuit-breaker and deadline skips above. `claimed` is certain to
+/// reject a build-incompatible candidate -- the thirteenth-bug fix above
+/// guarantees that. Without this gate, the forced lock still waits on
+/// an unrelated bucket row first. That wastes the whole wait on a claim
+/// that could never succeed.
+///
+/// Proven with a real lock held by a separate connection, not a
+/// `pg_sleep` stand-in, the same technique the circuit-breaker skip test
+/// above uses.
+#[tokio::test(flavor = "multi_thread")]
+async fn batched_claim_attempt_skips_the_bucket_lock_for_a_build_incompatible_candidate() {
+    use diesel_async::RunQueryDsl;
+
+    let (url, mut conn, _container) = setup_db().await;
+    let bucket_key = format!("bucket-{}", Uuid::new_v4().simple());
+    queue::ensure_rate_limit_bucket(&mut conn, &bucket_key, 0.0, 100.0)
+        .await
+        .expect("ensure bucket");
+
+    let queue = unique_queue("batched-build-incompatible-no-block");
+    // Unique per run: CI's DB-backed shards use a persistent Postgres,
+    // not always a fresh testcontainer, and harvest_build_compat rows
+    // outlive a single test process.
+    let unique = Uuid::new_v4().simple().to_string();
+    let required_build = format!("build-required-{unique}");
+    let worker_build = format!("build-worker-{unique}");
+    let exec_id = insert_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id);
+    params.activity_name = Some("noop".to_string());
+    params.activity_id = Some(Uuid::new_v4());
+    params.rate_limit_key = Some(bucket_key.clone());
+    params.required_build_id = Some(required_build);
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let locker_bucket_key = bucket_key.clone();
+    let locker_url = url.clone();
+    let locker = tokio::spawn(async move {
+        let mut locker_conn = connect(&locker_url).await;
+        let mut tx = locker_conn.build_transaction().read_committed();
+        tx.run(
+            async |conn: &mut AsyncPgConnection| -> Result<(), diesel::result::Error> {
+                diesel::sql_query(
+                    "SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1 FOR UPDATE",
+                )
+                .bind::<diesel::sql_types::Text, _>(&locker_bucket_key)
+                .execute(conn)
+                .await?;
+                let _ = locked_tx.send(());
+                diesel::sql_query("SELECT pg_sleep(1.5)")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
+        .expect("locker transaction");
+    });
+
+    // Wait for the locker to actually hold the row lock -- a fixed sleep
+    // cannot guarantee that on a loaded CI host.
+    locked_rx.await.expect("locker signaled");
+
+    #[derive(diesel::QueryableByName)]
+    struct ClaimedId {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+    }
+
+    let start = std::time::Instant::now();
+    let mut tx = conn.build_transaction().read_committed();
+    let claimed: Option<Uuid> = tx
+        .run(
+            async |conn: &mut AsyncPgConnection| -> Result<Option<Uuid>, diesel::result::Error> {
+                let rows: Vec<ClaimedId> =
+                    diesel::sql_query(queue::claim_batched_candidate_attempt_query())
+                        .bind::<diesel::sql_types::Text, _>("build-incompatible-no-block-tester")
+                        .bind::<diesel::sql_types::Uuid, _>(task_id)
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                            None::<String>,
+                        )
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(
+                            None::<i32>,
+                        )
+                        .bind::<diesel::sql_types::Text, _>("activity")
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(Some(
+                            bucket_key.clone(),
+                        ))
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                            None::<String>,
+                        )
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                            &Vec::<String>::new(),
+                        )
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+                            None::<chrono::DateTime<chrono::Utc>>,
+                        )
+                        .bind::<diesel::sql_types::Text, _>(&worker_build)
+                        .load(conn)
+                        .await?;
+                Ok(rows.into_iter().next().map(|r| r.id))
+            },
+        )
+        .await
+        .expect("transaction");
+    let elapsed = start.elapsed();
+
+    locker.await.expect("locker joined");
+
+    assert_eq!(claimed, None);
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "a build-incompatible claim must not wait on the bucket lock at \
+         all -- the locker holds it for 1.5s, so any wait on it would \
+         show up here; elapsed={elapsed:?}"
+    );
+    assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
+}
+
 /// Regression test for a review finding on this PR (P1). A long batch
 /// walk can leave this transaction's own frozen `NOW()` well behind
 /// real time by the time `rate_limit_debit` finally runs. Writing
