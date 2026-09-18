@@ -1716,6 +1716,39 @@ mod db {
         value: bool,
     }
 
+    /// A forwarding hop that would deadlock the chain walk below, or
+    /// `None` if `next` is safe to check out.
+    ///
+    /// `current` is `None` for the very first hop. It has no
+    /// already-checked-out connection of its own to conflict with yet
+    /// (issue #1317 review, P2 follow-up; fresh review, P2 follow-up).
+    fn forwarding_hop_conflict(
+        pool: &ShardedDbPool,
+        next: ShardId,
+        current: Option<ShardId>,
+        source_shard: ShardId,
+        exec_id: ExecutionId,
+    ) -> Option<HarvestError> {
+        let held = if next == source_shard || pool.same_physical_pool(next, source_shard) {
+            Some(source_shard)
+        } else {
+            current.filter(|&current| next == current || pool.same_physical_pool(next, current))
+        }?;
+        let relation = if next == held {
+            format!("loops back to shard {held}")
+        } else {
+            format!("shares a physical pool with shard {held}")
+        };
+        Some(HarvestError::ShardUnavailable {
+            shard_id: next.as_i32(),
+            reason: format!(
+                "execution forwarding chain for {exec_id} {relation}, already held for this \
+                 reconciliation; this is the committed window of an in-progress reverse \
+                 migration, not a resolvable live copy yet"
+            ),
+        })
+    }
+
     /// Has the live copy behind a forwarding seal reached a real terminal
     /// state (issue #1317)?
     ///
@@ -1757,6 +1790,18 @@ mod db {
     /// too, including `first_hop` itself before its very first checkout.
     /// A pre-split staging rollout can alias two shard ids to one
     /// size-one pool; a shard-id comparison alone cannot see that.
+    ///
+    /// The same aliasing hazard applies to every LATER hop against its
+    /// own immediately preceding one, not only against `source_shard`
+    /// (fresh review, P2 follow-up). This loop already checks out one
+    /// hop's connection before moving to the next. It holds that
+    /// connection open the same way `source_shard`'s caller holds theirs.
+    /// A chain can reach shard B and then point to shard C, with B and C
+    /// aliasing one physical pool. Checking out C would then wait on B's
+    /// own connection on that same pool, still held here. That is the
+    /// same deadlock the `source_shard` guard exists to prevent, just
+    /// one hop later. Each hop is checked against both `source_shard` and the
+    /// immediately preceding hop.
     async fn live_copy_is_terminal(
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
@@ -1774,23 +1819,8 @@ mod db {
         // times out. `first_hop` gets this check before its very first
         // checkout below. The loop's own per-iteration guard only runs on
         // a LATER hop's forwarding pointer, never on the first one.
-        let aliased_loop_reason = |shard: ShardId| {
-            let relation = if shard == source_shard {
-                format!("loops back to shard {source_shard}")
-            } else {
-                format!("shares a physical pool with shard {source_shard}")
-            };
-            format!(
-                "execution forwarding chain for {exec_id} {relation}, already held for this \
-                 reconciliation; this is the committed window of an in-progress reverse \
-                 migration, not a resolvable live copy yet"
-            )
-        };
-        if pool.same_physical_pool(first_hop, source_shard) {
-            return Err(HarvestError::ShardUnavailable {
-                shard_id: first_hop.as_i32(),
-                reason: aliased_loop_reason(first_hop),
-            });
+        if let Some(err) = forwarding_hop_conflict(pool, first_hop, None, source_shard, exec_id) {
+            return Err(err);
         }
         let mut current = first_hop;
         let mut conn = checkout(pool, current).await?;
@@ -1801,15 +1831,16 @@ mod db {
                     resolved = Some(current);
                     break;
                 }
-                Some(next)
-                    if next == source_shard || pool.same_physical_pool(next, source_shard) =>
-                {
-                    return Err(HarvestError::ShardUnavailable {
-                        shard_id: next.as_i32(),
-                        reason: aliased_loop_reason(next),
-                    });
-                }
                 Some(next) => {
+                    // Checked against `source_shard` (the caller's own held
+                    // connection) and `current` (this loop's own, about to
+                    // be replaced), in that order. Both are checked out
+                    // right now. Either would deadlock a re-entry.
+                    if let Some(err) =
+                        forwarding_hop_conflict(pool, next, Some(current), source_shard, exec_id)
+                    {
+                        return Err(err);
+                    }
                     current = next;
                     conn = checkout(pool, current).await?;
                 }
@@ -2718,6 +2749,7 @@ mod db {
         source: &mut AsyncPgConnection,
         target: &mut AsyncPgConnection,
         exec_id: ExecutionId,
+        target_shard: ShardId,
         reason: &str,
     ) -> HarvestResult<()> {
         // Serialize against `commit_cutover` on the execution row it locks, so
@@ -2794,26 +2826,35 @@ mod db {
         // review, P1 follow-up). The claim above can be arbitrarily old by
         // now. It only proves ABORTED was true at its own commit, and a
         // retrying call's read of it is older still. `begin_migration` can
-        // reopen this exact record in the gap. It can then run a whole new
-        // attempt through staging and cutover before this line runs. That
-        // risk is highest when the reopened attempt targets the same
-        // target shard. Cleaning up here would then hit that new attempt's
-        // now-live copy. That copy is not the abandoned one this call
-        // exists to finish. Deleting or resealing it would orphan a
-        // source seal the new attempt already committed. That is the
-        // exact "sealed source, missing copy" outcome the claim above
-        // exists to prevent.
+        // reopen this exact record in the gap, running a whole new attempt
+        // through staging and cutover before this line runs.
+        //
+        // `target` is the connection this specific call's caller already
+        // resolved, to `target_shard`, before the claim above ever ran. It
+        // does not move if the row reopens elsewhere. So the row's CURRENT
+        // `target_shard` is what decides whether cleaning up `target` here
+        // is still this call's job. Two cases (fresh review, P1 follow-up):
+        //
+        // - The reopened attempt targets `target_shard` too. Cleaning up
+        //   here would then hit that new attempt's now-live copy on the
+        //   very connection this call holds. That copy is not the
+        //   abandoned one this call exists to finish. Deleting or
+        //   resealing it would orphan a source seal the new attempt
+        //   already committed. That is the exact "sealed source, missing
+        //   copy" outcome the claim above exists to prevent. Skip.
+        //
+        // - The reopened attempt targets a DIFFERENT shard. Its whole
+        //   staging and cutover happens on a connection this call never
+        //   touches. So `target` here still holds only the original,
+        //   abandoned copy. The row no longer references it at all, and
+        //   nothing else will ever clean it up. Finish the cleanup.
         //
         // `begin_migration`'s `INSERT ... ON CONFLICT DO UPDATE` needs this
         // same row's lock to perform its update, so it blocks behind this
-        // transaction rather than racing it. A phase this re-read finds no
-        // longer `ABORTED` means a reopen won that race before this
-        // transaction's own lock closed it. That is legitimate progress,
-        // not an error. This call has nothing left to finish, so it
-        // returns cleanly without touching the target. On a genuine target
-        // failure, this transaction rolls back and releases the lock
-        // without writing anything. A later retry then finds exactly the
-        // state it would have found today.
+        // transaction rather than racing it. On a genuine target failure,
+        // this transaction rolls back and releases the lock without
+        // writing anything. A later retry then finds exactly the state it
+        // would have found today.
         Box::pin(source.transaction::<(), HarvestError, _>(async |conn| {
             diesel::sql_query(
                 "SELECT execution_id FROM harvest_shard_migrations \
@@ -2824,8 +2865,11 @@ mod db {
             .await
             .map_err(database_error)?;
 
-            let phase = load_migration(&mut *conn, exec_id).await?.map(|r| r.phase);
-            if phase != Some(MigrationPhase::Aborted) {
+            let record = load_migration(&mut *conn, exec_id).await?;
+            let ours_to_finish = record.is_some_and(|r| {
+                r.phase == MigrationPhase::Aborted || r.target_shard != target_shard
+            });
+            if !ours_to_finish {
                 return Ok(());
             }
 
@@ -3124,7 +3168,7 @@ mod db {
         if let Err(error) = staged {
             let reason = error.to_string();
             record_attempt(&mut source, exec_id, &reason).await?;
-            abort_migration(&mut source, &mut target, exec_id, &reason).await?;
+            abort_migration(&mut source, &mut target, exec_id, target_shard, &reason).await?;
             return Ok(MigrationOutcome::Aborted {
                 execution_id: exec_id,
                 reason,
@@ -3137,7 +3181,7 @@ mod db {
             Err(error) => {
                 let reason = error.to_string();
                 record_attempt(&mut source, exec_id, &reason).await?;
-                abort_migration(&mut source, &mut target, exec_id, &reason).await?;
+                abort_migration(&mut source, &mut target, exec_id, target_shard, &reason).await?;
                 return Ok(MigrationOutcome::Aborted {
                     execution_id: exec_id,
                     reason,
@@ -3164,7 +3208,7 @@ mod db {
         };
         if let Some(reason) = reason {
             record_attempt(&mut source, exec_id, &reason).await?;
-            abort_migration(&mut source, &mut target, exec_id, &reason).await?;
+            abort_migration(&mut source, &mut target, exec_id, target_shard, &reason).await?;
             return Ok(MigrationOutcome::Aborted {
                 execution_id: exec_id,
                 reason,
@@ -3563,7 +3607,14 @@ mod db {
                                 let reason = cutover_decline_reason(&mut source, exec_id)
                                     .await?
                                     .to_string();
-                                abort_migration(&mut source, &mut target, exec_id, &reason).await?;
+                                abort_migration(
+                                    &mut source,
+                                    &mut target,
+                                    exec_id,
+                                    record.target_shard,
+                                    &reason,
+                                )
+                                .await?;
                                 Ok(Some(MigrationOutcome::Aborted {
                                     execution_id: exec_id,
                                     reason,
@@ -3592,6 +3643,7 @@ mod db {
                                 &mut source,
                                 &mut target,
                                 exec_id,
+                                record.target_shard,
                                 "the execution woke up before cutover",
                             )
                             .await?;

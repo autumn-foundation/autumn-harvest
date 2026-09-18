@@ -662,9 +662,15 @@ async fn aborting_after_staging_restores_the_vacated_terminal_prior() {
 
     // Staging succeeded; abort anyway, exactly as `migrate_execution` does
     // when a LATER step (verification, cutover) fails.
-    abort_migration(&mut source, &mut target, exec_id, "forced for this test")
-        .await
-        .expect("abort");
+    abort_migration(
+        &mut source,
+        &mut target,
+        exec_id,
+        TARGET,
+        "forced for this test",
+    )
+    .await
+    .expect("abort");
 
     let mut target = shards.target().await;
     let restored: ScalarText =
@@ -3047,6 +3053,73 @@ async fn a_hop_into_a_pool_aliased_to_the_held_shard_is_refused_not_deadlocked()
 }
 
 #[tokio::test]
+async fn a_later_hop_into_a_pool_aliased_to_the_current_hop_is_refused_not_deadlocked() {
+    // Fresh review, P2 follow-up (companion to the two tests above). The
+    // aliasing guard above only ever compared a later hop against
+    // `source_shard` -- the shard the OUTER caller holds. It never
+    // compared a later hop against `current`, the shard THIS LOOP itself
+    // is already holding a connection to. A chain can reach shard B and
+    // then point on to shard C, with B and C aliasing one physical
+    // size-one pool. Checking out C would then try to wait on B's own
+    // connection on that pool, still held right here. That is the same
+    // deadlock the `source_shard` guard exists to prevent, one hop later.
+    // This test
+    // cannot reproduce the deadlock itself without hanging the suite, for
+    // the same reason the two tests above cannot. It pins the fast, named
+    // refusal instead.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "later-hop-aliased-pool").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("A -> B");
+
+    // B is now the live copy. Rewrite ITS OWN row to look as though it
+    // was itself migrated onward. The target id has no real data of its
+    // own -- distinct from every id used elsewhere in this file.
+    let aliased_shard = ShardId::new(98);
+    let mut raw_target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET migrated_to_shard = $1 WHERE id = $2",
+    )
+    .bind::<diesel::sql_types::Integer, _>(aliased_shard.as_i32())
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut raw_target)
+    .await
+    .expect("rewrite B's own row to point onward to the aliased shard id");
+
+    // A fresh capacity-one pool against B's own database is cloned under
+    // both `TARGET` and `aliased_shard`. This is the same shape a
+    // pre-split staging rollout produces, one hop past the first.
+    let target_pool = build_pool_capacity_one(&shards.target_url);
+    let aliased_pool = ShardedDbPool::from_map(
+        std::collections::BTreeMap::from([
+            (SOURCE, build_pool(&shards.source_url)),
+            (TARGET, target_pool.clone()),
+            (aliased_shard, target_pool.clone()),
+        ]),
+        SOURCE,
+    );
+
+    let mut a = shards.source().await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        reconcile_migrated_seal_terminality(&mut a, &aliased_pool, exec_id, SOURCE),
+    )
+    .await
+    .expect(
+        "must not stall: an aliased later hop must be refused before ever attempting a \
+         second checkout on that pool",
+    );
+    let err = result.expect_err("a later hop into an aliased pool must be refused, not resolved");
+    let message = err.to_string();
+    assert!(
+        message.contains("shares a physical pool") && message.contains(&TARGET.to_string()),
+        "the refusal must name the aliasing and the shard already held for this hop, got \
+         {message}"
+    );
+}
+
+#[tokio::test]
 async fn a_sweep_reports_a_seal_whose_target_is_unreachable_as_a_failure_not_a_silent_skip() {
     // Issue #1317 review: `Err` (a database or unreachable-target problem)
     // used to be treated exactly like `Ok(false)` (not yet terminal) --
@@ -3794,6 +3867,7 @@ async fn a_reverse_migration_keeps_the_origin_seal_resolvable_throughout() {
         &mut source,
         &mut target,
         exec_id,
+        SOURCE,
         "operator changed their mind",
     )
     .await
@@ -4157,7 +4231,7 @@ async fn aborting_before_staging_ever_touched_the_target_leaves_its_seal_untouch
         .await
         .expect("begin B -> A");
 
-    abort_migration(&mut source, &mut target, exec_id, "never staged")
+    abort_migration(&mut source, &mut target, exec_id, SOURCE, "never staged")
         .await
         .expect("abort a PENDING migration whose target was never touched");
 
@@ -4247,7 +4321,7 @@ async fn a_repeated_abort_finishes_a_target_cleanup_a_prior_attempt_did_not() {
 
     // A later call -- an operator re-running the same command, or an
     // automated retry -- must finish the cleanup instead of refusing.
-    abort_migration(&mut source, &mut target, exec_id, "operator retry")
+    abort_migration(&mut source, &mut target, exec_id, TARGET, "operator retry")
         .await
         .expect("a repeated abort must retry the target cleanup, not refuse");
 
@@ -4351,7 +4425,7 @@ async fn abort_migrations_gated_cleanup_waits_for_a_held_migration_row_lock() {
     let mut source = shards.source().await;
     let mut target = shards.target().await;
     let started = std::time::Instant::now();
-    abort_migration(&mut source, &mut target, exec_id, "late retry")
+    abort_migration(&mut source, &mut target, exec_id, TARGET, "late retry")
         .await
         .expect("the retry must still succeed once the lock is released");
     let elapsed = started.elapsed();
@@ -4385,6 +4459,236 @@ async fn abort_migrations_gated_cleanup_waits_for_a_held_migration_row_lock() {
         0,
         "a forward migration's staged row has no seal to restore, so it must be gone"
     );
+}
+
+#[tokio::test]
+async fn a_gated_cleanup_leaves_a_same_shard_reopen_alone() {
+    // Fresh review, P1 follow-up (companion to the lock-wait test above).
+    // `abort_migration` refuses outright when it is called on a record
+    // that is not `ABORTED` and not currently claimable (`PENDING`/
+    // `COPIED`/`VERIFIED`). A stale retry can only reach the gated
+    // cleanup section by way of a record its own earlier read (in THIS
+    // call) saw as `ABORTED`. So the reopen this test cares about
+    // cannot precede the call under test. It has to land inside that
+    // same call's own gap. That gap sits between the row this call
+    // already decided was `ABORTED`, and the fresh, lock-held re-read
+    // its cleanup performs.
+    //
+    // A lock held on the `harvest_shard_migrations` row (the same lock
+    // `abort_migration`'s own cleanup takes) reproduces exactly that gap
+    // deterministically. Hold it across a raw reopen of the row -- the
+    // same UPDATE `begin_migration` performs -- before releasing it into
+    // `abort_migration`'s wait.
+    //
+    // When the reopen targets the SAME shard the stuck attempt staged
+    // on, the cleanup must leave it alone. It cannot tell that stale
+    // copy apart from a live one on the very connection it holds.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "abort-gated-reopen-same-target").await;
+
+    begin_migration(&mut shards.source().await, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin the stuck attempt");
+    stage_copy(
+        &mut shards.source().await,
+        &mut shards.target().await,
+        exec_id,
+        TARGET,
+    )
+    .await
+    .expect("stage the stuck attempt");
+
+    // Simulate a claim that committed followed by a cleanup that never ran
+    // -- the exact stranding `abort_migration`'s own claim step produces.
+    let mut claim_conn = shards.source().await;
+    let claimed = diesel::sql_query(
+        "UPDATE harvest_shard_migrations \
+            SET phase = 'ABORTED', abort_reason = $2, updated_at = NOW() \
+          WHERE execution_id = $1 AND phase IN ('PENDING', 'COPIED', 'VERIFIED')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>("stuck attempt failed")
+    .execute(&mut claim_conn)
+    .await
+    .expect("claim");
+    assert_eq!(claimed, 1, "precondition: the claim itself must succeed");
+
+    // Hold the exact lock `abort_migration`'s gated section takes. While
+    // holding it, reopen the record -- the same UPDATE `begin_migration`
+    // performs -- onto the SAME target, then release the lock.
+    let mut holder = shards.source().await;
+    let (lock_held_tx, lock_held_rx) = tokio::sync::oneshot::channel();
+    let holder_task = tokio::spawn(async move {
+        Box::pin(holder.transaction::<(), HarvestError, _>(async |conn| {
+            diesel::sql_query(
+                "SELECT execution_id FROM harvest_shard_migrations \
+                  WHERE execution_id = $1 FOR UPDATE",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .execute(&mut *conn)
+            .await?;
+            let _ = lock_held_tx.send(());
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            diesel::sql_query(
+                "UPDATE harvest_shard_migrations \
+                    SET phase = 'PENDING', target_shard = $2, verified_fingerprint = NULL, \
+                        abort_reason = NULL, attempts = 0, last_error = NULL, updated_at = NOW() \
+                  WHERE execution_id = $1",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .bind::<diesel::sql_types::Integer, _>(TARGET.as_i32())
+            .execute(&mut *conn)
+            .await?;
+            Ok(())
+        }))
+        .await
+        .expect("holder transaction");
+    });
+    lock_held_rx.await.expect("lock-held signal");
+
+    let mut source = shards.source().await;
+    let mut target = shards.target().await;
+    abort_migration(&mut source, &mut target, exec_id, TARGET, "stale retry")
+        .await
+        .expect("a stale retry racing a same-target reopen must return cleanly, not error");
+    holder_task.await.expect("holder task");
+
+    assert!(
+        count(
+            &mut target,
+            "SELECT count(*)::BIGINT AS value FROM harvest_events WHERE workflow_exec_id = $1",
+            exec_id
+        )
+        .await
+            > 0,
+        "the stale retry must not delete a copy on the shard the reopen also targets"
+    );
+    let record = load_migration(&mut source, exec_id)
+        .await
+        .expect("load")
+        .expect("row");
+    assert_eq!(
+        record.phase,
+        MigrationPhase::Pending,
+        "the reopen's own phase must be untouched by the stale retry"
+    );
+    assert_eq!(record.target_shard, TARGET);
+}
+
+#[tokio::test]
+async fn a_gated_cleanup_finishes_an_abandoned_target_after_a_different_shard_reopen() {
+    // Fresh review, P1 follow-up (companion to the same-target test above).
+    // Here the reopen, raced into the same gap the same way, targets a
+    // DIFFERENT shard than the stuck attempt staged on. This call's own
+    // target connection was resolved by ITS caller before its claim ever
+    // ran. So it never overlaps the reopen at all, and once the reopen
+    // commits, the row no longer references the original target anywhere.
+    // Skipping cleanup here, as a bare `phase == ABORTED` check would,
+    // leaks the abandoned copy forever: absent from the row, invisible to
+    // later retention or erasure. Finishing it is always safe.
+    let shards = setup_three_shards().await;
+    let mut source = connect(&shards.urls[0]).await;
+    let exec_id = insert_execution(
+        &mut source,
+        "entity_flow",
+        "abort-gated-reopen-different-target",
+    )
+    .await;
+    append_history(
+        &mut source,
+        exec_id,
+        &[
+            started(json!({"seed": 1})),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("wake"),
+                duration_secs: 604_800,
+            },
+        ],
+    )
+    .await;
+    park_on_timer(&mut source, exec_id).await;
+
+    let mut old_target = connect(&shards.urls[1]).await;
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin the stuck attempt");
+    stage_copy(&mut source, &mut old_target, exec_id, TARGET)
+        .await
+        .expect("stage the stuck attempt onto TARGET");
+
+    let mut claim_conn = connect(&shards.urls[0]).await;
+    let claimed = diesel::sql_query(
+        "UPDATE harvest_shard_migrations \
+            SET phase = 'ABORTED', abort_reason = $2, updated_at = NOW() \
+          WHERE execution_id = $1 AND phase IN ('PENDING', 'COPIED', 'VERIFIED')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>("stuck attempt failed")
+    .execute(&mut claim_conn)
+    .await
+    .expect("claim");
+    assert_eq!(claimed, 1, "precondition: the claim itself must succeed");
+
+    let mut holder = connect(&shards.urls[0]).await;
+    let (lock_held_tx, lock_held_rx) = tokio::sync::oneshot::channel();
+    let holder_task = tokio::spawn(async move {
+        Box::pin(holder.transaction::<(), HarvestError, _>(async |conn| {
+            diesel::sql_query(
+                "SELECT execution_id FROM harvest_shard_migrations \
+                  WHERE execution_id = $1 FOR UPDATE",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .execute(&mut *conn)
+            .await?;
+            let _ = lock_held_tx.send(());
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // Reopen onto THIRD -- a DIFFERENT shard than the stuck
+            // attempt's TARGET.
+            diesel::sql_query(
+                "UPDATE harvest_shard_migrations \
+                    SET phase = 'PENDING', target_shard = $2, verified_fingerprint = NULL, \
+                        abort_reason = NULL, attempts = 0, last_error = NULL, updated_at = NOW() \
+                  WHERE execution_id = $1",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .bind::<diesel::sql_types::Integer, _>(THIRD.as_i32())
+            .execute(&mut *conn)
+            .await?;
+            Ok(())
+        }))
+        .await
+        .expect("holder transaction");
+    });
+    lock_held_rx.await.expect("lock-held signal");
+
+    // This call's own connection is `old_target` (TARGET) -- fixed by this
+    // call, resolved before the claim ever ran, never touched by the
+    // reopen onto THIRD.
+    abort_migration(&mut source, &mut old_target, exec_id, TARGET, "stale retry")
+        .await
+        .expect("a stale retry racing a different-target reopen must finish its own cleanup");
+    holder_task.await.expect("holder task");
+
+    assert_eq!(
+        count(
+            &mut old_target,
+            "SELECT count(*)::BIGINT AS value FROM harvest_events WHERE workflow_exec_id = $1",
+            exec_id
+        )
+        .await,
+        0,
+        "the abandoned copy on TARGET must be cleaned up even though the row moved on"
+    );
+    let record = load_migration(&mut source, exec_id)
+        .await
+        .expect("load")
+        .expect("row");
+    assert_eq!(
+        record.phase,
+        MigrationPhase::Pending,
+        "the reopen's own phase must be untouched by the stale retry"
+    );
+    assert_eq!(record.target_shard, THIRD);
 }
 
 // ── Issue #1317: a hold placed during staging must not be cut over past ─────
@@ -4436,9 +4740,15 @@ async fn a_hold_placed_after_verification_refuses_the_cutover() {
     // The runbook answer is what a declined cutover always requires: abort and
     // restart the migration. A fresh `stage_copy` snapshots the row with the
     // hold already on it, so the second attempt verifies and cuts over clean.
-    abort_migration(&mut source, &mut target, exec_id, "hold placed mid-staging")
-        .await
-        .expect("abort the stale attempt");
+    abort_migration(
+        &mut source,
+        &mut target,
+        exec_id,
+        TARGET,
+        "hold placed mid-staging",
+    )
+    .await
+    .expect("abort the stale attempt");
     begin_migration(&mut source, exec_id, SOURCE, TARGET)
         .await
         .expect("begin again");
@@ -4553,6 +4863,7 @@ async fn a_hold_placed_between_staging_and_verification_fails_verification() {
         &mut source,
         &mut target,
         exec_id,
+        TARGET,
         "hold arrived mid-staging",
     )
     .await
