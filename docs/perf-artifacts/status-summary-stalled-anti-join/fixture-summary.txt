@@ -1,0 +1,10 @@
+fixture: 50000 terminal (COMPLETED) executions, 3000 active (RUNNING) executions, 30 of the active set genuinely stalled (a stale 2h-old most-recent event, no pending task-queue row, no non-terminal child, no unconsumed signal, no timer at all); every other active row is healthy (a fresh event plus a real pending task-queue row). Both groups pass the OR-block's 'not purely sleeping' test -- the healthy group via its task-queue row, the stalled group via having no timer to sleep on -- so both reach the harvest_events anti-join probe; only that probe tells them apart
+request: GET /admin/status (admin-authed)
+reported stalled_count=30
+target_statement_shapes=1
+target_calls=1
+target_buffers=12219
+request_total_calls=14
+request_total_buffers=14521
+calls_pct=7.1%
+buffers_pct=84.1%

@@ -1,0 +1,31 @@
+-- pg_stat_statements @ one real GET /admin/status request, 50000 terminal + 3000 active executions (30 genuinely stalled) --
+REQUEST TOTAL: calls=14 buffers=14521
+stalled-count statement share: calls=1/14 (7.1%), buffers=12219/14521 (84.1%)
+
+calls=1 shared_blks_hit=12219 shared_blks_read=0 total_buffers=12219
+query=SELECT COUNT(*)::BIGINT AS cnt FROM ( SELECT $3 FROM harvest_workflow_executions e WHERE e.state IN ($4, $5) AND NOT EXISTS ( SELECT $6 FROM harvest_events ev WHERE ev.workflow_exec_id = e.id AND ev.timestamp >= NOW() - ($1 * INTERVAL $7) ) AND ( EXISTS ( SELECT $8 FROM harvest_task_queue WHERE workflow_exec_id = e.id AND state IN ($9,$10,$11,$12) ) OR EXISTS ( SELECT $13 FROM harvest_workflow_executions c WHERE c.parent_id = e.id AND c.state NOT IN ( $14,$15,$16, $17,$18,$19 ) ) OR EXISTS ( SELECT $20 FROM harvest_signals WHERE workflow_exec_id = e.id AND consumed = $21 ) OR NOT EXISTS ( SELECT $22 FROM harvest_timers WHERE workflow_exec_id = e.id AND fired = $23 AND fires_at > NOW() ) OR EXISTS ( SELECT $24 FROM harvest_timers WHERE workflow_exec_id = e.id AND fired = $25 AND fires_at <= NOW() ) ) LIMIT $2 ) t
+
+calls=2 shared_blks_hit=2302 shared_blks_read=0 total_buffers=2302
+query=SELECT tq.queue_name, tq.required_capabilities, tq.required_build_id, CASE WHEN tq.sticky_worker_id IS NOT NULL AND tq.sticky_until IS NOT NULL AND tq.sticky_until > NOW() THEN tq.sticky_worker_id ELSE $2 END AS sticky_owner, tq.activity_name, COUNT(*)::BIGINT AS cnt FROM harvest_task_queue tq LEFT JOIN harvest_workflow_executions e ON e.id = tq.workflow_exec_id WHERE tq.state = $3 AND tq.scheduled_at <= NOW() AND NOT EXISTS (SELECT $4 FROM harvest_queue_pauses qp WHERE qp.queue_name = tq.queue_name) AND NOT EXISTS (SELECT $5 FROM harvest_activity_pauses ap WHERE ap.activity_name = tq.activity_name AND tq.task_type = $6) AND ( tq.schedule_to_close_at IS NULL OR tq.schedule_to_close_at > NOW() ) AND ( tq.task_type <> $7 OR tq.workflow_exec_id IS NULL OR e.id IS NULL OR e.state <> $8 ) AND ( tq.concurrency_key IS NULL OR tq.concurrency_cap IS NULL OR ( SELECT COUNT(*) FROM harvest_task_queue inner_q WHERE inner_q.concurrency_key = tq.concurrency_key AND inner_q.task_type = tq.task_type AND inner_q.state = $9 AND inner_q.worker_id IS NOT NULL ) < tq.concurrency_cap ) AND ( tq.rate_limit_key IS NULL OR tq.activity_name = ANY($1) OR EXISTS ( SELECT $10 FROM harvest_rate_limit_buckets b WHERE b.key = tq.rate_limit_key AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE $11 END, b.burst), b.tokens + GREATEST($12, EXTRACT($13 FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST($14, EXTRACT($15 FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) >= $16 ) ) GROUP BY tq.queue_name, tq.required_capabilities, tq.required_build_id, CASE WHEN tq.sticky_worker_id IS NOT NULL AND tq.sticky_until IS NOT NULL AND tq.sticky_until > NOW() THEN tq.sticky_worker_id ELSE NULL END, tq.activity_name
+
+calls=2 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
+query=SELECT COUNT(*) FROM "harvest_dead_letters"
+
+calls=2 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
+query=SET TIME ZONE 'UTC'
+
+calls=1 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
+query=SELECT schedule_expr::TEXT AS schedule_expr, is_paused, workflow_name::TEXT AS workflow_name, queue_name::TEXT AS queue_name FROM harvest_schedules
+
+calls=2 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
+query=SELECT "harvest_workers"."worker_id", "harvest_workers"."started_at", "harvest_workers"."last_heartbeat_at", "harvest_workers"."queues", "harvest_workers"."shard_assignments", "harvest_workers"."max_concurrency", "harvest_workers"."in_flight_count", "harvest_workers"."host", "harvest_workers"."version", "harvest_workers"."status", "harvest_workers"."drain_deadline_at", "harvest_workers"."build_id", "harvest_workers"."deployment_name", "harvest_workers"."labels", "harvest_workers"."max_concurrent_sessions", "harvest_workers"."in_use_sessions" FROM "harvest_workers"
+
+calls=1 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
+query=SELECT CEIL(EXTRACT($1 FROM (NOW() - MAX(failed_at))))::BIGINT AS age FROM harvest_dead_letters
+
+calls=1 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
+query=SELECT build_id, compatible_with FROM harvest_build_compat
+
+calls=2 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
+query=SET CLIENT_ENCODING TO 'UTF8'
+
