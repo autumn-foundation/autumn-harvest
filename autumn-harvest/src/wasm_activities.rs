@@ -1050,7 +1050,9 @@ fn invoke_wasm_activity_inner(
     // Fuel consumed is deterministic for a given guest and request, unlike
     // wall-clock time. That is why the decision cache charges this rather
     // than an `Instant::elapsed()` measurement (issue #1345 finding 5).
-    let fuel_consumed = limits.fuel.saturating_sub(wasm_store.get_fuel().unwrap_or(0));
+    let fuel_consumed = limits
+        .fuel
+        .saturating_sub(wasm_store.get_fuel().unwrap_or(0));
 
     serde_json::from_slice(out_bytes)
         .map(|value| (value, fuel_consumed))

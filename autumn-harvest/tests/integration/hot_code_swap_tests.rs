@@ -701,9 +701,9 @@ fn unload_builds_doc_states_the_suspended_execution_caveat() {
     let start = src
         .find("pub fn unload_build(")
         .expect("unload_build is where the guard expects it");
-    let doc_start = src[..start].rfind("/// Drop every binding").expect(
-        "unload_build's doc comment is where the guard expects it",
-    );
+    let doc_start = src[..start]
+        .rfind("/// Drop every binding")
+        .expect("unload_build's doc comment is where the guard expects it");
     let doc = &src[doc_start..start];
     assert!(
         doc.contains("suspended"),
