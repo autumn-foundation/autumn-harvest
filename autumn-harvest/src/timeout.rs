@@ -3218,10 +3218,10 @@ pub async fn enforce_external_signals_outbox(
                     // delivery, and re-delivery is not idempotent without an
                     // idempotency key, so staying pending would duplicate the
                     // signal (issue #1146, Codex round 2).
-                    // `reverify_after_cancel` is likewise unused: a signal
-                    // reports a delivery to one run, never a claim about the
-                    // whole key, so a run that starts during the fan-out does
-                    // not falsify it (issue #1313).
+                    // `reverify_after_cancel` is likewise unused (issue
+                    // #1313). A signal reports a delivery to one run, never a
+                    // claim about the whole key. A run that starts during the
+                    // fan-out does not falsify that.
                     DeliveryRoute::Caller {
                         expected_live,
                         may_assert_key_state: _,
@@ -3405,8 +3405,8 @@ struct CancelDeliveryAccumulators {
     /// than finding the goal already met (issue #1313).
     ///
     /// A cancel that changes the key's state invalidates the fan-out that
-    /// chose its target: the reads are sequential, on separate databases,
-    /// so a run of the key can start on a shard after that shard answered.
+    /// chose its target. The reads are sequential, on separate databases. A
+    /// run of the key can start on a shard after that shard answered.
     /// See `DeliveryRoute::CrossShard::reverify_after_cancel`.
     cancelled_live_run: bool,
 }
@@ -3893,15 +3893,16 @@ pub async fn enforce_external_cancels_outbox(
                 //
                 // A third case withholds for the same reason, one step removed
                 // (issue #1313). The fan-out that chose this target read each
-                // shard on its own connection, with no shared snapshot, so a run
-                // of the key can start on a shard after that shard answered. The
-                // two checks above cannot see such a run: every shard answered,
-                // and the run they selected really was live. The stale answer
-                // only becomes a wrong assertion once this cancel makes the
-                // selected run terminal, which promotes the run that started
-                // during the fan-out to current run for the key. So a cancel
-                // that ends a live run leaves the assertion to a LATER fan-out,
-                // one that observes the whole window this sweep ran in.
+                // shard on its own connection, and the reads share no snapshot.
+                // A run of the key can start on a shard after that shard
+                // answered. The two checks above cannot see such a run: every
+                // shard answered, and the run they selected really was live.
+                // The stale answer only becomes a wrong assertion once this
+                // cancel makes the selected run terminal. That promotes the run
+                // which started during the fan-out to current run for the key.
+                // So a cancel that ends a live run leaves the assertion to a
+                // LATER fan-out, one that observes the whole window this sweep
+                // ran in.
                 //
                 // That converges exactly as the other two do. The run just
                 // cancelled is terminal, so the next sweep either finds nothing
@@ -3909,8 +3910,8 @@ pub async fn enforce_external_cancels_outbox(
                 // again. A cancel that found its target already terminal changed
                 // nothing and reports at once, which is what ends the chain. A
                 // deployment that starts fresh runs of one key faster than the
-                // outbox cancels them defers indefinitely, and it is already the
-                // deployment the two checks above leave pending forever.
+                // outbox cancels them defers indefinitely. The two checks above
+                // already leave that deployment pending forever.
                 let withheld = if cancel_may_assert {
                     (cancel_reverify && acc.cancelled_live_run).then_some(
                         "this cancel ended a live run, so its own fan-out is older than the \

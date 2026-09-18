@@ -2625,7 +2625,7 @@ async fn cross_shard_cancel_target_followups_survive_a_failed_caller_side_commit
     let recorder = Arc::new(CrossPoolFollowupRecorder::default());
     // Sweep 1 does the cross-pool cancel and its follow-ups. It appends no
     // terminal event, because a cancel that ends a live run leaves that to the
-    // next fan-out (issue #1313), so it never reaches the undecodable row.
+    // next fan-out (issue #1313). So it never reaches the undecodable row.
     autumn_harvest::timeout::enforce_external_cancels_outbox(
         &mut caller_conn,
         recorder.as_ref(),

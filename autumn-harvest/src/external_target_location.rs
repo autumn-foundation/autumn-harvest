@@ -313,10 +313,10 @@ impl TargetLocation {
     /// than only under a race.
     ///
     /// The cancel path narrows it further, and that rule lives with the route
-    /// rather than here: a cancel that ends a live run reports from a LATER
+    /// rather than here. A cancel that ends a live run reports from a LATER
     /// fan-out, which observes the whole window this one ran in. See
     /// `timeout::DeliveryRoute::CrossShard::reverify_after_cancel` (issue
-    /// #1313). This predicate is unchanged by that, and a `true` from it still
+    /// #1313). This predicate is unchanged by that rule. A `true` from it still
     /// means only what the paragraph above says.
     ///
     /// Closing the window outright means cross-shard key uniqueness, which is an
