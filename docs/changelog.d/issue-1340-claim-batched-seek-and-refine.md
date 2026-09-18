@@ -112,6 +112,49 @@ the same circuit-breaker exclusion to `now_ts`'s forced lock. Verified
 with a regression test proving a bypassed claim completes quickly
 despite a real, separately-held lock on the bucket row it never needs.
 
+Codex then caught an eleventh bug (P1), against the seventh bug's own
+`now_ts` fix: `rate_limit_debit` wrote `last_refilled_at = NOW()`, the
+transaction-frozen time, not the real time of the debit. A long batch
+walk can let another, faster transaction refill the same bucket in the
+meantime; this transaction's own stale `NOW()` can then persist a
+`last_refilled_at` from before that other write, letting a later
+claimant re-accrue tokens for an interval already accounted for and
+exceed the configured rate limit. Fixed by reusing `now_ts` for every
+real-time read the rate-limit formula makes: `rate_limit_available` is
+now `effective_available_tokens_expr`'s own formula with every `NOW()`
+substituted for `(SELECT ts FROM now_ts)`, scoped to this one call site,
+and `last_refilled_at` reads that same substituted value. Verified red
+against the pre-fix code with a deterministic `pg_sleep` test (same
+technique as the `started_at` test): `last_refilled_at` must land after
+a 600ms in-transaction sleep, not near the pre-sleep timestamp a frozen
+`NOW()` would give.
+
+This same finding also surfaced a related, genuinely pre-existing (not
+introduced by any of these fixes) limitation: the bucket row lock is
+retained for the whole claim-attempt transaction, across every distinct
+`rate_limit_key` any tried candidate carries. Unlike the already-documented
+advisory-lock limitation, this is a real, blocking Postgres lock and can
+deadlock two claimers walking overlapping bucket keys in opposite orders.
+Postgres resolves that cleanly, by aborting one attempt with a typed
+error, not a wedge or a double-claim. A real fix needs a redesign
+(canonical lock ordering or per-candidate `SAVEPOINT`s), out of scope
+here; documented as a named, pre-production gap instead.
+
+Codex then caught a twelfth bug (P2): a candidate's deadline can expire
+DURING the batch walk without ever touching its own bucket lock's wait —
+not while waiting on that candidate's own bucket lock (the ninth bug),
+but while an EARLIER candidate's bucket lock is being waited on. By the
+time the walk reaches the later candidate, its deadline has already
+passed, and it can never claim regardless of what its own bucket
+protects — so waiting on that bucket lock anyway wastes an entire second
+lock wait for nothing. Fixed by rejecting an already-expired candidate
+in Rust, against a fresh `Utc::now()`, before ever issuing the attempt
+query. Verified with a two-lock regression test: one candidate absorbs a
+real ~1s wait on its own bucket, a second candidate's deadline expires
+during that wait, and its own (still-locked, ~2.5s) bucket must never be
+waited on at all — red at ~2.4s against the pre-fix code, green at
+well under 1.5s after the fix.
+
 **Not wired into the default claim path.** `claim_task`/`claim_task_on_shard`
 are unchanged. Issue #1340 is explicit that no query change should land
 against it without sign-off from someone with full context on `queue.rs`'s
@@ -120,7 +163,7 @@ tested, measured building block for that review, not a switch of default
 production behavior. It also does not implement the cross-region DR fence
 (#954) or the by-id claim (#1312) the single-row path carries.
 
-**Test evidence.** `tests/integration/claim_batched_tests.rs` (15 DB-backed
+**Test evidence.** `tests/integration/claim_batched_tests.rs` (17 DB-backed
 tests, red-then-green): equivalence with the single-row path on a plain
 backlog, an adversarial saturated-concurrency-key fixture matching ledger
 #4/#5's own shape, a multi-batch fixture with tied sort keys spanning a
@@ -146,12 +189,20 @@ code against a real Postgres instance, then green), a regression test
 for the tenth bug above that holds the bucket row's lock from a separate
 connection while a circuit-breaker-bypassed claim runs, asserting it
 completes quickly rather than serializing behind a lock it never needed
-(also verified red then green), sticky routing and a
+(also verified red then green), a regression test for the eleventh bug
+above using a deterministic `pg_sleep` (same technique as `started_at`)
+asserting `last_refilled_at` lands after the sleep, not near the
+pre-sleep frozen-`NOW()` value (verified red then green), a regression
+test for the twelfth bug above using two real, separately-held locks —
+one candidate absorbs a genuine wait, a second candidate's deadline
+expires during that wait, and its own still-locked bucket must never be
+waited on (verified red at ~2.4s against the pre-fix code, green under
+1.5s), sticky routing and a
 capability-routed-activity gate exercised end-to-end through the real
 function (not just SQL-text checks), and — the gap ledger #5's own
 single-session apparatus explicitly could not close — real concurrent
 Tokio claimers racing a capped concurrency key, asserting the cap is
-never exceeded. `queue.rs`'s `mod tests` gains 13 SQL-shape unit tests
+never exceeded. `queue.rs`'s `mod tests` gains 16 SQL-shape unit tests
 pinning the query text (concurrency gate omitted from the batch scan,
 every other gate preserved byte-for-byte including both capability-label
 branches, the cursor's four-column `OR`-chain, the authoritative
@@ -163,8 +214,11 @@ and `claimed` read one shared `now_ts` value rather than calling
 `clock_timestamp()` twice, the eighth-bug fix that `started_at` reads
 that same shared value instead of the frozen `NOW()`, the ninth-bug fix
 that `now_ts` itself takes a `FOR UPDATE` lock on the same bucket row
-`rate_limit_debit` locks next, and the tenth-bug fix that this forced
-lock also skips circuit-breaker-tracked activities).
+`rate_limit_debit` locks next, the tenth-bug fix that this forced
+lock also skips circuit-breaker-tracked activities, the eleventh-bug fix
+that the rate-limit formula and `last_refilled_at` read `now_ts` instead
+of `NOW()`, and the twelfth-bug fix that an already-expired candidate is
+rejected before any query at all).
 
 **Measurement.** `docs/performance-claim-batched-seek-and-refine.md`,
 regenerated from a single run of

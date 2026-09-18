@@ -6097,6 +6097,18 @@ pub async fn pending_queue_demand_by_queue_name(
 /// override-active check, both segments of the piecewise accrual
 /// formula, and the final stamp all read the same materialized value.
 ///
+/// A twelfth bug (P2), caught by the same reviewer. A candidate's
+/// deadline can expire DURING the batch walk. Not while waiting on its
+/// own bucket lock (the ninth bug above), but while an EARLIER
+/// candidate's bucket lock is being waited on. That candidate still
+/// paid for its own bucket's `now_ts` lock wait before the post-lock
+/// deadline check could reject it. That wastes an entire lock wait on a
+/// candidate that can never claim, regardless of what the lock
+/// protects. [`try_claim_batched_candidate`] now rejects an
+/// already-expired candidate against a fresh `Utc::now()` before
+/// issuing the attempt query at all. It never touches that candidate's
+/// bucket lock.
+///
 /// # What this is not
 ///
 /// This is **not** wired into [`claim_task`] or [`claim_task_on_shard`].
@@ -6635,8 +6647,14 @@ async fn concurrency_probe_passes(
 /// the cap is now saturated, or there is no rate token. That is not an
 /// error, just "try the next candidate in the batch".
 ///
+/// Rejects an already-expired `schedule_to_close_at` first, against a
+/// fresh `Utc::now()` read, before issuing any query at all (review
+/// finding, twelfth bug in the module doc above). Such a
+/// candidate can never claim, regardless of what its own bucket
+/// protects, so it must not pay for that bucket's lock wait too.
+///
 /// Checks the concurrency gate with
-/// [`claim_batched_candidate_concurrency_probe_query`] FIRST, for any
+/// [`claim_batched_candidate_concurrency_probe_query`] next, for any
 /// candidate that carries a concurrency key. A rejected candidate never
 /// reaches the rate-limit debit at all -- see that probe's own doc
 /// comment for the leak this prevents.
@@ -6646,6 +6664,13 @@ async fn try_claim_batched_candidate(
     worker_id: &str,
     circuit_breaker_activities: &[String],
 ) -> HarvestResult<Option<TaskQueueItem>> {
+    if candidate
+        .schedule_to_close_at
+        .is_some_and(|deadline| deadline <= Utc::now())
+    {
+        return Ok(None);
+    }
+
     if candidate.concurrency_key.is_some() && !concurrency_probe_passes(conn, candidate).await? {
         return Ok(None);
     }

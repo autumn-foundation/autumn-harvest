@@ -1204,6 +1204,147 @@ async fn batched_claim_attempt_skips_the_bucket_lock_for_a_circuit_breaker_activ
     assert_eq!(task_state(&mut conn, task_id).await, "RUNNING");
 }
 
+/// Regression test for a review finding on this PR. A candidate's
+/// deadline can pass DURING the batch walk. Not while waiting on that
+/// candidate's own bucket lock (the ninth-bug scenario above), but
+/// while an EARLIER candidate's bucket lock is being waited on. By the
+/// time the walk reaches this later candidate, its deadline has already
+/// passed. It can never claim, regardless of what its own bucket
+/// protects. Waiting on that bucket lock anyway wastes an entire second
+/// lock wait for nothing.
+///
+/// `try_claim_batched_candidate` must reject an already-expired
+/// candidate before ever issuing the attempt query. It must not add its
+/// own bucket wait on top of the earlier candidate's. Proven with two
+/// real, separately-held locks, not a `pg_sleep` stand-in. One
+/// candidate absorbs a real wait. A second candidate's own deadline
+/// expires during that wait, and its own (still-locked) bucket must
+/// never be waited on at all.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::similar_names)]
+async fn batched_claim_skips_the_bucket_lock_for_a_candidate_already_past_its_deadline() {
+    use diesel_async::RunQueryDsl;
+
+    let (url, mut conn, _container) = setup_db().await;
+    let bucket_a = format!("bucket-a-{}", Uuid::new_v4().simple());
+    let bucket_b = format!("bucket-b-{}", Uuid::new_v4().simple());
+    // Funded with exactly one token. The batch scan's own soft
+    // rate-limit pre-filter (`{rate_limit_available} >= 1.0`) requires
+    // this, or candidate A is excluded from the batch before it ever
+    // reaches a per-candidate attempt. That would never touch
+    // bucket_a's lock at all, defeating this test's setup.
+    queue::ensure_rate_limit_bucket(&mut conn, &bucket_a, 0.0, 1.0)
+        .await
+        .expect("ensure bucket a");
+    queue::ensure_rate_limit_bucket(&mut conn, &bucket_b, 0.0, 100.0)
+        .await
+        .expect("ensure bucket b");
+
+    let queue = unique_queue("batched-expired-mid-walk");
+
+    // Candidate A: higher priority, walked first, exists only to make
+    // this transaction spend real time waiting on bucket_a's lock.
+    let exec_a = insert_execution(&mut conn).await;
+    let mut params_a = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+    params_a.workflow_exec_id = Some(exec_a);
+    params_a.activity_name = Some("noop".to_string());
+    params_a.activity_id = Some(Uuid::new_v4());
+    params_a.priority = 10;
+    params_a.rate_limit_key = Some(bucket_a.clone());
+    queue::enqueue(&mut conn, &params_a)
+        .await
+        .expect("enqueue a");
+
+    // Candidate B: lower priority, walked second. Valid at scan time,
+    // but expires well before the walk reaches it.
+    let exec_b = insert_execution(&mut conn).await;
+    let mut params_b = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+    params_b.workflow_exec_id = Some(exec_b);
+    params_b.activity_name = Some("noop".to_string());
+    params_b.activity_id = Some(Uuid::new_v4());
+    params_b.priority = 1;
+    params_b.rate_limit_key = Some(bucket_b.clone());
+    params_b.schedule_to_close_at = Some(chrono::Utc::now() + chrono::Duration::milliseconds(300));
+    let task_b = queue::enqueue(&mut conn, &params_b)
+        .await
+        .expect("enqueue b");
+
+    let locker_a_bucket = bucket_a.clone();
+    let locker_a_url = url.clone();
+    let locker_a = tokio::spawn(async move {
+        let mut locker_conn = connect(&locker_a_url).await;
+        let mut tx = locker_conn.build_transaction().read_committed();
+        tx.run(
+            async |conn: &mut AsyncPgConnection| -> Result<(), diesel::result::Error> {
+                // Locks the row and spends the one token a concurrent
+                // claimer would have spent. Once A's own attempt gets
+                // past this lock, it correctly finds no funds left and
+                // moves on to B.
+                diesel::sql_query(
+                    "UPDATE harvest_rate_limit_buckets SET tokens = 0 WHERE key = $1",
+                )
+                .bind::<diesel::sql_types::Text, _>(&locker_a_bucket)
+                .execute(conn)
+                .await?;
+                diesel::sql_query("SELECT pg_sleep(1.0)")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
+        .expect("locker a transaction");
+    });
+
+    let locker_b_bucket = bucket_b.clone();
+    let locker_b_url = url.clone();
+    let locker_b = tokio::spawn(async move {
+        let mut locker_conn = connect(&locker_b_url).await;
+        let mut tx = locker_conn.build_transaction().read_committed();
+        tx.run(
+            async |conn: &mut AsyncPgConnection| -> Result<(), diesel::result::Error> {
+                diesel::sql_query(
+                    "SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1 FOR UPDATE",
+                )
+                .bind::<diesel::sql_types::Text, _>(&locker_b_bucket)
+                .execute(conn)
+                .await?;
+                diesel::sql_query("SELECT pg_sleep(2.5)")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
+        .expect("locker b transaction");
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let start = std::time::Instant::now();
+    let claimed = batched_claim_one(
+        &mut conn,
+        &queue,
+        "expired-mid-walk-tester",
+        BatchedClaimConfig::default(),
+    )
+    .await;
+    let elapsed = start.elapsed();
+
+    locker_a.await.expect("locker a joined");
+    locker_b.await.expect("locker b joined");
+
+    assert_eq!(claimed, None);
+    assert!(
+        elapsed < std::time::Duration::from_millis(1500),
+        "candidate B's deadline expires during candidate A's ~1s bucket \
+         wait, and bucket_b stays locked until ~2.5s -- B must be \
+         rejected on its expired deadline alone, never waiting on its \
+         own bucket; elapsed={elapsed:?}"
+    );
+    assert_eq!(task_state(&mut conn, task_b).await, "PENDING");
+}
+
 /// Regression test for a review finding on this PR (P1). A long batch
 /// walk can leave this transaction's own frozen `NOW()` well behind
 /// real time by the time `rate_limit_debit` finally runs. Writing
