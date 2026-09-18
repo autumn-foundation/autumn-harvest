@@ -11,6 +11,7 @@ mod activity_start_to_close;
 mod atomicity;
 mod cancellable_timer_unsupported;
 mod cross_backend;
+mod docs_start_contract;
 mod drive_clock_refresh;
 mod durability;
 mod fleet_fault_isolation;
