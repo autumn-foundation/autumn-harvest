@@ -31,11 +31,28 @@ pub fn build_router(api_state: HarvestApiState, web_state: autumn_web::AppState)
 /// own `HarvestApiState` and must call it directly, or the admin gate
 /// (`require_admin`) stays fail-closed against every caller.
 ///
+/// A `HarvestPlugin` mount also warns at startup when this opens the admin
+/// API to unauthenticated callers (`plugin.rs`'s
+/// `warn_if_dev_admin_api_is_open`). This example never declares an admin
+/// auth boundary, so the same opening happens here. It logs the same
+/// warning, with remediation text for a standalone mount. An operator who
+/// copies this example onto a non-loopback address still learns it from
+/// the log.
+///
 /// Split out of [`run`] so a test can drive the exact startup posture
 /// without a process-wide `AUTUMN_PROFILE` env var (see `tests.rs`).
 pub fn declare_deployment_profile(api_state: &HarvestApiState, autumn_profile: Option<&str>) {
     if autumn_profile == Some("dev") {
         api_state.set_deployment_profile("dev");
+        tracing::warn!(
+            "AUTUMN_PROFILE=dev with no admin auth boundary declared: the Harvest management \
+             API (every /admin route and the Vantage dashboard) is reachable UNAUTHENTICATED by \
+             any caller that can open a socket to this process. This is what lets the README's \
+             documented `harvest preflight` step run with no credential. Do not expose this \
+             process beyond localhost. To close it, call \
+             HarvestApiState::set_admin_auth_boundary(true) after installing your own auth \
+             layer, or run a non-dev AUTUMN_PROFILE."
+        );
     }
 }
 
