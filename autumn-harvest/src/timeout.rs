@@ -2728,7 +2728,11 @@ async fn resolve_delivery_route(
                         // construction. It is evidence of the race's
                         // precondition: a key pinned to one shard while
                         // an unpinned start of it hashed to another.
-                        if !other_live.is_empty() {
+                        //
+                        if should_record_other_live_observed(
+                            other_live.is_empty(),
+                            uninspected.is_empty(),
+                        ) {
                             metrics.record_external_by_id_other_live_observed(
                                 crate::worker::shard_metric_label(shard),
                             );
@@ -2876,6 +2880,26 @@ const fn classify_by_id_outcome(
         return ByIdVerdict::NotFoundPolicy;
     }
     ByIdVerdict::Record
+}
+
+/// Whether a by-id fan-out's `other_live` observation should be counted as
+/// topology-drift evidence (issue #1313, review finding).
+///
+/// Pulled out as a pure predicate, for the same reason as
+/// `classify_by_id_outcome`. The interesting case needs a fan-out that is
+/// both partial and ambiguous. That window has no test seam in the
+/// resolver itself.
+///
+/// A partial fan-out that also saw `other_live` is not this signal. It is
+/// the ordinary partial-view case `by_id_found_over_incomplete_fanout`
+/// already counts. Only a fan-out that reached every expected shard and
+/// still saw a second live run is evidence the precondition, not the
+/// view, produced the ambiguity.
+const fn should_record_other_live_observed(
+    other_live_is_empty: bool,
+    uninspected_is_empty: bool,
+) -> bool {
+    !other_live_is_empty && uninspected_is_empty
 }
 
 /// Attempt one signal delivery to `target` on `conn` (issue #751).
@@ -5294,6 +5318,32 @@ mod tests {
             ByIdVerdict::Record,
             "the very next sweep's classification, once the global view agrees"
         );
+    }
+
+    // ── by-id other-live-observed metric gate (issue #1313) ────────────────
+
+    #[test]
+    fn a_complete_fanout_with_other_live_is_counted() {
+        assert!(should_record_other_live_observed(false, true));
+    }
+
+    #[test]
+    fn a_complete_fanout_with_no_other_live_is_not_counted() {
+        assert!(!should_record_other_live_observed(true, true));
+    }
+
+    #[test]
+    fn a_partial_fanout_with_other_live_is_not_counted() {
+        // Review finding (PR #1645). A fan-out that missed a shard AND saw
+        // `other_live` is not topology-drift evidence -- it is the
+        // ordinary partial-view case `by_id_found_over_incomplete_fanout`
+        // already counts. Counting it here too would blur the two.
+        assert!(!should_record_other_live_observed(false, false));
+    }
+
+    #[test]
+    fn a_partial_fanout_with_no_other_live_is_not_counted() {
+        assert!(!should_record_other_live_observed(true, false));
     }
 
     use super::*;
