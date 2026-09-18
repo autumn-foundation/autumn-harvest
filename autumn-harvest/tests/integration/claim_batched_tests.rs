@@ -1204,6 +1204,109 @@ async fn batched_claim_attempt_skips_the_bucket_lock_for_a_circuit_breaker_activ
     assert_eq!(task_state(&mut conn, task_id).await, "RUNNING");
 }
 
+/// Regression test for a review finding on this PR (P1). A long batch
+/// walk can leave this transaction's own frozen `NOW()` well behind
+/// real time by the time `rate_limit_debit` finally runs. Writing
+/// `last_refilled_at = NOW()` then persists a timestamp from the past,
+/// not from the actual moment of the debit. A later claimant reading
+/// that stale timestamp re-accrues tokens for an interval already
+/// accounted for, exceeding the configured rate limit.
+///
+/// Same deterministic `pg_sleep` technique as the sibling `started_at`
+/// test above. `last_refilled_at` must land after the in-transaction
+/// sleep, not near the pre-sleep timestamp a frozen `NOW()` would give.
+#[tokio::test(flavor = "multi_thread")]
+async fn batched_claim_attempt_stamps_last_refilled_at_with_real_time_not_frozen_now() {
+    use diesel_async::RunQueryDsl;
+
+    let (_url, mut conn, _container) = setup_db().await;
+    let bucket_key = format!("bucket-{}", Uuid::new_v4().simple());
+    queue::ensure_rate_limit_bucket(&mut conn, &bucket_key, 0.0, 100.0)
+        .await
+        .expect("ensure bucket");
+
+    let queue = unique_queue("batched-last-refilled-at");
+    let exec_id = insert_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id);
+    params.activity_name = Some("noop".to_string());
+    params.activity_id = Some(Uuid::new_v4());
+    params.rate_limit_key = Some(bucket_key.clone());
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+    let before_sleep = chrono::Utc::now();
+
+    #[derive(diesel::QueryableByName)]
+    struct ClaimedId {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+    }
+
+    let mut tx = conn.build_transaction().read_committed();
+    let claimed: Option<Uuid> = tx
+        .run(
+            async |conn: &mut AsyncPgConnection| -> Result<Option<Uuid>, diesel::result::Error> {
+                // Real wall-clock time advances 600ms here. This
+                // transaction's own frozen NOW() does not.
+                diesel::sql_query("SELECT pg_sleep(0.6)")
+                    .execute(conn)
+                    .await?;
+
+                let rows: Vec<ClaimedId> =
+                    diesel::sql_query(queue::claim_batched_candidate_attempt_query())
+                        .bind::<diesel::sql_types::Text, _>("last-refilled-at-tester")
+                        .bind::<diesel::sql_types::Uuid, _>(task_id)
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                            None::<String>,
+                        )
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(
+                            None::<i32>,
+                        )
+                        .bind::<diesel::sql_types::Text, _>("activity")
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(Some(
+                            bucket_key.clone(),
+                        ))
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                            None::<String>,
+                        )
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                            &Vec::<String>::new(),
+                        )
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+                            None::<chrono::DateTime<chrono::Utc>>,
+                        )
+                        .load(conn)
+                        .await?;
+                Ok(rows.into_iter().next().map(|r| r.id))
+            },
+        )
+        .await
+        .expect("transaction");
+
+    assert_eq!(claimed, Some(task_id));
+
+    #[derive(diesel::QueryableByName)]
+    struct RefilledAt {
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        last_refilled_at: chrono::DateTime<chrono::Utc>,
+    }
+    let final_refilled_at =
+        diesel::sql_query("SELECT last_refilled_at FROM harvest_rate_limit_buckets WHERE key = $1")
+            .bind::<diesel::sql_types::Text, _>(&bucket_key)
+            .get_result::<RefilledAt>(&mut conn)
+            .await
+            .expect("final last_refilled_at")
+            .last_refilled_at;
+
+    assert!(
+        final_refilled_at > before_sleep + chrono::Duration::milliseconds(400),
+        "last_refilled_at must reflect the real time of the debit, \
+         after the 600ms in-transaction sleep -- a frozen NOW() would \
+         stamp it near before_sleep instead; before_sleep={before_sleep}, \
+         final_refilled_at={final_refilled_at}"
+    );
+}
+
 // ── Other preserved gates, exercised end-to-end (not just SQL-shape) ───────
 
 /// Sticky routing, exercised through a real `claim_task_batched` call, not

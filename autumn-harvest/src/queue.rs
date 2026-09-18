@@ -6085,6 +6085,18 @@ pub async fn pending_queue_demand_by_queue_name(
 /// never needed. The fix adds the same `NOT ($7 = ANY($8))` gate to
 /// `now_ts`'s forced lock.
 ///
+/// An eleventh bug (P1), caught by the same reviewer: `rate_limit_debit`
+/// wrote `last_refilled_at = NOW()`, the transaction-frozen time, not
+/// the real time of the debit. A long batch walk can let another,
+/// faster transaction refill the SAME bucket in the meantime. This
+/// transaction's own stale `NOW()` can then persist a `last_refilled_at`
+/// from BEFORE that other write. A later claimant reading it re-accrues
+/// tokens for an interval already accounted for, exceeding the
+/// configured rate limit. The fix reuses `now_ts` for every real-time
+/// read the rate-limit formula makes, not just `last_refilled_at`. The
+/// override-active check, both segments of the piecewise accrual
+/// formula, and the final stamp all read the same materialized value.
+///
 /// # What this is not
 ///
 /// This is **not** wired into [`claim_task`] or [`claim_task_on_shard`].
@@ -6115,6 +6127,27 @@ pub async fn pending_queue_demand_by_queue_name(
 /// in every batch searched. This cannot cause a double-claim. It can only
 /// make other workers' claims on that key wait longer. Unmeasured, and
 /// not the same gap as the fleet-scale-throughput gap named above.
+///
+/// **Known limitation, review finding, not fixed here: a rate-limit
+/// bucket's row lock is retained the same way, but it can deadlock.**
+/// Unlike the advisory lock above, `rate_limit_debit`'s `UPDATE` (and now
+/// `now_ts`'s own lookup) takes a real, BLOCKING Postgres row lock on the
+/// bucket row. This is present since this module's very first draft, not
+/// introduced by the `now_ts` fix. It is held until the whole claim
+/// attempt's transaction ends, for every DISTINCT `rate_limit_key` any
+/// tried candidate carries, not just the winning one.
+///
+/// Two claimers walking batches that touch the same two bucket keys in
+/// opposite orders can each hold one key while waiting on the other.
+/// That is a genuine Postgres deadlock. Postgres detects and resolves
+/// it by aborting one claim attempt outright. That surfaces as a clean,
+/// typed error a caller's own retry loop already handles, not a wedge
+/// or a double-claim. Resolving this needs either a canonical per-transaction
+/// lock order across bucket keys or releasing a failed candidate's lock
+/// before moving on (a `SAVEPOINT` per candidate). Both are real
+/// redesigns, out of scope
+/// here. Named explicitly, alongside the gaps above, as what a reviewer
+/// needs before this becomes the default claim path.
 // The body is one SQL string literal; the line count is the query's, not
 // control flow's -- the same allow `claim_task_query` carries.
 #[allow(clippy::too_many_lines)]
@@ -6318,6 +6351,14 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
 /// draft). `rate_limit_debit` never touches the bucket row for such an
 /// activity, so a bypassed claim has no reason to wait on it either.
 ///
+/// `rate_limit_available` (a further review finding) is
+/// [`effective_available_tokens_expr`]'s own formula with every `NOW()`
+/// replaced by `(SELECT ts FROM now_ts)`. The shared helper's `NOW()` is
+/// correct for its other, fast-executing call sites; this one alone can
+/// run long after transaction start. `last_refilled_at` reads that same
+/// substituted value, never the raw `NOW()`, so it can never regress to
+/// a time before what a concurrent transaction already committed.
+///
 /// Binds: `$1` worker id, `$2` candidate row id, `$3` concurrency key,
 /// `$4` concurrency cap, `$5` task type. Also `$6` rate limit key, `$7`
 /// activity name, `$8` circuit-breaker-tracked activities, `$9` schedule-
@@ -6325,7 +6366,8 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
 #[must_use]
 pub fn claim_batched_candidate_attempt_query() -> &'static str {
     static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        let rate_limit_available = effective_available_tokens_expr("b");
+        let rate_limit_available =
+            effective_available_tokens_expr("b").replace("NOW()", "(SELECT ts FROM now_ts)");
         format!(
             "WITH now_ts AS ( \
                  SELECT clock_timestamp() AS ts \
@@ -6339,7 +6381,7 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
              rate_limit_debit AS ( \
                  UPDATE harvest_rate_limit_buckets b \
                  SET tokens = {rate_limit_available} - 1.0, \
-                     last_refilled_at = NOW() \
+                     last_refilled_at = (SELECT ts FROM now_ts) \
                  WHERE b.key = $6 \
                    AND NOT ($7 = ANY($8)) \
                    AND {rate_limit_available} >= 1.0 \
@@ -7444,10 +7486,12 @@ mod tests {
         );
         assert_eq!(
             sql.matches("SELECT ts FROM now_ts").count(),
-            3,
-            "rate_limit_debit's deadline check, claimed's deadline check, \
-             and claimed's own started_at stamp must all read the SAME \
-             materialized timestamp; got:\n{sql}"
+            10,
+            "every real-time read in this query -- both deadline checks, \
+             started_at, last_refilled_at, and the three NOW() reads \
+             inside the rate-limit formula, rendered twice (SET and \
+             WHERE) -- must read the SAME materialized timestamp; \
+             got:\n{sql}"
         );
     }
 
@@ -7579,12 +7623,39 @@ mod tests {
     #[test]
     fn claim_batched_candidate_attempt_query_honors_the_effective_rate_limit_override() {
         let sql = claim_batched_candidate_attempt_query();
-        let effective = effective_available_tokens_expr("b");
+        let effective =
+            effective_available_tokens_expr("b").replace("NOW()", "(SELECT ts FROM now_ts)");
         assert_eq!(
             sql.matches(&effective).count(),
             2,
             "the debit SET and its own WHERE re-check must both use the \
-             shared formula; got:\n{sql}"
+             shared formula, with every NOW() read as the post-lock \
+             now_ts value; got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR (P1). A long batch
+    /// walk can leave the transaction's own `NOW()` behind real time by
+    /// the time `rate_limit_debit` finally runs. Writing
+    /// `last_refilled_at = NOW()` can then move it BACKWARDS relative to
+    /// a value another, faster transaction already wrote in the
+    /// meantime. A later claimant reading that backward-moved timestamp
+    /// re-accrues tokens for an interval already accounted for,
+    /// exceeding the configured rate limit. `last_refilled_at` must read
+    /// the same post-lock `now_ts` value the available-tokens formula
+    /// now uses, never the frozen `NOW()`.
+    #[test]
+    fn claim_batched_candidate_attempt_query_stamps_last_refilled_at_with_real_time() {
+        let sql = claim_batched_candidate_attempt_query();
+        assert!(
+            sql.contains("last_refilled_at = (SELECT ts FROM now_ts)"),
+            "last_refilled_at must read the materialized now_ts value, \
+             not the transaction-frozen NOW(); got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("last_refilled_at = NOW()"),
+            "last_refilled_at must never fall back to the frozen NOW(); \
+             got:\n{sql}"
         );
     }
 
