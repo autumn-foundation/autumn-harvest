@@ -680,8 +680,16 @@ pub fn preview_schedule_firings(
     let mut cursor = from;
     let exclude_weekends = calendar_name.is_some_and(calendar_excludes_weekends);
     // Indexed once for the whole preview: `apply_skip_policy_indexed` below
-    // is called up to `count` times against this same list.
-    let excluded: std::collections::BTreeSet<NaiveDate> = excluded_dates.iter().copied().collect();
+    // is called up to `count` times against this same list. Skipped when
+    // `calendar_name` is `None`. The loop below then never reads `excluded`
+    // at all. A caller disabling calendar filtering while still holding a
+    // large `excluded_dates` snapshot must not pay to index a list it
+    // asked not to be checked.
+    let excluded: std::collections::BTreeSet<NaiveDate> = if calendar_name.is_some() {
+        excluded_dates.iter().copied().collect()
+    } else {
+        std::collections::BTreeSet::new()
+    };
 
     while entries.len() < count {
         let Some(fire_time) = next_run_after_pub(Some(schedule), cursor) else {
