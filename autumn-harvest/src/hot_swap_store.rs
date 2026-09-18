@@ -40,8 +40,8 @@ use crate::error::{HarvestError, HarvestResult, database_error};
 use std::sync::Arc;
 
 use crate::hot_swap::{
-    MAX_WORKFLOW_MODULE_BYTES, ModuleDescriptor, ModuleRegistry, ModuleVerification,
-    PreparedBinding, compute_module_hash, verify_module_bytes,
+    MAX_WORKFLOW_MODULE_BYTES, MAX_WORKFLOW_NAMES_PER_BUILD, ModuleDescriptor, ModuleRegistry,
+    ModuleVerification, PreparedBinding, compute_module_hash, verify_module_bytes,
 };
 
 /// One `harvest_workflow_modules` row, payload included.
@@ -458,6 +458,19 @@ pub async fn sync_build_into_registry(
         // cause is still visible.
         return Err(HarvestError::Config(format!(
             "build `{build_id}` registers no workflow modules (in this shard's database);              nothing to load. Check the build id, and that the publish targeted this shard."
+        )));
+    }
+    if names.len() > MAX_WORKFLOW_NAMES_PER_BUILD {
+        // Refused before fetching or compiling a single module (issue #1345
+        // finding 6). Source bytes are bounded by fetching one payload at a
+        // time, but the COMPILED artifacts stay resident for the whole batch
+        // until it commits — atomic binding needs every module in hand first
+        // — so nothing before this check bounded how many of them accumulate.
+        return Err(HarvestError::Config(format!(
+            "build `{build_id}` registers {} workflow modules, over the \
+             {MAX_WORKFLOW_NAMES_PER_BUILD}-name ceiling; refusing to sync it rather than risk \
+             exhausting memory compiling all of them before the batch commits",
+            names.len()
         )));
     }
 

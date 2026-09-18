@@ -316,6 +316,13 @@ const CITED_TESTS: &[&str] = &[
     "a_failing_module_leaves_the_whole_build_unbound",
     "a_guest_may_not_schedule_an_activity_the_host_did_not_allow",
     "a_guest_may_not_pick_the_queue_unless_the_host_allows_it",
+    // Codex review round 6, issue #1345.
+    "a_capability_enabled_host_never_uses_the_decision_cache",
+    "unloading_a_build_misses_on_a_suspended_executions_next_lookup",
+    "a_guest_may_not_pick_an_oversized_queue_name",
+    "a_sync_refuses_a_build_with_too_many_workflow_names",
+    "unloading_the_build_being_loaded_still_fails_the_commit",
+    "unloading_one_build_does_not_fail_an_unrelated_builds_in_flight_commit",
 ];
 
 #[test]
@@ -532,7 +539,7 @@ fn every_guest_response_is_valid_json_for_the_decide_abi() {
 const REPORT_CONSTANTS: &[(&str, &str)] = &[
     ("MAX_DECIDE_STEPS", "64"),
     ("DECIDE_MAX_WALL_CLOCK", "5 s"),
-    ("DECIDE_RUN_WALL_CLOCK", "10 s"),
+    ("DECIDE_RUN_FUEL_BUDGET", "2"),
 ];
 
 #[test]

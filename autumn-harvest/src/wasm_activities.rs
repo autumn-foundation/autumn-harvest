@@ -770,7 +770,7 @@ pub fn invoke_wasm_activity_cancellable(
         )
     }));
     match result {
-        Ok(inner) => inner,
+        Ok(inner) => inner.map(|(value, _fuel_consumed)| value),
         Err(payload) => Err(ActivityFailure::wasm_trap(format!(
             "host glue panicked during wasm invocation: {}",
             crate::error::panic_message(payload)
@@ -797,6 +797,13 @@ pub fn invoke_wasm_activity_cancellable(
 ///
 /// Returns an [`ActivityFailure`] classifying any sandbox denial, resource
 /// exhaustion, guest trap, ABI violation, or contained host-glue panic.
+///
+/// # Returns
+///
+/// The guest's decoded output, paired with the fuel it consumed. The caller
+/// (`hot_swap::decide_encoded`) charges the fuel figure to a cache entry's
+/// cost, deterministically: the same guest on the same input consumes the
+/// same fuel on every host, unlike wall-clock time.
 #[cfg(feature = "hot-code-swap")]
 pub(crate) fn invoke_wasm_guest_bytes(
     store: &WasmModuleStore,
@@ -805,7 +812,7 @@ pub(crate) fn invoke_wasm_guest_bytes(
     caps: &WasmCapabilities,
     limits: &WasmLimits,
     deadline: Option<Duration>,
-) -> Result<serde_json::Value, ActivityFailure> {
+) -> Result<(serde_json::Value, u64), ActivityFailure> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         invoke_wasm_activity_inner(
             store,
@@ -837,7 +844,7 @@ fn invoke_wasm_activity_inner(
     deadline: Option<Duration>,
     dispatch_start: Option<Instant>,
     cancel: Option<&CancellationToken>,
-) -> Result<serde_json::Value, ActivityFailure> {
+) -> Result<(serde_json::Value, u64), ActivityFailure> {
     let engine = store.engine();
 
     // Per-attempt fresh store with an independent limiter, fuel budget, and
@@ -1040,7 +1047,13 @@ fn invoke_wasm_activity_inner(
         .get(out_ptr..end)
         .ok_or_else(|| ActivityFailure::wasm_trap("wasm output range is out of bounds"))?;
 
+    // Fuel consumed is deterministic for a given guest and request, unlike
+    // wall-clock time, which is why the decision cache charges this rather
+    // than an `Instant::elapsed()` measurement (issue #1345 finding 5).
+    let fuel_consumed = limits.fuel.saturating_sub(wasm_store.get_fuel().unwrap_or(0));
+
     serde_json::from_slice(out_bytes)
+        .map(|value| (value, fuel_consumed))
         .map_err(|e| ActivityFailure::wasm_trap(format!("wasm output is not valid JSON: {e}")))
 }
 

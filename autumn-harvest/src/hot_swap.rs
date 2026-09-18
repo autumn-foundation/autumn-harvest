@@ -94,7 +94,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -135,6 +135,20 @@ pub const MAX_DECIDE_STEPS: usize = 64;
 /// a direct `INSERT` cannot plant an oversized row for a worker to materialise.
 pub const MAX_WORKFLOW_MODULE_BYTES: usize = 32 * 1024 * 1024;
 
+/// Hard ceiling on how many workflow names one build may register.
+///
+/// [`sync_build_into_registry`](crate::hot_swap_store::sync_build_into_registry)
+/// fetches modules one at a time and drops each payload's source bytes right
+/// after compiling it, so peak source residency is one module, not the whole
+/// build. That bounds source bytes only. Atomic binding needs every module
+/// compiled before any of them is bound, so the *compiled* artifacts stay
+/// resident for the whole build regardless — and nothing bounded how many of
+/// them a build could name. A build with enough workflow rows could still
+/// accumulate unboundedly many resident compiled modules and exhaust memory
+/// before the batch ever commits. This ceiling closes that: a build over it
+/// is refused before any module is fetched or compiled.
+pub const MAX_WORKFLOW_NAMES_PER_BUILD: usize = 256;
+
 /// Wall-clock **backstop** for a single guest decision.
 ///
 /// Not the operative budget — see [`DECIDE_FUEL`]. It exists for the one class
@@ -149,20 +163,30 @@ pub const MAX_WORKFLOW_MODULE_BYTES: usize = 32 * 1024 * 1024;
 /// avoid.
 pub const DECIDE_MAX_WALL_CLOCK: Duration = Duration::from_secs(5);
 
-/// Cumulative guest wall-clock budget for one handler invocation.
-///
-/// [`DECIDE_MAX_WALL_CLOCK`] bounds a single decision; this bounds the whole
-/// decision cycle, so a guest cannot compose per-decision budgets into an
-/// unbounded occupancy of a runtime worker thread. With memoisation a cycle
-/// performs one *new* decision, so a well-behaved guest never approaches it.
-pub const DECIDE_RUN_WALL_CLOCK: Duration = Duration::from_secs(10);
-
 /// CPU fuel budget for a single guest decision — the operative bound.
 ///
 /// Deterministic: the same guest on the same input consumes the same fuel on
 /// every host, so a fuel-exhaustion failure is reproducible rather than
 /// load-dependent.
 pub const DECIDE_FUEL: u64 = 10_000_000;
+
+/// Cumulative guest fuel budget for one handler invocation.
+///
+/// [`DECIDE_FUEL`] bounds a single decision; this bounds the whole decision
+/// cycle, so a guest cannot compose per-decision budgets into unbounded
+/// occupancy of a runtime worker thread. With memoisation a cycle performs
+/// one *new* decision, so a well-behaved guest never approaches it.
+///
+/// Fuel, not the clock (issue #1345 finding 5). An earlier cut charged a
+/// cache HIT the wall-clock duration recorded when the decision was first
+/// computed. That duration varies with host load, so the same run could pass
+/// on a busy host — where the recorded cost was high enough to still fit the
+/// budget — and fail on an idle one recomputing the same step fresh, or the
+/// reverse. Fuel is deterministic for a given guest and request, so the same
+/// run always reaches the same verdict regardless of cache residency or host
+/// speed. Set to twice [`DECIDE_FUEL`], mirroring the margin the former
+/// wall-clock pair kept between the per-decision and cumulative ceilings.
+pub const DECIDE_RUN_FUEL_BUDGET: u64 = DECIDE_FUEL * 2;
 
 /// Linear-memory ceiling for a guest decision: 4 MiB.
 pub const DECIDE_MEMORY_BYTES: usize = 4 * 1024 * 1024;
@@ -184,6 +208,15 @@ pub const MAX_DECIDE_REQUEST_BYTES: usize = 1024 * 1024;
 /// then durable and re-read on every history load. Truncation keeps the
 /// diagnostic while bounding the blast radius.
 pub const MAX_GUEST_TEXT_BYTES: usize = 2048;
+
+/// Ceiling on a guest-chosen activity queue name: 200 bytes.
+///
+/// `harvest_task_queue.queue_name` sits in a B-tree poll index. Postgres
+/// refuses an index entry near a page-fraction limit, so a long guest-chosen
+/// name would make every future insert for that queue fail, not just this
+/// one. Refusing the name here keeps the failure local to the guest that
+/// picked it.
+pub const MAX_QUEUE_NAME_BYTES: usize = 200;
 
 /// Minimum module-signing key length, in bytes.
 ///
@@ -645,10 +678,13 @@ pub struct ModuleDescriptor {
 
 /// A compiled module plus its identity.
 ///
-/// Handed out behind an [`Arc`], which is the whole answer to the unload
-/// hazard: [`ModuleRegistry::unload_build`] removes the *binding*, while an
-/// invocation that already resolved the module keeps the code alive until it
-/// finishes. In dylib hosting the same sequence is a use-after-free.
+/// Handed out behind an [`Arc`]. That answers the unload hazard for a
+/// **currently executing** invocation: [`ModuleRegistry::unload_build`]
+/// removes the *binding*, and the `Arc` already held keeps the code alive
+/// until that invocation finishes. It does not cover a *suspended*
+/// execution, which holds no `Arc` — see the caveat on
+/// [`ModuleRegistry::unload_build`]. In dylib hosting the same unload is a
+/// use-after-free regardless of execution state.
 #[derive(Debug)]
 pub struct LoadedWorkflowModule {
     descriptor: ModuleDescriptor,
@@ -690,10 +726,20 @@ pub struct ModuleRegistry {
     /// (issue #967, Codex review round 2). See [`DecisionCache`] for why the
     /// process is the right lifetime and why sharing is sound.
     decisions: Mutex<DecisionCache>,
-    /// Bumped by every [`Self::unload_build`]. A load captures it before
-    /// compiling and refuses to insert if it moved, so a retirement cannot be
-    /// silently undone by a sync that was already in flight.
+    /// Bumped by every [`Self::unload_build`]. Paired with `unloaded_at` below
+    /// to scope the race check to the build actually unloaded — see there.
     generation: AtomicU64,
+    /// The registry generation at which each build id was most recently
+    /// unloaded (issue #1345 finding 7).
+    ///
+    /// `generation` alone cannot tell a commit which build raced it: a single
+    /// counter shared by every build means unloading `wf-v1` also bumps the
+    /// generation a concurrent `wf-v2` sync captured, so that sync's commit
+    /// fails with [`HotSwapError::UnloadedDuringLoad`] blaming `wf-v2` even
+    /// though `wf-v2` was never touched. Recording *which* build moved lets
+    /// [`Self::commit`] fail closed only when the unloaded build overlaps the
+    /// batch actually committing.
+    unloaded_at: RwLock<BTreeMap<String, u64>>,
 }
 
 impl std::fmt::Debug for ModuleRegistry {
@@ -754,6 +800,7 @@ impl ModuleRegistry {
             bindings: RwLock::new(BTreeMap::new()),
             decisions: Mutex::new(DecisionCache::new()),
             generation: AtomicU64::new(0),
+            unloaded_at: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -857,13 +904,25 @@ impl ModuleRegistry {
             .write()
             .unwrap_or_else(PoisonError::into_inner);
 
-        if self.generation.load(Ordering::Acquire) != generation_at_start
-            && let Some(first) = prepared.first()
+        // Scoped to the builds THIS batch actually binds (issue #1345
+        // finding 7): a global generation bump would fail this commit for
+        // any unrelated build's unload, not just one racing this one.
         {
-            return Err(HotSwapError::UnloadedDuringLoad {
-                build_id: first.key.0.clone(),
-                workflow_name: first.key.1.clone(),
-            });
+            let unloaded_at = self
+                .unloaded_at
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            for entry in &prepared {
+                if unloaded_at
+                    .get(&entry.key.0)
+                    .is_some_and(|&at| at > generation_at_start)
+                {
+                    return Err(HotSwapError::UnloadedDuringLoad {
+                        build_id: entry.key.0.clone(),
+                        workflow_name: entry.key.1.clone(),
+                    });
+                }
+            }
         }
 
         // Re-take the duplicate decision for every entry before mutating
@@ -1038,10 +1097,19 @@ impl ModuleRegistry {
 
     /// Drop every binding for `build_id`, returning how many were removed.
     ///
-    /// Safe to call the moment
-    /// [`build_reachability`](crate::build_routing::build_reachability) reports
-    /// `safe_to_retire`; safe to call *before* that too, because an in-flight
-    /// invocation holds its own `Arc`.
+    /// Safe against use-after-free at any time. An invocation that already
+    /// resolved the module holds its own `Arc`, so dropping the binding here
+    /// cannot unmap code that invocation still runs on.
+    ///
+    /// That guarantee does not extend to a *suspended* execution. A
+    /// suspended execution holds no `Arc`, so its next
+    /// `process_workflow_task` does a fresh lookup, which misses after an
+    /// early unload. The miss is the typed capability miss (issue #804), not
+    /// a crash, but it costs a redelivery round trip, and it exhausts into a
+    /// failure once no peer still serves the build. Call this once
+    /// [`build_reachability`](crate::build_routing::build_reachability)
+    /// reports `safe_to_retire` to avoid that cost; calling it earlier is
+    /// legal, not free.
     ///
     /// Bumps the registry generation, so a load that is mid-compile for this
     /// build fails with [`HotSwapError::UnloadedDuringLoad`] instead of
@@ -1055,7 +1123,14 @@ impl ModuleRegistry {
         bindings.retain(|(bid, _), _| bid != build_id);
         // Bumped under the write lock so a concurrent `commit` either sees the
         // old generation and this removal, or the new generation and refuses.
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        // Recorded under the SAME write lock, so `commit`'s read of
+        // `unloaded_at` (also taken while holding `bindings`) can never
+        // observe the bumped generation without this entry already in place.
+        self.unloaded_at
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(build_id.to_string(), generation);
         before - bindings.len()
     }
 
@@ -1204,8 +1279,8 @@ struct CachedDecision {
     key: [u8; 32],
     response: DecideResponse,
     bytes: usize,
-    /// How long the guest took to produce this decision when it was actually
-    /// computed (issue #967, Codex review round 4).
+    /// Fuel the guest consumed to produce this decision when it was actually
+    /// computed (issue #967, Codex review rounds 4 and 6).
     ///
     /// Charged to the run's budget again on every cache HIT, so the accounting
     /// is the same whether a step was recomputed or served from cache. Without
@@ -1214,7 +1289,15 @@ struct CachedDecision {
     /// executions had evicted the entry, or whether the response happened to
     /// exceed `MAX_CACHED_RESPONSE_BYTES`. That is exactly the class of defect
     /// `MAX_DECIDE_STEPS` is a compile-time constant to avoid.
-    guest_time: Duration,
+    ///
+    /// **Fuel, not wall-clock time.** An earlier cut stored the wall-clock
+    /// `Duration` the first computation measured, which varies with host
+    /// load: a decision recorded slow on a busy runner charged that same slow
+    /// cost to every later hit, and a fast recomputation after eviction could
+    /// then complete a run the cached hit would have failed. Fuel is
+    /// deterministic for a given guest and request, so the charge is the same
+    /// on every host regardless of residency.
+    fuel: u64,
 }
 
 impl DecisionCache {
@@ -1246,12 +1329,12 @@ impl DecisionCache {
     }
 
     /// The decision recorded for `key`, if any. Records a hit or a miss.
-    pub fn get(&mut self, key: &[u8; 32]) -> Option<(DecideResponse, Duration)> {
+    pub fn get(&mut self, key: &[u8; 32]) -> Option<(DecideResponse, u64)> {
         let found = self
             .index
             .get(key)
             .and_then(|seq| self.entries.get(seq))
-            .map(|entry| (entry.response.clone(), entry.guest_time));
+            .map(|entry| (entry.response.clone(), entry.fuel));
         if found.is_some() {
             self.hits += 1;
         } else {
@@ -1266,12 +1349,7 @@ impl DecisionCache {
     /// A response larger than [`MAX_CACHED_RESPONSE_BYTES`] is **not** cached:
     /// the guest is simply re-asked for that step, which is what happened before
     /// the cache existed. Returns whether the decision was retained.
-    pub fn insert(
-        &mut self,
-        key: [u8; 32],
-        response: DecideResponse,
-        guest_time: Duration,
-    ) -> bool {
+    pub fn insert(&mut self, key: [u8; 32], response: DecideResponse, fuel: u64) -> bool {
         if self.index.contains_key(&key) {
             return false;
         }
@@ -1304,7 +1382,7 @@ impl DecisionCache {
                 key,
                 response,
                 bytes,
-                guest_time,
+                fuel,
             },
         );
         self.index.insert(key, seq);
@@ -1530,8 +1608,8 @@ fn decide_encoded(
     module: &LoadedWorkflowModule,
     request_bytes: &[u8],
     step: u32,
-) -> Result<DecideResponse, String> {
-    let raw = crate::wasm_activities::invoke_wasm_guest_bytes(
+) -> Result<(DecideResponse, u64), String> {
+    let (raw, fuel_consumed) = crate::wasm_activities::invoke_wasm_guest_bytes(
         host.registry.store(),
         module.module(),
         request_bytes,
@@ -1548,13 +1626,14 @@ fn decide_encoded(
         )
     })?;
 
-    serde_json::from_value(raw.clone()).map_err(|e| {
+    let response = serde_json::from_value(raw.clone()).map_err(|e| {
         format!(
             "workflow module {} returned a response the host cannot parse ({e}): {}",
             module.descriptor().module_hash,
             bound_guest_text(&raw.to_string()),
         )
-    })
+    })?;
+    Ok((response, fuel_consumed))
 }
 
 /// Classify an error returned by a `WorkflowContext` await.
@@ -1622,7 +1701,7 @@ fn outcome_for_guest(err: &HarvestError) -> Option<DecideOutcome> {
 /// outcome, which is the very thing charging cache hits exists to prevent.
 fn run_budget_exceeded(build_id: &str) -> String {
     format!(
-        "workflow module for build `{build_id}` exceeded the {DECIDE_RUN_WALL_CLOCK:?} \
+        "workflow module for build `{build_id}` exceeded the {DECIDE_RUN_FUEL_BUDGET}-fuel \
          cumulative guest budget for one decision cycle"
     )
 }
@@ -1701,6 +1780,15 @@ fn resolve_activity_queue(
         return Err(format!(
             "workflow module for build `{build_id}` resolved an empty activity queue for `{}`; \
              no worker polls the empty queue, so the activity would never be picked up",
+            bound_guest_text(activity)
+        ));
+    }
+    if queue.len() > MAX_QUEUE_NAME_BYTES {
+        return Err(format!(
+            "workflow module for build `{build_id}` resolved a {}-byte activity queue name for \
+             `{}`, over the {MAX_QUEUE_NAME_BYTES}-byte ceiling; refusing rather than \
+             truncating it, since a truncated name would route work to a queue nobody polls",
+            queue.len(),
             bound_guest_text(activity)
         ));
     }
@@ -1791,7 +1879,18 @@ pub fn module_workflow_handler(
         // one execution's drive) rather than in this future: a map created here
         // is written and read in the same monotonically increasing pass and can
         // never hit. See `ModuleHost::decisions`.
-        let mut guest_time = Duration::ZERO;
+        //
+        // The cache is skipped entirely when `host.capabilities` is not
+        // deny-all (issue #1345 finding 2). Its soundness rests on the guest
+        // being a pure function of its request, which holds only under
+        // deny-all: `with_capabilities` can grant a clock or randomness, and a
+        // guest granted either can answer differently on two calls with the
+        // same request. Serving a prior answer from the cache would then hand
+        // out a stale time- or random-dependent decision instead of asking the
+        // guest again. A capability-enabled guest already fails replay for the
+        // same reason (§7); the cache would only mask when.
+        let deny_all = host.capabilities == WasmCapabilities::default();
+        let mut guest_fuel: u64 = 0;
         let mut resolved: Vec<DecideOutcome> = Vec::new();
 
         for step in 0..MAX_DECIDE_STEPS {
@@ -1814,11 +1913,14 @@ pub fn module_workflow_handler(
             // would let v1's decision be served to v2, silently defeating the
             // swap this whole spike is about.
             let key = DecisionCache::key(&build_id, &module.descriptor().module_hash, &encoded);
-            let cached = host
-                .registry
-                .decisions()
-                .ok_or_else(|| "the decision cache is poisoned".to_string())?
-                .get(&key);
+            let cached = if deny_all {
+                host.registry
+                    .decisions()
+                    .ok_or_else(|| "the decision cache is poisoned".to_string())?
+                    .get(&key)
+            } else {
+                None
+            };
             // The budget is charged for a step whether it was recomputed or
             // served from cache (issue #967, Codex review round 4). A cache hit
             // used to be free, which made the run's TERMINAL OUTCOME depend on
@@ -1847,17 +1949,18 @@ pub fn module_workflow_handler(
             //
             // The pre-check is gone rather than duplicated: since every
             // iteration now returns as soon as the budget is reached, the loop
-            // cannot re-enter with `guest_time` already over it.
+            // cannot re-enter with `guest_fuel` already over it.
             let (response, cost) = if let Some((cached, recorded)) = cached {
                 (cached, recorded)
             } else {
-                let started = Instant::now();
-                let response = decide_encoded(&host, &limits, &module, &encoded, step_index)?;
-                let elapsed = started.elapsed();
-                host.registry
-                    .decisions()
-                    .ok_or_else(|| "the decision cache is poisoned".to_string())?
-                    .insert(key, response.clone(), elapsed);
+                let (response, fuel_consumed) =
+                    decide_encoded(&host, &limits, &module, &encoded, step_index)?;
+                if deny_all {
+                    host.registry
+                        .decisions()
+                        .ok_or_else(|| "the decision cache is poisoned".to_string())?
+                        .insert(key, response.clone(), fuel_consumed);
+                }
 
                 // NOTE: deliberately no `yield_now()` here (issue #967, Codex
                 // review round 1). `executor::run_workflow_handler_cycle` drives
@@ -1878,11 +1981,11 @@ pub fn module_workflow_handler(
                 // slow guest blocks the poll instead of yielding — bounded by
                 // fuel (the operative, deterministic budget) and by the wall
                 // clock backstop.
-                (response, elapsed)
+                (response, fuel_consumed)
             };
 
-            guest_time = guest_time.saturating_add(cost);
-            if guest_time >= DECIDE_RUN_WALL_CLOCK {
+            guest_fuel = guest_fuel.saturating_add(cost);
+            if guest_fuel >= DECIDE_RUN_FUEL_BUDGET {
                 return Err(run_budget_exceeded(&build_id));
             }
 
@@ -2006,13 +2109,22 @@ mod tests {
     }
 
     #[test]
-    fn the_wall_clock_backstop_sits_well_above_any_fuel_bounded_decision() {
-        // If these could plausibly race, a run's terminal outcome would depend
-        // on host load: the same history would fail on a busy worker and succeed
-        // on an idle one. The backstop must be comfortably the looser bound.
+    fn the_wall_clock_backstop_is_generous() {
         let limits = default_decide_limits();
         assert!(limits.max_wall_clock >= Duration::from_secs(1));
-        assert!(DECIDE_RUN_WALL_CLOCK > limits.max_wall_clock);
+    }
+
+    #[test]
+    fn the_cumulative_fuel_budget_sits_above_a_single_decisions_fuel_ceiling() {
+        // Issue #1345 finding 5. `DECIDE_RUN_FUEL_BUDGET` replaced a
+        // wall-clock cumulative budget, which raced the per-decision
+        // wall-clock backstop: a run's terminal outcome would depend on host
+        // load, since the same history could fail on a busy worker and
+        // succeed on an idle one. Fuel is deterministic, so that particular
+        // race is gone by construction — but the budget must still exceed a
+        // single decision's own ceiling, or one ordinary decision would
+        // already exhaust the whole run's budget.
+        assert!(DECIDE_RUN_FUEL_BUDGET > DECIDE_FUEL);
     }
 
     #[test]
