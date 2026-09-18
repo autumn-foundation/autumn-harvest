@@ -310,14 +310,27 @@ instant.** The shards are read sequentially, on separate connections to separate
 databases, with no shared snapshot — Postgres has no cross-shard transaction and
 Harvest deliberately adds no coordinator. A run of the key that starts on an
 already-read shard while a later shard is being read is therefore invisible to
-that fan-out, and a cancel can report success while it is live. This needs two
-live runs of one business key to be possible at all, which needs a deployment to
-mix pinned and unpinned starts of the same `workflow_id` — exactly the discipline
-the *Caveats* section above asks you to keep, and for exactly this reason. It is
-also strictly better than the pre-#1146 behaviour, which consulted one
-hash-derived shard and missed a second live run unconditionally rather than only
-under a race. Closing it properly means cross-shard key uniqueness, which is an
-architectural addition rather than a fix — see issue #1313 for the options.
+that fan-out. This needs two live runs of one business key to be possible at
+all, which needs a deployment to mix pinned and unpinned starts of the same
+`workflow_id` — exactly the discipline the *Caveats* section above asks you to
+keep, and for exactly this reason.
+
+**So a by-id cancel reports from a later fan-out than the one that cancelled**
+(issue #1313). The stale view only becomes a wrong answer once the cancel makes
+the run it found terminal, because that promotes the run which started during
+the fan-out to current run for the key. A cancel that ends a live run therefore
+cancels it, withholds `ExternalCancelDelivered`, and leaves the claim to the
+next sweep, whose fan-out observes the whole window the first one ran in. That
+run is then an ordinary second live copy, cancelled one per sweep until none is
+left, exactly as an ambiguous fan-out already converges. The cost is one extra
+scanner poll interval on every by-id cancel that finds a live run; a cancel
+whose target is already terminal changes nothing and still reports at once, as
+does every `ExecutionId`-addressed cancel and every single-shard deployment.
+
+This narrows the window rather than making the assertion atomic: the later
+fan-out is itself not a snapshot. Closing it outright means cross-shard key
+uniqueness, which is an architectural addition rather than a fix — see issue
+#1313 for the options.
 
 **Size each shard pool at one connection per local scanner sharing it, plus
 one.** `Worker` spawns one timeout checker per assigned shard, and each holds

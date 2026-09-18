@@ -732,27 +732,46 @@ async fn outbox_cancel_by_id_reaches_a_target_pinned_off_its_hash_shard() {
     .expect("seed caller history");
 
     let metrics = autumn_harvest::telemetry::NoOpMetrics;
-    let processed = autumn_harvest::timeout::enforce_external_cancels_outbox(
+    let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
         &mut caller_conn,
         &metrics,
         Duration::from_millis(0),
         &Some(sharded),
         &[ShardId::new(0)],
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        &codecs,
     )
     .await
     .expect("cancel outbox sweep should succeed");
-    assert_eq!(processed, 1, "the by-id cancel must be resolved this sweep");
+    assert_eq!(
+        load_execution(&mut conn1, target).await.state,
+        "CANCELLED",
+        "the cancel must land on the pinned target's own database"
+    );
+
+    // The report comes from the NEXT fan-out, not the one that cancelled
+    // (issue #1313). What this test is about is unchanged: the pinned target
+    // is reached and cancelled, and the caller records delivery rather than
+    // `target_unknown`.
+    let processed = autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut caller_conn,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool()),
+        &[ShardId::new(0)],
+        &codecs,
+    )
+    .await
+    .expect("second cancel outbox sweep should succeed");
+    assert_eq!(
+        processed, 1,
+        "the by-id cancel must be resolved by this sweep"
+    );
 
     let types = history_event_types(&mut caller_conn, caller).await;
     assert!(
         types.contains(&"ExternalCancelDelivered".to_string()),
         "the pinned target must be cancelled, not reported unknown; got {types:?}"
-    );
-    assert_eq!(
-        load_execution(&mut conn1, target).await.state,
-        "CANCELLED",
-        "the cancel must land on the pinned target's own database"
     );
 }
 
@@ -1938,17 +1957,30 @@ async fn outbox_cancel_by_id_reports_once_every_shard_can_be_inspected() {
     )
     .await
     .expect("recovered sweep should succeed");
+    assert_eq!(
+        load_execution(&mut conn1, live).await.state,
+        "CANCELLED",
+        "the recovered sweep reaches the target and cancels it"
+    );
+
+    // The recovered sweep is the one that cancels, so the report is the next
+    // one's to make (issue #1313).
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut caller_conn,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool()),
+        &[ShardId::new(0)],
+        &codecs,
+    )
+    .await
+    .expect("reporting sweep should succeed");
     assert!(
         history_event_types(&mut caller_conn, caller)
             .await
             .contains(&"ExternalCancelDelivered".to_string()),
         "once every shard answers, the cancel is reported — withholding must not \
          strand the request"
-    );
-    assert_eq!(
-        load_execution(&mut conn1, live).await.state,
-        "CANCELLED",
-        "and the target is cancelled either way"
     );
 }
 
@@ -2053,6 +2085,26 @@ async fn outbox_cancel_by_id_cancels_every_live_copy_before_reporting() {
         "one live copy per sweep, until none is left"
     );
     assert!(
+        !history_event_types(&mut conn0, caller)
+            .await
+            .contains(&"ExternalCancelDelivered".to_string()),
+        "the second sweep cancelled a live run too, so the claim is again left \
+         to a later fan-out (issue #1313)"
+    );
+
+    // Sweep 3: every copy is terminal, so this fan-out changes nothing and can
+    // report what it observed.
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut conn0,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool()),
+        &[ShardId::new(0)],
+        &codecs,
+    )
+    .await
+    .expect("third sweep should succeed");
+    assert!(
         history_event_types(&mut conn0, caller)
             .await
             .contains(&"ExternalCancelDelivered".to_string()),
@@ -2129,7 +2181,7 @@ async fn outbox_by_id_resolves_when_two_logical_shards_share_one_physical_pool()
         &mut pooled,
         &metrics,
         Duration::from_millis(0),
-        &Some(sharded),
+        &Some(sharded.clone()),
         &[ShardId::new(0)],
         &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
@@ -2141,6 +2193,21 @@ async fn outbox_by_id_resolves_when_two_logical_shards_share_one_physical_pool()
         "CANCELLED",
         "the target must be cancelled"
     );
+
+    // A second sweep, because the first one ended a live run and so leaves the
+    // claim to a later fan-out (issue #1313). The alias rule is what this test
+    // is about, and it is what decides whether that later fan-out can ever be
+    // authoritative.
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut pooled,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(sharded),
+        &[ShardId::new(0)],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("second cancel outbox sweep should succeed");
     assert!(
         history_event_types(&mut pooled, caller)
             .await
@@ -2214,7 +2281,7 @@ async fn outbox_by_id_resolves_when_the_caller_holds_the_higher_aliased_shard() 
         &mut pooled,
         &metrics,
         Duration::from_millis(0),
-        &Some(sharded),
+        &Some(sharded.clone()),
         &[ShardId::new(1)],
         &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
@@ -2226,6 +2293,21 @@ async fn outbox_by_id_resolves_when_the_caller_holds_the_higher_aliased_shard() 
         "CANCELLED",
         "the target must be cancelled"
     );
+
+    // A second sweep, because the first one ended a live run and so leaves the
+    // claim to a later fan-out (issue #1313). The alias rule is what this test
+    // is about, and it is what decides whether that later fan-out can ever be
+    // authoritative.
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut pooled,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(sharded),
+        &[ShardId::new(1)],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("second cancel outbox sweep should succeed");
     assert!(
         history_event_types(&mut pooled, caller)
             .await
@@ -2619,5 +2701,287 @@ async fn cancel_outbox_deferred_check_does_not_wait_on_a_peer_shard_whose_only_c
         types.contains(&"ExternalCancelDelivered".to_string()),
         "the target cancellation itself must not be blocked by the child's \
          unreachable shard; got {types:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 12. Issue #1313: a by-id cancel must not report from the fan-out that
+//     cancelled
+// ─────────────────────────────────────────────────────────────────────────
+
+// PR #1306 made `ExternalCancelDelivered` wait for an answer that is
+// authoritative for the whole business key: no uninspected shard, and no second
+// live run besides the winner. Issue #1313 is the residual. The fan-out reads
+// each shard on its own connection to its own database, with no shared
+// snapshot, so it is authoritative over the observations it made and not over
+// any instant in time. A run of the key can start on a shard after that shard
+// answered, and the merge never sees it.
+//
+// The two checks above cannot catch that run. Every shard answered, and the
+// selected run really was live, so nothing disagrees and `expected_live`'s
+// re-read has nothing to report. The stale view only becomes a wrong assertion
+// once the cancel makes the selected run terminal, which promotes the run that
+// started during the fan-out to current run for the key.
+//
+// So a cancel that ends a live run now leaves the assertion to a later
+// fan-out — one that observes the whole window this sweep ran in.
+
+/// Count of other backends on this database blocked on a lock.
+#[derive(diesel::QueryableByName)]
+struct BlockedBackends {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    blocked: i64,
+}
+
+/// Wait until another backend on `conn`'s database blocks on a lock.
+///
+/// The interleaving under test needs the racing start to land while the sweep
+/// is past its fan-out and not yet past its terminal event. A held row lock on
+/// the target pins the sweep in exactly that window, and this observes the
+/// sweep arriving there, so the test does not depend on a sleep being long
+/// enough.
+async fn wait_for_a_blocked_backend(conn: &mut AsyncPgConnection) {
+    for _ in 0..600 {
+        let rows: Vec<BlockedBackends> = diesel::sql_query(
+            "SELECT COUNT(*) AS blocked FROM pg_stat_activity \
+             WHERE datname = current_database() \
+               AND pid <> pg_backend_pid() \
+               AND wait_event_type = 'Lock'",
+        )
+        .get_results(conn)
+        .await
+        .expect("read pg_stat_activity");
+        // `iter().any`, not `first()`: `diesel::prelude::*` brings a `first`
+        // query method into scope that shadows the slice one here.
+        if rows.iter().any(|row| row.blocked > 0) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the cancel delivery never blocked on the locked target row");
+}
+
+/// Seed a caller on shard 0 whose history holds a pending
+/// `ExternalCancelRequested` addressed to `(workflow_name, workflow_id)`.
+async fn seed_cancel_caller(
+    conn: &mut AsyncPgConnection,
+    caller: ExecutionId,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> ExternalCancelId {
+    insert_running_row(conn, "by_id_caller", &format!("caller-{caller}"), caller).await;
+    let cancel_id = ExternalCancelId::new();
+    store::append_events(
+        conn,
+        caller,
+        &[
+            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: ExternalTarget::WorkflowId {
+                    workflow_name: workflow_name.to_string(),
+                    workflow_id: workflow_id.to_string(),
+                },
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("seed caller history");
+    cancel_id
+}
+
+#[tokio::test]
+async fn outbox_cancel_by_id_reports_from_a_later_fanout_than_the_one_that_cancelled() {
+    let _guard = TEST_MUTEX.lock().await;
+    let shards = TwoShards::start().await;
+    let router = two_shard_router();
+    autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
+
+    // The ordinary case, with no race in it: one live run of the key, on a
+    // peer shard. The cancel still acts on the sweep that finds it, and the
+    // report moves one sweep later. That is the whole cost of the rule, so it
+    // is pinned here rather than inferred from the race case below.
+    let workflow_id = key_hashing_to(&router, "later_fanout_wf", "later", ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let mut conn1 = shards.conn(ShardId::new(1)).await;
+    insert_running_row(&mut conn1, "later_fanout_wf", &workflow_id, target).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut conn0 = shards.conn(ShardId::new(0)).await;
+    seed_cancel_caller(&mut conn0, caller, "later_fanout_wf", &workflow_id).await;
+
+    let metrics = autumn_harvest::telemetry::NoOpMetrics;
+    let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut conn0,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool()),
+        &[ShardId::new(0)],
+        &codecs,
+    )
+    .await
+    .expect("first sweep should succeed");
+    assert_eq!(
+        load_execution(&mut conn1, target).await.state,
+        "CANCELLED",
+        "the cancel must still act on the sweep that resolves it"
+    );
+    assert!(
+        !history_event_types(&mut conn0, caller)
+            .await
+            .contains(&"ExternalCancelDelivered".to_string()),
+        "the fan-out that chose this target ran before the cancel changed the \
+         key's state, so it cannot be the one that asserts that state"
+    );
+
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut conn0,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool()),
+        &[ShardId::new(0)],
+        &codecs,
+    )
+    .await
+    .expect("second sweep should succeed");
+    assert!(
+        history_event_types(&mut conn0, caller)
+            .await
+            .contains(&"ExternalCancelDelivered".to_string()),
+        "the next fan-out observes the whole window the first one ran in, finds \
+         the key terminal everywhere, and reports — deferring must converge"
+    );
+}
+
+#[tokio::test]
+async fn outbox_cancel_by_id_does_not_report_over_a_run_that_started_during_its_fanout() {
+    let _guard = TEST_MUTEX.lock().await;
+    let shards = TwoShards::start().await;
+    let router = two_shard_router();
+    autumn_harvest::shard::install_global_router(router.clone());
+    let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
+
+    // The issue's interleaving, built from a real lock rather than a sleep.
+    // The key is pinned to shard 1 (#697) while its hash names shard 0, which
+    // is the mixed-placement deployment that lets two live runs of one key
+    // exist at all: uniqueness is a shard-local partial index, so neither
+    // shard's index can see the other's row.
+    let workflow_id = key_hashing_to(&router, "raced_start_wf", "raced", ShardId::new(0));
+    let pinned = ExecutionId::new_for_shard(ShardId::new(1));
+    let mut conn1 = shards.conn(ShardId::new(1)).await;
+    insert_running_row(&mut conn1, "raced_start_wf", &workflow_id, pinned).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut conn0 = shards.conn(ShardId::new(0)).await;
+    seed_cancel_caller(&mut conn0, caller, "raced_start_wf", &workflow_id).await;
+
+    // Hold the pinned run's row. The fan-out's probes are plain reads and are
+    // not blocked by this, so resolution completes and reports one live run,
+    // exactly as it does with no lock held. The cancel's own `FOR UPDATE` then
+    // blocks, which parks the sweep between its fan-out and its terminal event.
+    let mut blocker = shards.conn(ShardId::new(1)).await;
+    blocker
+        .batch_execute("BEGIN")
+        .await
+        .expect("open the blocking transaction");
+    let _held: Vec<uuid::Uuid> = harvest_workflow_executions::table
+        .find(pinned.as_uuid())
+        .select(harvest_workflow_executions::id)
+        .for_update()
+        .load(&mut blocker)
+        .await
+        .expect("lock the pinned run's row");
+
+    let metrics = autumn_harvest::telemetry::NoOpMetrics;
+    let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    let sharded = shards.sharded_pool();
+
+    let mut watcher = shards.conn(ShardId::new(1)).await;
+    let mut racer_conn = shards.conn(ShardId::new(0)).await;
+    let racing = ExecutionId::new_for_shard(ShardId::new(0));
+    let racing_key = workflow_id.clone();
+
+    let sweep = async {
+        autumn_harvest::timeout::enforce_external_cancels_outbox(
+            &mut conn0,
+            &metrics,
+            Duration::from_millis(0),
+            &Some(sharded),
+            &[ShardId::new(0)],
+            &codecs,
+        )
+        .await
+        .expect("first sweep should succeed")
+    };
+    let racing_start = async {
+        wait_for_a_blocked_backend(&mut watcher).await;
+        // Step 2 of the issue's interleaving: a run of the key starts on a
+        // shard the fan-out has already read and reported empty.
+        insert_running_row(&mut racer_conn, "raced_start_wf", &racing_key, racing).await;
+        blocker
+            .batch_execute("COMMIT")
+            .await
+            .expect("release the pinned run's row");
+    };
+    let (_swept, ()) = tokio::join!(sweep, racing_start);
+
+    assert_eq!(
+        load_execution(&mut conn1, pinned).await.state,
+        "CANCELLED",
+        "the cancel acts on the run its fan-out found, as it always has"
+    );
+    assert_eq!(
+        load_execution(&mut racer_conn, racing).await.state,
+        "RUNNING",
+        "the racing start is the run the fan-out could not see"
+    );
+    assert!(
+        !history_event_types(&mut conn0, caller)
+            .await
+            .contains(&"ExternalCancelDelivered".to_string()),
+        "this is the durable wrong answer of issue #1313: the claim that \
+         nothing runs under the key, recorded while the racing start is live \
+         and is now the current run for that key"
+    );
+
+    // The later fan-out sees the window the first one ran in, so the run it
+    // missed is an ordinary second live copy to it — one per sweep, as issue
+    // #1146's Codex round 3 case already converges.
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut conn0,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool()),
+        &[ShardId::new(0)],
+        &codecs,
+    )
+    .await
+    .expect("second sweep should succeed");
+    assert_eq!(
+        load_execution(&mut racer_conn, racing).await.state,
+        "CANCELLED",
+        "the run the first fan-out missed must still be cancelled"
+    );
+
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut conn0,
+        &metrics,
+        Duration::from_millis(0),
+        &Some(shards.sharded_pool()),
+        &[ShardId::new(0)],
+        &codecs,
+    )
+    .await
+    .expect("third sweep should succeed");
+    assert!(
+        history_event_types(&mut conn0, caller)
+            .await
+            .contains(&"ExternalCancelDelivered".to_string()),
+        "with every live copy cancelled and a fan-out that changed nothing, the \
+         claim is true and is finally recorded"
     );
 }
