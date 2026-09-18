@@ -80,7 +80,14 @@ counter above, recorded at the same point `timeout.rs` already records
 `by_id_found_over_incomplete_fanout`, and gated by a pure predicate,
 `should_record_other_live_observed`, so a partial fan-out that also saw
 `other_live` is never double-counted against the other counter (review
+finding). It also earns a starter-pack Grafana panel ("By-id fan-out
+observed more than one live run") and entries in
+`dashboard_pack_docs.rs`'s catalogue/label ground truth — the pack's own
+CI check (`every_catalogue_metric_appears_on_a_panel`) fails any
+`METRIC_*` constant with no panel, and it caught this one (review
 finding). `cargo test -p autumn-harvest --lib --all-features` on
 `external_target_location::`, `timeout::`, `telemetry::`, and
-`metrics_rs_adapter::` (210 tests across the four modules) and `python3
-docs/audits/comment-hygiene.py --base origin/trunk-dev` both pass.
+`metrics_rs_adapter::` (210 tests across the four modules),
+`cargo test -p autumn-harvest --test integration dashboard_pack_docs::`
+(18 tests), and `python3 docs/audits/comment-hygiene.py --base
+origin/trunk-dev` all pass.
