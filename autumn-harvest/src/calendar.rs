@@ -761,6 +761,15 @@ pub fn plan_backfill_with_calendar(
     exclude_weekends: bool,
 ) -> Result<Vec<BackfillSlot>, crate::scheduler::BackfillPlanError> {
     let raw = crate::scheduler::plan_backfill_timestamps(schedule, from, to, max_count)?;
+    if raw.is_empty() {
+        // No slot to check against `excluded_dates` at all -- a `Manual`
+        // schedule, or a cron/interval schedule with no occurrence in
+        // `[from, to]`. Building the index below would be pure waste. A
+        // caller can reach this on every call for a schedule outside its
+        // active window, still carrying its full (long-lived, unbounded)
+        // calendar exclusion list.
+        return Ok(Vec::new());
+    }
     // Indexed once for the whole backfill: `apply_skip_policy_indexed` below
     // is called once per raw slot (up to `max_count`) against this same list.
     let excluded: std::collections::BTreeSet<NaiveDate> = excluded_dates.iter().copied().collect();
