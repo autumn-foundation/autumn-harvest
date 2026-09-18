@@ -3333,6 +3333,76 @@ async fn an_allow_duplicate_start_creates_a_fresh_run_too_once_the_seal_is_recon
 }
 
 #[tokio::test]
+async fn a_reject_duplicate_start_refuses_over_a_reconciled_seal() {
+    // Fresh review, P1 follow-up. `RejectDuplicate` is not `AllowDuplicate`:
+    // the widened active-uniqueness index lets a fresh `INSERT` succeed
+    // past a reconciled seal, so `AllowDuplicate` et al. get a genuinely
+    // fresh run instead of stale attach data (see the test above).
+    //
+    // `RejectDuplicate`'s whole contract is "refuse if this business key
+    // has ever run" -- a reconciled seal still means exactly that. So
+    // letting the same `INSERT` decide for `RejectDuplicate` too would
+    // silently admit a second execution of a key that already completed.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "reject-duplicate-over-seal").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("complete the migrated run");
+
+    let mut source = shards.source().await;
+    reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+        .await
+        .expect("reconcile")
+        .then_some(())
+        .expect("the finished target must be observed terminal");
+
+    let err = autumn_harvest::execution::start_or_load_workflow_execution(
+        &mut source,
+        reject_duplicate_start("entity_flow", "reject-duplicate-over-seal"),
+        None,
+    )
+    .await
+    .expect_err("RejectDuplicate over a reconciled seal must refuse, not create");
+    assert!(
+        matches!(err, autumn_harvest::error::HarvestError::AlreadyExists { existing_exec_id, .. } if existing_exec_id == exec_id),
+        "must name the reconciled seal as the conflicting execution, got {err:?}"
+    );
+
+    let row_count: ScalarCount = diesel::sql_query(
+        "SELECT count(*)::BIGINT AS value FROM harvest_workflow_executions \
+          WHERE workflow_name = 'entity_flow' AND workflow_id = 'reject-duplicate-over-seal'",
+    )
+    .get_result(&mut source)
+    .await
+    .expect("count");
+    assert_eq!(
+        row_count.value, 1,
+        "no second row may have been created for this business key"
+    );
+}
+
+fn reject_duplicate_start<'a>(
+    workflow_name: &'a str,
+    workflow_id: &'a str,
+) -> autumn_harvest::execution::StartWorkflowParams<'a> {
+    autumn_harvest::execution::StartWorkflowParams {
+        reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::RejectDuplicate,
+        conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+        ..terminate_existing_start(workflow_name, workflow_id)
+    }
+}
+
+#[tokio::test]
 async fn try_load_by_key_finds_a_live_replacement_over_a_reconciled_seal() {
     // Issue #1317 review (companion to `a_reconciled_seal_alone_does_not_
     // bypass_the_throttle_token` above). When a live replacement exists

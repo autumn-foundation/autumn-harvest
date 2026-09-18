@@ -1307,6 +1307,47 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             }
         }
 
+        // `RejectDuplicate` must refuse against a reconciled `MIGRATED`
+        // seal, not silently create past it (fresh review, P1 follow-up).
+        // The active-uniqueness index below excludes an observed-terminal
+        // seal. A fresh run can then succeed with a plain `INSERT` under
+        // every OTHER reuse policy. See
+        // `an_allow_duplicate_start_creates_a_fresh_run_too_once_the_
+        // seal_is_reconciled`, which deliberately pins that outcome for
+        // `AllowDuplicate` (attaching to the seal's own stale, un-refreshed
+        // row would be useless). `RejectDuplicate` has no such "let it
+        // through" case: a reconciled seal still means this business key
+        // has already run once, full stop. The `INSERT` below cannot see
+        // that on its own, since the index no longer protects it, so check
+        // explicitly first.
+        //
+        // `FOR UPDATE` locks the row. A reconciler racing this exact
+        // check then blocks until this transaction commits or rolls
+        // back. It cannot reconcile the seal in the gap between this
+        // read and the insert.
+        if request.reuse_policy == WorkflowIdReusePolicy::RejectDuplicate {
+            let reconciled_seal: Option<(Uuid, String)> = harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::workflow_name.eq(request.workflow_name))
+                .filter(harvest_workflow_executions::workflow_id.eq(request.workflow_id))
+                .filter(harvest_workflow_executions::state.eq("MIGRATED"))
+                .filter(harvest_workflow_executions::migrated_run_terminal_at.is_not_null())
+                .select((
+                    harvest_workflow_executions::id,
+                    harvest_workflow_executions::state,
+                ))
+                .for_update()
+                .first(&mut *conn)
+                .await
+                .optional()
+                .map_err(database_error)?;
+            if let Some((id, state)) = reconciled_seal {
+                return Err(HarvestError::AlreadyExists {
+                    existing_exec_id: ExecutionId::from_uuid(id),
+                    existing_state: state,
+                });
+            }
+        }
+
         // `on_conflict_do_nothing()` (no explicit target) lets Postgres
         // arbitrate against the partial unique index installed by the
         // continue-as-new migration, which only enforces uniqueness on
