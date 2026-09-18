@@ -95,6 +95,12 @@ A complete, runnable version is in
   deterministic replay. Activity execution is therefore **at-least-once** — write
   activity bodies to be idempotent. See
   [`examples/durability.rs`](examples/durability.rs).
+- **Idempotent starts by default (issue #1068).** `start_workflow_with_id`
+  applies the `AllowDuplicate` reuse policy: a duplicate `(workflow_name,
+  workflow_id)` **attaches** to the existing, non-sealed run instead of
+  starting a second one, and the new call's input is discarded. Use
+  `start_workflow_with_reuse_policy` for the full `WorkflowIdReusePolicy`
+  matrix — reject, replace-if-failed, or terminate-and-restart.
 
 ## v0.1 non-goals
 
@@ -103,8 +109,6 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
 - Distributed / multi-writer workers; multi-server crash recovery.
 - `LISTEN`/`NOTIFY` push wake-ups.
 - Schedules, the management API, DAGs, worker sessions, retention, sharding.
-- Idempotent starts / the `WorkflowIdReusePolicy` matrix — every
-  `start_workflow` call creates a new, independent execution; dedupe upstream.
 - Child workflows, external signals/cancels, local activities, updates,
   search attributes, and `continue_as_new` — a workflow reaching one of these is
   rejected **loudly, by name**, never silently dropped.
