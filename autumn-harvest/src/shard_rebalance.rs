@@ -1750,12 +1750,48 @@ mod db {
     /// more than one hop. An example: A -> B staged while B -> A is
     /// mid-cutover. A hop landing back on `source_shard` would deadlock the
     /// same way the first hop does, so it is refused instead of attempted.
+    ///
+    /// Every one of those checks also treats an aliasing hop as the same
+    /// refusal (issue #1317 review, P2 follow-up). A hop into a DIFFERENT
+    /// shard id that aliases `source_shard`'s own physical pool counts
+    /// too, including `first_hop` itself before its very first checkout.
+    /// A pre-split staging rollout can alias two shard ids to one
+    /// size-one pool; a shard-id comparison alone cannot see that.
     async fn live_copy_is_terminal(
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
         first_hop: ShardId,
         source_shard: ShardId,
     ) -> HarvestResult<bool> {
+        // Aliased-pool guard (issue #1317 review, P2 follow-up). A
+        // shard-id comparison alone (`next == source_shard`, below) cannot
+        // catch two DISTINCT shard ids backed by the SAME physical
+        // size-one pool. That is a supported configuration during a
+        // pre-split staging rollout (`ShardedDbPool::same_physical_pool`).
+        // Checking out that pool again here would wait forever.
+        // `source`'s connection for it is still held by the caller, and
+        // the pool can never hand out a second one until that checkout
+        // times out. `first_hop` gets this check before its very first
+        // checkout below. The loop's own per-iteration guard only runs on
+        // a LATER hop's forwarding pointer, never on the first one.
+        let aliased_loop_reason = |shard: ShardId| {
+            let relation = if shard == source_shard {
+                format!("loops back to shard {source_shard}")
+            } else {
+                format!("shares a physical pool with shard {source_shard}")
+            };
+            format!(
+                "execution forwarding chain for {exec_id} {relation}, already held for this \
+                 reconciliation; this is the committed window of an in-progress reverse \
+                 migration, not a resolvable live copy yet"
+            )
+        };
+        if pool.same_physical_pool(first_hop, source_shard) {
+            return Err(HarvestError::ShardUnavailable {
+                shard_id: first_hop.as_i32(),
+                reason: aliased_loop_reason(first_hop),
+            });
+        }
         let mut current = first_hop;
         let mut conn = checkout(pool, current).await?;
         let mut resolved = None::<ShardId>;
@@ -1765,15 +1801,12 @@ mod db {
                     resolved = Some(current);
                     break;
                 }
-                Some(next) if next == source_shard => {
+                Some(next)
+                    if next == source_shard || pool.same_physical_pool(next, source_shard) =>
+                {
                     return Err(HarvestError::ShardUnavailable {
                         shard_id: next.as_i32(),
-                        reason: format!(
-                            "execution forwarding chain for {exec_id} loops back to shard \
-                             {source_shard}, the shard already held for this reconciliation; \
-                             this is the committed window of an in-progress reverse \
-                             migration, not a resolvable live copy yet"
-                        ),
+                        reason: aliased_loop_reason(next),
                     });
                 }
                 Some(next) => {

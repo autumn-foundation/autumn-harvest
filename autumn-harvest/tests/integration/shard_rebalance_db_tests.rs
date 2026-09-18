@@ -2978,6 +2978,75 @@ async fn a_hop_that_loops_back_to_the_held_shard_is_refused_not_deadlocked() {
 }
 
 #[tokio::test]
+async fn a_hop_into_a_pool_aliased_to_the_held_shard_is_refused_not_deadlocked() {
+    // Issue #1317 review, P2 follow-up. Two DISTINCT shard ids can be
+    // aliased to the SAME physical size-one pool during a pre-split
+    // staging rollout (issue #1266). The loop-back guard the test above
+    // pins compares `next == source_shard` by id alone. A hop into an
+    // ALIASED id, not `source_shard`'s own id, slips past that
+    // comparison. It would try to check out a second connection from the
+    // exact pool `source`'s own connection is already holding here. This
+    // test cannot reproduce the deadlock itself without hanging the
+    // suite, for the same reason the test above cannot. It pins the
+    // fast, named refusal instead.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "aliased-pool-hop").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("A -> B");
+
+    // Rewrite the seal's forwarding pointer to name a shard id that has no
+    // real data of its own. It is distinct from every id used elsewhere in
+    // this file. What makes it dangerous is not the id. It is that the
+    // pool built below maps it to the exact same physical pool as
+    // `SOURCE`.
+    let aliased_shard = ShardId::new(97);
+    let mut raw_source = shards.source().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET migrated_to_shard = $1 WHERE id = $2",
+    )
+    .bind::<diesel::sql_types::Integer, _>(aliased_shard.as_i32())
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut raw_source)
+    .await
+    .expect("rewrite the forwarding pointer onto the aliased shard id");
+
+    // A fresh capacity-one pool against SOURCE's own database is cloned
+    // under both `SOURCE` and `aliased_shard`. `ShardedDbPool::from_map`
+    // groups them as one physical pool by `Pool::manager()` identity,
+    // exactly the shape a pre-split staging rollout produces.
+    let source_pool = build_pool_capacity_one(&shards.source_url);
+    let aliased_pool = ShardedDbPool::from_map(
+        std::collections::BTreeMap::from([
+            (SOURCE, source_pool.clone()),
+            (aliased_shard, source_pool.clone()),
+        ]),
+        SOURCE,
+    );
+    // Hold the pool's only connection, exactly as `source`'s caller would
+    // for the real reconciliation call this pins.
+    let _held = source_pool
+        .get()
+        .await
+        .expect("check out the pool's only connection");
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        reconcile_migrated_seal_terminality(&mut raw_source, &aliased_pool, exec_id, SOURCE),
+    )
+    .await
+    .expect(
+        "must not stall: an aliased hop must be refused before ever attempting a second checkout",
+    );
+    let err = result.expect_err("a hop into an aliased pool must be refused, not resolved");
+    let message = err.to_string();
+    assert!(
+        message.contains("shares a physical pool") && message.contains(&SOURCE.to_string()),
+        "the refusal must name the aliasing and the held shard, got {message}"
+    );
+}
+
+#[tokio::test]
 async fn a_sweep_reports_a_seal_whose_target_is_unreachable_as_a_failure_not_a_silent_skip() {
     // Issue #1317 review: `Err` (a database or unreachable-target problem)
     // used to be treated exactly like `Ok(false)` (not yet terminal) --

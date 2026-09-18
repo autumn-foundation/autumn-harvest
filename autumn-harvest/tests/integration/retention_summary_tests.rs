@@ -654,11 +654,15 @@ async fn summary_gc_deletes_expired_and_emits_metric() {
 /// EVER a shard-rebalance migration target can still be the only surviving
 /// evidence an un-reconciled seal elsewhere needs.
 ///
-/// A bounded `SummaryPolicy` must not GC it past its horizon like an
-/// ordinary summary. That would reopen the exact "seal blocked forever"
-/// gap on a delay instead of immediately.
+/// A bounded `SummaryPolicy` must not hard-delete it past its horizon like
+/// an ordinary summary. That would reopen the exact "seal blocked forever"
+/// gap on a delay instead of immediately. It must, however, still strip the
+/// row's OPT-IN payload fields past that same horizon (issue #1317 review,
+/// P1 follow-up). Otherwise a `SummaryPolicy` that captures payloads
+/// retains them forever for any execution a shard rebalance ever touched,
+/// silently turning a finite horizon into unbounded retention.
 #[tokio::test]
-async fn summary_gc_never_deletes_a_migration_target_summary() {
+async fn summary_gc_tombstones_but_never_deletes_a_migration_target_summary() {
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
@@ -666,14 +670,17 @@ async fn summary_gc_never_deletes_a_migration_target_summary() {
 
     let now = Utc::now();
     // An ordinary old summary (GC-eligible) and a migration-target summary
-    // just as old (must survive regardless of age).
+    // just as old, carrying a payload (result/error/search_attrs). The
+    // test also proves the payload gets stripped rather than left intact.
     let ordinary = insert_summary(&mut conn, "gc_wf", "g1", now - chrono::Duration::days(2)).await;
     let migrated_id: uuid::Uuid = diesel::sql_query(
         "INSERT INTO harvest_execution_summaries
             (execution_id, workflow_name, workflow_id, state, started_at,
-             completed_at, duration_ms, shard_id, migrated_from_shards)
+             completed_at, duration_ms, shard_id, migrated_from_shards,
+             result, error, search_attrs)
          VALUES (gen_random_uuid(), 'gc_wf', 'g2', 'COMPLETED', $1, $1, 5000, 0,
-                 '[0]'::jsonb)
+                 '[0]'::jsonb, '{\"secret\":\"payload\"}'::jsonb, 'boom',
+                 '{\"tenant\":\"acme\"}'::jsonb)
          RETURNING execution_id AS id",
     )
     .bind::<Timestamptz, _>(now - chrono::Duration::days(2))
@@ -691,9 +698,32 @@ async fn summary_gc_never_deletes_a_migration_target_summary() {
         load_summary(&mut conn, ordinary).await.is_none(),
         "an ordinary old summary is still GC'd normally"
     );
+    let migrated = load_summary(&mut conn, migrated_id)
+        .await
+        .expect("a migration-target summary must survive its configured horizon");
+    assert_eq!(
+        migrated.state, "COMPLETED",
+        "reconciliation-relevant state stays"
+    );
+    assert_eq!(
+        migrated.workflow_name, "gc_wf",
+        "reconciliation-relevant identity stays"
+    );
+    assert_eq!(
+        migrated.workflow_id, "g2",
+        "reconciliation-relevant identity stays"
+    );
     assert!(
-        load_summary(&mut conn, migrated_id).await.is_some(),
-        "a migration-target summary must survive its configured horizon"
+        migrated.result.is_none(),
+        "the payload-bearing result field must be stripped past the horizon"
+    );
+    assert!(
+        migrated.error.is_none(),
+        "the payload-bearing error field must be stripped past the horizon"
+    );
+    assert!(
+        migrated.search_attrs.is_none(),
+        "the payload-bearing search_attrs field must be stripped past the horizon"
     );
     assert_eq!(
         count_summaries(&mut conn).await,

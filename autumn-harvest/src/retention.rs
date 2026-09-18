@@ -3127,17 +3127,17 @@ pub(crate) async fn purge_expired_summaries(
 
     // Issue #1317 review, P1 follow-up. A summary demoted from a row that
     // was EVER a shard-rebalance migration target
-    // (`migrated_from_shards` non-empty) is excluded from this horizon
-    // entirely, not merely scheduled later.
+    // (`migrated_from_shards` non-empty) is excluded from this horizon's
+    // DELETE entirely.
     //
     // It can still be the only surviving evidence a source shard's
     // un-reconciled `MIGRATED` seal needs to resolve
-    // (`live_copy_is_terminal`). GC'ing it past an operator's configured
-    // horizon reopens the exact "seal blocked forever" gap the retention
-    // fix above exists to close. That happens on a delay instead of
-    // immediately. This mirrors the codebase's existing rule for the row
-    // itself: retention already never hard-deletes a `MIGRATED` seal row
-    // outright, for the identical reason.
+    // (`live_copy_is_terminal`). Hard-deleting it past an operator's
+    // configured horizon reopens the exact "seal blocked forever" gap the
+    // retention fix above exists to close. This mirrors the codebase's
+    // existing rule for the row itself: retention already never
+    // hard-deletes a `MIGRATED` seal row outright, for the identical
+    // reason.
     const NOT_A_MIGRATION_TARGET: &str =
         "(migrated_from_shards IS NULL OR jsonb_array_length(migrated_from_shards) = 0)";
 
@@ -3190,6 +3190,44 @@ pub(crate) async fn purge_expired_summaries(
         // EFFECTIVE limit `batch` (clamped `.max(1)`), not the raw `batch_size`:
         // a `batch_size` of 0 makes the LIMIT 1 while `n < 0` is impossible, so
         // an `n == 0` early break is required or the loop would spin forever.
+        if n == 0 || i64::try_from(n).unwrap_or(i64::MAX) < batch {
+            break;
+        }
+    }
+
+    // Issue #1317 review, P1 follow-up to the exemption above. Excluding a
+    // migration-target summary from the DELETE protects the minimal
+    // reconciliation evidence. It also protects that row's OPT-IN payload
+    // fields (`result`/`error`/`search_attrs`) forever whenever a
+    // `SummaryPolicy` captures them. That silently turns a finite,
+    // operator-configured summary horizon into unbounded payload retention
+    // for any execution a shard rebalance ever touched.
+    //
+    // Past the SAME cutoff, strip the payload fields on those rows instead
+    // of leaving them untouched. `state`/`workflow_name`/`workflow_id`/
+    // `migrated_from_shards`/timestamps stay, matching the exact shape
+    // `retention.rs`'s own fallback-summary write already produces when
+    // summary retention is disabled outright. `live_copy_is_terminal` reads
+    // only those columns, never the payload ones, so reconciliation is
+    // unaffected.
+    loop {
+        let n = diesel::sql_query(
+            "UPDATE harvest_execution_summaries
+             SET result = NULL, error = NULL, search_attrs = NULL
+             WHERE execution_id IN (
+                 SELECT execution_id FROM harvest_execution_summaries
+                 WHERE completed_at < $1
+                   AND NOT (migrated_from_shards IS NULL OR jsonb_array_length(migrated_from_shards) = 0)
+                   AND (result IS NOT NULL OR error IS NOT NULL OR search_attrs IS NOT NULL)
+                 ORDER BY completed_at ASC, execution_id ASC
+                 LIMIT $2
+             )",
+        )
+        .bind::<Timestamptz, _>(cutoff)
+        .bind::<BigInt, _>(batch)
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
         if n == 0 || i64::try_from(n).unwrap_or(i64::MAX) < batch {
             break;
         }
