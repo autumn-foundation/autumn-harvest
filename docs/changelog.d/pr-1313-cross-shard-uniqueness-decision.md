@@ -40,10 +40,14 @@ closes the loop that left as an omission rather than a decision.
   run of a business key. It cannot catch the race this issue names — a
   run that starts mid fan-out is invisible to it by construction, same
   as `other_live`/`uninspected` are — but it is the observable proxy for
-  the precondition that makes the race possible at all: a key pinned to
-  one shard while an unpinned start of it hashed to another. An operator
-  now has a signal for "this deployment is not keeping the pinning
-  discipline `docs/sharding.md` asks for," distinct from the existing
+  the precondition that makes the race possible at all, and (per review;
+  see below) that precondition is not only pinning: a key pinned to one
+  shard while an unpinned start of it hashed to another is one path, and
+  a shard drained during a topology change — rehashing a later unpinned
+  start elsewhere while the old run stays live, no pin involved — is the
+  other. An operator now has a signal for "two live runs of one business
+  key coexisted," not for "an operator broke the pinning discipline"
+  specifically, distinct from the existing
   `by_id_indeterminate_shard`/`by_id_found_over_incomplete_fanout`
   counters, which are both about an *unreachable* shard rather than an
   *observed* second live run.
