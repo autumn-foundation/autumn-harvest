@@ -22,6 +22,23 @@ pub fn build_router(api_state: HarvestApiState, web_state: autumn_web::AppState)
         .with_state(web_state)
 }
 
+/// Declare the deployment posture the README's own `Run` command sets
+/// (`AUTUMN_PROFILE=dev`), so the documented `harvest preflight` step is
+/// not gated forever (issue #1609).
+///
+/// A `HarvestPlugin` mount gets this call for free at startup
+/// (`plugin.rs`'s `start_harvest_runtime`). A standalone mount builds its
+/// own `HarvestApiState` and must call it directly, or the admin gate
+/// (`require_admin`) stays fail-closed against every caller.
+///
+/// Split out of [`run`] so a test can drive the exact startup posture
+/// without a process-wide `AUTUMN_PROFILE` env var (see `tests.rs`).
+pub fn declare_deployment_profile(api_state: &HarvestApiState, autumn_profile: Option<&str>) {
+    if autumn_profile == Some("dev") {
+        api_state.set_deployment_profile("dev");
+    }
+}
+
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://runner:runner@localhost:5434/runner".to_owned());
@@ -42,6 +59,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map_err(|error| format!("failed to start Harvest runner: {error}"))?;
 
     let api_state = HarvestApiState::new();
+    declare_deployment_profile(&api_state, std::env::var("AUTUMN_PROFILE").ok().as_deref());
     api_state.install_storage_pool(runner.storage_pool());
     api_state.install(runner.api_runtime());
 
