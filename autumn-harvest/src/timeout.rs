@@ -2707,6 +2707,7 @@ async fn resolve_delivery_route(
                         shard,
                         ref run,
                         ref uninspected,
+                        ref other_live,
                         ..
                     } => {
                         // A live/terminal run was found, but not every
@@ -2717,6 +2718,18 @@ async fn resolve_delivery_route(
                         // condition it counts. This is the metric twin.
                         if !uninspected.is_empty() {
                             metrics.record_external_by_id_found_over_incomplete_fanout(
+                                crate::worker::shard_metric_label(shard),
+                            );
+                        }
+                        // The fan-out was complete, and it still saw a
+                        // second live run of this key (issue #1313). This
+                        // cannot catch the race the issue names -- a run
+                        // that starts mid fan-out is invisible to it by
+                        // construction. It is evidence of the race's
+                        // precondition: a key pinned to one shard while
+                        // an unpinned start of it hashed to another.
+                        if !other_live.is_empty() {
+                            metrics.record_external_by_id_other_live_observed(
                                 crate::worker::shard_metric_label(shard),
                             );
                         }

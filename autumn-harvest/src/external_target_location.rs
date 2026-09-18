@@ -1436,9 +1436,10 @@ mod tests {
         // This is accepted, not overlooked: a cancel here may report
         // `ExternalCancelDelivered` while shard 0's run stays live. Closing it
         // needs cross-shard uniqueness for the business key — a coordination
-        // primitive this engine deliberately does not have (`docs/sharding.md`,
-        // *Cross-shard global limits*). See `TargetLocation::is_authoritative_for_key`
-        // and `docs/sharding.md`'s by-id addressing section for the decision.
+        // primitive this engine deliberately does not have. See
+        // `TargetLocation::is_authoritative_for_key` and `docs/sharding.md`'s
+        // "Business-key addressing finds a pinned run wherever it is" section
+        // for the decision.
     }
 
     #[test]

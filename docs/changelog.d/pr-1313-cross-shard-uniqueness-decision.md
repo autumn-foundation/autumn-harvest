@@ -30,11 +30,23 @@ closes the loop that left as an omission rather than a decision.
 - A stale doc comment on `TargetLocation` is fixed. It described "several
   live runs across shards" as a hypothetical fourth enum variant "one bug
   report away," when `Found`'s `other_live` field already covers exactly
-  that case (issue #1146, Codex round 3) — both landed in the same
-  historical commit, and the comment was never updated once the field
-  shipped. It now names the actual still-open gap: this issue's race,
-  which cannot become an enum variant because no single fan-out can
-  observe it.
+  that case (issue #1146) — both landed in the same historical commit,
+  and the comment was never updated once the field shipped. It now names
+  the actual still-open gap: this issue's race, which cannot become an
+  enum variant because no single fan-out can observe it.
+- A new counter, `harvest.external_signal.by_id_other_live_observed`
+  (`MetricsRecorder::record_external_by_id_other_live_observed`), fires
+  whenever a **complete** by-id fan-out still finds more than one live
+  run of a business key. It cannot catch the race this issue names — a
+  run that starts mid fan-out is invisible to it by construction, same
+  as `other_live`/`uninspected` are — but it is the observable proxy for
+  the precondition that makes the race possible at all: a key pinned to
+  one shard while an unpinned start of it hashed to another. An operator
+  now has a signal for "this deployment is not keeping the pinning
+  discipline `docs/sharding.md` asks for," distinct from the existing
+  `by_id_indeterminate_shard`/`by_id_found_over_incomplete_fanout`
+  counters, which are both about an *unreachable* shard rather than an
+  *observed* second live run.
 
 **Preconditions, unchanged.** Two live runs of one business key require a
 deployment to mix pinned and unpinned starts of the same `workflow_id` —
@@ -44,8 +56,13 @@ strictly better than pre-#1146: a by-id resolution then consulted exactly
 one hash-derived shard and missed a second live run unconditionally,
 not only under a race.
 
-**No runtime behavior change.** `is_authoritative_for_key()`,
-`merge_locations`, and every call site are untouched. `cargo test -p
-autumn-harvest --lib external_target_location::` (33 tests, was 32) and
-`python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` both
-pass.
+**Runtime behavior is unchanged; observability is not.**
+`is_authoritative_for_key()`, `merge_locations`, and every delivery
+outcome are untouched — no signal or cancel resolves, delivers, or
+reports any differently than before. The only new runtime effect is the
+counter above, recorded at the same point `timeout.rs` already records
+`by_id_found_over_incomplete_fanout`. `cargo test -p autumn-harvest --lib
+--all-features` on `external_target_location::`, `timeout::`,
+`telemetry::`, and `metrics_rs_adapter::` (206 tests across the four
+modules) and `python3 docs/audits/comment-hygiene.py --base
+origin/trunk-dev` both pass.
