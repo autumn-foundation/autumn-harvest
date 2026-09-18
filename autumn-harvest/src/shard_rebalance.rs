@@ -1750,14 +1750,17 @@ mod db {
     }
 
     /// Has the live copy behind a forwarding seal reached a real terminal
-    /// state (issue #1317)?
+    /// state (issue #1317)? Returns that state when it has.
     ///
     /// `is_active_conflict_state` treats a `MIGRATED` seal as active
     /// forever, on purpose: the run is still live, just on another shard.
     /// Nothing else checks the other side of that trade. This reads the
     /// live copy's current state. The source is its execution row, or its
     /// retention-demoted summary once the row itself is gone. It reports
-    /// whether that state is terminal.
+    /// that state when it is terminal. The caller can then record WHICH
+    /// terminal state was observed, not merely THAT one was (fresh
+    /// review, P2 follow-up). `AllowDuplicateFailedOnly` needs to tell a
+    /// failed live copy from a successful one once this seal reconciles.
     ///
     /// `MIGRATED` itself does not count as terminal here: a live copy that
     /// has since been rebalanced again is still live, one more hop away.
@@ -1807,7 +1810,7 @@ mod db {
         exec_id: ExecutionId,
         first_hop: ShardId,
         source_shard: ShardId,
-    ) -> HarvestResult<bool> {
+    ) -> HarvestResult<Option<String>> {
         // Aliased-pool guard (issue #1317 review, P2 follow-up). A
         // shard-id comparison alone (`next == source_shard`, below) cannot
         // catch two DISTINCT shard ids backed by the SAME physical
@@ -1903,7 +1906,7 @@ mod db {
                 && matches!(row.state.as_str(), "FAILED" | "CANCELLED" | "TIMED_OUT"))
             || !crate::erase::is_terminal_state(&row.state)
         {
-            return Ok(false);
+            return Ok(None);
         }
         // A terminal row's OWN state is not the whole answer (issue #1317
         // review). `CONTINUED_AS_NEW` is terminal for this row, but its
@@ -1948,7 +1951,7 @@ mod db {
         .get_result(&mut *conn)
         .await
         .map_err(database_error)?;
-        Ok(!occupied.value)
+        Ok((!occupied.value).then_some(row.state))
     }
 
     /// Release a rebalanced source seal's uniqueness slot once its live copy
@@ -1957,6 +1960,12 @@ mod db {
     /// Idempotent: a no-op when `exec_id` does not name a seal on `source`.
     /// Also a no-op when it is already marked, or when the live copy has
     /// not finished yet. Safe to call from an operator sweep or on demand.
+    ///
+    /// Records the live copy's own terminal state alongside the
+    /// wall-clock marker (fresh review, P2 follow-up). A later
+    /// reuse-policy decision can then tell a failed live copy from a
+    /// successful one — see
+    /// [`crate::models::WorkflowExecution::effective_terminal_state`].
     ///
     /// `source_shard` is the shard `source` connects to (issue #1317
     /// review). It lets [`live_copy_is_terminal`] refuse a hop that loops
@@ -1998,15 +2007,18 @@ mod db {
         let Some((forward, _)) = existing_seal(source, exec_id).await? else {
             return Ok(false);
         };
-        if !live_copy_is_terminal(pool, exec_id, ShardId::new(forward), source_shard).await? {
+        let Some(observed_state) =
+            live_copy_is_terminal(pool, exec_id, ShardId::new(forward), source_shard).await?
+        else {
             return Ok(false);
-        }
+        };
         let updated = diesel::sql_query(
             "UPDATE harvest_workflow_executions \
-                SET migrated_run_terminal_at = NOW() \
+                SET migrated_run_terminal_at = NOW(), migrated_run_terminal_state = $2 \
               WHERE id = $1 AND state = 'MIGRATED' AND migrated_run_terminal_at IS NULL",
         )
         .bind::<SqlUuid, _>(exec_id.as_uuid())
+        .bind::<Text, _>(&observed_state)
         .execute(source)
         .await
         .map_err(database_error)?;

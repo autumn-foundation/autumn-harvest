@@ -245,12 +245,43 @@ pub struct WorkflowExecution {
     /// retention and erasure keep treating it as a `MIGRATED` seal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migrated_run_terminal_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The live copy's own terminal state, recorded alongside
+    /// `migrated_run_terminal_at` by the same reconciler pass (fresh
+    /// review, P2 follow-up). `state` on this row stays `MIGRATED`
+    /// forever; a reuse-policy decision that needs to know whether the
+    /// live copy actually finished FAILED/CANCELLED reads this instead.
+    /// See [`Self::effective_terminal_state`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migrated_run_terminal_state: Option<String>,
     /// The state a shard-rebalance staging vacate sealed over (issue #1317
     /// review). Non-`None` only while the migration that vacated this row
     /// is still in flight. An abort restores `state` to this value and
     /// clears it. A successful cutover just clears it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub staging_vacated_state: Option<String>,
+}
+
+impl WorkflowExecution {
+    /// The state a reuse-policy decision should judge this row by (fresh
+    /// review, P2 follow-up).
+    ///
+    /// `state` stays `MIGRATED` forever once a run rebalances, even after a
+    /// reconciler observes the live copy finish. A caller that needs to
+    /// distinguish a failed live copy (`AllowDuplicateFailedOnly` should
+    /// replace) from a successful one (it should attach) cannot read
+    /// `state` for that. It reads `migrated_run_terminal_state` instead,
+    /// falling back to `state` itself when the row is not a reconciled
+    /// `MIGRATED` seal, or was reconciled before this column existed.
+    #[must_use]
+    pub fn effective_terminal_state(&self) -> &str {
+        if self.state == "MIGRATED" {
+            self.migrated_run_terminal_state
+                .as_deref()
+                .unwrap_or(&self.state)
+        } else {
+            &self.state
+        }
+    }
 }
 
 /// Serialize a nullable `start_source` column, reporting a `None` (pre-upgrade /
@@ -1787,4 +1818,123 @@ pub struct NewHarvestWorkflowLog {
     pub seq: i64,
     pub level: String,
     pub message: String,
+}
+
+#[cfg(test)]
+mod effective_terminal_state_tests {
+    use super::WorkflowExecution;
+
+    /// A minimal row, defaulted to a live `RUNNING` execution untouched by
+    /// shard rebalancing. Callers override only the fields their case needs.
+    fn stub(state: &str) -> WorkflowExecution {
+        WorkflowExecution {
+            id: uuid::Uuid::new_v4(),
+            workflow_name: "entity_flow".to_string(),
+            workflow_id: "eff-terminal-state".to_string(),
+            run_id: uuid::Uuid::new_v4(),
+            shard_id: 0,
+            state: state.to_string(),
+            input: serde_json::json!({}),
+            output: None,
+            error: None,
+            parent_id: None,
+            sticky_worker_id: None,
+            queue_name: "default".to_string(),
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            execution_timeout: None,
+            deadline_at: None,
+            chain_execution_timeout: None,
+            chain_deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            created_at: chrono::Utc::now(),
+            assigned_build_id: None,
+            parent_close_policy: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            paused_at: None,
+            pause_reason: None,
+            pause_actor: None,
+            current_details: None,
+            context_headers: None,
+            sla: None,
+            sla_deadline_at: None,
+            sla_breached: false,
+            sla_breached_at: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            origin: None,
+            nd_blocked_at: None,
+            nd_block_reason: None,
+            nd_block_count: 0,
+            completion_callbacks: None,
+            continued_from_exec_id: None,
+            first_exec_id: None,
+            legal_hold_set_at: None,
+            legal_hold_until: None,
+            legal_hold_reason: None,
+            legal_hold_actor: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
+            history_bloat_warned_at: None,
+            triage_note: None,
+            quota_key: None,
+            migrated_to_shard: None,
+            migrated_at: None,
+            migrated_from_shards: None,
+            migrated_run_terminal_at: None,
+            migrated_run_terminal_state: None,
+            staging_vacated_state: None,
+        }
+    }
+
+    #[test]
+    fn a_non_migrated_row_reads_its_own_state_unchanged() {
+        let row = stub("FAILED");
+        assert_eq!(row.effective_terminal_state(), "FAILED");
+    }
+
+    #[test]
+    fn an_unreconciled_migrated_seal_reads_as_migrated() {
+        // Still live elsewhere; `migrated_run_terminal_state` is never set
+        // until a reconciler observes the live copy terminal.
+        let row = stub("MIGRATED");
+        assert_eq!(row.effective_terminal_state(), "MIGRATED");
+    }
+
+    #[test]
+    fn a_reconciled_seal_reads_the_live_copy_s_recorded_outcome() {
+        let mut row = stub("MIGRATED");
+        row.migrated_run_terminal_at = Some(chrono::Utc::now());
+        row.migrated_run_terminal_state = Some("FAILED".to_string());
+        assert_eq!(
+            row.effective_terminal_state(),
+            "FAILED",
+            "a failed live copy must read as FAILED, not the seal's own MIGRATED state"
+        );
+    }
+
+    #[test]
+    fn a_reconciled_seal_with_a_successful_outcome_still_reads_as_that_outcome() {
+        let mut row = stub("MIGRATED");
+        row.migrated_run_terminal_at = Some(chrono::Utc::now());
+        row.migrated_run_terminal_state = Some("COMPLETED".to_string());
+        assert_eq!(row.effective_terminal_state(), "COMPLETED");
+    }
+
+    #[test]
+    fn a_reconciled_seal_with_no_recorded_outcome_falls_back_to_migrated() {
+        // A seal reconciled before `migrated_run_terminal_state` existed
+        // (or by a reconciler build that predates it): the fallback must
+        // not panic or fabricate an outcome.
+        let mut row = stub("MIGRATED");
+        row.migrated_run_terminal_at = Some(chrono::Utc::now());
+        assert_eq!(row.effective_terminal_state(), "MIGRATED");
+    }
 }

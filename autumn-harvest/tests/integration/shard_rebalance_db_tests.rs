@@ -3333,6 +3333,59 @@ async fn an_allow_duplicate_start_creates_a_fresh_run_too_once_the_seal_is_recon
 }
 
 #[tokio::test]
+async fn try_load_by_key_finds_a_live_replacement_over_a_reconciled_seal() {
+    // Issue #1317 review (companion to `a_reconciled_seal_alone_does_not_
+    // bypass_the_throttle_token` above). When a live replacement exists
+    // for the same key (started after the seal was released), it must be
+    // what this lookup returns. The released seal also matches the
+    // broader `state NOT IN (...)` filter, so `TerminateIfRunning`
+    // callers must keep finding the row that is actually live.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "resolve-bypass-live-wins").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("complete the migrated run");
+
+    let mut source = shards.source().await;
+    reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+        .await
+        .expect("reconcile");
+
+    let started = autumn_harvest::execution::start_or_load_workflow_execution(
+        &mut source,
+        terminate_existing_start("entity_flow", "resolve-bypass-live-wins"),
+        None,
+    )
+    .await
+    .expect("fresh start over the reconciled seal");
+    assert!(started.created);
+
+    let found = autumn_harvest::execution::try_load_by_key(
+        &mut source,
+        "entity_flow",
+        "resolve-bypass-live-wins",
+    )
+    .await
+    .expect("lookup must not fail")
+    .expect("the live replacement must be found");
+    assert_eq!(
+        found.id,
+        started.exec_id.as_uuid(),
+        "must return the live replacement, not the reconciled seal it displaced"
+    );
+}
+
+#[tokio::test]
 async fn rolling_back_the_seal_column_refuses_once_a_key_has_both_a_seal_and_a_replacement() {
     // Issue #1317 review: once reconciliation releases a seal and a fresh
     // same-key run is admitted, both rows satisfy the pre-fix migration's

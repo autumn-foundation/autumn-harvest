@@ -38153,6 +38153,7 @@ mod tests {
             quota_key: None,
             created_at: chrono::Utc::now(),
             migrated_run_terminal_at: None,
+            migrated_run_terminal_state: None,
             staging_vacated_state: None,
         }
     }

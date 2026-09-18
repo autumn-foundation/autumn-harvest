@@ -18,6 +18,24 @@ COMMENT ON COLUMN harvest_workflow_executions.migrated_run_terminal_at IS
     'active-conflict classification without changing state, so retention '
     'and erasure keep treating it as a MIGRATED seal.';
 
+-- Record WHICH terminal state the live copy reached, alongside WHETHER it
+-- did (fresh review, P2 follow-up). `state` on this row stays 'MIGRATED'
+-- forever, by design, so `AllowDuplicateFailedOnly` cannot otherwise tell
+-- a live copy that finished FAILED/CANCELLED (replace) from one that
+-- finished COMPLETED/TIMED_OUT (attach) once this seal is reconciled --
+-- it silently always attaches, breaking the documented failed-only-reuse
+-- semantic for a business key that was ever rebalanced.
+ALTER TABLE harvest_workflow_executions
+    ADD COLUMN IF NOT EXISTS migrated_run_terminal_state TEXT NULL;
+
+COMMENT ON COLUMN harvest_workflow_executions.migrated_run_terminal_state IS
+    'The live copy''s own terminal state, recorded by the same reconciler '
+    'pass that sets migrated_run_terminal_at (fresh review, P2 follow-up). '
+    'NULL until observed, and for a seal reconciled before this column '
+    'existed. A reuse-policy decision that needs to distinguish a failed '
+    'live copy from a successful one reads this instead of state, which '
+    'stays MIGRATED regardless of how the live copy actually ended.';
+
 -- Widen the active-uniqueness partial index to also release an
 -- observed-terminal seal (issue #1317).
 --

@@ -50,3 +50,6 @@ CREATE UNIQUE INDEX harvest_we_workflow_name_workflow_id_active_key
 
 ALTER TABLE harvest_workflow_executions
     DROP COLUMN IF EXISTS migrated_run_terminal_at;
+
+ALTER TABLE harvest_workflow_executions
+    DROP COLUMN IF EXISTS migrated_run_terminal_state;

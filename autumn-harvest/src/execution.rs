@@ -1696,7 +1696,15 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                 }),
 
                 WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
-                    match existing.state.as_str() {
+                    // A reconciled `MIGRATED` seal's own `state` stays
+                    // `MIGRATED` forever, never `FAILED`/`CANCELLED` (fresh
+                    // review, P2 follow-up). `effective_terminal_state`
+                    // reads the live copy's OWN observed terminal state
+                    // for exactly that row. A failed live copy still
+                    // replaces here, instead of silently attaching to a
+                    // dead seal.
+                    let effective_state = existing.effective_terminal_state().to_string();
+                    match effective_state.as_str() {
                         "FAILED" | "CANCELLED" => {
                             // Replacing a terminal prior is a fresh start.
                             if reject_fresh_if_debounced {
@@ -5257,20 +5265,33 @@ pub fn workflow_id_slot_is_released(state: &str) -> bool {
     matches!(state, "CONTINUED_AS_NEW" | "TERMINATED")
 }
 
-/// Non-locking lookup used for the `TerminateIfRunning` pre-check outside any
-/// transaction. Returns `None` if no active execution exists.
+/// Non-locking lookup used for the `TerminateIfRunning` pre-check outside
+/// any transaction.
+///
+/// Also used by [`crate::throttle::resolve_bypass`] to predict the
+/// authoritative start path's attach-vs-create decision ahead of it.
+/// Returns `None` if no non-sealed execution exists.
+///
+/// An observed-terminal `MIGRATED` seal no longer occupies the
+/// active-uniqueness slot (issue #1317). The widened index already excludes
+/// it. So a fresh start of any reuse policy succeeds against it via a plain
+/// `INSERT`. This function's callers care about the reuse-policy branch
+/// (`load_workflow_execution_by_key_for_update`'s ATTACH/CREATE decision).
+/// That branch is never even reached for a SOLE reconciled seal, because
+/// nothing conflicts with the insert.
+///
+/// Returning the seal as `Some` here would read as a live prior. That
+/// would wrongly tell `resolve_bypass` to skip the throttle reservation
+/// for what is actually a fresh admission (fresh review, P2 follow-up
+/// considered and rejected). See
+/// `an_allow_duplicate_start_creates_a_fresh_run_too_once_the_seal_is_reconciled`
+/// and `a_reconciled_seal_alone_does_not_bypass_the_throttle_token`. Both
+/// pin the fresh-create outcome this exclusion must keep agreeing with.
 pub async fn try_load_by_key(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     workflow_id: &str,
 ) -> HarvestResult<Option<WorkflowExecution>> {
-    // An observed-terminal `MIGRATED` seal no longer occupies the
-    // active-uniqueness slot (issue #1317). The widened index already
-    // excludes it, so a fresh `TerminateIfRunning` start succeeds against
-    // it regardless. Exclude it here too. This caller has no
-    // `seal_observed_terminal` handling of its own, unlike
-    // `load_workflow_execution_by_key_for_update`. Returning the seal as
-    // `Some` would read as a live prior blocking a duplicate restart.
     harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))

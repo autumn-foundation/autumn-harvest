@@ -194,6 +194,12 @@ diesel::table! {
         /// deletion; this column carries the fact separately so that
         /// protection stays intact.
         migrated_run_terminal_at -> Nullable<Timestamptz>,
+        /// The live copy's own terminal state, recorded alongside
+        /// `migrated_run_terminal_at` (fresh review, P2 follow-up). `state`
+        /// on this row stays `MIGRATED` forever. A reuse-policy decision
+        /// that needs to distinguish a failed live copy from a successful
+        /// one reads this column instead.
+        migrated_run_terminal_state -> Nullable<Text>,
         /// The state a shard-rebalance staging vacate sealed over (issue
         /// #1317 review). Non-NULL only while the migration that vacated
         /// this row is still in flight. An abort restores `state` to this
