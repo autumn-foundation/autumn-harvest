@@ -3242,6 +3242,57 @@ async fn ui_schedules_preview_explains_an_exhausted_schedule() {
     );
 }
 
+/// RED (was): `count` was typed `Option<usize>` directly on
+/// `SchedulePreviewUiParams` — `?count=not-a-number` failed axum's own
+/// query deserialization with a bare 400 before `schedule_preview_ui` ever
+/// ran, aborting the whole preview page. Same mechanism as the Workflows/
+/// Workers/DLQ/Schedules list pages' `page`/`limit` fields and the DAG
+/// detail page's `node`/`refresh` (#1333/#1378/#1420/#1437/#1540/#1560/
+/// #1588/#1619/#1630).
+///
+/// GREEN (this commit): the request still renders the preview page (`200`)
+/// with the default entry count, and surfaces a `role="alert"` message
+/// naming the bad value.
+#[tokio::test]
+async fn ui_schedules_preview_invalid_count_redisplays_page_instead_of_aborting() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "preview_bad_count_wf",
+            schedule_expr: Some("cron:0 * * * *"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) =
+        fetch_html(&app, &format!("/schedules/{id}/preview?count=not-a-number")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid count must not abort the whole preview page: {html}"
+    );
+    assert!(
+        html.contains("Fire-time preview"),
+        "the page must still render: {html}"
+    );
+    assert!(
+        html.contains("preview_bad_count_wf"),
+        "the target name must still render: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must be shown: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+}
+
 /// An unknown schedule id is a 404 on every drill-down, not a blank page.
 #[tokio::test]
 async fn ui_schedules_drilldowns_404_on_unknown_id() {
@@ -3355,6 +3406,54 @@ async fn ui_schedules_run_history_renders_rows_and_summary() {
         "only the scheduled COMPLETED run may be counted: {summary}"
     );
     assert!(!html.contains("<script"), "no script tags allowed: {html}");
+}
+
+/// RED (was): `limit` was typed `Option<i64>` directly on
+/// `ScheduleRunsUiParams` — `?limit=not-a-number` failed axum's own query
+/// deserialization with a bare 400 before `schedule_runs_ui` ever ran,
+/// discarding the `origin` filter already on the URL along with the whole
+/// run-history page. Same mechanism as the Workers page's own `limit` fix
+/// (#1540/#1560/#1588/#1619/#1630).
+///
+/// GREEN (this commit): the request still renders the run-history page
+/// (`200`), preserves the `origin` filter, and surfaces a `role="alert"`
+/// message next to the "Rows" field naming the bad value.
+#[tokio::test]
+async fn ui_schedules_runs_invalid_limit_redisplays_form_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "runs_bad_limit_wf",
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(
+        &app,
+        &format!("/schedules/{id}/runs?limit=not-a-number&origin=scheduled"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid limit must not abort the whole run-history page: {html}"
+    );
+    assert!(
+        html.contains("value=\"scheduled\" selected"),
+        "the other filter the operator already picked must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
 }
 
 /// AC7/AC8: a schedule with no runs yet renders an explicit message.
