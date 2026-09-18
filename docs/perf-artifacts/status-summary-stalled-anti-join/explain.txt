@@ -1,56 +1,57 @@
 -- EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) of status_summary::count_stalled_candidates's exact SQL, minutes=60 cap=51, 50000 terminal + 3000 active executions (30 genuinely stalled) --
 
-Aggregate  (cost=19124.99..19125.00 rows=1 width=8) (actual time=18.721..18.727 rows=1 loops=1)
+Aggregate  (cost=19290.95..19290.96 rows=1 width=8) (actual time=12.413..12.416 rows=1 loops=1)
   Output: count(*)
-  Buffers: shared hit=12219
-  ->  Limit  (cost=0.70..19124.35 rows=51 width=4) (actual time=6.652..18.711 rows=30 loops=1)
+  Buffers: shared hit=15219
+  ->  Limit  (cost=0.70..19290.31 rows=51 width=4) (actual time=3.912..12.407 rows=30 loops=1)
         Output: NULL::integer
-        Buffers: shared hit=12219
-        ->  Nested Loop Anti Join  (cost=0.70..1031552.92 rows=2751 width=4) (actual time=6.651..18.703 rows=30 loops=1)
+        Buffers: shared hit=15219
+        ->  Nested Loop Anti Join  (cost=0.70..1036344.63 rows=2740 width=4) (actual time=3.912..12.402 rows=30 loops=1)
               Output: NULL::integer
-              Buffers: shared hit=12219
-              ->  Index Scan using idx_harvest_we_non_terminal_wf_name on public.harvest_workflow_executions e  (cost=0.28..1028976.68 rows=2915 width=16) (actual time=2.165..9.085 rows=3000 loops=1)
+              Buffers: shared hit=15219
+              ->  Index Scan using idx_harvest_we_non_terminal_wf_name on public.harvest_workflow_executions e  (cost=0.28..1031205.68 rows=2903 width=16) (actual time=1.341..5.336 rows=3000 loops=1)
                     Output: e.id
                     Filter: ((e.state = ANY ('{RUNNING,SUSPENDED}'::text[])) AND ((hashed SubPlan 2) OR (hashed SubPlan 4) OR (SubPlan 5) OR (NOT (hashed SubPlan 8)) OR (hashed SubPlan 10)))
-                    Buffers: shared hit=3218
+                    Buffers: shared hit=3219
                     SubPlan 2
-                      ->  Seq Scan on public.harvest_task_queue  (cost=0.00..105.55 rows=2970 width=16) (actual time=0.009..1.122 rows=2970 loops=1)
+                      ->  Seq Scan on public.harvest_task_queue  (cost=0.00..105.55 rows=2970 width=16) (actual time=0.006..0.703 rows=2970 loops=1)
                             Output: harvest_task_queue.workflow_exec_id
                             Filter: (harvest_task_queue.state = ANY ('{PENDING,CLAIMED,RUNNING,BACKOFF}'::text[]))
                             Buffers: shared hit=61
                     SubPlan 4
-                      ->  Bitmap Heap Scan on public.harvest_workflow_executions c  (cost=44.08..1178.73 rows=3009 width=16) (actual time=0.157..1.038 rows=3000 loops=1)
+                      ->  Bitmap Heap Scan on public.harvest_workflow_executions c  (cost=44.01..1178.44 rows=2996 width=16) (actual time=0.091..0.580 rows=3000 loops=1)
                             Output: c.parent_id
                             Recheck Cond: (c.state <> ALL ('{COMPLETED,FAILED,CANCELLED,TIMED_OUT,CONTINUED_AS_NEW,TERMINATED}'::text[]))
                             Heap Blocks: exact=62
                             Buffers: shared hit=68
-                            ->  Bitmap Index Scan on idx_harvest_we_non_terminal_wf_name  (cost=0.00..43.33 rows=3009 width=0) (actual time=0.140..0.141 rows=3000 loops=1)
+                            ->  Bitmap Index Scan on idx_harvest_we_non_terminal_wf_name  (cost=0.00..43.26 rows=2996 width=0) (actual time=0.076..0.076 rows=3000 loops=1)
                                   Buffers: shared hit=6
                     SubPlan 5
-                      ->  Seq Scan on public.harvest_signals  (cost=0.00..0.00 rows=1 width=0) (actual time=0.001..0.001 rows=0 loops=30)
+                      ->  Seq Scan on public.harvest_signals  (cost=0.00..0.00 rows=1 width=0) (actual time=0.000..0.000 rows=0 loops=30)
                             Filter: ((NOT harvest_signals.consumed) AND (harvest_signals.workflow_exec_id = e.id))
                     SubPlan 8
-                      ->  Bitmap Heap Scan on public.harvest_timers  (cost=36.60..153.91 rows=2621 width=16) (actual time=0.224..1.124 rows=2600 loops=1)
+                      ->  Bitmap Heap Scan on public.harvest_timers  (cost=36.60..154.91 rows=2621 width=16) (actual time=0.095..0.669 rows=2621 loops=1)
                             Output: harvest_timers.workflow_exec_id
                             Recheck Cond: ((harvest_timers.fires_at > now()) AND (NOT harvest_timers.fired))
-                            Heap Blocks: exact=78
-                            Buffers: shared hit=83
-                            ->  Bitmap Index Scan on idx_harvest_timers_pending  (cost=0.00..35.94 rows=2621 width=0) (actual time=0.192..0.193 rows=2600 loops=1)
+                            Heap Blocks: exact=79
+                            Buffers: shared hit=84
+                            ->  Bitmap Index Scan on idx_harvest_timers_pending  (cost=0.00..35.94 rows=2621 width=0) (actual time=0.080..0.080 rows=2621 loops=1)
                                   Index Cond: (harvest_timers.fires_at > now())
                                   Buffers: shared hit=5
                     SubPlan 10
-                      ->  Bitmap Heap Scan on public.harvest_timers harvest_timers_1  (cost=40.98..159.03 rows=2670 width=16) (never executed)
+                      ->  Bitmap Heap Scan on public.harvest_timers harvest_timers_1  (cost=41.05..160.23 rows=2679 width=16) (never executed)
                             Output: harvest_timers_1.workflow_exec_id
                             Recheck Cond: ((harvest_timers_1.fires_at <= now()) AND (NOT harvest_timers_1.fired))
-                            ->  Bitmap Index Scan on idx_harvest_timers_pending  (cost=0.00..40.31 rows=2670 width=0) (never executed)
+                            ->  Bitmap Index Scan on idx_harvest_timers_pending  (cost=0.00..40.38 rows=2679 width=0) (never executed)
                                   Index Cond: (harvest_timers_1.fires_at <= now())
-              ->  Index Only Scan using idx_harvest_events_exec_last on public.harvest_events ev  (cost=0.42..0.88 rows=1 width=16) (actual time=0.003..0.003 rows=1 loops=3000)
-                    Output: ev.workflow_exec_id, ev."timestamp"
-                    Index Cond: ((ev.workflow_exec_id = e.id) AND (ev."timestamp" >= (now() - '01:00:00'::interval)))
-                    Heap Fetches: 0
-                    Buffers: shared hit=9001
-Query Identifier: -3449457155530450439
+              ->  Index Scan using idx_harvest_events_history_page on public.harvest_events ev  (cost=0.41..1.77 rows=1 width=16) (actual time=0.002..0.002 rows=1 loops=3000)
+                    Output: ev.workflow_exec_id
+                    Index Cond: (ev.workflow_exec_id = e.id)
+                    Filter: (ev."timestamp" >= (now() - '01:00:00'::interval))
+                    Rows Removed by Filter: 0
+                    Buffers: shared hit=12000
+Query Identifier: 5671482349745030735
 Planning:
   Buffers: shared hit=1495
-Planning Time: 6.640 ms
-Execution Time: 19.150 ms
+Planning Time: 4.262 ms
+Execution Time: 12.620 ms

@@ -2,19 +2,20 @@
 //! subsystem.
 //!
 //! `status_summary::count_stalled_candidates` runs a single bounded SQL
-//! statement mirroring `api::load_stalled_workflows`'s candidate predicate: an
-//! active-state (`RUNNING`/`SUSPENDED`) execution with no recent
-//! `harvest_events` row, that is also not "correctly sleeping" on a lone
-//! future timer. This file profiles that statement against a
-//! production-shaped fixture (a large terminal-execution population, a
-//! moderate active population, a rare genuinely-stalled subset) through the
-//! real `GET /admin/status` HTTP entry point.
+//! statement. It mirrors `api::load_stalled_workflows`'s candidate
+//! predicate: an active-state (`RUNNING`/`SUSPENDED`) execution with no
+//! recent `harvest_events` row. The execution must also not be "correctly
+//! sleeping" on a lone future timer. This file profiles that statement
+//! against a production-shaped fixture through the real `GET /admin/status`
+//! HTTP entry point. The fixture holds a large terminal-execution
+//! population, a moderate active population, and a rare genuinely-stalled
+//! subset.
 //!
 //! This is a **measurement-only** investigation: it captures evidence
-//! (`pg_stat_statements`, `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)`) and
-//! does not ship a query-shape change. See
-//! `docs/performance-status-summary-stalled.md` for the write-up and the
-//! reasoning for why this stayed a findings report rather than a PR.
+//! (`pg_stat_statements`, `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)`)
+//! and does not ship a query-shape change. See the tracking issue this
+//! commit's history links for the write-up and the reasoning for why this
+//! stayed a findings report rather than a PR.
 
 #![allow(clippy::too_many_lines)]
 
@@ -114,10 +115,11 @@ fn build_app(pool: HarvestDbPool) -> HarvestApiApp {
     harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
-/// `build_app` sets `set_admin_auth_boundary(true)` (declares the boundary
-/// already enforced by an embedder), which short-circuits
-/// `has_harvest_admin_access` to `true` for every caller — no header needed,
-/// mirroring `status_summary_localpg.rs`'s own authenticated `build_app`.
+/// `build_app` sets `set_admin_auth_boundary(true)`. That declares the
+/// boundary already enforced by an embedder, so it short-circuits
+/// `has_harvest_admin_access` to `true` for every caller. No header is
+/// needed, mirroring `status_summary_localpg.rs`'s own authenticated
+/// `build_app`.
 async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
     let response = app
         .clone()
@@ -145,34 +147,37 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
 
 // ── Fixture generation ──────────────────────────────────────────────────────
 
-/// Production-shaped fixture: a large terminal population (the bulk of a
-/// mature deployment's history table), a moderate active population that is
-/// mostly healthy and progressing, and a rare, genuinely-stalled subset
-/// within it. Pure set-based SQL.
+/// Production-shaped fixture. Pure set-based SQL.
+///
+/// It holds a large terminal population — the bulk of a mature deployment's
+/// history table. It holds a moderate active population that is mostly
+/// healthy and progressing. And it holds a rare, genuinely-stalled subset
+/// within that active population.
 ///
 /// * `terminal` completed executions — dead weight the `state` filter must
 ///   skip without a full-table scan (served by `idx_harvest_we_state`).
 /// * `active` `RUNNING` executions, of which:
-///   - `active - stalled` are **healthy**: a fresh event (so the anti-join
-///     probe excludes them) plus a real pending `harvest_task_queue` row (so
-///     the "not purely sleeping" `OR`-block passes deterministically,
-///     independent of the timer table). This is the realistic majority
-///     shape — most active work is progressing normally.
-///   - `stalled` (the last `stalled` by workflow id) are the true positives:
-///     a stale (2h old) most-recent event, no pending task-queue row, no
-///     non-terminal child, no unconsumed signal, and no timer of any kind —
-///     so the `OR`-block passes via "no future timer to sleep on" and the
-///     row survives the anti-join.
+///   - `active - stalled` are **healthy**: a fresh event, so the anti-join
+///     probe excludes them. They also carry a real pending
+///     `harvest_task_queue` row, so the "not purely sleeping" `OR`-block
+///     passes deterministically, independent of the timer table. This is
+///     the realistic majority shape — most active work progresses normally.
+///   - `stalled` (the last `stalled` by workflow id) are the true
+///     positives. Each carries a stale (2h old) most-recent event, no
+///     pending task-queue row, no non-terminal child, no unconsumed
+///     signal, and no timer of any kind. The `OR`-block passes via "no
+///     future timer to sleep on", so the row survives the anti-join.
 ///
 ///   Both groups pass the `OR`-block, so **both** reach the
-///   `harvest_events` anti-join probe — only the events check itself tells
-///   healthy and stalled apart. That is the worst case for a bounded-`LIMIT`
-///   scan: since true positives (`stalled`) are far fewer than the cap, the
-///   scan cannot stop early and must probe the *entire* active population.
-/// * A `harvest_timers` population (~15% of terminal executions, fired
-///   status mixed) so the `OR`-block's timer subplans touch a non-trivial
-///   table, independent of the healthy/stalled classification above (which
-///   is decided by `task_queue`, not by timers).
+///   `harvest_events` anti-join probe. Only the events check itself tells
+///   healthy and stalled apart. That is the worst case for a
+///   bounded-`LIMIT` scan: true positives (`stalled`) are far fewer than
+///   the cap, so the scan cannot stop early. It must probe the *entire*
+///   active population.
+/// * A `harvest_timers` population, ~15% of terminal executions with fired
+///   status mixed, so the `OR`-block's timer subplans touch a non-trivial
+///   table. This population is independent of the healthy/stalled
+///   classification above, which `task_queue` decides, not timers.
 async fn seed_fixture(conn: &mut AsyncPgConnection, terminal: i64, active: i64, stalled: i64) {
     conn.batch_execute(&format!(
         "INSERT INTO harvest_workflow_executions (
@@ -276,8 +281,8 @@ async fn reset_stats_for_db(conn: &mut AsyncPgConnection, db_name: &str) {
 }
 
 /// Every statement recorded for this database since the last reset, in ONE
-/// query -- see `schedule_overdue_aux_perf.rs`'s identical helper for why a
-/// second `pg_stat_statements` query here would pollute its own total.
+/// query. See `schedule_overdue_aux_perf.rs`'s identical helper: a second
+/// `pg_stat_statements` query here would pollute its own total.
 async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec<StatRow> {
     diesel::sql_query(format!(
         "SELECT query, calls, shared_blks_hit, shared_blks_read, \
@@ -295,10 +300,10 @@ async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec
     )
 }
 
-/// Whether `row` is the `count_stalled_candidates` statement shape: the
-/// bounded stalled-candidate count from `status_summary.rs`, identified by a
-/// distinctive table/column substring combination not shared with any other
-/// statement `GET /admin/status` issues.
+/// Whether `row` is the `count_stalled_candidates` statement shape. This is
+/// the bounded stalled-candidate count from `status_summary.rs`. It is
+/// identified by a distinctive table/column substring combination, not
+/// shared with any other statement `GET /admin/status` issues.
 fn is_stalled_count_statement(row: &StatRow) -> bool {
     let q = row.query.to_ascii_lowercase();
     q.contains("harvest_workflow_executions")
@@ -417,9 +422,10 @@ async fn zz_capture_status_summary_stalled_perf_evidence() {
          calls_pct={calls_pct:.1}% buffers_pct={buffers_pct:.1}%"
     );
 
-    // Full EXPLAIN of the exact statement `count_stalled_candidates` issues,
-    // same connection, same fixture, immediately after the real request above
-    // (so the plan reflects a warm cache matching operational conditions).
+    // Full EXPLAIN of the exact statement `count_stalled_candidates` issues.
+    // Same connection, same fixture, immediately after the real request
+    // above, so the plan reflects a warm cache matching operational
+    // conditions.
     let explain_sql = "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) \
          SELECT COUNT(*)::BIGINT AS cnt FROM ( \
              SELECT 1 FROM harvest_workflow_executions e \

@@ -3,8 +3,8 @@ request: GET /admin/status (admin-authed)
 reported stalled_count=30
 target_statement_shapes=1
 target_calls=1
-target_buffers=12219
+target_buffers=15219
 request_total_calls=14
-request_total_buffers=14521
+request_total_buffers=17521
 calls_pct=7.1%
-buffers_pct=84.1%
+buffers_pct=86.9%
