@@ -2728,7 +2728,6 @@ async fn resolve_delivery_route(
                         // construction. It is evidence of the race's
                         // precondition: a key pinned to one shard while
                         // an unpinned start of it hashed to another.
-                        //
                         if should_record_other_live_observed(
                             other_live.is_empty(),
                             uninspected.is_empty(),
