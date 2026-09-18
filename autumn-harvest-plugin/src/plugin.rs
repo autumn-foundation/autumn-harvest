@@ -1482,35 +1482,18 @@ impl Plugin for HarvestPlugin {
 
         if let Some(path) = api_path {
             let ui_router = harvest_ui_router(api_state.clone());
-            // Clone the state for the token layer only when it will be installed,
-            // so a disabled deployment does an identical amount of work as before.
-            let token_layer_state = api_tokens_enabled.then(|| api_state.clone());
-            let mut router = harvest_api_router(api_state).nest("/ui", ui_router);
-            // Issue #776: install the class-aware read-only enforcement layer
-            // BEFORE the embedder's auth middleware wraps the router, so the
-            // request order is: embedder auth mw (sets Session) → this layer
-            // (reads Session + method + nest-stripped path) → per-route
-            // require_admin → handler. Applied to the combined router so it
-            // also covers the nested /ui sub-router (which, being unclassified,
-            // fails closed → 403 for read-only principals). Only installed
-            // under api_with_role_auth; the default and api_with_auth paths are
-            // byte-for-byte unchanged (AC6).
-            if role_auth_enabled {
-                router = router.layer(autumn_web::reexports::axum::middleware::from_fn(
-                    crate::api::enforce_read_only_class,
-                ));
-            }
-            // Issue #942: install the scoped-API-token verification + scope layer
-            // OUTSIDE the read-only-class layer (so it runs first: verify token →
-            // set TokenPrincipal / authoritative actor → deny read-scope mutation)
-            // and INSIDE the embedder's auth middleware. Only installed under
-            // enable_api_tokens(); the default path is byte-for-byte unchanged (AC7).
-            if let Some(state) = token_layer_state {
-                router = router.layer(autumn_web::reexports::axum::middleware::from_fn_with_state(
-                    state,
-                    crate::api_token::enforce_token_scope,
-                ));
-            }
+            let router = harvest_api_router(api_state.clone()).nest("/ui", ui_router);
+            // The layer stack and its load-bearing ordering live in
+            // `apply_admin_auth_layers`, which the standalone mount path also
+            // calls (issue #1608), so the two cannot drift. Neither layer is
+            // installed unless its opt-in is set, so the default and
+            // api_with_auth paths are byte-for-byte unchanged (AC6, AC7).
+            let mut router = crate::api::apply_admin_auth_layers(
+                router,
+                &api_state,
+                api_tokens_enabled,
+                role_auth_enabled,
+            );
             if let Some(mw) = api_middleware {
                 router = mw(router);
             }
