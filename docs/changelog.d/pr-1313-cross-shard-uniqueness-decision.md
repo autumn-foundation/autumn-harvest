@@ -73,8 +73,10 @@ a second live run unconditionally, not only under a race.
 outcome are untouched — no signal or cancel resolves, delivers, or
 reports any differently than before. The only new runtime effect is the
 counter above, recorded at the same point `timeout.rs` already records
-`by_id_found_over_incomplete_fanout`. `cargo test -p autumn-harvest --lib
---all-features` on `external_target_location::`, `timeout::`,
-`telemetry::`, and `metrics_rs_adapter::` (206 tests across the four
-modules) and `python3 docs/audits/comment-hygiene.py --base
-origin/trunk-dev` both pass.
+`by_id_found_over_incomplete_fanout`, and gated by a pure predicate,
+`should_record_other_live_observed`, so a partial fan-out that also saw
+`other_live` is never double-counted against the other counter (review
+finding). `cargo test -p autumn-harvest --lib --all-features` on
+`external_target_location::`, `timeout::`, `telemetry::`, and
+`metrics_rs_adapter::` (210 tests across the four modules) and `python3
+docs/audits/comment-hygiene.py --base origin/trunk-dev` both pass.
