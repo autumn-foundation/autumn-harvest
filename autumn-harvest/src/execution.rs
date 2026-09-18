@@ -4010,6 +4010,88 @@ pub async fn pause_workflow_execution(
     Ok(result)
 }
 
+/// SQL for [`release_claim_if_workflow_paused`], exposed for shape tests.
+///
+/// One statement. It takes a fresh `READ COMMITTED` snapshot. It sees any
+/// pause committed before it began.
+///
+/// Restores `attempt`. The task never ran, so a hold must not consume retry
+/// budget. The queue-pause and activity-pause siblings do the same.
+///
+/// Scoped to `task_type = 'workflow'`. A pause holds new workflow dispatch
+/// only. An activity task can carry the same `workflow_exec_id`. This
+/// statement must never release that activity task. See
+/// [`pause_workflow_execution`]'s doc comment: the hold does not block
+/// in-flight or pending activities.
+#[must_use]
+pub const fn release_claim_if_workflow_paused_query() -> &'static str {
+    "UPDATE harvest_task_queue \
+     SET state = 'PENDING', \
+         worker_id = NULL, \
+         started_at = NULL, \
+         attempt = GREATEST(attempt - 1, 0) \
+     WHERE id = $1 \
+       AND state = 'RUNNING' \
+       AND worker_id = $2 \
+       AND task_type = 'workflow' \
+       AND EXISTS (SELECT 1 FROM harvest_workflow_executions e \
+           WHERE e.id = harvest_task_queue.workflow_exec_id \
+             AND e.state = 'PAUSED')"
+}
+
+/// Releases a just-claimed workflow task back to `PENDING` when its owning
+/// execution turns out to be paused (issue #1640).
+///
+/// # Why a second statement is required
+///
+/// The claim is a single CTE statement. Under `READ COMMITTED`, its whole
+/// body — including the anti-join against `harvest_workflow_executions` —
+/// evaluates against **one snapshot taken at statement start**. A
+/// [`pause_workflow_execution`] commit landing after that snapshot stays
+/// invisible to it. A claim already in flight can then still move its task to
+/// `RUNNING`. It hands the task to a worker that dispatches into the pause.
+/// Re-checking in a **fresh statement** gets a fresh snapshot. The cost is one
+/// indexed probe per *successful workflow claim*. A pause committed before
+/// this re-check's statement begins always wins.
+///
+/// # Residual window (deliberate)
+///
+/// This re-check's verdict is authoritative as of *its own snapshot*, not
+/// through commit. This is the same accepted trade-off as
+/// [`crate::activity_pause::release_claim_if_activity_paused`]. A pause that
+/// commits in the window between this statement and the claim transaction's
+/// `COMMIT` can be acknowledged to the operator, while one already-claimed
+/// task still dispatches.
+///
+/// Queue pause closes that last window with a shared advisory lock on the
+/// queue key (issue #619). This path deliberately does not, for the same
+/// reasons that check gave. The two-argument advisory keyspace is single-user
+/// for `queue_pause`. The single-argument keyspace is already shared by five
+/// subsystems on this same hot claim path. The exposure here is a
+/// sub-millisecond window. It is bounded to at most one already-claimed task
+/// per racing worker. The leaked task's *next* attempt is held like any
+/// other.
+///
+/// Returns `true` when the claim was released (the caller must behave as if
+/// no task was claimed).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn release_claim_if_workflow_paused(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    worker_id: &str,
+) -> HarvestResult<bool> {
+    let released = diesel::sql_query(release_claim_if_workflow_paused_query())
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+    Ok(released > 0)
+}
+
 /// SQL to shift still-open task rows' cross-retry wall-clock deadline
 /// (`schedule_to_close_at`, issue #378) forward by the pause span on resume
 /// (issue #609, AC5).

@@ -257,6 +257,8 @@ mod workflow_logger_tests;
 mod workflow_logs_tests;
 mod workflow_mutation_tests;
 #[cfg(feature = "db")]
+mod workflow_pause_claim_recheck_tests;
+#[cfg(feature = "db")]
 mod workflow_reachability_samples_tests;
 mod workflow_retry_tests;
 mod workflow_schema_contract_tests;
