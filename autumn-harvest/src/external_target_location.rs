@@ -174,7 +174,7 @@ pub struct UninspectedShard {
 ///
 /// `#[non_exhaustive]`: a design note, not a promise of future variants.
 /// `Found` already carries "several live runs" as its `other_live` field
-/// (issue #1146, Codex round 3). A signal still needs one winner to
+/// (issue #1146). A signal still needs one winner to
 /// deliver to. Ranking therefore stays a field on `Found`, not a fork in
 /// the enum.
 ///
