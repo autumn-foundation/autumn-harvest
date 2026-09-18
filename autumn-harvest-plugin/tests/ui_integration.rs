@@ -3456,6 +3456,37 @@ async fn ui_schedules_runs_invalid_limit_redisplays_form_instead_of_aborting_pag
     );
 }
 
+/// Codex review finding on this PR: the "Rows" field became a text control
+/// with no browser-side floor (the previous `type="number" min="1"` blocked
+/// a `0` submission client-side). Without clamping, an operator-typed `0`
+/// would reach `ScheduleRunsParams::from_query_pairs`, which rejects it —
+/// reintroducing the whole-page-abort defect this PR exists to close.
+#[tokio::test]
+async fn ui_schedules_runs_zero_limit_clamps_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let id = insert_schedule_fixture(
+        &database_url,
+        &ScheduleFixture {
+            kind: "Workflow",
+            name: "runs_zero_limit_wf",
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/runs?limit=0")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "limit=0 must clamp to 1, not abort the whole run-history page: {html}"
+    );
+    assert!(
+        html.contains("Run history"),
+        "the page must still render: {html}"
+    );
+}
+
 /// AC7/AC8: a schedule with no runs yet renders an explicit message.
 #[tokio::test]
 async fn ui_schedules_run_history_empty_state() {

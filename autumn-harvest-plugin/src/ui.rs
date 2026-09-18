@@ -10546,7 +10546,15 @@ impl ScheduleRunsView {
     /// Query-string suffix (leading `&`) carrying the filters, for the next-page link.
     fn query_suffix(&self) -> String {
         let mut out = String::new();
-        if let Some(limit) = self.limit {
+        // Codex review finding on this PR: prefer `limit_raw` over `limit`
+        // when a parse failure left it set. Otherwise the Next link would
+        // drop the operator's bad text, and its `role="alert"` context,
+        // on the very click meant to keep their place. It would silently
+        // revert to the default instead of carrying the correction
+        // forward.
+        if !self.limit_raw.is_empty() {
+            let _ = write!(out, "&limit={}", url_encode(&self.limit_raw));
+        } else if let Some(limit) = self.limit {
             let _ = write!(out, "&limit={limit}");
         }
         if let Some(ref origin) = self.origin {
@@ -10858,11 +10866,22 @@ async fn schedule_runs_ui(
 /// [`crate::schedule_runs::DEFAULT_LIMIT`]. It reports the bad value
 /// inline, next to the "Rows" field, instead of aborting the whole page.
 /// Same contract as [`parse_limit_query_field`] on the list pages,
-/// including echoing the raw text back for redisplay. A
-/// numeric-but-out-of-range value (`limit=0`, `limit=100000`) is left for
+/// including echoing the raw text back for redisplay.
+///
+/// A numeric-but-out-of-range value (`limit=0`, `limit=100000`) is clamped
+/// silently to `[1, MAX_LIMIT]`, matching [`parse_limit_query_field`]'s own
+/// contract. It is not left for
 /// [`crate::schedule_runs::ScheduleRunsParams::from_query_pairs`] to
-/// validate, exactly as it does today. This closes the axum-level
-/// pre-handler abort on non-numeric text, not the API's own range check.
+/// reject.
+///
+/// Codex review finding on this PR: the "Rows" field used to be
+/// `type="number" min="1"`, which a browser refuses to submit below 1.
+/// The fix below switched it to a text control, to keep bad text visible
+/// (see `per_page_input_is_a_text_control_that_can_hold_invalid_text`).
+/// That drops the browser-side floor. Without clamping here, a `0` typed
+/// into the now-unconstrained field reaches `from_query_pairs`. It then
+/// rejects the value and aborts the whole page — reintroducing the exact
+/// defect class this PR exists to close.
 fn parse_schedule_runs_limit_query_field(
     raw: Option<&str>,
 ) -> (Option<i64>, String, Option<String>) {
@@ -10881,7 +10900,13 @@ fn parse_schedule_runs_limit_query_field(
                 )),
             )
         },
-        |parsed| (Some(parsed), String::new(), None),
+        |parsed| {
+            (
+                Some(parsed.clamp(1, crate::schedule_runs::MAX_LIMIT)),
+                String::new(),
+                None,
+            )
+        },
     )
 }
 
@@ -12141,18 +12166,21 @@ mod tests {
         );
     }
 
-    /// A well-formed but out-of-range limit (`0`, `100000`) is left for
-    /// `ScheduleRunsParams::from_query_pairs` to validate, unchanged from
-    /// before this fix — this function only owns non-numeric text.
+    /// Codex review finding on this PR: a well-formed but out-of-range
+    /// limit (`0`, `100000`) is clamped here, not left for
+    /// `ScheduleRunsParams::from_query_pairs` to reject. The "Rows" field
+    /// is a text control with no browser-side floor. An unclamped `0`
+    /// would reach `from_query_pairs` and abort the whole page — the
+    /// exact defect class this PR exists to close.
     #[test]
-    fn parse_schedule_runs_limit_query_field_leaves_out_of_range_values_for_the_caller() {
+    fn parse_schedule_runs_limit_query_field_clamps_out_of_range_values() {
         assert_eq!(
             parse_schedule_runs_limit_query_field(Some("0")),
-            (Some(0), String::new(), None)
+            (Some(1), String::new(), None)
         );
         assert_eq!(
             parse_schedule_runs_limit_query_field(Some("100000")),
-            (Some(100_000), String::new(), None)
+            (Some(crate::schedule_runs::MAX_LIMIT), String::new(), None)
         );
     }
 
@@ -12174,6 +12202,33 @@ mod tests {
             message.contains("not-a-number") && message.contains("limit"),
             "the error names the bad value and the field: {message}"
         );
+    }
+
+    /// Codex review finding on this PR: the Next link used to be built
+    /// from `limit` alone. A parse failure leaves `limit` at `None`. The
+    /// operator's bad text — and the error naming it — then silently
+    /// vanished on the very click meant to preserve their place.
+    #[test]
+    fn schedule_runs_view_query_suffix_carries_the_invalid_raw_limit() {
+        let view = ScheduleRunsView {
+            limit: None,
+            limit_raw: "not-a-number".to_string(),
+            origin: Some("scheduled".to_string()),
+            state: None,
+        };
+        assert_eq!(view.query_suffix(), "&limit=not-a-number&origin=scheduled");
+    }
+
+    /// A clean, already-resolved `limit` still round-trips as before.
+    #[test]
+    fn schedule_runs_view_query_suffix_carries_the_resolved_limit_when_valid() {
+        let view = ScheduleRunsView {
+            limit: Some(5),
+            limit_raw: String::new(),
+            origin: None,
+            state: None,
+        };
+        assert_eq!(view.query_suffix(), "&limit=5");
     }
 
     /// Codex review finding on this PR: a `type="number"` input sanitizes an
