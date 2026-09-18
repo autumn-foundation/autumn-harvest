@@ -3243,12 +3243,12 @@ async fn ui_schedules_preview_explains_an_exhausted_schedule() {
 }
 
 /// RED (was): `count` was typed `Option<usize>` directly on
-/// `SchedulePreviewUiParams` — `?count=not-a-number` failed axum's own
-/// query deserialization with a bare 400 before `schedule_preview_ui` ever
-/// ran, aborting the whole preview page. Same mechanism as the Workflows/
-/// Workers/DLQ/Schedules list pages' `page`/`limit` fields and the DAG
-/// detail page's `node`/`refresh` (#1333/#1378/#1420/#1437/#1540/#1560/
-/// #1588/#1619/#1630).
+/// `SchedulePreviewUiParams`. `?count=not-a-number` then failed axum's own
+/// query deserialization with a bare 400. That happened before
+/// `schedule_preview_ui` ever ran, aborting the whole preview page. Same
+/// mechanism as the Workflows/Workers/DLQ/Schedules list pages'
+/// `page`/`limit` fields and the DAG detail page's `node`/`refresh`
+/// (#1333/#1378/#1420/#1437/#1540/#1560/#1588/#1619/#1630).
 ///
 /// GREEN (this commit): the request still renders the preview page (`200`)
 /// with the default entry count, and surfaces a `role="alert"` message
@@ -3409,15 +3409,15 @@ async fn ui_schedules_run_history_renders_rows_and_summary() {
 }
 
 /// RED (was): `limit` was typed `Option<i64>` directly on
-/// `ScheduleRunsUiParams` — `?limit=not-a-number` failed axum's own query
-/// deserialization with a bare 400 before `schedule_runs_ui` ever ran,
-/// discarding the `origin` filter already on the URL along with the whole
-/// run-history page. Same mechanism as the Workers page's own `limit` fix
-/// (#1540/#1560/#1588/#1619/#1630).
+/// `ScheduleRunsUiParams`. `?limit=not-a-number` then failed axum's own
+/// query deserialization with a bare 400. That happened before
+/// `schedule_runs_ui` ever ran, discarding the `origin` filter already on
+/// the URL along with the whole run-history page. Same mechanism as the
+/// Workers page's own `limit` fix (#1540/#1560/#1588/#1619/#1630).
 ///
 /// GREEN (this commit): the request still renders the run-history page
-/// (`200`), preserves the `origin` filter, and surfaces a `role="alert"`
-/// message next to the "Rows" field naming the bad value.
+/// (`200`) and preserves the `origin` filter. It surfaces a
+/// `role="alert"` message next to the "Rows" field naming the bad value.
 #[tokio::test]
 async fn ui_schedules_runs_invalid_limit_redisplays_form_instead_of_aborting_page() {
     let (database_url, _container) = setup_test_database_url().await;

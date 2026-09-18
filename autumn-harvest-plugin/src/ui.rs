@@ -10493,13 +10493,14 @@ fn build_schedule_query_string(
 /// Query parameters for the preview drill-down.
 #[derive(Debug, Deserialize)]
 pub(crate) struct SchedulePreviewUiParams {
-    // `count` is `String`, not `usize` — same fix as `page`/`limit` on the
-    // Workflows, Workers, DLQ and Schedules pages and `node`/`refresh` on
-    // the DAG detail page (#1333/#1378/#1420/#1437/#1540/#1560/#1588/#1619/
-    // #1630). A numeric-typed field fails axum's query deserialization on
-    // non-numeric text with a bare 400 before this handler ever runs,
-    // discarding the whole preview page for a bookmarked or hand-edited
-    // `?count=` value. Clamped to 1..=100 by the API.
+    // `count` is `String`, not `usize`. Same fix as `page`/`limit` on the
+    // Workflows, Workers, DLQ and Schedules pages. Same fix as `node`/
+    // `refresh` on the DAG detail page (#1333/#1378/#1420/#1437/#1540/
+    // #1560/#1588/#1619/#1630). A numeric-typed field fails axum's query
+    // deserialization on non-numeric text. It fails with a bare 400 before
+    // this handler ever runs. That discards the whole preview page for a
+    // bookmarked or hand-edited `?count=` value. Clamped to 1..=100 by the
+    // API.
     #[serde(default)]
     count: Option<String>,
 }
@@ -10507,12 +10508,12 @@ pub(crate) struct SchedulePreviewUiParams {
 /// Query parameters for the run-history drill-down.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ScheduleRunsUiParams {
-    // `limit` is `String`, not `i64` — same fix as `count` above and
+    // `limit` is `String`, not `i64`. Same fix as `count` above and as
     // `page`/`limit` on the list pages (#1333/#1378/#1420/#1437/#1540/
     // #1560/#1588/#1619). A numeric-typed field fails axum's query
-    // deserialization on non-numeric text with a bare 400 before this
-    // handler ever runs, discarding the `origin`/`state` filters already on
-    // the URL along with everything else on the page.
+    // deserialization on non-numeric text. It fails with a bare 400 before
+    // this handler ever runs. That discards the `origin`/`state` filters
+    // already on the URL, along with everything else on the page.
     #[serde(default)]
     limit: Option<String>,
     #[serde(default)]
@@ -10532,8 +10533,8 @@ pub(crate) struct ScheduleRunsUiParams {
 #[derive(Debug, Clone, Default)]
 struct ScheduleRunsView {
     limit: Option<i64>,
-    /// The raw, unparsed `limit` text on a parse failure — echoed back into
-    /// the "Rows" field so the operator's own bad input stays visible
+    /// The raw, unparsed `limit` text on a parse failure. Echoed back into
+    /// the "Rows" field so the operator's own bad input stays visible,
     /// instead of silently reverting to blank. Empty when `limit` parsed
     /// cleanly or was omitted.
     limit_raw: String,
@@ -10620,9 +10621,9 @@ const SCHEDULE_PREVIEW_DEFAULT_COUNT: usize = 10;
 ///
 /// A non-numeric value falls back to [`SCHEDULE_PREVIEW_DEFAULT_COUNT`] and
 /// reports the bad value inline, instead of aborting the whole page. Same
-/// contract as [`parse_dag_node_query_field`]: this page has no form field
-/// backing `count` (it is link/URL-driven only), so the caller renders the
-/// error as a page-level notice rather than next to a control.
+/// contract as [`parse_dag_node_query_field`]. This page has no form field
+/// backing `count` — it is link/URL-driven only. So the caller renders the
+/// error as a page-level notice, rather than next to a control.
 fn parse_schedule_preview_count_query_field(raw: Option<&str>) -> (usize, Option<String>) {
     let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
         return (SCHEDULE_PREVIEW_DEFAULT_COUNT, None);
@@ -10791,16 +10792,17 @@ async fn schedule_runs_ui(
 ) -> Result<Markup, AutumnError> {
     let (row, shard_id) = load_schedule_for_drilldown(&api_state, &id_str).await?;
 
-    // `limit` is parsed here, ahead of the endpoint's own parser below, so a
-    // non-numeric value degrades to the default instead of ever reaching
-    // `from_query_pairs` as bad input — matching how the list pages'
-    // `page`/`limit` fields are parsed before their own filters are built.
+    // `limit` is parsed here, ahead of the endpoint's own parser below. A
+    // non-numeric value then degrades to the default, instead of ever
+    // reaching `from_query_pairs` as bad input. This matches how the list
+    // pages' `page`/`limit` fields are parsed before their own filters are
+    // built.
     let (limit, limit_raw, limit_error) =
         parse_schedule_runs_limit_query_field(params.limit.as_deref());
 
-    // Build the rest of the query through the endpoint's own parser so the
-    // UI applies the same clamping, vocabulary validation and cursor format
-    // as the API.
+    // Build the rest of the query through the endpoint's own parser. The UI
+    // then applies the same clamping, vocabulary validation and cursor
+    // format as the API.
     let mut pairs: Vec<(String, String)> = Vec::new();
     if let Some(limit) = limit {
         pairs.push(("limit".to_string(), limit.to_string()));
@@ -10852,14 +10854,14 @@ async fn schedule_runs_ui(
 
 /// Parses the run-history page's `limit` query parameter.
 ///
-/// A non-numeric value falls back to no limit (the endpoint's own default,
-/// [`crate::schedule_runs::DEFAULT_LIMIT`]) and reports the bad value
-/// inline, next to the "Rows" field — instead of aborting the whole page.
+/// A non-numeric value falls back to no limit — the endpoint's own default,
+/// [`crate::schedule_runs::DEFAULT_LIMIT`]. It reports the bad value
+/// inline, next to the "Rows" field, instead of aborting the whole page.
 /// Same contract as [`parse_limit_query_field`] on the list pages,
 /// including echoing the raw text back for redisplay. A
 /// numeric-but-out-of-range value (`limit=0`, `limit=100000`) is left for
 /// [`crate::schedule_runs::ScheduleRunsParams::from_query_pairs`] to
-/// validate exactly as it does today: this closes the axum-level
+/// validate, exactly as it does today. This closes the axum-level
 /// pre-handler abort on non-numeric text, not the API's own range check.
 fn parse_schedule_runs_limit_query_field(
     raw: Option<&str>,
@@ -11063,10 +11065,10 @@ fn render_schedule_runs_filters(
             label {
                 "Rows"
                 // `type="text"`, not `type="number"`. A number input
-                // sanitizes an invalid value (e.g. "not-a-number") to blank
-                // at render time, so the operator could never see or
-                // correct their own bad input. Matches the Workers page's
-                // "Per page" field.
+                // sanitizes an invalid value (e.g. "not-a-number") to
+                // blank at render time. The operator could then never see
+                // or correct their own bad input. Matches the Workers
+                // page's "Per page" field.
                 input type="text" inputmode="numeric" pattern="[0-9]*" name="limit"
                     value=(limit_val) placeholder=(crate::schedule_runs::DEFAULT_LIMIT);
                 @if let Some(error) = limit_error {
@@ -12100,11 +12102,11 @@ mod tests {
     }
 
     /// GREEN -- the fix under test: `count` was typed `Option<usize>`
-    /// directly on `SchedulePreviewUiParams`, so a non-numeric value failed
-    /// axum's own query deserialization with a bare 400 before
-    /// `schedule_preview_ui` ever ran — aborting the whole preview page.
-    /// It now degrades to `SCHEDULE_PREVIEW_DEFAULT_COUNT` while naming the
-    /// bad value, matching `parse_dag_node_query_field`.
+    /// directly on `SchedulePreviewUiParams`. A non-numeric value then
+    /// failed axum's own query deserialization with a bare 400. That
+    /// happened before `schedule_preview_ui` ever ran, aborting the whole
+    /// preview page. It now degrades to `SCHEDULE_PREVIEW_DEFAULT_COUNT`
+    /// while naming the bad value, matching `parse_dag_node_query_field`.
     #[test]
     fn parse_schedule_preview_count_query_field_rejects_non_numeric_text_without_erroring() {
         let (count, error) = parse_schedule_preview_count_query_field(Some("not-a-number"));
@@ -12155,12 +12157,13 @@ mod tests {
     }
 
     /// GREEN -- the fix under test: `limit` was typed `Option<i64>` directly
-    /// on `ScheduleRunsUiParams`, so a non-numeric value failed axum's own
-    /// query deserialization with a bare 400 before `schedule_runs_ui` ever
-    /// ran — discarding the `origin`/`state` filters already on the URL
-    /// along with the rest of the page. It now degrades to no limit (the
-    /// endpoint's own default) while naming the bad value and echoing the
-    /// raw text back for redisplay, matching `parse_limit_query_field`.
+    /// on `ScheduleRunsUiParams`. A non-numeric value then failed axum's
+    /// own query deserialization with a bare 400. That happened before
+    /// `schedule_runs_ui` ever ran, discarding the `origin`/`state`
+    /// filters already on the URL along with the rest of the page. It now
+    /// degrades to no limit (the endpoint's own default) while naming the
+    /// bad value. It also echoes the raw text back for redisplay, matching
+    /// `parse_limit_query_field`.
     #[test]
     fn parse_schedule_runs_limit_query_field_rejects_non_numeric_text_without_erroring() {
         let (limit, raw, error) = parse_schedule_runs_limit_query_field(Some("not-a-number"));
