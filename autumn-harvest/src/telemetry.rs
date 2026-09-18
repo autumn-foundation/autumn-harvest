@@ -614,8 +614,8 @@ pub const METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT: &str =
     "harvest.external_signal.by_id_found_over_incomplete_fanout";
 
 /// Counter: a by-id fan-out completed and found more than one live run
-/// of the same business key (issue #1146; issue #1313 records the
-/// residual bound this counter is evidence for).
+/// of the same business key (issue #1146). Issue #1313 records the
+/// residual bound this counter is evidence for.
 ///
 /// `(workflow_name, workflow_id)` uniqueness is shard-local. This fires
 /// only when a key was pinned to one shard while an unpinned start of
