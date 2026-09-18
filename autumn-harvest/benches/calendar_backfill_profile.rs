@@ -2,40 +2,42 @@
 //! harness for `autumn_harvest::calendar::plan_backfill_with_calendar` — the
 //! calendar-aware backfill planner behind
 //! `POST /admin/schedules/{id}/backfill` (`autumn-harvest-plugin/src/api.rs`,
-//! `schedule_backfill` -> `plan_backfill_with_calendar`). Wall-clock timing is
-//! not admissible evidence on this (shared-vCPU) machine — every number this
-//! harness produces evidence for is a deterministic instruction count
+//! `schedule_backfill` -> `plan_backfill_with_calendar`). Wall-clock timing
+//! is not admissible evidence on this (shared-vCPU) machine. Every number
+//! this harness produces evidence for is a deterministic instruction count
 //! (`valgrind --tool=callgrind`) or allocation count/bytes
 //! (`valgrind --tool=dhat`), both reproducible bit-for-bit on any machine.
 //!
 //! # Workload
 //!
-//! An hourly `Schedule::Interval` backfilled across `SLOTS` raw timestamps
-//! (the `max_count` the admin handler passes through from the request body,
-//! `DEFAULT_BACKFILL_MAX_COUNT` = 1,000 by default and **not hard-capped** by
-//! the handler — an operator can request more) against an `EXCLUSIONS`-entry
-//! calendar exclusion list, exactly as `load_exclusions_for_calendar` would
-//! return it: every exclusion row ever inserted for the named calendar, with
-//! no date-range bound (see that function's doc comment). A calendar in
-//! continuous use only grows this list; there is no retention or archival
-//! path for it. The exclusion dates are all drawn from the two years
-//! *before* `from`, so none of them land inside the backfill window itself —
-//! every one of the `SLOTS` calendar checks this workload performs is a
-//! miss, which is realistic (a backfill request commonly targets a recent
-//! window while the calendar's exclusion history spans years) and is also
-//! `Vec::contains`'s worst case: a linear scan cannot short-circuit on an
-//! absent element, so every check pays the full `EXCLUSIONS`-length scan.
-//! The exclusion dates are inserted in a deterministic non-sorted order (a
-//! fixed-stride permutation, not chronological) since nothing in the public
-//! contract (`is_excluded_date`'s doc comment) promises callers hand in a
-//! sorted slice.
+//! An hourly `Schedule::Interval` backfilled across `SLOTS` raw timestamps.
+//! `SLOTS` stands in for `max_count`, the value the admin handler passes
+//! through from the request body. `DEFAULT_BACKFILL_MAX_COUNT` is 1,000 by
+//! default, and the handler does **not** hard-cap it, so an operator can
+//! request more. The timestamps run against an `EXCLUSIONS`-entry calendar
+//! exclusion list, sized exactly as `load_exclusions_for_calendar` would
+//! return it. That is every exclusion row ever inserted for the named
+//! calendar, with no date-range bound (see that function's doc comment). A
+//! calendar in continuous use only grows this list; there is no retention
+//! or archival path for it. The exclusion dates are all drawn from the two
+//! years
+//! *before* `from`, so none of them land inside the backfill window itself.
+//! Every one of the `SLOTS` calendar checks this workload performs is
+//! therefore a miss. That is realistic: a backfill request commonly targets
+//! a recent window while the calendar's exclusion history spans years. It
+//! is also `Vec::contains`'s worst case, since a linear scan cannot
+//! short-circuit on an absent element, so every check pays the full
+//! `EXCLUSIONS`-length scan. The exclusion dates are inserted in a
+//! deterministic non-sorted order (a fixed-stride permutation, not
+//! chronological). Nothing in the public contract (`is_excluded_date`'s doc
+//! comment) promises callers hand in a sorted slice.
 //!
 //! `CALENDAR_PROFILE_SLOTS` (default `2000`) sets the backfill slot count
 //! (`max_count`, and the exact number of raw timestamps the interval
 //! schedule produces between `from` and `to`). `CALENDAR_PROFILE_EXCLUSIONS`
 //! (default `3000`) sets the exclusion-list length. `CALENDAR_PROFILE_REPS`
-//! (default `3`) repeats the whole `plan_backfill_with_calendar` call against
-//! the same fixed schedule and exclusion list.
+//! (default `3`) repeats the whole `plan_backfill_with_calendar` call
+//! against the same fixed schedule and exclusion list.
 //!
 //! # Running
 //!
@@ -70,14 +72,14 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 /// Builds `count` exclusion dates spanning the two years before `before`, in
-/// a fixed-stride (non-chronological) order — a long-lived calendar's rows
+/// a fixed-stride (non-chronological) order. A long-lived calendar's rows
 /// come back from `SELECT ... WHERE calendar_name = $1` with no `ORDER BY`,
 /// so insertion order (not date order) is what a real caller gets.
 fn build_exclusions(before: NaiveDate, count: usize) -> Vec<NaiveDate> {
     let window_days: i64 = 730;
     // A stride coprime with `window_days` (730 = 2 * 5 * 73) visits every
-    // day in the window exactly once before repeating, for any `count` up to
-    // `window_days`.
+    // day in the window exactly once before repeating. That holds for any
+    // `count` up to `window_days`.
     let stride: i64 = 317;
     let mut dates = Vec::with_capacity(count);
     for i in 0..count {
@@ -93,7 +95,10 @@ fn main() {
     let exclusions = env_usize("CALENDAR_PROFILE_EXCLUSIONS", 3000);
     let reps = env_usize("CALENDAR_PROFILE_REPS", 3);
 
-    assert!(slots > 0, "CALENDAR_PROFILE_SLOTS must be at least 1, got 0");
+    assert!(
+        slots > 0,
+        "CALENDAR_PROFILE_SLOTS must be at least 1, got 0"
+    );
     assert!(
         exclusions > 0,
         "CALENDAR_PROFILE_EXCLUSIONS must be at least 1, got 0"
@@ -120,9 +125,9 @@ fn main() {
         )
         .expect("slots was sized to exactly fill max_count, never exceed it");
         // None of the exclusion dates fall inside [from, to], so every raw
-        // slot survives unadjusted -- a change that silently started
-        // dropping or rebasing slots (not just moving their cost) would fail
-        // this harness rather than produce a quietly-wrong "faster" number.
+        // slot survives unadjusted. A change that silently started dropping
+        // or rebasing slots (not just moving their cost) would fail this
+        // harness rather than produce a quietly-wrong "faster" number.
         assert_eq!(
             result.len(),
             slots,
