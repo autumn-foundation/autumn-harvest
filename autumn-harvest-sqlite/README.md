@@ -96,9 +96,9 @@ A complete, runnable version is in
   activity bodies to be idempotent. See
   [`examples/durability.rs`](examples/durability.rs).
 - **Idempotent starts by default (issue #1068).** `start_workflow_with_id`
-  applies the `AllowDuplicate` reuse policy: a duplicate `(workflow_name,
+  applies the `AllowDuplicate` reuse policy. A duplicate `(workflow_name,
   workflow_id)` **attaches** to the existing, non-sealed run instead of
-  starting a second one, and the new call's input is discarded. Use
+  starting a second one. The new call's input is discarded. Use
   `start_workflow_with_reuse_policy` for the full `WorkflowIdReusePolicy`
   matrix — reject, replace-if-failed, or terminate-and-restart.
 
