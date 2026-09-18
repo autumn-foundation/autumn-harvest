@@ -797,6 +797,103 @@ async fn batched_claim_attempt_never_debits_rate_limit_for_a_candidate_past_its_
     );
 }
 
+/// Regression test for a review finding on this PR, against the
+/// thirteenth bug's own fix. Same shape as the deadline-leak test
+/// above: a data-modifying CTE runs whether or not `claimed` uses its
+/// result. A candidate whose build compatibility was never declared
+/// must not debit a rate-limit token either. `claimed` was always
+/// going to reject it on the build-routing gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn batched_claim_attempt_never_debits_rate_limit_for_a_build_incompatible_candidate() {
+    use diesel_async::RunQueryDsl;
+
+    let (_url, mut conn, _container) = setup_db().await;
+    let bucket_key = format!("bucket-{}", Uuid::new_v4().simple());
+    queue::ensure_rate_limit_bucket(&mut conn, &bucket_key, 0.0, 100.0)
+        .await
+        .expect("ensure bucket");
+
+    let queue = unique_queue("batched-build-routing-no-leak");
+    let unique = Uuid::new_v4().simple().to_string();
+    let required_build = format!("build-required-{unique}");
+    let worker_build = format!("build-worker-{unique}");
+    let exec_id = insert_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id);
+    params.activity_name = Some("noop".to_string());
+    params.activity_id = Some(Uuid::new_v4());
+    params.rate_limit_key = Some(bucket_key.clone());
+    params.required_build_id = Some(required_build.clone());
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+    #[derive(diesel::QueryableByName)]
+    struct ClaimedId {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+    }
+
+    let mut tx = conn.build_transaction().read_committed();
+    let claimed: Option<Uuid> = tx
+        .run(
+            async |conn: &mut AsyncPgConnection| -> Result<Option<Uuid>, diesel::result::Error> {
+                let rows: Vec<ClaimedId> =
+                    diesel::sql_query(queue::claim_batched_candidate_attempt_query())
+                        .bind::<diesel::sql_types::Text, _>("build-no-leak-tester")
+                        .bind::<diesel::sql_types::Uuid, _>(task_id)
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                            None::<String>,
+                        )
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(
+                            None::<i32>,
+                        )
+                        .bind::<diesel::sql_types::Text, _>("activity")
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(Some(
+                            bucket_key.clone(),
+                        ))
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                            None::<String>,
+                        )
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                            &Vec::<String>::new(),
+                        )
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+                            None::<chrono::DateTime<chrono::Utc>>,
+                        )
+                        .bind::<diesel::sql_types::Text, _>(&worker_build)
+                        .load(conn)
+                        .await?;
+                Ok(rows.into_iter().next().map(|r| r.id))
+            },
+        )
+        .await
+        .expect("transaction");
+
+    assert_eq!(
+        claimed, None,
+        "an undeclared worker/required-build pair must reject the claim"
+    );
+    assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
+
+    #[derive(diesel::QueryableByName)]
+    struct Tokens {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        tokens: f64,
+    }
+    let remaining =
+        diesel::sql_query("SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1")
+            .bind::<diesel::sql_types::Text, _>(&bucket_key)
+            .get_result::<Tokens>(&mut conn)
+            .await
+            .expect("tokens")
+            .tokens;
+    assert!(
+        (remaining - 100.0).abs() < 1e-9,
+        "the debit CTE must not spend a token for a candidate whose \
+         build is not compatible -- claimed was always going to reject \
+         it, so the debit must too; got {remaining}"
+    );
+}
+
 /// Regression test for a review finding on this PR. Walking a batch must
 /// NOT debit a rate-limit token for a candidate the concurrency gate
 /// always rejects.

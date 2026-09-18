@@ -176,6 +176,34 @@ compatibility had just been revoked, and declaring compatibility
 (`build_routing::declare_compat`) flips the same query's own re-check to
 pass.
 
+The same review round caught two more findings against that fix.
+First, `rate_limit_debit` is a data-modifying CTE that runs whether or
+not `claimed` uses its result -- the same shape as the original
+rate-limit-leak bug and the deadline-leak bug above. The build-routing
+gate had been added only to `claimed`'s `WHERE`, so a revoked-build
+candidate still spent a token before being rejected; an adversarial
+batch of revoked-build candidates sharing one rate-limited key could
+drain far more than the documented one-token bound. Fixed by adding the
+same gate, via a small `EXISTS` keyed on the candidate id, to
+`rate_limit_debit`'s own `WHERE`. Verified with a test mirroring the
+deadline-leak test: an undeclared build pair is rejected and the bucket
+is left untouched.
+
+Second, the twelfth bug's own fast pre-check compared
+`schedule_to_close_at` against `Utc::now()` -- the worker host's clock,
+not the database's. If that host clock runs ahead of Postgres, the
+pre-check could reject a candidate the database's own
+`clock_timestamp()` (the authoritative source every other deadline
+check in this module trusts) would still consider live, delaying
+dispatch until the skewed host clock caught up. Fixed with a new
+`db_now` helper that reads `clock_timestamp()` from the database (no
+table access, so it never waits on a lock) instead of the host clock.
+Genuine clock skew between the test process and the database is not
+practically reproducible in this environment, so this relies on the
+existing deadline-recheck regression tests (which exercise the same
+pre-check against real elapsed time) rather than a fabricated
+skew-specific test.
+
 **Not wired into the default claim path.** `claim_task`/`claim_task_on_shard`
 are unchanged. Issue #1340 is explicit that no query change should land
 against it without sign-off from someone with full context on `queue.rs`'s
@@ -184,7 +212,7 @@ tested, measured building block for that review, not a switch of default
 production behavior. It also does not implement the cross-region DR fence
 (#954) or the by-id claim (#1312) the single-row path carries.
 
-**Test evidence.** `tests/integration/claim_batched_tests.rs` (19 DB-backed
+**Test evidence.** `tests/integration/claim_batched_tests.rs` (20 DB-backed
 tests, red-then-green): equivalence with the single-row path on a plain
 backlog, an adversarial saturated-concurrency-key fixture matching ledger
 #4/#5's own shape, a multi-batch fixture with tied sort keys spanning a
@@ -222,13 +250,16 @@ waited on (verified red at ~2.4s against the pre-fix code, green under
 `claim_batched_candidate_attempt_query()` directly with an undeclared
 worker/required-build pair, asserting it is rejected exactly as
 `build_routing::revoke_compat` would leave it, then that declaring
-compatibility flips the same query's own re-check to pass, sticky
+compatibility flips the same query's own re-check to pass, a regression
+test for the build-routing-debit-leak follow-up above (same
+never-debits-on-rejection shape as the deadline-leak test, asserting an
+undeclared build pair leaves the bucket untouched), sticky
 routing and a
 capability-routed-activity gate exercised end-to-end through the real
 function (not just SQL-text checks), and — the gap ledger #5's own
 single-session apparatus explicitly could not close — real concurrent
 Tokio claimers racing a capped concurrency key, asserting the cap is
-never exceeded. `queue.rs`'s `mod tests` gains 17 SQL-shape unit tests
+never exceeded. `queue.rs`'s `mod tests` gains 18 SQL-shape unit tests
 pinning the query text (concurrency gate omitted from the batch scan,
 every other gate preserved byte-for-byte including both capability-label
 branches, the cursor's four-column `OR`-chain, the authoritative
@@ -244,8 +275,10 @@ that `now_ts` itself takes a `FOR UPDATE` lock on the same bucket row
 lock also skips circuit-breaker-tracked activities, the eleventh-bug fix
 that the rate-limit formula and `last_refilled_at` read `now_ts` instead
 of `NOW()`, the twelfth-bug fix that an already-expired candidate is
-rejected before any query at all, and the thirteenth-bug fix that
-`claimed`'s `WHERE` re-runs the scan's own build-routing gate).
+rejected before any query at all, the thirteenth-bug fix that
+`claimed`'s `WHERE` re-runs the scan's own build-routing gate, and its
+own follow-up fix that `rate_limit_debit`'s `WHERE` carries the same
+gate).
 
 **Measurement.** `docs/performance-claim-batched-seek-and-refine.md`,
 regenerated from a single run of

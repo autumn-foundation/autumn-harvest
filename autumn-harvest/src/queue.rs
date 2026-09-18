@@ -6121,6 +6121,26 @@ pub async fn pending_queue_demand_by_queue_name(
 /// exists to protect. [`claim_task_query`]'s single atomic statement
 /// has no such window; this two-phase design does. Fixed by re-running
 /// the scan's own build-routing gate, verbatim, in `claimed`'s `WHERE`.
+/// A same-review follow-up finding: `rate_limit_debit` is a
+/// data-modifying CTE. It runs whether or not `claimed` uses its
+/// result, the same shape as the original rate-limit-leak fix. Adding
+/// the build-routing gate only to `claimed` left a revoked-build
+/// candidate still spending a token. Fixed by adding the same gate,
+/// via a small `EXISTS` keyed on `$2`, to `rate_limit_debit`'s own
+/// `WHERE`.
+///
+/// A fourteenth bug (P2), caught by the same reviewer.
+/// [`try_claim_batched_candidate`]'s twelfth-bug fix above compared
+/// `schedule_to_close_at` against `Utc::now()`: the worker HOST's
+/// clock, not the database's. If that host clock runs ahead of
+/// Postgres, this fast pre-check can reject a candidate the database's
+/// own `clock_timestamp()` would still consider live. That is the
+/// authoritative source every other deadline check in this module
+/// already uses. The reject then delays dispatch until the skewed
+/// host clock catches up. Fixed by reading the deadline against a
+/// fresh `clock_timestamp()` from the database, not the host. This
+/// keeps the fast-reject property (no bucket lock
+/// touched) while trusting the same clock as everything else here.
 ///
 /// # What this is not
 ///
@@ -6411,6 +6431,20 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
                    AND NOT ($7 = ANY($8)) \
                    AND {rate_limit_available} >= 1.0 \
                    AND ($9::timestamptz IS NULL OR $9::timestamptz > (SELECT ts FROM now_ts)) \
+                   AND EXISTS ( \
+                       SELECT 1 FROM harvest_task_queue t \
+                       WHERE t.id = $2 \
+                         AND ( \
+                             t.required_build_id IS NULL \
+                             OR $10 = '' \
+                             OR t.required_build_id = $10 \
+                             OR EXISTS ( \
+                                 SELECT 1 FROM harvest_build_compat \
+                                 WHERE build_id = $10 \
+                                   AND compatible_with = t.required_build_id \
+                             ) \
+                         ) \
+                   ) \
                  RETURNING b.key AS debited_key \
              ), \
              claimed AS ( \
@@ -6638,6 +6672,26 @@ async fn fetch_claim_batch(
         .map_err(crate::error::database_error)
 }
 
+/// The database's own clock (review finding, fourteenth bug in the
+/// module doc above). A fast deadline pre-check that compared against
+/// the worker host's `Utc::now()` instead could reject a candidate.
+/// The database's `clock_timestamp()` is the authoritative source
+/// every other deadline check here trusts. It would still consider
+/// that candidate live, whenever the host clock runs ahead of the
+/// database's. No table access, so this never waits on a lock.
+async fn db_now(conn: &mut AsyncPgConnection) -> HarvestResult<DateTime<Utc>> {
+    #[derive(diesel::QueryableByName)]
+    struct Now {
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        now: DateTime<Utc>,
+    }
+    let row: Now = diesel::sql_query("SELECT clock_timestamp() AS now")
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(row.now)
+}
+
 /// Run [`claim_batched_candidate_concurrency_probe_query`] for one
 /// candidate. Only called when `candidate.concurrency_key` is `Some` --
 /// see [`try_claim_batched_candidate`].
@@ -6671,10 +6725,12 @@ async fn concurrency_probe_passes(
 /// error, just "try the next candidate in the batch".
 ///
 /// Rejects an already-expired `schedule_to_close_at` first, against a
-/// fresh `Utc::now()` read, before issuing any query at all (review
-/// finding, twelfth bug in the module doc above). Such a
-/// candidate can never claim, regardless of what its own bucket
-/// protects, so it must not pay for that bucket's lock wait too.
+/// fresh [`db_now`] read, before issuing the attempt query
+/// (review finding, twelfth bug in the module doc above). Reading the
+/// database's own clock rather than the host's is the fourteenth
+/// bug's fix. Such a candidate can never claim, regardless of what
+/// its own bucket protects, so it must not pay for that bucket's lock
+/// wait too.
 ///
 /// Checks the concurrency gate with
 /// [`claim_batched_candidate_concurrency_probe_query`] next, for any
@@ -6694,9 +6750,8 @@ async fn try_claim_batched_candidate(
     worker_build_id: &str,
     circuit_breaker_activities: &[String],
 ) -> HarvestResult<Option<TaskQueueItem>> {
-    if candidate
-        .schedule_to_close_at
-        .is_some_and(|deadline| deadline <= Utc::now())
+    if let Some(deadline) = candidate.schedule_to_close_at
+        && deadline <= db_now(conn).await?
     {
         return Ok(None);
     }
@@ -7742,6 +7797,37 @@ mod tests {
             "claimed's WHERE must re-check required_build_id against \
              $10 (worker_build_id) and harvest_build_compat, the same \
              gate the batch scan already applies; got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR, against the
+    /// thirteenth bug's own fix. `rate_limit_debit` is a data-modifying
+    /// CTE. It runs whether or not `claimed` ends up using its result
+    /// (the same shape as the original rate-limit-leak fix, and the
+    /// deadline-leak fix above). The build-routing gate was added only
+    /// to `claimed`'s `WHERE`, not to `rate_limit_debit`'s. A
+    /// candidate whose build compatibility was revoked still spends a
+    /// token before `claimed` rejects it. An adversarial batch of
+    /// revoked-build candidates sharing one rate-limited key could
+    /// drain far more than the documented one-token bound.
+    /// `rate_limit_debit`'s own `WHERE` must carry the same
+    /// build-routing gate too.
+    #[test]
+    fn claim_batched_candidate_attempt_query_gates_the_rate_limit_debit_on_build_routing_too() {
+        let sql = claim_batched_candidate_attempt_query();
+        let debit_clause = sql
+            .split("rate_limit_debit AS (")
+            .nth(1)
+            .and_then(|rest| rest.split("claimed AS (").next())
+            .unwrap_or_default();
+        assert!(
+            debit_clause.contains("required_build_id IS NULL")
+                && debit_clause.contains("required_build_id = $10")
+                && debit_clause.contains("FROM harvest_build_compat")
+                && debit_clause.contains("compatible_with = "),
+            "rate_limit_debit's WHERE must re-check build routing too, \
+             matching claimed's own gate, or a revoked-build candidate \
+             still spends a token before being rejected; got:\n{sql}"
         );
     }
 
