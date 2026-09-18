@@ -312,18 +312,21 @@ pattern applied to `rate_limit_debit`'s `WHERE` from the start).
 **Measurement.** `docs/performance-claim-batched-seek-and-refine.md`,
 regenerated from a single run of
 `autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh`
-against the final code, after all ten review findings above (Codex
-flagged that the previously-committed numbers predated the deadline/
-`now_ts` fixes and no longer measured the code they were attributed to).
+against the final code, after all fifteen review findings above (Codex
+flagged, twice, that the previously-committed numbers predated later
+fixes — first the deadline/`now_ts` fixes, then the build-routing and
+capability-label rechecks — and no longer measured the code they were
+attributed to).
 The script includes a committed, `#[ignore]`d capture test for the
 end-to-end numbers, not an ad hoc run, and reseeds an identical fixture
 per loop per the fix above: idle cost is 1.05x the single-row path (290
 vs 275 buffers, 10,000-row/4-queue/256-key fixture); under hot
 contention (2,000 `RUNNING` rows on the same keys) the batched path is
-~2.0x faster end-to-end over 400 real claims each (mean 828.2ms vs
-1,677.6ms per claim). This fixture sets no `rate_limit_key` and no
-deadline, so the ratio is essentially unchanged from the prior capture —
-none of the later fixes touch the concurrency-gate path it exercises.
+~2.1x faster end-to-end over 400 real claims each (mean 852.9ms vs
+1,766.8ms per claim). This fixture sets no `rate_limit_key`, no
+deadline, no `required_build_id`, and no `required_capabilities`, so the
+ratio is essentially unchanged from the prior captures — none of the
+later fixes touch the concurrency-gate path it exercises.
 Neither query gets an index-driven bounded scan at this backlog
 depth — the win is the concurrency-key aggregate's cost, not a `LIMIT`
 pushdown, so the O(backlog)-scaling question ledger #5 left open remains

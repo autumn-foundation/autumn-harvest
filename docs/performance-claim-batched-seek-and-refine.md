@@ -21,11 +21,11 @@ scan at this backlog depth -- both plan as a full `Seq Scan` feeding a
 At the 256-key hot-contention scenario (same backlog, 2,000 `RUNNING` rows
 spread across the same keys), the batch candidate fetch costs slightly
 FEWER buffers than the single-row scan (10,077 against 10,410) and far
-less wall-clock: 23.4ms against 154.3ms in an isolated
+less wall-clock: 23.7ms against 172.4ms in an isolated
 `EXPLAIN (ANALYZE, BUFFERS)`. A real end-to-end drive of the compiled
 `claim_task` and `claim_task_batched` functions against the same fixture
-shows the same direction, at a similar margin: mean 828.2ms per batched
-claim against 1,677.6ms per single-row claim (2.03x), over 400 real
+shows the same direction, at a similar margin: mean 852.9ms per batched
+claim against 1,766.8ms per single-row claim (2.07x), over 400 real
 claims each.
 
 The mechanism: the single-row path always evaluates
@@ -42,17 +42,20 @@ measured here is the concurrency-key aggregate's cost, not a `LIMIT`
 pushdown. See [What this does not establish](#what-this-does-not-establish).
 
 These numbers are measured AFTER every review finding on this PR,
-regenerated from the final SQL rather than an earlier draft (review
-finding: the first regeneration predated the deadline-recheck and
-`now_ts` fixes below, so it measured code the page no longer describes).
-`claim_batched_candidate_attempt_query()` now carries a `now_ts` CTE and
-`schedule_to_close_at` deadline checks on every successful claim; this
-fixture sets no `rate_limit_key` and no deadline, so `now_ts`'s forced
-bucket lock never runs and both deadline checks are no-ops, but the
-extra CTE and predicate text are present in the measured query either
-way. The direction and magnitude are unchanged from the prior capture,
-since none of those fixes touch the concurrency-gate path this fixture
-exercises.
+regenerated from the final SQL rather than an earlier draft. Three prior
+regenerations each predated a later fix (the deadline-recheck/`now_ts`
+fixes, then the build-routing recheck, then this recheck's own sibling
+the capability-label recheck), so each one measured code the page no
+longer described at the time a reviewer read it.
+`claim_batched_candidate_attempt_query()` now carries a `now_ts` CTE, a
+`worker_info` CTE, and `schedule_to_close_at`/build-routing/capability-
+label checks on every successful claim; this fixture sets no
+`rate_limit_key`, no deadline, no `required_build_id`, and no
+`required_capabilities`, so none of those predicates ever reject a
+candidate here, but their CTEs and predicate text are present in the
+measured query either way. The direction and magnitude are essentially
+unchanged from the prior captures, since none of those fixes touch the
+concurrency-gate path this fixture exercises.
 
 The first draft's per-candidate walk debited a rate-limit token for
 every candidate tried, including one the concurrency gate always
