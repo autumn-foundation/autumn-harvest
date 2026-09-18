@@ -1001,6 +1001,7 @@ async fn batched_claim_attempt_rejects_a_deadline_that_passes_while_waiting_on_t
     params.schedule_to_close_at = Some(deadline);
     let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
 
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
     let locker_bucket_key = bucket_key.clone();
     let locker_url = url.clone();
     let locker = tokio::spawn(async move {
@@ -1014,6 +1015,7 @@ async fn batched_claim_attempt_rejects_a_deadline_that_passes_while_waiting_on_t
                 .bind::<diesel::sql_types::Text, _>(&locker_bucket_key)
                 .execute(conn)
                 .await?;
+                let _ = locked_tx.send(());
                 // Holds the row lock well past the 500ms deadline above.
                 diesel::sql_query("SELECT pg_sleep(1.2)")
                     .execute(conn)
@@ -1025,8 +1027,9 @@ async fn batched_claim_attempt_rejects_a_deadline_that_passes_while_waiting_on_t
         .expect("locker transaction");
     });
 
-    // Give the locker a head start so it wins the row lock first.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Wait for the locker to actually hold the row lock -- a fixed sleep
+    // cannot guarantee that on a loaded CI host (review finding).
+    locked_rx.await.expect("locker signaled");
 
     #[derive(diesel::QueryableByName)]
     struct ClaimedId {
@@ -1129,6 +1132,7 @@ async fn batched_claim_attempt_skips_the_bucket_lock_for_a_circuit_breaker_activ
     params.rate_limit_key = Some(bucket_key.clone());
     let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
 
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
     let locker_bucket_key = bucket_key.clone();
     let locker_url = url.clone();
     let locker = tokio::spawn(async move {
@@ -1142,6 +1146,7 @@ async fn batched_claim_attempt_skips_the_bucket_lock_for_a_circuit_breaker_activ
                 .bind::<diesel::sql_types::Text, _>(&locker_bucket_key)
                 .execute(conn)
                 .await?;
+                let _ = locked_tx.send(());
                 diesel::sql_query("SELECT pg_sleep(1.5)")
                     .execute(conn)
                     .await?;
@@ -1152,7 +1157,9 @@ async fn batched_claim_attempt_skips_the_bucket_lock_for_a_circuit_breaker_activ
         .expect("locker transaction");
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Wait for the locker to actually hold the row lock -- a fixed sleep
+    // cannot guarantee that on a loaded CI host (review finding).
+    locked_rx.await.expect("locker signaled");
 
     #[derive(diesel::QueryableByName)]
     struct ClaimedId {
@@ -1275,6 +1282,7 @@ async fn batched_claim_skips_the_bucket_lock_for_a_candidate_already_past_its_de
         .await
         .expect("enqueue b");
 
+    let (locked_a_tx, locked_a_rx) = tokio::sync::oneshot::channel();
     let locker_a_bucket = bucket_a.clone();
     let locker_a_url = url.clone();
     let locker_a = tokio::spawn(async move {
@@ -1292,6 +1300,7 @@ async fn batched_claim_skips_the_bucket_lock_for_a_candidate_already_past_its_de
                 .bind::<diesel::sql_types::Text, _>(&locker_a_bucket)
                 .execute(conn)
                 .await?;
+                let _ = locked_a_tx.send(());
                 diesel::sql_query("SELECT pg_sleep(1.0)")
                     .execute(conn)
                     .await?;
@@ -1302,6 +1311,7 @@ async fn batched_claim_skips_the_bucket_lock_for_a_candidate_already_past_its_de
         .expect("locker a transaction");
     });
 
+    let (locked_b_tx, locked_b_rx) = tokio::sync::oneshot::channel();
     let locker_b_bucket = bucket_b.clone();
     let locker_b_url = url.clone();
     let locker_b = tokio::spawn(async move {
@@ -1315,6 +1325,7 @@ async fn batched_claim_skips_the_bucket_lock_for_a_candidate_already_past_its_de
                 .bind::<diesel::sql_types::Text, _>(&locker_b_bucket)
                 .execute(conn)
                 .await?;
+                let _ = locked_b_tx.send(());
                 diesel::sql_query("SELECT pg_sleep(3.0)")
                     .execute(conn)
                     .await?;
@@ -1325,7 +1336,10 @@ async fn batched_claim_skips_the_bucket_lock_for_a_candidate_already_past_its_de
         .expect("locker b transaction");
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Wait for both lockers to actually hold their row locks -- a fixed
+    // sleep cannot guarantee that on a loaded CI host (review finding).
+    locked_a_rx.await.expect("locker a signaled");
+    locked_b_rx.await.expect("locker b signaled");
 
     let start = std::time::Instant::now();
     let claimed = batched_claim_one(
