@@ -197,7 +197,10 @@ async fn a_claim_that_beat_the_workflow_pause_is_released_with_its_attempt_resto
     );
 
     let row = load_task(&mut conn, task_id).await;
-    assert_eq!(row.state, "PENDING", "the task must be held, not dispatched");
+    assert_eq!(
+        row.state, "PENDING",
+        "the task must be held, not dispatched"
+    );
     assert_eq!(
         row.attempt, 0,
         "a hold must consume no retry budget -- the claim's attempt increment \
