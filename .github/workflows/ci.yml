@@ -434,6 +434,16 @@ jobs:
       - name: Folio config/CLI drift scan (docs/audits/config-cli-drift.py)
         run: python3 docs/audits/config-cli-drift.py
 
+      # Folio corpus harness: audit-catalog coverage scan (see
+      # docs/audits/audit-catalog-coverage.py). docs/audits/README.md is
+      # itself a docs page — the catalog a contributor reads to find out
+      # which audit scripts exist and whether each is wired into CI. This
+      # fails the build if a script lands in docs/audits/ without a row
+      # naming it there, so the catalog cannot silently fall behind the
+      # directory it describes. Pure Python stdlib, no deps, no network.
+      - name: Folio audit-catalog coverage (docs/audits/audit-catalog-coverage.py)
+        run: python3 docs/audits/audit-catalog-coverage.py
+
       # Comment hygiene across the Rust sources (see
       # docs/audits/comment-hygiene.py). Two tiers, and the split is the
       # point: Tier A (commented-out code, an unreferenced TODO, a narrative
