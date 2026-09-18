@@ -31,7 +31,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -146,7 +145,7 @@ fn build_app_with(
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 fn build_app(pool: &DbPool) -> HarvestApiApp {
@@ -199,7 +198,7 @@ fn build_app_with_codec(pool: &DbPool) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// A compensation dispatch (the shape `unwind_dag_compensations` records)

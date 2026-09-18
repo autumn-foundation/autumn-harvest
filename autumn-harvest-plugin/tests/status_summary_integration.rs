@@ -17,7 +17,6 @@ use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::DbPool;
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -106,14 +105,14 @@ fn build_app(storage: HarvestDbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(storage);
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Router with NO auth boundary — used to prove the admin guard rejects.
 fn build_unauthenticated_app(storage: HarvestDbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(storage);
-    harvest_api_router(api_state).with_state(AppState::for_test())
+    harvest_api_router(api_state)
 }
 
 fn single_app(url: &str) -> HarvestApiApp {

@@ -160,10 +160,13 @@ struct HarvestRuntimeSlot {
     connectors: Vec<ConnectorRegistration>,
 }
 
+/// Wraps the nested management-API router in the embedder's auth layer.
+///
+/// Operates on `Router<()>` because both exported routers are state-free
+/// (issue #1606). The router is converted to `Router<AppState>` once, at the
+/// `AppBuilder::nest` boundary below.
 type ApiMiddlewareFn = Box<
-    dyn FnOnce(
-            autumn_web::reexports::axum::Router<autumn_web::AppState>,
-        ) -> autumn_web::reexports::axum::Router<autumn_web::AppState>
+    dyn FnOnce(autumn_web::reexports::axum::Router<()>) -> autumn_web::reexports::axum::Router<()>
         + Send
         + Sync,
 >;
@@ -1511,7 +1514,11 @@ impl Plugin for HarvestPlugin {
             if let Some(mw) = api_middleware {
                 router = mw(router);
             }
-            app.nest(&path, router)
+            // `AppBuilder::nest` takes a `Router<AppState>`. The router is
+            // `Router<()>`, so it declares the state type it never reads
+            // (issue #1606). No handler in either router takes a `State`
+            // extractor for it.
+            app.nest(&path, router.with_state(()))
         } else {
             let _ = api_tokens_enabled;
             app

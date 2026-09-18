@@ -15,7 +15,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -390,7 +389,7 @@ async fn test_queue_and_task_eligibility_scenarios() {
     );
     // bypass admin auth check in tests
     state.set_admin_auth_boundary(true);
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     // --- Validate Queue Eligibility Endpoint ---
     let (status, body) =
@@ -524,7 +523,7 @@ async fn test_task_eligibility_endpoints() {
         runtime_for(&["test-queue"], ShardRouter::single()),
     );
     state.set_admin_auth_boundary(true);
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) =
         get_json_with_auth(&app, format!("/admin/tasks/{task_id}/eligibility"), true).await;
@@ -715,7 +714,7 @@ async fn test_eligibility_optimizations_and_resilience() {
         runtime_for(&["test-queue-rl"], ShardRouter::single()),
     );
     state.set_admin_auth_boundary(true);
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     // Query queue eligibility
     let (status, body) =
@@ -766,8 +765,7 @@ async fn test_eligibility_optimizations_and_resilience() {
         runtime_for(&["test-queue-cap"], ShardRouter::single()),
     );
     state_cap.set_admin_auth_boundary(true);
-    let app_cap =
-        harvest_api_router(state_cap).with_state(AppState::for_test().with_profile("test"));
+    let app_cap = harvest_api_router(state_cap);
 
     let (status_cap, body_cap) =
         get_json_with_auth(&app_cap, "/admin/queues/test-queue-cap/eligibility", true).await;
@@ -793,8 +791,7 @@ async fn test_eligibility_optimizations_and_resilience() {
         runtime_for(&["test-queue-cap"], two_shard_router()),
     );
     state_sharded.set_admin_auth_boundary(true);
-    let app_sharded =
-        harvest_api_router(state_sharded).with_state(AppState::for_test().with_profile("test"));
+    let app_sharded = harvest_api_router(state_sharded);
 
     // GET /admin/tasks/{id}/eligibility for task_cap on shard 0 should succeed, skipping/ignoring the unhealthy shard 1
     let (status_task, body_task) = get_json_with_auth(
@@ -834,8 +831,7 @@ async fn test_eligibility_optimizations_and_resilience() {
         runtime_for(&["test-queue-multi"], two_shard_router()),
     );
     state_sharded_healthy.set_admin_auth_boundary(true);
-    let app_sharded_healthy = harvest_api_router(state_sharded_healthy)
-        .with_state(AppState::for_test().with_profile("test"));
+    let app_sharded_healthy = harvest_api_router(state_sharded_healthy);
 
     // Seed task on "test-queue-multi"
     let _task_multi =
@@ -898,8 +894,7 @@ async fn test_eligibility_optimizations_and_resilience() {
         runtime_for(&["test-queue-drain"], ShardRouter::single()),
     );
     state_drain.set_admin_auth_boundary(true);
-    let app_drain =
-        harvest_api_router(state_drain).with_state(AppState::for_test().with_profile("test"));
+    let app_drain = harvest_api_router(state_drain);
 
     // Seed task
     let _task_drain =
@@ -965,8 +960,7 @@ async fn test_eligibility_optimizations_and_resilience() {
         runtime_for(&["test-queue-mixed"], ShardRouter::single()),
     );
     state_mixed.set_admin_auth_boundary(true);
-    let app_mixed =
-        harvest_api_router(state_mixed).with_state(AppState::for_test().with_profile("test"));
+    let app_mixed = harvest_api_router(state_mixed);
 
     // Seed running task with mixed-key to occupy 1 slot
     {
@@ -1048,8 +1042,7 @@ async fn test_eligibility_optimizations_and_resilience() {
         runtime_for(&["test-queue-cap"], two_shard_router()),
     );
     state_all_broken.set_admin_auth_boundary(true);
-    let app_all_broken =
-        harvest_api_router(state_all_broken).with_state(AppState::for_test().with_profile("test"));
+    let app_all_broken = harvest_api_router(state_all_broken);
 
     let req = Request::builder()
         .method("GET")
@@ -1097,7 +1090,7 @@ async fn test_worker_capabilities_routing_and_triage() {
         ),
     );
     state.set_admin_auth_boundary(true);
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     // 1. Register a worker with matching labels (gpu=true)
     let mut matching_labels = std::collections::HashMap::new();
@@ -1327,7 +1320,7 @@ async fn test_open_circuit_reports_circuit_open() {
         runtime_for_registry(&["test-queue-cb"], registry, ShardRouter::single()),
     );
     state.set_admin_auth_boundary(true);
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     // Queue eligibility endpoint: worker-cb is ineligible and surfaces
     // `circuit_open` (never an empty/unknown set), absent from the eligible
@@ -1467,7 +1460,7 @@ async fn test_concurrency_capped_reports_concurrency_saturated_only() {
         runtime_for(&["test-queue-conc"], ShardRouter::single()),
     );
     state.set_admin_auth_boundary(true);
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) =
         get_json_with_auth(&app, "/admin/queues/test-queue-conc/eligibility", true).await;
@@ -1564,7 +1557,7 @@ async fn test_queue_paused_leads_the_final_reason_codes_over_another_impediment(
         runtime_for(&["test-queue-paused-prio"], ShardRouter::single()),
     );
     state.set_admin_auth_boundary(true);
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json_with_auth(
         &app,
@@ -1665,7 +1658,7 @@ async fn test_queue_paused_survives_the_worker_reason_short_circuit() {
         runtime_for(&["test-queue-paused-drain"], ShardRouter::single()),
     );
     state.set_admin_auth_boundary(true);
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json_with_auth(
         &app,
@@ -1786,7 +1779,7 @@ async fn test_activity_paused_surfaces_and_composes_with_a_queue_pause() {
         runtime_for(&["test-activity-paused-compose"], ShardRouter::single()),
     );
     state.set_admin_auth_boundary(true);
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json_with_auth(
         &app,
@@ -1898,7 +1891,7 @@ async fn test_activity_paused_survives_the_worker_reason_short_circuit() {
         runtime_for(&["test-activity-paused-drain"], ShardRouter::single()),
     );
     state.set_admin_auth_boundary(true);
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json_with_auth(
         &app,
@@ -2001,7 +1994,7 @@ async fn test_activity_pause_never_reports_a_workflow_task_as_held() {
         runtime_for(&["test-activity-paused-scope"], ShardRouter::single()),
     );
     state.set_admin_auth_boundary(true);
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json_with_auth(
         &app,
@@ -2066,7 +2059,7 @@ async fn test_worker_queue_filtering_for_capable_of() {
         ),
     );
     state.set_admin_auth_boundary(true);
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let mut matching_labels = std::collections::HashMap::new();
     matching_labels.insert("gpu".to_string(), "true".to_string());
@@ -2163,7 +2156,7 @@ async fn test_worker_queue_filtering_with_explicit_queue_override() {
         ),
     );
     state.set_admin_auth_boundary(true);
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let mut matching_labels = std::collections::HashMap::new();
     matching_labels.insert("gpu".to_string(), "true".to_string());

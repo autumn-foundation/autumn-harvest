@@ -21,7 +21,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -106,10 +105,6 @@ fn build_pool(url: &str) -> DbPool {
         .expect("pool should build")
 }
 
-fn test_app_state() -> AppState {
-    AppState::for_test().with_profile("test")
-}
-
 fn build_app(pool: &DbPool) -> HarvestApiApp {
     build_app_with_router(pool, ShardRouter::default())
 }
@@ -132,7 +127,7 @@ fn build_app_with_router(pool: &DbPool, router: ShardRouter) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    harvest_api_router(api_state).with_state(test_app_state())
+    harvest_api_router(api_state)
 }
 
 async fn post_json(app: &HarvestApiApp, uri: &str, body: Value) -> (StatusCode, Value) {

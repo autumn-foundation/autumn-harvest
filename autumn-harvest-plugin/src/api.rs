@@ -6,7 +6,6 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use autumn_web::AppState;
 use autumn_web::error::AutumnError;
 use autumn_web::reexports::axum;
 use autumn_web::session::Session;
@@ -4766,7 +4765,7 @@ async fn by_id_missing_workflow_id(Path(_workflow_name): Path<String>) -> axum::
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
+pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
     let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
     // issue #1278: the Vantage dead-letter page's bulk-action forms submit
     // here directly (a relative `../dead-letters/replay` /
@@ -8524,11 +8523,17 @@ pub const fn management_api_response_fields()
     ]
 }
 
-async fn preflight(
-    Extension(api_state): Extension<HarvestApiState>,
-    axum::extract::State(autumn_state): axum::extract::State<AppState>,
-) -> Json<PreflightReport> {
-    api_state.set_deployment_profile(autumn_state.profile().to_string());
+/// `GET /admin/preflight` -- the deployment preflight report.
+///
+/// The profile comes from `HarvestApiState` (issue #1606). An earlier version
+/// read it from an `autumn_web::AppState` the router carried. That single
+/// extractor is what forced both routers to be `Router<AppState>`.
+///
+/// The read was also redundant on the plugin path. `start_harvest_runtime`
+/// already sets the profile at startup. On a standalone mount the read was
+/// unreachable: this route sits behind the gate that reads the profile it set.
+/// `start_harvest_runtime` is now the only writer.
+async fn preflight(Extension(api_state): Extension<HarvestApiState>) -> Json<PreflightReport> {
     Json(build_preflight_report(&api_state).await)
 }
 

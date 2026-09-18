@@ -22,7 +22,6 @@ use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime};
 use autumn_harvest_plugin::ui::harvest_ui_router;
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -160,10 +159,6 @@ async fn setup_n_shard_databases(container: &ContainerAsync<Postgres>, n: usize)
         urls.push(url);
     }
     urls
-}
-
-fn test_app_state_without_database() -> AppState {
-    AppState::for_test().with_profile("test")
 }
 
 fn echo_registry() -> Arc<HandlerRegistry> {
@@ -486,7 +481,7 @@ async fn ui_root_redirects_to_workflows() {
         ShardRouter::single(),
     ));
 
-    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_ui_router(api_state);
 
     let response = app
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -522,11 +517,10 @@ async fn ui_lists_workflows_and_renders_detail_page() {
 
     let (worker, worker_task) = spawn_test_worker(Arc::clone(&registry), pool.clone());
 
-    let api_app = autumn_harvest_plugin::harvest_api_router(api_state.clone())
-        .with_state(test_app_state_without_database());
+    let api_app = autumn_harvest_plugin::harvest_api_router(api_state.clone());
     let exec_id = start_workflow_and_wait(&api_app, "ui-demo-1", &database_url).await;
 
-    let ui_app = harvest_ui_router(api_state.clone()).with_state(test_app_state_without_database());
+    let ui_app = harvest_ui_router(api_state.clone());
 
     let (status, list_html) = fetch_html(&ui_app, "/workflows").await;
     assert_eq!(status, StatusCode::OK);
@@ -608,7 +602,7 @@ async fn ui_lists_workflows_across_shards() {
     let exec_on_one =
         insert_workflow_on_url(&shard1_url, ShardId::new(1), "workflow_on_one", "ui-one").await;
 
-    let ui_app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+    let ui_app = harvest_ui_router(api_state);
     let (status, list_html) = fetch_html(&ui_app, "/workflows").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -663,7 +657,7 @@ fn build_single_shard_ui_app(database_url: &str) -> axum::Router {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    harvest_ui_router(api_state).with_state(test_app_state_without_database())
+    harvest_ui_router(api_state)
 }
 
 fn build_sharded_api_with_ui_app(shard0_url: &str, shard1_url: &str) -> axum::Router {
@@ -687,7 +681,6 @@ fn build_sharded_api_with_ui_app(shard0_url: &str, shard1_url: &str) -> axum::Ro
 
     autumn_harvest_plugin::harvest_api_router(api_state.clone())
         .nest("/ui", harvest_ui_router(api_state))
-        .with_state(test_app_state_without_database())
 }
 
 async fn seed_dead_letter_ui_fixture(shard0_url: &str, shard1_url: &str) -> Vec<SeededDeadLetter> {
@@ -1696,7 +1689,7 @@ async fn ui_workers_multi_shard_grouped() {
             ShardId::new(0),
         ),
     ));
-    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_ui_router(api_state);
 
     let (status, html) = fetch_html(&app, "/workers").await;
     assert_eq!(status, StatusCode::OK);
@@ -1740,7 +1733,7 @@ async fn ui_workers_partial_shard_failure_degraded() {
             ShardId::new(0),
         ),
     ));
-    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_ui_router(api_state);
 
     let (status, html) = fetch_html(&app, "/workers").await;
     // Must not 5xx — partial shard failure is a degraded scenario, not a crash.
@@ -1801,7 +1794,7 @@ async fn ui_workers_warns_when_a_shards_pause_state_is_unreadable() {
             ShardId::new(0),
         ),
     ));
-    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_ui_router(api_state);
 
     let (status, html) = fetch_html(&app, "/workers").await;
     assert_eq!(
@@ -1877,7 +1870,7 @@ async fn ui_workers_perf_1k_workers_4_shards_under_500ms() {
             ShardId::new(0),
         ),
     ));
-    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_ui_router(api_state);
 
     // Warm the lazy shard pools before measuring. This test covers the workers
     // page render/query budget, not first-use connection establishment against
@@ -2674,7 +2667,7 @@ async fn ui_schedules_multi_shard() {
             ShardId::new(0),
         ),
     ));
-    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_ui_router(api_state);
 
     let (status, html) = fetch_html(&app, "/schedules").await;
     assert_eq!(
@@ -2721,7 +2714,7 @@ async fn ui_schedules_partial_shard_failure() {
             ShardId::new(0),
         ),
     ));
-    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_ui_router(api_state);
 
     let (status, html) = fetch_html(&app, "/schedules").await;
     assert_ne!(
@@ -3429,7 +3422,7 @@ async fn ui_schedules_run_history_partial_shard_banner() {
             ShardId::new(0),
         ),
     ));
-    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_ui_router(api_state);
 
     let (status, html) = fetch_html(&app, &format!("/schedules/{id}/runs")).await;
     assert_eq!(
@@ -3725,7 +3718,7 @@ async fn ui_schedules_drilldown_auth_matches_the_api_routes() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_ui_router(api_state);
 
     let (status, html) = fetch_html(&app, &format!("/schedules/{id}/runs")).await;
     assert_eq!(
@@ -4175,7 +4168,7 @@ async fn ui_schedules_preview_survives_an_unreachable_earlier_shard() {
             ShardId::new(1),
         ),
     ));
-    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_ui_router(api_state);
 
     let (status, html) = fetch_html(&app, &format!("/schedules/{id}/preview")).await;
     assert_eq!(
@@ -4233,7 +4226,7 @@ async fn ui_schedules_backfill_survives_an_unreachable_earlier_shard() {
             ShardId::new(1),
         ),
     ));
-    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_ui_router(api_state);
 
     let (status, html) = fetch_html(&app, &format!("/schedules/{id}/backfill")).await;
     assert_eq!(
@@ -5431,7 +5424,7 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_ui_router(api_state);
 
     let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
     assert_eq!(status, StatusCode::OK, "detail page must render: {html}");
@@ -5578,7 +5571,7 @@ async fn ui_trigger_preserves_dag_metadata() {
         ShardRouter::single(),
     ));
     // Mount the UI router
-    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_ui_router(api_state);
 
     // POST /schedules/{id}/trigger-now
     let (status, _headers, _body) = post_form(
@@ -5691,7 +5684,7 @@ async fn ui_trigger_now_threads_dag_execution_timeout_sla_and_fleet_ceiling() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_ui_router(api_state);
 
     let (status, _headers, _body) = post_form(
         &app,
@@ -5863,7 +5856,6 @@ fn build_decode_enabled_api_with_ui_app(database_url: &str) -> axum::Router {
 
     autumn_harvest_plugin::harvest_api_router(api_state.clone())
         .nest("/ui", harvest_ui_router(api_state))
-        .with_state(test_app_state_without_database())
 }
 
 async fn count_decode_audit_rows(database_url: &str) -> i64 {
@@ -6414,7 +6406,7 @@ fn build_dag957_ui_app(
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    harvest_ui_router(api_state).with_state(test_app_state_without_database())
+    harvest_ui_router(api_state)
 }
 
 fn dag957_sched(name: &str, id: autumn_harvest::ActivityExecId) -> autumn_harvest::WorkflowEvent {
@@ -7590,8 +7582,7 @@ async fn ui_timeline_200_steps_under_1s() {
 async fn vantage_and_dlq_mutations_reject_cross_site_post() {
     let api_state = HarvestApiState::new();
     let app = autumn_harvest_plugin::harvest_api_router(api_state.clone())
-        .nest("/ui", harvest_ui_router(api_state))
-        .with_state(test_app_state_without_database());
+        .nest("/ui", harvest_ui_router(api_state));
 
     let placeholder = uuid::Uuid::nil();
     let targets: [(&str, String); 6] = [

@@ -37,7 +37,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -104,12 +103,10 @@ fn api_state(pool: &DbPool, admin_boundary: bool) -> HarvestApiState {
 /// composition.
 fn build_app_boundary(pool: &DbPool) -> HarvestApiApp {
     let state = api_state(pool, true);
-    harvest_api_router(state.clone())
-        .layer(axum::middleware::from_fn_with_state(
-            state,
-            autumn_harvest_plugin::api_token::enforce_token_scope,
-        ))
-        .with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(state.clone()).layer(axum::middleware::from_fn_with_state(
+        state,
+        autumn_harvest_plugin::api_token::enforce_token_scope,
+    ))
 }
 
 /// App with NO embedder boundary and the token scope layer installed. This is
@@ -117,12 +114,10 @@ fn build_app_boundary(pool: &DbPool) -> HarvestApiApp {
 /// `require_admin` via the `TokenPrincipal` extension.
 fn build_app_standalone(pool: &DbPool) -> HarvestApiApp {
     let state = api_state(pool, false);
-    harvest_api_router(state.clone())
-        .layer(axum::middleware::from_fn_with_state(
-            state,
-            autumn_harvest_plugin::api_token::enforce_token_scope,
-        ))
-        .with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(state.clone()).layer(axum::middleware::from_fn_with_state(
+        state,
+        autumn_harvest_plugin::api_token::enforce_token_scope,
+    ))
 }
 
 async fn scrub(conn: &mut AsyncPgConnection) {
