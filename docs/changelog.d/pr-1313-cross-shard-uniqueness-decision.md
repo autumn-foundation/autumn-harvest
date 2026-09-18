@@ -48,13 +48,25 @@ closes the loop that left as an omission rather than a decision.
   counters, which are both about an *unreachable* shard rather than an
   *observed* second live run.
 
-**Preconditions, unchanged.** Two live runs of one business key require a
-deployment to mix pinned and unpinned starts of the same `workflow_id` —
-the discipline `docs/sharding.md`'s *Caveats* section already asks
-operators to keep, for exactly this reason. Today's behavior is still
-strictly better than pre-#1146: a by-id resolution then consulted exactly
-one hash-derived shard and missed a second live run unconditionally,
-not only under a race.
+**Preconditions, corrected during review.** An earlier draft of this
+fragment named only one precondition for two live runs of one business
+key: a deployment mixing pinned and unpinned starts of the same
+`workflow_id` — the discipline `docs/sharding.md`'s *Caveats* section
+already asks operators to keep. Review (Codex) pointed out that is not
+the only path. Pinning is not required at all: `ShardRouter::pick_writable`
+re-hashes over the *current* `writable_shards` when the readable-set hash
+falls outside it, so draining a shard moves where a fresh start of the
+same key resolves — while an existing live run of it stays put on the
+drained shard. The same two-live-runs state, reached by draining a shard
+during a topology change, with every start left unpinned throughout.
+`external_target_location.rs`'s module doc and `docs/sharding.md`'s by-id
+addressing section already name
+this drift as the second of the two ways a hash-derived shard can diverge
+from where a run actually lives; this fragment now names it as a second
+precondition too, so operators do not read "never pin" as sufficient.
+Today's behavior is still strictly better than pre-#1146 either way: a
+by-id resolution then consulted exactly one hash-derived shard and missed
+a second live run unconditionally, not only under a race.
 
 **Runtime behavior is unchanged; observability is not.**
 `is_authoritative_for_key()`, `merge_locations`, and every delivery
