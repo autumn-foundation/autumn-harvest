@@ -617,9 +617,11 @@ pub const METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT: &str =
 /// of the same business key (issue #1146). Issue #1313 records the
 /// residual bound this counter is evidence for.
 ///
-/// `(workflow_name, workflow_id)` uniqueness is shard-local. This fires
-/// only when a key was pinned to one shard while an unpinned start of
-/// it hashed to another.
+/// `(workflow_name, workflow_id)` uniqueness is shard-local. Two paths
+/// make this fire. A key pinned to one shard while an unpinned start of
+/// it hashes to another is one. Draining a shard, so a later unpinned
+/// start of the same key rehashes elsewhere while the old run stays
+/// live, is the other. Neither pinning is required.
 ///
 /// It is the observable proxy for the precondition behind issue
 /// #1313's race. The race itself is a run that starts mid fan-out. No
