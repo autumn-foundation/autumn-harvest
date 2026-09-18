@@ -1211,65 +1211,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // debounced start has no exec_id-keyed handle to return anyway.
                     // So rather than silently bypassing the policy or admitting onto
                     // the wrong shard, reject early with a clear pointer to the HTTP
-                    // route. (Compile-time `#[workflow(debounce(...))]` is visible
-                    // here via `info.debounce`; a fluent `.with_debounce(...)` policy
-                    // is registry-only and is enforced by the HTTP route instead.)
-                    if let ::std::option::Option::Some(debounce_policy) = info.debounce {
-                        if ::autumn_harvest::debounce::resolve_debounce_key(
-                            debounce_policy.key_expr,
-                            &input,
-                        )
-                        .is_some()
-                        {
-                            return ::std::result::Result::Err(
-                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
-                                    "workflow '{0}' has a debounce policy; debounced starts \
-                                     must use the HTTP start route POST /workflows/{0}/start \
-                                     (the typed client cannot express a deferred debounced start)",
-                                    info.name,
-                                )),
-                            );
-                        }
-                    }
-                    // Same rationale as debounce: a throttle defers excess starts,
-                    // which the typed client cannot express (no exec_id-keyed handle
-                    // exists for a deferred start). A keyed throttle applies only when
-                    // its key resolves; an unkeyed (global) throttle always applies.
-                    if let ::std::option::Option::Some(throttle_policy) = info.throttle {
-                        let throttle_applies = match throttle_policy.key_expr {
-                            ::std::option::Option::Some(k) => {
-                                ::autumn_harvest::throttle::resolve_throttle_key(k, &input).is_some()
-                            }
-                            ::std::option::Option::None => true,
-                        };
-                        if throttle_applies {
-                            return ::std::result::Result::Err(
-                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
-                                    "workflow '{0}' has a start-throttle policy; throttled starts \
-                                     must use the HTTP start route POST /workflows/{0}/start \
-                                     (the typed client cannot express a deferred throttled start)",
-                                    info.name,
-                                )),
-                            );
-                        }
-                    }
-                    if let ::std::option::Option::Some(batch_policy) = info.batch.as_ref() {
-                        if ::autumn_harvest::concurrency::resolve_concurrency_key(
-                            &batch_policy.key_expr,
-                            &input,
-                        )
-                        .is_some()
-                        {
-                            return ::std::result::Result::Err(
-                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
-                                    "workflow '{0}' has an event batching policy; batched starts \
-                                     must use the HTTP start route POST /workflows/{0}/start \
-                                     (the typed client cannot express a deferred batched start)",
-                                    info.name,
-                                )),
-                            );
-                        }
-                    }
+                    // route. Same rationale covers the sibling throttle and batch
+                    // checks `reject_if_admission_may_defer` also runs.
+                    info.reject_if_admission_may_defer(&input)?;
                     if opts.batch.is_some() {
                         return ::std::result::Result::Err(
                             ::autumn_harvest::error::HarvestError::Config(::std::format!(
@@ -1413,62 +1357,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // debounced workflow must not be started — or signal-with-started —
                     // through the typed client, which cannot route to the debounce-key
                     // shard or admit through the gate. Reject with a pointer to HTTP.
-                    if let ::std::option::Option::Some(debounce_policy) = info.debounce {
-                        if ::autumn_harvest::debounce::resolve_debounce_key(
-                            debounce_policy.key_expr,
-                            &input,
-                        )
-                        .is_some()
-                        {
-                            return ::std::result::Result::Err(
-                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
-                                    "workflow '{0}' has a debounce policy; debounced starts \
-                                     must use the HTTP start route POST /workflows/{0}/start \
-                                     (the typed client cannot express a deferred debounced start)",
-                                    info.name,
-                                )),
-                            );
-                        }
-                    }
-                    // Same rationale as debounce: a throttle defers excess starts,
-                    // which the typed client cannot express (no exec_id-keyed handle
-                    // exists for a deferred start). A keyed throttle applies only when
-                    // its key resolves; an unkeyed (global) throttle always applies.
-                    if let ::std::option::Option::Some(throttle_policy) = info.throttle {
-                        let throttle_applies = match throttle_policy.key_expr {
-                            ::std::option::Option::Some(k) => {
-                                ::autumn_harvest::throttle::resolve_throttle_key(k, &input).is_some()
-                            }
-                            ::std::option::Option::None => true,
-                        };
-                        if throttle_applies {
-                            return ::std::result::Result::Err(
-                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
-                                    "workflow '{0}' has a start-throttle policy; throttled starts \
-                                     must use the HTTP start route POST /workflows/{0}/start \
-                                     (the typed client cannot express a deferred throttled start)",
-                                    info.name,
-                                )),
-                            );
-                        }
-                    }
-                    if let ::std::option::Option::Some(batch_policy) = info.batch.as_ref() {
-                        if ::autumn_harvest::concurrency::resolve_concurrency_key(
-                            &batch_policy.key_expr,
-                            &input,
-                        )
-                        .is_some()
-                        {
-                            return ::std::result::Result::Err(
-                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
-                                    "workflow '{0}' has an event batching policy; batched starts \
-                                     must use the HTTP start route POST /workflows/{0}/start \
-                                     (the typed client cannot express a deferred batched start)",
-                                    info.name,
-                                )),
-                            );
-                        }
-                    }
+                    // Same rationale covers the sibling throttle and batch checks
+                    // `reject_if_admission_may_defer` also runs.
+                    info.reject_if_admission_may_defer(&input)?;
                     let exec_id = opts.exec_id.unwrap_or_else(|| {
                         let shard = client.pick_shard_for_new_workflow(info.name, &workflow_id);
                         ::autumn_harvest::types::ExecutionId::new_for_shard(shard)

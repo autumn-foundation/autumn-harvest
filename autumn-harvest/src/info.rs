@@ -798,6 +798,72 @@ impl WorkflowInfo {
         self
     }
 
+    /// Reject a typed-client start-or-attach call whose admission a
+    /// debounce, start-throttle, or event-batching policy could defer
+    /// (issues #499, #607, #518).
+    ///
+    /// Debounce, start-throttle, and event-batching policies may defer the
+    /// actual admission of a start past the caller's own transaction, which
+    /// requires the debounce-key shard, the registry, and the HTTP-only
+    /// admission gate. A typed-client caller (`start_with_options`,
+    /// `signal_with_start`, `update_with_start_*`) has none of those, so it
+    /// rejects early with a pointer to the HTTP start route rather than
+    /// silently bypassing the policy.
+    ///
+    /// Checked in debounce, throttle, batch order; returns on the first
+    /// policy whose key resolves against `input` (an unkeyed throttle
+    /// always resolves).
+    ///
+    /// Shared by every typed-client start-or-attach stub `#[workflow]` and
+    /// `#[update]` generate. Before this method existed, each stub carried
+    /// its own hand-copied check; `update_with_start_*`'s copy omitted the
+    /// throttle case for a time -- the same missed-fix class as commit
+    /// 896978eb (issue #617).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(HarvestError::Config(_))` naming the first deferring
+    /// policy found.
+    pub fn reject_if_admission_may_defer(
+        &self,
+        input: &serde_json::Value,
+    ) -> crate::error::HarvestResult<()> {
+        if let Some(policy) = self.debounce
+            && crate::debounce::resolve_debounce_key(policy.key_expr, input).is_some()
+        {
+            return Err(crate::error::HarvestError::Config(format!(
+                "workflow '{0}' has a debounce policy; debounced starts \
+                 must use the HTTP start route POST /workflows/{0}/start \
+                 (the typed client cannot express a deferred debounced start)",
+                self.name,
+            )));
+        }
+        if let Some(policy) = self.throttle {
+            let throttle_applies = policy
+                .key_expr
+                .is_none_or(|k| crate::throttle::resolve_throttle_key(k, input).is_some());
+            if throttle_applies {
+                return Err(crate::error::HarvestError::Config(format!(
+                    "workflow '{0}' has a start-throttle policy; throttled starts \
+                     must use the HTTP start route POST /workflows/{0}/start \
+                     (the typed client cannot express a deferred throttled start)",
+                    self.name,
+                )));
+            }
+        }
+        if let Some(policy) = self.batch.as_ref()
+            && crate::concurrency::resolve_concurrency_key(&policy.key_expr, input).is_some()
+        {
+            return Err(crate::error::HarvestError::Config(format!(
+                "workflow '{0}' has an event batching policy; batched starts \
+                 must use the HTTP start route POST /workflows/{0}/start \
+                 (the typed client cannot express a deferred batched start)",
+                self.name,
+            )));
+        }
+        Ok(())
+    }
+
     /// Validate a JSON value against this workflow's `input_schema` (if any).
     ///
     /// Returns `Ok(())` when:
