@@ -802,8 +802,8 @@ pub fn invoke_wasm_activity_cancellable(
 ///
 /// The guest's decoded output, paired with the fuel it consumed. The caller
 /// (`hot_swap::decide_encoded`) charges the fuel figure to a cache entry's
-/// cost, deterministically: the same guest on the same input consumes the
-/// same fuel on every host, unlike wall-clock time.
+/// cost. That charge is deterministic: the same guest on the same input
+/// consumes the same fuel on every host, unlike wall-clock time.
 #[cfg(feature = "hot-code-swap")]
 pub(crate) fn invoke_wasm_guest_bytes(
     store: &WasmModuleStore,
@@ -1048,7 +1048,7 @@ fn invoke_wasm_activity_inner(
         .ok_or_else(|| ActivityFailure::wasm_trap("wasm output range is out of bounds"))?;
 
     // Fuel consumed is deterministic for a given guest and request, unlike
-    // wall-clock time, which is why the decision cache charges this rather
+    // wall-clock time. That is why the decision cache charges this rather
     // than an `Instant::elapsed()` measurement (issue #1345 finding 5).
     let fuel_consumed = limits.fuel.saturating_sub(wasm_store.get_fuel().unwrap_or(0));
 

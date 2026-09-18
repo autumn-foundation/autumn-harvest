@@ -672,12 +672,12 @@ fn unloading_a_build_drops_its_modules_but_not_a_live_holder() {
 #[test]
 fn unloading_a_build_misses_on_a_suspended_executions_next_lookup() {
     // Issue #1345 finding 1. The test above pins the case the doc comment on
-    // `unload_build` used to describe without a caveat: a caller that already
+    // `unload_build` used to describe without a caveat. A caller that already
     // holds an `Arc` keeps running. This pins the case the caveat now names: a
     // suspended execution holds no `Arc`. Its next `process_workflow_task`
-    // does a fresh lookup, and an early unload makes that lookup miss — the
-    // typed capability miss (issue #804), not a crash, but a cost the doc must
-    // not paper over as "safe".
+    // does a fresh lookup. An early unload makes that lookup miss — the
+    // typed capability miss (issue #804), not a crash. It is a cost the doc
+    // must not paper over as "safe".
     let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
 
     // No holder resolved the module before this unload — the suspended case.
@@ -692,10 +692,10 @@ fn unloading_a_build_misses_on_a_suspended_executions_next_lookup() {
 #[test]
 fn unload_builds_doc_states_the_suspended_execution_caveat() {
     // Issue #1345 finding 1. `unload_build`'s doc comment claimed early
-    // unload is safe for in-flight invocations because a resolved caller
-    // holds an `Arc` — true against use-after-free, but read as covering a
-    // *suspended* execution too, which holds no `Arc` and misses on resume.
-    // This guard keeps the doc honest about the distinction rather than
+    // unload is safe for in-flight invocations, because a resolved caller
+    // holds an `Arc`. That is true against use-after-free. It reads, though,
+    // as covering a *suspended* execution too, which holds no `Arc` and
+    // misses on resume. This guard keeps the doc honest about the distinction rather than
     // relying on a reviewer to notice the claim drifted again.
     let src = include_str!("../../src/hot_swap.rs");
     let start = src
@@ -751,9 +751,10 @@ fn unloading_the_build_being_loaded_still_fails_the_commit() {
 #[test]
 fn unloading_one_build_does_not_fail_an_unrelated_builds_in_flight_commit() {
     // Issue #1345 finding 7. `generation` used to be one counter shared by
-    // every build, so unloading `wf-a` also bumped the generation `wf-b`'s
-    // sync had captured — failing `wf-b`'s commit with `UnloadedDuringLoad`
-    // and reporting that `wf-b` was unloaded, when it was `wf-a` all along.
+    // every build. Unloading `wf-a` therefore also bumped the generation
+    // `wf-b`'s sync had captured. `wf-b`'s commit then failed with
+    // `UnloadedDuringLoad`, reporting that `wf-b` was unloaded, when it was
+    // `wf-a` all along.
     let registry = Arc::new(ModuleRegistry::new());
     registry
         .load_module(
@@ -1283,15 +1284,16 @@ async fn a_guest_may_not_pick_an_oversized_queue_name() {
         env().run(module_workflow_handler, json!({})),
     )
     .await;
+    let scheduled_any = outcome
+        .events()
+        .iter()
+        .any(|e| matches!(e, WorkflowEvent::ActivityScheduled { .. }));
     let err = outcome
         .result
         .expect_err("a queue name over the ceiling must be refused");
     assert!(err.contains("queue"), "{err}");
     assert!(
-        !outcome
-            .events()
-            .iter()
-            .any(|e| matches!(e, WorkflowEvent::ActivityScheduled { .. })),
+        !scheduled_any,
         "an oversized queue name must be refused before anything is scheduled onto it"
     );
 }
@@ -1476,9 +1478,9 @@ async fn syncing_a_build_discovers_verifies_and_loads_every_module() {
 #[tokio::test]
 async fn a_sync_refuses_a_build_with_too_many_workflow_names() {
     // Issue #1345 finding 6. Fetching one payload at a time bounds SOURCE
-    // residency; it does not bound the COMPILED artifacts, which stay
-    // resident for the whole batch because atomic binding needs every module
-    // compiled before any of them is bound. A build with enough workflow
+    // residency. It does not bound the COMPILED artifacts. Those stay
+    // resident for the whole batch, because atomic binding needs every
+    // module compiled before any of them is bound. A build with enough workflow
     // names could still accumulate unboundedly many resident compiled
     // modules before the batch ever commits. The ceiling refuses the sync
     // outright, before fetching or compiling a single module.
@@ -2655,12 +2657,12 @@ async fn a_capability_enabled_host_never_uses_the_decision_cache() {
     // Issue #1345 finding 2. The cache's soundness argument is "the guest is
     // a pure function of its request" — true only under deny-all
     // capabilities. `with_capabilities` lets a host grant a clock or
-    // randomness, and a guest granted either is not pure: serving a prior
+    // randomness. A guest granted either is not pure. Serving a prior
     // execution's answer from the cache would hand out a stale time- or
     // random-dependent decision instead of asking the guest again. The host
-    // must skip the cache entirely rather than key it by capability grant —
-    // a capability-enabled guest already fails replay for the same reason,
-    // and caching would only mask when.
+    // must skip the cache entirely rather than key it by capability grant. A
+    // capability-enabled guest already fails replay for the same reason.
+    // Caching would only mask when.
     let registry = registry_with(&[("wf-v2", "pipeline", pipeline_v2_bytes())]);
     let capable = autumn_harvest::wasm_activities::WasmCapabilities {
         allow_clock: true,
@@ -2698,7 +2700,7 @@ fn the_run_budget_is_charged_and_checked_once_for_both_cache_paths() {
     // total served from cache was rejected — the residency dependence surviving
     // inside its own fix.
     //
-    // Guarded structurally rather than functionally: reproducing it needs a
+    // Guarded structurally rather than functionally. Reproducing it needs a
     // guest expensive enough to exhaust the cumulative fuel budget, which is
     // not a test anyone should wait for. The invariant is that the cost is
     // charged and the

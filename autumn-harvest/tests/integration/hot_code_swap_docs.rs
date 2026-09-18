@@ -316,7 +316,7 @@ const CITED_TESTS: &[&str] = &[
     "a_failing_module_leaves_the_whole_build_unbound",
     "a_guest_may_not_schedule_an_activity_the_host_did_not_allow",
     "a_guest_may_not_pick_the_queue_unless_the_host_allows_it",
-    // Codex review round 6, issue #1345.
+    // Issue #1345.
     "a_capability_enabled_host_never_uses_the_decision_cache",
     "unloading_a_build_misses_on_a_suspended_executions_next_lookup",
     "a_guest_may_not_pick_an_oversized_queue_name",

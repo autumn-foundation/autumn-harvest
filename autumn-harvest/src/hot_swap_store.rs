@@ -463,9 +463,10 @@ pub async fn sync_build_into_registry(
     if names.len() > MAX_WORKFLOW_NAMES_PER_BUILD {
         // Refused before fetching or compiling a single module (issue #1345
         // finding 6). Source bytes are bounded by fetching one payload at a
-        // time, but the COMPILED artifacts stay resident for the whole batch
-        // until it commits — atomic binding needs every module in hand first
-        // — so nothing before this check bounded how many of them accumulate.
+        // time. The COMPILED artifacts stay resident for the whole batch
+        // until it commits, since atomic binding needs every module in hand
+        // first. Nothing before this check bounded how many of them
+        // accumulate.
         return Err(HarvestError::Config(format!(
             "build `{build_id}` registers {} workflow modules, over the \
              {MAX_WORKFLOW_NAMES_PER_BUILD}-name ceiling; refusing to sync it rather than risk \

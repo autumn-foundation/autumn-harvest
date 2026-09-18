@@ -138,11 +138,11 @@ pub const MAX_WORKFLOW_MODULE_BYTES: usize = 32 * 1024 * 1024;
 /// Hard ceiling on how many workflow names one build may register.
 ///
 /// [`sync_build_into_registry`](crate::hot_swap_store::sync_build_into_registry)
-/// fetches modules one at a time and drops each payload's source bytes right
-/// after compiling it, so peak source residency is one module, not the whole
-/// build. That bounds source bytes only. Atomic binding needs every module
-/// compiled before any of them is bound, so the *compiled* artifacts stay
-/// resident for the whole build regardless — and nothing bounded how many of
+/// fetches modules one at a time. It drops each payload's source bytes right
+/// after compiling it. Peak source residency is therefore one module, not
+/// the whole build — source bytes only. Atomic binding needs every module
+/// compiled before any of them is bound. The *compiled* artifacts therefore
+/// stay resident for the whole build regardless. Nothing bounded how many of
 /// them a build could name. A build with enough workflow rows could still
 /// accumulate unboundedly many resident compiled modules and exhaust memory
 /// before the batch ever commits. This ceiling closes that: a build over it
@@ -172,17 +172,17 @@ pub const DECIDE_FUEL: u64 = 10_000_000;
 
 /// Cumulative guest fuel budget for one handler invocation.
 ///
-/// [`DECIDE_FUEL`] bounds a single decision; this bounds the whole decision
+/// [`DECIDE_FUEL`] bounds a single decision. This bounds the whole decision
 /// cycle, so a guest cannot compose per-decision budgets into unbounded
 /// occupancy of a runtime worker thread. With memoisation a cycle performs
 /// one *new* decision, so a well-behaved guest never approaches it.
 ///
 /// Fuel, not the clock (issue #1345 finding 5). An earlier cut charged a
 /// cache HIT the wall-clock duration recorded when the decision was first
-/// computed. That duration varies with host load, so the same run could pass
-/// on a busy host — where the recorded cost was high enough to still fit the
-/// budget — and fail on an idle one recomputing the same step fresh, or the
-/// reverse. Fuel is deterministic for a given guest and request, so the same
+/// computed. That duration varies with host load. The same run could pass on
+/// a busy host, where the recorded cost happened to still fit the budget.
+/// The same run could then fail on an idle host recomputing the same step
+/// fresh — or the reverse. Fuel is deterministic for a given guest and request, so the same
 /// run always reaches the same verdict regardless of cache residency or host
 /// speed. Set to twice [`DECIDE_FUEL`], mirroring the margin the former
 /// wall-clock pair kept between the per-decision and cumulative ceilings.
@@ -212,10 +212,10 @@ pub const MAX_GUEST_TEXT_BYTES: usize = 2048;
 /// Ceiling on a guest-chosen activity queue name: 200 bytes.
 ///
 /// `harvest_task_queue.queue_name` sits in a B-tree poll index. Postgres
-/// refuses an index entry near a page-fraction limit, so a long guest-chosen
-/// name would make every future insert for that queue fail, not just this
-/// one. Refusing the name here keeps the failure local to the guest that
-/// picked it.
+/// refuses an index entry near a page-fraction limit. A long guest-chosen
+/// name would therefore make every future insert for that queue fail, not
+/// just this one. Refusing the name here keeps the failure local to the
+/// guest that picked it.
 pub const MAX_QUEUE_NAME_BYTES: usize = 200;
 
 /// Minimum module-signing key length, in bytes.
@@ -679,8 +679,8 @@ pub struct ModuleDescriptor {
 /// A compiled module plus its identity.
 ///
 /// Handed out behind an [`Arc`]. That answers the unload hazard for a
-/// **currently executing** invocation: [`ModuleRegistry::unload_build`]
-/// removes the *binding*, and the `Arc` already held keeps the code alive
+/// **currently executing** invocation. [`ModuleRegistry::unload_build`]
+/// removes the *binding*. The `Arc` already held keeps the code alive
 /// until that invocation finishes. It does not cover a *suspended*
 /// execution, which holds no `Arc` — see the caveat on
 /// [`ModuleRegistry::unload_build`]. In dylib hosting the same unload is a
@@ -732,11 +732,11 @@ pub struct ModuleRegistry {
     /// The registry generation at which each build id was most recently
     /// unloaded (issue #1345 finding 7).
     ///
-    /// `generation` alone cannot tell a commit which build raced it: a single
-    /// counter shared by every build means unloading `wf-v1` also bumps the
-    /// generation a concurrent `wf-v2` sync captured, so that sync's commit
-    /// fails with [`HotSwapError::UnloadedDuringLoad`] blaming `wf-v2` even
-    /// though `wf-v2` was never touched. Recording *which* build moved lets
+    /// `generation` alone cannot tell a commit which build raced it. One
+    /// counter is shared by every build. Unloading `wf-v1` therefore also
+    /// bumps the generation a concurrent `wf-v2` sync captured. That sync's
+    /// commit then fails with [`HotSwapError::UnloadedDuringLoad`], blaming
+    /// `wf-v2` — a build it never touched. Recording *which* build moved lets
     /// [`Self::commit`] fail closed only when the unloaded build overlaps the
     /// batch actually committing.
     unloaded_at: RwLock<BTreeMap<String, u64>>,
@@ -905,8 +905,9 @@ impl ModuleRegistry {
             .unwrap_or_else(PoisonError::into_inner);
 
         // Scoped to the builds THIS batch actually binds (issue #1345
-        // finding 7): a global generation bump would fail this commit for
-        // any unrelated build's unload, not just one racing this one.
+        // finding 7). A global generation bump would otherwise fail this
+        // commit for any unrelated build's unload, not just one racing this
+        // one.
         {
             let unloaded_at = self
                 .unloaded_at
@@ -1105,8 +1106,8 @@ impl ModuleRegistry {
     /// suspended execution holds no `Arc`, so its next
     /// `process_workflow_task` does a fresh lookup, which misses after an
     /// early unload. The miss is the typed capability miss (issue #804), not
-    /// a crash, but it costs a redelivery round trip, and it exhausts into a
-    /// failure once no peer still serves the build. Call this once
+    /// a crash. It costs a redelivery round trip. It exhausts into a failure
+    /// once no peer still serves the build. Call this once
     /// [`build_reachability`](crate::build_routing::build_reachability)
     /// reports `safe_to_retire` to avoid that cost; calling it earlier is
     /// legal, not free.
@@ -1124,9 +1125,10 @@ impl ModuleRegistry {
         // Bumped under the write lock so a concurrent `commit` either sees the
         // old generation and this removal, or the new generation and refuses.
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        // Recorded under the SAME write lock, so `commit`'s read of
-        // `unloaded_at` (also taken while holding `bindings`) can never
-        // observe the bumped generation without this entry already in place.
+        // Recorded under the SAME write lock. `commit`'s read of
+        // `unloaded_at` (also taken while holding `bindings`) can therefore
+        // never observe the bumped generation without this entry already in
+        // place.
         self.unloaded_at
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1291,10 +1293,10 @@ struct CachedDecision {
     /// `MAX_DECIDE_STEPS` is a compile-time constant to avoid.
     ///
     /// **Fuel, not wall-clock time.** An earlier cut stored the wall-clock
-    /// `Duration` the first computation measured, which varies with host
-    /// load: a decision recorded slow on a busy runner charged that same slow
-    /// cost to every later hit, and a fast recomputation after eviction could
-    /// then complete a run the cached hit would have failed. Fuel is
+    /// `Duration` the first computation measured. That duration varies with
+    /// host load. A decision recorded slow on a busy runner charged that same
+    /// slow cost to every later hit. A fast recomputation after eviction
+    /// could then complete a run the cached hit would have failed. Fuel is
     /// deterministic for a given guest and request, so the charge is the same
     /// on every host regardless of residency.
     fuel: u64,
@@ -1882,8 +1884,8 @@ pub fn module_workflow_handler(
         //
         // The cache is skipped entirely when `host.capabilities` is not
         // deny-all (issue #1345 finding 2). Its soundness rests on the guest
-        // being a pure function of its request, which holds only under
-        // deny-all: `with_capabilities` can grant a clock or randomness, and a
+        // being a pure function of its request. That holds only under
+        // deny-all. `with_capabilities` can grant a clock or randomness. A
         // guest granted either can answer differently on two calls with the
         // same request. Serving a prior answer from the cache would then hand
         // out a stale time- or random-dependent decision instead of asking the
@@ -1947,9 +1949,9 @@ pub fn module_workflow_handler(
             // effect the run then fails immediately after, which is the worst of
             // both outcomes.
             //
-            // The pre-check is gone rather than duplicated: since every
-            // iteration now returns as soon as the budget is reached, the loop
-            // cannot re-enter with `guest_fuel` already over it.
+            // The pre-check is gone rather than duplicated. Every iteration
+            // now returns as soon as the budget is reached. The loop
+            // therefore cannot re-enter with `guest_fuel` already over it.
             let (response, cost) = if let Some((cached, recorded)) = cached {
                 (cached, recorded)
             } else {
@@ -2117,12 +2119,12 @@ mod tests {
     #[test]
     fn the_cumulative_fuel_budget_sits_above_a_single_decisions_fuel_ceiling() {
         // Issue #1345 finding 5. `DECIDE_RUN_FUEL_BUDGET` replaced a
-        // wall-clock cumulative budget, which raced the per-decision
-        // wall-clock backstop: a run's terminal outcome would depend on host
-        // load, since the same history could fail on a busy worker and
-        // succeed on an idle one. Fuel is deterministic, so that particular
-        // race is gone by construction — but the budget must still exceed a
-        // single decision's own ceiling, or one ordinary decision would
+        // wall-clock cumulative budget. That budget raced the per-decision
+        // wall-clock backstop. A run's terminal outcome would depend on host
+        // load. The same history could fail on a busy worker and succeed on
+        // an idle one. Fuel is deterministic, so that particular race is
+        // gone by construction. The budget must still exceed a single
+        // decision's own ceiling. Otherwise one ordinary decision would
         // already exhaust the whole run's budget.
         assert!(DECIDE_RUN_FUEL_BUDGET > DECIDE_FUEL);
     }
