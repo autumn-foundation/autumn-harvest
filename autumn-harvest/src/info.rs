@@ -803,11 +803,11 @@ impl WorkflowInfo {
     /// (issues #499, #607, #518).
     ///
     /// Debounce, start-throttle, and event-batching policies may defer the
-    /// actual admission of a start past the caller's own transaction, which
-    /// requires the debounce-key shard, the registry, and the HTTP-only
-    /// admission gate. A typed-client caller (`start_with_options`,
-    /// `signal_with_start`, `update_with_start_*`) has none of those, so it
-    /// rejects early with a pointer to the HTTP start route rather than
+    /// actual admission of a start past the caller's own transaction. That
+    /// deferral requires the debounce-key shard, the registry, and the
+    /// HTTP-only admission gate. A typed-client caller (`start_with_options`,
+    /// `signal_with_start`, `update_with_start_*`) has none of those. It
+    /// rejects early with a pointer to the HTTP start route, instead of
     /// silently bypassing the policy.
     ///
     /// Checked in debounce, throttle, batch order; returns on the first
@@ -816,7 +816,7 @@ impl WorkflowInfo {
     ///
     /// Shared by every typed-client start-or-attach stub `#[workflow]` and
     /// `#[update]` generate. Before this method existed, each stub carried
-    /// its own hand-copied check; `update_with_start_*`'s copy omitted the
+    /// its own hand-copied check. `update_with_start_*`'s copy omitted the
     /// throttle case for a time -- the same missed-fix class as commit
     /// 896978eb (issue #617).
     ///

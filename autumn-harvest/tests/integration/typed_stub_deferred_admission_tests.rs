@@ -6,11 +6,11 @@
 //! All three must reject a call against a throttled workflow with the same
 //! `HarvestError::Config` the debounce/batch cases already got. Before the
 //! shared check existed, `update_with_start_*` hand-carried its own copy of
-//! this guard and that copy omitted the throttle case -- the same
-//! missed-fix class as commit 896978eb (issue #617): a fix applied to some
-//! copies of duplicated logic and missed in another. This file pins the now-
-//! unified behavior so a future edit to the check cannot silently regress
-//! one call site while fixing the others.
+//! this guard. That copy omitted the throttle case. Commit 896978eb (issue
+//! #617) is the same missed-fix class: a fix applied to some copies of
+//! duplicated logic, and missed in another. This file pins the now-unified
+//! behavior. A future edit to the check cannot silently regress one call
+//! site while fixing the others.
 #![cfg(feature = "db")]
 #![allow(clippy::all, clippy::pedantic, clippy::nursery)]
 
@@ -87,9 +87,9 @@ fn build_pool(database_url: &str) -> DbPool {
 // ── Test Workflow Declaration ───────────────────────────────────────────────
 //
 // An unkeyed (global) throttle always applies (issue #607's `key_expr:
-// None` branch), so these tests need no JSON input shape to trigger the
-// rejection -- unlike debounce/batch, already covered indirectly by every
-// debounced/batched workflow's existing tests elsewhere in this suite.
+// None` branch). These tests need no JSON input shape to trigger the
+// rejection. Debounce/batch rejection is already covered indirectly,
+// by every debounced/batched workflow's existing tests in this suite.
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct ThrottledInput {
@@ -166,9 +166,9 @@ async fn signal_with_start_rejects_a_throttled_workflow() {
     assert_rejects_as_throttled(&result);
 }
 
-/// The regression test: before `reject_if_admission_may_defer` was shared,
-/// `update_with_start_*`'s hand-copied guard checked debounce and batch but
-/// not throttle, so this call was silently admitted instead of rejected.
+/// The regression test. Before `reject_if_admission_may_defer` was shared,
+/// `update_with_start_*`'s hand-copied guard checked debounce and batch,
+/// but not throttle, so this call was silently admitted, not rejected.
 #[tokio::test]
 async fn update_with_start_rejects_a_throttled_workflow() {
     let (db_url, _container) = setup_database_url().await;
