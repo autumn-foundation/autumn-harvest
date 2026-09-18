@@ -39,11 +39,19 @@ pub fn build_router(api_state: HarvestApiState, web_state: autumn_web::AppState)
 /// copies this example onto a non-loopback address still learns it from
 /// the log.
 ///
+/// Records whatever profile is supplied, not only `"dev"`. A future caller
+/// might add its own auth boundary under a non-dev profile.
+/// `harvest preflight`'s `admin_auth_boundary` check needs the real profile
+/// then, not `"unknown"`. A declared non-dev profile with no boundary is a
+/// hard failure. An undeclared profile is only a warning.
+///
 /// Split out of [`run`] so a test can drive the exact startup posture
 /// without a process-wide `AUTUMN_PROFILE` env var (see `tests.rs`).
 pub fn declare_deployment_profile(api_state: &HarvestApiState, autumn_profile: Option<&str>) {
+    if let Some(profile) = autumn_profile {
+        api_state.set_deployment_profile(profile);
+    }
     if autumn_profile == Some("dev") {
-        api_state.set_deployment_profile("dev");
         tracing::warn!(
             "AUTUMN_PROFILE=dev with no admin auth boundary declared: the Harvest management \
              API (every /admin route and the Vantage dashboard) is reachable UNAUTHENTICATED by \
