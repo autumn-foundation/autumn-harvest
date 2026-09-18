@@ -168,8 +168,8 @@ async fn load_task(conn: &mut AsyncPgConnection, id: Uuid) -> TaskRow {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-/// A claim that beat the pause must be released once the pause is visible to a
-/// fresh statement, with its `attempt` restored (no retry budget consumed).
+/// A claim that beat the pause must be released once a fresh statement sees
+/// the pause. Its `attempt` must be restored: no retry budget is consumed.
 #[tokio::test]
 async fn a_claim_that_beat_the_workflow_pause_is_released_with_its_attempt_restored() {
     let (url, _c) = setup_db_url().await;

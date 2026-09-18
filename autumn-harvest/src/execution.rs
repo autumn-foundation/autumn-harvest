@@ -4058,9 +4058,9 @@ pub const fn release_claim_if_workflow_paused_query() -> &'static str {
 ///
 /// This re-check's verdict is authoritative as of *its own snapshot*, not
 /// through commit. This is the same accepted trade-off as
-/// [`crate::activity_pause::release_claim_if_activity_paused`]. A pause that
-/// commits in the window between this statement and the claim transaction's
-/// `COMMIT` can be acknowledged to the operator, while one already-claimed
+/// [`crate::activity_pause::release_claim_if_activity_paused`]. A pause can
+/// commit in the window between this statement and the claim transaction's
+/// `COMMIT`. The operator can see it acknowledged, while one already-claimed
 /// task still dispatches.
 ///
 /// Queue pause closes that last window with a shared advisory lock on the
