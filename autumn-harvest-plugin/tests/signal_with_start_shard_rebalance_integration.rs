@@ -1,7 +1,8 @@
 //! Regression test for issue #1317 review. `signal-with-start` (and the
-//! identical `update-with-start` scan) must place a genuinely fresh
-//! post-reconciliation run on the business key's canonically-routed shard.
-//! Never on whatever shard happens to hold a dead, terminal predecessor.
+//! identical `update-with-start` scan) must place a fresh run on the shard
+//! that keeps the business key safe from a two-shard duplicate. Which
+//! shard that is depends on whether the dead predecessor it meets can turn
+//! live again on its own.
 //!
 //! `pool.iter_shards()`'s prescan can encounter a terminal
 //! (`COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`) row for `(workflow_name,
@@ -10,14 +11,25 @@
 //! to. This happens whenever an execution's physical shard has drifted from
 //! its hash-routed shard. The drift can come from a completed shard
 //! rebalance (the migrated-seal-reconciliation feature, issue #1317), or
-//! from a writable-subset change. `replace_execution` seals and inserts on
-//! the SAME connection. So treating that stale row as the replace target
-//! anchors the fresh run to the WRONG shard.
+//! from a writable-subset change.
 //!
-//! A later plain `start_workflow` for the same key then routes to the
-//! canonical shard and finds nothing occupying it. It inserts a SECOND live
-//! run for the same business key -- the two-shard duplicate this test
-//! proves cannot happen.
+//! For a `COMPLETED` predecessor, never resettable whatever happens next,
+//! the fresh run must land on the CANONICAL shard. That is the shard a
+//! plain `start_workflow` for this key would also use. Landing it on the
+//! dead row's shard instead would let a later plain `start_workflow` route
+//! to the canonical shard. It would find nothing there and insert a SECOND
+//! live run.
+//!
+//! A `FAILED`/`CANCELLED`/`TIMED_OUT` predecessor stays resettable, through
+//! `reset.rs`'s `allow_terminal_source`, for as long as it keeps that exact
+//! state. For that case the fresh run must land on THAT ROW'S OWN shard
+//! instead. `replace_execution` then seals it to `CONTINUED_AS_NEW`, a
+//! state `allow_terminal_source` never admits, closing its resettability
+//! for good. Landing the fresh run on the canonical shard instead would
+//! leave the dead row resettable. A different live run already occupies
+//! the same business key elsewhere. A later reset would then produce the
+//! second live execution this whole scan exists to prevent,
+//! from the opposite direction.
 //!
 //! Dual-mode like the sibling multi-shard suites: uses
 //! `HARVEST_TEST_DATABASE_URL` when set, else boots two fresh testcontainers
@@ -510,5 +522,103 @@ async fn signal_with_start_routes_a_fresh_run_past_a_stale_terminal_copy_to_the_
             + running_count(other_url, workflow_id).await,
         1,
         "exactly one live run for this business key must exist, on either shard"
+    );
+}
+
+#[tokio::test]
+async fn signal_with_start_replaces_a_resettable_dead_row_on_its_own_shard_not_the_canonical_one() {
+    // Issue #1317 review, P1 follow-up. Unlike a `COMPLETED` predecessor
+    // (the case above), a `FAILED`/`CANCELLED`/`TIMED_OUT` row stays
+    // resettable. `reset.rs`'s `allow_terminal_source` admits it for as
+    // long as it keeps that exact state. Routing the fresh run to
+    // `canonical_shard` instead of this row's own shard would leave it
+    // sitting there, still revivable. A different live run already
+    // occupies the same business key elsewhere, so a later reset would
+    // produce a second live execution.
+    //
+    // `replace_execution` seals whatever row it replaces to
+    // `CONTINUED_AS_NEW`, a state `allow_terminal_source` never admits.
+    // Landing the fresh run on the dead row's own shard, not the canonical
+    // one, does not just reduce the exposure window. It seals the exact
+    // row that was resettable, closing it for good.
+    let ((url_a, url_b), _guard) = setup_two_shard_databases().await;
+    let (app, router) = build_app(&url_a, &url_b);
+
+    let workflow_id = "resettable-cross-shard-key";
+    let canonical = router.pick_for_new_workflow("onboarding", workflow_id);
+    let (canonical_url, other_url) = if canonical == ShardId::new(SHARD_A) {
+        (&url_a, &url_b)
+    } else {
+        (&url_b, &url_a)
+    };
+    let other_shard = if canonical == ShardId::new(SHARD_A) {
+        ShardId::new(SHARD_B)
+    } else {
+        ShardId::new(SHARD_A)
+    };
+
+    // A FAILED predecessor sits on the NON-canonical shard, with nothing at
+    // all on the canonical shard. Same drift as the COMPLETED case above,
+    // but in a state that stays resettable.
+    let dead_id = seed_with_state(other_url, other_shard, workflow_id, "FAILED").await;
+
+    let (status, body) = post_json(
+        &app,
+        "/workflows/onboarding/signal-with-start",
+        json!({
+            "workflow_id": workflow_id,
+            "start_input": {},
+            "signal_name": "wake",
+            "signal_payload": {}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    assert_eq!(
+        body["started_fresh"],
+        json!(true),
+        "no live prior anywhere, so this must be a fresh start"
+    );
+
+    // The fresh run must land where the resettable row sits, NOT on the
+    // canonical shard. Opposite of the COMPLETED case above, because this
+    // row can still turn live again on its own.
+    assert_eq!(
+        running_count(other_url, workflow_id).await,
+        1,
+        "the fresh run must be created on the dead row's own shard"
+    );
+    assert_eq!(
+        running_count(canonical_url, workflow_id).await,
+        0,
+        "the canonical shard must not gain an unrelated fresh run"
+    );
+
+    // The dead row itself must have been sealed CONTINUED_AS_NEW by
+    // `replace_execution`, not left FAILED -- proving it can no longer be
+    // resurrected via `allow_terminal_source`.
+    assert_eq!(
+        state_count(other_url, workflow_id, "FAILED").await,
+        0,
+        "the resettable row must no longer be in a resettable state"
+    );
+    assert_eq!(
+        state_count(other_url, workflow_id, "CONTINUED_AS_NEW").await,
+        1,
+        "replace_execution must have sealed the exact row that was resettable"
+    );
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(other_url)
+        .await
+        .expect("connect to verify the sealed row");
+    let sealed_id: uuid::Uuid = harvest_workflow_executions::table
+        .find(dead_id.as_uuid())
+        .select(harvest_workflow_executions::id)
+        .first(&mut conn)
+        .await
+        .expect("the original row must still exist, sealed rather than deleted");
+    assert_eq!(
+        sealed_id,
+        dead_id.as_uuid(),
+        "the exact row seeded as FAILED must be the one sealed"
     );
 }
