@@ -174,7 +174,7 @@ async fn load_task(conn: &mut AsyncPgConnection, id: Uuid) -> TaskRow {
 async fn a_claim_that_beat_the_workflow_pause_is_released_with_its_attempt_restored() {
     let (url, _c) = setup_db_url().await;
     let mut conn = connect(&url).await;
-    let q = unique_queue("wf-claim-release");
+    let q = unique_queue("wp-release");
 
     let exec_id = insert_execution(&mut conn).await;
     let task_id = enqueue_workflow_task(&mut conn, &q, exec_id, None).await;
@@ -213,7 +213,7 @@ async fn a_claim_that_beat_the_workflow_pause_is_released_with_its_attempt_resto
 async fn an_ordinary_claim_is_not_released_when_the_workflow_is_not_paused() {
     let (url, _c) = setup_db_url().await;
     let mut conn = connect(&url).await;
-    let q = unique_queue("wf-claim-noop");
+    let q = unique_queue("wp-noop");
 
     let exec_id = insert_execution(&mut conn).await;
     let task_id = enqueue_workflow_task(&mut conn, &q, exec_id, None).await;
@@ -240,7 +240,7 @@ async fn an_ordinary_claim_is_not_released_when_the_workflow_is_not_paused() {
 async fn an_activity_task_of_a_paused_workflow_is_not_held_by_this_recheck() {
     let (url, _c) = setup_db_url().await;
     let mut conn = connect(&url).await;
-    let q = unique_queue("wf-activity-unheld");
+    let q = unique_queue("wp-act");
 
     let exec_id = insert_execution(&mut conn).await;
     let task_id = enqueue_activity_task(&mut conn, &q, exec_id).await;
@@ -277,7 +277,7 @@ async fn a_workflow_pause_committed_mid_claim_still_holds_the_task() {
 
     let (url, _c) = setup_db_url().await;
     let mut conn = connect(&url).await;
-    let q = unique_queue("wf-mid-claim");
+    let q = unique_queue("wp-mid");
     let rl_key = format!("{q}-bucket");
 
     queue::ensure_rate_limit_bucket(&mut conn, &rl_key, 100.0, 100.0)
