@@ -6109,6 +6109,19 @@ pub async fn pending_queue_demand_by_queue_name(
 /// issuing the attempt query at all. It never touches that candidate's
 /// bucket lock.
 ///
+/// A thirteenth bug (P2, a real correctness gap, not a performance
+/// one), caught by the same reviewer. The batch scan's own build-routing
+/// gate (`required_build_id`/`harvest_build_compat`) only filters
+/// candidates at SCAN time. The scan and this candidate's own attempt
+/// are separate statements. An operator revoking build compatibility
+/// in between is invisible to `claimed`'s `WHERE`, which checked only
+/// `id = $2` plus the concurrency/rate-limit/deadline gates. A worker
+/// could claim a task requiring a build it is no longer compatible
+/// with, breaking the replay-determinism guarantee build routing
+/// exists to protect. [`claim_task_query`]'s single atomic statement
+/// has no such window; this two-phase design does. Fixed by re-running
+/// the scan's own build-routing gate, verbatim, in `claimed`'s `WHERE`.
+///
 /// # What this is not
 ///
 /// This is **not** wired into [`claim_task`] or [`claim_task_on_shard`].
@@ -6374,7 +6387,7 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
 /// Binds: `$1` worker id, `$2` candidate row id, `$3` concurrency key,
 /// `$4` concurrency cap, `$5` task type. Also `$6` rate limit key, `$7`
 /// activity name, `$8` circuit-breaker-tracked activities, `$9` schedule-
-/// to-close deadline.
+/// to-close deadline, `$10` worker build id.
 #[must_use]
 pub fn claim_batched_candidate_attempt_query() -> &'static str {
     static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
@@ -6430,6 +6443,16 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
                    AND ( \
                        $9::timestamptz IS NULL \
                        OR $9::timestamptz > (SELECT ts FROM now_ts) \
+                   ) \
+                   AND ( \
+                       required_build_id IS NULL \
+                       OR $10 = '' \
+                       OR required_build_id = $10 \
+                       OR EXISTS ( \
+                           SELECT 1 FROM harvest_build_compat \
+                           WHERE build_id = $10 \
+                             AND compatible_with = harvest_task_queue.required_build_id \
+                       ) \
                    ) \
                  RETURNING harvest_task_queue.* \
              ) \
@@ -6658,10 +6681,17 @@ async fn concurrency_probe_passes(
 /// candidate that carries a concurrency key. A rejected candidate never
 /// reaches the rate-limit debit at all -- see that probe's own doc
 /// comment for the leak this prevents.
+///
+/// Passes `worker_build_id` through so the attempt query's own `WHERE`
+/// can re-check build-routing compatibility (review finding, thirteenth
+/// bug in the module doc above). The batch scan already filtered on it,
+/// but only as of scan time -- this candidate's own attempt is a later,
+/// separate statement.
 async fn try_claim_batched_candidate(
     conn: &mut AsyncPgConnection,
     candidate: &BatchedClaimCandidate,
     worker_id: &str,
+    worker_build_id: &str,
     circuit_breaker_activities: &[String],
 ) -> HarvestResult<Option<TaskQueueItem>> {
     if candidate
@@ -6695,6 +6725,7 @@ async fn try_claim_batched_candidate(
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
             candidate.schedule_to_close_at,
         )
+        .bind::<diesel::sql_types::Text, _>(worker_build_id)
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -6759,6 +6790,7 @@ pub async fn claim_task_batched(
                             conn,
                             candidate,
                             worker_id,
+                            worker_build_id,
                             circuit_breaker_activities,
                         )
                         .await?
@@ -7681,6 +7713,35 @@ mod tests {
             !sql.contains("last_refilled_at = NOW()"),
             "last_refilled_at must never fall back to the frozen NOW(); \
              got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR. The batch scan's
+    /// own build-routing gate (`required_build_id`/`harvest_build_compat`)
+    /// only filters candidates at SCAN time. This candidate's own attempt
+    /// is a separate, later statement. An operator can revoke build
+    /// compatibility in between. This query would still claim the row
+    /// for a worker no longer allowed to run it, breaking the
+    /// replay-determinism guarantee build routing exists to protect.
+    /// `claimed`'s `WHERE` must re-run the SAME gate the scan
+    /// uses, verbatim, so a revoked candidate is rejected here too.
+    #[test]
+    fn claim_batched_candidate_attempt_query_rechecks_build_routing() {
+        let sql = claim_batched_candidate_attempt_query();
+        let claimed_clause = sql
+            .split("claimed AS (")
+            .nth(1)
+            .and_then(|rest| rest.split("RETURNING harvest_task_queue.*").next())
+            .unwrap_or_default();
+        assert!(
+            claimed_clause.contains("required_build_id IS NULL")
+                && claimed_clause.contains("required_build_id = $10")
+                && claimed_clause.contains("FROM harvest_build_compat")
+                && claimed_clause
+                    .contains("compatible_with = harvest_task_queue.required_build_id"),
+            "claimed's WHERE must re-check required_build_id against \
+             $10 (worker_build_id) and harvest_build_compat, the same \
+             gate the batch scan already applies; got:\n{sql}"
         );
     }
 

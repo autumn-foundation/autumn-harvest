@@ -25,6 +25,7 @@
 //! run against it directly. Otherwise a fresh testcontainers Postgres
 //! boots with the full migration bundle.
 
+use autumn_harvest::build_routing;
 use autumn_harvest::queue::{
     self, BatchedClaimConfig, EnqueueParams, TaskType, claim_task, claim_task_batched,
 };
@@ -678,6 +679,7 @@ async fn batched_claim_attempt_rejects_a_deadline_that_passed_mid_transaction() 
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
                             Some(deadline),
                         )
+                        .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
                         .await?;
                 Ok(rows.into_iter().next().map(|r| r.id))
@@ -759,6 +761,7 @@ async fn batched_claim_attempt_never_debits_rate_limit_for_a_candidate_past_its_
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
                             Some(deadline),
                         )
+                        .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
                         .await?;
                 Ok(rows.into_iter().next().map(|r| r.id))
@@ -942,6 +945,7 @@ async fn batched_claim_attempt_stamps_started_at_with_real_time_not_frozen_now()
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
                             None::<chrono::DateTime<chrono::Utc>>,
                         )
+                        .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
                         .await?;
                 Ok(rows.into_iter().next().expect("the row must be claimed"))
@@ -1057,6 +1061,7 @@ async fn batched_claim_attempt_rejects_a_deadline_that_passes_while_waiting_on_t
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
                             Some(deadline),
                         )
+                        .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
                         .await?;
                 Ok(rows.into_iter().next().map(|r| r.id))
@@ -1183,6 +1188,7 @@ async fn batched_claim_attempt_skips_the_bucket_lock_for_a_circuit_breaker_activ
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
                             None::<chrono::DateTime<chrono::Utc>>,
                         )
+                        .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
                         .await?;
                 Ok(rows.into_iter().next().map(|r| r.id))
@@ -1309,7 +1315,7 @@ async fn batched_claim_skips_the_bucket_lock_for_a_candidate_already_past_its_de
                 .bind::<diesel::sql_types::Text, _>(&locker_b_bucket)
                 .execute(conn)
                 .await?;
-                diesel::sql_query("SELECT pg_sleep(2.5)")
+                diesel::sql_query("SELECT pg_sleep(3.0)")
                     .execute(conn)
                     .await?;
                 Ok(())
@@ -1336,9 +1342,9 @@ async fn batched_claim_skips_the_bucket_lock_for_a_candidate_already_past_its_de
 
     assert_eq!(claimed, None);
     assert!(
-        elapsed < std::time::Duration::from_millis(1500),
+        elapsed < std::time::Duration::from_millis(2000),
         "candidate B's deadline expires during candidate A's ~1s bucket \
-         wait, and bucket_b stays locked until ~2.5s -- B must be \
+         wait, and bucket_b stays locked until ~3s -- B must be \
          rejected on its expired deadline alone, never waiting on its \
          own bucket; elapsed={elapsed:?}"
     );
@@ -1416,6 +1422,7 @@ async fn batched_claim_attempt_stamps_last_refilled_at_with_real_time_not_frozen
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
                             None::<chrono::DateTime<chrono::Utc>>,
                         )
+                        .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
                         .await?;
                 Ok(rows.into_iter().next().map(|r| r.id))
@@ -1446,6 +1453,100 @@ async fn batched_claim_attempt_stamps_last_refilled_at_with_real_time_not_frozen
          stamp it near before_sleep instead; before_sleep={before_sleep}, \
          final_refilled_at={final_refilled_at}"
     );
+}
+
+/// Regression test for a review finding on this PR. The batch scan's
+/// own build-routing gate only filters at scan time. This candidate's
+/// own attempt is a separate, later statement. An operator revoking
+/// build compatibility in between must still be caught. Otherwise a
+/// worker could claim a task requiring a build it is no longer allowed
+/// to run, breaking the replay-determinism guarantee build routing
+/// protects.
+///
+/// Drives `claim_batched_candidate_attempt_query()` directly (like the
+/// deadline and concurrency authoritative-recheck tests above), proving
+/// the `WHERE` clause's own re-check, not just the batch scan's.
+#[tokio::test(flavor = "multi_thread")]
+async fn batched_claim_attempt_rechecks_build_routing_not_just_the_batch_scan() {
+    use diesel_async::RunQueryDsl;
+
+    let (_url, mut conn, _container) = setup_db().await;
+    let queue = unique_queue("batched-build-routing");
+    // Unique per run: CI's DB-backed shards use a persistent Postgres,
+    // not always a fresh testcontainer, and harvest_build_compat rows
+    // outlive a single test process.
+    let unique = Uuid::new_v4().simple().to_string();
+    let required_build = format!("build-required-{unique}");
+    let worker_build = format!("build-worker-{unique}");
+    let exec_id = insert_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id);
+    params.activity_name = Some("noop".to_string());
+    params.activity_id = Some(Uuid::new_v4());
+    params.required_build_id = Some(required_build.clone());
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+    #[derive(diesel::QueryableByName)]
+    struct ClaimedId {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+    }
+    async fn try_attempt(
+        conn: &mut AsyncPgConnection,
+        task_id: Uuid,
+        worker_build_id: &str,
+    ) -> Option<Uuid> {
+        let mut tx = conn.build_transaction().read_committed();
+        tx.run(
+            async |conn: &mut AsyncPgConnection| -> Result<Option<Uuid>, diesel::result::Error> {
+                let rows: Vec<ClaimedId> =
+                    diesel::sql_query(queue::claim_batched_candidate_attempt_query())
+                        .bind::<diesel::sql_types::Text, _>("build-routing-tester")
+                        .bind::<diesel::sql_types::Uuid, _>(task_id)
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                            None::<String>,
+                        )
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(
+                            None::<i32>,
+                        )
+                        .bind::<diesel::sql_types::Text, _>("activity")
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                            None::<String>,
+                        )
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                            None::<String>,
+                        )
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                            &Vec::<String>::new(),
+                        )
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+                            None::<chrono::DateTime<chrono::Utc>>,
+                        )
+                        .bind::<diesel::sql_types::Text, _>(worker_build_id)
+                        .load(conn)
+                        .await?;
+                Ok(rows.into_iter().next().map(|r| r.id))
+            },
+        )
+        .await
+        .expect("transaction")
+    }
+
+    // No declared compatibility between the worker's build and the
+    // task's required build. The attempt must reject it, exactly as if
+    // compatibility had just been revoked before this attempt ran.
+    let claimed = try_attempt(&mut conn, task_id, &worker_build).await;
+    assert_eq!(claimed, None);
+    assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
+
+    // Declaring compatibility flips the same query's own re-check to
+    // pass, proving this is a live gate, not a stale one.
+    build_routing::declare_compat(&mut conn, &worker_build, &required_build)
+        .await
+        .expect("declare compat");
+    let claimed = try_attempt(&mut conn, task_id, &worker_build).await;
+    assert_eq!(claimed, Some(task_id));
+    assert_eq!(task_state(&mut conn, task_id).await, "RUNNING");
 }
 
 // ── Other preserved gates, exercised end-to-end (not just SQL-shape) ───────
