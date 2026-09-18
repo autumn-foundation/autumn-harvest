@@ -20906,7 +20906,6 @@ pub(crate) async fn signal_with_start_workflow(
         .pick_for_new_workflow(&workflow_name, &workflow_id);
     let mut found_shard: Option<(ShardId, PoolConn, ExecutionId, bool)> = None;
     let mut seal_only: Option<ShardId> = None;
-    let mut dead_shard: Option<ShardId> = None;
     for (candidate_shard, shard_pool) in pool.iter_shards() {
         let mut shard_conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
@@ -20987,37 +20986,27 @@ pub(crate) async fn signal_with_start_workflow(
             // connection and keep scanning (issue #1317 review). Holding it
             // via a `canonical_dead`-style fallback would starve a later
             // shard aliased to the same size-one pool. A live row found
-            // later still wins.
+            // later still wins. The fallback below reacquires
+            // `canonical_shard` fresh.
             //
-            // Remember the shard, not the connection, but only for a
-            // RESETTABLE terminal state (issue #1317 review, P1 follow-up).
-            // FAILED/CANCELLED/TIMED_OUT stay resettable
-            // (`reset.rs`'s `allow_terminal_source`), so a row in one of
-            // these states can still turn live again right where it sits.
-            // `canonical_shard` is recomputed from current routing and can
-            // name a different shard once rebalancing has moved where this
-            // business key now hashes to. Falling through to it blindly
-            // would start a fresh run there. This row would still be
-            // live-again-capable on its own shard. That is two live rows
-            // for one business key the moment either side of that split is
-            // reset or resettled. Landing the fresh start on this row's own shard
-            // instead keeps `replace_execution` sealing the exact row that
-            // would otherwise be resurrectable.
+            // `canonical_shard`, not this row's own shard. This applies
+            // even to a FAILED/CANCELLED/TIMED_OUT row that stays
+            // resettable through `reset.rs`'s `allow_terminal_source`
+            // (issue #1317 review, P1 follow-up and its own follow-up).
+            // Landing the fresh start on
+            // the dead row's shard instead was tried and reverted. A later
+            // plain `start_workflow` for the same key still routes to
+            // `canonical_shard` regardless, finds nothing there, and admits
+            // a second live run immediately. No reset is required, and
+            // this is the exact race the COMPLETED case below, and its
+            // own regression test, already close.
             //
-            // COMPLETED is excluded. `validate_source_execution` never
-            // admits it under `allow_terminal_source`, so it can never
-            // become live again. Routing a fresh start away from
-            // `canonical_shard` for one would only reopen the OTHER race
-            // this scan exists to close. A later plain `start_workflow` for
-            // the same key routes straight to `canonical_shard`, finds
-            // nothing there, and admits a second live run beside this one
-            // (`signal_with_start_routes_a_fresh_run_past_a_stale_terminal_copy_to_the_canonical_shard`).
-            if matches!(
-                existing_state.as_str(),
-                "FAILED" | "CANCELLED" | "TIMED_OUT"
-            ) {
-                dead_shard.get_or_insert(candidate_shard);
-            }
+            // A resettable row left off `canonical_shard` this way can
+            // still be revived by a later reset on its own shard. That
+            // produces a second live execution the far slower way. Closing
+            // it needs cross-shard coordination this codebase deliberately
+            // does not have (see `docs/sharding.md`'s residency caveats and
+            // issue #1313). Accepted as a known residual, not fixed here.
         }
     }
 
@@ -21040,19 +21029,14 @@ pub(crate) async fn signal_with_start_workflow(
     let (shard, mut conn, exec_id, _will_attach) = if let Some(tuple) = found_shard {
         tuple
     } else {
-        // A resettable dead row's own shard wins over `canonical_shard`
-        // (issue #1317 review, P1 follow-up) -- see the comment on
-        // `dead_shard` above. `canonical_shard` is used only once the scan
-        // saw no row at all.
-        let target_shard = dead_shard.unwrap_or(canonical_shard);
-        let conn = match db_conn_for_shard(&api_state, target_shard).await {
+        let conn = match db_conn_for_shard(&api_state, canonical_shard).await {
             Ok(c) => c,
             Err(e) => return e.into_response(),
         };
         (
-            target_shard,
+            canonical_shard,
             conn,
-            ExecutionId::new_for_shard(target_shard),
+            ExecutionId::new_for_shard(canonical_shard),
             false,
         )
     };
@@ -21689,7 +21673,6 @@ async fn update_with_start_workflow(
             .pick_for_new_workflow(&workflow_name, &workflow_id);
         let mut found_shard: Option<(ShardId, PoolConn, ExecutionId)> = None;
         let mut seal_only: Option<ShardId> = None;
-        let mut dead_shard: Option<ShardId> = None;
         for (candidate_shard, shard_pool) in pool.iter_shards() {
             let mut shard_conn = match acquire_conn(shard_pool).await {
                 Ok(c) => c,
@@ -21762,21 +21745,12 @@ async fn update_with_start_workflow(
                 // holding it as a fallback (issue #1317 review). A
                 // `canonical_dead`-style hold would starve a later shard
                 // aliased to the same size-one pool. A live row found later
-                // still wins.
-                //
-                // Remember the shard, not the connection, but only for a
-                // RESETTABLE terminal state. See the matching `dead_shard`
-                // comment in the signal-with-start handler (issue #1317
-                // review, P1 follow-up). COMPLETED is excluded. It can
-                // never turn live again, so it keeps using
-                // `canonical_shard`, which the sibling scan's own
-                // regression coverage requires.
-                if matches!(
-                    existing_state.as_str(),
-                    "FAILED" | "CANCELLED" | "TIMED_OUT"
-                ) {
-                    dead_shard.get_or_insert(candidate_shard);
-                }
+                // still wins. The fallback below reacquires
+                // `canonical_shard` fresh, including for a
+                // FAILED/CANCELLED/TIMED_OUT row that stays resettable.
+                // See the matching comment in the signal-with-start handler
+                // (issue #1317 review, P1 follow-up and its own follow-up)
+                // for why that tradeoff is deliberate.
             }
         }
 
@@ -21795,15 +21769,15 @@ async fn update_with_start_workflow(
             ))
             .into_response();
         } else {
-            // A resettable dead row's own shard wins over `canonical_shard`
-            // -- see the matching comment in the signal-with-start handler
-            // (issue #1317 review, P1 follow-up).
-            let target_shard = dead_shard.unwrap_or(canonical_shard);
-            let conn = match db_conn_for_shard(&api_state, target_shard).await {
+            let conn = match db_conn_for_shard(&api_state, canonical_shard).await {
                 Ok(c) => c,
                 Err(e) => return e.into_response(),
             };
-            (target_shard, conn, ExecutionId::new_for_shard(target_shard))
+            (
+                canonical_shard,
+                conn,
+                ExecutionId::new_for_shard(canonical_shard),
+            )
         }
     };
 

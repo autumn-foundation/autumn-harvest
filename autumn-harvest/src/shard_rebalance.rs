@@ -2596,7 +2596,7 @@ mod db {
                 // just came from — a cycle, and `read_forward` matches on the
                 // pointer rather than the state, so the live row's state would
                 // not save it.
-                diesel::sql_query(
+                let activated = diesel::sql_query(
                     "UPDATE harvest_workflow_executions \
                         SET state = 'RUNNING', \
                             migrated_to_shard = NULL, \
@@ -2617,23 +2617,46 @@ mod db {
                 // #1317 review, P1). Activation is the point of no return
                 // for that seal. Drop its restore marker rather than carry
                 // it forever: nothing will ever abort this migration again
-                // to need it. Idempotent, like the update above -- a
-                // repeat activation finds nothing left to clear.
-                diesel::sql_query(
-                    "UPDATE harvest_workflow_executions \
-                      SET staging_vacated_state = NULL \
-                      WHERE staging_vacated_state IS NOT NULL AND id != $1 \
-                        AND workflow_name = \
-                            (SELECT workflow_name FROM harvest_workflow_executions \
-                              WHERE id = $1) \
-                        AND workflow_id = \
-                            (SELECT workflow_id FROM harvest_workflow_executions \
-                              WHERE id = $1)",
-                )
-                .bind::<SqlUuid, _>(exec_id.as_uuid())
-                .execute(&mut *conn)
-                .await
-                .map_err(database_error)?;
+                // to need it.
+                //
+                // Gated on `activated > 0` (issue #1317 review, P1
+                // follow-up), not run unconditionally on every call. The
+                // durable `COMMITTED` record can retry this function long
+                // after the update above already matched and committed.
+                // A target-side crash between that commit and the
+                // source-side `DONE` write is exactly the case
+                // `activate_target`'s own idempotence exists to tolerate.
+                // By then a DIFFERENT same-key migration can have vacated
+                // its OWN unrelated terminal row on this same target. The
+                // clear below is keyed only by business identity, with no
+                // link to which migration attempt owns which vacate. An
+                // unconditional retry would clear that newer attempt's
+                // marker instead of this one's. If the newer migration
+                // later aborts, it would find no marker to restore from,
+                // leaving its vacated row stuck reporting
+                // `CONTINUED_AS_NEW` forever. `activated > 0` is true only
+                // in the exact call that just performed the transition
+                // above, in the same transaction as the clear. It scopes
+                // the clear to the marker this invocation actually owns,
+                // exactly once. A retry after that same transition has
+                // already committed skips it entirely.
+                if activated > 0 {
+                    diesel::sql_query(
+                        "UPDATE harvest_workflow_executions \
+                          SET staging_vacated_state = NULL \
+                          WHERE staging_vacated_state IS NOT NULL AND id != $1 \
+                            AND workflow_name = \
+                                (SELECT workflow_name FROM harvest_workflow_executions \
+                                  WHERE id = $1) \
+                            AND workflow_id = \
+                                (SELECT workflow_id FROM harvest_workflow_executions \
+                                  WHERE id = $1)",
+                    )
+                    .bind::<SqlUuid, _>(exec_id.as_uuid())
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(database_error)?;
+                }
 
                 if let Some(task) = staged_task {
                     diesel::sql_query(
