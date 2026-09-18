@@ -2765,11 +2765,53 @@ mod db {
         // `discard_staged_copy_restoring_seal` runs in one transaction. It
         // is a no-op once the target is no longer `MIGRATING`. Repeating it
         // here is always safe, not merely safe on the first attempt.
-        Box::pin(target.transaction::<(), HarvestError, _>(async |conn| {
-            discard_staged_copy_restoring_seal(&mut *conn, exec_id).await
+        //
+        // Gated behind a fresh lock on this exact `harvest_shard_migrations`
+        // row, held open for the target call's whole duration (issue #1317
+        // review, P1 follow-up). The claim above can be arbitrarily old by
+        // now. It only proves ABORTED was true at its own commit, and a
+        // retrying call's read of it is older still. `begin_migration` can
+        // reopen this exact record in the gap. It can then run a whole new
+        // attempt through staging and cutover before this line runs. That
+        // risk is highest when the reopened attempt targets the same
+        // target shard. Cleaning up here would then hit that new attempt's
+        // now-live copy. That copy is not the abandoned one this call
+        // exists to finish. Deleting or resealing it would orphan a
+        // source seal the new attempt already committed. That is the
+        // exact "sealed source, missing copy" outcome the claim above
+        // exists to prevent.
+        //
+        // `begin_migration`'s `INSERT ... ON CONFLICT DO UPDATE` needs this
+        // same row's lock to perform its update, so it blocks behind this
+        // transaction rather than racing it. A phase this re-read finds no
+        // longer `ABORTED` means a reopen won that race before this
+        // transaction's own lock closed it. That is legitimate progress,
+        // not an error. This call has nothing left to finish, so it
+        // returns cleanly without touching the target. On a genuine target
+        // failure, this transaction rolls back and releases the lock
+        // without writing anything. A later retry then finds exactly the
+        // state it would have found today.
+        Box::pin(source.transaction::<(), HarvestError, _>(async |conn| {
+            diesel::sql_query(
+                "SELECT execution_id FROM harvest_shard_migrations \
+                  WHERE execution_id = $1 FOR UPDATE",
+            )
+            .bind::<SqlUuid, _>(exec_id.as_uuid())
+            .execute(&mut *conn)
+            .await
+            .map_err(database_error)?;
+
+            let phase = load_migration(&mut *conn, exec_id).await?.map(|r| r.phase);
+            if phase != Some(MigrationPhase::Aborted) {
+                return Ok(());
+            }
+
+            Box::pin(target.transaction::<(), HarvestError, _>(async |tconn| {
+                discard_staged_copy_restoring_seal(&mut *tconn, exec_id).await
+            }))
+            .await
         }))
-        .await?;
-        Ok(())
+        .await
     }
 
     // ── Candidate discovery ──────────────────────────────────────────────────

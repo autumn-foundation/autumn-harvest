@@ -4273,6 +4273,120 @@ async fn a_repeated_abort_finishes_a_target_cleanup_a_prior_attempt_did_not() {
     );
 }
 
+#[tokio::test]
+async fn abort_migrations_gated_cleanup_waits_for_a_held_migration_row_lock() {
+    // Issue #1317 review, P1 follow-up. `abort_migration`'s target cleanup
+    // now runs gated behind a fresh lock on this exact
+    // `harvest_shard_migrations` row, held open for the cleanup's whole
+    // duration. Without that lock, a `begin_migration` reopen could win a
+    // race against an abort retry. The retry decides the record is
+    // `ABORTED`. The reopen can still stage, verify and cut over an
+    // entire new attempt before the retry reaches the target. The retry
+    // could then delete or reseal the new attempt's live copy, orphaning
+    // a source seal that had already committed.
+    //
+    // `begin_migration`'s `INSERT ... ON CONFLICT DO UPDATE` needs the
+    // same row's lock to perform its update. Holding that lock is what
+    // would block a concurrent reopen out of the race window. This test
+    // proves `abort_migration` itself pays that price. Called while
+    // something else holds the row locked, it must wait rather than
+    // reach the target immediately. It must still finish the cleanup
+    // correctly once the lock is released.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "abort-lock-race").await;
+
+    begin_migration(&mut shards.source().await, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(
+        &mut shards.source().await,
+        &mut shards.target().await,
+        exec_id,
+        TARGET,
+    )
+    .await
+    .expect("stage");
+
+    // Claim the abort exactly like `abort_migration`'s own CLAIM UPDATE.
+    // That puts the record in the same `ABORTED` state its gated cleanup
+    // section would find it in. The target's staged copy is still intact
+    // -- the cleanup that phase claims already happened never ran.
+    let mut claim_conn = shards.source().await;
+    let claimed = diesel::sql_query(
+        "UPDATE harvest_shard_migrations \
+            SET phase = 'ABORTED', abort_reason = $2, updated_at = NOW() \
+          WHERE execution_id = $1 AND phase IN ('PENDING', 'COPIED', 'VERIFIED')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>("simulated dropped connection")
+    .execute(&mut claim_conn)
+    .await
+    .expect("claim");
+    assert_eq!(claimed, 1, "precondition: the claim itself must succeed");
+
+    // Hold the exact lock `abort_migration`'s gated section takes, on its
+    // own task, with a signal for when the lock is actually held. That
+    // way `abort_migration` below races against a lock that is
+    // definitely acquired, not against unspecified task-scheduling order.
+    let mut holder = shards.source().await;
+    let (lock_held_tx, lock_held_rx) = tokio::sync::oneshot::channel();
+    let holder_task = tokio::spawn(async move {
+        Box::pin(holder.transaction::<(), HarvestError, _>(async |conn| {
+            diesel::sql_query(
+                "SELECT execution_id FROM harvest_shard_migrations \
+                  WHERE execution_id = $1 FOR UPDATE",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .execute(conn)
+            .await?;
+            let _ = lock_held_tx.send(());
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            Ok(())
+        }))
+        .await
+        .expect("holder transaction");
+    });
+    lock_held_rx.await.expect("lock-held signal");
+
+    let mut source = shards.source().await;
+    let mut target = shards.target().await;
+    let started = std::time::Instant::now();
+    abort_migration(&mut source, &mut target, exec_id, "late retry")
+        .await
+        .expect("the retry must still succeed once the lock is released");
+    let elapsed = started.elapsed();
+    holder_task.await.expect("holder task");
+
+    assert!(
+        elapsed >= std::time::Duration::from_millis(200),
+        "abort_migration's gated cleanup must wait behind a held \
+         harvest_shard_migrations row lock, not race past it -- took {elapsed:?}"
+    );
+
+    // The cleanup itself must still have run correctly once unblocked --
+    // same assertions as the unheld-lock case above.
+    assert_eq!(
+        count(
+            &mut target,
+            "SELECT count(*)::BIGINT AS value FROM harvest_events WHERE workflow_exec_id = $1",
+            exec_id
+        )
+        .await,
+        0,
+        "the target's staged copy must be cleaned up once the lock releases"
+    );
+    assert_eq!(
+        count(
+            &mut target,
+            "SELECT count(*)::BIGINT AS value FROM harvest_workflow_executions WHERE id = $1",
+            exec_id
+        )
+        .await,
+        0,
+        "a forward migration's staged row has no seal to restore, so it must be gone"
+    );
+}
+
 // ── Issue #1317: a hold placed during staging must not be cut over past ─────
 
 #[tokio::test]
