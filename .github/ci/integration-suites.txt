@@ -130,6 +130,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          terminal_write_ownership_tests
 linux        autumn-harvest         integration                      -                          transactional_start_tests
 linux        autumn-harvest         integration                      -                          triage_tests
+linux        autumn-harvest         integration                      -                          typed_stub_deferred_admission_tests
 linux        autumn-harvest         integration                      -                          typed_workflow_failure_tests
 linux        autumn-harvest         integration                      -                          usage_report_activity_lookback_tests
 linux        autumn-harvest         integration                      -                          workflow_id_targeted_tests
