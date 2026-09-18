@@ -1932,6 +1932,28 @@ mod db {
     /// back to the connection this call already holds, instead of
     /// deadlocking a pool-size-one shard against itself.
     ///
+    /// # A residual cross-shard race (issue #1317 review, P1 follow-up)
+    ///
+    /// [`live_copy_is_terminal`] reads the target shard's occupancy on one
+    /// connection, then this function's `UPDATE` commits on `source`'s
+    /// separate connection. Postgres offers no cross-shard transaction, and
+    /// this engine deliberately adds no coordinator (`docs/sharding.md`,
+    /// *Cross-shard global limits — explicit out of scope*). A target-side
+    /// restart can therefore replace the terminal row between the read and
+    /// the commit. A later start pinned back to `source` can then create a
+    /// second live run under the same business key. The same is true of a
+    /// start whose routing view has not yet observed a completed rebalance.
+    ///
+    /// This is the same architectural gap issue #1313 already tracks for
+    /// [`crate::external_target_location`]'s by-id fan-out.
+    /// `(workflow_name, workflow_id)` uniqueness is shard-local, so two live
+    /// runs of one key require mixing pinned and unpinned starts of it.
+    /// `docs/sharding.md`'s pinning-discipline caveat already asks
+    /// operators to avoid exactly that mix. Issue #1313 records the
+    /// project's own inclination as accept-and-name-it, over building a
+    /// coordination primitive for one caller. This function follows that
+    /// precedent instead of repeating the design discussion here.
+    ///
     /// # Errors
     ///
     /// Same as [`live_copy_is_terminal`], plus [`HarvestError::Database`] on

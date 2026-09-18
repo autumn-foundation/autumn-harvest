@@ -1610,9 +1610,10 @@ impl ShardedDbPool {
     /// Two distinct [`ShardId`]s can be aliased to one physical database
     /// during a pre-split staging rollout (see [`Self::pool_groups`]). A
     /// caller holding a checked-out connection for `a` must not check out
-    /// `b` too when this returns `true`: on a size-one pool that would wait
-    /// for a second connection the held one can never release, deadlocking
-    /// until the checkout times out. Comparing `a == b` alone misses this,
+    /// `b` too when this returns `true`. On a size-one pool, that would
+    /// wait for a second connection the held one can never release. It
+    /// would deadlock until the checkout times out. Comparing `a == b`
+    /// alone misses this,
     /// since the aliasing is about physical pool identity, not shard-id
     /// equality. Unknown shards (absent from `pool_group`) compare unequal
     /// to everything, including themselves.
