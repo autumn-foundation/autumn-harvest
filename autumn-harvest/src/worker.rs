@@ -20630,10 +20630,10 @@ async fn process_workflow_task(
             //
             // Route the park through `check_paused_and_park`, the same guard
             // the persist-time check further down uses. It re-checks PAUSED
-            // under a `FOR UPDATE` lock on the execution row, then re-derives
-            // the task claim under its own lock (issue #1184) before parking.
-            // A lost claim surfaces as `TerminalWriteClaimAmbiguous` instead
-            // of an unconditional park.
+            // under a `FOR UPDATE` lock on the execution row. It then
+            // re-derives the task claim under its own lock (issue #1184)
+            // before parking. A lost claim surfaces as
+            // `TerminalWriteClaimAmbiguous` instead of an unconditional park.
             //
             // This also removes the raced-wake gap the old fast-path park had
             // (PR #901 review). The execution row lock here serializes with

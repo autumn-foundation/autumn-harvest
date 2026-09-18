@@ -2063,7 +2063,7 @@ async fn pause_during_inflight_decision_task_discards_pending_commands() {
 // Issue #1347: the early, non-locking pause fast path in
 // `process_workflow_task` had no ownership guard. It called
 // `queue::park_workflow_task` directly. That function parks a row by task id
-// alone; it has no worker_id check. A stale dispatcher whose claim already
+// alone. It has no worker_id check. A stale dispatcher whose claim already
 // moved to a new owner could still clear that owner's claim on this path.
 // This was the one #1184 site this class of guard had not yet reached.
 //
@@ -2101,7 +2101,7 @@ async fn task_owner_and_state(
         .expect("the task row survives an undecided dispatch")
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pause_fast_path_makes_no_terminal_decision_when_the_claim_moved() {
     let (url, _c) = setup().await;
     let pool = build_pool(&url);
