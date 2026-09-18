@@ -9,7 +9,7 @@ use tower::ServiceExt;
 
 use crate::domain::{RUNNER_QUEUE, StandaloneOrder};
 use crate::runtime::{standalone_builder, standalone_runtime_config};
-use crate::server::build_router;
+use crate::server::{build_router, declare_deployment_profile};
 use crate::workflows;
 
 #[test]
@@ -125,15 +125,38 @@ async fn openapi_document_is_ungated() {
     );
 }
 
-/// Pins issue #1609. The example's own README documents this exact request
-/// as the deployment preflight step. The example never declares a
-/// credential, so the admin gate fails closed. This assertion is a
-/// regression guard, not a fix. Flip it to `OK` once #1609 gives the
-/// example a credential to present.
+/// Pins issue #1609's fail-closed default. `router_under_test` never
+/// declares a profile, so the admin gate has nothing to open on.
 #[tokio::test]
 async fn preflight_without_a_credential_is_rejected() {
     assert_eq!(
         get_status(router_under_test(), "/api/harvest/admin/preflight").await,
         StatusCode::UNAUTHORIZED
+    );
+}
+
+/// Closes issue #1609. `declare_deployment_profile` is what `run` calls
+/// before installing the runner's API runtime, so this reproduces the
+/// exact posture the README's `AUTUMN_PROFILE=dev` command produces.
+///
+/// The request runs twice. The `preflight` handler used to reset the
+/// deployment profile from the router's `autumn_web::AppState` on every
+/// call, and a placeholder `AppState::for_test()` reports `"default"`, not
+/// `"dev"`. That would have closed the gate again after the first request.
+/// The router now carries no `AppState` at all (issue #1606), so the reset
+/// has no source left. This pins its absence.
+#[tokio::test]
+async fn preflight_succeeds_once_dev_profile_is_declared() {
+    let api_state = HarvestApiState::new();
+    declare_deployment_profile(&api_state, Some("dev"));
+    let app = build_router(api_state);
+
+    assert_eq!(
+        get_status(app.clone(), "/api/harvest/admin/preflight").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        get_status(app, "/api/harvest/admin/preflight").await,
+        StatusCode::OK
     );
 }

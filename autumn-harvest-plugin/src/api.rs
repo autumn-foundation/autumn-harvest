@@ -8691,16 +8691,32 @@ pub const fn management_api_response_fields()
     ]
 }
 
-/// `GET /admin/preflight` -- the deployment preflight report.
-///
-/// The profile comes from `HarvestApiState` (issue #1606). An earlier version
-/// read it from an `autumn_web::AppState` the router carried. That single
-/// extractor is what forced both routers to be `Router<AppState>`.
-///
-/// The read was also redundant on the plugin path. `start_harvest_runtime`
-/// already sets the profile at startup. On a standalone mount the read was
-/// unreachable: this route sits behind the gate that reads the profile it set.
-/// `start_harvest_runtime` is now the only writer.
+// Issue #1609: this handler used to reset the deployment profile from
+// `AppState::profile()` on every call.
+//
+// The reset was redundant on the `HarvestPlugin` path. `plugin.rs`'s
+// `start_harvest_runtime` sets the profile once at startup, before this
+// handler can run.
+//
+// The reset was harmful on a standalone mount. The admin gate
+// (`require_admin`, a `route_layer`) reads the profile before this handler
+// runs. The reset here can never open the gate for its own request.
+//
+// The reset could also close a gate an embedder had opened. Some mounts use
+// a placeholder `AppState`, for example `AppState::for_test()`. Its
+// `profile()` method returns `"default"`. A first request could pass
+// through a profile the embedder set with
+// `HarvestApiState::set_deployment_profile`. The handler would then
+// overwrite that profile with `"default"` as a side effect of the response.
+// Every later request would then fail the gate.
+//
+// A preflight check reports the current profile. It must not also change
+// the profile.
+//
+// Issue #1606: that reset was also the only reader of the router's
+// `autumn_web::AppState`. Removing it is what lets both routers be
+// `Router<()>`, so an embedder no longer constructs an `AppState` it has no
+// other use for.
 async fn preflight(Extension(api_state): Extension<HarvestApiState>) -> Json<PreflightReport> {
     Json(build_preflight_report(&api_state).await)
 }
