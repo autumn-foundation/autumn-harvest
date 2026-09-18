@@ -204,6 +204,26 @@ existing deadline-recheck regression tests (which exercise the same
 pre-check against real elapsed time) rather than a fabricated
 skew-specific test.
 
+Codex then caught a fifteenth bug (P2, a real correctness gap, the
+same class as the thirteenth): the batch scan's own capability-label
+gate (`required_capabilities` against `harvest_workers.labels`) only
+filters candidates at SCAN time, the same two-phase staleness window
+as build routing. A worker's labels can change between the scan and
+this candidate's own attempt (a heartbeat refresh, or the same worker
+id re-registering with different capabilities), and the attempt never
+re-checked them. Fixed by adding a `worker_info` CTE to the attempt
+query (reading `harvest_workers.labels` fresh, not the scan's stale
+snapshot) and re-running the scan's own capability check, verbatim, in
+`claimed`'s `WHERE`. Applied the SAME leak-prevention pattern already
+used for the deadline and build-routing gates to `rate_limit_debit`'s
+`WHERE` too, closing the same class of leak for this gate from the
+start rather than needing a follow-up finding. Verified with a test
+driving the attempt query directly (worker labels that do not satisfy
+the requirement are rejected, then updating them flips the same
+query's own re-check to pass) and a debit-leak test mirroring the
+build-routing one (a capability-mismatched candidate leaves the bucket
+untouched).
+
 **Not wired into the default claim path.** `claim_task`/`claim_task_on_shard`
 are unchanged. Issue #1340 is explicit that no query change should land
 against it without sign-off from someone with full context on `queue.rs`'s
@@ -212,7 +232,7 @@ tested, measured building block for that review, not a switch of default
 production behavior. It also does not implement the cross-region DR fence
 (#954) or the by-id claim (#1312) the single-row path carries.
 
-**Test evidence.** `tests/integration/claim_batched_tests.rs` (20 DB-backed
+**Test evidence.** `tests/integration/claim_batched_tests.rs` (22 DB-backed
 tests, red-then-green): equivalence with the single-row path on a plain
 backlog, an adversarial saturated-concurrency-key fixture matching ledger
 #4/#5's own shape, a multi-batch fixture with tied sort keys spanning a
@@ -253,13 +273,20 @@ worker/required-build pair, asserting it is rejected exactly as
 compatibility flips the same query's own re-check to pass, a regression
 test for the build-routing-debit-leak follow-up above (same
 never-debits-on-rejection shape as the deadline-leak test, asserting an
-undeclared build pair leaves the bucket untouched), sticky
+undeclared build pair leaves the bucket untouched), a regression test for
+the fifteenth bug above that drives
+`claim_batched_candidate_attempt_query()` directly with a worker whose
+labels do not satisfy `required_capabilities`, asserting rejection, then
+that updating those labels flips the same query's own re-check to pass,
+a regression test for the matching debit-leak follow-up (same
+never-debits-on-rejection shape, asserting a capability-mismatched
+candidate leaves the bucket untouched), sticky
 routing and a
 capability-routed-activity gate exercised end-to-end through the real
 function (not just SQL-text checks), and — the gap ledger #5's own
 single-session apparatus explicitly could not close — real concurrent
 Tokio claimers racing a capped concurrency key, asserting the cap is
-never exceeded. `queue.rs`'s `mod tests` gains 18 SQL-shape unit tests
+never exceeded. `queue.rs`'s `mod tests` gains 19 SQL-shape unit tests
 pinning the query text (concurrency gate omitted from the batch scan,
 every other gate preserved byte-for-byte including both capability-label
 branches, the cursor's four-column `OR`-chain, the authoritative
@@ -276,9 +303,11 @@ lock also skips circuit-breaker-tracked activities, the eleventh-bug fix
 that the rate-limit formula and `last_refilled_at` read `now_ts` instead
 of `NOW()`, the twelfth-bug fix that an already-expired candidate is
 rejected before any query at all, the thirteenth-bug fix that
-`claimed`'s `WHERE` re-runs the scan's own build-routing gate, and its
+`claimed`'s `WHERE` re-runs the scan's own build-routing gate, its
 own follow-up fix that `rate_limit_debit`'s `WHERE` carries the same
-gate).
+gate, and the fifteenth-bug fix that `claimed`'s `WHERE` re-runs the
+scan's own capability-label gate too, with the same leak-prevention
+pattern applied to `rate_limit_debit`'s `WHERE` from the start).
 
 **Measurement.** `docs/performance-claim-batched-seek-and-refine.md`,
 regenerated from a single run of

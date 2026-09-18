@@ -6408,6 +6408,9 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
 /// `$4` concurrency cap, `$5` task type. Also `$6` rate limit key, `$7`
 /// activity name, `$8` circuit-breaker-tracked activities, `$9` schedule-
 /// to-close deadline, `$10` worker build id.
+// The body is one SQL string literal; the line count is the query's, not
+// control flow's -- the same allow `claim_task_query` carries.
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn claim_batched_candidate_attempt_query() -> &'static str {
     static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
@@ -6422,6 +6425,9 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
                      WHERE $6::text IS NOT NULL AND NOT ($7 = ANY($8)) AND b.key = $6 \
                      FOR UPDATE \
                  ) locked ON TRUE \
+             ), \
+             worker_info AS ( \
+                 SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{{}}'::jsonb) AS labels \
              ), \
              rate_limit_debit AS ( \
                  UPDATE harvest_rate_limit_buckets b \
@@ -6442,6 +6448,26 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
                                  SELECT 1 FROM harvest_build_compat \
                                  WHERE build_id = $10 \
                                    AND compatible_with = t.required_build_id \
+                             ) \
+                         ) \
+                         AND ( \
+                             t.required_capabilities IS NULL \
+                             OR NOT EXISTS ( \
+                                 SELECT 1 \
+                                 FROM jsonb_array_elements(t.required_capabilities) AS r(value) \
+                                 WHERE ( \
+                                     r.value ? 'Exact' AND ( \
+                                         (SELECT labels FROM worker_info)->>(r.value->'Exact'->>'key') IS NULL \
+                                         OR (SELECT labels FROM worker_info)->>(r.value->'Exact'->>'key') != (r.value->'Exact'->>'value') \
+                                     ) \
+                                 ) OR ( \
+                                     r.value ? 'In' AND ( \
+                                         (SELECT labels FROM worker_info)->>(r.value->'In'->>'key') IS NULL \
+                                         OR NOT ( \
+                                             (r.value->'In'->'values') @> jsonb_build_array((SELECT labels FROM worker_info)->>(r.value->'In'->>'key')) \
+                                         ) \
+                                     ) \
+                                 ) \
                              ) \
                          ) \
                    ) \
@@ -6486,6 +6512,26 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
                            SELECT 1 FROM harvest_build_compat \
                            WHERE build_id = $10 \
                              AND compatible_with = harvest_task_queue.required_build_id \
+                       ) \
+                   ) \
+                   AND ( \
+                       required_capabilities IS NULL \
+                       OR NOT EXISTS ( \
+                           SELECT 1 \
+                           FROM jsonb_array_elements(required_capabilities) AS r(value) \
+                           WHERE ( \
+                               r.value ? 'Exact' AND ( \
+                                   (SELECT labels FROM worker_info)->>(r.value->'Exact'->>'key') IS NULL \
+                                   OR (SELECT labels FROM worker_info)->>(r.value->'Exact'->>'key') != (r.value->'Exact'->>'value') \
+                               ) \
+                           ) OR ( \
+                               r.value ? 'In' AND ( \
+                                   (SELECT labels FROM worker_info)->>(r.value->'In'->>'key') IS NULL \
+                                   OR NOT ( \
+                                       (r.value->'In'->'values') @> jsonb_build_array((SELECT labels FROM worker_info)->>(r.value->'In'->>'key')) \
+                                   ) \
+                               ) \
+                           ) \
                        ) \
                    ) \
                  RETURNING harvest_task_queue.* \
@@ -7797,6 +7843,43 @@ mod tests {
             "claimed's WHERE must re-check required_build_id against \
              $10 (worker_build_id) and harvest_build_compat, the same \
              gate the batch scan already applies; got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR. The batch
+    /// scan's own capability-label gate (`required_capabilities`
+    /// against `harvest_workers.labels`) only filters at SCAN time,
+    /// the same class of gap as the build-routing bug above. A
+    /// worker's labels can change between the scan and this
+    /// candidate's own attempt, a separate, later statement. A
+    /// heartbeat refresh, or the same worker id re-registering, can
+    /// both do it.
+    /// `claimed`'s `WHERE` must re-run the same capability check the
+    /// scan uses. It must read the worker's current labels through a
+    /// fresh `worker_info` CTE, not the scan's own stale snapshot.
+    #[test]
+    fn claim_batched_candidate_attempt_query_rechecks_capability_labels() {
+        let sql = claim_batched_candidate_attempt_query();
+        assert!(
+            sql.contains("worker_info AS ( \\") || sql.contains("worker_info AS ("),
+            "the attempt query must define its own worker_info CTE, \
+             reading harvest_workers.labels fresh rather than reusing \
+             a stale value from the batch scan; got:\n{sql}"
+        );
+        let claimed_clause = sql
+            .split("claimed AS (")
+            .nth(1)
+            .and_then(|rest| rest.split("RETURNING harvest_task_queue.*").next())
+            .unwrap_or_default();
+        assert!(
+            claimed_clause.contains("required_capabilities IS NULL")
+                && claimed_clause.contains("jsonb_array_elements(required_capabilities)")
+                && claimed_clause.contains("FROM worker_info")
+                && claimed_clause.contains("r.value ? 'Exact'")
+                && claimed_clause.contains("r.value ? 'In'"),
+            "claimed's WHERE must re-check required_capabilities against \
+             a freshly-read worker_info.labels, the same gate the batch \
+             scan already applies; got:\n{sql}"
         );
     }
 

@@ -894,6 +894,216 @@ async fn batched_claim_attempt_never_debits_rate_limit_for_a_build_incompatible_
     );
 }
 
+/// Regression test for a review finding on this PR. Same
+/// never-debits-on-rejection shape as the build-routing and deadline
+/// leak tests above, for the capability-labels gate. A candidate whose
+/// worker does not satisfy `required_capabilities` must not debit a
+/// rate-limit token either.
+#[tokio::test(flavor = "multi_thread")]
+async fn batched_claim_attempt_never_debits_rate_limit_for_a_capability_mismatched_candidate() {
+    use diesel_async::RunQueryDsl;
+
+    let (_url, mut conn, _container) = setup_db().await;
+    let bucket_key = format!("bucket-{}", Uuid::new_v4().simple());
+    queue::ensure_rate_limit_bucket(&mut conn, &bucket_key, 0.0, 100.0)
+        .await
+        .expect("ensure bucket");
+
+    let worker_id = format!("capability-no-leak-tester-{}", Uuid::new_v4().simple());
+    diesel::sql_query(
+        "INSERT INTO harvest_workers \
+         (worker_id, queues, shard_assignments, max_concurrency, host, build_id, labels) \
+         VALUES ($1, '[]'::jsonb, '[]'::jsonb, 1, 'test-host', '', '{}'::jsonb)",
+    )
+    .bind::<diesel::sql_types::Text, _>(&worker_id)
+    .execute(&mut conn)
+    .await
+    .expect("insert worker");
+
+    let queue = unique_queue("batched-capability-no-leak");
+    let exec_id = insert_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id);
+    params.activity_name = Some("noop".to_string());
+    params.activity_id = Some(Uuid::new_v4());
+    params.rate_limit_key = Some(bucket_key.clone());
+    params.required_capabilities = Some(serde_json::json!([
+        {"Exact": {"key": "region", "value": "us-east"}}
+    ]));
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+    #[derive(diesel::QueryableByName)]
+    struct ClaimedId {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+    }
+
+    let mut tx = conn.build_transaction().read_committed();
+    let claimed: Option<Uuid> = tx
+        .run(
+            async |conn: &mut AsyncPgConnection| -> Result<Option<Uuid>, diesel::result::Error> {
+                let rows: Vec<ClaimedId> =
+                    diesel::sql_query(queue::claim_batched_candidate_attempt_query())
+                        .bind::<diesel::sql_types::Text, _>(&worker_id)
+                        .bind::<diesel::sql_types::Uuid, _>(task_id)
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                            None::<String>,
+                        )
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(
+                            None::<i32>,
+                        )
+                        .bind::<diesel::sql_types::Text, _>("activity")
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(Some(
+                            bucket_key.clone(),
+                        ))
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                            None::<String>,
+                        )
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                            &Vec::<String>::new(),
+                        )
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+                            None::<chrono::DateTime<chrono::Utc>>,
+                        )
+                        .bind::<diesel::sql_types::Text, _>("")
+                        .load(conn)
+                        .await?;
+                Ok(rows.into_iter().next().map(|r| r.id))
+            },
+        )
+        .await
+        .expect("transaction");
+
+    assert_eq!(
+        claimed, None,
+        "a worker whose labels do not satisfy required_capabilities must \
+         reject the claim"
+    );
+    assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
+
+    #[derive(diesel::QueryableByName)]
+    struct Tokens {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        tokens: f64,
+    }
+    let remaining =
+        diesel::sql_query("SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1")
+            .bind::<diesel::sql_types::Text, _>(&bucket_key)
+            .get_result::<Tokens>(&mut conn)
+            .await
+            .expect("tokens")
+            .tokens;
+    assert!(
+        (remaining - 100.0).abs() < 1e-9,
+        "the debit CTE must not spend a token for a candidate whose \
+         worker does not satisfy required_capabilities -- claimed was \
+         always going to reject it, so the debit must too; \
+         got {remaining}"
+    );
+}
+
+/// Regression test for a review finding on this PR. The batch scan's
+/// own capability-label gate only filters at scan time, the same class
+/// of gap the build-routing bug closed. A worker's labels can change
+/// between the scan and this candidate's own attempt, a separate,
+/// later statement. `claimed`'s `WHERE` must re-check labels fresh from
+/// `harvest_workers`, not trust the scan's own stale snapshot.
+///
+/// Drives `claim_batched_candidate_attempt_query()` directly, same
+/// style as the build-routing test above. A worker whose labels do
+/// not satisfy the requirement is rejected. Updating the worker's
+/// labels to satisfy it flips the same query's own re-check to pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn batched_claim_attempt_rechecks_capability_labels_not_just_the_batch_scan() {
+    use diesel_async::RunQueryDsl;
+
+    let (_url, mut conn, _container) = setup_db().await;
+    let worker_id = format!("capability-tester-{}", Uuid::new_v4().simple());
+    diesel::sql_query(
+        "INSERT INTO harvest_workers \
+         (worker_id, queues, shard_assignments, max_concurrency, host, build_id, labels) \
+         VALUES ($1, '[]'::jsonb, '[]'::jsonb, 1, 'test-host', '', '{}'::jsonb)",
+    )
+    .bind::<diesel::sql_types::Text, _>(&worker_id)
+    .execute(&mut conn)
+    .await
+    .expect("insert worker");
+
+    let queue = unique_queue("batched-capability-labels");
+    let exec_id = insert_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id);
+    params.activity_name = Some("noop".to_string());
+    params.activity_id = Some(Uuid::new_v4());
+    params.required_capabilities = Some(serde_json::json!([
+        {"Exact": {"key": "region", "value": "us-east"}}
+    ]));
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+    #[derive(diesel::QueryableByName)]
+    struct ClaimedId {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+    }
+    async fn try_attempt(
+        conn: &mut AsyncPgConnection,
+        worker_id: &str,
+        task_id: Uuid,
+    ) -> Option<Uuid> {
+        let mut tx = conn.build_transaction().read_committed();
+        tx.run(
+            async |conn: &mut AsyncPgConnection| -> Result<Option<Uuid>, diesel::result::Error> {
+                let rows: Vec<ClaimedId> =
+                    diesel::sql_query(queue::claim_batched_candidate_attempt_query())
+                        .bind::<diesel::sql_types::Text, _>(worker_id)
+                        .bind::<diesel::sql_types::Uuid, _>(task_id)
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                            None::<String>,
+                        )
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(
+                            None::<i32>,
+                        )
+                        .bind::<diesel::sql_types::Text, _>("activity")
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                            None::<String>,
+                        )
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                            None::<String>,
+                        )
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                            &Vec::<String>::new(),
+                        )
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+                            None::<chrono::DateTime<chrono::Utc>>,
+                        )
+                        .bind::<diesel::sql_types::Text, _>("")
+                        .load(conn)
+                        .await?;
+                Ok(rows.into_iter().next().map(|r| r.id))
+            },
+        )
+        .await
+        .expect("transaction")
+    }
+
+    // The worker's labels are empty: does not satisfy "region=us-east".
+    let claimed = try_attempt(&mut conn, &worker_id, task_id).await;
+    assert_eq!(claimed, None);
+    assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
+
+    // Updating the worker's labels flips the same query's own re-check
+    // to pass, confirming it reads current state, not a stale snapshot.
+    diesel::sql_query("UPDATE harvest_workers SET labels = $2 WHERE worker_id = $1")
+        .bind::<diesel::sql_types::Text, _>(&worker_id)
+        .bind::<diesel::sql_types::Jsonb, _>(serde_json::json!({"region": "us-east"}))
+        .execute(&mut conn)
+        .await
+        .expect("update worker labels");
+    let claimed = try_attempt(&mut conn, &worker_id, task_id).await;
+    assert_eq!(claimed, Some(task_id));
+    assert_eq!(task_state(&mut conn, task_id).await, "RUNNING");
+}
+
 /// Regression test for a review finding on this PR. Walking a batch must
 /// NOT debit a rate-limit token for a candidate the concurrency gate
 /// always rejects.
