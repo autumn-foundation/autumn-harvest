@@ -2797,6 +2797,14 @@ async fn delete_candidate_execution(
     let summary = summary.copied();
     Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
         let mut summarized = false;
+        // Set alongside `summarized` when this candidate hits the forced
+        // migration-target tombstone below. It is set even on the `ON
+        // CONFLICT DO NOTHING` path, where `summarized` itself stays
+        // `false` (issue #1317 review, P1 follow-up). The child-lineage
+        // check near the end of this function needs to know a summary row
+        // exists for this row. It is not enough to know THIS call
+        // inserted one.
+        let mut preserve_child_lineage_for_migration_tombstone = false;
         // ── Authoritative legal-hold re-check under a row lock (issue #747
         // BLOCKER 1) ─────────────────────────────────────────────────────
         // The candidate SELECT read the hold columns then committed and
@@ -2910,6 +2918,7 @@ async fn delete_candidate_execution(
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|hops| !hops.is_empty());
             if summary.is_some() || was_ever_migrated_here {
+                preserve_child_lineage_for_migration_tombstone = was_ever_migrated_here;
                 // completed_at is NOT NULL by the candidate query's WHERE
                 // clause; fall back to started_at defensively so the NOT
                 // NULL summary column always has a value.
@@ -2999,7 +3008,15 @@ async fn delete_candidate_execution(
         // of whether the parent or child is processed first. The retained
         // `parent_id` on a to-be-deleted terminal child is harmless (no FK;
         // `should_skip_candidate` only reads `parent_id` downward).
-        if summary.is_none() {
+        //
+        // The forced migration-target tombstone above is a THIRD trigger
+        // for a surviving summary row, besides `summary` being configured
+        // (issue #1317 review, P1 follow-up). `summary.is_none()` alone
+        // does not see it, so this null-out ran even when a summary row
+        // for this exact candidate had just been inserted. A later #495
+        // erase of that summary would then find no child to cascade to.
+        // It could report success over a child payload it never reached.
+        if summary.is_none() && !preserve_child_lineage_for_migration_tombstone {
             diesel::update(
                 harvest_workflow_executions::table
                     .filter(harvest_workflow_executions::parent_id.eq(Some(candidate_id)))

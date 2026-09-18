@@ -455,6 +455,81 @@ async fn summary_disabled_still_tombstones_a_row_that_was_ever_a_migration_targe
     );
 }
 
+/// Read a still-live execution row's `parent_id`.
+async fn execution_parent(conn: &mut AsyncPgConnection, exec_id: uuid::Uuid) -> Option<uuid::Uuid> {
+    #[derive(diesel::QueryableByName)]
+    struct ParentRow {
+        #[diesel(sql_type = Nullable<diesel::sql_types::Uuid>)]
+        parent_id: Option<uuid::Uuid>,
+    }
+    diesel::sql_query("SELECT parent_id FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id)
+        .get_result::<ParentRow>(conn)
+        .await
+        .expect("execution row must still exist")
+        .parent_id
+}
+
+/// Issue #1317 review, P1 follow-up. The forced migration-target tombstone
+/// (previous test) writes a summary row even though `summary` retention is
+/// off. `delete_candidate_execution`'s child-lineage null-out must treat
+/// that exactly like a configured summary policy. A child still inside its
+/// own retention window must keep its `parent_id` pointed at the parent.
+/// It must not be cleared just because no `SummaryPolicy` is configured.
+/// Otherwise a LATER #495 erase of the parent's tombstone summary can never
+/// discover that child, via `collect_child_ids` or otherwise.
+#[tokio::test]
+async fn migration_tombstone_preserves_a_still_live_childs_parent_id() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let old = Utc::now() - chrono::Duration::days(2);
+    let recent = Utc::now() - chrono::Duration::seconds(1);
+
+    let parent = insert_completed(&mut conn, "parent_wf", "migrated-parent", old).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET migrated_from_shards = '[0]'::jsonb \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(parent)
+    .execute(&mut conn)
+    .await
+    .expect("mark the parent as a migration target");
+
+    // Recent enough that this tick's age cutoff (1 day) leaves it alone.
+    let child = insert_completed(&mut conn, "child_wf", "c1", recent).await;
+    set_parent(&mut conn, child, parent).await;
+
+    // Summary retention OFF -- only the forced migration tombstone should
+    // produce a summary row this tick.
+    let config = history_only(Some(Duration::from_secs(86_400)));
+    let metrics = Arc::new(CapturingMetrics::default());
+    let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
+
+    assert_eq!(
+        result.deleted_count, 1,
+        "only the parent is old enough to delete"
+    );
+    assert_eq!(
+        result.summarized_count, 1,
+        "the forced tombstone summarized the parent"
+    );
+    assert_eq!(
+        count_executions(&mut conn).await,
+        1,
+        "the child execution row survives this tick"
+    );
+
+    assert_eq!(
+        execution_parent(&mut conn, child).await,
+        Some(parent),
+        "the surviving child must keep parent_id -- the parent got a forced \
+         tombstone summary despite summary retention being off"
+    );
+}
+
 // AC2 + AC3: a summary row is written in the same delete transaction, carrying
 // identity/timing/shard/search-attrs. summarized_count reported.
 #[tokio::test]
