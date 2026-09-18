@@ -8,6 +8,19 @@
 -- first and refuse with a clear message, rather than an opaque constraint
 -- violation, since resolving the duplicate is an operator decision this
 -- migration cannot make for them.
+--
+-- Locked in ACCESS EXCLUSIVE mode before the check runs (issue #1317
+-- review, P1 follow-up, same class as the staging-vacate rollback guard).
+-- A plain read takes only ACCESS SHARE, which stays compatible with a
+-- concurrent seal reconcile or a fresh same-key start. Without this
+-- lock, a duplicate pair could form after the count reads zero but
+-- before `CREATE UNIQUE INDEX` takes its own exclusive lock, and that
+-- index build would then fail on a pair this guard never saw. Taking
+-- the exclusive lock first closes that gap. A concurrent writer needs
+-- at least a row-exclusive lock, which conflicts with this one, so it
+-- must wait until this transaction commits or rolls back.
+LOCK TABLE harvest_workflow_executions IN ACCESS EXCLUSIVE MODE;
+
 DO $$
 DECLARE
     dup_count integer;
