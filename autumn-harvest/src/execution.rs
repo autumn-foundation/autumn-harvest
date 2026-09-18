@@ -4092,6 +4092,29 @@ pub async fn release_claim_if_workflow_paused(
     Ok(released > 0)
 }
 
+#[cfg(test)]
+mod workflow_pause_recheck_tests {
+    use super::release_claim_if_workflow_paused_query;
+
+    /// A hold must never consume retry budget: the release restores the
+    /// attempt the claim incremented. Scoped to `task_type = 'workflow'` so an
+    /// activity row sharing the paused execution's `workflow_exec_id` is never
+    /// released by this statement (issue #1640).
+    #[test]
+    fn release_claim_restores_the_attempt_and_is_scoped_to_workflow_rows() {
+        let sql = release_claim_if_workflow_paused_query();
+        assert!(sql.contains("attempt = GREATEST(attempt - 1, 0)"));
+        assert!(sql.contains("state = 'RUNNING'"));
+        assert!(sql.contains("worker_id = $2"));
+        assert!(
+            sql.contains("task_type = 'workflow'"),
+            "the release must never touch an activity row that shares the \
+             paused execution's workflow_exec_id; got: {sql}"
+        );
+        assert!(sql.contains("e.state = 'PAUSED'"));
+    }
+}
+
 /// SQL to shift still-open task rows' cross-retry wall-clock deadline
 /// (`schedule_to_close_at`, issue #378) forward by the pause span on resume
 /// (issue #609, AC5).
