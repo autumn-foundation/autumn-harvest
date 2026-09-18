@@ -1619,6 +1619,23 @@ async fn apply_post_claim_rechecks(
         return Ok(ClaimOutcome::Released(task.id));
     }
 
+    // Authoritative workflow-pause re-check (issue #1640). The reasoning
+    // matches the two re-checks above. The claim's own anti-join against
+    // `harvest_workflow_executions` is evaluated against that statement's
+    // snapshot. A `pause_workflow_execution` commit while the claim was in
+    // flight stays invisible to it.
+    //
+    // Gated on `task_type` and a non-null `workflow_exec_id`. An activity
+    // claim can never be held by a workflow pause, so it pays no extra round
+    // trip. See `execution::release_claim_if_workflow_paused` for the
+    // residual-window trade-off this re-check accepts.
+    if task.task_type == TaskType::Workflow.as_str()
+        && task.workflow_exec_id.is_some()
+        && crate::execution::release_claim_if_workflow_paused(conn, task.id, worker_id).await?
+    {
+        return Ok(ClaimOutcome::Released(task.id));
+    }
+
     Ok(ClaimOutcome::Claimed(Box::new(task)))
 }
 

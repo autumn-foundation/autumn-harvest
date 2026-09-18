@@ -134,6 +134,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          usage_report_activity_lookback_tests
 linux        autumn-harvest         integration                      -                          workflow_id_targeted_tests
 linux        autumn-harvest         integration                      -                          workflow_logs_tests
+linux        autumn-harvest         integration                      -                          workflow_pause_claim_recheck_tests
 linux        autumn-harvest         integration                      -                          workflow_reachability_samples_tests
 linux        autumn-harvest         integration                      -                          workflow_retry_tests
 linux        autumn-harvest         integration                      hot-code-swap,testing      hot_code_swap_tests
