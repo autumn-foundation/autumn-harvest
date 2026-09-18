@@ -8524,11 +8524,28 @@ pub const fn management_api_response_fields()
     ]
 }
 
-async fn preflight(
-    Extension(api_state): Extension<HarvestApiState>,
-    axum::extract::State(autumn_state): axum::extract::State<AppState>,
-) -> Json<PreflightReport> {
-    api_state.set_deployment_profile(autumn_state.profile().to_string());
+// Issue #1609: this handler used to reset the deployment profile from
+// `AppState::profile()` on every call.
+//
+// The reset was redundant on the `HarvestPlugin` path. `plugin.rs`'s
+// `start_harvest_runtime` sets the profile once at startup, before this
+// handler can run.
+//
+// The reset was harmful on a standalone mount. The admin gate
+// (`require_admin`, a `route_layer`) reads the profile before this handler
+// runs. The reset here can never open the gate for its own request.
+//
+// The reset could also close a gate an embedder had opened. Some mounts use
+// a placeholder `AppState`, for example `AppState::for_test()`. Its
+// `profile()` method returns `"default"`. A first request could pass
+// through a profile the embedder set with
+// `HarvestApiState::set_deployment_profile`. The handler would then
+// overwrite that profile with `"default"` as a side effect of the response.
+// Every later request would then fail the gate.
+//
+// A preflight check reports the current profile. It must not also change
+// the profile.
+async fn preflight(Extension(api_state): Extension<HarvestApiState>) -> Json<PreflightReport> {
     Json(build_preflight_report(&api_state).await)
 }
 
