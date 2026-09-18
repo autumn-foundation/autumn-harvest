@@ -59,7 +59,11 @@ behind the `hot-code-swap` Cargo feature, so none affects a default build.
   mid-compile at the same time, reporting that `wf-b` was unloaded when it
   never was. The registry now also records the generation at which each
   build id was last unloaded, and `commit` checks only the builds its own
-  batch actually binds.
+  batch actually binds. That record itself grows without eviction, one entry
+  per distinct build id ever unloaded — a known, slow residual paced by
+  operator-driven retirements rather than by execution volume, not a new
+  hazard; documented in the report rather than patched with an eviction
+  policy that could re-open the resurrection bug this map exists to close.
 
 No new `WorkflowEvent` variant, no migration, no event-contract or
 replay-determinism change. New and updated tests in

@@ -782,6 +782,15 @@ The hazard is unloading a module while an in-flight task still holds its code.
   build id was last unloaded, and `commit` checks only the builds its own
   batch actually binds.
 
+  That record is itself unbounded — one entry per distinct build id ever
+  unloaded, for the life of the process, with no eviction (Codex review of
+  this same fix). Pruning it soundly needs proof that no in-flight `prepare`
+  still holds an older generation, which the registry does not track.
+  Growth is paced by `unload_build` calls, an operator action, not a guest
+  or a request, so it is bounded by deploy cadence rather than by execution
+  volume — a real but slow residual, in the same class as §8.3's
+  unautomated retirement, not a new hazard this fix introduces.
+
 ### 8.3 Memory growth under repeated swaps
 
 Three bounds, none of them "hope":

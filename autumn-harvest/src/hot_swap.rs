@@ -739,6 +739,19 @@ pub struct ModuleRegistry {
     /// `wf-v2` — a build it never touched. Recording *which* build moved lets
     /// [`Self::commit`] fail closed only when the unloaded build overlaps the
     /// batch actually committing.
+    ///
+    /// **Unbounded, unlike every other structure in this registry — a known
+    /// residual, not an oversight.** One entry is added per distinct
+    /// `build_id` ever unloaded, for the life of the process, with no
+    /// eviction. Pruning it soundly needs proof that no in-flight `prepare`
+    /// still holds an older generation, which this registry does not track.
+    /// The growth is paced by `unload_build` calls: an operator retiring a
+    /// build, not a guest or a request. It is therefore bounded by deploy
+    /// cadence rather than by execution volume. Even a build retired every
+    /// minute for a year adds well under a megabyte. Worth bounding for a
+    /// GA version once retirement is automated (§8.3's residual). Not worth
+    /// an eviction policy here that could re-open the resurrection bug this
+    /// map exists to close.
     unloaded_at: RwLock<BTreeMap<String, u64>>,
 }
 
