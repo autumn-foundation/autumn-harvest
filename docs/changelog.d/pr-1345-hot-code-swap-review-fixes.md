@@ -43,7 +43,15 @@ behind the `hot-code-swap` Cargo feature, so none affects a default build.
   needed `invoke_wasm_guest_bytes` (and the shared `invoke_wasm_activity_inner`
   it sits alongside) to report the fuel a call actually consumed, and the
   cumulative budget is now `DECIDE_RUN_FUEL_BUDGET` (twice `DECIDE_FUEL`)
-  rather than a ten-second wall clock.
+  rather than a ten-second wall clock. A bot review of this exact fix caught
+  that fuel alone does not bound wall-clock *occupancy*: a capability-enabled
+  host or a cache miss recomputes every step fresh, so a guest cheap in fuel
+  but slow in real time (bulk-memory instructions) could occupy a runtime
+  worker for minutes while staying under the fuel budget. A new
+  `DECIDE_RUN_WALL_CLOCK_BACKSTOP` (10 s) closes that: a live `Instant::now()`
+  check, re-read every step and never charged from a cached value, so it adds
+  a real-time ceiling without reintroducing the residency-dependent bug the
+  fuel budget itself fixed.
 - **Compiled modules could accumulate unbounded during one sync.**
   `sync_build_into_registry` fetches source bytes one payload at a time,
   bounding *source* residency to one module — but atomic binding needs every

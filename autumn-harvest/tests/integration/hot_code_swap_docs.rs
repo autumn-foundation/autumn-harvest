@@ -323,6 +323,8 @@ const CITED_TESTS: &[&str] = &[
     "a_sync_refuses_a_build_with_too_many_workflow_names",
     "unloading_the_build_being_loaded_still_fails_the_commit",
     "unloading_one_build_does_not_fail_an_unrelated_builds_in_flight_commit",
+    "the_wall_clock_backstop_still_bounds_a_cheap_in_fuel_slow_guest",
+    "the_decide_loop_still_bounds_real_wall_clock_occupancy",
 ];
 
 #[test]
@@ -540,6 +542,7 @@ const REPORT_CONSTANTS: &[(&str, &str)] = &[
     ("MAX_DECIDE_STEPS", "64"),
     ("DECIDE_MAX_WALL_CLOCK", "5 s"),
     ("DECIDE_RUN_FUEL_BUDGET", "2"),
+    ("DECIDE_RUN_WALL_CLOCK_BACKSTOP", "10 s"),
 ];
 
 #[test]

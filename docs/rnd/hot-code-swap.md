@@ -429,14 +429,23 @@ it should be named rather than discovered later:
 
 The other cost is C5's: a decision runs inline on the decision-cycle thread —
 and, per C9 below, *must*, since the host may not introduce an await that records
-no command. `DECIDE_RUN_FUEL_BUDGET` (twice `DECIDE_FUEL`) is therefore the
-worst case for how long one workflow task can occupy a runtime worker, with
-`DECIDE_MAX_WALL_CLOCK` (5 s) bounding any single decision inside it as a
-wall-clock backstop for the one class fuel cannot see (bulk-memory
-instructions). Those are policy numbers, not laws, and a deployment with many
-hosted workflows should size its worker pool knowing them. Fuel, not the
-clock, is the *operative* budget — for the per-decision ceiling as before, and
-now for the cumulative one too.
+no command. `DECIDE_RUN_FUEL_BUDGET` (twice `DECIDE_FUEL`) is the operative
+cumulative bound, with `DECIDE_MAX_WALL_CLOCK` (5 s) bounding any single
+decision inside it as a wall-clock backstop for the one class fuel cannot see
+(bulk-memory instructions). Fuel alone is not sufficient at the cumulative
+level either, and a bot review of the finding-5 fix caught the gap: a
+capability-enabled host (§8.5) or a cache miss recomputes every step fresh,
+so up to `MAX_DECIDE_STEPS` decisions could each spend close to
+`DECIDE_MAX_WALL_CLOCK` while staying under the fuel budget, wedging a
+runtime worker for minutes. `DECIDE_RUN_WALL_CLOCK_BACKSTOP` (10 s) closes
+that: measured live from `Instant::now()` at the top of the decide loop, on
+every step, never charged retroactively from a cached value — so a cache hit
+still costs it nothing, and it does not reinstate the residency-dependent
+terminal-outcome bug the fuel budget exists to avoid. Those are policy
+numbers, not laws, and a deployment with many hosted workflows should size
+its worker pool knowing them. Fuel is the *operative* budget, both
+per-decision and cumulative; the wall-clock pair at each level is a backstop
+for what fuel cannot see, not a second accounting mechanism.
 
 ### What a hosted workflow can and cannot express
 
@@ -896,11 +905,21 @@ honestly named.
   cannot, with a `br`-looping guest that does consume fuel) distinguish which of
   the two bounds fired.
 * **Cumulative:** `DECIDE_RUN_FUEL_BUDGET` bounds the guest fuel of a whole
-  decision cycle, so per-decision budgets cannot be composed into unbounded
-  occupancy of a runtime worker thread. Fuel, not wall-clock time (issue
-  #1345) — see §5's cache section for why a wall-clock cumulative charge
-  re-opened the same host-load dependence the per-decision fuel bound exists
-  to close.
+  decision cycle, deterministically (issue #1345) — see §5's cache section
+  for why a wall-clock cumulative *charge* re-opened the same host-load
+  dependence the per-decision fuel bound exists to close. Fuel alone does
+  not bound wall-clock *occupancy*, though: a capability-enabled host or a
+  cache miss recomputes every step fresh, so a guest cheap in fuel but slow
+  in real time (bulk-memory instructions) could still occupy the thread for
+  minutes while staying under the fuel budget — a gap a bot review of that
+  same fix caught. `DECIDE_RUN_WALL_CLOCK_BACKSTOP` (10 s) closes it: a live
+  `Instant::now()` check, re-read every step and never charged from a cached
+  value, so it adds a real-time ceiling without reinstating the
+  residency-dependent bug the fuel budget fixed
+  (`the_wall_clock_backstop_still_bounds_a_cheap_in_fuel_slow_guest` pins
+  the ceiling itself;
+  `the_decide_loop_still_bounds_real_wall_clock_occupancy` pins where the
+  decide loop captures and checks it).
 * **Decision count:** `MAX_DECIDE_STEPS` (64). Without it a guest answering
   `Await` forever would append activity events without bound — a durable,
   replayable denial of service rather than a transient one

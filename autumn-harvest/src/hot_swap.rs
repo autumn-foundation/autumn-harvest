@@ -94,7 +94,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -187,6 +187,28 @@ pub const DECIDE_FUEL: u64 = 10_000_000;
 /// speed. Set to twice [`DECIDE_FUEL`], mirroring the margin the former
 /// wall-clock pair kept between the per-decision and cumulative ceilings.
 pub const DECIDE_RUN_FUEL_BUDGET: u64 = DECIDE_FUEL * 2;
+
+/// Cumulative REAL wall-clock backstop for one handler invocation: 10 s.
+///
+/// [`DECIDE_RUN_FUEL_BUDGET`] is the operative cumulative bound. It is not
+/// sufficient alone, for the same reason [`DECIDE_MAX_WALL_CLOCK`] backs up
+/// [`DECIDE_FUEL`] at the per-decision level. Bulk-memory instructions cost
+/// one fuel unit regardless of bytes moved. A guest granted capabilities
+/// (finding 2) or one that defeats the decision cache recomputes every step
+/// fresh. Up to [`MAX_DECIDE_STEPS`] decisions could each spend close to
+/// [`DECIDE_MAX_WALL_CLOCK`] while staying under the fuel budget. That
+/// wedges a runtime worker for minutes — the exact hazard §8.6 of the
+/// report exists to close.
+///
+/// Measured live from `Instant::now()` at the top of the decide loop, never
+/// charged retroactively from a cached value. It therefore does not
+/// reinstate the residency-dependent terminal-outcome bug
+/// [`DECIDE_RUN_FUEL_BUDGET`]'s own doc names. A cache hit costs this
+/// backstop nothing, since no real time passes to measure. It can only fire
+/// in the pathological case described above, with the same host-load
+/// sensitivity [`DECIDE_MAX_WALL_CLOCK`] already accepts at the per-decision
+/// level.
+pub const DECIDE_RUN_WALL_CLOCK_BACKSTOP: Duration = Duration::from_secs(10);
 
 /// Linear-memory ceiling for a guest decision: 4 MiB.
 pub const DECIDE_MEMORY_BYTES: usize = 4 * 1024 * 1024;
@@ -1721,6 +1743,18 @@ fn run_budget_exceeded(build_id: &str) -> String {
     )
 }
 
+/// The run-scoped wall-clock backstop was exceeded.
+///
+/// Separate from [`run_budget_exceeded`], on purpose. This is a real-time
+/// safety valve for a guest cheap in fuel but expensive in wall-clock time
+/// (bulk-memory instructions), not the operative, deterministic budget.
+fn run_wall_clock_backstop_exceeded(build_id: &str) -> String {
+    format!(
+        "workflow module for build `{build_id}` exceeded the \
+         {DECIDE_RUN_WALL_CLOCK_BACKSTOP:?} cumulative wall-clock backstop for one decision cycle"
+    )
+}
+
 /// The statically-linked [`WorkflowHandlerFn`](crate::info::WorkflowHandlerFn)
 /// that hosts a runtime-loaded module.
 ///
@@ -1907,6 +1941,12 @@ pub fn module_workflow_handler(
         let deny_all = host.capabilities == WasmCapabilities::default();
         let mut guest_fuel: u64 = 0;
         let mut resolved: Vec<DecideOutcome> = Vec::new();
+        // Live wall-clock backstop (issue #1345). Fuel alone does not bound
+        // a bulk-memory-heavy guest that is cheap in fuel but expensive in
+        // real time — see `DECIDE_RUN_WALL_CLOCK_BACKSTOP`. Measured once
+        // here and re-read every step; never charged from a cached value,
+        // so a cache hit costs it nothing.
+        let cycle_started = Instant::now();
 
         for step in 0..MAX_DECIDE_STEPS {
             let step_index = u32::try_from(step)
@@ -2002,6 +2042,12 @@ pub fn module_workflow_handler(
             guest_fuel = guest_fuel.saturating_add(cost);
             if guest_fuel >= DECIDE_RUN_FUEL_BUDGET {
                 return Err(run_budget_exceeded(&build_id));
+            }
+            // The live backstop, checked separately from the fuel budget
+            // above and never charged from a cached value — see
+            // `DECIDE_RUN_WALL_CLOCK_BACKSTOP`.
+            if cycle_started.elapsed() >= DECIDE_RUN_WALL_CLOCK_BACKSTOP {
+                return Err(run_wall_clock_backstop_exceeded(&build_id));
             }
 
             match response {
@@ -2131,15 +2177,33 @@ mod tests {
 
     #[test]
     fn the_cumulative_fuel_budget_sits_above_a_single_decisions_fuel_ceiling() {
-        // Issue #1345 finding 5. `DECIDE_RUN_FUEL_BUDGET` replaced a
-        // wall-clock cumulative budget. That budget raced the per-decision
-        // wall-clock backstop. A run's terminal outcome would depend on host
-        // load. The same history could fail on a busy worker and succeed on
-        // an idle one. Fuel is deterministic, so that particular race is
-        // gone by construction. The budget must still exceed a single
-        // decision's own ceiling. Otherwise one ordinary decision would
-        // already exhaust the whole run's budget.
-        assert!(DECIDE_RUN_FUEL_BUDGET > DECIDE_FUEL);
+        // Issue #1345 finding 5. `DECIDE_RUN_FUEL_BUDGET` is now the
+        // OPERATIVE cumulative budget, replacing one that charged a cache
+        // hit the wall-clock duration recorded when the decision was first
+        // computed. That charge varied with host load. A run's terminal
+        // outcome would then depend on host load too. The same history
+        // could fail on a busy worker and succeed on an idle one. Fuel is
+        // deterministic, so that particular race is gone by construction.
+        // The budget must still exceed a single decision's own ceiling.
+        // Otherwise one ordinary decision would already exhaust the whole
+        // run's budget.
+        const { assert!(DECIDE_RUN_FUEL_BUDGET > DECIDE_FUEL) };
+    }
+
+    #[test]
+    fn the_wall_clock_backstop_still_bounds_a_cheap_in_fuel_slow_guest() {
+        // Codex review of the finding-5 fix (issue #1345). Fuel alone does
+        // not bound a bulk-memory-heavy guest: such instructions cost one
+        // fuel unit regardless of bytes moved. A capability-enabled host
+        // (finding 2) or a cache miss recomputes every step fresh. Up to
+        // `MAX_DECIDE_STEPS` decisions could each spend close to
+        // `DECIDE_MAX_WALL_CLOCK` while staying under the fuel budget.
+        // `DECIDE_RUN_WALL_CLOCK_BACKSTOP` must still be the looser bound
+        // against a single decision's own wall-clock backstop, or one
+        // ordinary slow decision would already trip it.
+        const {
+            assert!(DECIDE_RUN_WALL_CLOCK_BACKSTOP.as_nanos() > DECIDE_MAX_WALL_CLOCK.as_nanos());
+        };
     }
 
     #[test]

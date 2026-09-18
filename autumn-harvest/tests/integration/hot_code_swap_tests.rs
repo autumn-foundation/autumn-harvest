@@ -2756,6 +2756,48 @@ fn the_run_budget_is_charged_and_checked_once_for_both_cache_paths() {
     );
 }
 
+#[test]
+fn the_decide_loop_still_bounds_real_wall_clock_occupancy() {
+    // Issue #1345. A bot review of the finding-5 fix flagged a real
+    // regression. Replacing the wall-clock cumulative budget with a
+    // fuel-only one removed the one thing bounding a guest cheap in fuel
+    // but expensive in real time. Bulk-memory instructions cost one fuel
+    // unit regardless of bytes moved. A capability-enabled host or a cache
+    // miss recomputes every step fresh. Up to `MAX_DECIDE_STEPS` decisions
+    // could each spend close to `DECIDE_MAX_WALL_CLOCK` while staying
+    // under the fuel budget, wedging a runtime worker for minutes.
+    //
+    // Guarded structurally rather than functionally. Reproducing it needs
+    // a guest that actually occupies the thread for real time, which is
+    // not a test anyone should wait for.
+    let src = include_str!("../../src/hot_swap.rs");
+    let start = src
+        .find("pub fn module_workflow_handler(")
+        .expect("the trampoline is where the guard expects it");
+    let body = &src[start..];
+    let live: Vec<&str> = body
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect();
+
+    let cycle_started = live
+        .iter()
+        .position(|line| line.contains("let cycle_started = Instant::now()"))
+        .expect("the decide loop must capture a live wall-clock start");
+    let backstop_check = live
+        .iter()
+        .position(|line| line.contains("cycle_started.elapsed() >= DECIDE_RUN_WALL_CLOCK_BACKSTOP"))
+        .expect("the decide loop must check the live wall-clock backstop every step");
+    let acted_on = live
+        .iter()
+        .position(|line| line.trim_start().starts_with("match response"))
+        .expect("the trampoline acts on the response with `match response`");
+    assert!(
+        cycle_started < backstop_check && backstop_check < acted_on,
+        "the wall-clock backstop must be captured before the loop and checked          before the response is acted on"
+    );
+}
+
 #[tokio::test]
 async fn the_decision_cache_never_serves_one_builds_answer_to_another() {
     // A `DecideRequest` carries no build id — the guest has no business knowing
