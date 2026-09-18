@@ -49,10 +49,10 @@ fn is_excluded_impl(date: NaiveDate, excluded_dates: &[NaiveDate], exclude_weeke
 
 /// Shared skip-search: advances `date` per `skip_policy` using `is_excluded`
 /// as the exclusion check. Factored out so the two `excluded_dates`
-/// representations below (`&[NaiveDate]` for a single lookup,
-/// `&BTreeSet<NaiveDate>` for a caller repeating this check across many
-/// dates) share one 365-day scan implementation rather than two copies that
-/// could drift.
+/// representations below share one 365-day scan implementation rather than
+/// two copies that could drift. Those representations are `&[NaiveDate]`
+/// for a single lookup, and `&BTreeSet<NaiveDate>` for a caller repeating
+/// this check across many dates.
 fn apply_skip_policy_with(
     date: NaiveDate,
     skip_policy: SkipPolicy,
@@ -104,9 +104,9 @@ fn apply_skip_policy_with(
 ///
 /// Checks `excluded_dates` with an O(n) linear scan per date. A caller that
 /// invokes this once per date in a loop over the *same* `excluded_dates`
-/// (backfill planning, firing previews) should instead index it once into a
-/// `BTreeSet` and call [`apply_skip_policy_indexed`] — see that function for
-/// why.
+/// should instead index it once into a `BTreeSet`. Such a caller should
+/// call [`apply_skip_policy_indexed`] instead — see that function for why.
+/// Backfill planning and firing previews are two such loop callers.
 #[must_use]
 pub fn apply_skip_policy(
     date: NaiveDate,
@@ -119,17 +119,25 @@ pub fn apply_skip_policy(
     })
 }
 
-/// Same contract as [`apply_skip_policy`], but checks `excluded` (a
-/// `BTreeSet` built once by the caller) with an O(log n) lookup per date
-/// instead of `apply_skip_policy`'s O(n) linear scan.
+/// Same contract as [`apply_skip_policy`], but checks `excluded` — a
+/// `BTreeSet` built once by the caller — with an O(log n) lookup per
+/// date. `apply_skip_policy` itself does an O(n) linear scan instead.
 ///
-/// A calendar's exclusion list only grows over the calendar's lifetime (no
-/// date-range bound, no retention path — see [`load_exclusions_for_calendar`]),
-/// while a single backfill or preview call checks it once per generated slot
-/// (up to `max_count`, client-suppliable and not hard-capped by the admin
-/// handler). Re-scanning the whole list from scratch on every slot makes
-/// that call's cost the product of two values that both grow independently
-/// of each other and are quadratic in the callers this function serves.
+/// A calendar's exclusion list only grows over the calendar's lifetime.
+/// There is no date-range bound and no retention path — see
+/// [`load_exclusions_for_calendar`]. A single backfill or preview call
+/// checks it once per generated slot, up to `max_count`. That count is
+/// client-suppliable and not hard-capped by the admin handler.
+/// Re-scanning the whole list from scratch on every slot makes that call's
+/// cost the product of two values that both grow independently of each
+/// other. That product is quadratic in the callers this function serves.
+///
+/// `cfg(feature = "db")`. Its only two callers,
+/// [`plan_backfill_with_calendar`] and [`preview_schedule_firings`], are
+/// both gated on `db`. A `db`-off build — the corpus crates under
+/// `autumn-harvest-verify` build this way — would otherwise see it as
+/// dead code.
+#[cfg(feature = "db")]
 fn apply_skip_policy_indexed(
     date: NaiveDate,
     skip_policy: SkipPolicy,
