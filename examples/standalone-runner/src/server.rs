@@ -12,14 +12,16 @@ use crate::runtime::{standalone_builder, standalone_runtime_config};
 ///
 /// Split out of [`run`] so a test can drive it with `tower::ServiceExt::oneshot`
 /// without binding a socket or starting a `HarvestRunner` (see `tests.rs`).
-pub fn build_router(api_state: HarvestApiState, web_state: autumn_web::AppState) -> axum::Router {
+///
+/// No `autumn_web::AppState` is required (issue #1607). `harvest_api_router`
+/// returns `Router<()>`, so the standalone mount carries no autumn-web state.
+pub fn build_router(api_state: HarvestApiState) -> axum::Router {
     axum::Router::new()
         .route(
             "/",
             get(|| async { Json(json!({ "service": "standalone-runner" })) }),
         )
         .nest("/api/harvest", harvest_api_router(api_state))
-        .with_state(web_state)
 }
 
 /// Declare the deployment posture the README's own `Run` command sets
@@ -79,7 +81,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let config = standalone_runtime_config(database_url);
     let built = standalone_builder().try_build()?;
-    let runner = HarvestRunner::start(built, &config, HarvestRunnerResources::new(pool.clone()))
+    let runner = HarvestRunner::start(built, &config, HarvestRunnerResources::new(pool))
         .await
         .map_err(|error| format!("failed to start Harvest runner: {error}"))?;
 
@@ -88,8 +90,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     api_state.install_storage_pool(runner.storage_pool());
     api_state.install(runner.api_runtime());
 
-    let web_state = autumn_web::AppState::for_test().with_pool(pool);
-    let app = build_router(api_state, web_state);
+    let app = build_router(api_state);
 
     let address = SocketAddr::from(([127, 0, 0, 1], 8082));
     tracing::info!(%address, "standalone Harvest runner listening");

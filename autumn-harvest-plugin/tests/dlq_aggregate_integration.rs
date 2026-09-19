@@ -12,7 +12,6 @@ use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::DbPool;
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -130,14 +129,14 @@ fn build_dlq_app(pool: DbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 fn build_sharded_dlq_app(shard0_url: &str, shard1_url: &str) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(build_two_shard_pool(shard0_url, shard1_url));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 async fn read_json_response(response: axum::response::Response) -> Value {

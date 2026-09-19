@@ -19,7 +19,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_harvest_plugin::management_api_routes;
 use autumn_harvest_plugin::openapi::{openapi_document, openapi_json};
-use autumn_web::AppState;
 use autumn_web::reexports::axum::Router;
 use autumn_web::reexports::axum::body::Body;
 use autumn_web::reexports::axum::routing::get;
@@ -696,8 +695,7 @@ async fn the_route_does_not_take_the_application_root_path() {
 
     let app = Router::new()
         .route("/openapi.json", get(app_document))
-        .nest("/api/harvest", harvest_api_router(HarvestApiState::new()))
-        .with_state(AppState::for_test());
+        .nest("/api/harvest", harvest_api_router(HarvestApiState::new()));
 
     let harvest = body_of(app.clone(), "/api/harvest/openapi.json").await;
     assert_eq!(
@@ -730,7 +728,7 @@ async fn body_of(app: Router<()>, uri: &str) -> Value {
 /// AC1 and AC7: the served endpoint answers 200 with exactly the artifact.
 #[tokio::test]
 async fn served_endpoint_returns_the_document() {
-    let app = harvest_api_router(HarvestApiState::new()).with_state(AppState::for_test());
+    let app = harvest_api_router(HarvestApiState::new());
     let request = Request::builder()
         .method(Method::GET)
         .uri("/openapi.json")

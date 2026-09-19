@@ -54,7 +54,6 @@ use autumn_harvest::worker::DbPool;
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -75,10 +74,6 @@ fn init_sql() -> Vec<u8> {
 }
 
 type HarvestApiApp = axum::Router;
-
-fn test_app_state() -> AppState {
-    AppState::for_test().with_profile("test")
-}
 
 async fn setup_database() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
@@ -162,7 +157,7 @@ fn build_app(database_url: &str) -> HarvestApiApp {
 fn build_app_with_pool(pool: HarvestDbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(pool);
-    harvest_api_router(api_state).with_state(test_app_state())
+    harvest_api_router(api_state)
 }
 
 async fn get_json(app: &HarvestApiApp, uri: impl Into<String>) -> (StatusCode, Value) {

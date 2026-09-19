@@ -44,7 +44,7 @@ type HarvestApiApp = axum::Router;
 fn build_app() -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
-    harvest_api_router(api_state).with_state(autumn_web::AppState::for_test())
+    harvest_api_router(api_state)
 }
 
 /// Asserts a malformed-query `400` body carries the documented message.

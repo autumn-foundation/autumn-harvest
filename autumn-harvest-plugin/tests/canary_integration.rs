@@ -28,7 +28,6 @@ use autumn_harvest::worker::DbPool;
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_harvest_plugin::canary::CanaryConfig;
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -116,7 +115,7 @@ fn build_app_with_canary(url: &str) -> HarvestApiApp {
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(build_pool(url)));
     api_state.set_canary_config(Some(CanaryConfig::new(Duration::from_secs(30))));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Admin-gated router with the canary **disabled** (no config mirrored).
@@ -124,7 +123,7 @@ fn build_app_canary_disabled(url: &str) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(build_pool(url)));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Router with NO auth boundary — used to prove the admin guard rejects.
@@ -132,7 +131,7 @@ fn build_unauthenticated_app(url: &str) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(build_pool(url)));
     api_state.set_canary_config(Some(CanaryConfig::new(Duration::from_secs(30))));
-    harvest_api_router(api_state).with_state(AppState::for_test())
+    harvest_api_router(api_state)
 }
 
 async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {

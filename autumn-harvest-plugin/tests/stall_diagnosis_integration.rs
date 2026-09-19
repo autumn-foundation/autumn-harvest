@@ -48,7 +48,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -362,7 +361,7 @@ fn build_api_state(pool: &DbPool) -> HarvestApiState {
 }
 
 fn build_api_app(state: HarvestApiState) -> axum::Router {
-    harvest_api_router(state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(state)
 }
 
 async fn get_json(app: &axum::Router, uri: &str, admin: bool) -> (StatusCode, Value) {

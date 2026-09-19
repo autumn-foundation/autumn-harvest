@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
 
-use autumn_web::AppState;
 use autumn_web::error::AutumnError;
 use autumn_web::extract::{Path, Query};
 use autumn_web::reexports::axum;
@@ -618,7 +617,7 @@ fn worker_sort_key(row: &WorkerRow) -> (u8, u8, &str) {
 }
 
 /// Build the Vantage dashboard router.
-pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
+pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<()> {
     let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
 
     Router::new()

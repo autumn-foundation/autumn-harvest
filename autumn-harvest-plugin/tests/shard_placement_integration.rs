@@ -45,7 +45,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -260,7 +259,7 @@ fn build_app_with_writable(
         router,
     ));
 
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 async fn post_start(app: &HarvestApiApp, body: Value) -> (StatusCode, Value) {
@@ -787,7 +786,7 @@ fn build_app_with_unpooled_shard(url_eu: &str, url_us: &str, url_drained: &str) 
         router,
     ));
 
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// AC2/AC5 (fail closed): a pin to a shard the router accepts but that has no

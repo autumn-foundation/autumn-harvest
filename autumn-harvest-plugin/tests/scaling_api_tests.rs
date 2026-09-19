@@ -13,7 +13,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -316,7 +315,7 @@ async fn single_shard_scaling_signals_endpoint_correctly_categorizes_tasks_and_w
             ShardRouter::single(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     // 1. JSON scaling API format
     let (status, body) = get_json(&app, "/admin/queues/scaling").await;
@@ -444,7 +443,7 @@ async fn multi_shard_scaling_signals_are_correctly_aggregated_across_shards() {
         ShardId::new(0),
     );
     let state = api_state(pool, runtime_for(&["queue-a"], router));
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/queues/scaling").await;
     assert_eq!(status, StatusCode::OK);

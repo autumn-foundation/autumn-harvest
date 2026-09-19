@@ -1,7 +1,6 @@
 use autumn_harvest::{WorkflowEvent, WorkflowSimulator};
 use autumn_harvest_plugin::HarvestApiState;
 use autumn_harvest_plugin::prelude::HarvestMode;
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -89,13 +88,13 @@ async fn standalone_order_uses_version_gate_saga_and_child_workflow() {
 /// #1610). The three tests above assert only the workflow and config layer.
 /// Nothing before this exercised the router itself. That gap let two live
 /// defects go unnoticed until a real embedder hit them. The first was the
-/// `AppState::for_test()` call in the production entry point (issue #1607).
-/// The second was the always-`401` documented `preflight` step (issue
-/// #1609). No database is needed here. `HarvestApiState::new()` with
-/// nothing installed matches a router that has never received traffic. That
-/// is exactly the state these three routes must tolerate.
+/// `AppState::for_test()` call in the production entry point, now removed
+/// (issue #1607). The second was the always-`401` documented `preflight`
+/// step (issue #1609). No database is needed here. `HarvestApiState::new()`
+/// with nothing installed matches a router that has never received traffic.
+/// That is exactly the state these three routes must tolerate.
 fn router_under_test() -> axum::Router {
-    build_router(HarvestApiState::new(), AppState::for_test())
+    build_router(HarvestApiState::new())
 }
 
 async fn get_status(app: axum::Router, uri: &str) -> StatusCode {
@@ -141,15 +140,16 @@ async fn preflight_without_a_credential_is_rejected() {
 /// exact posture the README's `AUTUMN_PROFILE=dev` command produces.
 ///
 /// The request runs twice. The `preflight` handler used to reset the
-/// deployment profile from `AppState::profile()` on every call, and
-/// `AppState::for_test()` reports `"default"`, not `"dev"`. That would
-/// have closed the gate again after the first request. This pins its
-/// absence.
+/// deployment profile from the router's `autumn_web::AppState` on every
+/// call, and a placeholder `AppState::for_test()` reports `"default"`, not
+/// `"dev"`. That would have closed the gate again after the first request.
+/// The router now carries no `AppState` at all (issue #1606), so the reset
+/// has no source left. This pins its absence.
 #[tokio::test]
 async fn preflight_succeeds_once_dev_profile_is_declared() {
     let api_state = HarvestApiState::new();
     declare_deployment_profile(&api_state, Some("dev"));
-    let app = build_router(api_state, AppState::for_test());
+    let app = build_router(api_state);
 
     assert_eq!(
         get_status(app.clone(), "/api/harvest/admin/preflight").await,

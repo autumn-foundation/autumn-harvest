@@ -15,7 +15,6 @@ use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
 use autumn_harvest_plugin::preflight::{PreflightStatus, build_preflight_report};
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -392,7 +391,7 @@ async fn preflight_endpoint_returns_all_green_single_shard_report() {
         "prod",
         true,
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("prod"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/preflight").await;
 
