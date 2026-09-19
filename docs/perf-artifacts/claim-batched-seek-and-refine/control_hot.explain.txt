@@ -70,7 +70,7 @@
                                                  Rows Removed by Filter: 255
                                                  Buffers: shared hit=343
                                          SubPlan 7
-                                           ->  Seq Scan on harvest_workflow_executions e  (cost=0.00..173.69 rows=1 width=16) (never executed)
+                                           ->  Seq Scan on harvest_workflow_executions e  (cost=0.00..176.24 rows=1 width=16) (never executed)
                                                  Filter: (state = 'PAUSED'::text)
                                          SubPlan 14
                                            ->  Seq Scan on harvest_rate_limit_buckets b  (cost=0.00..21.02 rows=89 width=32) (never executed)
@@ -123,8 +123,8 @@
                        Index Cond: (id = candidate_1.id)
                        Buffers: shared hit=3
  Planning:
-   Buffers: shared hit=1226
- Planning Time: 3.844 ms
- Execution Time: 172.388 ms
+   Buffers: shared hit=1224
+ Planning Time: 4.274 ms
+ Execution Time: 175.266 ms
 (126 rows)
 

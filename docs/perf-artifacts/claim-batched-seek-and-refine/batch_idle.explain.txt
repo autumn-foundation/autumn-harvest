@@ -33,7 +33,7 @@
                                  Filter: (((session_id IS NULL) OR (sticky_worker_id = 'w1'::text)) AND ((task_type <> 'activity'::text) OR (activity_name IS NULL) OR (required_capabilities IS NOT NULL) OR (activity_name <> ALL ('{}'::text[]))) AND (state = 'PENDING'::text) AND (queue_name = ANY ('{bench-q-0,bench-q-1,bench-q-2,bench-q-3}'::text[])) AND (scheduled_at <= now()) AND ((schedule_to_close_at IS NULL) OR (schedule_to_close_at > now())) AND ((sticky_worker_id IS NULL) OR (sticky_worker_id = 'w1'::text) OR (sticky_until IS NULL) OR (sticky_until <= now())) AND ((task_type <> 'workflow'::text) OR (workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 4))) AND ((rate_limit_key IS NULL) OR (activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 11)) AND ((required_capabilities IS NULL) OR (NOT (SubPlan 9))))
                                  Buffers: shared hit=229
                                  SubPlan 4
-                                   ->  Seq Scan on harvest_workflow_executions e  (cost=0.00..173.69 rows=1 width=16) (never executed)
+                                   ->  Seq Scan on harvest_workflow_executions e  (cost=0.00..176.24 rows=1 width=16) (never executed)
                                          Filter: (state = 'PAUSED'::text)
                                  SubPlan 11
                                    ->  Seq Scan on harvest_rate_limit_buckets b  (cost=0.00..21.02 rows=89 width=32) (never executed)
@@ -55,7 +55,7 @@
                                                  Index Cond: (worker_id = 'w1'::text)
  Planning:
    Buffers: shared hit=58
- Planning Time: 1.036 ms
- Execution Time: 25.351 ms
+ Planning Time: 1.174 ms
+ Execution Time: 24.754 ms
 (57 rows)
 

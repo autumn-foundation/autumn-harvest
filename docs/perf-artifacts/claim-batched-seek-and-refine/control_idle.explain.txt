@@ -60,7 +60,7 @@
                                                  Filter: ((concurrency_key = harvest_task_queue_1.concurrency_key) AND (task_type = harvest_task_queue_1.task_type))
                                                  Buffers: shared hit=4
                                          SubPlan 7
-                                           ->  Seq Scan on harvest_workflow_executions e  (cost=0.00..173.69 rows=1 width=16) (never executed)
+                                           ->  Seq Scan on harvest_workflow_executions e  (cost=0.00..176.24 rows=1 width=16) (never executed)
                                                  Filter: (state = 'PAUSED'::text)
                                          SubPlan 14
                                            ->  Seq Scan on harvest_rate_limit_buckets b  (cost=0.00..21.02 rows=89 width=32) (never executed)
@@ -108,8 +108,8 @@
                        Index Cond: (id = candidate_1.id)
                        Buffers: shared hit=3
  Planning:
-   Buffers: shared hit=1234 read=10
- Planning Time: 3.781 ms
- Execution Time: 18.122 ms
+   Buffers: shared hit=1188 read=56 dirtied=1
+ Planning Time: 915.544 ms
+ Execution Time: 18.815 ms
 (111 rows)
 
