@@ -34,6 +34,16 @@ undefined example types, at the cost of not catching type errors.
 
 ## How a block is checked
 
+Extraction is line-oriented, not a single multi-line regex: a fence is any
+line whose stripped content opens with "```rust", however far it is
+indented under a list item, and the matching close is the next line whose
+stripped content is exactly "```". An opener with no close before EOF is a
+hard error (a silently unmatched fence would drop a block from the
+"corpus" count without saying so). An `ignore` info-string annotation (for
+example ```` ```rust,ignore ````) does NOT exempt a block here — only the
+named entries in KNOWN_FRAGMENT_EXCEPTIONS below do, since `ignore` marks a
+block skipped by `rustdoc`, not a block whose Rust syntax stopped mattering.
+
 Each ```rust fenced block is wrapped as the body of its own function,
 `fn __snippet_N() { <block content> }`, and every block from one source
 file is concatenated into a single generated file, which is handed to
@@ -78,7 +88,8 @@ TARGET_GLOBS = [
     "README.md",
 ]
 
-FENCE_RE = re.compile(r"```rust([^\n]*)\n(.*?)\n```", re.DOTALL)
+FENCE_OPEN_RE = re.compile(r"^\s*```rust(.*)$")
+FENCE_CLOSE_RE = re.compile(r"^\s*```\s*$")
 
 # (file, first-content-line-prefix) -> reason. The prefix is matched against
 # the block's first non-blank, non-comment line, stripped. Verified against
@@ -117,13 +128,50 @@ def collect_files() -> list[str]:
     return sorted(files)
 
 
+def find_rust_blocks(text: str, relpath: str) -> list[str]:
+    """Returns the code of every ```rust fenced block in `text`, in order.
+
+    Line-oriented so an indented fence (a code block nested under a list
+    item) is still found — a single-regex scan anchored on an unindented
+    close silently drops those. Exits with an error if an opening fence has
+    no matching close before EOF: a block dropped that way would shrink the
+    "corpus" count with no signal that it happened.
+    """
+    lines = text.split("\n")
+    blocks: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        if not FENCE_OPEN_RE.match(lines[i]):
+            i += 1
+            continue
+        start_line = i + 1
+        i += 1
+        code_lines: list[str] = []
+        closed = False
+        while i < n:
+            if FENCE_CLOSE_RE.match(lines[i]):
+                closed = True
+                i += 1
+                break
+            code_lines.append(lines[i])
+            i += 1
+        if not closed:
+            sys.exit(
+                f"{relpath}: ```rust fence opened at line {start_line} has no "
+                "closing ``` before end of file"
+            )
+        blocks.append("\n".join(code_lines))
+    return blocks
+
+
 def check_file(relpath: str) -> tuple[int, int, list[tuple[str, str, str]]]:
     """Returns (blocks_checked, blocks_excepted, failures).
 
     failures is a list of (first_line, rustfmt_location, rustfmt_message).
     """
     text = (REPO_ROOT / relpath).read_text(encoding="utf-8")
-    blocks = list(FENCE_RE.finditer(text))
+    blocks = find_rust_blocks(text, relpath)
     if not blocks:
         return 0, 0, []
 
@@ -131,11 +179,9 @@ def check_file(relpath: str) -> tuple[int, int, list[tuple[str, str, str]]]:
     # block_meta[i] = (fn_header_line_in_buf, first_line, excepted)
     block_meta = []
     excepted_count = 0
-    for i, m in enumerate(blocks):
-        info = m.group(1).strip()
-        code = m.group(2)
+    for i, code in enumerate(blocks):
         first_line = first_content_line(code)
-        excepted = (relpath, first_line) in KNOWN_FRAGMENT_EXCEPTIONS or "ignore" in info
+        excepted = (relpath, first_line) in KNOWN_FRAGMENT_EXCEPTIONS
         if excepted:
             excepted_count += 1
         fn_name = f"__snippet_{i}"
