@@ -216,6 +216,20 @@ FENCE_OPEN_RE = re.compile(
 FENCE_CLOSE_RE = re.compile(rf"^({LEAD_INDENT}(?:{BQ})*){FENCE_DELIM}\s*$")
 
 
+def _expand_column(text: str, start_col: int) -> int:
+    """The absolute column reached after `text`, starting at `start_col`,
+    expanding tabs to 4-column stops. `str.expandtabs` always measures as
+    though its input starts at column 0; a tab's width depends on the
+    column it actually starts at (a tab at column 3 reaches column 4, one
+    at column 4 reaches column 8), so expanding an isolated substring on
+    its own under- or over-counts unless it truly begins the line.
+    """
+    col = start_col
+    for ch in text:
+        col = col + 4 - (col % 4) if ch == "\t" else col + 1
+    return col
+
+
 def _valid_indent(text: str) -> bool:
     """True if pure-indentation `text` is within the 3-column fence budget
     once tabs are expanded to 4-column stops. A literal character count
@@ -234,17 +248,27 @@ def _fence_indent_valid(prefix: str) -> bool:
     return all(_valid_indent(chunk) for chunk in prefix.split(">"))
 
 
-def _list_marker_padding_valid(marker: str) -> bool:
+def _list_marker_padding_valid(marker: str, start_col: int) -> bool:
     """True if EVERY list marker glyph in a captured marker run — possibly
-    several stacked on one line, as in "- 1. " — is followed by 1-4 columns
+    several stacked on one line, as in "- 1. " — is followed by 1-4 COLUMNS
     of padding, CommonMark's allowance checked independently per container
-    since each one opens on its own. Empty `marker` (no marker at all) is
-    trivially fine.
+    since each one opens on its own. `start_col` is the true column the
+    marker text itself begins at (after any lead indent); a glyph is never
+    a tab, so it always advances the column by its own character length,
+    but the padding after it is measured with _expand_column from that
+    running position — measuring the padding substring on its own (as a
+    naive `expandtabs(4)` would) silently resets tab math to column 0 and
+    can under-count a tab's true width. Empty `marker` (no marker at all)
+    is trivially fine.
     """
-    return all(
-        1 <= len(m.group(1).expandtabs(4)) <= 4
-        for m in re.finditer(rf"{MARKER_GLYPH}(\s+)", marker)
-    )
+    col = start_col
+    for m in re.finditer(rf"({MARKER_GLYPH})(\s+)", marker):
+        col += len(m.group(1))
+        end_col = _expand_column(m.group(2), col)
+        if not (1 <= end_col - col <= 4):
+            return False
+        col = end_col
+    return True
 
 
 def _blockquote_depth(prefix: str) -> int:
@@ -393,7 +417,9 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
         if (
             not m
             or not _fence_indent_valid(m.group(1) + m.group(3))
-            or not _list_marker_padding_valid(m.group(2))
+            or not _list_marker_padding_valid(
+                m.group(2), _expand_column(m.group(1), 0)
+            )
         ):
             i += 1
             continue
