@@ -115,9 +115,23 @@ TARGET_GLOBS = [
 # that for staying dependency-free: docs/audits/*.py runs with no network
 # access, so no markdown-parsing package can be installed to do this
 # properly, and a hand-rolled line scanner is what stays within that.
+#
+# The list marker is captured separately (group 2) from the indentation/
+# blockquote text around it (groups 1 and 3) because only the latter repeats
+# on every content line of the container — "- " never appears again after
+# the fence's own opening line, but "> " does, on every line of a
+# blockquote. Stripping the marker back out of content lines would be
+# wrong; not stripping the indent/blockquote text would leave Markdown
+# syntax inside the Rust source handed to `rustfmt`.
+#
+# The delimiter itself (group 4) is 3+ backticks or 3+ tildes, matching
+# CommonMark: a closing fence must use the same character and be at least
+# as long as the opener's, so a run of 4 is also captured and compared,
+# not just matched literally against exactly 3.
 LIST_MARKER = r"(?:[-*+]|\d+[.)])\s+"
-FENCE_OPEN_RE = re.compile(rf"^([\s>]*(?:{LIST_MARKER})?[\s>]*)```rust(.*)$")
-FENCE_CLOSE_RE = re.compile(rf"^([\s>]*(?:{LIST_MARKER})?[\s>]*)```\s*$")
+FENCE_DELIM = r"(`{3,}|~{3,})"
+FENCE_OPEN_RE = re.compile(rf"^([\s>]*)((?:{LIST_MARKER})?)([\s>]*){FENCE_DELIM}rust(.*)$")
+FENCE_CLOSE_RE = re.compile(rf"^([\s>]*(?:{LIST_MARKER})?[\s>]*){FENCE_DELIM}\s*$")
 
 
 def _blockquote_depth(prefix: str) -> int:
@@ -192,22 +206,44 @@ def _strip_prefix(line: str, prefix: str) -> str:
     return line[n:]
 
 
+def _strip_marker_width(line: str, width: int) -> str:
+    """Strips up to `width` leading whitespace characters from `line`.
+
+    A fence opened on its list marker's own line ("- ```rust") leaves no
+    marker text on later content lines, but CommonMark still indents those
+    lines by the marker's own display width ("- " is 2 columns) to keep them
+    inside the list item — plain alignment spaces, not part of the Rust
+    source. Stops at the first non-whitespace character rather than always
+    removing exactly `width`, so a shorter or blank line is not corrupted.
+    """
+    n = 0
+    for ch in line[:width]:
+        if not ch.isspace():
+            break
+        n += 1
+    return line[n:]
+
+
 def find_rust_blocks(text: str, relpath: str) -> list[str]:
     """Returns the code of every ```rust fenced block in `text`, in order.
 
     Line-oriented so an indented or blockquoted fence (a code block nested
     under a list item or a "> " note) is still found — a single-regex scan
     anchored on an unindented close silently drops those. The same leading
-    indentation/">" prefix the opening fence carried is stripped from every
-    content line too, so a blockquote's "> " does not end up inside the Rust
-    source handed to `rustfmt`. A closing fence only ends the block if it is
-    at the same blockquote depth as the opener — otherwise an unrelated
-    fence at a different depth (a later top-level "```", say) could get
-    mistaken for this one's close and swallow everything up to it as this
-    block's content. Exits with an error if an opening fence has no matching
-    close before EOF: a block dropped that way would shrink the "corpus"
-    count with no signal that it happened, and so would one whose real close
-    was skipped over for depth mismatch with nothing compatible after it.
+    indentation/">" text the opening fence carried (excluding any list
+    marker, which does not repeat) is stripped from every content line too,
+    so a blockquote's "> " does not end up inside the Rust source handed to
+    `rustfmt`; a list marker's own display width is separately blanked back
+    out as plain alignment. A closing fence only ends the block if it is at
+    the same blockquote depth AND uses the same delimiter character with a
+    run at least as long as the opener's, per CommonMark — otherwise an
+    unrelated fence (a different depth, or a bare "```" closing some other
+    ```` ```` ````-delimited block) could get mistaken for this one's close
+    and swallow everything up to it as this block's content. Exits with an
+    error if an opening fence has no matching close before EOF: a block
+    dropped that way would shrink the "corpus" count with no signal that it
+    happened, and so would one whose real close was skipped over for a
+    depth or delimiter mismatch with nothing compatible after it.
     """
     lines = text.split("\n")
     blocks: list[str] = []
@@ -218,19 +254,27 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
         if not m:
             i += 1
             continue
-        prefix = m.group(1)
-        depth = _blockquote_depth(prefix)
+        lead, marker, trail, delim = m.group(1), m.group(2), m.group(3), m.group(4)
+        strip_prefix = lead + trail
+        depth = _blockquote_depth(strip_prefix)
+        delim_char, delim_len = delim[0], len(delim)
         start_line = i + 1
         i += 1
         code_lines: list[str] = []
         closed = False
         while i < n:
             cm = FENCE_CLOSE_RE.match(lines[i])
-            if cm and _blockquote_depth(cm.group(1)) == depth:
+            if (
+                cm
+                and _blockquote_depth(cm.group(1)) == depth
+                and cm.group(2)[0] == delim_char
+                and len(cm.group(2)) >= delim_len
+            ):
                 closed = True
                 i += 1
                 break
-            code_lines.append(_strip_prefix(lines[i], prefix))
+            line = _strip_marker_width(lines[i], len(marker))
+            code_lines.append(_strip_prefix(line, strip_prefix))
             i += 1
         if not closed:
             sys.exit(
