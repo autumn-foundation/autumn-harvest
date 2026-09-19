@@ -25,12 +25,16 @@ use std::time::Duration;
 
 use autumn_harvest::chaos::points::{
     ChaosPoint, OUTBOX_INLINE_AFTER_REQUESTED, QUEUE_PARK_BEFORE_UPDATE, SCHED_AFTER_CLAIM,
-    SCHED_AFTER_START_BEFORE_ADVANCE, WORKER_PERSIST_BEFORE_COMMIT,
+    SCHED_AFTER_START_BEFORE_ADVANCE, WORKER_AFTER_OUTER_COMMIT, WORKER_PERSIST_BEFORE_COMMIT,
 };
 use autumn_harvest::chaos::{ChaosPlan, arm};
+use autumn_harvest::context::empty_shared_state;
 use autumn_harvest::prelude::*;
 use autumn_harvest::telemetry::NoOpMetrics;
-use autumn_harvest::worker::{DbPool, HandlerRegistry, chaos_drive_one_workflow_task};
+use autumn_harvest::worker::{
+    DbPool, HandlerRegistry, chaos_drive_one_workflow_task,
+    chaos_drive_one_workflow_task_cancel_at_hold,
+};
 use autumn_harvest::{
     DagCatalog, ExecutionId, SchedulerMonitor, ShardId, StartWorkflowParams, WorkflowIdReusePolicy,
     tick_once,
@@ -580,6 +584,156 @@ async fn chaos_repro_367_crash_orphan_is_reclaimed() {
     assert!(
         worker.is_none(),
         "recovered task must have no worker_id; {diag}"
+    );
+}
+
+// ── Reproducer 2b — issue #1348 terminal metrics lost to post-commit cancel ──
+
+/// A minimal recorder that captures only the two calls
+/// [`emit_pending_workflow_metrics`](autumn_harvest::worker) makes on a
+/// non-canary `Completed` outcome. Every other [`MetricsRecorder`] method
+/// keeps its no-op default.
+#[derive(Default)]
+struct TerminalMetricsRecorder {
+    completed: std::sync::atomic::AtomicUsize,
+    terminal: std::sync::atomic::AtomicUsize,
+}
+
+impl MetricsRecorder for TerminalMetricsRecorder {
+    fn record_workflow_completed(
+        &self,
+        _workflow_name: &str,
+        _queue: &str,
+        _duration_secs: f64,
+        _status: WorkflowStatus,
+    ) {
+        self.completed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn record_workflow_terminal(
+        &self,
+        _workflow_name: &str,
+        _queue: &str,
+        _outcome: WorkflowStatus,
+    ) {
+        self.terminal
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// `run_under_workflow_body_budget` (issue #494) races the whole decision
+/// cycle against a wall-clock budget and DROPS it, uncompleted, on a timeout
+/// -- even when the persist transaction inside it already committed. HOLD at
+/// `WORKER_AFTER_OUTER_COMMIT`, the very first thing the `Persisted` arm does
+/// once that transaction has committed, then cancel the cycle right there
+/// (`chaos_drive_one_workflow_task_cancel_at_hold`) instead of releasing it --
+/// modelling that drop deterministically, with no wall-clock race.
+///
+/// The outcome is durable either way (`COMPLETED` in the DB): the persist
+/// transaction committed before this hold was ever reached. The terminal
+/// metrics must be durable too, on the same footing as the outcome they
+/// describe -- not lost to whatever unrelated post-commit housekeeping
+/// (`.await`) happens to be pending when the budget elapses.
+///
+/// RED procedure: this reproducer fails on the pre-fix shape, where
+/// `emit_pending_workflow_metrics` runs only after several deferred
+/// post-commit `.await`s (dispatch-hint flush, the schedule-failure counter,
+/// unfinished-handler checks, the history-bloat read) -- all of which sit
+/// AFTER `WORKER_AFTER_OUTER_COMMIT`. Cancelling at that hold therefore always
+/// cancels before the emit call is reached, and the metric asserts below
+/// fail. The fix moves the call to run immediately at that hold, before any
+/// of those `.await`s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// `_body` (the shared-DB isolation guard from `chaos_db`) intentionally lives to
+// end-of-scope; see `DB_BODY_SERIAL`.
+#[allow(clippy::significant_drop_tightening)]
+async fn chaos_repro_1348_terminal_metrics_survive_post_commit_cancellation() {
+    let (_body, url, _c) = chaos_db().await;
+    let mut conn = connect(&url).await;
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let params = base_params("chaos_noop", "c1348-wf", exec_id, serde_json::json!(null));
+    autumn_harvest::execution::start_or_load_workflow_execution(&mut conn, params, None)
+        .await
+        .expect("start chaos_noop");
+
+    let recorder = Arc::new(TerminalMetricsRecorder::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recorder) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![chaos_noop_info()],
+        vec![],
+        empty_shared_state(),
+        telemetry,
+    ));
+
+    let task = autumn_harvest::queue::claim_task(
+        &mut conn,
+        &["default".to_string()],
+        "c1348-worker",
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim")
+    .expect("workflow task claimable");
+
+    let guard = arm(ChaosPlan::scripted().hold_at(WORKER_AFTER_OUTER_COMMIT)).await;
+    let hold = guard.hold(WORKER_AFTER_OUTER_COMMIT);
+
+    let cancelled = chaos_drive_one_workflow_task_cancel_at_hold(
+        &url,
+        Arc::clone(&registry),
+        task,
+        "c1348-worker".to_string(),
+        hold,
+    )
+    .await;
+    let diag = guard.diagnostics();
+    assert!(
+        cancelled,
+        "the cycle must have been cancelled AT the post-commit hold, not finished on its \
+         own first (non-vacuity); {diag}"
+    );
+    assert!(
+        guard.actions_fired() >= 1,
+        "the HOLD must have fired; {diag}"
+    );
+    drop(guard);
+
+    let state = exec_state(&mut conn, exec_id).await;
+    assert_eq!(
+        state, "COMPLETED",
+        "the persist transaction had already committed before the hold -- the outcome must \
+         be durable regardless of the cancellation; {diag}"
+    );
+
+    // Fully qualified: `.load(...)` alone resolves to the blanket
+    // `diesel_async::RunQueryDsl::load` in scope in this file, not
+    // `AtomicUsize::load` (issue #1348 review fix).
+    assert_eq!(
+        std::sync::atomic::AtomicUsize::load(
+            &recorder.completed,
+            std::sync::atomic::Ordering::SeqCst
+        ),
+        1,
+        "harvest.workflow.duration must be recorded once the outcome is durable, even though \
+         the cycle was cancelled immediately after commit; {diag}"
+    );
+    assert_eq!(
+        std::sync::atomic::AtomicUsize::load(
+            &recorder.terminal,
+            std::sync::atomic::Ordering::SeqCst
+        ),
+        1,
+        "harvest.workflow.terminal must be recorded once the outcome is durable, even though \
+         the cycle was cancelled immediately after commit; {diag}"
     );
 }
 

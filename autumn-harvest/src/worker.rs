@@ -18207,6 +18207,15 @@ enum TerminalMetricsKind {
 /// persist transaction has actually committed (the `Persisted` arm), never
 /// speculatively -- mirrors the discipline issue #684 already established
 /// for `harvest.update.completed`/`.failed` and `harvest.signal.unhandled`.
+///
+/// Issue #1348 adds the other half of the ordering. Call this BEFORE any
+/// `.await` in the `Persisted` arm, right after the commit. A
+/// `workflow_task_timeout` cancellation
+/// (`run_under_workflow_body_budget`) drops the whole decision cycle if it
+/// fires while the cycle is parked on a later `.await` in that arm. The
+/// outcome is durable by then, but the metrics call never runs. Calling
+/// this first closes that window: two statements with no `.await`
+/// between them cannot be split by a cancellation.
 fn emit_pending_workflow_metrics(
     telemetry: &crate::telemetry::TelemetryConfig,
     execution: &WorkflowExecution,
@@ -21274,6 +21283,29 @@ async fn process_workflow_task(
                     had_nd_details: false,
                 };
             }
+
+            // Issue #1348: call this first in the arm. No `.await` sits
+            // between it and the persist commit above. Every later step in
+            // this arm has an `.await`. A `workflow_task_timeout`
+            // cancellation (issue #494, `run_under_workflow_body_budget`)
+            // can drop the whole cycle while it is parked on one of those.
+            // The outcome is durable by then, but a dropped cycle never
+            // resumes, so a later emit call can be lost. No `.await` sits
+            // between the commit and this call, so nothing can drop the
+            // cycle here.
+            //
+            // Issue #1184 established the other half of this order: never
+            // emit before the commit, or a rolled-back attempt double-
+            // counts. See `emit_pending_workflow_metrics`'s doc comment for
+            // both halves.
+            emit_pending_workflow_metrics(
+                &telemetry,
+                &prepared.execution,
+                &task.queue_name,
+                build_id,
+                &pending_workflow_metrics,
+            );
+
             // Chaos: kill/delay after the outer persist commit but before the
             // deferred-trigger fan-out — committed work whose in-process
             // follow-up side effects have not fired yet. Convergence must still
@@ -21411,19 +21443,6 @@ async fn process_workflow_task(
                 should_warn_history_bloat,
             )
             .await;
-
-            // Issue #1184 (Codex review round 2, P2): the terminal/canary
-            // metrics this cycle computed above, captured before `outcome`
-            // moved into the transaction -- emitted only now that the
-            // transaction has actually committed. See
-            // `emit_pending_workflow_metrics`'s doc comment.
-            emit_pending_workflow_metrics(
-                &telemetry,
-                &prepared.execution,
-                &task.queue_name,
-                build_id,
-                &pending_workflow_metrics,
-            );
         }
         Err(error) => {
             // Issue #1182 (Codex review round 3): an ambiguous suspended-
@@ -29414,6 +29433,74 @@ pub async fn chaos_drive_one_workflow_task(
         .await
     })
     .await
+}
+
+/// Chaos-only (issue #1348): a [`chaos_drive_one_workflow_task`] variant that
+/// cancels the cycle deterministically, at a chosen point, instead of
+/// letting it run to completion.
+///
+/// Drops the cycle the instant it reaches `hold`'s rendezvous. Mirrors the
+/// drop [`run_under_workflow_body_budget`] performs when
+/// `workflow_task_timeout` elapses mid-cycle: the cycle future is
+/// abandoned while parked on an `.await`, never polled again. A `Hold`
+/// rendezvous fires only once its chaos point is reached. So every
+/// earlier `.await` the cycle crossed has already resolved -- in
+/// particular, the persist transaction's commit.
+///
+/// Returns `true` when the cycle was cancelled at the hold: the intended
+/// race. Returns `false` if the cycle finished on its own first. This is a
+/// non-vacuity guard. A `false` result means the workload never reaches
+/// the hold's chaos point, so the caller's race assertion would
+/// otherwise pass vacuously.
+#[cfg(feature = "chaos")]
+pub async fn chaos_drive_one_workflow_task_cancel_at_hold(
+    db_url: &str,
+    registry: Arc<HandlerRegistry>,
+    task: TaskQueueItem,
+    worker_id: String,
+    hold: crate::chaos::HoldHandle,
+) -> bool {
+    let db_url = db_url.to_string();
+    tokio::spawn(async move {
+        let mut conn = AsyncPgConnection::establish(&db_url)
+            .await
+            .expect("chaos: establish owned workflow-task connection");
+        let workflow_cache = Arc::new(tokio::sync::Mutex::new(crate::cache::WorkflowCache::new(
+            16,
+        )));
+        let workflow_panic_strikes = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            uuid::Uuid,
+            u32,
+        >::new()));
+        let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
+        // Boxed for the same reason as `chaos_drive_one_workflow_task`
+        // (clippy::large_futures).
+        let mut cycle = Box::pin(process_workflow_task(
+            &mut conn,
+            registry.as_ref(),
+            &task,
+            &worker_id,
+            "",
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            workflow_cache,
+            std::time::Instant::now(),
+            &workflow_panic_strikes,
+            3,
+            None,
+            &frontier_reset_committed,
+        ));
+        let cancelled_at_hold = tokio::select! {
+            () = hold.reached() => true,
+            _ = &mut cycle => false,
+        };
+        // `cycle`, and its owned connection, drop here -- still parked on the
+        // hold's rendezvous on the `true` arm. Exactly what
+        // `tokio::time::timeout` does to a timed-out body.
+        cancelled_at_hold
+    })
+    .await
+    .expect("chaos: cancel-at-hold drive task must not panic")
 }
 
 // ---------------------------------------------------------------------------
