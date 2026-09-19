@@ -6656,7 +6656,8 @@ async fn resolve_live_attempt_follows_the_seeds_own_migration_before_walking_ret
     );
 
     assert_eq!(
-        resolved.id, retry.as_uuid(),
+        resolved.id,
+        retry.as_uuid(),
         "the live attempt is the retry on the migrated copy's new shard, not the \
          stale MIGRATED seal left behind on the origin"
     );
