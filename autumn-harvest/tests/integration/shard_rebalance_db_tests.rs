@@ -3640,6 +3640,11 @@ async fn an_allow_duplicate_failed_only_start_attaches_to_a_reconciled_successfu
         started.exec_id, exec_id,
         "must return the reconciled seal's own identity"
     );
+    assert_eq!(
+        started.state, "COMPLETED",
+        "must report the effective terminal state, not the seal's own \
+         MIGRATED forwarding marker (Codex P2 review, comment 4054062525)"
+    );
 }
 
 #[tokio::test]

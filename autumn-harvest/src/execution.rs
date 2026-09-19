@@ -1400,8 +1400,15 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                         });
                     }
                     if !matches!(seal.effective_terminal_state(), "FAILED" | "CANCELLED") {
+                        // Report the live copy's effective terminal state,
+                        // not the seal's own `MIGRATED` marker (Codex P2
+                        // review, comment 4054062525). `MIGRATED` is an
+                        // internal forwarding state. A public start API
+                        // must not leak it as if the run were nonterminal.
+                        let mut attached_seal = seal;
+                        attached_seal.state = attached_seal.effective_terminal_state().to_string();
                         return Ok((
-                            StartedWorkflowExecution::from_row(seal, false),
+                            StartedWorkflowExecution::from_row(attached_seal, false),
                             Vec::new(),
                             tx_deferred_checks,
                             Vec::new(),
