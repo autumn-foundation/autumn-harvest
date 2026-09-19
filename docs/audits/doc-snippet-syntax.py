@@ -142,11 +142,32 @@ BQ = r">[ \t]{0,3}"
 # just prose that happens to start with digits) followed by "." or ")";
 # `[0-9]`, not `\d`, so a Unicode digit character does not also qualify.
 #
-# This is deliberately not a full CommonMark container parser (no nesting
-# beyond one list level, no lazy continuation lines) — this script trades
-# that for staying dependency-free: docs/audits/*.py runs with no network
-# access, so no markdown-parsing package can be installed to do this
-# properly, and a hand-rolled line scanner is what stays within that.
+# This is deliberately not a full CommonMark container parser — this
+# script trades that for staying dependency-free: docs/audits/*.py runs
+# with no network access, so no markdown-parsing package can be installed
+# to do this properly, and a hand-rolled line scanner is what stays within
+# that. Two specific, known gaps from that trade, both requiring state
+# that spans lines OUTSIDE a fence's own span, not just within it (every
+# rule this file does implement, however deep, only ever needs the fence's
+# own opener line and the lines between it and its closer):
+#
+# 1. A fence on a list item's own CONTINUATION line, not the marker's own
+#    line, needs that item's content column carried over from wherever the
+#    marker actually was — this script has no cross-line container stack,
+#    so it only recognizes a marker's width when the marker is on the
+#    fence's own opening line (LIST_MARKER above).
+# 2. Whether an ordered marker (other than "1.") may open a list at all
+#    depends on whether it interrupts an open paragraph — this script has
+#    no paragraph-state tracking, so every marker that otherwise matches
+#    LIST_MARKER is accepted regardless of what precedes it.
+# Both are confirmed absent from the current corpus (`grep -rnP` for a
+# multi-digit/wide marker followed by an indented fence, and for a
+# non-"1." ordered marker anywhere near a fence, both come up empty) — if
+# either shows up for real, this is where to extend the scanner, most
+# likely by adopting the container-stack approach
+# `docs/audits/comment-hygiene.py`'s own fence_delimiter/strip_containers
+# already use for the same problem in a different context (Rust doc
+# comments rather than raw Markdown).
 #
 # The list marker is captured separately (group 2) from the indentation/
 # blockquote text around it (groups 1 and 3) because only the latter repeats
