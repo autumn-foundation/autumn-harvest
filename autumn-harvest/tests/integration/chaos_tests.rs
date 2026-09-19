@@ -623,27 +623,28 @@ impl MetricsRecorder for TerminalMetricsRecorder {
 }
 
 /// `run_under_workflow_body_budget` (issue #494) races the whole decision
-/// cycle against a wall-clock budget and DROPS it, uncompleted, on a timeout
-/// -- even when the persist transaction inside it already committed. HOLD at
-/// `WORKER_AFTER_OUTER_COMMIT`, the very first thing the `Persisted` arm does
-/// once that transaction has committed, then cancel the cycle right there
-/// (`chaos_drive_one_workflow_task_cancel_at_hold`) instead of releasing it --
-/// modelling that drop deterministically, with no wall-clock race.
+/// cycle against a wall-clock budget. It DROPS the cycle, uncompleted, on a
+/// timeout -- even when the persist transaction inside it already
+/// committed. HOLD at `WORKER_AFTER_OUTER_COMMIT`: the very first thing the
+/// `Persisted` arm does once that transaction has committed. Then cancel
+/// the cycle right there (`chaos_drive_one_workflow_task_cancel_at_hold`)
+/// instead of releasing it -- modelling that drop deterministically, with
+/// no wall-clock race.
 ///
 /// The outcome is durable either way (`COMPLETED` in the DB): the persist
 /// transaction committed before this hold was ever reached. The terminal
 /// metrics must be durable too, on the same footing as the outcome they
-/// describe -- not lost to whatever unrelated post-commit housekeeping
-/// (`.await`) happens to be pending when the budget elapses.
+/// describe. They must not be lost to unrelated post-commit housekeeping
+/// (`.await`) that happens to be pending when the budget elapses.
 ///
-/// RED procedure: this reproducer fails on the pre-fix shape, where
-/// `emit_pending_workflow_metrics` runs only after several deferred
-/// post-commit `.await`s (dispatch-hint flush, the schedule-failure counter,
-/// unfinished-handler checks, the history-bloat read) -- all of which sit
-/// AFTER `WORKER_AFTER_OUTER_COMMIT`. Cancelling at that hold therefore always
-/// cancels before the emit call is reached, and the metric asserts below
-/// fail. The fix moves the call to run immediately at that hold, before any
-/// of those `.await`s.
+/// RED procedure: this reproducer fails on the pre-fix shape. There,
+/// `emit_pending_workflow_metrics` ran only after several deferred
+/// post-commit `.await`s: a dispatch-hint flush, the schedule-failure
+/// counter, unfinished-handler checks, the history-bloat read. All of
+/// those sit AFTER `WORKER_AFTER_OUTER_COMMIT`. Cancelling at that hold
+/// therefore always cancelled before the emit call was reached, and the
+/// metric asserts below failed. The fix moves the call to run immediately
+/// at that hold, before any of those `.await`s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 // `_body` (the shared-DB isolation guard from `chaos_db`) intentionally lives to
 // end-of-scope; see `DB_BODY_SERIAL`.
@@ -705,6 +706,11 @@ async fn chaos_repro_1348_terminal_metrics_survive_post_commit_cancellation() {
         guard.actions_fired() >= 1,
         "the HOLD must have fired; {diag}"
     );
+    assert_eq!(
+        guard.hits(WORKER_AFTER_OUTER_COMMIT),
+        1,
+        "the post-commit hold point must have been hit exactly once; {diag}"
+    );
     drop(guard);
 
     let state = exec_state(&mut conn, exec_id).await;
@@ -714,9 +720,11 @@ async fn chaos_repro_1348_terminal_metrics_survive_post_commit_cancellation() {
          be durable regardless of the cancellation; {diag}"
     );
 
-    // Fully qualified: `.load(...)` alone resolves to the blanket
-    // `diesel_async::RunQueryDsl::load` in scope in this file, not
-    // `AtomicUsize::load` (issue #1348 review fix).
+    // Fully qualified: a bare `.load(...)` here resolves to
+    // `diesel_async::RunQueryDsl::load` (imported in this file), whose
+    // `self` parameter is by value. Method lookup matches that by-value
+    // step before it ever reaches `AtomicUsize::load`, an inherent method
+    // that takes `&self`.
     assert_eq!(
         std::sync::atomic::AtomicUsize::load(
             &recorder.completed,
