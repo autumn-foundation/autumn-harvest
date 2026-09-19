@@ -104,30 +104,44 @@ TARGET_GLOBS = [
 # well past CommonMark's actual per-container cap.
 #
 # BQ is one level of Markdown blockquote marker (">") plus its own trailing
-# indentation, repeated for however many "> " a nested blockquote carries —
+# whitespace, repeated for however many "> " a nested blockquote carries —
 # captured (with LEAD_INDENT) so the same text can be stripped from the
 # block's content lines too, since a blockquote's "> " is Markdown syntax,
 # not part of the Rust source, and left in place would break every
 # blockquoted snippet's parse regardless of whether its actual code is
 # valid.
 #
-# Each indentation run — LEAD_INDENT, and every BQ repetition's own trailing
-# whitespace — is capped at 3 COLUMNS, not 3 characters: a single leading
-# tab expands to a 4-column stop and so already exceeds the budget by
-# itself, which `{0,3}` alone (a character count) would not catch.
-# `docs/audits/comment-hygiene.py` already implements this exact CommonMark
-# rule (see its fence_delimiter, which validates with the equivalent of
-# `text.expandtabs(4)`, and its own fixture tests around "four spaces is an
-# indented code line, not a fence opener" / "an over-indented \`\`\` inside a
-# fence is content, not a closer") for the same reason — indent past the
-# container's budget makes a delimiter-looking line indented CONTENT, not a
-# fence marker, opener or closer alike. The regex itself still only bounds
-# each run to 3 *characters* (a plain, tab-free run of that length is
-# always within budget); _valid_indent below additionally rejects any run
-# whose tab-expanded width exceeds 3, since regex alone cannot do that
+# BQ's own trailing run is capped at 4 characters, not 3: CommonMark
+# consumes at most ONE character right after ">" as the marker's own
+# optional padding (deterministically, if present — not a choice), and
+# only what follows THAT is the blockquote's inner content, subject to the
+# usual 3-column fence-indent budget fresh from there. So up to 1 (padding)
+# + 3 (budget) = 4 total characters/columns after ">" can still be a valid
+# fence — capping the whole run at 3 like a bare LEAD_INDENT would reject a
+# legitimate "> " (with padding) followed by a further 3 columns of indent.
+# _valid_bq_padding below does the actual budget check (1 mandatory-if-
+# present padding char peeled off, then the usual 3-column check on the
+# rest); the regex here only needs to admit enough characters for that
+# check to have something to work with.
+#
+# LEAD_INDENT itself — and, after peeling BQ's own padding, what
+# _valid_bq_padding checks — is capped at 3 COLUMNS, not 3 characters: a
+# single leading tab expands to a 4-column stop and so already exceeds the
+# budget by itself, which `{0,3}` alone (a character count) would not
+# catch. `docs/audits/comment-hygiene.py` already implements this exact
+# CommonMark rule (see its fence_delimiter, which validates with the
+# equivalent of `text.expandtabs(4)`, and its own fixture tests around
+# "four spaces is an indented code line, not a fence opener" / "an
+# over-indented \`\`\` inside a fence is content, not a closer") for the
+# same reason — indent past the container's budget makes a
+# delimiter-looking line indented CONTENT, not a fence marker, opener or
+# closer alike. The regexes below still only bound each run to a character
+# count (a plain, tab-free run within that count is always within budget);
+# _valid_indent/_valid_bq_padding additionally reject a run whose
+# tab-expanded width exceeds budget, since regex alone cannot do that
 # arithmetic.
 LEAD_INDENT = r"[ \t]{0,3}"
-BQ = r">[ \t]{0,3}"
+BQ = r">[ \t]{0,4}"
 #
 # LIST_MARKER additionally allows a fence to be the first block of a list
 # item, opening on the marker's own line ("- ```rust", "1. ```rust") rather
@@ -250,13 +264,27 @@ def _valid_indent(text: str) -> bool:
     return len(text.expandtabs(4)) <= 3
 
 
+def _valid_bq_padding(text: str) -> bool:
+    """True if the whitespace right after a single ">" is within budget.
+    Unlike a bare lead indent, up to 4 characters can be valid here: the
+    first one (if present) is the blockquote marker's own optional padding
+    — CommonMark consumes it as part of the marker itself, not as indent —
+    and only what remains after it counts against the usual 3-column fence
+    budget.
+    """
+    return not text or _valid_indent(text[1:])
+
+
 def _fence_indent_valid(prefix: str) -> bool:
     """True if every indentation run in a captured fence prefix is within
-    budget: the lead indent before any blockquote marker, and each ">"'s
-    own trailing indent. Splitting on ">" recovers each run whether `prefix`
-    is an opener's lead+trail or a closer's single combined group.
+    budget: the lead indent before any blockquote marker (a flat 3-column
+    budget), and each ">"'s own trailing indent (up to 4, one of which may
+    be the marker's own padding). Splitting on ">" recovers each run
+    whether `prefix` is an opener's lead+trail or a closer's single
+    combined group.
     """
-    return all(_valid_indent(chunk) for chunk in prefix.split(">"))
+    chunks = prefix.split(">")
+    return _valid_indent(chunks[0]) and all(_valid_bq_padding(c) for c in chunks[1:])
 
 
 def _list_marker_padding_valid(marker: str, start_col: int) -> bool:
@@ -291,6 +319,22 @@ def _blockquote_depth(prefix: str) -> int:
     of the container, so it never appears on a closing fence line at all.
     """
     return prefix.count(">")
+
+
+def _quote_prefix_present(line: str, depth: int) -> bool:
+    """True if `line` still carries at least `depth` levels of blockquote
+    marker. CommonMark has no lazy continuation inside a fenced code block
+    (unlike a paragraph, which can continue without repeating the marker):
+    a line that drops the required ">" ends the blockquote there, and any
+    fence still open inside it along with it — not merely leaves that
+    fence's own closer unfound many lines later. `depth == 0` (no
+    blockquote at all — the overwhelming common case) is trivially always
+    present.
+    """
+    if depth == 0:
+        return True
+    return re.match(rf"^{LEAD_INDENT}(?:{BQ}){{{depth},}}", line) is not None
+
 
 # The only edition this corpus ever tells a reader to use: chapter 1's
 # Cargo.toml block pins `edition = "2021"` for the tutorial project every
@@ -420,6 +464,15 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
     over for a depth or delimiter mismatch with nothing compatible after it.
     """
     lines = text.split("\n")
+    if lines and lines[-1] == "":
+        # A file ending in "\n" (virtually all of them) splits into a
+        # phantom empty final element that is not a real line. Left in,
+        # the container-end check below reads it as a genuine blank line
+        # dropping out of an open blockquote — implicitly, wrongly,
+        # "closing" a fence that was never actually closed, right at true
+        # EOF, defeating the unmatched-fence error this function exists to
+        # raise.
+        lines.pop()
     blocks: list[str] = []
     i = 0
     n = len(lines)
@@ -458,6 +511,14 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
             ):
                 closed = True
                 i += 1
+                break
+            if depth > 0 and not _quote_prefix_present(line, depth):
+                # No lazy continuation inside a fenced code block: a line
+                # that drops out of the blockquote ends it, and the fence
+                # open inside it, right here -- not merely fails to close
+                # it. Leave `i` where it is so this same line is still
+                # considered as a fresh opener candidate on the next pass.
+                closed = True
                 break
             if is_rust:
                 code_lines.append(_strip_blockquote(line, depth))
