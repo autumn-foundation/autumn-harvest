@@ -1,0 +1,603 @@
+{"dhatFileVersion":2
+,"mode":"heap","verb":"Allocated"
+,"bklt":true,"bkacc":true
+,"tu":"instrs","Mtu":"Minstr"
+,"tuth":500
+,"cmd":"/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82"
+,"pid":6214
+,"te":617732448
+,"tg":608542911
+,"pps":
+ [{"tb":472,"tbk":1
+  ,"tl":157796
+  ,"mb":472,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":2863,"wb":1334
+  ,"acc":[194,-3,143,-4,0,-8,186,-8,86,-8,12,-8,17,-16,12,-8,22,-8,13,-8,10,-16,1,-8,8,-8,3,-4,14,13,-3,5,-8,0,-2,1,-6,0,-8,4,-8,7,-8,0,-16,1,-16,0,-4,9,-20,0,-8,15,-4,4,-4,3,-8,5,-88,1,-136,0,-8,1]
+  ,"fs":[1,2,3,4,5,6]
+  }
+ ,{"tb":360,"tbk":2
+  ,"tl":156885
+  ,"mb":240,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":6240,"wb":4971
+  ,"fs":[1,7,8,5,6]
+  }
+ ,{"tb":1024,"tbk":1
+  ,"tl":156936
+  ,"mb":1024,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":9609,"wb":5120
+  ,"acc":[20,-705,15,-318,13]
+  ,"fs":[1,9,10,11,12,8,5,6]
+  }
+ ,{"tb":32,"tbk":1
+  ,"tl":326
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":32,"wb":32
+  ,"acc":[-32,2]
+  ,"fs":[13,14,5,6]
+  }
+ ,{"tb":152,"tbk":1
+  ,"tl":296
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":24,"wb":16
+  ,"acc":[-8,3,-8,2,-136,0]
+  ,"fs":[15,16,17,18,5,6]
+  }
+ ,{"tb":32,"tbk":1
+  ,"tl":212
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":0,"wb":32
+  ,"acc":[-32,1]
+  ,"fs":[13,19,18,5,6]
+  }
+ ,{"tb":4,"tbk":1
+  ,"tl":617251109
+  ,"mb":0,"mbk":0
+  ,"gb":4,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":0,"wb":4
+  ,"acc":[-4,1]
+  ,"fs":[1,20,21,6]
+  }
+ ,{"tb":544,"tbk":1
+  ,"tl":617256177
+  ,"mb":0,"mbk":0
+  ,"gb":544,"gbk":1
+  ,"eb":544,"ebk":1
+  ,"rb":76,"wb":60
+  ,"acc":[-16,3,-80,0,-40,2,-402,0,-2,4,-4,0]
+  ,"fs":[1,22,21,6]
+  }
+ ,{"tb":120,"tbk":2
+  ,"tl":617248552
+  ,"mb":0,"mbk":0
+  ,"gb":80,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":305,"wb":84
+  ,"fs":[1,23,24,25,26,27,6]
+  }
+ ,{"tb":32816,"tbk":1
+  ,"tl":8621513
+  ,"mb":32816,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":8786,"wb":7108
+  ,"fs":[1,28,29,30,31,32,33,34,25,26,27,6]
+  }
+ ,{"tb":44,"tbk":1
+  ,"tl":8621489
+  ,"mb":44,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":5104,"wb":44
+  ,"acc":[-44,117]
+  ,"fs":[1,35,32,33,34,25,26,27,6]
+  }
+ ,{"tb":48,"tbk":1
+  ,"tl":8621358
+  ,"mb":48,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":6576,"wb":1920
+  ,"acc":[-8,700,-8,4,-8,2,-8,118,-8,117,-8,121]
+  ,"fs":[1,36,32,33,34,25,26,27,6]
+  }
+ ,{"tb":1595,"tbk":116
+  ,"tl":8599418
+  ,"mb":17,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":1595,"wb":1711
+  ,"fs":[1,37,38,39,40,33,34,25,26,27,6]
+  }
+ ,{"tb":15312,"tbk":232
+  ,"tl":8560355
+  ,"mb":88,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":33966,"wb":11803
+  ,"fs":[1,23,41,42,33,34,25,26,27,6]
+  }
+ ,{"tb":6704,"tbk":114
+  ,"tl":86524
+  ,"mb":54,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":13294,"wb":6704
+  ,"fs":[1,43,44,45,46,47,48,33,34,25,26,27,6]
+  }
+ ,{"tb":6590,"tbk":114
+  ,"tl":69923635507
+  ,"mb":6590,"mbk":114
+  ,"gb":6590,"gbk":114
+  ,"eb":0,"ebk":0
+  ,"rb":38860,"wb":6590
+  ,"fs":[1,49,47,48,33,34,25,26,27,6]
+  }
+ ,{"tb":12812,"tbk":7
+  ,"tl":617460390
+  ,"mb":9632,"mbk":2
+  ,"gb":6416,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":17378,"wb":9330
+  ,"fs":[1,50,51,52,53,33,34,25,26,27,6]
+  }
+ ,{"tb":13173757,"tbk":114
+  ,"tl":69923973653
+  ,"mb":13173757,"mbk":114
+  ,"gb":13173757,"gbk":114
+  ,"eb":0,"ebk":0
+  ,"rb":66328626,"wb":13173757
+  ,"fs":[1,54,55,56,57,33,34,25,26,27,6]
+  }
+ ,{"tb":6590,"tbk":114
+  ,"tl":69916269586
+  ,"mb":6590,"mbk":114
+  ,"gb":6590,"gbk":114
+  ,"eb":0,"ebk":0
+  ,"rb":337790,"wb":6590
+  ,"fs":[1,58,59,33,34,25,26,27,6]
+  }
+ ,{"tb":12096,"tbk":6
+  ,"tl":617226332
+  ,"mb":6144,"mbk":1
+  ,"gb":6144,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":107024,"wb":11472
+  ,"fs":[1,60,61,62,33,34,25,26,27,6]
+  }
+ ,{"tb":32816,"tbk":1
+  ,"tl":8177
+  ,"mb":32816,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":219,"wb":220
+  ,"fs":[1,28,29,30,31,32,63,33,34,25,26,27,6]
+  }
+ ,{"tb":48,"tbk":1
+  ,"tl":8153
+  ,"mb":48,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":48,"wb":48
+  ,"acc":[-48,2]
+  ,"fs":[1,35,32,63,33,34,25,26,27,6]
+  }
+ ,{"tb":48,"tbk":1
+  ,"tl":8037
+  ,"mb":48,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":136,"wb":80
+  ,"acc":[-8,10,-8,4,-8,2,-8,3,-8,2,-8,6]
+  ,"fs":[1,36,32,63,33,34,25,26,27,6]
+  }
+ ,{"tb":14,"tbk":1
+  ,"tl":7397
+  ,"mb":14,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":14,"wb":15
+  ,"acc":[4,-12,2,1]
+  ,"fs":[1,37,38,39,40,63,33,34,25,26,27,6]
+  }
+ ,{"tb":144,"tbk":2
+  ,"tl":7067
+  ,"mb":96,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":317,"wb":110
+  ,"fs":[1,23,41,42,63,33,34,25,26,27,6]
+  }
+ ,{"tb":63,"tbk":1
+  ,"tl":801
+  ,"mb":63,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":125,"wb":63
+  ,"acc":[-62,3,2]
+  ,"fs":[1,43,44,45,46,47,48,63,33,34,25,26,27]
+  }
+ ,{"tb":62,"tbk":1
+  ,"tl":609344765
+  ,"mb":62,"mbk":1
+  ,"gb":62,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":248,"wb":62
+  ,"acc":[3,7,-3,5,3,7,-3,5,3,7,-13,5,3,7,-13,5,3,7,-2,5,3,7,-2,5,3,7,-12,5]
+  ,"fs":[1,49,47,48,63,33,34,25,26,27,6]
+  }
+ ,{"tb":843,"tbk":1
+  ,"tl":609351325
+  ,"mb":843,"mbk":1
+  ,"gb":843,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":5617,"wb":843
+  ,"acc":[20,18,15,18,-2,16,14,12,-3,10,8,-2,6,7,-15,6,7,6,-8,7,9,6,20,19,16,19,-2,17,14,12,-3,10,8,-2,6,7,-17,6,7,-5,6,-5,7,9,-2,6,23,22,21,27,24,23,21,22,-2,13,16,6,8,-3,9,8,-20,7,8,-10,7,-7,8,10,6,8,-4,9,-2,8,-12,7,8,-16,7,8,-15,7,8,-2,7,-13,8,10,6,-5,8,-11,7,8,-5,7,8,-14,7,8,-5,7,8,-16,7,8,-3,7,9,6,8,-4,9,8,9,-7,8,7,-24,6,-5,7,8,10,6,8,-4,9,8,9,8,-6,7,-2,6,-9,7,8,10,-2,6,8,-2,9,-2,8,-10,7,8,-7,7,8,-16,7,8,-10,7,-8,8,10,6,8,-8,9,-8,8,10,6,8,-2,9,-6,8,-2,7,8,-14,7,8,-17,7,8,-5,7,8,-8,7,8,-6,7,9,6,8,-12,9,-2,8,-7,7,8,-16,7,9,-13,8,10,6,8,-8,9,10,6,8,-4,9,-4,8,-13,7,-5,6,-7,7,8,-2,7,-2,8,10,6,8,-8,9,-3,8,-8,7,8,-15,7,8,-2,7,-5,8,10,6,8,-5,9,-3,8,-9,7,8,-3,7,-7,8,10,6,8,-4,9,10,6,7,-4,8,-9,7,8,-7,7,8,-14,7,8,-5,7,8,-12,7,8,-7,7,9,-3,8,10,6,8,-4,9,8,9,-3,8,-4,7,-20,6,-10,7,8,10,6,8,-2,9,-2,8,7,8,-7,7,-11,6,7,9,5,6,5]
+  ,"fs":[1,54,55,56,57,63,33,34,25,26,27,6]
+  }
+ ,{"tb":62,"tbk":1
+  ,"tl":609349964
+  ,"mb":62,"mbk":1
+  ,"gb":62,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":62,"wb":62
+  ,"acc":[-62,2]
+  ,"fs":[1,58,59,63,33,34,25,26,27,6]
+  }
+ ,{"tb":13582144,"tbk":1113
+  ,"tl":596538749
+  ,"mb":262144,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":11898656,"wb":11606656
+  ,"fs":[1,64,65,66,34,25,26,27,6]
+  }
+ ,{"tb":217890,"tbk":6148
+  ,"tl":18174467
+  ,"mb":30,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":260463,"wb":184794
+  ,"fs":[1,67,68,69,66,34,25,26,27,6]
+  }
+ ,{"tb":944,"tbk":114
+  ,"tl":515574342
+  ,"mb":8,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":106583,"wb":9801
+  ,"fs":[1,60,70,71,72,69,66,34,25,26,27,6]
+  }
+ ,{"tb":3410989,"tbk":74356
+  ,"tl":145764450
+  ,"mb":73,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":1638814,"wb":1638814
+  ,"fs":[1,67,73,69,66,34,25,26,27,6]
+  }
+ ,{"tb":594272,"tbk":21156
+  ,"tl":13514741
+  ,"mb":64,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":503832,"wb":503832
+  ,"fs":[1,60,74,75,76,69,66,34,25,26,27,6]
+  }
+ ,{"tb":230875,"tbk":5972
+  ,"tl":1826810693678
+  ,"mb":229482,"mbk":5923
+  ,"gb":230875,"gbk":5972
+  ,"eb":0,"ebk":0
+  ,"rb":490076,"wb":230584
+  ,"fs":[1,54,77,78,79,80,81,69,66,34,25,26]
+  }
+ ,{"tb":6068446,"tbk":136479
+  ,"tl":41048288016914
+  ,"mb":6050641,"mbk":136086
+  ,"gb":6068446,"gbk":136479
+  ,"eb":0,"ebk":0
+  ,"rb":0,"wb":6068446
+  ,"fs":[1,82,69,66,34,25,26,27,6]
+  }
+ ,{"tb":11648384,"tbk":18444
+  ,"tl":1817249463979
+  ,"mb":6187648,"mbk":5899
+  ,"gb":6204800,"gbk":5947
+  ,"eb":0,"ebk":0
+  ,"rb":7627248,"wb":9264996
+  ,"fs":[1,60,83,84,69,66,34,25,26,27,6]
+  }
+ ,{"tb":337308,"tbk":5972
+  ,"tl":27661970
+  ,"mb":56,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":683571,"wb":337130
+  ,"fs":[1,67,85,69,66,34,25,26,27,6]
+  }
+ ,{"tb":660584,"tbk":4788
+  ,"tl":24353946
+  ,"mb":192,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":781874,"wb":554022
+  ,"fs":[1,60,74,86,69,66,34,25,26,27,6]
+  }
+ ,{"tb":223920,"tbk":6300
+  ,"tl":17004065
+  ,"mb":28,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":393874,"wb":196042
+  ,"fs":[1,67,87,69,66,34,25,26,27,6]
+  }
+ ,{"tb":57734,"tbk":9001
+  ,"tl":2844168595630
+  ,"mb":57547,"mbk":8960
+  ,"gb":57734,"gbk":9001
+  ,"eb":0,"ebk":0
+  ,"rb":0,"wb":57734
+  ,"fs":[1,88,89,69,66,34,25,26,27,6]
+  }
+ ,{"tb":461088,"tbk":2987
+  ,"tl":650567875018
+  ,"mb":324576,"mbk":1978
+  ,"gb":326208,"gbk":1993
+  ,"eb":0,"ebk":0
+  ,"rb":278896,"wb":350904
+  ,"fs":[1,90,91,92,89,69,66,34,25,26,27,6]
+  }
+ ,{"tb":2096640,"tbk":465
+  ,"tl":464271503
+  ,"mb":32768,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":2023200,"wb":1975424
+  ,"fs":[1,60,93,94,69,66,34,25,26,27,6]
+  }
+ ,{"tb":337852,"tbk":5972
+  ,"tl":1787411155624
+  ,"mb":335308,"mbk":5924
+  ,"gb":337852,"gbk":5972
+  ,"eb":0,"ebk":0
+  ,"rb":0,"wb":337852
+  ,"fs":[1,54,77,95,96,66,34,25,26,27,6]
+  }
+ ,{"tb":2094336,"tbk":10
+  ,"tl":607581959
+  ,"mb":1048576,"mbk":1
+  ,"gb":1048576,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":1718172,"wb":1810176
+  ,"fs":[1,60,74,97,66,34,25,26,27,6]
+  }
+ ,{"tb":287014,"tbk":4735
+  ,"tl":3486852
+  ,"mb":55,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":350155,"wb":287014
+  ,"fs":[1,60,74,98,69,66,34,25,26,27,6]
+  }
+ ,{"tb":2472,"tbk":197
+  ,"tl":127344
+  ,"mb":8,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":1854,"wb":1854
+  ,"fs":[1,60,74,99,100,69,66,34,25,26,27,6]
+  }
+ ,{"tb":1174,"tbk":139
+  ,"tl":197910057
+  ,"mb":5,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":24385,"wb":1174
+  ,"fs":[1,101,72,69,66,34,25,26,27,6]
+  }
+ ,{"tb":9600,"tbk":100
+  ,"tl":213388537
+  ,"mb":96,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":103960,"wb":3336
+  ,"acc":[-8,260,-8,4436,-8,8482,-8,18,-8,81,-8,135,-48,0]
+  ,"fs":[1,90,91,102,72,69,66,34,25,26,27,6]
+  }
+ ,{"tb":24511,"tbk":4176
+  ,"tl":1231329826484
+  ,"mb":0,"mbk":0
+  ,"gb":24511,"gbk":4176
+  ,"eb":0,"ebk":0
+  ,"rb":0,"wb":24511
+  ,"fs":[1,103,104,69,66,34,25,26,27,6]
+  }
+ ,{"tb":32,"tbk":4
+  ,"tl":3881320
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":1426,"wb":119
+  ,"acc":[543,585,250,149,18,-3,0]
+  ,"fs":[1,60,70,105,72,69,66,34,25,26,27,6]
+  }
+ ,{"tb":5,"tbk":1
+  ,"tl":281814792
+  ,"mb":0,"mbk":0
+  ,"gb":5,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":0,"wb":5
+  ,"acc":[-5,1]
+  ,"fs":[1,58,106,69,66,34,25,26,27,6]
+  }
+ ,{"tb":128,"tbk":1
+  ,"tl":281814638
+  ,"mb":0,"mbk":0
+  ,"gb":128,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":16,"wb":28
+  ,"acc":[-4,1,-4,0,-16,2,-8,1,-96,0]
+  ,"fs":[1,60,83,107,69,66,34,25,26,27,6]
+  }
+ ,{"tb":671772,"tbk":12
+  ,"tl":7637814
+  ,"mb":503840,"mbk":2
+  ,"gb":503840,"gbk":2
+  ,"eb":0,"ebk":0
+  ,"rb":1091413,"wb":706830
+  ,"fs":[1,50,108,109,110,111,66,34,25,26,27,6]
+  }
+ ,{"tb":188576,"tbk":5891
+  ,"tl":15199640158
+  ,"mb":0,"mbk":0
+  ,"gb":114688,"gbk":3584
+  ,"eb":0,"ebk":0
+  ,"rb":64,"wb":47840
+  ,"fs":[1,112,113,114,111,66,34,25,26,27,6]
+  }
+ ,{"tb":1024,"tbk":1
+  ,"tl":3791
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":120,"wb":113
+  ,"acc":[-22,2,3,-43,2,3,-5,2,-2,3,-15,2,-2,3,-19,2,3,-2,2,-911,0]
+  ,"fs":[1,115,116,117,118,119,25,26,27,6]
+  }
+ ]
+,"ftbl":
+ ["[root]"
+ ,"0x4846828: malloc (in /usr/libexec/valgrind/vgpreload_dhat-amd64-linux.so)"
+ ,"0x4916E7E: __fopen_internal (iofopen.c:65)"
+ ,"0x4916E7E: fopen@@GLIBC_2.2.5 (iofopen.c:86)"
+ ,"0x492F0B5: pthread_getattr_np@@GLIBC_2.32 (pthread_getattr_np.c:85)"
+ ,"0x1758CD: std::rt::lang_start_internal (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x14D334: main (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x4917D84: getdelim (iogetdelim.c:65)"
+ ,"0x492F20E: pthread_getattr_np@@GLIBC_2.32 (pthread_getattr_np.c:122)"
+ ,"0x49161B4: _IO_file_doallocate (filedoalloc.c:101)"
+ ,"0x4926523: _IO_doallocbuf (genops.c:347)"
+ ,"0x4923883: _IO_file_underflow@@GLIBC_2.2.5 (fileops.c:486)"
+ ,"0x4917E0F: getdelim (iogetdelim.c:77)"
+ ,"0x484DB80: realloc (in /usr/libexec/valgrind/vgpreload_dhat-amd64-linux.so)"
+ ,"0x492EF79: pthread_getattr_np@@GLIBC_2.32 (pthread_getattr_np.c:180)"
+ ,"0x484D953: calloc (in /usr/libexec/valgrind/vgpreload_dhat-amd64-linux.so)"
+ ,"0x492AE7A: __pthread_attr_extension (pthread_attr_extension.c:28)"
+ ,"0x492B1BF: pthread_attr_setaffinity_np@@GLIBC_2.32 (pthread_attr_setaffinity.c:45)"
+ ,"0x492F007: pthread_getattr_np@@GLIBC_2.32 (pthread_getattr_np.c:194)"
+ ,"0x492B1D8: pthread_attr_setaffinity_np@@GLIBC_2.32 (pthread_attr_setaffinity.c:51)"
+ ,"0x177577: std::sys::pal::unix::stack_overflow::thread_info::set_current_info (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1759FE: std::rt::lang_start_internal (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x17777C: std::sys::pal::unix::stack_overflow::thread_info::set_current_info (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x17ADB9: std::path::Path::_join (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x14CC8C: det_check_profile::main (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x14D242: std::sys::backtrace::__rust_begin_short_backtrace (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x14D238: std::rt::lang_start::{{closure}} (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x175AC5: std::rt::lang_start_internal (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x497E60B: __alloc_dir (opendir.c:115)"
+ ,"0x497E60B: opendir_tail (opendir.c:63)"
+ ,"0x497E60B: opendir (opendir.c:86)"
+ ,"0x177181: std::sys::fs::read_dir (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15BFE7: autumn_harvest::det_check::collect_rs_sources_robust (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x152A14: autumn_harvest::det_check::check_paths (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x14CDC7: det_check_profile::main (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1771AF: std::sys::fs::read_dir (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x177238: std::sys::fs::read_dir (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1A49F5: alloc::wtf8::<impl core::wtf8::Wtf8>::into_box (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x196CE8: <std::sys::fs::unix::ReadDir as core::iter::traits::iterator::Iterator>::next (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1961A5: <std::fs::ReadDir as core::iter::traits::iterator::Iterator>::next (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15C045: autumn_harvest::det_check::collect_rs_sources_robust (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1737E7: std::fs::DirEntry::path (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15C0F0: autumn_harvest::det_check::collect_rs_sources_robust (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x494537E: strdup (strdup.c:42)"
+ ,"0x48D7E86: realpath_stk (canonicalize.c:409)"
+ ,"0x48D7E86: realpath@@GLIBC_2.3 (canonicalize.c:431)"
+ ,"0x176798: std::sys::fs::unix::canonicalize (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x176606: std::sys::fs::canonicalize (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15C1DD: autumn_harvest::det_check::collect_rs_sources_robust (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1767C5: std::sys::fs::unix::canonicalize (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1643E7: hashbrown::raw::RawTableInner::fallible_with_capacity (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x165002: hashbrown::raw::RawTable<T,A>::reserve_rehash (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x16177A: hashbrown::map::HashMap<K,V,S,A>::insert (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15C297: autumn_harvest::det_check::collect_rs_sources_robust (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1A52CA: alloc::raw_vec::RawVecInner<A>::finish_grow (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1A5213: alloc::string::String::try_reserve_exact (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1734B2: std::fs::read_to_string::inner (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15C2B3: autumn_harvest::det_check::collect_rs_sources_robust (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x161EE1: alloc::raw_vec::RawVecInner<A>::try_allocate_in (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15C4B3: autumn_harvest::det_check::collect_rs_sources_robust (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x161E09: alloc::raw_vec::RawVecInner<A>::finish_grow (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x161BF9: alloc::raw_vec::RawVec<T,A>::grow_one (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15C545: autumn_harvest::det_check::collect_rs_sources_robust (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15C3DB: autumn_harvest::det_check::collect_rs_sources_robust (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1679D5: <alloc::vec::Vec<T> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<T,I>>::from_iter (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15306C: autumn_harvest::det_check::scan_sources (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x152BAC: autumn_harvest::det_check::check_paths (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15C9AC: autumn_harvest::det_check::strip_unparseable_content (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15AF06: autumn_harvest::det_check::extract_all_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15308B: autumn_harvest::det_check::scan_sources (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x161CD9: alloc::raw_vec::RawVec<T,A>::grow_one (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15BD23: autumn_harvest::det_check::apply_line_braces_scoped (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15AFF8: autumn_harvest::det_check::extract_all_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15AE6E: autumn_harvest::det_check::extract_all_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x161F63: alloc::raw_vec::RawVecInner<A>::reserve::do_reserve_and_handle (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x166FAA: <alloc::string::String as core::iter::traits::collect::FromIterator<char>>::from_iter (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x159C9B: autumn_harvest::det_check::extract_all_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1A5351: alloc::raw_vec::RawVecInner<A>::reserve::do_reserve_and_handle (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1A4C32: <alloc::string::String as core::fmt::Write>::write_str (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1A6A09: core::fmt::write (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1A4E4D: alloc::fmt::format::format_inner (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x159D75: autumn_harvest::det_check::extract_all_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15A38F: autumn_harvest::det_check::extract_all_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x161D49: alloc::raw_vec::RawVec<T,A>::grow_one (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15A3E3: autumn_harvest::det_check::extract_all_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15A5A0: autumn_harvest::det_check::extract_all_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15AB55: autumn_harvest::det_check::extract_all_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15A83B: autumn_harvest::det_check::extract_all_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15CF7C: autumn_harvest::det_check::det010_pattern_mask_idents (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15AB11: autumn_harvest::det_check::extract_all_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x18CC2C: alloc::raw_vec::RawVecInner<A>::finish_grow (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x18C82E: alloc::raw_vec::RawVec<T,A>::grow_one (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15CFAD: autumn_harvest::det_check::det010_pattern_mask_idents (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x161B89: alloc::raw_vec::RawVec<T,A>::grow_one (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15ACE6: autumn_harvest::det_check::extract_all_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1A53E9: <alloc::string::String as core::clone::Clone>::clone_from (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1530C8: autumn_harvest::det_check::scan_sources (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x153180: autumn_harvest::det_check::scan_sources (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15AB31: autumn_harvest::det_check::extract_all_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x167298: <alloc::string::String as core::iter::traits::collect::FromIterator<char>>::from_iter (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15B473: autumn_harvest::det_check::extract_all_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15BD01: autumn_harvest::det_check::apply_line_braces_scoped (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15BD71: autumn_harvest::det_check::apply_line_braces_scoped (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x160B15: alloc::str::join_generic_copy (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15AC16: autumn_harvest::det_check::extract_all_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15BCCF: autumn_harvest::det_check::apply_line_braces_scoped (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15A4BD: autumn_harvest::det_check::extract_all_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x15A50D: autumn_harvest::det_check::extract_all_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1644D1: hashbrown::raw::RawTable<T,A>::reserve_rehash (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x161044: hashbrown::rustc_entry::<impl hashbrown::map::HashMap<K,V,S,A>>::rustc_entry (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1534E6: autumn_harvest::det_check::scan_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1531B6: autumn_harvest::det_check::scan_sources (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x168989: alloc::raw_vec::RawVecInner<A>::finish_grow (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x1688C9: alloc::raw_vec::RawVec<T,A>::grow_one (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x153493: autumn_harvest::det_check::scan_functions (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x17B57D: std::sync::once::Once::call_once_force::{{closure}} (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x179216: std::sys::sync::once::futex::Once::call (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x17B9F4: std::sync::once_lock::OnceLock<T>::initialize (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x17514C: std::io::stdio::_print (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ,"0x14D162: det_check_profile::main (in /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82)"
+ ]
+}

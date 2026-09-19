@@ -1,0 +1,91 @@
+diff --git a/autumn-harvest/src/det_check.rs b/autumn-harvest/src/det_check.rs
+index 1a6da4e..ae1e3d1 100644
+--- a/autumn-harvest/src/det_check.rs
++++ b/autumn-harvest/src/det_check.rs
+@@ -672,6 +672,55 @@ enum ScopeKind {
+     Opaque,
+ }
+ 
++/// Trims leading/trailing whitespace, byte-identical to [`str::trim`], with an
++/// ASCII fast path for the common case.
++///
++/// `str::trim()` dispatches through the generic `Pattern`/`Searcher`
++/// machinery for the `char::is_whitespace` predicate, which a self-scan
++/// profile of this module's own workload (`docs/perf-artifacts/
++/// det-check-line-trim/`) attributes over 5% of total instructions to
++/// (`core::str::trim_matches`) -- called once per source line from both the
++/// module-scope scan below and the per-line function-body loop it inlines.
++/// Every `cargo fmt`-formatted Rust source line is ASCII-whitespace-only at
++/// its edges, so this strips ASCII whitespace with `str::trim_ascii` first,
++/// then falls back to the general `str::trim()` only when a residual
++/// Unicode-whitespace codepoint is still sitting at an edge afterward --
++/// which can only happen for non-ASCII whitespace (`u8::is_ascii_whitespace`
++/// omits vertical tab and every non-ASCII `White_Space` codepoint that
++/// `char::is_whitespace` includes), so the result is exactly what
++/// `line.trim()` would have produced, on every input.
++#[inline]
++fn trim_line(line: &str) -> &str {
++    // `str::trim_ascii` (stable since 1.80, within this crate's 1.88 MSRV) is
++    // std's own ASCII-whitespace trim. Its internal implementation slices the
++    // result with `from_utf8_unchecked` (sound: trimming ASCII bytes off a
++    // valid UTF-8 string cannot break UTF-8 validity), skipping the
++    // char-boundary check every `&str` range index normally pays -- cheaper
++    // than an equivalent hand-rolled byte scan built from safe indexing.
++    let candidate = line.trim_ascii();
++    let bytes = candidate.as_bytes();
++    let edges_are_ascii = bytes.first().is_none_or(|&f| f < 0x80)
++        && bytes.last().is_none_or(|&l| l < 0x80);
++    if edges_are_ascii {
++        // Neither edge survived the ASCII-whitespace trim above while also
++        // being ASCII, so neither is ASCII whitespace -- and an ASCII byte is
++        // never part of a non-ASCII `White_Space` codepoint, so neither is any
++        // other kind of whitespace either. This is the common case (every
++        // `cargo fmt`-formatted line), and it skips the char-decode +
++        // `is_whitespace` table lookup below entirely.
++        return candidate;
++    }
++    // Rare: a non-ASCII byte sits at an edge. Only then pay for a real
++    // decode + `char::is_whitespace` check.
++    let edge_has_unicode_ws = candidate.chars().next().is_some_and(char::is_whitespace)
++        || candidate.chars().next_back().is_some_and(char::is_whitespace);
++    if edge_has_unicode_ws {
++        candidate.trim()
++    } else {
++        candidate
++    }
++}
++
+ /// Returns every **module-scope** function definition (top level and inside
+ /// `mod NAME { … }` blocks, at any nesting), with a flag for whether it carries
+ /// `#[workflow]` / `#[activity]`. Methods inside `impl`/`trait` blocks are
+@@ -715,7 +764,7 @@ fn extract_all_functions(lines: &[&str]) -> Vec<FnDef> {
+             continue;
+         }
+ 
+-        let trimmed = lines[i].trim();
++        let trimmed = trim_line(lines[i]);
+ 
+         // Accumulate the workflow/activity attribute state, keeping it across
+         // intervening attributes, doc comments, and blank lines.
+@@ -764,7 +813,7 @@ fn extract_all_functions(lines: &[&str]) -> Vec<FnDef> {
+         pending_wf = false;
+         pending_act = false;
+         let stripped = strip_unparseable_content(lines[i]);
+-        let trimmed_stripped = stripped.trim();
++        let trimmed_stripped = trim_line(&stripped);
+         // Resolve the module name for a `Module` scope this line may open: either
+         // continuing a `pending_mod` from a prior line, or a fresh `mod NAME {`.
+         let (mod_first, mod_name) = if pending_mod {
+@@ -843,10 +892,10 @@ fn extract_fn_body(lines: &[&str], fn_idx: usize) -> Option<(Vec<(u32, String)>,
+ 
+         if let Some(pos) = scan_braces_outside_literals(line, &mut depth) {
+             let before = &line[..pos];
+-            if !before.trim().is_empty() {
++            if !trim_line(before).is_empty() {
+                 body.push((line_num, before.to_string()));
+             }
+-        } else if !line.trim().is_empty() {
++        } else if !trim_line(line).is_empty() {
+             body.push((line_num, line.to_string()));
+         }
+ 

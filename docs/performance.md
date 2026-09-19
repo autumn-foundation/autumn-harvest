@@ -1781,6 +1781,10 @@ standalone note rather than part of the claim-path attribution table above:
   — lazy JSON-Pointer path construction in schema validation (issue #373).
 * [`docs/performance-det-check.md`](performance-det-check.md) — fusing a
   redundant per-line comment scan in `harvest det-check` (issue #778).
+* [`docs/performance-det-check-line-trim.md`](performance-det-check-line-trim.md)
+  — an ASCII-fast-path `str::trim()` replacement for the same scan's per-line
+  whitespace trim; a real but sub-floor win (best of three variants: 2.66%
+  instruction reduction against a >=5% floor) — a negative result.
 * [`docs/performance-dag-graph.md`](performance-dag-graph.md) — hoisting a
   per-node rebuild out of `GET /dag-run-graph` (issue #690).
 * [`docs/performance-dlq-aggregate.md`](performance-dlq-aggregate.md) — DLQ
