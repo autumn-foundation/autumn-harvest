@@ -516,7 +516,7 @@ async fn admin_status_localpg_end_to_end() {
     );
     eprintln!("PASS (h) just-outside-window: count={}", stalled["count"]);
 
-    // ── (i) an old event AND a fresh event on the same execution ────────────
+    // ── (i) an old event AND a fresh event, on the same execution. ──────────
     // The fresh one must be found regardless of how many older rows exist.
     // This guards against a rewrite that looks at only one event per
     // execution.
