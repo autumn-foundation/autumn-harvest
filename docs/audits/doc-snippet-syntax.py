@@ -233,7 +233,7 @@ BQ = r">[ \t]{0,4}"
 # cross-line gaps noted above, this needs no state beyond the current
 # line, so it stays in scope.
 MARKER_GLYPH = r"(?:[-*+]|[0-9]{1,9}[.)])"
-LIST_MARKER = rf"{MARKER_GLYPH}\s+"
+LIST_MARKER = rf"{MARKER_GLYPH}[ \t]+"
 FENCE_DELIM = r"(`{3,}|~{3,})"
 FENCE_OPEN_RE = re.compile(
     rf"^({LEAD_INDENT})((?:{LIST_MARKER})*)((?:{BQ})*){FENCE_DELIM}(.*)$"
