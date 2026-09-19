@@ -211,17 +211,23 @@ result at this scale.
 All three regimes hold active-execution count constant (3,000) and vary
 only how many *other* rows fall inside the recent-events window —
 either from chattier active executions (event-write-heavy) or from a burst
-of terminal-execution completions (terminal-churn). Interpolating the
-three points (267 buffers at ~2,970 window rows, 2,094 at ~152,970, 5,724
-at ~297,000, versus a constant ~12,175 pre-fix) puts the crossover roughly
-where window rows approach 200,000-250,000 for this exact fixture shape —
-a fleet combining thousands of active executions with both high per-
+of terminal-execution completions (terminal-churn). At 297,000 window rows
+(event-write-heavy) the fix still costs less than half the pre-fix
+baseline (5,724 vs. 12,175), so the crossover has not happened yet at that
+scale (code review, correcting an earlier draft of this section that
+mis-stated it as 200,000-250,000, which the 297,000-row point itself
+contradicts). A linear extrapolation from the two largest measured points
+(152,970 rows -> 2,094 buffers; 297,000 rows -> 5,724 buffers) puts the
+crossover around **550,000 window rows** for this exact fixture shape — a
+fleet combining thousands of active executions with both high per-
 execution write rates AND high completion churn could tip the balance
-back. This is an approximation from three measured points on one fixture
-shape, not an exhaustively characterized curve. A deployment whose
-workload diverges materially from all three regimes measured here should
-re-run this harness against its own fixture shape before relying on this
-rewrite being a win.
+back there. This is a linear extrapolation from two measured points on one
+fixture shape, not an exhaustively characterized curve, and the true curve
+is not necessarily linear across the range where the planner switches
+between an index scan and a sequential scan. A deployment whose workload
+diverges materially from all three regimes measured here should re-run
+this harness against its own fixture shape before relying on this rewrite
+being a win.
 
 ## Equivalence
 
