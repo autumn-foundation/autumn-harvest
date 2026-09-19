@@ -522,10 +522,25 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
         if delim_char == "`" and "`" in info:
             i += 1
             continue
-        is_rust = info.strip().startswith("rust")
+        # The info string's language is its first comma-separated word
+        # (rustdoc's own convention for annotations like "rust,ignore" or
+        # "rust,no_run") — an exact match, not a prefix: "rustfmt" or
+        # "rustic" both start with "rust" but are not the Rust language tag,
+        # and a block genuinely written in one of those (if this corpus ever
+        # gets one) is not Rust source this script should be checking.
+        is_rust = info.strip().split(",", 1)[0].strip() == "rust"
         depth = _blockquote_depth(lead + trail)
         marker_start_col = _expand_column(lead, 0)
-        marker_width = _expand_column(marker, marker_start_col) - marker_start_col
+        # The absolute column marker's content starts at, not just the
+        # marker text's own width: an indented marker ("   - ```rust") has
+        # already used marker_start_col columns before its own text even
+        # begins, and a later line must reach lead's indent PLUS the
+        # marker's width to still be inside the item, not just the
+        # marker's width alone measured from column 0. 0 when there is no
+        # marker at all (not merely when it measures to 0 some other way),
+        # since this also gates whether the list-specific checks below
+        # apply at all.
+        marker_width = _expand_column(marker, marker_start_col) if marker else 0
         start_line = i + 1
         i += 1
         code_lines: list[str] = []
