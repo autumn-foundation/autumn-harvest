@@ -405,19 +405,26 @@ def _strip_blockquote(line: str, depth: int) -> str:
 
 
 def _strip_marker_width(line: str, width: int) -> str:
-    """Strips up to `width` leading whitespace characters from `line`.
+    """Strips leading whitespace from `line` up to `width` COLUMNS, not
+    characters.
 
     A fence opened on its list marker's own line ("- ```rust") leaves no
     marker text on later content lines, but CommonMark still indents those
     lines by the marker's own display width ("- " is 2 columns) to keep them
     inside the list item — plain alignment spaces, not part of the Rust
-    source. Stops at the first non-whitespace character rather than always
-    removing exactly `width`, so a shorter or blank line is not corrupted.
+    source. A character count under-strips when the marker itself contained
+    a tab (its width in columns exceeds its length in characters), leaving
+    genuine alignment whitespace sitting in front of otherwise-correct
+    content. Stops at the first non-whitespace character, or once `width`
+    columns are consumed, rather than always removing exactly `width`
+    characters, so a shorter or blank line is not corrupted.
     """
+    col = 0
     n = 0
-    for ch in line[:width]:
-        if not ch.isspace():
+    for ch in line:
+        if col >= width or not ch.isspace():
             break
+        col = _expand_column(ch, col)
         n += 1
     return line[n:]
 
@@ -494,7 +501,8 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
             continue
         is_rust = info.strip().startswith("rust")
         depth = _blockquote_depth(lead + trail)
-        marker_width = len(marker)
+        marker_start_col = _expand_column(lead, 0)
+        marker_width = _expand_column(marker, marker_start_col) - marker_start_col
         start_line = i + 1
         i += 1
         code_lines: list[str] = []
