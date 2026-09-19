@@ -697,6 +697,10 @@ checking against this hot path's documented advisory-lock-ordering,
 exactly-once-claim, and `SKIP LOCKED`-concurrency-safety invariants by
 someone with full context on `queue.rs`. It is out of scope for this page and
 is not decided here; it is tracked separately as issue #1340.
+`docs/assays/0005-claim-batched-seek-and-refine.md` prototyped that shape and
+`docs/performance-claim-batched-seek-and-refine.md` measures a real,
+DB-tested implementation (`queue::claim_task_batched`, additive, not wired
+into the default claim path) against the single-row query above.
 
 This also corrects, without fully resolving, the
 [known limitations](#known-limitations) bullet that called `schedule_to_close`
@@ -1766,6 +1770,14 @@ from the benchmark are directly comparable.
   per RUNNING execution on every timeout-scanner tick.
 * Issue #1177 — reproduction and full `EXPLAIN` captures for
   [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
+* [`docs/performance-claim-batched-seek-and-refine.md`](performance-claim-batched-seek-and-refine.md) —
+  issue #1340's batched seek-and-refine claim (`queue::claim_task_batched`,
+  additive, not wired into the default claim path), measured against the
+  single-row query above.
+* `docs/perf-artifacts/claim-batched-seek-and-refine/` — committed `EXPLAIN`
+  evidence for that measurement.
+* `autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh` —
+  regenerates that evidence from a clean checkout.
 
 ### Other profiling notes
 
