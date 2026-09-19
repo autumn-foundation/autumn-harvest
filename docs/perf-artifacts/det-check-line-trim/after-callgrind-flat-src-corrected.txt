@@ -4,9 +4,9 @@ Profile data file 'cg.out' (creator: callgrind-3.22.0)
 I1 cache: 
 D1 cache: 
 LL cache: 
-Timerange: Basic block 0 - 203084176
+Timerange: Basic block 0 - 203101352
 Trigger: Program termination
-Profiled target:  /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82 (PID 12757, part 1)
+Profiled target:  /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82 (PID 2054, part 1)
 Events recorded:  Ir
 Events shown:     Ir
 Event sort order: Ir
@@ -18,79 +18,79 @@ Auto-annotation:  on
 --------------------------------------------------------------------------------
 Ir                   
 --------------------------------------------------------------------------------
-642,244,285 (100.0%)  PROGRAM TOTALS
+643,931,960 (100.0%)  PROGRAM TOTALS
 
 --------------------------------------------------------------------------------
 Ir                    file:function
 --------------------------------------------------------------------------------
-150,031,952 (23.36%)  ???:autumn_harvest::det_check::extract_all_functions [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-103,787,277 (16.16%)  ???:autumn_harvest::det_check::strip_unparseable_content [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-102,870,369 (16.02%)  ???:autumn_harvest::det_check::next_char [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
- 42,753,592 ( 6.66%)  ???:core::slice::memchr::memchr_aligned [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
- 36,920,770 ( 5.75%)  ???:autumn_harvest::det_check::raw_string_end [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
- 28,535,878 ( 4.44%)  ./malloc/./malloc/malloc.c:_int_malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
- 24,076,202 ( 3.75%)  ???:<core::str::iter::Lines as core::iter::traits::iterator::Iterator>::next [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
- 20,956,256 ( 3.26%)  ???:autumn_harvest::det_check::apply_line_braces_scoped [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
- 20,459,227 ( 3.19%)  ???:autumn_harvest::det_check::trim_line [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
- 19,903,004 ( 3.10%)  ./malloc/./malloc/malloc.c:_int_free [/usr/lib/x86_64-linux-gnu/libc.so.6]
- 12,586,445 ( 1.96%)  ./malloc/./malloc/malloc.c:malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
-  9,598,985 ( 1.49%)  ./malloc/./malloc/malloc.c:malloc_consolidate [/usr/lib/x86_64-linux-gnu/libc.so.6]
-  7,885,896 ( 1.23%)  ./malloc/./malloc/malloc.c:free [/usr/lib/x86_64-linux-gnu/libc.so.6]
-  7,489,119 ( 1.17%)  ???:core::str::converts::from_utf8 [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-  7,316,939 ( 1.14%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__memcpy_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
-  4,537,791 ( 0.71%)  ./malloc/./malloc/malloc.c:unlink_chunk.isra.0 [/usr/lib/x86_64-linux-gnu/libc.so.6]
-  4,159,538 ( 0.65%)  ???:autumn_harvest::det_check::det010_pattern_mask_idents [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-  3,929,895 ( 0.61%)  ???:<alloc::vec::Vec<T> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<T,I>>::from_iter [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-  3,201,455 ( 0.50%)  ./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S:__memcmp_avx2_movbe [/usr/lib/x86_64-linux-gnu/libc.so.6]
-  3,030,170 ( 0.47%)  ???:alloc::raw_vec::RawVecInner<A>::finish_grow [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-  2,533,635 ( 0.39%)  ???:__rustc::__rdl_alloc [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-  2,345,582 ( 0.37%)  ???:<core::hash::sip::Hasher<S> as core::hash::Hasher>::write [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-  2,283,550 ( 0.36%)  ./malloc/./malloc/malloc.c:realloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
-  2,023,767 ( 0.32%)  ./malloc/./malloc/malloc.c:_int_realloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
-  1,765,950 ( 0.27%)  ???:core::ptr::drop_in_place<autumn_harvest::det_check::FnDef> [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-  1,755,978 ( 0.27%)  ???:<core::str::pattern::CharSearcher as core::str::pattern::Searcher>::next_match [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-  1,510,442 ( 0.24%)  ???:alloc::raw_vec::RawVecInner<A>::reserve::do_reserve_and_handle [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-  1,393,077 ( 0.22%)  ???:core::hash::BuildHasher::hash_one [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-  1,371,959 ( 0.21%)  ./malloc/./malloc/malloc.c:_int_free_merge_chunk [/usr/lib/x86_64-linux-gnu/libc.so.6]
-    844,836 ( 0.13%)  ./malloc/./malloc/arena.c:free
-    743,116 ( 0.12%)  ???:__rustc::__rdl_realloc [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-    681,696 ( 0.11%)  ???:alloc::raw_vec::RawVec<T,A>::grow_one [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-    680,922 ( 0.11%)  ???:alloc::fmt::format::format_inner [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-    645,712 ( 0.10%)  ???:core::str::<impl str>::trim_start_matches [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-    626,160 ( 0.10%)  ./malloc/./malloc/malloc.c:alloc_perturb [/usr/lib/x86_64-linux-gnu/libc.so.6]
-    529,313 ( 0.08%)  ???:autumn_harvest::det_check::scan_functions [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+150,051,802 (23.30%)  ???:autumn_harvest::det_check::extract_all_functions [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+103,790,727 (16.12%)  ???:autumn_harvest::det_check::strip_unparseable_content [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+102,879,606 (15.98%)  ???:autumn_harvest::det_check::next_char [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+ 42,758,011 ( 6.64%)  ???:core::slice::memchr::memchr_aligned [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+ 36,922,073 ( 5.73%)  ???:autumn_harvest::det_check::raw_string_end [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+ 28,537,093 ( 4.43%)  ./malloc/./malloc/malloc.c:_int_malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 24,078,520 ( 3.74%)  ???:<core::str::iter::Lines as core::iter::traits::iterator::Iterator>::next [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+ 22,088,881 ( 3.43%)  ???:autumn_harvest::det_check::trim_line [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+ 20,956,256 ( 3.25%)  ???:autumn_harvest::det_check::apply_line_braces_scoped [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+ 19,905,446 ( 3.09%)  ./malloc/./malloc/malloc.c:_int_free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 12,587,924 ( 1.95%)  ./malloc/./malloc/malloc.c:malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  9,601,161 ( 1.49%)  ./malloc/./malloc/malloc.c:malloc_consolidate [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  7,886,820 ( 1.22%)  ./malloc/./malloc/malloc.c:free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  7,489,673 ( 1.16%)  ???:core::str::converts::from_utf8 [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  7,316,884 ( 1.14%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__memcpy_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  4,538,148 ( 0.70%)  ./malloc/./malloc/malloc.c:unlink_chunk.isra.0 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  4,159,564 ( 0.65%)  ???:autumn_harvest::det_check::det010_pattern_mask_idents [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  3,930,272 ( 0.61%)  ???:<alloc::vec::Vec<T> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<T,I>>::from_iter [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  3,201,824 ( 0.50%)  ./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S:__memcmp_avx2_movbe [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  3,030,718 ( 0.47%)  ???:alloc::raw_vec::RawVecInner<A>::finish_grow [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  2,533,932 ( 0.39%)  ???:__rustc::__rdl_alloc [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  2,346,043 ( 0.36%)  ???:<core::hash::sip::Hasher<S> as core::hash::Hasher>::write [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  2,284,036 ( 0.35%)  ./malloc/./malloc/malloc.c:realloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  2,024,086 ( 0.31%)  ./malloc/./malloc/malloc.c:_int_realloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  1,766,250 ( 0.27%)  ???:core::ptr::drop_in_place<autumn_harvest::det_check::FnDef> [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  1,756,194 ( 0.27%)  ???:<core::str::pattern::CharSearcher as core::str::pattern::Searcher>::next_match [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  1,510,718 ( 0.23%)  ???:alloc::raw_vec::RawVecInner<A>::reserve::do_reserve_and_handle [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  1,393,170 ( 0.22%)  ???:core::hash::BuildHasher::hash_one [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  1,371,439 ( 0.21%)  ./malloc/./malloc/malloc.c:_int_free_merge_chunk [/usr/lib/x86_64-linux-gnu/libc.so.6]
+    844,935 ( 0.13%)  ./malloc/./malloc/arena.c:free
+    743,270 ( 0.12%)  ???:__rustc::__rdl_realloc [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    681,816 ( 0.11%)  ???:alloc::raw_vec::RawVec<T,A>::grow_one [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    681,036 ( 0.11%)  ???:alloc::fmt::format::format_inner [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    645,785 ( 0.10%)  ???:core::str::<impl str>::trim_start_matches [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    626,292 ( 0.10%)  ./malloc/./malloc/malloc.c:alloc_perturb [/usr/lib/x86_64-linux-gnu/libc.so.6]
+    530,588 ( 0.08%)  ???:autumn_harvest::det_check::scan_functions [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
     523,246 ( 0.08%)  ???:autumn_harvest::det_check::char_literal_end [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-    522,721 ( 0.08%)  ./malloc/./malloc/malloc.c:_int_free_maybe_consolidate [/usr/lib/x86_64-linux-gnu/libc.so.6]
-    519,874 ( 0.08%)  ???:core::fmt::write [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-    422,592 ( 0.07%)  ???:alloc::str::join_generic_copy [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-    358,380 ( 0.06%)  ???:<alloc::string::String as core::fmt::Write>::write_str [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-    357,370 ( 0.06%)  ???:hashbrown::rustc_entry::<impl hashbrown::map::HashMap<K,V,S,A>>::rustc_entry [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    522,578 ( 0.08%)  ./malloc/./malloc/malloc.c:_int_free_maybe_consolidate [/usr/lib/x86_64-linux-gnu/libc.so.6]
+    519,961 ( 0.08%)  ???:core::fmt::write [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    422,682 ( 0.07%)  ???:alloc::str::join_generic_copy [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    360,146 ( 0.06%)  ???:hashbrown::rustc_entry::<impl hashbrown::map::HashMap<K,V,S,A>>::rustc_entry [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    358,440 ( 0.06%)  ???:<alloc::string::String as core::fmt::Write>::write_str [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
     338,037 ( 0.05%)  ???:hashbrown::raw::RawTable<T,A>::reserve_rehash [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-    336,943 ( 0.05%)  ./malloc/./malloc/arena.c:malloc
-    298,675 ( 0.05%)  ???:core::fmt::Formatter::pad [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-    281,515 ( 0.04%)  ???:__rustc::__rust_alloc [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-    281,515 ( 0.04%)  ???:__rustc::__rust_no_alloc_shim_is_unstable_v2 [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-    281,514 ( 0.04%)  ???:__rustc::__rdl_dealloc [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-    281,514 ( 0.04%)  ???:__rustc::__rust_dealloc [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-    197,109 ( 0.03%)  ???:<alloc::string::String as core::clone::Clone>::clone_from [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-    195,078 ( 0.03%)  ./malloc/./malloc/arena.c:realloc
+    336,993 ( 0.05%)  ./malloc/./malloc/arena.c:malloc
+    298,725 ( 0.05%)  ???:core::fmt::Formatter::pad [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    281,548 ( 0.04%)  ???:__rustc::__rust_alloc [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    281,548 ( 0.04%)  ???:__rustc::__rust_no_alloc_shim_is_unstable_v2 [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    281,547 ( 0.04%)  ???:__rustc::__rdl_dealloc [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    281,547 ( 0.04%)  ???:__rustc::__rust_dealloc [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    197,142 ( 0.03%)  ???:<alloc::string::String as core::clone::Clone>::clone_from [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    195,120 ( 0.03%)  ./malloc/./malloc/arena.c:realloc
     143,086 ( 0.02%)  ???:autumn_harvest::det_check::strip_leading_visibility [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
     101,146 ( 0.02%)  ./stdlib/./stdlib/canonicalize.c:realpath@@GLIBC_2.3 [/usr/lib/x86_64-linux-gnu/libc.so.6]
      89,944 ( 0.01%)  ./elf/./elf/dl-tunables.c:__GI___tunables_init [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
-     85,604 ( 0.01%)  ???:autumn_harvest::det_check::scan_sources [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-     59,735 ( 0.01%)  ???:<str as core::fmt::Display>::fmt [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+     85,617 ( 0.01%)  ???:autumn_harvest::det_check::scan_sources [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+     59,745 ( 0.01%)  ???:<str as core::fmt::Display>::fmt [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
      49,656 ( 0.01%)  ???:<core::str::lossy::Utf8Chunks as core::iter::traits::iterator::Iterator>::next [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
      49,343 ( 0.01%)  ./elf/./elf/dl-lookup.c:do_lookup_x [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
      45,558 ( 0.01%)  ./stdio-common/./stdio-common/vfscanf-internal.c:__vfscanf_internal [/usr/lib/x86_64-linux-gnu/libc.so.6]
-     33,778 ( 0.01%)  ???:__rustc::__rust_realloc [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-     32,634 ( 0.01%)  ???:0x00000000048a06b0 [???]
-     32,540 ( 0.01%)  ./malloc/../string/bits/string_fortified.h:_int_realloc
-     29,865 ( 0.00%)  ???:<&T as core::fmt::Display>::fmt [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
-     29,865 ( 0.00%)  ???:<alloc::string::String as core::fmt::Display>::fmt [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+     33,785 ( 0.01%)  ???:__rustc::__rust_realloc [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+     32,644 ( 0.01%)  ???:0x00000000048a06b0 [???]
+     32,550 ( 0.01%)  ./malloc/../string/bits/string_fortified.h:_int_realloc
+     29,870 ( 0.00%)  ???:<&T as core::fmt::Display>::fmt [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+     29,870 ( 0.00%)  ???:<alloc::string::String as core::fmt::Display>::fmt [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
      27,544 ( 0.00%)  ???:core::ffi::c_str::CStr::from_bytes_with_nul [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
      22,028 ( 0.00%)  ./stdlib/../stdlib/strtol_l.c:____strtoul_l_internal [/usr/lib/x86_64-linux-gnu/libc.so.6]
-     19,817 ( 0.00%)  ???:std::path::Components::parse_next_component_back [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
      19,583 ( 0.00%)  ./elf/./elf/dl-reloc.c:_dl_relocate_object [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+     19,537 ( 0.00%)  ???:std::path::Components::parse_next_component_back [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
      16,713 ( 0.00%)  ./elf/./elf/dl-lookup.c:_dl_lookup_symbol_x [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
      16,502 ( 0.00%)  ???:autumn_harvest::det_check::collect_rs_sources_robust [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
      15,561 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/../multiarch/strcmp-sse2.S:strcmp [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
@@ -104,7 +104,7 @@ Ir                    file:function
      11,349 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__mempcpy_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
      10,463 ( 0.00%)  ???:core::unicode::unicode_data::white_space::lookup [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
      10,327 ( 0.00%)  ./elf/./elf/dl-lookup.c:check_match [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
-      9,623 ( 0.00%)  ???:hashbrown::map::HashMap<K,V,S,A>::insert [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      9,733 ( 0.00%)  ???:hashbrown::map::HashMap<K,V,S,A>::insert [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
       9,443 ( 0.00%)  ???:<std::path::Components as core::iter::traits::double_ended::DoubleEndedIterator>::next_back [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
       8,496 ( 0.00%)  ???:std::path::Path::_join [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
       8,492 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strlen-avx2.S:__strlen_avx2 [/usr/lib/x86_64-linux-gnu/libc.so.6]
@@ -127,8 +127,8 @@ Ir                    file:function
       3,565 ( 0.00%)  ???:std::sys::fs::canonicalize [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
       3,540 ( 0.00%)  ???:<std::fs::ReadDir as core::iter::traits::iterator::Iterator>::next [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
       3,230 ( 0.00%)  ./libio/./libio/iogetdelim.c:getdelim [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      3,106 ( 0.00%)  ./misc/./misc/sbrk.c:sbrk [/usr/lib/x86_64-linux-gnu/libc.so.6]
       3,096 ( 0.00%)  ./elf/../sysdeps/x86/dl-cacheinfo.h:intel_check_word.constprop.0 [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
-      3,083 ( 0.00%)  ./misc/./misc/sbrk.c:sbrk [/usr/lib/x86_64-linux-gnu/libc.so.6]
       2,925 ( 0.00%)  ???:alloc::wtf8::<impl core::wtf8::Wtf8>::into_box [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
       2,808 ( 0.00%)  ???:std::fs::DirEntry::file_type [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
       2,339 ( 0.00%)  ./elf/./elf/dl-load.c:_dl_map_object_from_fd [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
@@ -140,7 +140,7 @@ Ir                    file:function
       1,874 ( 0.00%)  ./stdlib/./stdlib/getenv.c:getenv [/usr/lib/x86_64-linux-gnu/libc.so.6]
       1,840 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/read.c:read [/usr/lib/x86_64-linux-gnu/libc.so.6]
       1,739 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/memchr-avx2.S:__memchr_avx2 [/usr/lib/x86_64-linux-gnu/libc.so.6]
-      1,681 ( 0.00%)  ./malloc/./malloc/malloc.c:systrim.constprop.0 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      1,718 ( 0.00%)  ./malloc/./malloc/malloc.c:systrim.constprop.0 [/usr/lib/x86_64-linux-gnu/libc.so.6]
       1,680 ( 0.00%)  ./libio/./libio/strops.c:_IO_str_init_static_internal [/usr/lib/x86_64-linux-gnu/libc.so.6]
       1,596 ( 0.00%)  ./stdio-common/./stdio-common/isoc23_sscanf.c:__isoc23_sscanf [/usr/lib/x86_64-linux-gnu/libc.so.6]
       1,573 ( 0.00%)  ./malloc/./malloc/malloc.c:sysmalloc_mmap.isra.0 [/usr/lib/x86_64-linux-gnu/libc.so.6]
@@ -154,7 +154,7 @@ Ir                    file:function
       1,276 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/statx.c:statx [/usr/lib/x86_64-linux-gnu/libc.so.6]
       1,193 ( 0.00%)  ./elf/./elf/rtld.c:dl_main [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
       1,175 ( 0.00%)  ./nptl/./nptl/pthread_getattr_np.c:pthread_getattr_np@@GLIBC_2.32 [/usr/lib/x86_64-linux-gnu/libc.so.6]
-      1,144 ( 0.00%)  ./malloc/./malloc/morecore.c:__glibc_morecore [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      1,154 ( 0.00%)  ./malloc/./malloc/morecore.c:__glibc_morecore [/usr/lib/x86_64-linux-gnu/libc.so.6]
       1,047 ( 0.00%)  ./elf/./elf/dl-load.c:_dl_map_object [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
       1,039 ( 0.00%)  ./libio/./libio/genops.c:_IO_no_init [/usr/lib/x86_64-linux-gnu/libc.so.6]
       1,000 ( 0.00%)  ./elf/./elf/get-dynamic-info.h:_dl_map_object_from_fd
@@ -211,7 +211,7 @@ Ir                    file:function
         268 ( 0.00%)  ./elf/./get-dynamic-info.h:_dl_start
         263 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:mempcpy [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
         262 ( 0.00%)  ./libio/./libio/fileops.c:_IO_file_underflow@@GLIBC_2.2.5 [/usr/lib/x86_64-linux-gnu/libc.so.6]
-        253 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/open64_nocancel.c:__open_nocancel [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        253 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/open64_nocancel.c:__open_nocancel [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
         248 ( 0.00%)  ./elf/./elf/dl-minimal.c:strsep [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
         247 ( 0.00%)  ./elf/./elf/rtld.c:_dl_start [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
         246 ( 0.00%)  ./elf/./elf/dl-init.c:call_init.part.0 [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
@@ -441,7 +441,7 @@ Ir                    file:function
          14 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/pread64_nocancel.c:__pread64_nocancel [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
          14 ( 0.00%)  ./libio/./libio/fileops.c:_IO_file_finish@@GLIBC_2.2.5 [/usr/lib/x86_64-linux-gnu/libc.so.6]
          14 ( 0.00%)  ./libio/./libio/genops.c:_IO_unsave_markers [/usr/lib/x86_64-linux-gnu/libc.so.6]
-         14 ( 0.00%)  ???:0x0000000000045420 [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         14 ( 0.00%)  ???:0x00000000000453f0 [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
          14 ( 0.00%)  ???:std::sys::random::linux::hashmap_random_keys [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
          13 ( 0.00%)  ./elf/../sysdeps/unix/sysv/linux/rseq-internal.h:__tls_init_tp
          13 ( 0.00%)  ./elf/./elf/dl-cache.c:_dl_unload_cache [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
@@ -460,7 +460,7 @@ Ir                    file:function
          12 ( 0.00%)  ???:(below main) [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
          12 ( 0.00%)  ???:0x0000000000001110 [/usr/libexec/valgrind/vgpreload_core-amd64-linux.so]
          12 ( 0.00%)  ???:0x0000000000005b10 [/usr/lib/x86_64-linux-gnu/libgcc_s.so.1]
-         12 ( 0.00%)  ???:0x0000000000045460 [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         12 ( 0.00%)  ???:0x0000000000045430 [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
          11 ( 0.00%)  ./elf/../sysdeps/unix/sysv/linux/x86/dl-minsigstacksize.h:get_common_indices.constprop.0
          11 ( 0.00%)  ???:main [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
          10 ( 0.00%)  ./elf/../include/rtld-malloc.h:__minimal_calloc
@@ -482,7 +482,7 @@ Ir                    file:function
           8 ( 0.00%)  ./string/../include/rtld-malloc.h:strdup
           7 ( 0.00%)  ./elf/../sysdeps/x86_64/dl-hwcaps-subdirs.c:_dl_hwcaps_subdirs_active [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
           7 ( 0.00%)  ./stdlib/./stdlib/exit.c:exit [/usr/lib/x86_64-linux-gnu/libc.so.6]
-          7 ( 0.00%)  ???:0x00000000001aaee0 [???]
+          7 ( 0.00%)  ???:0x00000000001aaef0 [???]
           7 ( 0.00%)  ???:0x000000000483d000 [???]
           7 ( 0.00%)  ???:0x000000000484e000 [???]
           6 ( 0.00%)  ./dirent/../sysdeps/unix/sysv/linux/dirfd.c:dirfd [/usr/lib/x86_64-linux-gnu/libc.so.6]
@@ -515,7 +515,7 @@ Ir                    file:function
           5 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-sse4_2.h:strspn
           5 ( 0.00%)  ???:0x0000000000001060 [/usr/libexec/valgrind/vgpreload_core-amd64-linux.so]
           5 ( 0.00%)  ???:0x0000000000005a60 [/usr/lib/x86_64-linux-gnu/libgcc_s.so.1]
-          5 ( 0.00%)  ???:0x00000000000453b0 [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+          5 ( 0.00%)  ???:0x0000000000045380 [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
           4 ( 0.00%)  ./elf/../include/rtld-malloc.h:_dl_important_hwcaps
           4 ( 0.00%)  ./elf/../sysdeps/x86_64/dl-cet.c:_dl_cet_setup_features [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
           4 ( 0.00%)  ./elf/./elf/dl-debug.c:_dl_debug_state [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
@@ -526,7 +526,7 @@ Ir                    file:function
           4 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/wcschr.c:wcschr
           4 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/wmemchr.c:wmemchr [/usr/lib/x86_64-linux-gnu/libc.so.6]
           4 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/wmemset.c:wmemset [/usr/lib/x86_64-linux-gnu/libc.so.6]
-          4 ( 0.00%)  ???:0x00000000001aaefc [???]
+          4 ( 0.00%)  ???:0x00000000001aaf0c [???]
           4 ( 0.00%)  ???:0x000000000483d294 [???]
           4 ( 0.00%)  ???:0x0000000004871748 [???]
           4 ( 0.00%)  ???:0x00000000048a0740 [???]
