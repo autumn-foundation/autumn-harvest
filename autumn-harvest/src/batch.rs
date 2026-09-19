@@ -767,11 +767,18 @@ mod db {
         // process each shard's view independently and merge counters via
         // `record_progress` against the *default* shard's row.
         for (_shard, shard_pool) in pool.iter_shards() {
-            let mut conn = shard_pool
-                .get()
-                .await
-                .map_err(|e| HarvestError::Database(e.to_string()))?;
-            let jobs = open_jobs(&mut conn).await?;
+            // The listing connection is not needed past `open_jobs`. Release
+            // it here, before `process_job` runs. `process_job` checks out
+            // its own connection from this exact pool. A small shard pool
+            // would otherwise self-deadlock waiting for a connection this
+            // loop still holds (issue #1360).
+            let jobs = {
+                let mut conn = shard_pool
+                    .get()
+                    .await
+                    .map_err(|e| HarvestError::Database(e.to_string()))?;
+                open_jobs(&mut conn).await?
+            };
             for job in jobs {
                 process_job(pool, shard_pool, job, config).await?;
             }
@@ -833,12 +840,21 @@ mod db {
         // lease is reclaimed without touching `total`. If another worker
         // owns the lease, skip silently. record_progress runs on the owning
         // shard (where the job row lives).
-        let mut owning_conn = owning_shard_pool
-            .get()
-            .await
-            .map_err(|e| HarvestError::Database(e.to_string()))?;
+        //
+        // The claim connection is checked out and released here, not held
+        // for the rest of the function. The dispatch loop below concurrently
+        // checks out its own connections from `pool`. For a single-shard
+        // deployment that is this exact same pool. Holding a connection
+        // across that loop would self-deadlock a small pool (issue #1360).
         let total = i64::try_from(all_targets.len()).unwrap_or(i64::MAX);
-        if !try_claim_job(&mut owning_conn, job.id, total).await? {
+        let claimed = {
+            let mut owning_conn = owning_shard_pool
+                .get()
+                .await
+                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            try_claim_job(&mut owning_conn, job.id, total).await?
+        };
+        if !claimed {
             tracing::debug!(
                 job_id = %job.id,
                 "batch job is owned by another worker; skipping"
@@ -914,6 +930,13 @@ mod db {
                     }
                 }
             }
+            // Acquired fresh for this write, dropped at the end of the
+            // chunk. The next chunk's dispatch loop never finds it held
+            // (issue #1360).
+            let mut owning_conn = owning_shard_pool
+                .get()
+                .await
+                .map_err(|e| HarvestError::Database(e.to_string()))?;
             record_progress(
                 &mut owning_conn,
                 job.id,
@@ -925,6 +948,10 @@ mod db {
             .await?;
         }
 
+        let mut owning_conn = owning_shard_pool
+            .get()
+            .await
+            .map_err(|e| HarvestError::Database(e.to_string()))?;
         mark_completed(&mut owning_conn, job.id).await?;
         Ok(())
     }
