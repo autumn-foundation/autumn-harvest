@@ -613,6 +613,28 @@ pub const METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE: &str =
 pub const METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT: &str =
     "harvest.external_signal.by_id_found_over_incomplete_fanout";
 
+/// Counter: a by-id fan-out completed and found more than one live run
+/// of the same business key (issue #1146). Issue #1313 records the
+/// residual bound this counter is evidence for.
+///
+/// `(workflow_name, workflow_id)` uniqueness is shard-local. Two paths
+/// make this fire. A key pinned to one shard while an unpinned start of
+/// it hashes to another is one. Draining a shard, so a later unpinned
+/// start of the same key rehashes elsewhere while the old run stays
+/// live, is the other. Neither pinning is required.
+///
+/// It is the observable proxy for the precondition behind issue
+/// #1313's race. The race itself is a run that starts mid fan-out. No
+/// counter can see that instant. Two live runs surviving a complete
+/// fan-out is different: it is real, and it is countable. Labelled
+/// `shard` (the winning run's shard) only, per ADR-0001 §7.
+///
+/// Distinct from [`METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT`]:
+/// that counter fires over a partial view, a shard that could not be
+/// read. This one fires over a complete view that is still ambiguous.
+pub const METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED: &str =
+    "harvest.external_signal.by_id_other_live_observed";
+
 /// OpenTelemetry span attribute: the signal name for `signal_external_workflow` spans.
 ///
 /// Used in `harvest.signal.send` child spans. Low-cardinality (equals the
@@ -3318,6 +3340,15 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = shard;
     }
 
+    /// A by-id fan-out completed and found more than one live run of the
+    /// same business key (issue #1146; issue #1313). `shard` is the
+    /// winning run's shard.
+    ///
+    /// Maps to the counter [`METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED`].
+    fn record_external_by_id_other_live_observed(&self, shard: u16) {
+        let _ = shard;
+    }
+
     /// A start request was absorbed by a debounce pending record (issue #499).
     ///
     /// Maps to the counter [`METRIC_WORKFLOW_DEBOUNCED`] with label `workflow`.
@@ -4652,6 +4683,7 @@ mod tests {
         rec.record_external_signal_by_id_oldest_pending_indeterminate_age(0.0);
         rec.record_external_cancel_by_id_oldest_pending_indeterminate_age(30.5);
         rec.record_external_by_id_found_over_incomplete_fanout(2);
+        rec.record_external_by_id_other_live_observed(1);
         assert_eq!(
             METRIC_EXTERNAL_CANCEL_SENT,
             "harvest.workflow.external_cancel.sent"
@@ -4671,6 +4703,10 @@ mod tests {
         assert_eq!(
             METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT,
             "harvest.external_signal.by_id_found_over_incomplete_fanout"
+        );
+        assert_eq!(
+            METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED,
+            "harvest.external_signal.by_id_other_live_observed"
         );
     }
 

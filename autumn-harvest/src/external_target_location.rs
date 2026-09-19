@@ -172,10 +172,17 @@ pub struct UninspectedShard {
 /// of where an **existing** run is. Issue #1146 is precisely what happens when
 /// the first is used to answer the second.
 ///
-/// `#[non_exhaustive]`: a fourth outcome is one bug report away — an
-/// "ambiguous, several live runs across shards" verdict is the obvious
-/// candidate, since `(workflow_name, workflow_id)` uniqueness is shard-local
-/// and today's rule silently takes the most recently started of them.
+/// `#[non_exhaustive]`: a design note, not a promise of future variants.
+/// `Found` already carries "several live runs" as its `other_live` field
+/// (issue #1146). A signal still needs one winner to
+/// deliver to. Ranking therefore stays a field on `Found`, not a fork in
+/// the enum.
+///
+/// The still-open gap is issue #1313's race: a run that starts on an
+/// already-read shard, mid fan-out. No enum variant can name that. A
+/// single fan-out cannot tell it apart from an ordinary complete answer.
+/// Closing it needs cross-shard coordination, not a smarter classification
+/// here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TargetLocation {
@@ -1383,6 +1390,56 @@ mod tests {
             !merge_locations(Vec::new(), vec![uninspected(1)], false).is_authoritative_for_key(),
             "`Indeterminate` never is"
         );
+    }
+
+    #[test]
+    fn issue_1313_a_start_racing_the_fanout_is_invisible_and_the_answer_is_still_authoritative() {
+        // Issue #1313. The fan-out reads shards sequentially, on separate
+        // connections, with no shared snapshot. Walk the exact race from the
+        // issue:
+        //
+        // 1. Shard 0 is read and reports no run of key K. It contributes no
+        //    candidate — indistinguishable, from here, from a shard that was
+        //    never asked before K started.
+        // 2. A run of K starts on shard 0, after the read. This fan-out never
+        //    asks shard 0 again.
+        // 3. Shard 1 is read and reports its live run of K.
+        // 4. The merge sees one live candidate. Neither safety net fires.
+        //    `uninspected` is empty. Shard 0 answered, just before the race.
+        //    `other_live` is empty too. Shard 0's run had not started yet,
+        //    so this fan-out never saw it.
+        let live_on_shard_1 = run(1, "RUNNING", 1);
+        let merged = merge_locations(vec![(ShardId::new(1), live_on_shard_1)], Vec::new(), false);
+
+        assert_eq!(merged.found_shard(), Some(ShardId::new(1)));
+        assert!(
+            merged.is_authoritative_for_key(),
+            "a complete, race-free-looking fan-out is reported authoritative even \
+             though a run the fan-out could not have seen may be live on shard 0"
+        );
+        match merged {
+            TargetLocation::Found {
+                uninspected,
+                other_live,
+                ..
+            } => {
+                assert!(uninspected.is_empty(), "shard 0 was read; nothing to retry");
+                assert!(
+                    other_live.is_empty(),
+                    "shard 0's run started after its read, so this fan-out has no way \
+                     to have observed it"
+                );
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+
+        // This is accepted, not overlooked: a cancel here may report
+        // `ExternalCancelDelivered` while shard 0's run stays live. Closing it
+        // needs cross-shard uniqueness for the business key — a coordination
+        // primitive this engine deliberately does not have. See
+        // `TargetLocation::is_authoritative_for_key` and `docs/sharding.md`'s
+        // "Business-key addressing finds a pinned run wherever it is" section
+        // for the decision.
     }
 
     #[test]
