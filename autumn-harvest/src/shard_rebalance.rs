@@ -1773,6 +1773,13 @@ mod db {
     /// `MIGRATED` itself does not count as terminal here: a live copy that
     /// has since been rebalanced again is still live, one more hop away.
     ///
+    /// `CONTINUED_AS_NEW` gets the same treatment, for the same reason
+    /// (fresh review, P1 follow-up). It is terminal for the row, but a
+    /// successor was inserted under the same business key. The returned
+    /// state names that successor's own eventual outcome, resolved via
+    /// [`resolve_continuation_outcome`]. It is never the predecessor's
+    /// stale `CONTINUED_AS_NEW` seal.
+    ///
     /// # Errors
     ///
     /// [`HarvestError::ShardUnavailable`] when the live shard has no pool
@@ -1959,7 +1966,102 @@ mod db {
         .get_result(&mut *conn)
         .await
         .map_err(database_error)?;
-        Ok((!occupied.value).then_some(row.state))
+        if occupied.value {
+            return Ok(None);
+        }
+        // Not occupied does not mean this row's OWN state is the answer
+        // (fresh review, P1 follow-up). `CONTINUED_AS_NEW` means a
+        // successor was inserted. Every OTHER terminal state here
+        // genuinely belongs to THIS row, whether it is `COMPLETED`,
+        // `TERMINATED`, or a resettable state already demoted to a summary
+        // above. Report it as-is.
+        if row.state != "CONTINUED_AS_NEW" {
+            return Ok(Some(row.state));
+        }
+        resolve_continuation_outcome(&mut conn, &row.workflow_name, &row.workflow_id).await
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct ContinuationOutcomeRow {
+        #[diesel(sql_type = Text)]
+        state: String,
+        #[diesel(sql_type = Nullable<Text>)]
+        migrated_run_terminal_state: Option<String>,
+    }
+
+    /// Resolve what a `CONTINUED_AS_NEW` chain under `(workflow_name,
+    /// workflow_id)` actually finished as (issue #1317 review, P1
+    /// follow-up).
+    ///
+    /// `CONTINUED_AS_NEW` never blocks the business key by itself. The
+    /// successor inserted in the same transaction does. The `occupied`
+    /// check in [`live_copy_is_terminal`] already confirmed no row under
+    /// this key is still active, resettable, or an unreconciled `MIGRATED`
+    /// seal. Every remaining row is therefore safe to read at face value.
+    /// `COMPLETED`/`TERMINATED` are final in themselves. A `MIGRATED` row
+    /// reached here is reconciled by construction, so its sibling
+    /// `migrated_run_terminal_state` column already carries the real
+    /// answer. This reads that column directly, instead of chasing
+    /// `migrated_to_shard` again. A chased hop can land on a shard an
+    /// operator has since decommissioned. The cached column survives that
+    /// case; it never depends on the target shard being reachable.
+    ///
+    /// A chain can hold any number of `CONTINUED_AS_NEW` links before its
+    /// true final node, including one itself later migrated and
+    /// reconciled. The partial unique index on `(workflow_name,
+    /// workflow_id)` allows at most one row outside
+    /// `CONTINUED_AS_NEW`/`TERMINATED` at a time. So the newest row under
+    /// the key that is not itself `CONTINUED_AS_NEW` is always that true
+    /// final node. Reading it directly resolves the whole chain in one
+    /// query, with no need to walk it link by link. This also reaches a
+    /// successor retention already demoted to a
+    /// `harvest_execution_summaries` row, which carries no forward link of
+    /// its own to walk.
+    ///
+    /// Returns `None` when no such row exists yet. A well-formed chain
+    /// should never reach this: the `occupied` check already proved the
+    /// key is not still forming. Defensively, the seal simply stays held
+    /// for a later sweep to retry, rather than reporting a fabricated
+    /// answer.
+    async fn resolve_continuation_outcome(
+        conn: &mut AsyncPgConnection,
+        workflow_name: &str,
+        workflow_id: &str,
+    ) -> HarvestResult<Option<String>> {
+        let outcome: Option<ContinuationOutcomeRow> = diesel::sql_query(
+            "SELECT state, migrated_run_terminal_state FROM ( \
+                 SELECT state, migrated_run_terminal_state, started_at \
+                   FROM harvest_workflow_executions \
+                  WHERE workflow_name = $1 AND workflow_id = $2 \
+                    AND state <> 'CONTINUED_AS_NEW' \
+                    AND (state <> 'MIGRATED' OR migrated_run_terminal_at IS NOT NULL) \
+                 UNION ALL \
+                 SELECT state, NULL::text AS migrated_run_terminal_state, started_at \
+                   FROM harvest_execution_summaries \
+                  WHERE workflow_name = $1 AND workflow_id = $2 \
+                    AND state <> 'CONTINUED_AS_NEW' \
+             ) chain \
+             ORDER BY started_at DESC \
+             LIMIT 1",
+        )
+        .bind::<Text, _>(workflow_name)
+        .bind::<Text, _>(workflow_id)
+        .get_result(conn)
+        .await
+        .optional_row()?;
+        let Some(outcome) = outcome else {
+            return Ok(None);
+        };
+        // `state = 'MIGRATED'` here is reconciled by construction (the
+        // query excludes an unreconciled one), so its sibling column names
+        // the real outcome. The fallback to the row's own `state` guards
+        // only a hand-seeded `migrated_run_terminal_at` with no matching
+        // `migrated_run_terminal_state`. [`reconcile_migrated_seal_terminality`]
+        // itself never produces that shape; it always writes both columns
+        // together.
+        Ok(Some(
+            outcome.migrated_run_terminal_state.unwrap_or(outcome.state),
+        ))
     }
 
     /// Release a rebalanced source seal's uniqueness slot once its live copy

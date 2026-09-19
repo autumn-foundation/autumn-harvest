@@ -419,6 +419,21 @@ async fn state_of(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Option<
     row.and_then(|r| r.value)
 }
 
+/// The observed terminal state a reconciliation recorded on a seal, if any
+/// (`harvest_workflow_executions.migrated_run_terminal_state`).
+async fn terminal_state_of(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Option<String> {
+    let row: Option<ScalarText> = diesel::sql_query(
+        "SELECT migrated_run_terminal_state AS value FROM harvest_workflow_executions \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(conn)
+    .await
+    .optional()
+    .expect("query migrated_run_terminal_state");
+    row.and_then(|r| r.value)
+}
+
 async fn forward_of(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Option<i32> {
     let row: Option<ScalarInt> = diesel::sql_query(
         "SELECT migrated_to_shard AS value FROM harvest_workflow_executions WHERE id = $1",
@@ -3013,6 +3028,98 @@ async fn a_reconciled_migrated_successor_no_longer_blocks_its_predecessors_seal(
         reconciled_after_successor_reconciles,
         "a reconciled MIGRATED successor no longer occupies the business key, \
          so the predecessor's seal must release"
+    );
+}
+
+#[tokio::test]
+async fn a_summarised_failed_successor_records_its_own_outcome_not_the_predecessors() {
+    // Issue #1596 review, on the #1317 reconciler. Once the
+    // successor's own execution row is gone, `occupied` naturally reports
+    // "not occupied". That alone does not look wrong. The bug was
+    // recording the predecessor's own stale `CONTINUED_AS_NEW` as the
+    // observed terminal state, instead of the successor's real `FAILED`
+    // outcome. A later `AllowDuplicateFailedOnly` start would then attach
+    // to the seal instead of starting the promised retry. It would do so
+    // because `CONTINUED_AS_NEW` does not read as a failure.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "chained-then-summarised-successor").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'CONTINUED_AS_NEW', \
+                completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("seal the predecessor as continued");
+    let successor = insert_execution_with_id(
+        &mut target,
+        "entity_flow",
+        "chained-then-summarised-successor",
+        ExecutionId::new_for_shard(TARGET),
+        TARGET,
+    )
+    .await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(successor.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("fail the successor");
+
+    let mut source = shards.source().await;
+    let reconciled_while_row_exists =
+        reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+            .await
+            .expect("reconcile must not fail merely because the successor failed");
+    assert!(
+        !reconciled_while_row_exists,
+        "a FAILED successor remains resettable while its execution row exists"
+    );
+
+    // Demote the successor exactly as retention does: a summary row
+    // carrying its last state, and no execution row. The predecessor's own
+    // row is untouched, so it still resolves as `CONTINUED_AS_NEW`.
+    diesel::sql_query(
+        "INSERT INTO harvest_execution_summaries \
+             (execution_id, workflow_name, workflow_id, state, started_at, completed_at, \
+              duration_ms, shard_id, search_attrs, result, error, parent_id, \
+              migrated_from_shards) \
+         SELECT e.id, e.workflow_name, e.workflow_id, 'FAILED', e.started_at, NOW(), 0, \
+                e.shard_id, e.search_attrs, NULL, NULL, e.parent_id, e.migrated_from_shards \
+           FROM harvest_workflow_executions e WHERE e.id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(successor.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("summarise the successor");
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(successor.as_uuid())
+        .execute(&mut target)
+        .await
+        .expect("retention-delete the successor's execution row");
+
+    let reconciled_after_summarised =
+        reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+            .await
+            .expect("reconcile must not fail once only a summary remains");
+    assert!(
+        reconciled_after_summarised,
+        "the business key is no longer occupied once the summary-only \
+         successor replaces the deleted row"
+    );
+    assert_eq!(
+        terminal_state_of(&mut source, exec_id).await.as_deref(),
+        Some("FAILED"),
+        "the seal must record the successor's own FAILED outcome, not the \
+         predecessor's stale CONTINUED_AS_NEW state"
     );
 }
 
