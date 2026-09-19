@@ -210,20 +210,26 @@ def collect_files() -> list[str]:
     return sorted(files)
 
 
-def _strip_prefix(line: str, prefix: str) -> str:
-    """Strips `prefix` from the start of `line`. A blank blockquoted line is
-    often just ">" with no trailing space its sibling lines have, so an exact
-    `startswith` match is not guaranteed; fall back to stripping whatever
-    leading run of characters `line` and `prefix` have in common.
+def _strip_blockquote(line: str, depth: int) -> str:
+    """Strips `depth` levels of blockquote marker from the start of `line`.
+
+    Structural, not textual: each level is arbitrary leading whitespace, a
+    ">", and at most one following space/tab — CommonMark's own grammar for
+    a blockquote marker, and permissive about how one is spelled. A literal-
+    prefix comparison against the opener's exact spelling would miss this:
+    "> > ```rust" opens the same depth-2 blockquote as ">> ```rust" (no
+    space between the markers), but a body line spelled the other way from
+    its opener shares no common leading substring with it at all.
     """
-    if line.startswith(prefix):
-        return line[len(prefix) :]
-    n = 0
-    for a, b in zip(line, prefix):
-        if a != b:
+    for _ in range(depth):
+        stripped = line.lstrip(" \t")
+        if not stripped.startswith(">"):
             break
-        n += 1
-    return line[n:]
+        stripped = stripped[1:]
+        if stripped[:1] in (" ", "\t"):
+            stripped = stripped[1:]
+        line = stripped
+    return line
 
 
 def _strip_marker_width(line: str, width: int) -> str:
@@ -249,24 +255,36 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
 
     Line-oriented so an indented or blockquoted fence (a code block nested
     under a list item or a "> " note) is still found — a single-regex scan
-    anchored on an unindented close silently drops those. The same leading
-    indentation/">" text the opening fence carried (excluding any list
-    marker, which does not repeat) is stripped from every content line too,
-    so a blockquote's "> " does not end up inside the Rust source handed to
-    `rustfmt`; a list marker's own display width is separately blanked back
-    out as plain alignment. A closing fence only ends the block if it is at
-    the same blockquote depth AND uses the same delimiter character with a
-    run at least as long as the opener's, per CommonMark — otherwise an
-    unrelated fence (a different depth, or a bare "```" closing some other
-    ```` ```` ````-delimited block) could get mistaken for this one's close
-    and swallow everything up to it as this block's content.
+    anchored on an unindented close silently drops those. A list marker's
+    own display width (its "10. " is 4 columns, not the usual "- "'s 2) is
+    stripped from every line of its container, closer included, before that
+    line is measured against the 3-column indent budget or matched for
+    blockquote depth — the budget is relative to the list item's own
+    content column, not to column 0, per CommonMark. `depth` levels of
+    blockquote marker (">", with at most one following space, however many
+    columns of whitespace lead into it) are then stripped structurally from
+    each content line, not by comparing it against the opener's own exact
+    spelling — a nested "> > ```rust" and a body written as ">> let x = 1;"
+    (no space between the markers) are the same depth-2 blockquote, but
+    share no literal common prefix to fall back on. A closing fence only
+    ends the block if it is at the same blockquote depth AND uses the same
+    delimiter character with a run at least as long as the opener's, per
+    CommonMark — otherwise an unrelated fence (a different depth, or a bare
+    "```" closing some other ```` ```` ````-delimited block) could get
+    mistaken for this one's close and swallow everything up to it as this
+    block's content.
 
     Every fence is tracked this way, Rust-tagged or not: once a fence of any
     language is open, the only thing that can end it is ITS OWN matching
     closer — no other fence can open inside it, so a line that merely looks
     like a nested ```rust opener, inside some outer fence used to show
     Markdown-about-Markdown as a literal example, is correctly read as inert
-    content of the outer fence rather than a real block of its own.
+    content of the outer fence rather than a real block of its own. A
+    backtick-delimited opener whose info string itself contains a backtick
+    is not a fence at all, per CommonMark (it would be ambiguous with an
+    inline code span) — skipped over as plain content rather than opening
+    anything, so a later, real ```rust a few lines down is not mistaken for
+    that non-opener's content and left unchecked.
 
     Exits with an error if an opening fence has no matching close before
     EOF: a block dropped that way would shrink the "corpus" count with no
@@ -283,16 +301,20 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
             i += 1
             continue
         lead, marker, trail, delim, info = m.groups()
-        is_rust = info.strip().startswith("rust")
-        strip_prefix = lead + trail
-        depth = _blockquote_depth(strip_prefix)
         delim_char, delim_len = delim[0], len(delim)
+        if delim_char == "`" and "`" in info:
+            i += 1
+            continue
+        is_rust = info.strip().startswith("rust")
+        depth = _blockquote_depth(lead + trail)
+        marker_width = len(marker)
         start_line = i + 1
         i += 1
         code_lines: list[str] = []
         closed = False
         while i < n:
-            cm = FENCE_CLOSE_RE.match(lines[i])
+            line = _strip_marker_width(lines[i], marker_width)
+            cm = FENCE_CLOSE_RE.match(line)
             if (
                 cm
                 and _blockquote_depth(cm.group(1)) == depth
@@ -303,8 +325,7 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
                 i += 1
                 break
             if is_rust:
-                line = _strip_marker_width(lines[i], len(marker))
-                code_lines.append(_strip_prefix(line, strip_prefix))
+                code_lines.append(_strip_blockquote(line, depth))
             i += 1
         if not closed:
             sys.exit(
