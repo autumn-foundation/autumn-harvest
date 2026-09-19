@@ -7,14 +7,21 @@ both on the hot path of `check_paths` (issue #778's CI governance gate,
 already profiled in [`docs/performance-det-check.md`](performance-det-check.md)).
 Wall-clock timing is not admissible evidence on this (shared-vCPU) machine —
 every number below is a deterministic instruction count
-(`valgrind --tool=callgrind`), reproducible bit-for-bit on this workload (no
-`HashMap` on the measured call path; three independent code variants below
-moved the total in the same direction by consistent amounts, which noise
-would not do).
+(`valgrind --tool=callgrind`). This workload is **not** bit-for-bit
+reproducible: `check_paths` builds a `HashSet<PathBuf>` for path
+de-duplication and `scan_functions` builds a `HashMap<&str, Vec<usize>>`
+helper index (both `std::collections`' default, randomly-seeded
+`RandomState`), so hash bucket layout can vary between process runs. Measured
+directly: two repeated runs of the unmodified baseline binary gave
+659,413,233 and 659,410,374 Ir against the 659,412,564 reported below — a
+2,859-instruction (0.00043%) spread, four orders of magnitude below every
+delta this note reports. That is real corroboration, not an assumption: the
+mechanism exists, but at this workload's scale it is negligible next to the
+signal below.
 
 **Outcome: reverted.** The mechanism is real — an ASCII fast path removes
 most of the targeted cost — but the best of three implementations tried
-still only clears **2.66%** of total instructions, short of this agent's
+still only clears **2.60%** of total instructions, short of this agent's
 **>=5%** impact floor. No code shipped from this pass; `det_check.rs` is
 unchanged. Recorded here so nobody re-discovers the same sub-floor result.
 
@@ -116,7 +123,7 @@ helper. Full diff of the final (best) variant:
 | 1: hand loop, always decode | 647,470,972 | -1.81% | 25,997,318 (4.02%) |
 | 2: hand loop, ASCII-skip decode | 644,963,147 | -2.19% | 23,781,640 (3.69%) |
 | 3: `trim_ascii()`, ASCII-skip decode | 642,244,285 | **-2.60%** | 20,459,227 (3.19%) |
-| 4: variant 3 + `#[inline]` | 642,250,701 | -2.66% (noise vs. 3) | n/a (inlined) |
+| 4: variant 3 + `#[inline]` | 642,250,701 | -2.60% (6,416 Ir worse than 3, noise) | n/a (inlined) |
 
 All four variants pass the pre-existing pinned unit tests
 (`strip_unparseable_content_removes_comments_and_strings`,
@@ -131,13 +138,14 @@ sequencing and argument setup at four call sites, plus the two-`while`-loop
 ASCII scan itself (real work: indentation is typically several bytes, and
 that scan runs unconditionally on every line, cheap or not), together cost
 more than the naive "delete a 5.83% line item" framing suggests. Three
-independently-written variants converge on the same ~2.2-2.7% ceiling,
-which is strong evidence this is the real ceiling for this specific
-mechanism (a cheaper whitespace *predicate*), not measurement noise or an
-unlucky implementation.
+independently-written variants converge on the same ~1.8-2.6% ceiling,
+well above the measured ~0.0004% run-to-run noise floor, which is strong
+evidence this is the real ceiling for this specific mechanism (a cheaper
+whitespace *predicate*), not measurement noise or an unlucky implementation.
 
-**Impact-floor check:** best result **2.60-2.66%** instruction-count
-reduction, on a benchmark representing >5% of a real, CI-gated workload.
+**Impact-floor check:** best result **2.60%** instruction-count reduction
+(variant 3; variant 4's `#[inline]` did not improve on it), on a benchmark
+representing >5% of a real, CI-gated workload.
 This does **not** clear the required **>=5%** floor. Allocation counts were
 not separately re-measured post-change: `str::trim()` /
 `str::trim_ascii()` / a hand-rolled byte scan all return borrowed slices,
