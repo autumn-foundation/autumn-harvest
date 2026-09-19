@@ -336,6 +336,23 @@ def _quote_prefix_present(line: str, depth: int) -> bool:
     return re.match(rf"^{LEAD_INDENT}(?:{BQ}){{{depth},}}", line) is not None
 
 
+def _list_prefix_present(line: str, marker_width: int) -> bool:
+    """True if `line` is still indented to at least the list item's own
+    content column (`marker_width`, 0 when the fence didn't open on a
+    marker's own line — trivially always present then). Same rule as the
+    sibling blockquote check above, for the other container type: a line
+    that dedents below the item's content column ends the item, and any
+    fence still open inside it, right there — this script does not
+    special-case a blank line as an exception, matching that check.
+    """
+    col = 0
+    for ch in line:
+        if not ch.isspace():
+            break
+        col = _expand_column(ch, col)
+    return col >= marker_width
+
+
 # The only edition this corpus ever tells a reader to use: chapter 1's
 # Cargo.toml block pins `edition = "2021"` for the tutorial project every
 # later chapter (and README.md) builds on. Checking snippets against a
@@ -508,7 +525,16 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
         code_lines: list[str] = []
         closed = False
         while i < n:
-            line = _strip_marker_width(lines[i], marker_width)
+            raw = lines[i]
+            if marker_width > 0 and not _list_prefix_present(raw, marker_width):
+                # Same idea as the blockquote check below, checked first and
+                # on the RAW line: a line dedented below the list item's own
+                # content column ends the item (and any fence open inside
+                # it) before the marker-width stripping below would even
+                # make sense to apply.
+                closed = True
+                break
+            line = _strip_marker_width(raw, marker_width)
             cm = FENCE_CLOSE_RE.match(line)
             if (
                 cm
