@@ -97,8 +97,23 @@ TARGET_GLOBS = [
     "README.md",
 ]
 
-FENCE_OPEN_RE = re.compile(r"^\s*```rust(.*)$")
-FENCE_CLOSE_RE = re.compile(r"^\s*```\s*$")
+# [\s>]* absorbs both list indentation and Markdown blockquote markers ("> "),
+# including a blockquote nested inside a list item, ahead of the fence itself.
+# Captured so the same prefix can be stripped from the block's content lines
+# too — a blockquoted block's lines all carry "> ", which is Markdown syntax,
+# not part of the Rust source, and left in place would break every blockquoted
+# snippet's parse regardless of whether its actual code is valid.
+FENCE_OPEN_RE = re.compile(r"^([\s>]*)```rust(.*)$")
+FENCE_CLOSE_RE = re.compile(r"^[\s>]*```\s*$")
+
+# The only edition this corpus ever tells a reader to use: chapter 1's
+# Cargo.toml block pins `edition = "2021"` for the tutorial project every
+# later chapter (and README.md) builds on. Checking snippets against a
+# different edition risks both false positives (valid 2021 code rejected
+# for using an edition-2024-only reserved word like `gen`) and false
+# negatives (a snippet only valid in 2024 waved through as fine for readers
+# on the documented 2021 setup).
+RUST_EDITION = "2021"
 
 # (file, first-content-line-prefix) -> reason. The prefix is matched against
 # the block's first non-blank, non-comment line, stripped. Verified against
@@ -137,12 +152,31 @@ def collect_files() -> list[str]:
     return sorted(files)
 
 
+def _strip_prefix(line: str, prefix: str) -> str:
+    """Strips `prefix` from the start of `line`. A blank blockquoted line is
+    often just ">" with no trailing space its sibling lines have, so an exact
+    `startswith` match is not guaranteed; fall back to stripping whatever
+    leading run of characters `line` and `prefix` have in common.
+    """
+    if line.startswith(prefix):
+        return line[len(prefix) :]
+    n = 0
+    for a, b in zip(line, prefix):
+        if a != b:
+            break
+        n += 1
+    return line[n:]
+
+
 def find_rust_blocks(text: str, relpath: str) -> list[str]:
     """Returns the code of every ```rust fenced block in `text`, in order.
 
-    Line-oriented so an indented fence (a code block nested under a list
-    item) is still found — a single-regex scan anchored on an unindented
-    close silently drops those. Exits with an error if an opening fence has
+    Line-oriented so an indented or blockquoted fence (a code block nested
+    under a list item or a "> " note) is still found — a single-regex scan
+    anchored on an unindented close silently drops those. The same leading
+    indentation/">" prefix the opening fence carried is stripped from every
+    content line too, so a blockquote's "> " does not end up inside the Rust
+    source handed to `rustfmt`. Exits with an error if an opening fence has
     no matching close before EOF: a block dropped that way would shrink the
     "corpus" count with no signal that it happened.
     """
@@ -151,9 +185,11 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
     i = 0
     n = len(lines)
     while i < n:
-        if not FENCE_OPEN_RE.match(lines[i]):
+        m = FENCE_OPEN_RE.match(lines[i])
+        if not m:
             i += 1
             continue
+        prefix = m.group(1)
         start_line = i + 1
         i += 1
         code_lines: list[str] = []
@@ -163,7 +199,7 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
                 closed = True
                 i += 1
                 break
-            code_lines.append(lines[i])
+            code_lines.append(_strip_prefix(lines[i], prefix))
             i += 1
         if not closed:
             sys.exit(
@@ -187,7 +223,7 @@ def check_block(code: str) -> tuple[str, str] | None:
 
     try:
         proc = subprocess.run(
-            ["rustfmt", "--edition", "2024", "--emit", "stdout", tmp_path],
+            ["rustfmt", "--edition", RUST_EDITION, "--emit", "stdout", tmp_path],
             capture_output=True,
             text=True,
         )
