@@ -273,15 +273,23 @@ pub(crate) struct WorkflowListParams {
 
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct WorkflowDetailParams {
+    // `event_page`/`jump_event` are `String`, not `i64`. This is the same
+    // fix as `page`/`limit` on the Workflows, Workers, DLQ and Schedules
+    // pages (#1540/#1560/#1588/#1619), and as `node`/`refresh` on the DAG
+    // detail page. An `i64`-typed field fails axum's query deserialization
+    // on non-numeric text with a bare 400 before this handler -- or the
+    // `log_level` filter -- ever runs. Unlike a list page, that also
+    // discards the whole execution view: status, blocked-on panel, activity
+    // attempts, signals panel and the event timeline (issue #1627).
     /// Zero-based page index for the event timeline.
     #[serde(default)]
-    event_page: Option<i64>,
+    event_page: Option<String>,
     /// Flash message to display at the top of the detail page.
     #[serde(default)]
     flash: Option<String>,
     /// Jump to the page containing this 1-based event number.
     #[serde(default)]
-    jump_event: Option<i64>,
+    jump_event: Option<String>,
     /// Level filter for the durable workflow-logs panel (issue #790):
     /// `info` | `warn` | `error`. Absent or unrecognised means "all levels".
     #[serde(default)]
@@ -1392,6 +1400,52 @@ fn parse_started_bound(
     )
 }
 
+/// Parses the workflow detail page's `jump_event` query parameter (a
+/// 1-based event number to jump to).
+///
+/// Same contract as [`parse_dag_node_query_field`]. A non-numeric value
+/// falls back to no jump; `event_page` applies instead. It reports the bad
+/// value inline, instead of aborting the whole page (issue #1627).
+fn parse_jump_event_query_field(raw: Option<&str>) -> (Option<i64>, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (None, None);
+    };
+    trimmed.parse::<i64>().map_or_else(
+        |_| {
+            (
+                None,
+                Some(format!(
+                    "Invalid jump_event '{trimmed}'; expected a whole number. Jump ignored."
+                )),
+            )
+        },
+        |parsed| (Some(parsed), None),
+    )
+}
+
+/// Resolves the workflow detail page's event-timeline page index from the
+/// raw `event_page`/`jump_event` query values.
+///
+/// A valid `jump_event` wins over `event_page`. A non-numeric `event_page`
+/// or `jump_event` does not abort the page (issue #1627). Each degrades on
+/// its own and reports the bad value. A typo in one field never costs the
+/// operator the other field, or the rest of the page.
+/// Returns `(event_page, event_page_error, jump_event_error)`.
+fn resolve_workflow_detail_event_page(
+    event_page_raw: Option<&str>,
+    jump_event_raw: Option<&str>,
+    page_size: i64,
+) -> (i64, Option<String>, Option<String>) {
+    let (event_page_from_query, _event_page_raw, event_page_error) =
+        parse_page_query_field(event_page_raw);
+    let (jump_event, jump_event_error) = parse_jump_event_query_field(jump_event_raw);
+    let event_page = jump_event.map_or(event_page_from_query, |jump| {
+        let jump_zero = (jump - 1).max(0);
+        jump_zero / page_size
+    });
+    (event_page, event_page_error, jump_event_error)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn workflow_detail_ui(
     Extension(api_state): Extension<HarvestApiState>,
@@ -1409,12 +1463,11 @@ async fn workflow_detail_ui(
 
     // Resolve event_page before any DB queries so we can use OFFSET/LIMIT directly.
     let page_size = DETAIL_EVENT_PAGE_SIZE;
-    let event_page = if let Some(jump) = params.jump_event {
-        let jump_zero = (jump - 1).max(0);
-        jump_zero / page_size
-    } else {
-        params.event_page.unwrap_or(0).max(0)
-    };
+    let (event_page, event_page_error, jump_event_error) = resolve_workflow_detail_event_page(
+        params.event_page.as_deref(),
+        params.jump_event.as_deref(),
+        page_size,
+    );
 
     // Total event count — used for pagination controls.
     let total_events: i64 = harvest_events::table
@@ -1646,6 +1699,8 @@ async fn workflow_detail_ui(
         event_page,
         &blocked_on,
         params.flash.as_deref(),
+        event_page_error.as_deref(),
+        jump_event_error.as_deref(),
         continue_as_new_threshold,
         &WorkflowLogsPanelData {
             lines: &log_lines,
@@ -5333,6 +5388,8 @@ fn render_workflow_detail(
     event_page: i64,
     blocked_on: &BlockedOnData,
     flash: Option<&str>,
+    event_page_error: Option<&str>,
+    jump_event_error: Option<&str>,
     continue_as_new_threshold: Option<u64>,
     logs: &WorkflowLogsPanelData<'_>,
 ) -> Markup {
@@ -5396,6 +5453,13 @@ fn render_workflow_detail(
 
         @if let Some(message) = flash {
             div.flash role="status" tabindex="-1" autofocus { (message) }
+        }
+
+        @if let Some(error) = event_page_error {
+            span.field-error role="alert" { (error) }
+        }
+        @if let Some(error) = jump_event_error {
+            span.field-error role="alert" { (error) }
         }
 
         @if let Some(error) = execution.error.as_deref() {
@@ -12091,6 +12155,73 @@ mod tests {
         );
     }
 
+    // ── issue #1627: Workflow Detail page 400-aborts on a non-numeric
+    // `event_page`/`jump_event` ──
+
+    #[test]
+    fn parse_jump_event_query_field_accepts_valid_values() {
+        assert_eq!(parse_jump_event_query_field(Some("12")), (Some(12), None));
+        assert_eq!(parse_jump_event_query_field(Some("  7  ")), (Some(7), None));
+    }
+
+    #[test]
+    fn parse_jump_event_query_field_blank_or_missing_is_not_an_error() {
+        assert_eq!(parse_jump_event_query_field(None), (None, None));
+        assert_eq!(parse_jump_event_query_field(Some("   ")), (None, None));
+    }
+
+    /// RED -> GREEN: a non-numeric `jump_event` must no longer abort the
+    /// whole `/workflows/{id}` response with axum's bare 400 (issue #1627).
+    /// It degrades to no jump -- `event_page` applies instead -- while
+    /// naming the bad value, matching `parse_dag_node_query_field`.
+    #[test]
+    fn parse_jump_event_query_field_rejects_non_numeric_text_without_erroring() {
+        let (jump_event, error) = parse_jump_event_query_field(Some("not-a-number"));
+        assert_eq!(
+            jump_event, None,
+            "an invalid jump_event falls back to no jump"
+        );
+        let message = error.expect("an invalid jump_event must carry a redisplayable error");
+        assert!(
+            message.contains("not-a-number") && message.contains("jump_event"),
+            "the error names the bad value and the field: {message}"
+        );
+    }
+
+    /// `jump_event` wins over `event_page` when both are present and valid.
+    #[test]
+    fn resolve_workflow_detail_event_page_prefers_a_valid_jump_event() {
+        let (page, page_error, jump_error) =
+            resolve_workflow_detail_event_page(Some("5"), Some("101"), 100);
+        assert_eq!(page, 1, "event 101 (1-based) falls on page index 1");
+        assert_eq!(page_error, None);
+        assert_eq!(jump_error, None);
+    }
+
+    /// GREEN -- the fix under test: a non-numeric `event_page` no longer
+    /// aborts the page. It degrades to page 0 and reports the bad value,
+    /// exactly like the four already-fixed sibling list pages.
+    #[test]
+    fn resolve_workflow_detail_event_page_degrades_a_non_numeric_event_page() {
+        let (page, page_error, jump_error) =
+            resolve_workflow_detail_event_page(Some("not-a-number"), None, 100);
+        assert_eq!(page, 0);
+        assert!(page_error.is_some_and(|e| e.contains("not-a-number")));
+        assert_eq!(jump_error, None);
+    }
+
+    /// GREEN -- the fix under test: a non-numeric `jump_event` no longer
+    /// aborts the page. It degrades to `event_page`'s own value (or 0)
+    /// instead, and reports the bad `jump_event` value.
+    #[test]
+    fn resolve_workflow_detail_event_page_degrades_a_non_numeric_jump_event() {
+        let (page, page_error, jump_error) =
+            resolve_workflow_detail_event_page(Some("2"), Some("not-a-number"), 100);
+        assert_eq!(page, 2, "falls back to the valid event_page");
+        assert_eq!(page_error, None);
+        assert!(jump_error.is_some_and(|e| e.contains("not-a-number")));
+    }
+
     #[test]
     fn parse_schedule_preview_count_query_field_accepts_valid_values() {
         assert_eq!(
@@ -14538,6 +14669,8 @@ mod tests {
             0,
             &blocked,
             None,
+            None,
+            None,
             Some(10_000),
             &WorkflowLogsPanelData::default(),
         )
@@ -14573,6 +14706,8 @@ mod tests {
             &blocked,
             None,
             None,
+            None,
+            None,
             &WorkflowLogsPanelData::default(),
         )
         .into_string();
@@ -14601,6 +14736,8 @@ mod tests {
             &[],
             0,
             &blocked,
+            None,
+            None,
             None,
             Some(500),
             &WorkflowLogsPanelData::default(),
@@ -16351,6 +16488,8 @@ mod tests {
             &blocked,
             None,
             None,
+            None,
+            None,
             logs,
         )
         .into_string()
@@ -16468,6 +16607,8 @@ mod tests {
             &blocked,
             None,
             None,
+            None,
+            None,
             &WorkflowLogsPanelData {
                 lines: &[],
                 admin: true,
@@ -16504,6 +16645,8 @@ mod tests {
             &[],
             0,
             &blocked,
+            None,
+            None,
             None,
             None,
             &WorkflowLogsPanelData {
