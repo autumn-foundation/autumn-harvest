@@ -3980,10 +3980,20 @@ pub async fn resolve_live_attempt_id_best_effort(
 /// it the way a fresh [`resolve_live_attempt_id_best_effort`] call would
 /// guarantee for ITS OWN result.
 ///
-/// Returns `None` when `conn` is already correct: no sharded pool was ever
-/// installed, or `exec_id`'s row is already visible on `conn`. Returns
-/// `Some` freshly checked-out connection, resolved through `exec_id`'s own
-/// forwarding chain, otherwise.
+/// Returns `None` when `conn` is already correct. That covers two cases:
+/// no sharded pool was ever installed, or `exec_id`'s row is visible on
+/// `conn` and is not itself a forwarding seal. Returns `Some` freshly
+/// checked-out connection, resolved through `exec_id`'s own forwarding
+/// chain, otherwise.
+///
+/// A row's mere presence on `conn` does not prove `conn` is correct (issue
+/// #1596 follow-up review, comment 4053705972). A retry successor migrated
+/// off `conn`'s shard still leaves its `MIGRATED` seal visible there. The
+/// row exists, but it is not the live copy. Trusting presence alone sent
+/// every follow-up query to that stale seal instead of the shard the
+/// successor actually runs on now. This checks the row's forwarding
+/// pointer first, and only trusts `conn` when the row is present and NOT
+/// forwarding.
 ///
 /// # Errors
 ///
@@ -4000,9 +4010,11 @@ pub async fn bind_to_shard_best_effort(
     else {
         return Ok(None);
     };
-    if crate::shard_rebalance::shard_of_held_row(conn, exec_id)
-        .await
-        .is_some()
+    let held = crate::shard_rebalance::shard_of_held_row(conn, exec_id).await;
+    if held.is_some()
+        && crate::shard_rebalance::forward_of_held_row(conn, exec_id)
+            .await
+            .is_none()
     {
         return Ok(None);
     }

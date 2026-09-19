@@ -6471,3 +6471,113 @@ async fn a_cancel_against_a_migrated_retry_successor_reaches_its_live_shard() {
         "the origin-side seal on SOURCE must be untouched by the cancel"
     );
 }
+
+/// Issue #1596 follow-up review (comment 4053705972): the read path above and
+/// `cancel_live_attempt` both reuse `resolve_live_attempt_id_best_effort`'s
+/// own rebind directly. `send_signal_to_live_attempt` does not -- it
+/// discards that rebind and lets `send_signal_from_resolved` re-derive one
+/// through `bind_to_shard_best_effort` instead. That helper trusted a row's
+/// mere presence on the caller's connection as proof the connection was
+/// already correct. A migrated successor's origin-side `MIGRATED` seal
+/// (still visible on SOURCE) satisfied it. The signal was then queued
+/// against that seal instead of the live copy on TARGET. This pins the
+/// fix: `bind_to_shard_best_effort` must follow the seal's forwarding
+/// pointer before trusting presence.
+#[tokio::test]
+async fn a_signal_against_a_migrated_retry_successor_reaches_its_live_shard() {
+    let shards = setup_two_shards().await;
+
+    let mut source = shards.source().await;
+    let predecessor = insert_execution(&mut source, "entity_flow", "signal-then-migrate").await;
+    append_history(&mut source, predecessor, &[started(json!({"seed": 1}))]).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(predecessor.as_uuid())
+    .execute(&mut source)
+    .await
+    .expect("seal the predecessor FAILED");
+
+    let successor = insert_execution_with_id(
+        &mut source,
+        "entity_flow",
+        "signal-then-migrate-successor",
+        ExecutionId::new_for_shard(SOURCE),
+        SOURCE,
+    )
+    .await;
+    diesel::sql_query("UPDATE harvest_workflow_executions SET retry_of_exec_id = $1 WHERE id = $2")
+        .bind::<diesel::sql_types::Uuid, _>(predecessor.as_uuid())
+        .bind::<diesel::sql_types::Uuid, _>(successor.as_uuid())
+        .execute(&mut source)
+        .await
+        .expect("link the successor to its predecessor");
+    append_history(&mut source, successor, &[started(json!({"seed": 1}))]).await;
+    park_on_signal(&mut source, successor).await;
+    drop(source);
+
+    let outcome = migrate_execution(&shards.pool, successor, SOURCE, TARGET, &codecs())
+        .await
+        .expect("the successor's migration must not error");
+    assert!(
+        matches!(outcome, MigrationOutcome::Migrated { .. }),
+        "expected the successor's migration to complete, got {outcome:?}"
+    );
+
+    // Exactly what a caller holding only the ORIGINAL (predecessor) id
+    // would do: resolve a connection for ITS residence alone. Then signal
+    // through `send_signal_to_live_attempt`, the routed entry point that
+    // discards `resolve_live_attempt_id_best_effort`'s own rebind.
+    let (mut conn, _predecessor_shard) =
+        conn_for_execution_forwarded_with_shard(&shards.pool, predecessor)
+            .await
+            .expect("resolve the predecessor's own residence");
+
+    let delivery = autumn_harvest::signal::send_signal_to_live_attempt(
+        &mut conn,
+        predecessor,
+        "wake",
+        json!({"from": "test"}),
+        None,
+    )
+    .await
+    .expect(
+        "the signal must reach the live successor on its migrated-to shard, not fail \
+         against a connection still pointed at the origin-side MIGRATED seal",
+    );
+
+    assert_eq!(
+        delivery.target, successor,
+        "the delivery must report the live successor as what it actually signalled"
+    );
+    assert!(delivery.delivered, "the signal must be freshly queued");
+
+    // The authoritative check: the LIVE copy's mailbox on TARGET, not the
+    // origin-side seal's on SOURCE, must hold the signal.
+    let mut target = shards.target().await;
+    assert_eq!(
+        count(
+            &mut target,
+            "SELECT count(*)::BIGINT AS value FROM harvest_signals \
+              WHERE workflow_exec_id = $1 AND signal_name = 'wake'",
+            successor
+        )
+        .await,
+        1,
+        "the signal must land on the successor's live mailbox on its real shard (TARGET)"
+    );
+    let mut source = shards.source().await;
+    assert_eq!(
+        count(
+            &mut source,
+            "SELECT count(*)::BIGINT AS value FROM harvest_signals \
+              WHERE workflow_exec_id = $1 AND signal_name = 'wake'",
+            successor
+        )
+        .await,
+        0,
+        "the origin-side seal's mailbox on SOURCE must not accumulate a delivery \
+         meant for the live copy"
+    );
+}
