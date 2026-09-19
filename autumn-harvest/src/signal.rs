@@ -266,7 +266,11 @@ pub async fn send_signal_to_live_attempt(
     payload: serde_json::Value,
     idempotency_key: Option<&str>,
 ) -> HarvestResult<RoutedSignalDelivery> {
-    let target = crate::execution::resolve_live_attempt_id(conn, exec_id).await?;
+    // `conn` is supplied by the caller (generated typed-signal code predating
+    // sharding), so its shard is not known here. `resolve_live_attempt_id_best_effort`
+    // (issue #1596 review) recovers it from the row itself rather than
+    // trusting a retry successor's stale `MIGRATED` stub across a rebalance.
+    let target = crate::execution::resolve_live_attempt_id_best_effort(conn, exec_id).await?;
     send_signal_from_resolved(conn, exec_id, target, signal_name, payload, idempotency_key).await
 }
 
@@ -311,7 +315,7 @@ pub async fn send_signal_from_resolved(
             // sealed `FAILED` — swallowing a re-send the live attempt still
             // needs. Nothing was queued, so re-driving cannot double-deliver.
             Ok(false) => {
-                let fresh = crate::execution::resolve_live_attempt_id(conn, exec_id)
+                let fresh = crate::execution::resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
                     .unwrap_or(target);
                 if !crate::execution::redrive_target(target, fresh) {
@@ -325,7 +329,7 @@ pub async fn send_signal_from_resolved(
             Err(error) => {
                 // The delivery was rolled back, so re-driving is safe: it can
                 // never double-deliver a signal that was actually queued.
-                let fresh = crate::execution::resolve_live_attempt_id(conn, exec_id)
+                let fresh = crate::execution::resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
                     .unwrap_or(target);
                 if !crate::execution::redrive_target(target, fresh) {

@@ -2171,14 +2171,27 @@ impl WorkflowHandle {
     /// management API cannot drift on what "the live attempt" means (#843).
     /// For workflows without a retry policy this is exactly `load_execution()`
     /// — the original row — so behavior is unchanged for the non-retry case.
+    ///
+    /// Passes the shard `conn` was actually checked out from (issue #1596
+    /// review). A retry successor found mid-walk can itself have been
+    /// rebalanced away from that shard.
+    /// [`crate::execution::resolve_live_attempt`] must follow it there,
+    /// rather than trust the origin-side `MIGRATED` stub it would otherwise
+    /// read.
     async fn load_effective_execution(&self) -> HarvestResult<WorkflowExecution> {
         // Resolve residence, not origin (issue #1317): see `cancel` above.
-        let mut conn = crate::shard_rebalance::conn_for_execution_forwarded(
+        let (mut conn, shard) = crate::shard_rebalance::conn_for_execution_forwarded_with_shard(
             &self.client.inner.pools,
             self.exec_id,
         )
         .await?;
-        crate::execution::resolve_live_attempt(&mut conn, self.exec_id).await
+        crate::execution::resolve_live_attempt(
+            &mut conn,
+            &self.client.inner.pools,
+            shard,
+            self.exec_id,
+        )
+        .await
     }
 
     /// Execute a registered query handler in-process by replaying event history.
@@ -2360,7 +2373,13 @@ impl WorkflowHandle {
         // `RUNNING` under a `FOR UPDATE` lock and rolls back otherwise, so
         // re-driving against a freshly resolved live attempt can never admit
         // the same update twice.
-        let mut target = crate::execution::resolve_live_attempt_id(conn, self.exec_id).await?;
+        //
+        // `conn` is supplied by the caller (generated typed-update code
+        // predating sharding), so its shard is not known here the way
+        // `load_effective_execution` knows its own. `resolve_live_attempt_id_best_effort`
+        // (issue #1596 review) recovers it from the row itself instead.
+        let mut target =
+            crate::execution::resolve_live_attempt_id_best_effort(conn, self.exec_id).await?;
         self.validate_workflow_type_for(conn, target, workflow_name)
             .await?;
         let update_id = crate::types::UpdateId::new();
@@ -2381,7 +2400,7 @@ impl WorkflowHandle {
         .await;
         for _ in 0..crate::execution::RETRY_CHAIN_MAX_REDRIVES {
             let Err(error) = admit else { break };
-            let fresh = crate::execution::resolve_live_attempt_id(conn, self.exec_id)
+            let fresh = crate::execution::resolve_live_attempt_id_best_effort(conn, self.exec_id)
                 .await
                 .unwrap_or(target);
             if !crate::execution::redrive_target(target, fresh) {

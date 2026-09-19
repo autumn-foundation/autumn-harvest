@@ -22,10 +22,11 @@ use crate::info::WorkflowInfo;
 use crate::models::{NewHarvestSignal, NewWorkflowExecution, WorkflowExecution};
 use crate::queue::{self, EnqueueParams, TaskType};
 use crate::schema::{harvest_signals, harvest_workflow_executions};
+use crate::shard::ShardedDbPool;
 use crate::store;
 use crate::telemetry::TraceContextCarrier;
 use crate::types::{
-    ExecutionId, ParentClosePolicy, Priority, StartSource, WorkflowIdConflictPolicy,
+    ExecutionId, ParentClosePolicy, Priority, ShardId, StartSource, WorkflowIdConflictPolicy,
     WorkflowIdReusePolicy,
 };
 
@@ -3594,11 +3595,18 @@ pub const RETRY_CHAIN_MAX_REDRIVES: usize = RETRY_CHAIN_MAX_DEPTH;
 /// [`HarvestError::Database`] for query failures, and
 /// [`HarvestError::RetryChainMaxDepthExceeded`] when the chain exceeds [`RETRY_CHAIN_MAX_DEPTH`]
 /// (fail-closed — see that constant).
+///
+/// `pool`/`held_shard` name the shard `conn` is already checked out from.
+/// That lets a hop which has itself been rebalanced be followed to its live
+/// shard (issue #1596 review, PR #1596 comment 4052029175). See
+/// [`walk_retry_chain`] for why that residence check exists.
 pub async fn resolve_live_attempt(
     conn: &mut AsyncPgConnection,
+    pool: &ShardedDbPool,
+    held_shard: ShardId,
     exec_id: ExecutionId,
 ) -> HarvestResult<WorkflowExecution> {
-    let mut chain = walk_retry_chain(conn, exec_id).await?;
+    let mut chain = walk_retry_chain(conn, pool, held_shard, exec_id).await?;
     Ok(chain
         .pop()
         .expect("walk_retry_chain always returns at least the addressed row"))
@@ -3614,17 +3622,71 @@ pub async fn resolve_live_attempt(
 /// of row loads the plain resolve already performed — the walk had to load
 /// every intermediate row anyway to read its `state`.
 ///
+/// # Residence, not just origin (issue #1596 review, comment 4052029175)
+///
+/// A retry successor is minted on its predecessor's shard. Nothing stops it
+/// from being rebalanced away afterwards. Shard rebalancing (issue #964)
+/// moves any quiescent execution, and a parked retry successor qualifies
+/// like any other. `conn`/`held_shard` are only ever resolved for the row
+/// the walk STARTS at.
+///
+/// Reading a later hop on that same connection would find whatever row
+/// physically exists there. After a rebalance, that is the origin shard's
+/// sealed `MIGRATED` stub, not the live copy. `"MIGRATED" != "FAILED"`. The
+/// old walk stopped right there and returned the stub as the live attempt.
+/// That is silently wrong for every consumer, `load_effective_execution`
+/// above all. A result waiter would poll a nonterminal seal forever. A
+/// listener rebind would keep watching the wrong execution.
+///
+/// So every hop's residence is resolved before its state is trusted, via
+/// [`crate::shard_rebalance::resolve_execution_shard_holding`]. A hop that
+/// lands on the connection already in hand costs nothing extra. Only a hop
+/// that has actually moved pays for a fresh checkout.
+///
+/// Every checkout is guarded by
+/// [`crate::shard_rebalance::forwarding_hop_conflict`]. It checks both
+/// `held_shard` (the caller's own connection, held for this whole call) and
+/// the walk's own previous hop. This mirrors
+/// [`crate::shard_rebalance::live_copy_is_terminal`]'s identical discipline.
+/// Otherwise a hop landing back on either one could deadlock a
+/// pool-size-one shard against a connection this call already holds open.
+///
 /// # Errors
 ///
-/// Returns [`HarvestError::NotFound`] when `exec_id` does not exist,
-/// [`HarvestError::Database`] for query failures, and
-/// [`HarvestError::RetryChainMaxDepthExceeded`] when the chain exceeds [`RETRY_CHAIN_MAX_DEPTH`]
-/// (see the fail-closed rationale on that constant).
+/// Returns [`HarvestError::NotFound`] when `exec_id` does not exist.
+/// Returns [`HarvestError::Database`] for query failures. Returns
+/// [`HarvestError::RetryChainMaxDepthExceeded`] when the chain exceeds
+/// [`RETRY_CHAIN_MAX_DEPTH`] (see the fail-closed rationale on that
+/// constant). Returns [`HarvestError::ShardUnavailable`] when a hop's live
+/// shard cannot be reached from this node, or would deadlock a connection
+/// already held.
 pub async fn walk_retry_chain(
     conn: &mut AsyncPgConnection,
+    pool: &ShardedDbPool,
+    held_shard: ShardId,
     exec_id: ExecutionId,
 ) -> HarvestResult<Vec<WorkflowExecution>> {
-    let mut chain = vec![load_execution_row(conn, exec_id).await?];
+    // Tracks which connection is actually being read right now. It stays the
+    // caller's own `conn` until a hop moves off `held_shard`, then switches
+    // to this walk's own checked-out connection. Reusing `conn` for as long
+    // as possible keeps the common, never-rebalanced case free of any extra
+    // checkout.
+    enum ActiveConn<'a> {
+        Held(&'a mut AsyncPgConnection),
+        Owned(Box<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>>),
+    }
+    impl ActiveConn<'_> {
+        fn as_mut(&mut self) -> &mut AsyncPgConnection {
+            match self {
+                Self::Held(conn) => conn,
+                Self::Owned(conn) => conn,
+            }
+        }
+    }
+
+    let mut active = ActiveConn::Held(conn);
+    let mut current_shard = held_shard;
+    let mut chain = vec![load_execution_row(active.as_mut(), exec_id).await?];
     for _ in 0..RETRY_CHAIN_MAX_DEPTH {
         let (current_id, current_failed) = {
             let current = chain
@@ -3648,14 +3710,47 @@ pub async fn walk_retry_chain(
                 harvest_workflow_executions::id.asc(),
             ))
             .select(harvest_workflow_executions::id)
-            .first(conn)
+            .first(active.as_mut())
             .await
             .optional()
             .map_err(database_error)?;
         let Some(next_id) = next else {
             return Ok(chain);
         };
-        chain.push(load_execution_row(conn, ExecutionId::from_uuid(next_id)).await?);
+        let next_id = ExecutionId::from_uuid(next_id);
+
+        // Resolve where `next_id` actually lives before loading it, relative
+        // to whichever connection this walk currently holds.
+        let next_shard = crate::shard_rebalance::resolve_execution_shard_holding(
+            active.as_mut(),
+            pool,
+            next_id,
+            current_shard,
+        )
+        .await?;
+        if next_shard != current_shard && !pool.same_physical_pool(next_shard, current_shard) {
+            // The hop moved off the connection this walk is currently
+            // reading. Refuse a checkout that would alias `held_shard` (the
+            // caller's own connection, held for this entire call). Also
+            // refuse one that aliases the walk's own previous hop, past the
+            // very first one. Either would deadlock a pool-size-one shard
+            // against a connection already checked out.
+            let previous_hop = (current_shard != held_shard).then_some(current_shard);
+            if let Some(err) = crate::shard_rebalance::forwarding_hop_conflict(
+                pool,
+                next_shard,
+                previous_hop,
+                held_shard,
+                exec_id,
+            ) {
+                return Err(err);
+            }
+            active = ActiveConn::Owned(Box::new(
+                crate::shard_rebalance::conn_for_shard(pool, next_shard).await?,
+            ));
+            current_shard = next_shard;
+        }
+        chain.push(load_execution_row(active.as_mut(), next_id).await?);
     }
     // Unreachable for any real chain (see `RETRY_CHAIN_MAX_DEPTH`). Reaching it
     // means the chain is pathological — a cycle, or a `max_attempts` far above
@@ -3686,9 +3781,11 @@ pub async fn walk_retry_chain(
 /// See [`walk_retry_chain`].
 pub async fn retry_chain_ids(
     conn: &mut AsyncPgConnection,
+    pool: &ShardedDbPool,
+    held_shard: ShardId,
     exec_id: ExecutionId,
 ) -> HarvestResult<Vec<ExecutionId>> {
-    Ok(walk_retry_chain(conn, exec_id)
+    Ok(walk_retry_chain(conn, pool, held_shard, exec_id)
         .await?
         .into_iter()
         .map(|e| ExecutionId::from_uuid(e.id))
@@ -3702,11 +3799,123 @@ pub async fn retry_chain_ids(
 /// See [`resolve_live_attempt`].
 pub async fn resolve_live_attempt_id(
     conn: &mut AsyncPgConnection,
+    pool: &ShardedDbPool,
+    held_shard: ShardId,
     exec_id: ExecutionId,
 ) -> HarvestResult<ExecutionId> {
-    resolve_live_attempt(conn, exec_id)
+    resolve_live_attempt(conn, pool, held_shard, exec_id)
         .await
         .map(|e| ExecutionId::from_uuid(e.id))
+}
+
+/// [`walk_retry_chain`], for a caller with no [`ShardedDbPool`] of its own to
+/// pass in (issue #1596 review).
+///
+/// Signal delivery and in-process update admission are public entry points.
+/// Their `conn` is supplied by application code generated at compile time by
+/// `autumn-harvest-macros`. Their signature predates sharding, and cannot
+/// grow a pool parameter without breaking every generated caller. This
+/// recovers the two pieces of context [`walk_retry_chain`] needs from
+/// [`crate::shard::GLOBAL_SHARDED_POOL`] and
+/// [`crate::shard_rebalance::shard_of_held_row`] instead.
+///
+/// Either can come back empty. No sharded pool was ever installed: a
+/// single-shard embedder, or a test harness wired with a bare connection.
+/// Or `exec_id`'s row is not on this connection at all. Both cases fall
+/// back to walking on `conn` alone, exactly as this function's callers did
+/// before issue #1596. That is not a silent downgrade. With no pool to
+/// move it to, a retry successor cannot have been rebalanced anywhere. A
+/// stale `MIGRATED` stub can never be sitting in its place.
+///
+/// # Errors
+///
+/// See [`walk_retry_chain`].
+pub async fn walk_retry_chain_best_effort(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Vec<WorkflowExecution>> {
+    let pool = crate::shard::GLOBAL_SHARDED_POOL
+        .read()
+        .ok()
+        .and_then(|p| p.clone());
+    let held_shard = if pool.is_some() {
+        crate::shard_rebalance::shard_of_held_row(conn, exec_id).await
+    } else {
+        None
+    };
+    if let (Some(pool), Some(held_shard)) = (pool, held_shard) {
+        return walk_retry_chain(conn, &pool, held_shard, exec_id).await;
+    }
+    walk_retry_chain_on_conn_only(conn, exec_id).await
+}
+
+/// The pre-#1596 walk: every hop read on `conn` alone, with no residence
+/// check. This is [`walk_retry_chain_best_effort`]'s fallback when it cannot
+/// recover a [`ShardedDbPool`] or a held shard for `exec_id`.
+///
+/// # Errors
+///
+/// See [`walk_retry_chain`].
+async fn walk_retry_chain_on_conn_only(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Vec<WorkflowExecution>> {
+    let mut chain = vec![load_execution_row(conn, exec_id).await?];
+    for _ in 0..RETRY_CHAIN_MAX_DEPTH {
+        let (current_id, current_failed) = {
+            let current = chain
+                .last()
+                .expect("the chain is seeded with the addressed row");
+            (current.id, current.state == "FAILED")
+        };
+        if !current_failed {
+            return Ok(chain);
+        }
+        let next: Option<Uuid> = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::retry_of_exec_id.eq(Some(current_id)))
+            .order((
+                harvest_workflow_executions::started_at.asc(),
+                harvest_workflow_executions::id.asc(),
+            ))
+            .select(harvest_workflow_executions::id)
+            .first(conn)
+            .await
+            .optional()
+            .map_err(database_error)?;
+        let Some(next_id) = next else {
+            return Ok(chain);
+        };
+        chain.push(load_execution_row(conn, ExecutionId::from_uuid(next_id)).await?);
+    }
+    tracing::error!(
+        execution_id = %exec_id,
+        max_depth = RETRY_CHAIN_MAX_DEPTH,
+        "harvest: retry chain exceeded the maximum walk depth; refusing to route \
+         to a possibly-stale attempt"
+    );
+    Err(HarvestError::RetryChainMaxDepthExceeded {
+        exec_id,
+        max_depth: RETRY_CHAIN_MAX_DEPTH,
+    })
+}
+
+/// [`resolve_live_attempt_id`], for a caller with no [`ShardedDbPool`] of its
+/// own. See [`walk_retry_chain_best_effort`].
+///
+/// # Errors
+///
+/// See [`walk_retry_chain`].
+pub async fn resolve_live_attempt_id_best_effort(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<ExecutionId> {
+    let mut chain = walk_retry_chain_best_effort(conn, exec_id).await?;
+    Ok(ExecutionId::from_uuid(
+        chain
+            .pop()
+            .expect("walk_retry_chain_best_effort always returns at least the addressed row")
+            .id,
+    ))
 }
 
 /// Load one execution row by id.
@@ -3773,12 +3982,12 @@ pub async fn cancel_live_attempt(
     reason: &str,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<CancelledWorkflowExecution> {
-    let mut target = resolve_live_attempt_id(conn, exec_id).await?;
+    let mut target = resolve_live_attempt_id_best_effort(conn, exec_id).await?;
     for _ in 0..RETRY_CHAIN_MAX_REDRIVES {
         match cancel_workflow_execution(conn, target, reason, metrics).await {
             Ok(result) => return Ok(result),
             Err(error) => {
-                let fresh = resolve_live_attempt_id(conn, exec_id)
+                let fresh = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
                     .unwrap_or(target);
                 if !redrive_target(target, fresh) {
@@ -3814,7 +4023,7 @@ pub async fn terminate_live_attempt(
     reason: &str,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<CancelledWorkflowExecution> {
-    let mut target = resolve_live_attempt_id(conn, exec_id).await?;
+    let mut target = resolve_live_attempt_id_best_effort(conn, exec_id).await?;
     for _ in 0..RETRY_CHAIN_MAX_REDRIVES {
         match terminate_workflow_execution(conn, target, reason, metrics).await {
             // A genuine seal, or an idempotent no-op against a row that is
@@ -3825,7 +4034,7 @@ pub async fn terminate_live_attempt(
                 return Ok(result);
             }
             Ok(result) => {
-                let fresh = resolve_live_attempt_id(conn, exec_id)
+                let fresh = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
                     .unwrap_or(target);
                 if !redrive_target(target, fresh) {
@@ -3834,7 +4043,7 @@ pub async fn terminate_live_attempt(
                 target = fresh;
             }
             Err(error) => {
-                let fresh = resolve_live_attempt_id(conn, exec_id)
+                let fresh = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
                     .unwrap_or(target);
                 if !redrive_target(target, fresh) {
@@ -3870,12 +4079,12 @@ pub async fn pause_live_attempt(
     actor: &str,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<PausedWorkflowExecution> {
-    let mut target = resolve_live_attempt_id(conn, exec_id).await?;
+    let mut target = resolve_live_attempt_id_best_effort(conn, exec_id).await?;
     for _ in 0..RETRY_CHAIN_MAX_REDRIVES {
         match pause_workflow_execution(conn, target, reason, actor, metrics).await {
             Ok(result) => return Ok(result),
             Err(error) => {
-                let fresh = resolve_live_attempt_id(conn, exec_id)
+                let fresh = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
                     .unwrap_or(target);
                 if !redrive_target(target, fresh) {
@@ -3910,14 +4119,14 @@ pub async fn resume_live_attempt(
     actor: &str,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<ResumedWorkflowExecution> {
-    let mut target = resolve_live_attempt_id(conn, exec_id).await?;
+    let mut target = resolve_live_attempt_id_best_effort(conn, exec_id).await?;
     for _ in 0..RETRY_CHAIN_MAX_REDRIVES {
         match resume_workflow_execution(conn, target, actor, metrics).await {
             Ok(result) if result.newly_resumed || result.state != "FAILED" => {
                 return Ok(result);
             }
             Ok(result) => {
-                let fresh = resolve_live_attempt_id(conn, exec_id)
+                let fresh = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
                     .unwrap_or(target);
                 if !redrive_target(target, fresh) {
@@ -3926,7 +4135,7 @@ pub async fn resume_live_attempt(
                 target = fresh;
             }
             Err(error) => {
-                let fresh = resolve_live_attempt_id(conn, exec_id)
+                let fresh = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
                     .unwrap_or(target);
                 if !redrive_target(target, fresh) {

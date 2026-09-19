@@ -11279,14 +11279,21 @@ async fn workflow_result_snapshot_following_can(
 /// [`autumn_harvest::execution::resolve_live_attempt`] so the management API and
 /// the core `WorkflowHandle` cannot drift on what "the live attempt" means
 /// (issue #843).
+///
+/// Resolves `exec_id`'s residence WITH its shard (issue #1596 review), not
+/// just a connection. A retry successor found mid-walk can itself have been
+/// rebalanced away from that shard. The walker must follow it there, rather
+/// than trust the origin-side `MIGRATED` stub it would otherwise read.
 async fn load_execution_following_retries(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
 ) -> HarvestResult<WorkflowExecution> {
-    let mut conn = db_conn_for_execution(api_state, exec_id)
+    let pool = api_state.storage_pool()?;
+    let (mut conn, shard) = db_conn_for_execution_with_shard(api_state, exec_id)
         .await
         .map_err(|e| HarvestError::Database(e.to_string()))?;
-    autumn_harvest::execution::resolve_live_attempt(&mut conn, exec_id).await
+    autumn_harvest::execution::resolve_live_attempt(&mut conn, pool.sharded_pool(), shard, exec_id)
+        .await
 }
 
 /// Load the successor execution ID from a `WorkflowContinuedAsNew` event in
@@ -25014,7 +25021,7 @@ pub(crate) async fn signal_workflow(
             return e.into_response();
         }
     };
-    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+    let (mut conn, shard) = match db_conn_for_execution_with_shard(&api_state, exec_id).await {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -25025,7 +25032,21 @@ pub(crate) async fn signal_workflow(
     // sent after attempt 1 sealed `FAILED` was inserted against — and dropped
     // with — the sealed predecessor while the retry ran on. For a workflow with
     // no retry policy this resolves to `exec_id` and is a strict no-op.
-    let execution = match autumn_harvest::execution::resolve_live_attempt(&mut conn, exec_id).await
+    //
+    // Issue #1596 review: a retry successor can itself have been rebalanced
+    // off `shard` after being minted. Residence is re-resolved at this hop
+    // too, rather than trusting `conn` to already own the whole chain.
+    let pool = match api_state.storage_pool() {
+        Ok(pool) => pool,
+        Err(e) => return map_error(e).into_response(),
+    };
+    let execution = match autumn_harvest::execution::resolve_live_attempt(
+        &mut conn,
+        pool.sharded_pool(),
+        shard,
+        exec_id,
+    )
+    .await
     {
         Ok(ex) => ex,
         Err(e) => {
@@ -25228,14 +25249,23 @@ async fn hydrate_ctx_for_query(
     query_label: &str,
 ) -> Result<WorkflowContext, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
-    let mut conn = db_conn_for_execution(api_state, exec_id).await?;
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let (mut conn, shard) = db_conn_for_execution_with_shard(api_state, exec_id).await?;
     // Issue #843: a query addresses the LOGICAL run, so follow the
-    // workflow-level retry chain (#523/#842) to the live attempt. A retry
-    // successor is minted on the predecessor's shard, so the connection
-    // resolved from `exec_id` above already owns the whole chain.
-    let execution = autumn_harvest::execution::resolve_live_attempt(&mut conn, exec_id)
-        .await
-        .map_err(map_error)?;
+    // workflow-level retry chain (#523/#842) to the live attempt.
+    //
+    // A retry successor is minted on the predecessor's shard. Nothing stops
+    // it from being rebalanced away afterwards (issue #1596 review).
+    // `resolve_live_attempt` re-resolves residence at each hop, rather than
+    // trusting `conn` to already own the whole chain.
+    let execution = autumn_harvest::execution::resolve_live_attempt(
+        &mut conn,
+        pool.sharded_pool(),
+        shard,
+        exec_id,
+    )
+    .await
+    .map_err(map_error)?;
     let target = ExecutionId::from_uuid(execution.id);
 
     // Terminal executions are now queryable for post-mortem state inspection
@@ -45940,7 +45970,7 @@ pub(crate) async fn admit_update(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+    let (mut conn, shard) = match db_conn_for_execution_with_shard(&api_state, exec_id).await {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -45968,11 +45998,26 @@ pub(crate) async fn admit_update(
     //
     // Issue #843: an update addresses the LOGICAL run, so follow the
     // workflow-level retry chain (#523/#842) to the live attempt before both
-    // validating and admitting. A retry successor is minted on the
-    // predecessor's shard, so `conn` above already owns the whole chain.
-    // `resolve_live_attempt` returns the resolved row, so the validation below
-    // reuses it rather than re-loading the identical row by id.
-    let resolved = match autumn_harvest::execution::resolve_live_attempt(&mut conn, exec_id).await {
+    // validating and admitting.
+    //
+    // A retry successor is minted on the predecessor's shard. Nothing stops
+    // it from being rebalanced away afterwards (issue #1596 review).
+    // `resolve_live_attempt` re-resolves residence at each hop, rather than
+    // trusting `conn` to already own the whole chain. `resolve_live_attempt`
+    // returns the resolved row, so the validation below reuses it rather than
+    // re-loading the identical row by id.
+    let pool = match api_state.storage_pool() {
+        Ok(pool) => pool,
+        Err(e) => return map_error(e).into_response(),
+    };
+    let resolved = match autumn_harvest::execution::resolve_live_attempt(
+        &mut conn,
+        pool.sharded_pool(),
+        shard,
+        exec_id,
+    )
+    .await
+    {
         Ok(ex) => ex,
         Err(e) => return map_error(e).into_response(),
     };
@@ -46046,9 +46091,14 @@ pub(crate) async fn admit_update(
     .await;
     for _ in 0..autumn_harvest::execution::RETRY_CHAIN_MAX_REDRIVES {
         let Err(error) = admit else { break };
-        let fresh = autumn_harvest::execution::resolve_live_attempt_id(&mut conn, exec_id)
-            .await
-            .unwrap_or(target);
+        let fresh = autumn_harvest::execution::resolve_live_attempt_id(
+            &mut conn,
+            pool.sharded_pool(),
+            shard,
+            exec_id,
+        )
+        .await
+        .unwrap_or(target);
         if !autumn_harvest::execution::redrive_target(target, fresh) {
             return map_error(error).into_response();
         }
@@ -46234,6 +46284,11 @@ pub async fn poll_update_result(
 /// - `409 Conflict` with `error` if the handler failed or the update was rejected.
 /// - `202 Accepted` if the update is still in-flight.
 /// - `404 Not Found` if no `UpdateAdmitted` event exists for the given ID.
+// Issue #1596 review: threading the sharded pool and shard through the
+// residence-aware `retry_chain_ids` call pushed this past the clippy line
+// limit. An allow is cheaper than refactoring an unrelated large function
+// for a four-line fix (mirrors `execute_query_in_process`'s own allow).
+#[allow(clippy::too_many_lines)]
 async fn get_update_result(
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, update_id_str)): Path<(String, String)>,
@@ -46252,9 +46307,13 @@ async fn get_update_result(
         }
     };
 
-    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+    let (mut conn, shard) = match db_conn_for_execution_with_shard(&api_state, exec_id).await {
         Ok(c) => c,
         Err(e) => return e.into_response(),
+    };
+    let pool = match api_state.storage_pool() {
+        Ok(pool) => pool,
+        Err(e) => return map_error(e).into_response(),
     };
 
     // Issue #843: `admit_update` routes admission to the live attempt of the
@@ -46271,7 +46330,18 @@ async fn get_update_result(
     // this admission — deepest first, because the live attempt is the common
     // case (an update admitted moments ago) and a workflow that never retried
     // has a one-element chain, i.e. exactly today's single history load.
-    let chain = match autumn_harvest::execution::retry_chain_ids(&mut conn, exec_id).await {
+    //
+    // Issue #1596 review: `retry_chain_ids` re-resolves residence at each
+    // hop. A chain member rebalanced onto another shard is still discovered
+    // here, instead of the walk stopping at its stale origin-side seal.
+    let chain = match autumn_harvest::execution::retry_chain_ids(
+        &mut conn,
+        pool.sharded_pool(),
+        shard,
+        exec_id,
+    )
+    .await
+    {
         Ok(c) => c,
         Err(e) => return map_error(e).into_response(),
     };

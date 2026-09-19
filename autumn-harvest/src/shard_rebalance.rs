@@ -640,6 +640,14 @@ pub use db::{
     shard_of_held_row, stage_copy, verify_target_copy,
 };
 
+// This is `pub(crate)`, not part of the `pub use` block above (issue #1596
+// review). `forwarding_hop_conflict` itself is a plain `pub` function inside
+// a private module, so this re-export is what actually bounds it to the
+// crate. Only a crate-internal caller, such as
+// `crate::execution::walk_retry_chain`, may reach it here.
+#[cfg(feature = "db")]
+pub(crate) use db::forwarding_hop_conflict;
+
 #[cfg(feature = "db")]
 mod db {
     use chrono::{DateTime, Utc};
@@ -1722,7 +1730,7 @@ mod db {
     /// `current` is `None` for the very first hop. It has no
     /// already-checked-out connection of its own to conflict with yet
     /// (issue #1317 review, P2 follow-up; fresh review, P2 follow-up).
-    fn forwarding_hop_conflict(
+    pub fn forwarding_hop_conflict(
         pool: &ShardedDbPool,
         next: ShardId,
         current: Option<ShardId>,

@@ -5924,3 +5924,154 @@ async fn a_forward_to_an_unconfigured_shard_fails_closed_not_via_the_held_pools_
         "expected ShardUnavailable naming the unconfigured shard 2, got {err:?}"
     );
 }
+
+// ── Issue #1596 review (comment 4052029175): follow forwarding pointers for
+// retry successors ──────────────────────────────────────────────────────────
+
+/// A workflow-level retry successor (issue #523) is minted on its
+/// predecessor's shard. Nothing stops it from being rebalanced away
+/// afterwards. Before this fix, `walk_retry_chain` read every hop on the
+/// single connection resolved for the ORIGINAL (predecessor) execution id.
+///
+/// A successor migrated to another shard therefore surfaced, on that
+/// connection, as the origin-side `MIGRATED` stub the migration leaves
+/// behind. That stub is not `FAILED`, so the walk stopped right there and
+/// reported the stub as the live attempt. This pins the fix: residence is
+/// re-resolved at each hop, so the walker follows the successor to its
+/// real, live shard.
+#[tokio::test]
+async fn a_retry_successor_migrated_to_another_shard_still_resolves_to_its_live_state() {
+    let shards = setup_two_shards().await;
+
+    // The predecessor: started, then sealed FAILED with a scheduled retry --
+    // exactly the shape `update_workflow_execution_failed` leaves behind.
+    let mut source = shards.source().await;
+    let predecessor = insert_execution(&mut source, "entity_flow", "retry-then-migrate").await;
+    append_history(&mut source, predecessor, &[started(json!({"seed": 1}))]).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(predecessor.as_uuid())
+    .execute(&mut source)
+    .await
+    .expect("seal the predecessor FAILED");
+
+    // The retry successor: minted on the predecessor's own shard, and
+    // linked via `retry_of_exec_id`. That link is precisely what the same
+    // transaction that seals a predecessor FAILED also does.
+    //
+    // A distinct `workflow_id` sidesteps the active-uniqueness partial index
+    // entirely. A real retry reuses the predecessor's own key, but
+    // `walk_retry_chain` only ever follows `retry_of_exec_id`. It never
+    // compares `workflow_id`, so this is not a gap in what the test proves.
+    let successor = insert_execution_with_id(
+        &mut source,
+        "entity_flow",
+        "retry-then-migrate-successor",
+        ExecutionId::new_for_shard(SOURCE),
+        SOURCE,
+    )
+    .await;
+    diesel::sql_query("UPDATE harvest_workflow_executions SET retry_of_exec_id = $1 WHERE id = $2")
+        .bind::<diesel::sql_types::Uuid, _>(predecessor.as_uuid())
+        .bind::<diesel::sql_types::Uuid, _>(successor.as_uuid())
+        .execute(&mut source)
+        .await
+        .expect("link the successor to its predecessor");
+    append_history(
+        &mut source,
+        successor,
+        &[
+            started(json!({"seed": 1})),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("wake"),
+                duration_secs: 604_800,
+            },
+        ],
+    )
+    .await;
+    park_on_timer(&mut source, successor).await;
+    drop(source);
+
+    // Rebalance the successor -- and ONLY the successor -- onto TARGET. The
+    // predecessor's own row never moves.
+    let outcome = migrate_execution(&shards.pool, successor, SOURCE, TARGET, &codecs())
+        .await
+        .expect("the successor's migration must not error");
+    assert!(
+        matches!(outcome, MigrationOutcome::Migrated { .. }),
+        "expected the successor's migration to complete, got {outcome:?}"
+    );
+
+    // The origin-side stub the migration leaves behind: `MIGRATED`, not
+    // `FAILED`. This is the row the pre-fix walk stopped at and returned.
+    let mut source = shards.source().await;
+    assert_eq!(
+        state_of(&mut source, successor).await.as_deref(),
+        Some("MIGRATED"),
+        "the successor's origin-side row must be sealed MIGRATED, not deleted or FAILED"
+    );
+    drop(source);
+
+    // Resolve the predecessor's OWN residence only -- exactly what
+    // `WorkflowHandle::load_effective_execution` does: a connection resolved
+    // for `exec_id` alone, with no foreknowledge that a later hop moved.
+    let (mut conn, shard) = conn_for_execution_forwarded_with_shard(&shards.pool, predecessor)
+        .await
+        .expect("resolve the predecessor's own residence");
+    assert_eq!(shard, SOURCE, "the predecessor itself was never migrated");
+
+    let resolved = autumn_harvest::execution::resolve_live_attempt(
+        &mut conn,
+        &shards.pool,
+        shard,
+        predecessor,
+    )
+    .await
+    .expect("resolving the live attempt must follow the successor to its live shard");
+
+    assert_eq!(
+        resolved.id,
+        successor.as_uuid(),
+        "the live attempt must be the retry successor, not the sealed predecessor"
+    );
+    assert_eq!(
+        resolved.state, "RUNNING",
+        "the resolved row must be the successor's REAL state on its live shard \
+         (TARGET), not the stale MIGRATED stub left behind on the origin (SOURCE)"
+    );
+
+    // The id-only and full-chain variants built on the same walker must agree.
+    let (mut id_conn, id_shard) =
+        conn_for_execution_forwarded_with_shard(&shards.pool, predecessor)
+            .await
+            .expect("resolve the predecessor's own residence");
+    let resolved_id = autumn_harvest::execution::resolve_live_attempt_id(
+        &mut id_conn,
+        &shards.pool,
+        id_shard,
+        predecessor,
+    )
+    .await
+    .expect("resolve_live_attempt_id must also follow the successor across shards");
+    assert_eq!(resolved_id.as_uuid(), successor.as_uuid());
+
+    let (mut chain_conn, chain_shard) =
+        conn_for_execution_forwarded_with_shard(&shards.pool, predecessor)
+            .await
+            .expect("resolve the predecessor's own residence");
+    let chain = autumn_harvest::execution::retry_chain_ids(
+        &mut chain_conn,
+        &shards.pool,
+        chain_shard,
+        predecessor,
+    )
+    .await
+    .expect("retry_chain_ids must also follow the successor across shards");
+    assert_eq!(
+        chain,
+        vec![predecessor, successor],
+        "the chain must list the predecessor then the migrated successor, in order"
+    );
+}
