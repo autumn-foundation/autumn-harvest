@@ -1111,14 +1111,16 @@ async fn resolve_live_attempt_walks_the_chain() {
     assert_eq!(
         autumn_harvest::execution::resolve_live_attempt_id_best_effort(&mut conn, original)
             .await
-            .expect("resolve"),
+            .expect("resolve")
+            .0,
         retry
     );
     // Resolving from the deepest attempt is a fixed point.
     assert_eq!(
         autumn_harvest::execution::resolve_live_attempt_id_best_effort(&mut conn, retry)
             .await
-            .expect("resolve"),
+            .expect("resolve")
+            .0,
         retry
     );
     drop(conn);
@@ -1137,7 +1139,8 @@ async fn resolve_live_attempt_is_a_noop_without_a_retry_chain() {
     assert_eq!(
         autumn_harvest::execution::resolve_live_attempt_id_best_effort(&mut conn, running)
             .await
-            .expect("resolve running"),
+            .expect("resolve running")
+            .0,
         running
     );
 
@@ -1151,7 +1154,8 @@ async fn resolve_live_attempt_is_a_noop_without_a_retry_chain() {
     assert_eq!(
         autumn_harvest::execution::resolve_live_attempt_id_best_effort(&mut conn, running)
             .await
-            .expect("resolve failed"),
+            .expect("resolve failed")
+            .0,
         running
     );
 }
@@ -1201,6 +1205,7 @@ async fn a_chain_deeper_than_the_walk_bound_fails_closed() {
 
     let error = autumn_harvest::execution::resolve_live_attempt_id_best_effort(&mut conn, head)
         .await
+        .map(|_| ())
         .expect_err("a chain deeper than the walk bound must fail closed, not return a stale row");
     // Distinct from `Config` (issue #1445 review) so cancel/pause's shared
     // `conflict_from` mapper can pattern-match this precisely instead of
@@ -1231,7 +1236,8 @@ async fn a_chain_deeper_than_the_walk_bound_fails_closed() {
     assert_eq!(
         autumn_harvest::execution::resolve_live_attempt_id_best_effort(&mut conn, shallow)
             .await
-            .expect("a chain within the bound still resolves"),
+            .expect("a chain within the bound still resolves")
+            .0,
         shallow
     );
 }

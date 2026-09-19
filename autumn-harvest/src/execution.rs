@@ -3600,12 +3600,21 @@ pub const RETRY_CHAIN_MAX_REDRIVES: usize = RETRY_CHAIN_MAX_DEPTH;
 /// That lets a hop which has itself been rebalanced be followed to its live
 /// shard (issue #1596 review, PR #1596 comment 4052029175). See
 /// [`walk_retry_chain`] for why that residence check exists.
+///
+/// Also returns the shard the live attempt actually lives on (issue #1596
+/// follow-up review, comment 4052389744), which can differ from
+/// `held_shard`. `conn` itself is not moved. A caller that runs any
+/// follow-up query against the returned execution must first
+/// [`crate::shard_rebalance::bind_to_shard`] using this shard. It must not
+/// reuse `conn` unconditionally. Otherwise a follow-up against a live
+/// attempt that hopped shards silently runs against the wrong database.
+/// That is exactly the class of bug this whole primitive exists to close.
 pub async fn resolve_live_attempt(
     conn: &mut AsyncPgConnection,
     pool: &ShardedDbPool,
     held_shard: ShardId,
     exec_id: ExecutionId,
-) -> HarvestResult<WorkflowExecution> {
+) -> HarvestResult<(WorkflowExecution, ShardId)> {
     let mut chain = walk_retry_chain(conn, pool, held_shard, exec_id).await?;
     Ok(chain
         .pop()
@@ -3651,6 +3660,15 @@ pub async fn resolve_live_attempt(
 /// Otherwise a hop landing back on either one could deadlock a
 /// pool-size-one shard against a connection this call already holds open.
 ///
+/// Each row is paired with the shard it was actually read from (issue #1596
+/// follow-up review, comment 4052389744). That shard is not necessarily
+/// `held_shard`, once a hop has moved. A caller that must act on a specific
+/// element needs that shard. [`retry_chain_ids`]'s own consumers sometimes must act on an
+/// element other than the last one. Use
+/// [`crate::shard_rebalance::bind_to_shard`] before running any follow-up
+/// query against it. Only index 0 is guaranteed to sit on `conn`'s own
+/// shard.
+///
 /// # Errors
 ///
 /// Returns [`HarvestError::NotFound`] when `exec_id` does not exist.
@@ -3665,7 +3683,7 @@ pub async fn walk_retry_chain(
     pool: &ShardedDbPool,
     held_shard: ShardId,
     exec_id: ExecutionId,
-) -> HarvestResult<Vec<WorkflowExecution>> {
+) -> HarvestResult<Vec<(WorkflowExecution, ShardId)>> {
     // Tracks which connection is actually being read right now. It stays the
     // caller's own `conn` until a hop moves off `held_shard`, then switches
     // to this walk's own checked-out connection. Reusing `conn` for as long
@@ -3686,10 +3704,13 @@ pub async fn walk_retry_chain(
 
     let mut active = ActiveConn::Held(conn);
     let mut current_shard = held_shard;
-    let mut chain = vec![load_execution_row(active.as_mut(), exec_id).await?];
+    let mut chain = vec![(
+        load_execution_row(active.as_mut(), exec_id).await?,
+        current_shard,
+    )];
     for _ in 0..RETRY_CHAIN_MAX_DEPTH {
         let (current_id, current_failed) = {
-            let current = chain
+            let (current, _) = chain
                 .last()
                 .expect("the chain is seeded with the addressed row");
             (current.id, current.state == "FAILED")
@@ -3750,7 +3771,10 @@ pub async fn walk_retry_chain(
             ));
             current_shard = next_shard;
         }
-        chain.push(load_execution_row(active.as_mut(), next_id).await?);
+        chain.push((
+            load_execution_row(active.as_mut(), next_id).await?,
+            current_shard,
+        ));
     }
     // Unreachable for any real chain (see `RETRY_CHAIN_MAX_DEPTH`). Reaching it
     // means the chain is pathological — a cycle, or a `max_attempts` far above
@@ -3772,9 +3796,14 @@ pub async fn walk_retry_chain(
     })
 }
 
-/// [`walk_retry_chain`], returning only the [`ExecutionId`]s.
+/// [`walk_retry_chain`], returning only the [`ExecutionId`]s, each paired
+/// with the shard it was actually read from (issue #1596 follow-up review,
+/// comment 4052389744).
 ///
-/// Ordered `exec_id` first, live attempt last.
+/// Ordered `exec_id` first, live attempt last. A caller that must act on any
+/// element other than the last needs each one's own shard. The management
+/// API's search for which attempt carries a given update admission is one
+/// example. Only `conn`'s own shard is guaranteed for index 0.
 ///
 /// # Errors
 ///
@@ -3784,15 +3813,16 @@ pub async fn retry_chain_ids(
     pool: &ShardedDbPool,
     held_shard: ShardId,
     exec_id: ExecutionId,
-) -> HarvestResult<Vec<ExecutionId>> {
+) -> HarvestResult<Vec<(ExecutionId, ShardId)>> {
     Ok(walk_retry_chain(conn, pool, held_shard, exec_id)
         .await?
         .into_iter()
-        .map(|e| ExecutionId::from_uuid(e.id))
+        .map(|(e, shard)| (ExecutionId::from_uuid(e.id), shard))
         .collect())
 }
 
-/// [`resolve_live_attempt`], returning only the resolved [`ExecutionId`].
+/// [`resolve_live_attempt`], returning only the resolved [`ExecutionId`] and
+/// its shard.
 ///
 /// # Errors
 ///
@@ -3802,56 +3832,15 @@ pub async fn resolve_live_attempt_id(
     pool: &ShardedDbPool,
     held_shard: ShardId,
     exec_id: ExecutionId,
-) -> HarvestResult<ExecutionId> {
+) -> HarvestResult<(ExecutionId, ShardId)> {
     resolve_live_attempt(conn, pool, held_shard, exec_id)
         .await
-        .map(|e| ExecutionId::from_uuid(e.id))
-}
-
-/// [`walk_retry_chain`], for a caller with no [`ShardedDbPool`] of its own to
-/// pass in (issue #1596 review).
-///
-/// Signal delivery and in-process update admission are public entry points.
-/// Their `conn` is supplied by application code generated at compile time by
-/// `autumn-harvest-macros`. Their signature predates sharding, and cannot
-/// grow a pool parameter without breaking every generated caller. This
-/// recovers the two pieces of context [`walk_retry_chain`] needs from
-/// [`crate::shard::GLOBAL_SHARDED_POOL`] and
-/// [`crate::shard_rebalance::shard_of_held_row`] instead.
-///
-/// Either can come back empty. No sharded pool was ever installed: a
-/// single-shard embedder, or a test harness wired with a bare connection.
-/// Or `exec_id`'s row is not on this connection at all. Both cases fall
-/// back to walking on `conn` alone, exactly as this function's callers did
-/// before issue #1596. That is not a silent downgrade. With no pool to
-/// move it to, a retry successor cannot have been rebalanced anywhere. A
-/// stale `MIGRATED` stub can never be sitting in its place.
-///
-/// # Errors
-///
-/// See [`walk_retry_chain`].
-pub async fn walk_retry_chain_best_effort(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-) -> HarvestResult<Vec<WorkflowExecution>> {
-    let pool = crate::shard::GLOBAL_SHARDED_POOL
-        .read()
-        .ok()
-        .and_then(|p| p.clone());
-    let held_shard = if pool.is_some() {
-        crate::shard_rebalance::shard_of_held_row(conn, exec_id).await
-    } else {
-        None
-    };
-    if let (Some(pool), Some(held_shard)) = (pool, held_shard) {
-        return walk_retry_chain(conn, &pool, held_shard, exec_id).await;
-    }
-    walk_retry_chain_on_conn_only(conn, exec_id).await
+        .map(|(e, shard)| (ExecutionId::from_uuid(e.id), shard))
 }
 
 /// The pre-#1596 walk: every hop read on `conn` alone, with no residence
-/// check. This is [`walk_retry_chain_best_effort`]'s fallback when it cannot
-/// recover a [`ShardedDbPool`] or a held shard for `exec_id`.
+/// check. This is [`resolve_live_attempt_id_best_effort`]'s fallback when it
+/// cannot recover a [`ShardedDbPool`] or a held shard for `exec_id`.
 ///
 /// # Errors
 ///
@@ -3899,8 +3888,40 @@ async fn walk_retry_chain_on_conn_only(
     })
 }
 
+/// A connection this call checked out itself, for a caller of
+/// [`resolve_live_attempt_id_best_effort`] to use for every follow-up
+/// operation against the resolved live attempt.
+pub type BestEffortRebind =
+    Box<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>>;
+
 /// [`resolve_live_attempt_id`], for a caller with no [`ShardedDbPool`] of its
-/// own. See [`walk_retry_chain_best_effort`].
+/// own to pass in (issue #1596 review).
+///
+/// Signal delivery and in-process update admission are public entry points.
+/// Their `conn` is supplied by application code generated at compile time by
+/// `autumn-harvest-macros`. Their signature predates sharding, and cannot
+/// grow a pool parameter without breaking every generated caller. This
+/// recovers the pieces of context [`resolve_live_attempt_id`] needs from
+/// [`crate::shard::GLOBAL_SHARDED_POOL`] and
+/// [`crate::shard_rebalance::shard_of_held_row`] instead.
+///
+/// Also returns a connection for the caller to run every follow-up
+/// operation against the resolved live attempt through (issue #1596
+/// follow-up review, comment 4052389744). Resolving the id alone is not
+/// enough. A hop the walk follows internally can land on a different shard
+/// than `conn`. Reusing `conn` for the follow-up would then silently
+/// operate on the wrong database. That is the same class of bug the
+/// retry-chain walker itself was fixed for, one layer up.
+///
+/// The returned connection is `Some` fresh checkout exactly when the live
+/// attempt's shard differs from `conn`'s own. It is `None` in every other
+/// case, meaning `conn` itself is already correct. Three cases give `None`.
+/// No sharded pool was ever installed: a single-shard embedder, or a test
+/// harness wired with a bare connection. Or `exec_id`'s row is not on this
+/// connection at all. Or the live attempt never left `conn`'s shard. The
+/// first two fall back to walking on `conn` alone, exactly as this function
+/// did before issue #1596. That is not a silent downgrade. With no pool to
+/// move it to, a retry successor cannot have been rebalanced anywhere.
 ///
 /// # Errors
 ///
@@ -3908,14 +3929,73 @@ async fn walk_retry_chain_on_conn_only(
 pub async fn resolve_live_attempt_id_best_effort(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-) -> HarvestResult<ExecutionId> {
-    let mut chain = walk_retry_chain_best_effort(conn, exec_id).await?;
-    Ok(ExecutionId::from_uuid(
-        chain
-            .pop()
-            .expect("walk_retry_chain_best_effort always returns at least the addressed row")
-            .id,
-    ))
+) -> HarvestResult<(ExecutionId, Option<BestEffortRebind>)> {
+    let pool = crate::shard::GLOBAL_SHARDED_POOL
+        .read()
+        .ok()
+        .and_then(|p| p.clone());
+    let held_shard = match &pool {
+        Some(_) => crate::shard_rebalance::shard_of_held_row(conn, exec_id).await,
+        None => None,
+    };
+    let Some((pool, held_shard)) = pool.zip(held_shard) else {
+        let chain = walk_retry_chain_on_conn_only(conn, exec_id).await?;
+        let target = chain
+            .last()
+            .expect("walk_retry_chain_on_conn_only always returns at least the addressed row")
+            .id;
+        return Ok((ExecutionId::from_uuid(target), None));
+    };
+    let (target, target_shard) = resolve_live_attempt_id(conn, &pool, held_shard, exec_id).await?;
+    if target_shard == held_shard || pool.same_physical_pool(target_shard, held_shard) {
+        return Ok((target, None));
+    }
+    let fresh = crate::shard_rebalance::conn_for_shard(&pool, target_shard).await?;
+    Ok((target, Some(Box::new(fresh))))
+}
+
+/// Bind to `exec_id`'s own shard for a caller with no [`ShardedDbPool`] of
+/// its own (issue #1596 follow-up review, comment 4052389744).
+///
+/// This is the building block [`resolve_live_attempt_id_best_effort`] uses
+/// for the id it resolves. It is exposed here for a caller that already has
+/// an `ExecutionId` in hand. That caller only needs to make sure `conn` is
+/// actually positioned on it.
+///
+/// `send_signal_from_resolved` is the motivating case. It can be called
+/// with a `resolved` id a caller obtained independently: the management
+/// API's own pool-aware resolve. So `conn` is not guaranteed to be bound to
+/// it the way a fresh [`resolve_live_attempt_id_best_effort`] call would
+/// guarantee for ITS OWN result.
+///
+/// Returns `None` when `conn` is already correct: no sharded pool was ever
+/// installed, or `exec_id`'s row is already visible on `conn`. Returns
+/// `Some` freshly checked-out connection, resolved through `exec_id`'s own
+/// forwarding chain, otherwise.
+///
+/// # Errors
+///
+/// [`HarvestError::ShardUnavailable`] when `exec_id`'s live shard cannot be
+/// reached from this node.
+pub async fn bind_to_shard_best_effort(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Option<BestEffortRebind>> {
+    let Some(pool) = crate::shard::GLOBAL_SHARDED_POOL
+        .read()
+        .ok()
+        .and_then(|p| p.clone())
+    else {
+        return Ok(None);
+    };
+    if crate::shard_rebalance::shard_of_held_row(conn, exec_id)
+        .await
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let fresh = crate::shard_rebalance::conn_for_execution_forwarded(&pool, exec_id).await?;
+    Ok(Some(Box::new(fresh)))
 }
 
 /// Load one execution row by id.
@@ -3976,28 +4056,47 @@ pub const fn redrive_target(acted_on: ExecutionId, freshly_resolved: ExecutionId
 /// [`HarvestError::Config`] when the resolved live attempt is already terminal
 /// (an exhausted chain), and [`HarvestError::Database`] for persistence
 /// failures.
+///
+/// `conn` is supplied by the caller. This function's signature predates
+/// sharding. It is a public part of the crate's API surface. A direct
+/// embedder can call it with a bare connection, so its shard is not known
+/// here. [`resolve_live_attempt_id_best_effort`] (issue #1596 review;
+/// follow-up review, comment 4052389744) recovers it from the row itself.
+/// It binds every hop it resolves to that hop's own real shard before the
+/// cancel runs against it. Resolving the id alone is not enough when the
+/// live attempt has moved, because `conn` itself does not move with it.
 pub async fn cancel_live_attempt(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     reason: &str,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<CancelledWorkflowExecution> {
-    let mut target = resolve_live_attempt_id_best_effort(conn, exec_id).await?;
+    let (mut target, mut rebind) = resolve_live_attempt_id_best_effort(conn, exec_id).await?;
     for _ in 0..RETRY_CHAIN_MAX_REDRIVES {
-        match cancel_workflow_execution(conn, target, reason, metrics).await {
+        let active: &mut AsyncPgConnection = match &mut rebind {
+            Some(fresh) => fresh,
+            None => conn,
+        };
+        let result = cancel_workflow_execution(active, target, reason, metrics).await;
+        match result {
             Ok(result) => return Ok(result),
             Err(error) => {
-                let fresh = resolve_live_attempt_id_best_effort(conn, exec_id)
+                let (fresh, fresh_rebind) = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
-                    .unwrap_or(target);
+                    .unwrap_or((target, None));
                 if !redrive_target(target, fresh) {
                     return Err(error);
                 }
                 target = fresh;
+                rebind = fresh_rebind;
             }
         }
     }
-    cancel_workflow_execution(conn, target, reason, metrics).await
+    let active: &mut AsyncPgConnection = match &mut rebind {
+        Some(fresh) => fresh,
+        None => conn,
+    };
+    cancel_workflow_execution(active, target, reason, metrics).await
 }
 
 /// Terminate the **live attempt** of the logical run named by `exec_id` (#843).
@@ -4017,15 +4116,27 @@ pub async fn cancel_live_attempt(
 ///
 /// Returns [`HarvestError::NotFound`] when the execution does not exist and
 /// [`HarvestError::Database`] for persistence failures.
+///
+/// `conn` is supplied by the caller. This function's signature predates
+/// sharding, so its shard is not known here.
+/// [`resolve_live_attempt_id_best_effort`] (issue #1596 review; follow-up
+/// review, comment 4052389744) recovers it from the row itself. It binds
+/// every hop it resolves to that hop's own real shard before the terminate
+/// runs against it.
 pub async fn terminate_live_attempt(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     reason: &str,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<CancelledWorkflowExecution> {
-    let mut target = resolve_live_attempt_id_best_effort(conn, exec_id).await?;
+    let (mut target, mut rebind) = resolve_live_attempt_id_best_effort(conn, exec_id).await?;
     for _ in 0..RETRY_CHAIN_MAX_REDRIVES {
-        match terminate_workflow_execution(conn, target, reason, metrics).await {
+        let active: &mut AsyncPgConnection = match &mut rebind {
+            Some(fresh) => fresh,
+            None => conn,
+        };
+        let result = terminate_workflow_execution(active, target, reason, metrics).await;
+        match result {
             // A genuine seal, or an idempotent no-op against a row that is
             // terminal for a reason OTHER than a retryable failure, is the
             // final answer. Only a no-op against a `FAILED` row can mean the
@@ -4034,26 +4145,32 @@ pub async fn terminate_live_attempt(
                 return Ok(result);
             }
             Ok(result) => {
-                let fresh = resolve_live_attempt_id_best_effort(conn, exec_id)
+                let (fresh, fresh_rebind) = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
-                    .unwrap_or(target);
+                    .unwrap_or((target, None));
                 if !redrive_target(target, fresh) {
                     return Ok(result);
                 }
                 target = fresh;
+                rebind = fresh_rebind;
             }
             Err(error) => {
-                let fresh = resolve_live_attempt_id_best_effort(conn, exec_id)
+                let (fresh, fresh_rebind) = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
-                    .unwrap_or(target);
+                    .unwrap_or((target, None));
                 if !redrive_target(target, fresh) {
                     return Err(error);
                 }
                 target = fresh;
+                rebind = fresh_rebind;
             }
         }
     }
-    terminate_workflow_execution(conn, target, reason, metrics).await
+    let active: &mut AsyncPgConnection = match &mut rebind {
+        Some(fresh) => fresh,
+        None => conn,
+    };
+    terminate_workflow_execution(active, target, reason, metrics).await
 }
 
 /// Pause the **live attempt** of the logical run named by `exec_id` (#843).
@@ -4072,6 +4189,13 @@ pub async fn terminate_live_attempt(
 /// Returns [`HarvestError::NotFound`] when the execution does not exist,
 /// [`HarvestError::Config`] when the resolved live attempt is terminal (an
 /// exhausted chain), and [`HarvestError::Database`] for persistence failures.
+///
+/// `conn` is supplied by the caller. This function's signature predates
+/// sharding, so its shard is not known here.
+/// [`resolve_live_attempt_id_best_effort`] (issue #1596 review; follow-up
+/// review, comment 4052389744) recovers it from the row itself. It binds
+/// every hop it resolves to that hop's own real shard before the pause
+/// runs against it.
 pub async fn pause_live_attempt(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -4079,22 +4203,32 @@ pub async fn pause_live_attempt(
     actor: &str,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<PausedWorkflowExecution> {
-    let mut target = resolve_live_attempt_id_best_effort(conn, exec_id).await?;
+    let (mut target, mut rebind) = resolve_live_attempt_id_best_effort(conn, exec_id).await?;
     for _ in 0..RETRY_CHAIN_MAX_REDRIVES {
-        match pause_workflow_execution(conn, target, reason, actor, metrics).await {
+        let active: &mut AsyncPgConnection = match &mut rebind {
+            Some(fresh) => fresh,
+            None => conn,
+        };
+        let result = pause_workflow_execution(active, target, reason, actor, metrics).await;
+        match result {
             Ok(result) => return Ok(result),
             Err(error) => {
-                let fresh = resolve_live_attempt_id_best_effort(conn, exec_id)
+                let (fresh, fresh_rebind) = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
-                    .unwrap_or(target);
+                    .unwrap_or((target, None));
                 if !redrive_target(target, fresh) {
                     return Err(error);
                 }
                 target = fresh;
+                rebind = fresh_rebind;
             }
         }
     }
-    pause_workflow_execution(conn, target, reason, actor, metrics).await
+    let active: &mut AsyncPgConnection = match &mut rebind {
+        Some(fresh) => fresh,
+        None => conn,
+    };
+    pause_workflow_execution(active, target, reason, actor, metrics).await
 }
 
 /// Resume the **live attempt** of the logical run named by `exec_id` (#843).
@@ -4113,39 +4247,57 @@ pub async fn pause_live_attempt(
 ///
 /// Returns [`HarvestError::NotFound`] when the execution does not exist and
 /// [`HarvestError::Database`] for persistence failures.
+///
+/// `conn` is supplied by the caller. This function's signature predates
+/// sharding, so its shard is not known here.
+/// [`resolve_live_attempt_id_best_effort`] (issue #1596 review; follow-up
+/// review, comment 4052389744) recovers it from the row itself. It binds
+/// every hop it resolves to that hop's own real shard before the resume
+/// runs against it.
 pub async fn resume_live_attempt(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     actor: &str,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<ResumedWorkflowExecution> {
-    let mut target = resolve_live_attempt_id_best_effort(conn, exec_id).await?;
+    let (mut target, mut rebind) = resolve_live_attempt_id_best_effort(conn, exec_id).await?;
     for _ in 0..RETRY_CHAIN_MAX_REDRIVES {
-        match resume_workflow_execution(conn, target, actor, metrics).await {
+        let active: &mut AsyncPgConnection = match &mut rebind {
+            Some(fresh) => fresh,
+            None => conn,
+        };
+        let result = resume_workflow_execution(active, target, actor, metrics).await;
+        match result {
             Ok(result) if result.newly_resumed || result.state != "FAILED" => {
                 return Ok(result);
             }
             Ok(result) => {
-                let fresh = resolve_live_attempt_id_best_effort(conn, exec_id)
+                let (fresh, fresh_rebind) = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
-                    .unwrap_or(target);
+                    .unwrap_or((target, None));
                 if !redrive_target(target, fresh) {
                     return Ok(result);
                 }
                 target = fresh;
+                rebind = fresh_rebind;
             }
             Err(error) => {
-                let fresh = resolve_live_attempt_id_best_effort(conn, exec_id)
+                let (fresh, fresh_rebind) = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
-                    .unwrap_or(target);
+                    .unwrap_or((target, None));
                 if !redrive_target(target, fresh) {
                     return Err(error);
                 }
                 target = fresh;
+                rebind = fresh_rebind;
             }
         }
     }
-    resume_workflow_execution(conn, target, actor, metrics).await
+    let active: &mut AsyncPgConnection = match &mut rebind {
+        Some(fresh) => fresh,
+        None => conn,
+    };
+    resume_workflow_execution(active, target, actor, metrics).await
 }
 
 /// Maximum length of an operator-supplied pause reason (issue #383).

@@ -6022,7 +6022,7 @@ async fn a_retry_successor_migrated_to_another_shard_still_resolves_to_its_live_
         .expect("resolve the predecessor's own residence");
     assert_eq!(shard, SOURCE, "the predecessor itself was never migrated");
 
-    let resolved = autumn_harvest::execution::resolve_live_attempt(
+    let (resolved, resolved_shard) = autumn_harvest::execution::resolve_live_attempt(
         &mut conn,
         &shards.pool,
         shard,
@@ -6041,13 +6041,18 @@ async fn a_retry_successor_migrated_to_another_shard_still_resolves_to_its_live_
         "the resolved row must be the successor's REAL state on its live shard \
          (TARGET), not the stale MIGRATED stub left behind on the origin (SOURCE)"
     );
+    assert_eq!(
+        resolved_shard, TARGET,
+        "resolve_live_attempt must also report WHERE the live attempt lives \
+         (issue #1596 follow-up review, comment 4052389744), not just its row"
+    );
 
     // The id-only and full-chain variants built on the same walker must agree.
     let (mut id_conn, id_shard) =
         conn_for_execution_forwarded_with_shard(&shards.pool, predecessor)
             .await
             .expect("resolve the predecessor's own residence");
-    let resolved_id = autumn_harvest::execution::resolve_live_attempt_id(
+    let (resolved_id, resolved_id_shard) = autumn_harvest::execution::resolve_live_attempt_id(
         &mut id_conn,
         &shards.pool,
         id_shard,
@@ -6056,6 +6061,7 @@ async fn a_retry_successor_migrated_to_another_shard_still_resolves_to_its_live_
     .await
     .expect("resolve_live_attempt_id must also follow the successor across shards");
     assert_eq!(resolved_id.as_uuid(), successor.as_uuid());
+    assert_eq!(resolved_id_shard, TARGET);
 
     let (mut chain_conn, chain_shard) =
         conn_for_execution_forwarded_with_shard(&shards.pool, predecessor)
@@ -6071,7 +6077,119 @@ async fn a_retry_successor_migrated_to_another_shard_still_resolves_to_its_live_
     .expect("retry_chain_ids must also follow the successor across shards");
     assert_eq!(
         chain,
-        vec![predecessor, successor],
-        "the chain must list the predecessor then the migrated successor, in order"
+        vec![(predecessor, SOURCE), (successor, TARGET)],
+        "the chain must list the predecessor then the migrated successor, in \
+         order, each paired with the shard IT actually lives on"
+    );
+}
+
+/// Issue #1596 follow-up review (comment 4052389744): resolving a migrated
+/// hop correctly is not enough on its own. `resolve_live_attempt`, and the
+/// best-effort resolvers `cancel_live_attempt` etc. build on, read the
+/// successor's row through a connection this walk itself checks out
+/// internally. Returning only the row leaves the CALLER still holding its
+/// original connection. Before this fix, a mutating follow-up such as
+/// `cancel_live_attempt` re-resolved the same correct id, then ran the
+/// actual cancel through that stale original connection. That connection
+/// still pointed at the successor's origin-side `MIGRATED` seal, not its
+/// live copy. This pins the fix for the write path: the cancel must
+/// actually land on the live copy on its real (migrated-to) shard.
+#[tokio::test]
+async fn a_cancel_against_a_migrated_retry_successor_reaches_its_live_shard() {
+    let shards = setup_two_shards().await;
+
+    let mut source = shards.source().await;
+    let predecessor = insert_execution(&mut source, "entity_flow", "cancel-then-migrate").await;
+    append_history(&mut source, predecessor, &[started(json!({"seed": 1}))]).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(predecessor.as_uuid())
+    .execute(&mut source)
+    .await
+    .expect("seal the predecessor FAILED");
+
+    // Distinct `workflow_id` sidesteps the active-uniqueness partial index
+    // (see the read-path test above for why that is not a gap here either).
+    let successor = insert_execution_with_id(
+        &mut source,
+        "entity_flow",
+        "cancel-then-migrate-successor",
+        ExecutionId::new_for_shard(SOURCE),
+        SOURCE,
+    )
+    .await;
+    diesel::sql_query("UPDATE harvest_workflow_executions SET retry_of_exec_id = $1 WHERE id = $2")
+        .bind::<diesel::sql_types::Uuid, _>(predecessor.as_uuid())
+        .bind::<diesel::sql_types::Uuid, _>(successor.as_uuid())
+        .execute(&mut source)
+        .await
+        .expect("link the successor to its predecessor");
+    append_history(
+        &mut source,
+        successor,
+        &[
+            started(json!({"seed": 1})),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("wake"),
+                duration_secs: 604_800,
+            },
+        ],
+    )
+    .await;
+    park_on_timer(&mut source, successor).await;
+    drop(source);
+
+    let outcome = migrate_execution(&shards.pool, successor, SOURCE, TARGET, &codecs())
+        .await
+        .expect("the successor's migration must not error");
+    assert!(
+        matches!(outcome, MigrationOutcome::Migrated { .. }),
+        "expected the successor's migration to complete, got {outcome:?}"
+    );
+
+    // Exactly what a caller holding only the ORIGINAL (predecessor) id would
+    // do: resolve a connection for ITS residence alone. `cancel_live_attempt`
+    // must not simply reuse this connection for whatever hop it resolves to.
+    let (mut conn, _predecessor_shard) =
+        conn_for_execution_forwarded_with_shard(&shards.pool, predecessor)
+            .await
+            .expect("resolve the predecessor's own residence");
+
+    let cancel_result = autumn_harvest::execution::cancel_live_attempt(
+        &mut conn,
+        predecessor,
+        "operator requested",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect(
+        "cancel must reach the live successor on its migrated-to shard, not fail \
+         against a connection still pointed at the origin-side MIGRATED seal",
+    );
+
+    assert_eq!(
+        cancel_result.exec_id, successor,
+        "the cancel must report the live successor as what it actually cancelled"
+    );
+    assert!(
+        cancel_result.newly_cancelled,
+        "the successor must be newly cancelled, not found already-terminal"
+    );
+
+    // The authoritative check: the LIVE copy on TARGET, not the origin-side
+    // seal on SOURCE, must be the one actually sealed CANCELLED.
+    let mut target = shards.target().await;
+    assert_eq!(
+        state_of(&mut target, successor).await.as_deref(),
+        Some("CANCELLED"),
+        "the cancel must land on the successor's live copy on its real shard (TARGET)"
+    );
+    let mut source = shards.source().await;
+    assert_eq!(
+        state_of(&mut source, successor).await.as_deref(),
+        Some("MIGRATED"),
+        "the origin-side seal on SOURCE must be untouched by the cancel"
     );
 }

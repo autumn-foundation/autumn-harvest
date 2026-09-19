@@ -270,7 +270,13 @@ pub async fn send_signal_to_live_attempt(
     // sharding), so its shard is not known here. `resolve_live_attempt_id_best_effort`
     // (issue #1596 review) recovers it from the row itself rather than
     // trusting a retry successor's stale `MIGRATED` stub across a rebalance.
-    let target = crate::execution::resolve_live_attempt_id_best_effort(conn, exec_id).await?;
+    //
+    // `send_signal_from_resolved` binds to `target`'s own shard itself
+    // (issue #1596 follow-up review, comment 4052389744). Passing `conn`
+    // through unchanged here is correct even when the resolve above hopped
+    // to a different shard than `conn` currently holds.
+    let (target, _rebind) =
+        crate::execution::resolve_live_attempt_id_best_effort(conn, exec_id).await?;
     send_signal_from_resolved(conn, exec_id, target, signal_name, payload, idempotency_key).await
 }
 
@@ -284,6 +290,16 @@ pub async fn send_signal_to_live_attempt(
 /// the resolved row's `workflow_name` — uses this so one request performs one
 /// chain walk instead of two, and so the row it validated against is provably
 /// the row it delivers to.
+///
+/// `resolved` may have been resolved by a caller that holds no
+/// [`crate::shard::ShardedDbPool`] of its own. This function's `conn`-only
+/// signature is unchanged since before sharding. Or it may come from a
+/// caller that does hold one, such as the management API. Either way,
+/// `conn` is not guaranteed to already be bound to `resolved`'s own shard
+/// (issue #1596 follow-up review, comment 4052389744). This function binds
+/// to it itself, rather than trusting the caller to have done so. A hop
+/// that moved shards mid-resolution leaves `conn` on the ORIGINAL shard,
+/// not the resolved one.
 ///
 /// # Errors
 ///
@@ -299,9 +315,20 @@ pub async fn send_signal_from_resolved(
 ) -> HarvestResult<RoutedSignalDelivery> {
     let exec_id = logical_exec_id;
     let mut target = resolved;
+    let mut rebind = crate::execution::bind_to_shard_best_effort(conn, target).await?;
     for _ in 0..crate::execution::RETRY_CHAIN_MAX_REDRIVES {
-        match send_signal_idempotent(conn, target, signal_name, payload.clone(), idempotency_key)
-            .await
+        let active: &mut AsyncPgConnection = match &mut rebind {
+            Some(fresh) => fresh,
+            None => conn,
+        };
+        match send_signal_idempotent(
+            active,
+            target,
+            signal_name,
+            payload.clone(),
+            idempotency_key,
+        )
+        .await
         {
             // A fresh insert is final: it landed on the attempt we resolved.
             Ok(true) => {
@@ -315,9 +342,11 @@ pub async fn send_signal_from_resolved(
             // sealed `FAILED` — swallowing a re-send the live attempt still
             // needs. Nothing was queued, so re-driving cannot double-deliver.
             Ok(false) => {
-                let fresh = crate::execution::resolve_live_attempt_id_best_effort(conn, exec_id)
-                    .await
-                    .unwrap_or(target);
+                drop(rebind);
+                let (fresh, fresh_rebind) =
+                    crate::execution::resolve_live_attempt_id_best_effort(conn, exec_id)
+                        .await
+                        .unwrap_or((target, None));
                 if !crate::execution::redrive_target(target, fresh) {
                     return Ok(RoutedSignalDelivery {
                         target,
@@ -325,22 +354,30 @@ pub async fn send_signal_from_resolved(
                     });
                 }
                 target = fresh;
+                rebind = fresh_rebind;
             }
             Err(error) => {
                 // The delivery was rolled back, so re-driving is safe: it can
                 // never double-deliver a signal that was actually queued.
-                let fresh = crate::execution::resolve_live_attempt_id_best_effort(conn, exec_id)
-                    .await
-                    .unwrap_or(target);
+                drop(rebind);
+                let (fresh, fresh_rebind) =
+                    crate::execution::resolve_live_attempt_id_best_effort(conn, exec_id)
+                        .await
+                        .unwrap_or((target, None));
                 if !crate::execution::redrive_target(target, fresh) {
                     return Err(error);
                 }
                 target = fresh;
+                rebind = fresh_rebind;
             }
         }
     }
+    let active: &mut AsyncPgConnection = match &mut rebind {
+        Some(fresh) => fresh,
+        None => conn,
+    };
     let delivered =
-        send_signal_idempotent(conn, target, signal_name, payload, idempotency_key).await?;
+        send_signal_idempotent(active, target, signal_name, payload, idempotency_key).await?;
     Ok(RoutedSignalDelivery { target, delivered })
 }
 

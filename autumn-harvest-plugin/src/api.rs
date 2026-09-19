@@ -11292,8 +11292,15 @@ async fn load_execution_following_retries(
     let (mut conn, shard) = db_conn_for_execution_with_shard(api_state, exec_id)
         .await
         .map_err(|e| HarvestError::Database(e.to_string()))?;
+    // Only the row is needed here (issue #1596 follow-up review, comment
+    // 4052389744). Every caller reads fields off it directly. A caller that
+    // must follow up against the resolved execution's own id resolves its
+    // own fresh connection for that id, instead of reusing this one. That
+    // fresh resolve already follows the id's own forwarding pointer
+    // correctly.
     autumn_harvest::execution::resolve_live_attempt(&mut conn, pool.sharded_pool(), shard, exec_id)
         .await
+        .map(|(execution, _shard)| execution)
 }
 
 /// Load the successor execution ID from a `WorkflowContinuedAsNew` event in
@@ -22387,6 +22394,10 @@ async fn cancel_workflow(
     // running — the sharpest correctness gap this routing closes. The response's
     // `execution_id` reports the attempt actually cancelled. For a workflow with
     // no retry policy this is exactly `cancel_workflow_execution`.
+    //
+    // `cancel_live_attempt` binds each resolved hop to its own real shard
+    // internally (issue #1596 follow-up review, comment 4052389744), rather
+    // than trusting `conn` to already be there.
     let cancel_result = autumn_harvest::execution::cancel_live_attempt(
         &mut conn,
         exec_id,
@@ -22528,6 +22539,9 @@ async fn terminate_workflow(
     let exec_id_str = exec_id.to_string();
 
     let metrics_ref = metrics_recorder_or_noop(&api_state);
+    // `terminate_live_attempt` binds each resolved hop to its own real shard
+    // internally (issue #1596 follow-up review, comment 4052389744), rather
+    // than trusting `conn` to already be there.
     let terminate_result = autumn_harvest::execution::terminate_live_attempt(
         &mut conn,
         exec_id,
@@ -23208,6 +23222,10 @@ async fn pause_workflow(
     // only accepts a `RUNNING`/`PAUSED` row, so an unrouted pause of a retried
     // run 409s against its sealed `FAILED` predecessor — denying the operator
     // the one reversible containment lever.
+    //
+    // `pause_live_attempt` binds each resolved hop to its own real shard
+    // internally (issue #1596 follow-up review, comment 4052389744), rather
+    // than trusting `conn` to already be there.
     let result = autumn_harvest::execution::pause_live_attempt(
         &mut conn,
         exec_id,
@@ -23280,6 +23298,10 @@ async fn resume_workflow(
     // an idempotent success no-op against a non-paused row, so an unrouted
     // resume of a retried run would report success while the paused live
     // attempt stayed parked.
+    //
+    // `resume_live_attempt` binds each resolved hop to its own real shard
+    // internally (issue #1596 follow-up review, comment 4052389744), rather
+    // than trusting `conn` to already be there.
     let result = autumn_harvest::execution::resume_live_attempt(
         &mut conn,
         exec_id,
@@ -25040,7 +25062,7 @@ pub(crate) async fn signal_workflow(
         Ok(pool) => pool,
         Err(e) => return map_error(e).into_response(),
     };
-    let execution = match autumn_harvest::execution::resolve_live_attempt(
+    let (execution, target_shard) = match autumn_harvest::execution::resolve_live_attempt(
         &mut conn,
         pool.sharded_pool(),
         shard,
@@ -25048,7 +25070,7 @@ pub(crate) async fn signal_workflow(
     )
     .await
     {
-        Ok(ex) => ex,
+        Ok(resolved) => resolved,
         Err(e) => {
             let err_str = e.to_string();
             let ar = NewAuditRecord {
@@ -25088,7 +25110,26 @@ pub(crate) async fn signal_workflow(
     // to validation + the `ON CONFLICT` insert. Skipped when no key is present,
     // so fresh + unkeyed deliveries are still fully validated before enqueue.
     if let Some(key) = idempotency_key.as_deref() {
-        match signal::signal_idempotency_key_exists(&mut conn, target, key).await {
+        // Issue #1596 follow-up review, comment 4052389744: `target` can
+        // live on a different shard than `conn`. `conn` is still resolved
+        // for the ORIGINAL `exec_id`, and the retry chain can hop shards
+        // mid-walk. Bind to `target`'s own shard before probing it, rather
+        // than reading whatever row happens to be on `conn`'s database.
+        let exists = {
+            let mut bound = match autumn_harvest::shard_rebalance::bind_to_shard(
+                &mut conn,
+                pool.sharded_pool(),
+                shard,
+                target_shard,
+            )
+            .await
+            {
+                Ok(b) => b,
+                Err(e) => return map_error(e).into_response(),
+            };
+            signal::signal_idempotency_key_exists(bound.as_mut(), target, key).await
+        };
+        match exists {
             Ok(true) => {
                 // Same success audit + response the normal on-conflict path
                 // writes when `send_signal_idempotent` returns `Ok(false)`.
@@ -25181,15 +25222,32 @@ pub(crate) async fn signal_workflow(
     // against, so hand it straight to the delivery rather than walking the chain
     // a second time (one full row load per hop, on the highest-volume mutating
     // route). A re-drive inside still re-resolves from `exec_id`.
-    let signal_result = signal::send_signal_from_resolved(
-        &mut conn,
-        exec_id,
-        target,
-        &signal_name,
-        payload,
-        idempotency_key.as_deref(),
-    )
-    .await;
+    //
+    // Bound to `target_shard`, not `conn` directly (issue #1596 follow-up
+    // review, comment 4052389744). Same reason as the idempotency-key probe
+    // above: `target` can have moved off `conn`'s own shard.
+    let signal_result = {
+        let mut bound = match autumn_harvest::shard_rebalance::bind_to_shard(
+            &mut conn,
+            pool.sharded_pool(),
+            shard,
+            target_shard,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => return map_error(e).into_response(),
+        };
+        signal::send_signal_from_resolved(
+            bound.as_mut(),
+            exec_id,
+            target,
+            &signal_name,
+            payload,
+            idempotency_key.as_deref(),
+        )
+        .await
+    };
 
     let (signal_delivered, delivered_to) = match signal_result {
         Ok(delivery) => (delivery.delivered, delivery.target),
@@ -25258,7 +25316,7 @@ async fn hydrate_ctx_for_query(
     // it from being rebalanced away afterwards (issue #1596 review).
     // `resolve_live_attempt` re-resolves residence at each hop, rather than
     // trusting `conn` to already own the whole chain.
-    let execution = autumn_harvest::execution::resolve_live_attempt(
+    let (execution, target_shard) = autumn_harvest::execution::resolve_live_attempt(
         &mut conn,
         pool.sharded_pool(),
         shard,
@@ -25267,6 +25325,17 @@ async fn hydrate_ctx_for_query(
     .await
     .map_err(map_error)?;
     let target = ExecutionId::from_uuid(execution.id);
+    // Bind to `target`'s own shard (issue #1596 follow-up review, comment
+    // 4052389744). A retry successor found mid-walk can itself have moved
+    // off `shard`. `conn` does not move there on its own.
+    let mut bound = autumn_harvest::shard_rebalance::bind_to_shard(
+        &mut conn,
+        pool.sharded_pool(),
+        shard,
+        target_shard,
+    )
+    .await
+    .map_err(map_error)?;
 
     // Terminal executions are now queryable for post-mortem state inspection
     // (issue #612): the workflow function is driven through replay and the query
@@ -25303,14 +25372,15 @@ async fn hydrate_ctx_for_query(
                 execution.workflow_name
             ))
         })?;
-    let history = store::load_history_with_codecs(&mut conn, target, &api_state.payload_codecs())
-        .await
-        .map_err(map_error)?;
+    let history =
+        store::load_history_with_codecs(bound.as_mut(), target, &api_state.payload_codecs())
+            .await
+            .map_err(map_error)?;
 
     // Drop the DB connection before driving user code — prevents holding a
     // pool slot during replay, which would starve other management and worker
     // DB operations for the entire duration of the workflow replay.
-    drop(conn);
+    drop(bound);
 
     // Whether the recorded history reached a terminal seal (issue #612). A run
     // the engine seals while its function is parked mid-command (TIMED_OUT,
@@ -46010,7 +46080,7 @@ pub(crate) async fn admit_update(
         Ok(pool) => pool,
         Err(e) => return map_error(e).into_response(),
     };
-    let resolved = match autumn_harvest::execution::resolve_live_attempt(
+    let (resolved, mut target_shard) = match autumn_harvest::execution::resolve_live_attempt(
         &mut conn,
         pool.sharded_pool(),
         shard,
@@ -46018,7 +46088,7 @@ pub(crate) async fn admit_update(
     )
     .await
     {
-        Ok(ex) => ex,
+        Ok(resolved) => resolved,
         Err(e) => return map_error(e).into_response(),
     };
     let mut target = ExecutionId::from_uuid(resolved.id);
@@ -46079,8 +46149,24 @@ pub(crate) async fn admit_update(
     // attempt. `admit_update_event` verifies RUNNING under the same FOR UPDATE
     // lock and rolls back on rejection, so a re-driven admit can never
     // double-admit.
-    let mut admit = store::admit_update_event_with_codecs(
+    //
+    // Bound to `target_shard`, not `conn` directly (issue #1596 follow-up
+    // review, comment 4052389744). The resolved attempt, and each
+    // re-drive's fresh one, can live on a different shard than `conn`.
+    // `conn` stays on `exec_id`'s own shard throughout.
+    let mut bound = match autumn_harvest::shard_rebalance::bind_to_shard(
         &mut conn,
+        pool.sharded_pool(),
+        shard,
+        target_shard,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => return map_error(e).into_response(),
+    };
+    let mut admit = store::admit_update_event_with_codecs(
+        bound.as_mut(),
         target,
         update_id,
         update_name.clone(),
@@ -46091,20 +46177,33 @@ pub(crate) async fn admit_update(
     .await;
     for _ in 0..autumn_harvest::execution::RETRY_CHAIN_MAX_REDRIVES {
         let Err(error) = admit else { break };
-        let fresh = autumn_harvest::execution::resolve_live_attempt_id(
+        drop(bound);
+        let (fresh, fresh_shard) = autumn_harvest::execution::resolve_live_attempt_id(
             &mut conn,
             pool.sharded_pool(),
             shard,
             exec_id,
         )
         .await
-        .unwrap_or(target);
+        .unwrap_or((target, target_shard));
         if !autumn_harvest::execution::redrive_target(target, fresh) {
             return map_error(error).into_response();
         }
         target = fresh;
-        admit = store::admit_update_event_with_codecs(
+        target_shard = fresh_shard;
+        bound = match autumn_harvest::shard_rebalance::bind_to_shard(
             &mut conn,
+            pool.sharded_pool(),
+            shard,
+            target_shard,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => return map_error(e).into_response(),
+        };
+        admit = store::admit_update_event_with_codecs(
+            bound.as_mut(),
             target,
             update_id,
             update_name.clone(),
@@ -46119,7 +46218,7 @@ pub(crate) async fn admit_update(
     }
 
     // Wake the workflow worker so it picks up the new admitted update.
-    if let Err(e) = queue::wake_workflow_task(&mut conn, target).await {
+    if let Err(e) = queue::wake_workflow_task(bound.as_mut(), target).await {
         return map_error(e).into_response();
     }
 
@@ -46346,9 +46445,24 @@ async fn get_update_result(
         Err(e) => return map_error(e).into_response(),
     };
     let mut found = None;
-    for candidate in chain.into_iter().rev() {
-        let history = match store::load_history_with_codecs(
+    for (candidate, candidate_shard) in chain.into_iter().rev() {
+        // Bound to THIS candidate's own shard (issue #1596 follow-up
+        // review, comment 4052389744). Different links of the chain can
+        // live on different shards. `conn` is fixed on `shard`, `exec_id`'s
+        // own, and does not follow any of them on its own.
+        let mut bound = match autumn_harvest::shard_rebalance::bind_to_shard(
             &mut conn,
+            pool.sharded_pool(),
+            shard,
+            candidate_shard,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => return map_error(e).into_response(),
+        };
+        let history = match store::load_history_with_codecs(
+            bound.as_mut(),
             candidate,
             &api_state.payload_codecs(),
         )
@@ -46360,20 +46474,34 @@ async fn get_update_result(
         if history.events.iter().any(
             |ev| matches!(ev, WorkflowEvent::UpdateAdmitted { update_id: id, .. } if *id == update_id),
         ) {
-            found = Some((candidate, history));
+            found = Some((candidate, candidate_shard, history));
             break;
         }
     }
-    let Some((target, history)) = found else {
+    let Some((target, target_shard, history)) = found else {
         return AutumnError::not_found_msg(format!("update {update_id_str}")).into_response();
     };
 
     let mut terminal_state = get_terminal_workflow_state(&history.events);
+    // Bound to `target`'s own shard, not `conn` directly (issue #1596
+    // follow-up review, comment 4052389744). `target` is the chain member
+    // found above. It may not be `exec_id` itself.
+    let mut bound = match autumn_harvest::shard_rebalance::bind_to_shard(
+        &mut conn,
+        pool.sharded_pool(),
+        shard,
+        target_shard,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => return map_error(e).into_response(),
+    };
     if (terminal_state == Some("CANCELLED") || terminal_state == Some("FAILED"))
         && let Ok(Some(db_state)) = harvest_workflow_executions::table
             .find(target.as_uuid())
             .select(harvest_workflow_executions::state)
-            .first::<String>(&mut conn)
+            .first::<String>(bound.as_mut())
             .await
             .optional()
     {

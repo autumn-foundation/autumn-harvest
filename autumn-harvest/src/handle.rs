@@ -2185,6 +2185,14 @@ impl WorkflowHandle {
             self.exec_id,
         )
         .await?;
+        // Only the row is needed here (issue #1596 follow-up review, comment
+        // 4052389744). Every caller of this method reads fields off the
+        // returned `WorkflowExecution` directly. None reuses a connection
+        // carried over from this resolution. A caller that DOES need to
+        // follow up against the resolved execution, such as
+        // `execute_query_in_process` below, re-resolves its own connection
+        // for that execution's own id. That re-resolve already follows ITS
+        // forwarding pointer correctly.
         crate::execution::resolve_live_attempt(
             &mut conn,
             &self.client.inner.pools,
@@ -2192,6 +2200,7 @@ impl WorkflowHandle {
             self.exec_id,
         )
         .await
+        .map(|(execution, _shard)| execution)
     }
 
     /// Execute a registered query handler in-process by replaying event history.
@@ -2376,11 +2385,24 @@ impl WorkflowHandle {
         //
         // `conn` is supplied by the caller (generated typed-update code
         // predating sharding), so its shard is not known here the way
-        // `load_effective_execution` knows its own. `resolve_live_attempt_id_best_effort`
-        // (issue #1596 review) recovers it from the row itself instead.
-        let mut target =
-            crate::execution::resolve_live_attempt_id_best_effort(conn, self.exec_id).await?;
-        self.validate_workflow_type_for(conn, target, workflow_name)
+        // `load_effective_execution` knows its own. `shard_of_held_row`
+        // recovers it from the row itself. It falls back to `self.exec_id`'s
+        // own encoded shard (the pre-#964 behavior) when the row is not
+        // visible on `conn` at all.
+        //
+        // Every follow-up operation below runs through `bound`, not `conn`
+        // directly (issue #1596 follow-up review, comment 4052389744). The
+        // resolved live attempt can live on a different shard than `conn`.
+        // `conn` itself does not move there on its own.
+        let pool = &self.client.inner.pools;
+        let held_shard = crate::shard_rebalance::shard_of_held_row(conn, self.exec_id)
+            .await
+            .unwrap_or_else(|| self.exec_id.shard());
+        let (mut target, mut target_shard) =
+            crate::execution::resolve_live_attempt_id(conn, pool, held_shard, self.exec_id).await?;
+        let mut bound =
+            crate::shard_rebalance::bind_to_shard(conn, pool, held_shard, target_shard).await?;
+        self.validate_workflow_type_for(bound.as_mut(), target, workflow_name)
             .await?;
         let update_id = crate::types::UpdateId::new();
         // Issue #684: emit harvest.update.admitted post-commit for the in-process
@@ -2389,7 +2411,7 @@ impl WorkflowHandle {
         // without recording admitted would leave this path asymmetric. The
         // recorder defaults to a no-op when the client was built without one.
         let mut admit = crate::store::admit_update_event_with_codecs(
-            conn,
+            bound.as_mut(),
             target,
             update_id,
             name.to_string(),
@@ -2400,17 +2422,22 @@ impl WorkflowHandle {
         .await;
         for _ in 0..crate::execution::RETRY_CHAIN_MAX_REDRIVES {
             let Err(error) = admit else { break };
-            let fresh = crate::execution::resolve_live_attempt_id_best_effort(conn, self.exec_id)
-                .await
-                .unwrap_or(target);
+            drop(bound);
+            let (fresh, fresh_shard) =
+                crate::execution::resolve_live_attempt_id(conn, pool, held_shard, self.exec_id)
+                    .await
+                    .unwrap_or((target, target_shard));
             if !crate::execution::redrive_target(target, fresh) {
                 return Err(error);
             }
             target = fresh;
-            self.validate_workflow_type_for(conn, target, workflow_name)
+            target_shard = fresh_shard;
+            bound =
+                crate::shard_rebalance::bind_to_shard(conn, pool, held_shard, target_shard).await?;
+            self.validate_workflow_type_for(bound.as_mut(), target, workflow_name)
                 .await?;
             admit = crate::store::admit_update_event_with_codecs(
-                conn,
+                bound.as_mut(),
                 target,
                 update_id,
                 name.to_string(),
@@ -2421,14 +2448,14 @@ impl WorkflowHandle {
             .await;
         }
         admit?;
-        crate::queue::wake_workflow_task(conn, target).await?;
+        crate::queue::wake_workflow_task(bound.as_mut(), target).await?;
         let start = Instant::now();
         let poll_interval = Duration::from_millis(100);
 
         loop {
             let result = {
                 let h = crate::store::load_history_with_codecs(
-                    conn,
+                    bound.as_mut(),
                     target,
                     &self.client.inner.payload_codecs,
                 )

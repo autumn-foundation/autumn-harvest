@@ -628,16 +628,16 @@ pub fn raw_history_fingerprint(raw: &serde_json::Value) -> String {
 
 #[cfg(feature = "db")]
 pub use db::{
-    MigrationBatchReport, MigrationOutcome, MigrationRecord, MigrationScanCursor,
+    MigrationBatchReport, MigrationOutcome, MigrationRecord, MigrationScanCursor, ResidentConn,
     SealReconciliationFailure, ShardMigrationCandidate, abort_migration, activate_target,
-    assert_schema_parity, begin_migration, commit_cutover, conn_for_execution_forwarded,
-    conn_for_execution_forwarded_with_shard, conn_for_live_shard, conn_for_shard,
-    forward_of_held_row, list_migration_candidates, load_migration, migrate_execution,
-    migrate_quiescent_executions, migrate_quiescent_executions_after, observe_quiescence,
-    reconcile_migrated_seal_terminality, reconcile_migrated_seals, reconcile_migrated_seals_after,
-    residence_chain, resolve_execution_shard, resolve_execution_shard_holding,
-    resolve_target_shard, resolve_target_shard_holding, resume_incomplete_migrations,
-    shard_of_held_row, stage_copy, verify_target_copy,
+    assert_schema_parity, begin_migration, bind_to_shard, commit_cutover,
+    conn_for_execution_forwarded, conn_for_execution_forwarded_with_shard, conn_for_live_shard,
+    conn_for_shard, forward_of_held_row, list_migration_candidates, load_migration,
+    migrate_execution, migrate_quiescent_executions, migrate_quiescent_executions_after,
+    observe_quiescence, reconcile_migrated_seal_terminality, reconcile_migrated_seals,
+    reconcile_migrated_seals_after, residence_chain, resolve_execution_shard,
+    resolve_execution_shard_holding, resolve_target_shard, resolve_target_shard_holding,
+    resume_incomplete_migrations, shard_of_held_row, stage_copy, verify_target_copy,
 };
 
 // This is `pub(crate)`, not part of the `pub use` block above (issue #1596
@@ -4114,6 +4114,67 @@ mod db {
         shard: ShardId,
     ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
         checkout(pool, shard).await
+    }
+
+    /// A connection actually bound to the shard a caller needs, produced by
+    /// [`bind_to_shard`].
+    ///
+    /// Resolving a live attempt's residence (issue #1596) tells a caller
+    /// WHICH shard it must operate on, but does not move the caller's own
+    /// connection there. `Held` is the connection the caller already had,
+    /// reused because it already lives on the target shard's physical pool.
+    /// `Fresh` is a connection this call checked out itself, because the
+    /// target shard is a genuinely different database. A caller must run
+    /// every follow-up query through [`ResidentConn::as_mut`]. It must never
+    /// go through its own original connection directly. The whole point is
+    /// that the two can differ.
+    pub enum ResidentConn<'a> {
+        Held(&'a mut AsyncPgConnection),
+        Fresh(Box<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>>),
+    }
+
+    impl AsMut<AsyncPgConnection> for ResidentConn<'_> {
+        fn as_mut(&mut self) -> &mut AsyncPgConnection {
+            match self {
+                Self::Held(conn) => conn,
+                Self::Fresh(conn) => conn,
+            }
+        }
+    }
+
+    /// Bind to `target_shard`, the shard a resolved execution actually lives
+    /// on (issue #1596 follow-up review, comment 4052389744).
+    ///
+    /// `resolve_live_attempt` (and its siblings) can discover, mid-walk,
+    /// that the execution a caller asked about now lives elsewhere. It may
+    /// sit on a different shard than the connection the caller already
+    /// holds. Returning only the resolved row left every caller still holding its ORIGINAL
+    /// connection. A follow-up read or write against the resolved execution
+    /// then silently ran against the wrong database whenever a hop had
+    /// moved. That is the same class of bug the retry-chain walker itself
+    /// was fixed for, one layer up.
+    ///
+    /// Reuses `held_conn` when `target_shard` shares its physical pool with
+    /// `held_shard`. That is the overwhelmingly common case, and it is
+    /// free. Otherwise checks out a fresh connection scoped to
+    /// `target_shard` via [`conn_for_shard`].
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError::ShardUnavailable`] when `target_shard` has no pool
+    /// configured on this node.
+    pub async fn bind_to_shard<'a>(
+        held_conn: &'a mut AsyncPgConnection,
+        pool: &ShardedDbPool,
+        held_shard: ShardId,
+        target_shard: ShardId,
+    ) -> HarvestResult<ResidentConn<'a>> {
+        if target_shard == held_shard || pool.same_physical_pool(target_shard, held_shard) {
+            return Ok(ResidentConn::Held(held_conn));
+        }
+        Ok(ResidentConn::Fresh(Box::new(
+            conn_for_shard(pool, target_shard).await?,
+        )))
     }
 
     /// Check out a connection for an execution's **live** residence.
