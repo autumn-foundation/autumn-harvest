@@ -103,8 +103,21 @@ TARGET_GLOBS = [
 # too — a blockquoted block's lines all carry "> ", which is Markdown syntax,
 # not part of the Rust source, and left in place would break every blockquoted
 # snippet's parse regardless of whether its actual code is valid.
-FENCE_OPEN_RE = re.compile(r"^([\s>]*)```rust(.*)$")
-FENCE_CLOSE_RE = re.compile(r"^[\s>]*```\s*$")
+#
+# LIST_MARKER additionally allows a fence to be the first block of a list
+# item, opening on the marker's own line ("- ```rust", "1. ```rust") rather
+# than on a line under it — valid CommonMark, and unlike the marker's own
+# text there is no per-line repeat of it to strip back out of content lines,
+# so those are left to the plain indentation-stripping case above.
+#
+# This is deliberately not a full CommonMark container parser (no nesting
+# beyond one list level, no lazy continuation lines) — this script trades
+# that for staying dependency-free: docs/audits/*.py runs with no network
+# access, so no markdown-parsing package can be installed to do this
+# properly, and a hand-rolled line scanner is what stays within that.
+LIST_MARKER = r"(?:[-*+]|\d+[.)])\s+"
+FENCE_OPEN_RE = re.compile(rf"^([\s>]*(?:{LIST_MARKER})?[\s>]*)```rust(.*)$")
+FENCE_CLOSE_RE = re.compile(rf"^[\s>]*(?:{LIST_MARKER})?[\s>]*```\s*$")
 
 # The only edition this corpus ever tells a reader to use: chapter 1's
 # Cargo.toml block pins `edition = "2021"` for the tutorial project every
