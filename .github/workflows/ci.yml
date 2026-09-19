@@ -444,6 +444,22 @@ jobs:
       - name: Folio audit-catalog coverage (docs/audits/audit-catalog-coverage.py)
         run: python3 docs/audits/audit-catalog-coverage.py
 
+      # Folio corpus harness: Rust syntax check for every ```rust fence in
+      # docs/getting-started/*.md and README.md (see
+      # docs/audits/doc-snippet-syntax.py). These are the front-door
+      # snippets — the fastest documented path promises "nothing to
+      # configure", and every later chapter's fenced block is something a
+      # reader on that path copies into their own editor. Uses only
+      # `rustfmt` (installed above via `components: rustfmt`), never
+      # `cargo`, so it costs a couple of seconds and needs no network or
+      # `target/`. It is a syntax check, not a compile check — see the
+      # script's own docstring for why that scope is deliberate. Exits 1
+      # only on a block that fails to parse and is not a documented
+      # fragment exception (a bare `.method(...)` continuation line, listed
+      # by name in the script).
+      - name: Folio doc-snippet syntax check (docs/audits/doc-snippet-syntax.py)
+        run: python3 docs/audits/doc-snippet-syntax.py
+
       # Comment hygiene across the Rust sources (see
       # docs/audits/comment-hygiene.py). Two tiers, and the split is the
       # point: Tier A (commented-out code, an unreferenced TODO, a narrative
