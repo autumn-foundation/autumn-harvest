@@ -9,22 +9,23 @@
 //! with a recent event", built once, then anti-joins by equality.
 //!
 //! The issue explicitly declined to propose this fix without first
-//! characterizing it against **two** workload shapes, because the new query
-//! scans `harvest_events` by timestamp fleet-wide instead of once per active
+//! characterizing it against **two** workload shapes. The new query scans
+//! `harvest_events` by timestamp fleet-wide instead of once per active
 //! execution:
 //!
 //! * **execution-heavy** — many active executions, few recent events per one
 //!   (the issue's own worst-case fixture: 3,000 active, ~1 recent event
 //!   each).
 //! * **event-write-heavy** — the same active-execution count, but each
-//!   healthy execution is far chattier (many recent events each), so the
+//!   healthy execution is far chattier (many recent events each). The
 //!   window `harvest_events` must scan is much larger relative to the
 //!   active-execution count.
 //!
-//! Both regimes share the same 50,000-row terminal-execution population (each
-//! with old, out-of-window events) as dead weight the state filter and the
-//! new index must both skip, and the same 30 true-positive stalled
-//! executions, so only the write-volume variable changes between them.
+//! Both regimes share the same 50,000-row terminal-execution population.
+//! Each terminal execution carries old, out-of-window events, as dead weight
+//! the state filter and the new index must both skip. Both regimes also
+//! share the same 30 true-positive stalled executions, so only the
+//! write-volume variable changes between them.
 //!
 //! This file is the evidence generator (`#[ignore]`d) plus a
 //! permanent correctness regression pinning the true-positive/healthy split
@@ -133,18 +134,20 @@ const HEALTHY_COUNT: i64 = 2_970;
 const STALLED_COUNT: i64 = 30;
 const WINDOW_MINUTES: i64 = 60;
 
-/// Seeds the shared fixture skeleton: `TERMINAL_COUNT` completed executions
-/// (each with 3 old events, well outside the window — a mature deployment's
-/// dead-weight history), `HEALTHY_COUNT` actively-progressing RUNNING
-/// executions (a pending task-queue row so they pass the OR-block, plus
-/// `events_per_healthy` recent events each), and `STALLED_COUNT` true
-/// positives (a single stale event, no other pending work, no timer at all —
-/// the worst case for the bounded LIMIT, matching issue #1643's own fixture).
+/// Seeds the shared fixture skeleton, in three populations.
+/// `TERMINAL_COUNT` completed executions each carry 3 old events, well
+/// outside the window — a mature deployment's dead-weight history.
+/// `HEALTHY_COUNT` actively-progressing RUNNING executions each carry a
+/// pending task-queue row, so they pass the OR-block, plus
+/// `events_per_healthy` recent events. `STALLED_COUNT` true positives each
+/// carry a single stale event, no other pending work, and no timer at all.
+/// This is the worst case for the bounded LIMIT, matching issue #1643's own
+/// fixture.
 ///
 /// `events_per_healthy` is the one variable that distinguishes the
-/// execution-heavy regime (1) from the event-write-heavy regime (100):
-/// everything else — active-execution count, OR-block shape, true-positive
-/// count — is held constant so only write volume changes between runs.
+/// execution-heavy regime (1) from the event-write-heavy regime (100).
+/// Everything else — active-execution count, OR-block shape, true-positive
+/// count — is held constant. Only write volume changes between runs.
 async fn seed_fixture(conn: &mut AsyncPgConnection, events_per_healthy: i64) {
     conn.batch_execute(&format!(
         "INSERT INTO harvest_workflow_executions (
@@ -265,9 +268,9 @@ async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec
     )
 }
 
-/// Identifies the `count_stalled_candidates` statement by a substring present
-/// in both the pre-#1643 and post-#1643 query text (the OR-block is
-/// untouched by the rewrite), so the same filter works for before/after
+/// Identifies the `count_stalled_candidates` statement by a substring
+/// present in both the pre-#1643 and post-#1643 query text. The OR-block is
+/// untouched by the rewrite, so the same filter works for before/after
 /// comparisons.
 fn is_stalled_candidates_statement(row: &StatRow) -> bool {
     let q = row.query.to_ascii_lowercase();
@@ -403,12 +406,12 @@ async fn capture_regime(
     )
     .expect("write pg_stat_statements artifact");
 
-    // A representative EXPLAIN (ANALYZE, BUFFERS) run with the same values
-    // `count_stalled_candidates` binds (60-minute window, cap =
-    // stalled_critical_count + 1 = 51), as literals rather than placeholders:
-    // `pg_stat_statements` jumbles every constant in `target_rows[0].query`
-    // (not just the two real bind parameters) into renumbered `$N`
-    // placeholders, so that text cannot be replayed directly.
+    // A representative EXPLAIN (ANALYZE, BUFFERS) run, using the same values
+    // `count_stalled_candidates` binds: a 60-minute window, cap =
+    // stalled_critical_count + 1 = 51. These values are literals, not
+    // placeholders. `pg_stat_statements` jumbles every constant in
+    // `target_rows[0].query`, not just the two real bind parameters, into
+    // renumbered `$N` placeholders. That text cannot be replayed directly.
     let explainable = literal_count_stalled_candidates_sql(WINDOW_MINUTES, 51);
     let explain_rows: Vec<ExplainRow> =
         diesel::sql_query(format!("EXPLAIN (ANALYZE, BUFFERS) {explainable}"))
@@ -433,9 +436,9 @@ async fn capture_regime(
 }
 
 /// Evidence generator: captures `count_stalled_candidates`'s buffer cost
-/// under both workload regimes against whatever query the working tree
-/// currently has (run once before the #1643 rewrite and once after, per
-/// `docs/performance-status-summary-stalled.md`'s reproduction steps).
+/// under both workload regimes, against whatever query the working tree
+/// currently has. Run once before the #1643 rewrite and once after, per
+/// `docs/performance-status-summary-stalled.md`'s reproduction steps.
 #[tokio::test]
 #[ignore = "evidence generator, not a CI assertion -- see \
             docs/performance-status-summary-stalled.md"]

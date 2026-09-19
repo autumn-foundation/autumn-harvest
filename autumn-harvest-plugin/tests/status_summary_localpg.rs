@@ -255,10 +255,10 @@ async fn seed_future_timer(url: &str, exec_id: Uuid) {
     .expect("seed future timer");
 }
 
-/// Insert a `harvest_events` row for `exec_id` at an explicit age, so a test
-/// can place an event just inside or just outside the no-progress window
-/// (issue #1643). `age_secs` is how many seconds before `NOW()` the event's
-/// `timestamp` is set to.
+/// Insert a `harvest_events` row for `exec_id` at an explicit age.
+/// A test can then place an event just inside or just outside the
+/// no-progress window (issue #1643). `age_secs` is how many seconds before
+/// `NOW()` the event's `timestamp` is set to.
 async fn seed_event_at_age(url: &str, exec_id: Uuid, event_id: i32, age_secs: i64) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
         .await
@@ -464,10 +464,12 @@ async fn admin_status_localpg_end_to_end() {
     // ── (f)-(i): issue #1643 rewrite coverage. `count_stalled_candidates`'s
     // "no recent event" check now reads a `MATERIALIZED` CTE instead of a
     // per-row correlated `NOT EXISTS`. These phases pin the boundary and
-    // multiplicity behavior the rewrite must preserve. Folded into this same
-    // test function (not a separate `#[tokio::test]`): every phase here
-    // resets and re-migrates the shared `postgres` database in place, so two
-    // test functions running concurrently would race on that reset.
+    // multiplicity behavior the rewrite must preserve.
+    //
+    // These phases are folded into this same test function, not a separate
+    // `#[tokio::test]`. Every phase here resets and re-migrates the shared
+    // `postgres` database in place. Two test functions running concurrently
+    // would race on that reset.
 
     // ── (f) a stale event, no other pending work: a true positive ───────────
     reset_and_migrate(&url).await;
@@ -514,9 +516,10 @@ async fn admin_status_localpg_end_to_end() {
     );
     eprintln!("PASS (h) just-outside-window: count={}", stalled["count"]);
 
-    // ── (i) an old event AND a fresh event on the same execution: the fresh
-    // one must be found regardless of how many older rows also exist (guards
-    // against a rewrite that only looks at one event per execution) ─────────
+    // ── (i) an old event AND a fresh event on the same execution ────────────
+    // The fresh one must be found regardless of how many older rows exist.
+    // This guards against a rewrite that looks at only one event per
+    // execution.
     reset_and_migrate(&url).await;
     let exec = seed_running_execution(&url, 0).await;
     seed_event_at_age(&url, exec, 0, WINDOW_SECS * 3).await; // 3 hours old
