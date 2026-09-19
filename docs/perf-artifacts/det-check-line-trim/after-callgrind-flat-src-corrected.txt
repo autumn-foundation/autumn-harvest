@@ -1,0 +1,857 @@
+--------------------------------------------------------------------------------
+Profile data file 'cg.out' (creator: callgrind-3.22.0)
+--------------------------------------------------------------------------------
+I1 cache: 
+D1 cache: 
+LL cache: 
+Timerange: Basic block 0 - 203101352
+Trigger: Program termination
+Profiled target:  /home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82 (PID 2054, part 1)
+Events recorded:  Ir
+Events shown:     Ir
+Event sort order: Ir
+Thresholds:       100
+Include dirs:     
+User annotated:   
+Auto-annotation:  on
+
+--------------------------------------------------------------------------------
+Ir                   
+--------------------------------------------------------------------------------
+643,931,960 (100.0%)  PROGRAM TOTALS
+
+--------------------------------------------------------------------------------
+Ir                    file:function
+--------------------------------------------------------------------------------
+150,051,802 (23.30%)  ???:autumn_harvest::det_check::extract_all_functions [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+103,790,727 (16.12%)  ???:autumn_harvest::det_check::strip_unparseable_content [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+102,879,606 (15.98%)  ???:autumn_harvest::det_check::next_char [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+ 42,758,011 ( 6.64%)  ???:core::slice::memchr::memchr_aligned [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+ 36,922,073 ( 5.73%)  ???:autumn_harvest::det_check::raw_string_end [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+ 28,537,093 ( 4.43%)  ./malloc/./malloc/malloc.c:_int_malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 24,078,520 ( 3.74%)  ???:<core::str::iter::Lines as core::iter::traits::iterator::Iterator>::next [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+ 22,088,881 ( 3.43%)  ???:autumn_harvest::det_check::trim_line [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+ 20,956,256 ( 3.25%)  ???:autumn_harvest::det_check::apply_line_braces_scoped [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+ 19,905,446 ( 3.09%)  ./malloc/./malloc/malloc.c:_int_free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 12,587,924 ( 1.95%)  ./malloc/./malloc/malloc.c:malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  9,601,161 ( 1.49%)  ./malloc/./malloc/malloc.c:malloc_consolidate [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  7,886,820 ( 1.22%)  ./malloc/./malloc/malloc.c:free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  7,489,673 ( 1.16%)  ???:core::str::converts::from_utf8 [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  7,316,884 ( 1.14%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__memcpy_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  4,538,148 ( 0.70%)  ./malloc/./malloc/malloc.c:unlink_chunk.isra.0 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  4,159,564 ( 0.65%)  ???:autumn_harvest::det_check::det010_pattern_mask_idents [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  3,930,272 ( 0.61%)  ???:<alloc::vec::Vec<T> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<T,I>>::from_iter [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  3,201,824 ( 0.50%)  ./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S:__memcmp_avx2_movbe [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  3,030,718 ( 0.47%)  ???:alloc::raw_vec::RawVecInner<A>::finish_grow [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  2,533,932 ( 0.39%)  ???:__rustc::__rdl_alloc [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  2,346,043 ( 0.36%)  ???:<core::hash::sip::Hasher<S> as core::hash::Hasher>::write [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  2,284,036 ( 0.35%)  ./malloc/./malloc/malloc.c:realloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  2,024,086 ( 0.31%)  ./malloc/./malloc/malloc.c:_int_realloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+  1,766,250 ( 0.27%)  ???:core::ptr::drop_in_place<autumn_harvest::det_check::FnDef> [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  1,756,194 ( 0.27%)  ???:<core::str::pattern::CharSearcher as core::str::pattern::Searcher>::next_match [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  1,510,718 ( 0.23%)  ???:alloc::raw_vec::RawVecInner<A>::reserve::do_reserve_and_handle [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  1,393,170 ( 0.22%)  ???:core::hash::BuildHasher::hash_one [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+  1,371,439 ( 0.21%)  ./malloc/./malloc/malloc.c:_int_free_merge_chunk [/usr/lib/x86_64-linux-gnu/libc.so.6]
+    844,935 ( 0.13%)  ./malloc/./malloc/arena.c:free
+    743,270 ( 0.12%)  ???:__rustc::__rdl_realloc [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    681,816 ( 0.11%)  ???:alloc::raw_vec::RawVec<T,A>::grow_one [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    681,036 ( 0.11%)  ???:alloc::fmt::format::format_inner [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    645,785 ( 0.10%)  ???:core::str::<impl str>::trim_start_matches [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    626,292 ( 0.10%)  ./malloc/./malloc/malloc.c:alloc_perturb [/usr/lib/x86_64-linux-gnu/libc.so.6]
+    530,588 ( 0.08%)  ???:autumn_harvest::det_check::scan_functions [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    523,246 ( 0.08%)  ???:autumn_harvest::det_check::char_literal_end [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    522,578 ( 0.08%)  ./malloc/./malloc/malloc.c:_int_free_maybe_consolidate [/usr/lib/x86_64-linux-gnu/libc.so.6]
+    519,961 ( 0.08%)  ???:core::fmt::write [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    422,682 ( 0.07%)  ???:alloc::str::join_generic_copy [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    360,146 ( 0.06%)  ???:hashbrown::rustc_entry::<impl hashbrown::map::HashMap<K,V,S,A>>::rustc_entry [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    358,440 ( 0.06%)  ???:<alloc::string::String as core::fmt::Write>::write_str [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    338,037 ( 0.05%)  ???:hashbrown::raw::RawTable<T,A>::reserve_rehash [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    336,993 ( 0.05%)  ./malloc/./malloc/arena.c:malloc
+    298,725 ( 0.05%)  ???:core::fmt::Formatter::pad [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    281,548 ( 0.04%)  ???:__rustc::__rust_alloc [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    281,548 ( 0.04%)  ???:__rustc::__rust_no_alloc_shim_is_unstable_v2 [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    281,547 ( 0.04%)  ???:__rustc::__rdl_dealloc [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    281,547 ( 0.04%)  ???:__rustc::__rust_dealloc [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    197,142 ( 0.03%)  ???:<alloc::string::String as core::clone::Clone>::clone_from [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    195,120 ( 0.03%)  ./malloc/./malloc/arena.c:realloc
+    143,086 ( 0.02%)  ???:autumn_harvest::det_check::strip_leading_visibility [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+    101,146 ( 0.02%)  ./stdlib/./stdlib/canonicalize.c:realpath@@GLIBC_2.3 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+     89,944 ( 0.01%)  ./elf/./elf/dl-tunables.c:__GI___tunables_init [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+     85,617 ( 0.01%)  ???:autumn_harvest::det_check::scan_sources [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+     59,745 ( 0.01%)  ???:<str as core::fmt::Display>::fmt [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+     49,656 ( 0.01%)  ???:<core::str::lossy::Utf8Chunks as core::iter::traits::iterator::Iterator>::next [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+     49,343 ( 0.01%)  ./elf/./elf/dl-lookup.c:do_lookup_x [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+     45,558 ( 0.01%)  ./stdio-common/./stdio-common/vfscanf-internal.c:__vfscanf_internal [/usr/lib/x86_64-linux-gnu/libc.so.6]
+     33,785 ( 0.01%)  ???:__rustc::__rust_realloc [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+     32,644 ( 0.01%)  ???:0x00000000048a06b0 [???]
+     32,550 ( 0.01%)  ./malloc/../string/bits/string_fortified.h:_int_realloc
+     29,870 ( 0.00%)  ???:<&T as core::fmt::Display>::fmt [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+     29,870 ( 0.00%)  ???:<alloc::string::String as core::fmt::Display>::fmt [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+     27,544 ( 0.00%)  ???:core::ffi::c_str::CStr::from_bytes_with_nul [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+     22,028 ( 0.00%)  ./stdlib/../stdlib/strtol_l.c:____strtoul_l_internal [/usr/lib/x86_64-linux-gnu/libc.so.6]
+     19,583 ( 0.00%)  ./elf/./elf/dl-reloc.c:_dl_relocate_object [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+     19,537 ( 0.00%)  ???:std::path::Components::parse_next_component_back [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+     16,713 ( 0.00%)  ./elf/./elf/dl-lookup.c:_dl_lookup_symbol_x [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+     16,502 ( 0.00%)  ???:autumn_harvest::det_check::collect_rs_sources_robust [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+     15,561 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/../multiarch/strcmp-sse2.S:strcmp [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+     15,038 ( 0.00%)  ./elf/../sysdeps/generic/dl-new-hash.h:_dl_lookup_symbol_x
+     14,859 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/memset-vec-unaligned-erms.S:__memset_avx2_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
+     13,571 ( 0.00%)  ./elf/../sysdeps/x86_64/dl-machine.h:_dl_relocate_object
+     12,691 ( 0.00%)  ./elf/./elf/do-rel.h:_dl_relocate_object
+     12,645 ( 0.00%)  ???:std::sys::fs::unix::try_statx [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+     12,535 ( 0.00%)  ???:std::io::default_read_to_end [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+     11,730 ( 0.00%)  ???:std::fs::read_to_string::inner [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+     11,349 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__mempcpy_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
+     10,463 ( 0.00%)  ???:core::unicode::unicode_data::white_space::lookup [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+     10,327 ( 0.00%)  ./elf/./elf/dl-lookup.c:check_match [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+      9,733 ( 0.00%)  ???:hashbrown::map::HashMap<K,V,S,A>::insert [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      9,443 ( 0.00%)  ???:<std::path::Components as core::iter::traits::double_ended::DoubleEndedIterator>::next_back [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      8,496 ( 0.00%)  ???:std::path::Path::_join [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      8,492 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strlen-avx2.S:__strlen_avx2 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      8,404 ( 0.00%)  ./stdlib/../include/scratch_buffer.h:realpath@@GLIBC_2.3
+      7,602 ( 0.00%)  ./elf/./elf/dl-version.c:_dl_check_map_versions [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+      7,245 ( 0.00%)  ???:std::sys::fs::unix::File::open_c [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      6,921 ( 0.00%)  ???:<std::sys::fs::unix::ReadDir as core::iter::traits::iterator::Iterator>::next [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      6,910 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/readlink.c:readlink [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      6,858 ( 0.00%)  ???:std::path::Path::extension [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      6,125 ( 0.00%)  ./elf/./elf/dl-tunables.h:__GI___tunables_init
+      5,750 ( 0.00%)  ???:std::io::default_read_to_end::small_probe_read [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      5,336 ( 0.00%)  ???:alloc::raw_vec::RawVecInner<A>::try_allocate_in [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      4,827 ( 0.00%)  ./dirent/../sysdeps/unix/sysv/linux/readdir64.c:readdir [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      4,600 ( 0.00%)  ???:std::sys::fs::unix::canonicalize [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      4,150 ( 0.00%)  ???:autumn_harvest::det_check::check_paths [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      4,140 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/open64.c:open [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      4,025 ( 0.00%)  ???:alloc::string::String::from_utf8_lossy [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      4,025 ( 0.00%)  ???:alloc::string::String::try_reserve_exact [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      3,696 ( 0.00%)  ./libio/./libio/genops.c:_IO_sputbackc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      3,565 ( 0.00%)  ???:std::sys::fs::canonicalize [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      3,540 ( 0.00%)  ???:<std::fs::ReadDir as core::iter::traits::iterator::Iterator>::next [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      3,230 ( 0.00%)  ./libio/./libio/iogetdelim.c:getdelim [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      3,106 ( 0.00%)  ./misc/./misc/sbrk.c:sbrk [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      3,096 ( 0.00%)  ./elf/../sysdeps/x86/dl-cacheinfo.h:intel_check_word.constprop.0 [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+      2,925 ( 0.00%)  ???:alloc::wtf8::<impl core::wtf8::Wtf8>::into_box [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      2,808 ( 0.00%)  ???:std::fs::DirEntry::file_type [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      2,339 ( 0.00%)  ./elf/./elf/dl-load.c:_dl_map_object_from_fd [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+      2,275 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__memcpy_chk_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      2,268 ( 0.00%)  ./elf/../bits/stdlib-bsearch.h:intel_check_word.constprop.0
+      2,106 ( 0.00%)  ???:std::fs::DirEntry::path [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      2,058 ( 0.00%)  ???:<alloc::vec::into_iter::IntoIter<T,A> as core::ops::drop::Drop>::drop [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      1,908 ( 0.00%)  ./string/./string/strdup.c:strdup [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+      1,874 ( 0.00%)  ./stdlib/./stdlib/getenv.c:getenv [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      1,840 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/read.c:read [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      1,739 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/memchr-avx2.S:__memchr_avx2 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      1,718 ( 0.00%)  ./malloc/./malloc/malloc.c:systrim.constprop.0 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      1,680 ( 0.00%)  ./libio/./libio/strops.c:_IO_str_init_static_internal [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      1,596 ( 0.00%)  ./stdio-common/./stdio-common/isoc23_sscanf.c:__isoc23_sscanf [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      1,573 ( 0.00%)  ./malloc/./malloc/malloc.c:sysmalloc_mmap.isra.0 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      1,547 ( 0.00%)  ./elf/./elf/dl-cache.c:_dl_cache_libcmp [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+      1,511 ( 0.00%)  ???:hashbrown::raw::RawTableInner::fallible_with_capacity [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+      1,454 ( 0.00%)  ./elf/./elf/dl-deps.c:_dl_map_object_deps [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+      1,412 ( 0.00%)  ./misc/../sysdeps/unix/sysv/linux/mmap64.c:mmap [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+      1,382 ( 0.00%)  ???:0x00000000048a0430 [???]
+      1,292 ( 0.00%)  ./elf/./elf/dl-misc.c:_dl_name_match_p [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+      1,281 ( 0.00%)  ./libio/./libio/genops.c:_IO_setb [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      1,276 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/statx.c:statx [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      1,193 ( 0.00%)  ./elf/./elf/rtld.c:dl_main [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+      1,175 ( 0.00%)  ./nptl/./nptl/pthread_getattr_np.c:pthread_getattr_np@@GLIBC_2.32 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      1,154 ( 0.00%)  ./malloc/./malloc/morecore.c:__glibc_morecore [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      1,047 ( 0.00%)  ./elf/./elf/dl-load.c:_dl_map_object [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+      1,039 ( 0.00%)  ./libio/./libio/genops.c:_IO_no_init [/usr/lib/x86_64-linux-gnu/libc.so.6]
+      1,000 ( 0.00%)  ./elf/./elf/get-dynamic-info.h:_dl_map_object_from_fd
+        991 ( 0.00%)  ./libio/./libio/genops.c:_IO_old_init [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        924 ( 0.00%)  ./elf/./elf/dl-minimal-malloc.c:__minimal_malloc [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        924 ( 0.00%)  ./stdio-common/../include/scratch_buffer.h:__vfscanf_internal
+        920 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/close.c:close [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        894 ( 0.00%)  ./elf/./elf/dl-environ.c:_dl_next_ld_env_entry [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        886 ( 0.00%)  ./elf/./elf/dl-tunables.c:__tunable_get_val [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        863 ( 0.00%)  ./misc/../sysdeps/unix/sysv/linux/setvmaname.c:__set_vma_name [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        815 ( 0.00%)  ./elf/../sysdeps/generic/ldsodefs.h:do_lookup_x
+        812 ( 0.00%)  ???:core::slice::memchr::memrchr [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+        771 ( 0.00%)  ./malloc/./malloc/malloc.c:ptmalloc_init.part.0
+        761 ( 0.00%)  ./malloc/./malloc/malloc.c:sysmalloc_mmap_fallback.constprop.0 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        752 ( 0.00%)  ./elf/./elf/dl-object.c:_dl_new_object [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        750 ( 0.00%)  ./malloc/./malloc/malloc.c:munmap_chunk [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        652 ( 0.00%)  ./elf/../sysdeps/generic/dl-protected.h:do_lookup_x
+        646 ( 0.00%)  ./elf/./elf/dl-cache.c:_dl_load_cache_lookup [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        630 ( 0.00%)  ./stdio-common/../libio/strfile.h:__isoc23_sscanf
+        598 ( 0.00%)  ./nptl/./nptl/libc-cleanup.c:__libc_cleanup_push_defer [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        576 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/../multiarch/strchr-sse2.S:index [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        571 ( 0.00%)  ./elf/../sysdeps/generic/ldsodefs.h:_dl_relocate_object
+        544 ( 0.00%)  ./elf/./elf/dl-hwcaps_split.c:_dl_hwcaps_split_masked [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        536 ( 0.00%)  ???:core::iter::traits::iterator::Iterator::eq_by [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+        526 ( 0.00%)  ./elf/../sysdeps/unix/sysv/linux/dl-sysdep.c:_dl_sysdep_parse_arguments [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        516 ( 0.00%)  ./elf/../sysdeps/x86/dl-cacheinfo.h:handle_intel.constprop.0 [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        512 ( 0.00%)  ???:<Q as hashbrown::Equivalent<K>>::equivalent [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+        504 ( 0.00%)  ./stdio-common/./stdio-common/printf-parse.h:__vfscanf_internal
+        502 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/../multiarch/strlen-sse2.S:strlen [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        497 ( 0.00%)  ./misc/../sysdeps/unix/sysv/linux/brk.c:brk [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        488 ( 0.00%)  ./csu/./csu/errno-loc.c:__errno_location [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        477 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/../multiarch/memset-vec-unaligned-erms.S:memset [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        460 ( 0.00%)  ./string/../string/bits/string_fortified.h:strdup
+        434 ( 0.00%)  ???:<std::io::stdio::StdoutLock as std::io::Write>::write_all [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+        424 ( 0.00%)  ./elf/./elf/dl-load.c:open_path [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        420 ( 0.00%)  ./stdlib/../stdlib/strtol.c:__strtoul_internal [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        415 ( 0.00%)  ./elf/./dl-map-segments.h:_dl_map_object_from_fd
+        414 ( 0.00%)  ./nptl/./nptl/libc-cleanup.c:__libc_cleanup_pop_restore [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        396 ( 0.00%)  ./elf/./elf/dl-load.c:open_verify.constprop.0 [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        395 ( 0.00%)  ./elf/./elf/dl-sort-maps.c:dfs_traversal.part.0 [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        386 ( 0.00%)  ./elf/./get-dynamic-info.h:dl_main
+        364 ( 0.00%)  ???:__cpu_indicator_init [/usr/lib/x86_64-linux-gnu/libgcc_s.so.1]
+        340 ( 0.00%)  ./elf/../elf/dl-tls.c:_dl_allocate_tls_storage [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        318 ( 0.00%)  ./elf/./elf/dl-load.c:_dl_init_paths [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        318 ( 0.00%)  ???:0x00000000048a0500 [???]
+        315 ( 0.00%)  ./elf/./dl-find_object.h:_dl_find_object_from_map [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        314 ( 0.00%)  ./elf/./elf/dl-sort-maps.c:_dl_sort_maps [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        300 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strcmp-avx2.S:__strncmp_avx2 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        298 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:memcpy [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        294 ( 0.00%)  ./elf/./elf/dl-catch.c:_dl_catch_exception [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        292 ( 0.00%)  ./misc/./misc/getauxval.c:getauxval [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        280 ( 0.00%)  ./elf/./elf/dl-tunables.c:__GI___tunable_set_val [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        274 ( 0.00%)  ./elf/./elf/dl-lookup-direct.c:_dl_lookup_direct [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        268 ( 0.00%)  ./elf/./get-dynamic-info.h:_dl_start
+        263 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:mempcpy [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        262 ( 0.00%)  ./libio/./libio/fileops.c:_IO_file_underflow@@GLIBC_2.2.5 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        253 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/open64_nocancel.c:__open_nocancel [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        248 ( 0.00%)  ./elf/./elf/dl-minimal.c:strsep [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        247 ( 0.00%)  ./elf/./elf/rtld.c:_dl_start [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        246 ( 0.00%)  ./elf/./elf/dl-init.c:call_init.part.0 [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        243 ( 0.00%)  ./elf/./elf/dl-fini.c:_dl_fini [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        240 ( 0.00%)  ./string/../string/strcspn.c:strcspn [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        240 ( 0.00%)  ???:0x00000000048a03f0 [???]
+        231 ( 0.00%)  ./elf/../sysdeps/x86/dl-cacheinfo.h:init_cpu_features.constprop.0
+        230 ( 0.00%)  ???:0x00000000048a06f0 [???]
+        223 ( 0.00%)  ./elf/../sysdeps/x86/dl-cacheinfo.h:get_common_cache_info.constprop.0 [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        222 ( 0.00%)  ./elf/./elf/dl-hwcaps.c:_dl_important_hwcaps [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        218 ( 0.00%)  ???:std::rt::lang_start_internal [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+        210 ( 0.00%)  ./elf/./elf/dl-find_object.c:_dlfo_process_initial [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        209 ( 0.00%)  ./elf/../elf/dl-tls.c:_dl_allocate_tls_init [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        203 ( 0.00%)  ./elf/../sysdeps/unix/sysv/linux/dl-parse_auxv.h:_dl_sysdep_parse_arguments
+        192 ( 0.00%)  ???:std::path::Path::components [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+        190 ( 0.00%)  ./setjmp/../sysdeps/x86_64/setjmp.S:__sigsetjmp [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        188 ( 0.00%)  ???:autumn_harvest::det_check::collect_rs_sources_robust'2 [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+        186 ( 0.00%)  ./signal/../sysdeps/unix/sysv/linux/libc_sigaction.c:__libc_sigaction [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        184 ( 0.00%)  ./libio/../string/bits/string_fortified.h:getdelim
+        183 ( 0.00%)  ./elf/./elf/dl-object.c:_dl_add_to_namespace_list [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        180 ( 0.00%)  ???:<std::io::default_write_fmt::Adapter<T> as core::fmt::Write>::write_str [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+        176 ( 0.00%)  ./elf/../sysdeps/x86/cpu-features.c:update_active.constprop.0 [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        175 ( 0.00%)  ./elf/../sysdeps/x86/cpu-features.c:init_cpu_features.constprop.0 [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        174 ( 0.00%)  ./stdlib/./stdlib/cxa_finalize.c:__cxa_finalize [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        168 ( 0.00%)  ./elf/./elf/dl-call_fini.c:_dl_call_fini [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        168 ( 0.00%)  ./libio/./libio/libioP.h:getdelim
+        168 ( 0.00%)  ./stdio-common/./stdio-common/getline.c:getline [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        162 ( 0.00%)  ./misc/../sysdeps/unix/syscall-template.S:munmap [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        159 ( 0.00%)  ./libio/./libio/genops.c:_IO_flush_all [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        159 ( 0.00%)  ./libio/./libio/genops.c:__underflow [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        159 ( 0.00%)  ???:core::fmt::Formatter::pad_integral [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+        156 ( 0.00%)  ???:std::sys::fs::read_dir [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+        152 ( 0.00%)  ./elf/./elf/dl-minimal.c:lookup_malloc_symbol [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        151 ( 0.00%)  ./libio/./libio/genops.c:_IO_cleanup [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        148 ( 0.00%)  ./elf/./elf/dl-load.c:_dl_process_pt_gnu_property [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        147 ( 0.00%)  ./elf/../elf/dl-tls.c:_dl_determine_tlsoffset [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        138 ( 0.00%)  ./elf/./elf/dl-load.c:_dl_dst_count [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        138 ( 0.00%)  ./elf/./elf/dl-load.c:fillin_rpath.isra.0 [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        135 ( 0.00%)  ./elf/./elf/dl-setup_hash.c:_dl_setup_hash [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        134 ( 0.00%)  ./misc/../sysdeps/unix/sysv/linux/brk_call.h:brk
+        132 ( 0.00%)  ./elf/./elf/dl-deps.c:openaux [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        130 ( 0.00%)  ./libio/./libio/genops.c:_IO_switch_to_get_mode [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        128 ( 0.00%)  ./elf/./elf/dl-find_object.c:_dlfo_sort_mappings [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        128 ( 0.00%)  ???:det_check_profile::main [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+        126 ( 0.00%)  ./elf/./elf/dl-init.c:_dl_init [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+        121 ( 0.00%)  ???:std::sys::pal::unix::stack_overflow::imp::drop_handler [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+        112 ( 0.00%)  ???:std::sys::pal::unix::stack_overflow::thread_info::set_current_info [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+        105 ( 0.00%)  ./misc/../sysdeps/unix/sysv/linux/mremap.c:mremap [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        102 ( 0.00%)  ./dirent/../sysdeps/unix/sysv/linux/opendir.c:opendir [/usr/lib/x86_64-linux-gnu/libc.so.6]
+        100 ( 0.00%)  ./elf/./elf/dl-minimal-malloc.c:__minimal_calloc [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         98 ( 0.00%)  ./libio/./libio/fileops.c:_IO_file_fopen@@GLIBC_2.2.5 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         96 ( 0.00%)  ./signal/../string/bits/string_fortified.h:__libc_sigaction
+         96 ( 0.00%)  ???:std::sys::sync::once::futex::Once::call [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         92 ( 0.00%)  ???:0x00000000048a0480 [???]
+         90 ( 0.00%)  ???:std::env::_var_os [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         89 ( 0.00%)  ???:core::fmt::num::imp::<impl u64>::_fmt_inner [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         88 ( 0.00%)  ./elf/../sysdeps/x86/dl-prop.h:dl_main
+         88 ( 0.00%)  ./libio/./libio/genops.c:_IO_link_in [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         88 ( 0.00%)  ./malloc/../string/bits/string_fortified.h:tcache_init.part.0
+         85 ( 0.00%)  ./elf/./elf/dl-version.c:_dl_check_all_versions [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         85 ( 0.00%)  ???:alloc::collections::btree::remove::<impl alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Leaf>,alloc::collections::btree::node::marker::KV>>::remove_leaf_kv [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         84 ( 0.00%)  ./elf/../elf/dl-tls.c:_dl_add_to_slotinfo [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         81 ( 0.00%)  ./csu/../csu/libc-start.c:__libc_start_main@@GLIBC_2.34 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         79 ( 0.00%)  ./elf/./elf/rtld.c:init_tls [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         79 ( 0.00%)  ./stdlib/./stdlib/exit.c:__run_exit_handlers [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         76 ( 0.00%)  ???:std::io::buffered::bufwriter::BufWriter<W>::flush_buf [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         75 ( 0.00%)  ./malloc/./malloc/scratch_buffer_set_array_size.c:__libc_scratch_buffer_set_array_size [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         75 ( 0.00%)  ???:core::fmt::num::imp::<impl core::fmt::Display for u64>::fmt [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         72 ( 0.00%)  ./malloc/./malloc/arena.c:ptmalloc_init.part.0 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         72 ( 0.00%)  ???:std::sys::env::unix::getenv::{{closure}} [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         71 ( 0.00%)  ./elf/./elf/rtld.c:handle_preload_list [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         70 ( 0.00%)  ./elf/../sysdeps/x86/dl-prop.h:_dl_process_pt_gnu_property
+         66 ( 0.00%)  ./malloc/./malloc/malloc.c:calloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         65 ( 0.00%)  ./elf/../sysdeps/generic/dl-hash.h:__rtld_malloc_init_real
+         64 ( 0.00%)  ./libio/./libio/genops.c:__GI__IO_un_link.part.0 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         63 ( 0.00%)  ./elf/../sysdeps/x86/cpu-features.c:get_common_indices.constprop.0 [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         63 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-memcmp.h:bcmp
+         60 ( 0.00%)  ???:core::fmt::Formatter::pad_integral::write_prefix [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         59 ( 0.00%)  ./elf/../sysdeps/x86_64/dl-machine.h:_dl_start
+         59 ( 0.00%)  ???:<&std::io::stdio::Stdout as std::io::Write>::write_fmt [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         58 ( 0.00%)  ./elf/./dl-load.h:_dl_map_object_from_fd
+         58 ( 0.00%)  ???:std::sys::pal::unix::stack_overflow::imp::make_handler [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         57 ( 0.00%)  ./posix/./posix/register-atfork.c:__unregister_atfork [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         56 ( 0.00%)  ./elf/./elf/do-rel.h:_dl_start
+         56 ( 0.00%)  ???:std::env::_var [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         56 ( 0.00%)  ???:std::sync::once::Once::call_once::{{closure}} [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         51 ( 0.00%)  ./libio/./libio/fileops.c:_IO_file_close_it@@GLIBC_2.2.5 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         49 ( 0.00%)  ???:std::sys::random::linux::getrandom [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         48 ( 0.00%)  ./elf/../sysdeps/posix/dl-fileid.h:_dl_map_object_from_fd
+         48 ( 0.00%)  ./elf/./elf/dl-load.c:expand_dynamic_string_token [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         48 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/read_nocancel.c:__read_nocancel [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         48 ( 0.00%)  ???:alloc::sync::Arc<T,A>::drop_slow [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         47 ( 0.00%)  ./elf/../sysdeps/nptl/dl-mutex.c:__rtld_mutex_init [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         47 ( 0.00%)  ./libio/./libio/filedoalloc.c:_IO_file_doallocate [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         46 ( 0.00%)  ./elf/./elf/dl-minimal.c:__rtld_malloc_init_real [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         46 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-memset.h:memset
+         45 ( 0.00%)  ./elf/./elf/dl-misc.c:_dl_sysdep_read_whole_file [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         44 ( 0.00%)  ./elf/../sysdeps/x86/get-isa-level.h:update_active.constprop.0
+         44 ( 0.00%)  ./nptl/./nptl/pthread_mutex_lock.c:pthread_mutex_lock@@GLIBC_2.2.5 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         44 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-avx2.h:strlen
+         44 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-avx2.h:strnlen
+         44 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/ifunc-avx2.h:wcschr
+         43 ( 0.00%)  ./libio/./libio/iofopen.c:fopen@@GLIBC_2.2.5 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         42 ( 0.00%)  ./elf/../sysdeps/x86/get-isa-level.h:_dl_hwcaps_subdirs_active
+         42 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/fstat64.c:fstat [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         42 ( 0.00%)  ./stdio-common/../string/bits/string_fortified.h:__vfscanf_internal
+         42 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-memmove.h:memcpy@@GLIBC_2.14
+         42 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-memmove.h:memmove
+         42 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/ifunc-evex.h:wmemchr
+         42 ( 0.00%)  ???:0x00000000048a0720 [???]
+         42 ( 0.00%)  ???:<std::ffi::os_str::Display as core::fmt::Display>::fmt [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         40 ( 0.00%)  ./elf/../elf/dl-tls.c:_dl_tls_static_surplus_init [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         40 ( 0.00%)  ./elf/./dl-hwcaps.h:_dl_important_hwcaps
+         40 ( 0.00%)  ???:std::sys::fs::symlink_metadata [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         39 ( 0.00%)  ./libio/./libio/fileops.c:_IO_file_open [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         39 ( 0.00%)  ./nptl/../sysdeps/unix/sysv/linux/x86/elision-conf.c:__lll_elision_init [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         39 ( 0.00%)  ./stdlib/./stdlib/cxa_atexit.c:__cxa_atexit [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         39 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strrchr-avx2.S:__strrchr_avx2 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         38 ( 0.00%)  ./elf/./elf/dl-find_object.c:_dl_find_object_init [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         36 ( 0.00%)  ./dirent/../sysdeps/unix/sysv/linux/getdents64.c:__getdents [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         36 ( 0.00%)  ./elf/../sysdeps/nptl/dl-tls_init_tp.c:__tls_init_tp [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         36 ( 0.00%)  ./elf/../sysdeps/unix/sysv/linux/dl-sysdep.c:_dl_sysdep_start [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         36 ( 0.00%)  ./libio/./libio/iofclose.c:fclose@@GLIBC_2.2.5 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         36 ( 0.00%)  ./misc/../sysdeps/unix/syscall-template.S:mprotect [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         36 ( 0.00%)  ./nptl/./nptl/pthread_attr_setaffinity.c:pthread_attr_setaffinity_np@@GLIBC_2.32 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         36 ( 0.00%)  ./string/../string/strstr.c:__GI_strstr [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         35 ( 0.00%)  ./signal/./signal/sigaction.c:sigaction [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         34 ( 0.00%)  ./elf/./elf/dl-debug.c:_dl_debug_initialize [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         34 ( 0.00%)  ./nptl/./nptl/pthread_mutex_unlock.c:pthread_mutex_unlock@@GLIBC_2.2.5 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         33 ( 0.00%)  ./elf/../sysdeps/x86_64/dl-cet.c:_dl_cet_check [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         33 ( 0.00%)  ./elf/./elf/dl-audit.c:_dl_audit_activity_nsid [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         33 ( 0.00%)  ./stdlib/./stdlib/cxa_atexit.c:__new_exitfn [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         33 ( 0.00%)  ???:std::io::stdio::_print [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         32 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/../multiarch/strcmp-sse2.S:strncmp [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         32 ( 0.00%)  ???:0x00000000000048f0 [/usr/lib/x86_64-linux-gnu/libgcc_s.so.1]
+         31 ( 0.00%)  ./signal/../sysdeps/posix/signal.c:signal [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         30 ( 0.00%)  ./elf/../sysdeps/nptl/dl-tls_init_tp.c:rtld_mutex_dummy [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         30 ( 0.00%)  ./libio/./libio/libioP.h:_IO_file_underflow@@GLIBC_2.2.5
+         30 ( 0.00%)  ???:<std::sys::fs::unix::DirStream as core::ops::drop::Drop>::drop [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         30 ( 0.00%)  ???:core::ptr::drop_in_place<std::io::buffered::linewriter::LineWriter<std::io::stdio::StdoutRaw>> [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         28 ( 0.00%)  ./csu/../sysdeps/nptl/libc_start_call_main.h:(below main) [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         28 ( 0.00%)  ./elf/./elf/dl-debug.c:_dl_debug_update [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         28 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/fstatat64.c:fstatat [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         28 ( 0.00%)  ./libio/./libio/libioP.h:fclose@@GLIBC_2.2.5
+         27 ( 0.00%)  ./nptl/./nptl/pthread_mutex_conf.c:__pthread_tunables_init [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         27 ( 0.00%)  ./string/../sysdeps/x86/cacheinfo.h:__x86_cacheinfo
+         26 ( 0.00%)  ./dirent/../sysdeps/unix/sysv/linux/closedir.c:closedir [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         26 ( 0.00%)  ./elf/./elf/dl-catch.c:_dl_catch_error [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         26 ( 0.00%)  ./malloc/./malloc/malloc.c:tcache_init.part.0 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         26 ( 0.00%)  ./misc/./misc/init-misc.c:__init_misc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         26 ( 0.00%)  ???:std::sync::once::Once::call_once_force::{{closure}} [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         25 ( 0.00%)  ./elf/../sysdeps/nptl/pthread_early_init.h:__libc_early_init
+         25 ( 0.00%)  ./elf/./elf/dl-audit.c:_dl_audit_objclose [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         25 ( 0.00%)  ./elf/./elf/dl-call-libc-early-init.c:_dl_call_libc_early_init [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         25 ( 0.00%)  ./elf/./elf/dl-tunables.h:__GI___tunable_set_val
+         25 ( 0.00%)  ./libio/./libio/fileops.c:_IO_file_read [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         25 ( 0.00%)  ./libio/./libio/libioP.h:__underflow
+         25 ( 0.00%)  ./posix/../sysdeps/unix/sysv/linux/x86/sysconf.c:sysconf [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         24 ( 0.00%)  ./elf/../elf/dl-tls.c:_dl_assign_tls_modid [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         24 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/close_nocancel.c:__GI___close_nocancel [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         24 ( 0.00%)  ./libio/./libio/genops.c:_IO_doallocbuf [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         24 ( 0.00%)  ???:0x00000000048a0600 [???]
+         23 ( 0.00%)  ./debug/../sysdeps/x86_64/multiarch/ifunc-memset.h:__memset_chk
+         23 ( 0.00%)  ???:0x000000000001f540 [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         23 ( 0.00%)  ???:std::path::Path::file_name [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         22 ( 0.00%)  ./csu/./csu/init-first.c:_init_first [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         22 ( 0.00%)  ./elf/./elf/dl-catch.c:_dl_receive_error [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         22 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-avx2.h:memrchr
+         22 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-avx2.h:rindex
+         22 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-avx2.h:strchrnul
+         22 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/ifunc-avx2.h:wcscmp
+         22 ( 0.00%)  ???:std::sync::once_lock::OnceLock<T>::initialize [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         21 ( 0.00%)  ./debug/../sysdeps/x86_64/multiarch/ifunc-memmove.h:__memcpy_chk
+         21 ( 0.00%)  ./debug/../sysdeps/x86_64/multiarch/ifunc-memmove.h:__memmove_chk
+         21 ( 0.00%)  ./debug/../sysdeps/x86_64/multiarch/ifunc-memmove.h:__mempcpy_chk
+         21 ( 0.00%)  ./elf/../include/rtld-malloc.h:_dl_new_object
+         21 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-evex.h:memchr
+         21 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-memmove.h:mempcpy
+         21 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strchr-avx2.S:__strchr_avx2 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         21 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strncmp.c:strncmp [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         21 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/ifunc-memcmp.h:wmemcmp
+         21 ( 0.00%)  ???:alloc::vec::Vec<T,A>::retain [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         20 ( 0.00%)  ./elf/./dl-sym-post.h:lookup_malloc_symbol
+         20 ( 0.00%)  ./elf/./elf/libc_early_init.c:__libc_early_init [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         20 ( 0.00%)  ./libio/./libio/genops.c:_IO_default_finish [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         20 ( 0.00%)  ./nptl/./nptl/pthread_getaffinity.c:pthread_getaffinity_np@@GLIBC_2.32 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         20 ( 0.00%)  ./resource/../sysdeps/unix/sysv/linux/getrlimit64.c:getrlimit [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         20 ( 0.00%)  ???:std::io::stdio::print_to_buffer_if_capture_used [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         19 ( 0.00%)  ./elf/./elf/rtld.c:map_doit [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         19 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/../multiarch/memcmp-sse2.S:bcmp [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         19 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strchr.c:index [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         19 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strcmp.c:strcmp [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         18 ( 0.00%)  ./elf/../include/scratch_buffer.h:_dl_map_object_deps
+         18 ( 0.00%)  ./elf/../sysdeps/generic/_itoa.h:_dl_check_map_versions
+         18 ( 0.00%)  ./elf/../sysdeps/x86/dl-procinfo.h:_dl_load_cache_lookup
+         18 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/close_nocancel.c:__close_nocancel [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         18 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/stat64.c:stat [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         18 ( 0.00%)  ./nptl/./nptl/pthread_attr_extension.c:__pthread_attr_extension [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         18 ( 0.00%)  ./signal/../sysdeps/unix/syscall-template.S:sigaltstack [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         18 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-strcasecmp.h:strcasecmp
+         18 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-strcasecmp.h:strcasecmp_l
+         18 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-strcasecmp.h:strncasecmp
+         18 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-strcasecmp.h:strncasecmp_l
+         18 ( 0.00%)  ???:<hashbrown::raw::RawTable<T,A> as core::ops::drop::Drop>::drop [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         17 ( 0.00%)  ./ctype/./ctype/ctype-info.c:__ctype_init [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         17 ( 0.00%)  ./elf/../sysdeps/nptl/dl-tls_init_tp.c:__tls_pre_init_tp [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         17 ( 0.00%)  ./elf/./elf/dl-audit.c:_dl_audit_activity_map [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         17 ( 0.00%)  ./nptl/./nptl/pthread_attr_destroy.c:pthread_attr_destroy [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         17 ( 0.00%)  ./posix/../sysdeps/posix/sysconf.c:sysconf
+         17 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-strncpy.h:stpncpy
+         17 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-strncpy.h:strncpy
+         17 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/ifunc-wcslen.h:wcslen
+         17 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/ifunc-wcslen.h:wcsnlen
+         16 ( 0.00%)  ./elf/../misc/sbrk.c:sbrk [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         16 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/ifunc-wcs.h:wcpncpy
+         16 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/ifunc-wcs.h:wcscat
+         16 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/ifunc-wcs.h:wcsncpy
+         16 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/ifunc-wmemset.h:wmemset
+         16 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/wcscpy.c:wcscpy [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         16 ( 0.00%)  ???:0x00000000048a03e0 [???]
+         15 ( 0.00%)  ./elf/./elf/dl-audit.c:_dl_audit_objopen [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         15 ( 0.00%)  ./elf/./elf/rtld.c:version_check_doit [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         15 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-strcpy.h:stpcpy
+         15 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-strcpy.h:strcat
+         15 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-strcpy.h:strcpy
+         14 ( 0.00%)  ./elf/./elf/dl-sort-maps.c:_dl_sort_maps_init [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         14 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/pread64_nocancel.c:__pread64_nocancel [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         14 ( 0.00%)  ./libio/./libio/fileops.c:_IO_file_finish@@GLIBC_2.2.5 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         14 ( 0.00%)  ./libio/./libio/genops.c:_IO_unsave_markers [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         14 ( 0.00%)  ???:0x00000000000453f0 [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         14 ( 0.00%)  ???:std::sys::random::linux::hashmap_random_keys [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         13 ( 0.00%)  ./elf/../sysdeps/unix/sysv/linux/rseq-internal.h:__tls_init_tp
+         13 ( 0.00%)  ./elf/./elf/dl-cache.c:_dl_unload_cache [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         13 ( 0.00%)  ./elf/./elf/dl-hwcaps_split.c:_dl_hwcaps_split [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         13 ( 0.00%)  ./libio/./libio/fileops.c:_IO_new_file_init_internal [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         13 ( 0.00%)  ./nptl/./nptl/pthread_attr_init.c:pthread_attr_init@@GLIBC_2.2.5 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         13 ( 0.00%)  ./setjmp/./setjmp/sigjmp.c:__sigjmp_save [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         13 ( 0.00%)  ./stdlib/./stdlib/cxa_thread_atexit_impl.c:__call_tls_dtors [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         13 ( 0.00%)  ???:0x00000000000010d0 [/usr/libexec/valgrind/vgpreload_core-amd64-linux.so]
+         13 ( 0.00%)  ???:0x0000000000005ad0 [/usr/lib/x86_64-linux-gnu/libgcc_s.so.1]
+         12 ( 0.00%)  ./elf/../include/rtld-malloc.h:_dl_check_map_versions
+         12 ( 0.00%)  ./elf/../sysdeps/x86/dl-isa-level.h:_dl_load_cache_lookup
+         12 ( 0.00%)  ./elf/../sysdeps/x86/dl-prop.h:_dl_map_object_from_fd
+         12 ( 0.00%)  ./libio/./libio/vtables.c:check_stdfiles_vtables [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         12 ( 0.00%)  ./misc/../sysdeps/unix/sysv/linux/getpagesize.c:getpagesize [/usr/lib/x86_64-linux-gnu/libc.so.6]
+         12 ( 0.00%)  ???:(below main) [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         12 ( 0.00%)  ???:0x0000000000001110 [/usr/libexec/valgrind/vgpreload_core-amd64-linux.so]
+         12 ( 0.00%)  ???:0x0000000000005b10 [/usr/lib/x86_64-linux-gnu/libgcc_s.so.1]
+         12 ( 0.00%)  ???:0x0000000000045430 [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         11 ( 0.00%)  ./elf/../sysdeps/unix/sysv/linux/x86/dl-minsigstacksize.h:get_common_indices.constprop.0
+         11 ( 0.00%)  ???:main [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+         10 ( 0.00%)  ./elf/../include/rtld-malloc.h:__minimal_calloc
+         10 ( 0.00%)  ./elf/./elf/dl-minimal.c:__rtld_malloc_init_stubs [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+         10 ( 0.00%)  ./posix/../sysdeps/unix/sysv/linux/x86/../sysconf.c:sysconf
+         10 ( 0.00%)  ???:0x0000000000004940 [/usr/lib/x86_64-linux-gnu/libgcc_s.so.1]
+          9 ( 0.00%)  ./elf/../sysdeps/generic/dl-call_tls_init_tp.h:init_tls
+          9 ( 0.00%)  ./elf/../sysdeps/unix/sysv/linux/dl-vdso.h:dl_main
+          9 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/access.c:access [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+          9 ( 0.00%)  ./nptl/./nptl/pthread_attr_getstack.c:pthread_attr_getstack@@GLIBC_2.34 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          9 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/memcmp.c:bcmp [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          8 ( 0.00%)  ./elf/../include/rtld-malloc.h:_dl_map_object_deps
+          8 ( 0.00%)  ./elf/../nptl/nptl-stack.h:__libc_early_init
+          8 ( 0.00%)  ./elf/../sysdeps/generic/dl-cache.h:_dl_load_cache_lookup
+          8 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/poll.c:poll [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          8 ( 0.00%)  ./io/../sysdeps/unix/sysv/linux/write.c:write [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          8 ( 0.00%)  ./libio/./libio/genops.c:_IO_un_link [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          8 ( 0.00%)  ./stdlib/../sysdeps/unix/sysv/linux/getrandom.c:getrandom [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          8 ( 0.00%)  ./string/../include/rtld-malloc.h:strdup
+          7 ( 0.00%)  ./elf/../sysdeps/x86_64/dl-hwcaps-subdirs.c:_dl_hwcaps_subdirs_active [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+          7 ( 0.00%)  ./stdlib/./stdlib/exit.c:exit [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          7 ( 0.00%)  ???:0x00000000001aaef0 [???]
+          7 ( 0.00%)  ???:0x000000000483d000 [???]
+          7 ( 0.00%)  ???:0x000000000484e000 [???]
+          6 ( 0.00%)  ./dirent/../sysdeps/unix/sysv/linux/dirfd.c:dirfd [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          6 ( 0.00%)  ./elf/../elf/dl-tls.c:_dl_count_modids [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+          6 ( 0.00%)  ./elf/../include/list.h:__tls_init_tp
+          6 ( 0.00%)  ./elf/../sysdeps/generic/ldsodefs.h:_dl_start
+          6 ( 0.00%)  ./elf/../sysdeps/unix/sysv/linux/brk.c:brk [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+          6 ( 0.00%)  ./elf/../sysdeps/x86/dl-get-cpu-features.c:__x86_cpu_features [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+          6 ( 0.00%)  ./malloc/../sysdeps/unix/sysv/linux/not-cancel.h:ptmalloc_init.part.0
+          6 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strlen.c:strlen [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          6 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strnlen.c:strnlen [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          6 ( 0.00%)  ???:0x00000000048a0410 [???]
+          6 ( 0.00%)  ???:std::rt::lang_start::{{closure}} [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+          5 ( 0.00%)  ./elf/../include/rtld-malloc.h:_dl_init_paths
+          5 ( 0.00%)  ./elf/../include/rtld-malloc.h:fillin_rpath.isra.0
+          5 ( 0.00%)  ./elf/../sysdeps/generic/dl-debug.h:dl_main
+          5 ( 0.00%)  ./elf/../sysdeps/unix/sysv/linux/dl-vdso-setup.h:dl_main
+          5 ( 0.00%)  ./elf/../sysdeps/x86/dl-get-cpu-features.c:_dl_x86_init_cpu_features [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+          5 ( 0.00%)  ./elf/./dl-main.h:dl_main
+          5 ( 0.00%)  ./elf/./dl-tunable-types.h:__GI___tunable_set_val
+          5 ( 0.00%)  ./elf/./elf/dl-audit.c:_dl_audit_preinit [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+          5 ( 0.00%)  ./elf/./elf/dl-minimal-malloc.c:__minimal_free [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+          5 ( 0.00%)  ./libio/./libio/libioP.h:_IO_doallocbuf
+          5 ( 0.00%)  ./libio/./libio/libioP.h:_IO_file_close_it@@GLIBC_2.2.5
+          5 ( 0.00%)  ./libio/./libio/libioP.h:_IO_file_doallocate
+          5 ( 0.00%)  ./nptl/../string/bits/string_fortified.h:pthread_attr_init@@GLIBC_2.2.5
+          5 ( 0.00%)  ./signal/../sysdeps/unix/sysv/linux/internal-signals.h:sigaction
+          5 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-sse4_2.h:strcspn
+          5 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-sse4_2.h:strpbrk
+          5 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/ifunc-sse4_2.h:strspn
+          5 ( 0.00%)  ???:0x0000000000001060 [/usr/libexec/valgrind/vgpreload_core-amd64-linux.so]
+          5 ( 0.00%)  ???:0x0000000000005a60 [/usr/lib/x86_64-linux-gnu/libgcc_s.so.1]
+          5 ( 0.00%)  ???:0x0000000000045380 [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+          4 ( 0.00%)  ./elf/../include/rtld-malloc.h:_dl_important_hwcaps
+          4 ( 0.00%)  ./elf/../sysdeps/x86_64/dl-cet.c:_dl_cet_setup_features [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+          4 ( 0.00%)  ./elf/./elf/dl-debug.c:_dl_debug_state [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+          4 ( 0.00%)  ./misc/../sysdeps/unix/syscall-template.S:gettid [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          4 ( 0.00%)  ./nptl/../string/bits/string_fortified.h:pthread_attr_setaffinity_np@@GLIBC_2.32
+          4 ( 0.00%)  ./posix/../sysdeps/unix/sysv/linux/_exit.c:_Exit [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          4 ( 0.00%)  ./signal/../sysdeps/unix/sysv/linux/sigsetops.h:signal
+          4 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/wcschr.c:wcschr
+          4 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/wmemchr.c:wmemchr [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          4 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/wmemset.c:wmemset [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          4 ( 0.00%)  ???:0x00000000001aaf0c [???]
+          4 ( 0.00%)  ???:0x000000000483d294 [???]
+          4 ( 0.00%)  ???:0x0000000004871748 [???]
+          4 ( 0.00%)  ???:0x00000000048a0740 [???]
+          4 ( 0.00%)  ???:std::sys::args::unix::imp::ARGV_INIT_ARRAY::init_wrapper [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+          4 ( 0.00%)  ???:std::sys::backtrace::__rust_begin_short_backtrace [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+          3 ( 0.00%)  ./elf/../include/rtld-malloc.h:_dl_allocate_tls_storage
+          3 ( 0.00%)  ./elf/../sysdeps/unix/sysv/linux/dl-osinfo.h:dl_main
+          3 ( 0.00%)  ./libio/./libio/fileops.c:_IO_file_close [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          3 ( 0.00%)  ./libio/./libio/fileops.c:_IO_file_stat [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          3 ( 0.00%)  ./malloc/../string/bits/string_fortified.h:calloc
+          3 ( 0.00%)  ./nptl/./nptl/pthread_self.c:pthread_self [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          3 ( 0.00%)  ./posix/../malloc/dynarray-skeleton.c:__unregister_atfork
+          3 ( 0.00%)  ./setjmp/../sysdeps/x86_64/bsd-_setjmp.S:_setjmp [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          3 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/memrchr.c:memrchr [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          3 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strcasecmp.c:strcasecmp [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          3 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strcasecmp_l.c:strcasecmp_l [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          3 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strchrnul.c:strchrnul [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          3 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strncase.c:strncasecmp [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          3 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strncase_l.c:strncasecmp_l [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          3 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strrchr.c:rindex [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          3 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/wcscmp.c:wcscmp [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          3 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/wmemcmp.c:wmemcmp [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          2 ( 0.00%)  ./elf/../include/rtld-malloc.h:_dl_find_object_init
+          2 ( 0.00%)  ./elf/../include/rtld-malloc.h:init_tls
+          2 ( 0.00%)  ./elf/../sysdeps/unix/sysv/linux/brk_call.h:brk
+          2 ( 0.00%)  ./elf/../sysdeps/unix/sysv/linux/dl-sysdep.c:_dl_sysdep_start_cleanup [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+          2 ( 0.00%)  ./elf/../sysdeps/unix/sysv/linux/x86/dl-hwcap2.h:update_active.constprop.0
+          2 ( 0.00%)  ./elf/./setup-vdso.h:dl_main
+          2 ( 0.00%)  ./libio/./libio/libioP.h:_IO_flush_all
+          2 ( 0.00%)  ./malloc/./malloc/arena.c:calloc
+          2 ( 0.00%)  ./nptl/../string/bits/string_fortified.h:pthread_getaffinity_np@@GLIBC_2.32
+          2 ( 0.00%)  ./nptl/../string/bits/string_fortified.h:pthread_getattr_np@@GLIBC_2.32
+          2 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/memchr.c:memchr [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          2 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/memcmpeq.c:memcpy@@GLIBC_2.14 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          2 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/memmove.c:memmove [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          2 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/memset.c:memset [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          2 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/stpcpy.c:stpcpy [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          2 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/stpncpy.c:stpncpy [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          2 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strcat.c:strcat [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          2 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strcpy.c:strcpy [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          2 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strcspn.c:strcspn [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          2 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strncpy.c:strncpy [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          2 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strpbrk.c:strpbrk [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          2 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/strspn.c:strspn [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          2 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/wcscat.c:wcscat [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          2 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/wcscat.c:wcschr [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          2 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/wcslen.c:wcslen [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          2 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/wcsncpy.c:wcsncpy [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          2 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/wcsnlen.c:wcsnlen [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          2 ( 0.00%)  ???:0x000000000483d030 [???]
+          2 ( 0.00%)  ???:0x000000000484e3c0 [???]
+          2 ( 0.00%)  ???:0x00000000048a0450 [???]
+          2 ( 0.00%)  ???:0x00000000048a0660 [???]
+          2 ( 0.00%)  ???:0x00000000048a0680 [???]
+          2 ( 0.00%)  ???:0x00000000048a07b0 [???]
+          1 ( 0.00%)  ./debug/../sysdeps/x86_64/multiarch/memcpy_chk.c:__memcpy_chk [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          1 ( 0.00%)  ./debug/../sysdeps/x86_64/multiarch/memmove_chk.c:__memmove_chk [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          1 ( 0.00%)  ./debug/../sysdeps/x86_64/multiarch/mempcpy_chk.c:__mempcpy_chk [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          1 ( 0.00%)  ./debug/../sysdeps/x86_64/multiarch/memset_chk.c:__memset_chk [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          1 ( 0.00%)  ./elf/../sysdeps/x86_64/dl-machine.h:_dl_sysdep_start
+          1 ( 0.00%)  ./libio/./libio/libioP.h:_IO_cleanup
+          1 ( 0.00%)  ./signal/../sysdeps/unix/sysv/linux/internal-signals.h:signal
+          1 ( 0.00%)  ./string/../sysdeps/x86/cacheinfo.c:__x86_cacheinfo [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          1 ( 0.00%)  ./string/../sysdeps/x86_64/multiarch/mempcpy.c:mempcpy [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          1 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/wcpcpy.c:wcpncpy [/usr/lib/x86_64-linux-gnu/libc.so.6]
+          1 ( 0.00%)  ./wcsmbs/../sysdeps/x86_64/multiarch/wcpncpy.c:wcpncpy
+          1 ( 0.00%)  ???:<std::path::Display as core::fmt::Display>::fmt [/home/user/autumn-harvest/target/release/deps/det_check_profile-b1f6fb53b3e72b82]
+
+--------------------------------------------------------------------------------
+The following files chosen for auto-annotation could not be found:
+--------------------------------------------------------------------------------
+  ./csu/../csu/libc-start.c
+  ./csu/../sysdeps/nptl/libc_start_call_main.h
+  ./csu/./csu/errno-loc.c
+  ./csu/./csu/init-first.c
+  ./ctype/./ctype/ctype-info.c
+  ./debug/../sysdeps/x86_64/multiarch/ifunc-memmove.h
+  ./debug/../sysdeps/x86_64/multiarch/ifunc-memset.h
+  ./debug/../sysdeps/x86_64/multiarch/memcpy_chk.c
+  ./debug/../sysdeps/x86_64/multiarch/memmove_chk.c
+  ./debug/../sysdeps/x86_64/multiarch/mempcpy_chk.c
+  ./debug/../sysdeps/x86_64/multiarch/memset_chk.c
+  ./dirent/../sysdeps/unix/sysv/linux/closedir.c
+  ./dirent/../sysdeps/unix/sysv/linux/dirfd.c
+  ./dirent/../sysdeps/unix/sysv/linux/getdents64.c
+  ./dirent/../sysdeps/unix/sysv/linux/opendir.c
+  ./dirent/../sysdeps/unix/sysv/linux/readdir64.c
+  ./elf/../bits/stdlib-bsearch.h
+  ./elf/../elf/dl-tls.c
+  ./elf/../include/list.h
+  ./elf/../include/rtld-malloc.h
+  ./elf/../include/scratch_buffer.h
+  ./elf/../misc/sbrk.c
+  ./elf/../nptl/nptl-stack.h
+  ./elf/../sysdeps/generic/_itoa.h
+  ./elf/../sysdeps/generic/dl-cache.h
+  ./elf/../sysdeps/generic/dl-call_tls_init_tp.h
+  ./elf/../sysdeps/generic/dl-debug.h
+  ./elf/../sysdeps/generic/dl-hash.h
+  ./elf/../sysdeps/generic/dl-new-hash.h
+  ./elf/../sysdeps/generic/dl-protected.h
+  ./elf/../sysdeps/generic/ldsodefs.h
+  ./elf/../sysdeps/nptl/dl-mutex.c
+  ./elf/../sysdeps/nptl/dl-tls_init_tp.c
+  ./elf/../sysdeps/nptl/pthread_early_init.h
+  ./elf/../sysdeps/posix/dl-fileid.h
+  ./elf/../sysdeps/unix/sysv/linux/brk.c
+  ./elf/../sysdeps/unix/sysv/linux/brk_call.h
+  ./elf/../sysdeps/unix/sysv/linux/dl-osinfo.h
+  ./elf/../sysdeps/unix/sysv/linux/dl-parse_auxv.h
+  ./elf/../sysdeps/unix/sysv/linux/dl-sysdep.c
+  ./elf/../sysdeps/unix/sysv/linux/dl-vdso-setup.h
+  ./elf/../sysdeps/unix/sysv/linux/dl-vdso.h
+  ./elf/../sysdeps/unix/sysv/linux/rseq-internal.h
+  ./elf/../sysdeps/unix/sysv/linux/x86/dl-hwcap2.h
+  ./elf/../sysdeps/unix/sysv/linux/x86/dl-minsigstacksize.h
+  ./elf/../sysdeps/x86/cpu-features.c
+  ./elf/../sysdeps/x86/dl-cacheinfo.h
+  ./elf/../sysdeps/x86/dl-get-cpu-features.c
+  ./elf/../sysdeps/x86/dl-isa-level.h
+  ./elf/../sysdeps/x86/dl-procinfo.h
+  ./elf/../sysdeps/x86/dl-prop.h
+  ./elf/../sysdeps/x86/get-isa-level.h
+  ./elf/../sysdeps/x86_64/dl-cet.c
+  ./elf/../sysdeps/x86_64/dl-hwcaps-subdirs.c
+  ./elf/../sysdeps/x86_64/dl-machine.h
+  ./elf/./dl-find_object.h
+  ./elf/./dl-hwcaps.h
+  ./elf/./dl-load.h
+  ./elf/./dl-main.h
+  ./elf/./dl-map-segments.h
+  ./elf/./dl-sym-post.h
+  ./elf/./dl-tunable-types.h
+  ./elf/./elf/dl-audit.c
+  ./elf/./elf/dl-cache.c
+  ./elf/./elf/dl-call-libc-early-init.c
+  ./elf/./elf/dl-call_fini.c
+  ./elf/./elf/dl-catch.c
+  ./elf/./elf/dl-debug.c
+  ./elf/./elf/dl-deps.c
+  ./elf/./elf/dl-environ.c
+  ./elf/./elf/dl-find_object.c
+  ./elf/./elf/dl-fini.c
+  ./elf/./elf/dl-hwcaps.c
+  ./elf/./elf/dl-hwcaps_split.c
+  ./elf/./elf/dl-init.c
+  ./elf/./elf/dl-load.c
+  ./elf/./elf/dl-lookup-direct.c
+  ./elf/./elf/dl-lookup.c
+  ./elf/./elf/dl-minimal-malloc.c
+  ./elf/./elf/dl-minimal.c
+  ./elf/./elf/dl-misc.c
+  ./elf/./elf/dl-object.c
+  ./elf/./elf/dl-reloc.c
+  ./elf/./elf/dl-setup_hash.c
+  ./elf/./elf/dl-sort-maps.c
+  ./elf/./elf/dl-tunables.c
+  ./elf/./elf/dl-tunables.h
+  ./elf/./elf/dl-version.c
+  ./elf/./elf/do-rel.h
+  ./elf/./elf/get-dynamic-info.h
+  ./elf/./elf/libc_early_init.c
+  ./elf/./elf/rtld.c
+  ./elf/./get-dynamic-info.h
+  ./elf/./setup-vdso.h
+  ./io/../sysdeps/unix/sysv/linux/access.c
+  ./io/../sysdeps/unix/sysv/linux/close.c
+  ./io/../sysdeps/unix/sysv/linux/close_nocancel.c
+  ./io/../sysdeps/unix/sysv/linux/fstat64.c
+  ./io/../sysdeps/unix/sysv/linux/fstatat64.c
+  ./io/../sysdeps/unix/sysv/linux/open64.c
+  ./io/../sysdeps/unix/sysv/linux/open64_nocancel.c
+  ./io/../sysdeps/unix/sysv/linux/poll.c
+  ./io/../sysdeps/unix/sysv/linux/pread64_nocancel.c
+  ./io/../sysdeps/unix/sysv/linux/read.c
+  ./io/../sysdeps/unix/sysv/linux/read_nocancel.c
+  ./io/../sysdeps/unix/sysv/linux/readlink.c
+  ./io/../sysdeps/unix/sysv/linux/stat64.c
+  ./io/../sysdeps/unix/sysv/linux/statx.c
+  ./io/../sysdeps/unix/sysv/linux/write.c
+  ./libio/../string/bits/string_fortified.h
+  ./libio/./libio/filedoalloc.c
+  ./libio/./libio/fileops.c
+  ./libio/./libio/genops.c
+  ./libio/./libio/iofclose.c
+  ./libio/./libio/iofopen.c
+  ./libio/./libio/iogetdelim.c
+  ./libio/./libio/libioP.h
+  ./libio/./libio/strops.c
+  ./libio/./libio/vtables.c
+  ./malloc/../string/bits/string_fortified.h
+  ./malloc/../sysdeps/unix/sysv/linux/not-cancel.h
+  ./malloc/./malloc/arena.c
+  ./malloc/./malloc/malloc.c
+  ./malloc/./malloc/morecore.c
+  ./malloc/./malloc/scratch_buffer_set_array_size.c
+  ./misc/../sysdeps/unix/syscall-template.S
+  ./misc/../sysdeps/unix/sysv/linux/brk.c
+  ./misc/../sysdeps/unix/sysv/linux/brk_call.h
+  ./misc/../sysdeps/unix/sysv/linux/getpagesize.c
+  ./misc/../sysdeps/unix/sysv/linux/mmap64.c
+  ./misc/../sysdeps/unix/sysv/linux/mremap.c
+  ./misc/../sysdeps/unix/sysv/linux/setvmaname.c
+  ./misc/./misc/getauxval.c
+  ./misc/./misc/init-misc.c
+  ./misc/./misc/sbrk.c
+  ./nptl/../string/bits/string_fortified.h
+  ./nptl/../sysdeps/unix/sysv/linux/x86/elision-conf.c
+  ./nptl/./nptl/libc-cleanup.c
+  ./nptl/./nptl/pthread_attr_destroy.c
+  ./nptl/./nptl/pthread_attr_extension.c
+  ./nptl/./nptl/pthread_attr_getstack.c
+  ./nptl/./nptl/pthread_attr_init.c
+  ./nptl/./nptl/pthread_attr_setaffinity.c
+  ./nptl/./nptl/pthread_getaffinity.c
+  ./nptl/./nptl/pthread_getattr_np.c
+  ./nptl/./nptl/pthread_mutex_conf.c
+  ./nptl/./nptl/pthread_mutex_lock.c
+  ./nptl/./nptl/pthread_mutex_unlock.c
+  ./nptl/./nptl/pthread_self.c
+  ./posix/../malloc/dynarray-skeleton.c
+  ./posix/../sysdeps/posix/sysconf.c
+  ./posix/../sysdeps/unix/sysv/linux/_exit.c
+  ./posix/../sysdeps/unix/sysv/linux/x86/../sysconf.c
+  ./posix/../sysdeps/unix/sysv/linux/x86/sysconf.c
+  ./posix/./posix/register-atfork.c
+  ./resource/../sysdeps/unix/sysv/linux/getrlimit64.c
+  ./setjmp/../sysdeps/x86_64/bsd-_setjmp.S
+  ./setjmp/../sysdeps/x86_64/setjmp.S
+  ./setjmp/./setjmp/sigjmp.c
+  ./signal/../string/bits/string_fortified.h
+  ./signal/../sysdeps/posix/signal.c
+  ./signal/../sysdeps/unix/syscall-template.S
+  ./signal/../sysdeps/unix/sysv/linux/internal-signals.h
+  ./signal/../sysdeps/unix/sysv/linux/libc_sigaction.c
+  ./signal/../sysdeps/unix/sysv/linux/sigsetops.h
+  ./signal/./signal/sigaction.c
+  ./stdio-common/../include/scratch_buffer.h
+  ./stdio-common/../libio/strfile.h
+  ./stdio-common/../string/bits/string_fortified.h
+  ./stdio-common/./stdio-common/getline.c
+  ./stdio-common/./stdio-common/isoc23_sscanf.c
+  ./stdio-common/./stdio-common/printf-parse.h
+  ./stdio-common/./stdio-common/vfscanf-internal.c
+  ./stdlib/../include/scratch_buffer.h
+  ./stdlib/../stdlib/strtol.c
+  ./stdlib/../stdlib/strtol_l.c
+  ./stdlib/../sysdeps/unix/sysv/linux/getrandom.c
+  ./stdlib/./stdlib/canonicalize.c
+  ./stdlib/./stdlib/cxa_atexit.c
+  ./stdlib/./stdlib/cxa_finalize.c
+  ./stdlib/./stdlib/cxa_thread_atexit_impl.c
+  ./stdlib/./stdlib/exit.c
+  ./stdlib/./stdlib/getenv.c
+  ./string/../include/rtld-malloc.h
+  ./string/../string/bits/string_fortified.h
+  ./string/../string/strcspn.c
+  ./string/../string/strstr.c
+  ./string/../sysdeps/x86/cacheinfo.c
+  ./string/../sysdeps/x86/cacheinfo.h
+  ./string/../sysdeps/x86_64/multiarch/../multiarch/memcmp-sse2.S
+  ./string/../sysdeps/x86_64/multiarch/../multiarch/memset-vec-unaligned-erms.S
+  ./string/../sysdeps/x86_64/multiarch/../multiarch/strchr-sse2.S
+  ./string/../sysdeps/x86_64/multiarch/../multiarch/strcmp-sse2.S
+  ./string/../sysdeps/x86_64/multiarch/../multiarch/strlen-sse2.S
+  ./string/../sysdeps/x86_64/multiarch/ifunc-avx2.h
+  ./string/../sysdeps/x86_64/multiarch/ifunc-evex.h
+  ./string/../sysdeps/x86_64/multiarch/ifunc-memcmp.h
+  ./string/../sysdeps/x86_64/multiarch/ifunc-memmove.h
+  ./string/../sysdeps/x86_64/multiarch/ifunc-memset.h
+  ./string/../sysdeps/x86_64/multiarch/ifunc-sse4_2.h
+  ./string/../sysdeps/x86_64/multiarch/ifunc-strcasecmp.h
+  ./string/../sysdeps/x86_64/multiarch/ifunc-strcpy.h
+  ./string/../sysdeps/x86_64/multiarch/ifunc-strncpy.h
+  ./string/../sysdeps/x86_64/multiarch/memchr-avx2.S
+  ./string/../sysdeps/x86_64/multiarch/memchr.c
+  ./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S
+  ./string/../sysdeps/x86_64/multiarch/memcmp.c
+  ./string/../sysdeps/x86_64/multiarch/memcmpeq.c
+  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S
+  ./string/../sysdeps/x86_64/multiarch/memmove.c
+  ./string/../sysdeps/x86_64/multiarch/mempcpy.c
+  ./string/../sysdeps/x86_64/multiarch/memrchr.c
+  ./string/../sysdeps/x86_64/multiarch/memset-vec-unaligned-erms.S
+  ./string/../sysdeps/x86_64/multiarch/memset.c
+  ./string/../sysdeps/x86_64/multiarch/stpcpy.c
+  ./string/../sysdeps/x86_64/multiarch/stpncpy.c
+  ./string/../sysdeps/x86_64/multiarch/strcasecmp.c
+  ./string/../sysdeps/x86_64/multiarch/strcasecmp_l.c
+  ./string/../sysdeps/x86_64/multiarch/strcat.c
+  ./string/../sysdeps/x86_64/multiarch/strchr-avx2.S
+  ./string/../sysdeps/x86_64/multiarch/strchr.c
+  ./string/../sysdeps/x86_64/multiarch/strchrnul.c
+  ./string/../sysdeps/x86_64/multiarch/strcmp-avx2.S
+  ./string/../sysdeps/x86_64/multiarch/strcmp.c
+  ./string/../sysdeps/x86_64/multiarch/strcpy.c
+  ./string/../sysdeps/x86_64/multiarch/strcspn.c
+  ./string/../sysdeps/x86_64/multiarch/strlen-avx2.S
+  ./string/../sysdeps/x86_64/multiarch/strlen.c
+  ./string/../sysdeps/x86_64/multiarch/strncase.c
+  ./string/../sysdeps/x86_64/multiarch/strncase_l.c
+  ./string/../sysdeps/x86_64/multiarch/strncmp.c
+  ./string/../sysdeps/x86_64/multiarch/strncpy.c
+  ./string/../sysdeps/x86_64/multiarch/strnlen.c
+  ./string/../sysdeps/x86_64/multiarch/strpbrk.c
+  ./string/../sysdeps/x86_64/multiarch/strrchr-avx2.S
+  ./string/../sysdeps/x86_64/multiarch/strrchr.c
+  ./string/../sysdeps/x86_64/multiarch/strspn.c
+  ./string/./string/strdup.c
+  ./wcsmbs/../sysdeps/x86_64/multiarch/ifunc-avx2.h
+  ./wcsmbs/../sysdeps/x86_64/multiarch/ifunc-evex.h
+  ./wcsmbs/../sysdeps/x86_64/multiarch/ifunc-memcmp.h
+  ./wcsmbs/../sysdeps/x86_64/multiarch/ifunc-wcs.h
+  ./wcsmbs/../sysdeps/x86_64/multiarch/ifunc-wcslen.h
+  ./wcsmbs/../sysdeps/x86_64/multiarch/ifunc-wmemset.h
+  ./wcsmbs/../sysdeps/x86_64/multiarch/wcpcpy.c
+  ./wcsmbs/../sysdeps/x86_64/multiarch/wcpncpy.c
+  ./wcsmbs/../sysdeps/x86_64/multiarch/wcscat.c
+  ./wcsmbs/../sysdeps/x86_64/multiarch/wcschr.c
+  ./wcsmbs/../sysdeps/x86_64/multiarch/wcscmp.c
+  ./wcsmbs/../sysdeps/x86_64/multiarch/wcscpy.c
+  ./wcsmbs/../sysdeps/x86_64/multiarch/wcslen.c
+  ./wcsmbs/../sysdeps/x86_64/multiarch/wcsncpy.c
+  ./wcsmbs/../sysdeps/x86_64/multiarch/wcsnlen.c
+  ./wcsmbs/../sysdeps/x86_64/multiarch/wmemchr.c
+  ./wcsmbs/../sysdeps/x86_64/multiarch/wmemcmp.c
+  ./wcsmbs/../sysdeps/x86_64/multiarch/wmemset.c
+
