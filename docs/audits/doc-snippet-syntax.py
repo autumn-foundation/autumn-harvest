@@ -146,24 +146,35 @@ BQ = r">[ \t]{0,3}"
 # script trades that for staying dependency-free: docs/audits/*.py runs
 # with no network access, so no markdown-parsing package can be installed
 # to do this properly, and a hand-rolled line scanner is what stays within
-# that. Two specific, known gaps from that trade, both requiring state
-# that spans lines OUTSIDE a fence's own span, not just within it (every
-# rule this file does implement, however deep, only ever needs the fence's
-# own opener line and the lines between it and its closer):
+# that. Three specific, known gaps from that trade:
 #
 # 1. A fence on a list item's own CONTINUATION line, not the marker's own
 #    line, needs that item's content column carried over from wherever the
 #    marker actually was — this script has no cross-line container stack,
 #    so it only recognizes a marker's width when the marker is on the
-#    fence's own opening line (LIST_MARKER above).
+#    fence's own opening line (LIST_MARKER above). Needs state spanning
+#    lines OUTSIDE the fence's own span.
 # 2. Whether an ordered marker (other than "1.") may open a list at all
 #    depends on whether it interrupts an open paragraph — this script has
 #    no paragraph-state tracking, so every marker that otherwise matches
-#    LIST_MARKER is accepted regardless of what precedes it.
-# Both are confirmed absent from the current corpus (`grep -rnP` for a
-# multi-digit/wide marker followed by an indented fence, and for a
-# non-"1." ordered marker anywhere near a fence, both come up empty) — if
-# either shows up for real, this is where to extend the scanner, most
+#    LIST_MARKER is accepted regardless of what precedes it. Also needs
+#    state spanning lines outside the fence's own span.
+# 3. Containers can nest in ANY order — "> - \`\`\`rust" (list inside
+#    blockquote) is as valid as "- > \`\`\`rust" (blockquote inside list,
+#    which this script does handle). FENCE_OPEN_RE hard-codes list markers
+#    before blockquote markers (group 2 then group 3): fully local to the
+#    opener's own line, unlike 1 and 2 above, but supporting arbitrary
+#    interleaving means replacing "all list markers, then all blockquote
+#    markers" with an ordered token sequence — and every downstream piece
+#    that currently assumes that fixed shape (_blockquote_depth,
+#    _fence_indent_valid, the content-line stripping in find_rust_blocks)
+#    would need to walk that same sequence instead of two flat groups.
+#    That is a rewrite of this script's core model, not a local fix.
+# All three are confirmed absent from the current corpus (grepped for a
+# multi-digit/wide marker followed by an indented fence, for a non-"1."
+# ordered marker anywhere near a fence, and for a blockquote marker
+# followed by a list marker before a fence — all three come up empty) —
+# if any shows up for real, this is where to extend the scanner, most
 # likely by adopting the container-stack approach
 # `docs/audits/comment-hygiene.py`'s own fence_delimiter/strip_containers
 # already use for the same problem in a different context (Rust doc
