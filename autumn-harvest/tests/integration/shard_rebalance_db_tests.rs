@@ -3685,6 +3685,59 @@ async fn a_reconciled_seal_lookup_picks_the_newest_over_an_older_one() {
     assert_ne!(started.exec_id, newer_exec_id);
 }
 
+#[tokio::test]
+async fn a_reconciled_seal_never_outranks_the_current_occupant() {
+    // Fresh review, P1 follow-up. A reconciled seal is only authoritative
+    // when nothing newer occupies the business key. Seed a reconciled
+    // seal whose live copy succeeded. Then start a FRESH run under the
+    // same key -- exactly as a caller legitimately can, since the seal no
+    // longer occupies the active-uniqueness slot. `AllowDuplicateFailedOnly`
+    // must attach to that fresh, currently-RUNNING occupant, not to the
+    // stale seal. Without the current-occupant check, the seal lookup
+    // would find the older seal first and return it unchanged. That
+    // would hide the real current run from the caller entirely.
+    let shards = setup_two_shards().await;
+    let workflow_id = "reconciled-seal-never-outranks-occupant";
+
+    let seal_exec_id = quiescent_fixture(&shards, workflow_id).await;
+    migrate_execution(&shards.pool, seal_exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate the sealed run");
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(seal_exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("complete the migrated run");
+    let mut source = shards.source().await;
+    reconcile_migrated_seal_terminality(&mut source, &shards.pool, seal_exec_id, SOURCE)
+        .await
+        .expect("reconcile the seal")
+        .then_some(())
+        .expect("the sealed run must be observed terminal");
+
+    let occupant_exec_id = insert_execution(&mut source, "entity_flow", workflow_id).await;
+
+    let started = autumn_harvest::execution::start_or_load_workflow_execution(
+        &mut source,
+        allow_duplicate_failed_only_start("entity_flow", workflow_id),
+        None,
+    )
+    .await
+    .expect("AllowDuplicateFailedOnly must resolve against the current occupant");
+    assert!(
+        !started.created,
+        "must attach to the running occupant, not create past it"
+    );
+    assert_eq!(
+        started.exec_id, occupant_exec_id,
+        "must return the current occupant's own identity, not the stale seal's"
+    );
+}
+
 fn allow_duplicate_failed_only_start<'a>(
     workflow_name: &'a str,
     workflow_id: &'a str,

@@ -1339,45 +1339,65 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             WorkflowIdReusePolicy::RejectDuplicate
                 | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
         ) {
-            // A business key can accumulate more than one reconciled seal
-            // over time (fresh review, P1 follow-up). Each repeat run
-            // gets its own row, and any of them may have migrated and
-            // reconciled independently. `started_at DESC` picks the
-            // newest one, the same recency rule
-            // `resolve_execution_id_by_workflow_id` already uses. Without
-            // it, an unordered `LIMIT 1` could return an older seal
-            // instead, attaching to a stale outcome or replacing the
-            // wrong one.
-            let reconciled_seal: Option<WorkflowExecution> = harvest_workflow_executions::table
-                .filter(harvest_workflow_executions::workflow_name.eq(request.workflow_name))
-                .filter(harvest_workflow_executions::workflow_id.eq(request.workflow_id))
-                .filter(harvest_workflow_executions::state.eq("MIGRATED"))
-                .filter(harvest_workflow_executions::migrated_run_terminal_at.is_not_null())
-                .order(harvest_workflow_executions::started_at.desc())
-                .select(WorkflowExecution::as_select())
-                .for_update()
-                .first(&mut *conn)
-                .await
-                .optional()
-                .map_err(database_error)?;
-            if let Some(seal) = reconciled_seal {
-                if request.reuse_policy == WorkflowIdReusePolicy::RejectDuplicate {
-                    return Err(HarvestError::AlreadyExists {
-                        existing_exec_id: ExecutionId::from_uuid(seal.id),
-                        existing_state: seal.state,
-                    });
+            // A reconciled seal is only authoritative when nothing newer
+            // occupies the key (fresh review, P1 follow-up). A run that
+            // started after the seal was released is the real current
+            // occupant. That includes an active run, and one already
+            // terminal but not yet sealed or migrated itself.
+            // `try_load_active_execution_for_update` already answers
+            // exactly that question. It is safe to call again here, even
+            // when the admission-gate block above already did. It is the
+            // same lock, on the same connection, in the same
+            // transaction. When it finds an occupant, skip the seal
+            // check entirely. Let the ordinary insert/conflict path
+            // below resolve the policy against the real occupant instead.
+            let current_occupant = try_load_active_execution_for_update(
+                conn,
+                request.workflow_name,
+                request.workflow_id,
+            )
+            .await?;
+            if current_occupant.is_none() {
+                // A business key can accumulate more than one reconciled
+                // seal over time. Each repeat run gets its own row, and
+                // any of them may have migrated and reconciled
+                // independently. `started_at DESC` picks the newest one,
+                // the same recency rule
+                // `resolve_execution_id_by_workflow_id` already uses.
+                // Without it, an unordered `LIMIT 1` could return an
+                // older seal instead, attaching to a stale outcome or
+                // replacing the wrong one.
+                let reconciled_seal: Option<WorkflowExecution> = harvest_workflow_executions::table
+                    .filter(harvest_workflow_executions::workflow_name.eq(request.workflow_name))
+                    .filter(harvest_workflow_executions::workflow_id.eq(request.workflow_id))
+                    .filter(harvest_workflow_executions::state.eq("MIGRATED"))
+                    .filter(harvest_workflow_executions::migrated_run_terminal_at.is_not_null())
+                    .order(harvest_workflow_executions::started_at.desc())
+                    .select(WorkflowExecution::as_select())
+                    .for_update()
+                    .first(&mut *conn)
+                    .await
+                    .optional()
+                    .map_err(database_error)?;
+                if let Some(seal) = reconciled_seal {
+                    if request.reuse_policy == WorkflowIdReusePolicy::RejectDuplicate {
+                        return Err(HarvestError::AlreadyExists {
+                            existing_exec_id: ExecutionId::from_uuid(seal.id),
+                            existing_state: seal.state,
+                        });
+                    }
+                    if !matches!(seal.effective_terminal_state(), "FAILED" | "CANCELLED") {
+                        return Ok((
+                            StartedWorkflowExecution::from_row(seal, false),
+                            Vec::new(),
+                            tx_deferred_checks,
+                            Vec::new(),
+                        ));
+                    }
+                    // FAILED/CANCELLED: fall through, the INSERT below
+                    // replaces it exactly as `AllowDuplicateFailedOnly`
+                    // already does for any other failed/cancelled prior.
                 }
-                if !matches!(seal.effective_terminal_state(), "FAILED" | "CANCELLED") {
-                    return Ok((
-                        StartedWorkflowExecution::from_row(seal, false),
-                        Vec::new(),
-                        tx_deferred_checks,
-                        Vec::new(),
-                    ));
-                }
-                // FAILED/CANCELLED: fall through, the INSERT below
-                // replaces it exactly as `AllowDuplicateFailedOnly`
-                // already does for any other failed/cancelled prior.
             }
         }
 
