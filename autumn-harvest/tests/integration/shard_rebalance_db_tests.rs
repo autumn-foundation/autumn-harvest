@@ -46,10 +46,11 @@ use autumn_harvest::shard::{ShardRouter, ShardedDbPool, install_global_router};
 use autumn_harvest::shard_rebalance::{
     MigrationOutcome, MigrationPhase, QuiescenceBlocker, abort_migration, activate_target,
     assess_quiescence, begin_migration, commit_cutover, conn_for_execution_forwarded_with_shard,
-    history_fingerprint, list_migration_candidates, load_migration, migrate_execution,
-    migrate_quiescent_executions, migrate_quiescent_executions_after, observe_quiescence,
-    reconcile_migrated_seal_terminality, reconcile_migrated_seals_after, residence_chain,
-    resolve_execution_shard, resume_incomplete_migrations, stage_copy, verify_target_copy,
+    conn_for_shard, history_fingerprint, list_migration_candidates, load_migration,
+    migrate_execution, migrate_quiescent_executions, migrate_quiescent_executions_after,
+    observe_quiescence, reconcile_migrated_seal_terminality, reconcile_migrated_seals_after,
+    residence_chain, resolve_execution_shard, resolve_execution_shard_holding,
+    resume_incomplete_migrations, stage_copy, verify_target_copy,
 };
 use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
@@ -6477,6 +6478,32 @@ async fn a_retry_successor_migrated_to_another_shard_still_resolves_to_its_live_
     );
 }
 
+/// Reduces, but cannot by itself eliminate, a pre-existing race on
+/// `GLOBAL_SHARDED_POOL` shared by this file's roughly 180 tests.
+///
+/// `ShardedDbPool::from_map` installs its result into that process global as
+/// a side effect, and almost every test in this file calls it. That churn is
+/// harmless to a test that only ever reads its OWN `pool` value back through
+/// an explicit parameter. It is not harmless to a test that calls a
+/// `_best_effort` entry point, such as `cancel_live_attempt` or
+/// `send_signal_to_live_attempt`. Those read the global directly, with no
+/// parameter of their own to shield them. An unrelated concurrently running
+/// test can install a DIFFERENT pool in the middle of such a call. That
+/// other pool points at different databases, producing a spurious
+/// `NotFound` instead of the outcome under test.
+///
+/// This lock only serializes the handful of tests below against EACH OTHER.
+/// It cannot protect them from the other ~180, which do not take it. A
+/// complete fix needs every test in the file to cooperate. That is out of
+/// scope here. This narrows the window for the tests this change adds,
+/// matching the exposure the file's two pre-existing `_best_effort` tests
+/// already carried before this change.
+///
+/// A `tokio::sync::Mutex` is used, not `std::sync::Mutex`. The guard is held
+/// across the awaits between installing the pool and finishing the
+/// assertions that depend on it.
+static GLOBAL_SHARDED_POOL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Issue #1596 follow-up review (comment 4052389744): resolving a migrated
 /// hop correctly is not enough on its own. `resolve_live_attempt`, and the
 /// best-effort resolvers `cancel_live_attempt` etc. build on, read the
@@ -6488,6 +6515,9 @@ async fn a_retry_successor_migrated_to_another_shard_still_resolves_to_its_live_
 /// still pointed at the successor's origin-side `MIGRATED` seal, not its
 /// live copy. This pins the fix for the write path: the cancel must
 /// actually land on the live copy on its real (migrated-to) shard.
+///
+/// Not gated on `GLOBAL_SHARDED_POOL_TEST_LOCK`: it predates this change,
+/// and already carries the shared-global exposure described above.
 #[tokio::test]
 async fn a_cancel_against_a_migrated_retry_successor_reaches_its_live_shard() {
     let shards = setup_two_shards().await;
@@ -6599,6 +6629,9 @@ async fn a_cancel_against_a_migrated_retry_successor_reaches_its_live_shard() {
 /// against that seal instead of the live copy on TARGET. This pins the
 /// fix: `bind_to_shard_best_effort` must follow the seal's forwarding
 /// pointer before trusting presence.
+///
+/// Not gated on `GLOBAL_SHARDED_POOL_TEST_LOCK`: it predates this change,
+/// and already carries the shared-global exposure described above.
 #[tokio::test]
 async fn a_signal_against_a_migrated_retry_successor_reaches_its_live_shard() {
     let shards = setup_two_shards().await;
@@ -6780,5 +6813,276 @@ async fn resolve_live_attempt_follows_the_seeds_own_migration_before_walking_ret
     assert_eq!(
         resolved_shard, TARGET,
         "the resolved row must be reported on the shard it actually lives on"
+    );
+}
+
+/// A staged `MIGRATING` copy must carry its migration origin from the moment
+/// it exists, not only after `activate_target` runs.
+///
+/// `terminate_workflow_execution` is an operator override with no state
+/// precondition. It accepts a `MIGRATING` row. An operator can therefore
+/// force-seal a staged target `TERMINATED` inside the window between the
+/// source's cutover commit and this target's own activation.
+///
+/// Retention on the target shard treats `migrated_from_shards` non-empty as
+/// proof this row must never be hard-deleted with no trace. A source seal
+/// can still be forwarding to it. Before this fix, that array was populated
+/// only by `activate_target`'s own update. A copy terminated in that window
+/// looked exactly like a row that never migrated at all. Retention could
+/// then delete it, and the source's seal would never resolve again.
+#[tokio::test]
+async fn a_force_terminated_staged_copy_still_carries_its_migration_origin() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "force-terminated-before-activation").await;
+
+    let mut source = shards.source().await;
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    let mut target = shards.target().await;
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+
+    // Force-terminate the staged copy directly, exactly as
+    // `terminate_workflow_execution`'s unconditional `UPDATE` does, without
+    // ever calling `activate_target`.
+    diesel::sql_query("UPDATE harvest_workflow_executions SET state = 'TERMINATED' WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut target)
+        .await
+        .expect("force-terminate the staged copy");
+
+    let row: ScalarText = diesel::sql_query(
+        "SELECT migrated_from_shards::text AS value FROM harvest_workflow_executions \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(&mut target)
+    .await
+    .expect("read the terminated copy's residence history");
+    let history: Vec<i32> = row
+        .value
+        .as_deref()
+        .map(|raw| serde_json::from_str(raw).expect("valid jsonb array"))
+        .unwrap_or_default();
+
+    assert_eq!(
+        history,
+        vec![SOURCE.as_i32()],
+        "a copy force-terminated before activation must already show it was staged \
+         off SOURCE -- retention's tombstone check must not depend on activation \
+         having run"
+    );
+}
+
+/// `resolve_execution_shard_holding` must report the shard a hop's read
+/// actually used, not the id's raw encoded shard, whenever the two differ.
+///
+/// An `ExecutionId` can encode a shard with no configured pool on this node.
+/// Routing still reaches the row through `pool_for`'s default-pool fallback
+/// when that fallback happens to be the SAME physical pool `held_shard`
+/// already names. Before this fix the function returned the unconfigured
+/// encoded shard in that case, even though the read had just succeeded
+/// through `held_shard`'s own connection. A caller that then calls
+/// `conn_for_shard` on the returned value -- exactly what `walk_retry_chain`
+/// does -- fails with `ShardUnavailable` moments after a successful read.
+#[tokio::test]
+async fn resolve_execution_shard_holding_normalizes_an_unconfigured_origin_to_the_held_shard() {
+    let shards = setup_two_shards().await;
+    // A single-pool `ShardedDbPool`: only SOURCE has a configured pool, and
+    // it is also the default shard `pool_for` falls back to.
+    let single = ShardedDbPool::from_map(
+        std::collections::BTreeMap::from([(SOURCE, build_pool(&shards.source_url))]),
+        SOURCE,
+    );
+    let unconfigured = ShardId::new(97);
+    let exec_id = ExecutionId::new_for_shard(unconfigured);
+    let mut conn = shards.source().await;
+    insert_execution_with_id(
+        &mut conn,
+        "entity_flow",
+        "unconfigured-origin",
+        exec_id,
+        SOURCE,
+    )
+    .await;
+
+    let resolved = resolve_execution_shard_holding(&mut conn, &single, exec_id, SOURCE)
+        .await
+        .expect("the row is reachable through the default-pool fallback");
+    assert_eq!(
+        resolved, SOURCE,
+        "must report the shard the read actually used, not the unconfigured \
+         encoded shard"
+    );
+    // A caller must be able to act on the returned value immediately, the
+    // same way `walk_retry_chain` checks out a connection for it.
+    let _checked_out = conn_for_shard(&single, resolved)
+        .await
+        .expect("the normalized shard must be a real, checkoutable pool");
+}
+
+#[derive(Debug, Default)]
+struct NoMetrics;
+impl autumn_harvest::telemetry::MetricsRecorder for NoMetrics {}
+
+/// `send_signal_to_live_attempt` must not deadlock a documented
+/// pool-size-one shard when the live attempt it resolves has moved there.
+///
+/// Fresh review, P1 (comment 4054355805). `resolve_live_attempt_id_best_effort`
+/// checks out a connection for the live attempt's shard whenever it differs
+/// from the caller's own. `send_signal_to_live_attempt` discarded that
+/// checkout under a `_`-prefixed binding without dropping it, so it stayed
+/// open for the rest of the call. `send_signal_from_resolved` then binds to
+/// the SAME shard again to deliver the signal. On the documented size-one
+/// pool this configuration supports, the second checkout can never be
+/// satisfied while the first is still held.
+#[tokio::test]
+async fn send_signal_to_live_attempt_does_not_deadlock_a_capacity_one_target_pool() {
+    let _global_pool_guard = GLOBAL_SHARDED_POOL_TEST_LOCK.lock().await;
+    let shards = setup_two_shards().await;
+
+    // `original` fails and its retry successor is inserted where it always
+    // starts -- on `original`'s own shard, SOURCE. That RETRY, not
+    // `original` itself, is then independently migrated onward to TARGET.
+    // This is the shape the finding describes: a live attempt reached only
+    // through the retry chain, whose OWN residence has moved.
+    let mut source = shards.source().await;
+    let original = insert_execution(&mut source, "entity_flow", "signal-deadlock").await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(original.as_uuid())
+    .execute(&mut source)
+    .await
+    .expect("seal the original FAILED");
+    let retry = insert_execution_with_id(
+        &mut source,
+        "entity_flow",
+        "signal-deadlock-retry",
+        ExecutionId::new_for_shard(SOURCE),
+        SOURCE,
+    )
+    .await;
+    append_history(&mut source, retry, &[started(json!({"seed": 1}))]).await;
+    park_on_timer(&mut source, retry).await;
+    diesel::sql_query("UPDATE harvest_workflow_executions SET retry_of_exec_id = $1 WHERE id = $2")
+        .bind::<diesel::sql_types::Uuid, _>(original.as_uuid())
+        .bind::<diesel::sql_types::Uuid, _>(retry.as_uuid())
+        .execute(&mut source)
+        .await
+        .expect("link the retry to the failed original");
+    drop(source);
+
+    migrate_execution(&shards.pool, retry, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate the retry onward to TARGET");
+
+    // A fresh `ShardedDbPool` with TARGET behind a capacity-ONE pool -- a
+    // documented, supported configuration -- installed globally, exactly as
+    // `send_signal_to_live_attempt`'s internal `_best_effort` resolution
+    // reads it. Any routing bug that checks out two connections against it
+    // at once shows up as a bounded stall here, not a silent pass.
+    let _capped_pool = ShardedDbPool::from_map(
+        std::collections::BTreeMap::from([
+            (SOURCE, build_pool(&shards.source_url)),
+            (TARGET, build_pool_capacity_one(&shards.target_url)),
+        ]),
+        SOURCE,
+    );
+
+    let mut caller_conn = shards.source().await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        autumn_harvest::signal::send_signal_to_live_attempt(
+            &mut caller_conn,
+            original,
+            "wake",
+            json!({}),
+            None,
+        ),
+    )
+    .await
+    .expect(
+        "must not stall: the resolver's own checkout must be released before \
+         delivery binds to the same shard again",
+    )
+    .expect("delivery must succeed against the retry's live copy on TARGET");
+
+    assert_eq!(
+        result.target, retry,
+        "the signal must route to the retry's live copy, not the failed original"
+    );
+    assert!(
+        result.delivered,
+        "a fresh signal against a running attempt must be delivered"
+    );
+}
+
+/// `cancel_live_attempt` must not deadlock a documented pool-size-one shard
+/// when its own redrive loop re-resolves the live attempt.
+///
+/// Fresh review, P1 follow-up (comment 4054355812). A cancel against the
+/// migrated attempt can fail, and the loop then calls
+/// `resolve_live_attempt_id_best_effort` again to check for a chain advance.
+/// `rebind` still holds that migrated attempt's shard connection at that
+/// point. On the documented size-one pool this configuration supports, the
+/// second checkout could never be satisfied while the first was still held.
+/// The terminate, pause, and resume loops share the exact same pattern and
+/// the same fix.
+#[tokio::test]
+async fn cancel_live_attempt_does_not_deadlock_a_capacity_one_target_pool() {
+    let _global_pool_guard = GLOBAL_SHARDED_POOL_TEST_LOCK.lock().await;
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "cancel-redrive-deadlock").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    // Seal the live copy FAILED with no successor. A cancel against it
+    // errors "already terminal". The redrive branch then re-resolves the
+    // SAME row -- exactly the shape needing a second TARGET checkout while
+    // the first one is still held.
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("seal the migrated copy FAILED");
+    drop(target);
+
+    let _capped_pool = ShardedDbPool::from_map(
+        std::collections::BTreeMap::from([
+            (SOURCE, build_pool(&shards.source_url)),
+            (TARGET, build_pool_capacity_one(&shards.target_url)),
+        ]),
+        SOURCE,
+    );
+
+    let mut caller_conn = shards.source().await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        autumn_harvest::execution::cancel_live_attempt(
+            &mut caller_conn,
+            exec_id,
+            "test cancel",
+            &NoMetrics,
+        ),
+    )
+    .await
+    .expect(
+        "must not stall: the redrive branch must drop its current rebind before \
+         re-resolving the same shard",
+    );
+
+    let error = result.expect_err("a FAILED row with no successor must report already-terminal");
+    assert!(
+        error.to_string().contains("already terminal"),
+        "expected the terminal-state refusal, got {error:?}"
     );
 }

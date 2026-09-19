@@ -275,8 +275,14 @@ pub async fn send_signal_to_live_attempt(
     // (issue #1596 follow-up review, comment 4052389744). Passing `conn`
     // through unchanged here is correct even when the resolve above hopped
     // to a different shard than `conn` currently holds.
-    let (target, _rebind) =
+    let (target, rebind) =
         crate::execution::resolve_live_attempt_id_best_effort(conn, exec_id).await?;
+    // Drop this checkout before `send_signal_from_resolved` binds again for
+    // the same shard (fresh review, P1). `rebind` is not reused below: this
+    // call passes `conn` and lets `send_signal_from_resolved` rebind on its
+    // own. Holding both open at once can deadlock a pool-size-one shard
+    // against itself.
+    drop(rebind);
     send_signal_from_resolved(conn, exec_id, target, signal_name, payload, idempotency_key).await
 }
 

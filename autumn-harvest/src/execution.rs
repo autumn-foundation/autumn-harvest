@@ -4100,6 +4100,15 @@ async fn load_execution_row(
 ///
 /// This is deliberately **never** consulted after an operation that DID take
 /// effect: re-driving a delivered signal would double-deliver it.
+///
+/// Every redrive site below drops its current `rebind` before calling
+/// [`resolve_live_attempt_id_best_effort`] again (fresh review, P1
+/// follow-up). The attempt just acted on can have moved shards, so `rebind`
+/// still holds that shard's connection open. A migrated attempt's retry
+/// successor is usually inserted on that SAME shard. Re-resolving while the
+/// old connection is still held would then need a second connection to that
+/// same pool. The documented single-connection configuration cannot supply
+/// one, so the resolve blocks until checkout times out instead of redriving.
 #[must_use]
 pub const fn redrive_target(acted_on: ExecutionId, freshly_resolved: ExecutionId) -> bool {
     acted_on.as_uuid().as_u128() != freshly_resolved.as_uuid().as_u128()
@@ -4154,6 +4163,7 @@ pub async fn cancel_live_attempt(
         match result {
             Ok(result) => return Ok(result),
             Err(error) => {
+                drop(rebind.take());
                 let (fresh, fresh_rebind) = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
                     .unwrap_or((target, None));
@@ -4218,6 +4228,7 @@ pub async fn terminate_live_attempt(
                 return Ok(result);
             }
             Ok(result) => {
+                drop(rebind.take());
                 let (fresh, fresh_rebind) = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
                     .unwrap_or((target, None));
@@ -4228,6 +4239,7 @@ pub async fn terminate_live_attempt(
                 rebind = fresh_rebind;
             }
             Err(error) => {
+                drop(rebind.take());
                 let (fresh, fresh_rebind) = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
                     .unwrap_or((target, None));
@@ -4286,6 +4298,7 @@ pub async fn pause_live_attempt(
         match result {
             Ok(result) => return Ok(result),
             Err(error) => {
+                drop(rebind.take());
                 let (fresh, fresh_rebind) = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
                     .unwrap_or((target, None));
@@ -4345,6 +4358,7 @@ pub async fn resume_live_attempt(
                 return Ok(result);
             }
             Ok(result) => {
+                drop(rebind.take());
                 let (fresh, fresh_rebind) = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
                     .unwrap_or((target, None));
@@ -4355,6 +4369,7 @@ pub async fn resume_live_attempt(
                 rebind = fresh_rebind;
             }
             Err(error) => {
+                drop(rebind.take());
                 let (fresh, fresh_rebind) = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
                     .unwrap_or((target, None));

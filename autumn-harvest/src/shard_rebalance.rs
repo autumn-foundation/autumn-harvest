@@ -1412,6 +1412,32 @@ mod db {
                 .map_err(database_error)?;
             }
 
+            // `migrated_from_shards` gets its new hop stamped HERE, at staging
+            // time. It is not deferred to `activate_target`'s
+            // `MIGRATING -> RUNNING` update.
+            //
+            // Termination is an operator override with no state-precondition
+            // filter. It accepts a `MIGRATING` row and can seal this copy
+            // `TERMINATED` before activation ever runs. A history appended
+            // only on activation would then leave the array empty. That is
+            // indistinguishable, to retention, from a row that never moved.
+            // Stamping the hop in this same INSERT closes that window
+            // completely, for every staged copy, from the instant it exists.
+            //
+            // The appended value is this row's OWN current `shard_id`. It is
+            // read back out of `$1`, the same `to_jsonb(e)` snapshot the
+            // rest of the copy is built from. At staging time that is
+            // unambiguous: the row has not moved yet, so its `shard_id`
+            // names exactly the shard being staged FROM.
+            //
+            // `NULLIF(..., 'null'::jsonb)` guards a SQL-NULL column, not an
+            // absent key. `to_jsonb(e)` renders a NULL `migrated_from_shards`
+            // column as the JSON literal `null`, still present under its
+            // key. That value is not SQL NULL, so a plain `COALESCE` never
+            // sees it and passes it straight through. Concatenating an
+            // array onto a JSON `null` scalar with `||` does not error. It
+            // silently produces `[null, shard_id]`. Any later reader then
+            // rejects that as an undecodable residence history.
             diesel::sql_query(
                 "INSERT INTO harvest_workflow_executions \
                          SELECT * FROM jsonb_populate_record( \
@@ -1420,7 +1446,12 @@ mod db {
                                  'shard_id', $2::int, \
                                  'state', 'MIGRATING', \
                                  'migrated_to_shard', $3::int, \
-                                 'migrated_at', $4::timestamptz))",
+                                 'migrated_at', $4::timestamptz, \
+                                 'migrated_from_shards', \
+                                     COALESCE( \
+                                         NULLIF($1::jsonb -> 'migrated_from_shards', 'null'::jsonb), \
+                                         '[]'::jsonb) \
+                                         || to_jsonb(($1::jsonb ->> 'shard_id')::int)))",
             )
             .bind::<Jsonb, _>(&execution)
             .bind::<Integer, _>(target_shard.as_i32())
@@ -2705,12 +2736,9 @@ mod db {
         target: &mut AsyncPgConnection,
         exec_id: ExecutionId,
     ) -> HarvestResult<()> {
-        // `staged_task` and the shard this copy came FROM, in one read. The
-        // source shard is taken from the migration record rather than from the
-        // source row's own `shard_id`, so a resume long after the cutover still
-        // appends the shard the migration actually moved the run off.
+        // `staged_task`, captured verbatim at stage time and restored here.
         let staged: ActivationRow = diesel::sql_query(
-            "SELECT staged_task AS payload, source_shard FROM harvest_shard_migrations \
+            "SELECT staged_task AS payload FROM harvest_shard_migrations \
               WHERE execution_id = $1",
         )
         .bind::<SqlUuid, _>(exec_id.as_uuid())
@@ -2724,22 +2752,18 @@ mod db {
             ))
         })?;
         let staged_task: Option<Value> = staged.payload;
-        let source_shard: i32 = staged.source_shard;
 
         Box::pin(target.transaction::<(), HarvestError, _>(async |conn| {
             let staged_task = staged_task.clone();
             {
-                // The residence-history append rides on the SAME statement as
-                // the state transition, and inherits its `state = 'MIGRATING'`
-                // guard. That is what makes it exactly-once across the
-                // idempotent re-runs this function is required to tolerate: a
-                // second activation matches zero rows and appends nothing,
-                // instead of growing the array on every resume sweep.
-                //
-                // The copy carried the source's own `migrated_from_shards`
-                // verbatim (the copy is column-list-free), so appending the
-                // source shard here accumulates the full history across any
-                // number of hops without a backwards walk.
+                // `migrated_from_shards` is NOT touched here. `stage_copy`
+                // already stamped this row's new hop into the array, in the
+                // same statement that created the `MIGRATING` copy. The
+                // history is complete from the moment the row exists,
+                // including for a copy force-terminated before this
+                // activation ever runs. Appending again here would double
+                // the entry on every ordinary migration instead of only
+                // closing that gap.
                 //
                 // `migrated_to_shard`/`migrated_at` are CLEARED here. They are
                 // normally already NULL, but on a reverse migration the staged
@@ -2753,14 +2777,10 @@ mod db {
                     "UPDATE harvest_workflow_executions \
                         SET state = 'RUNNING', \
                             migrated_to_shard = NULL, \
-                            migrated_at = NULL, \
-                            migrated_from_shards = \
-                                COALESCE(migrated_from_shards, '[]'::jsonb) \
-                                || to_jsonb($2::int) \
+                            migrated_at = NULL \
                       WHERE id = $1 AND state = 'MIGRATING'",
                 )
                 .bind::<SqlUuid, _>(exec_id.as_uuid())
-                .bind::<Integer, _>(source_shard)
                 .execute(&mut *conn)
                 .await
                 .map_err(database_error)?;
@@ -3961,15 +3981,37 @@ mod db {
             // pool by coincidence. It would then read `conn`'s database in
             // its place, and report a never-inspected hop as resolved
             // (issue #1324, Codex review).
-            let forward = if hop == 0 && !forwarded {
+            //
+            // Each branch also records `actual_shard`: the shard whose
+            // database this hop's read really ran against. It is not always
+            // `current` (fresh review, P2 follow-up). An unconfigured origin
+            // reaches a database only through a default-pool fallback.
+            // That fallback sits on either side of the read: `pool_for`'s
+            // here, or `checkout_entry`'s own inside the "else" branch
+            // below. A resolution that ends at this hop must report the
+            // shard that fallback actually used. Reporting the unconfigured
+            // `current` instead hands the caller a value `conn_for_shard`
+            // cannot open, even though the row was just read successfully.
+            let (forward, actual_shard) = if hop == 0 && !forwarded {
                 if crate::external_target_location::same_underlying_pool(
                     pool.pool_for(current),
                     held_pool,
                 ) {
-                    read_forward(conn, exec_id).await?
+                    // Read on the caller's OWN held connection, so the
+                    // database actually reached is `held_shard`'s, whether
+                    // or not `current` has a configured pool of its own.
+                    (read_forward(conn, exec_id).await?, held_shard)
                 } else {
+                    // A fresh checkout. Mirror `resolve_execution_shard`'s
+                    // own entry-hop normalization: `checkout_entry` falls
+                    // back to the default pool when `current` has none.
+                    let actual = if pool.exact_pool_for(current).is_none() {
+                        pool.default_shard()
+                    } else {
+                        current
+                    };
                     let mut hop_conn = checkout_entry(pool, current).await?;
-                    read_forward(&mut hop_conn, exec_id).await?
+                    (read_forward(&mut hop_conn, exec_id).await?, actual)
                 }
             } else {
                 let Some(shard_pool) = pool.exact_pool_for(current) else {
@@ -3980,14 +4022,14 @@ mod db {
                     });
                 };
                 if crate::external_target_location::same_underlying_pool(shard_pool, held_pool) {
-                    read_forward(conn, exec_id).await?
+                    (read_forward(conn, exec_id).await?, current)
                 } else {
                     let mut hop_conn = checkout(pool, current).await?;
-                    read_forward(&mut hop_conn, exec_id).await?
+                    (read_forward(&mut hop_conn, exec_id).await?, current)
                 }
             };
             match forward {
-                None => return Ok(current),
+                None => return Ok(actual_shard),
                 Some(next) => current = next,
             }
         }
@@ -4089,8 +4131,6 @@ mod db {
     struct ActivationRow {
         #[diesel(sql_type = Nullable<Jsonb>)]
         payload: Option<Value>,
-        #[diesel(sql_type = Integer)]
-        source_shard: i32,
     }
 
     #[derive(diesel::QueryableByName)]
