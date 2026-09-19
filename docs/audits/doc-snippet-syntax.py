@@ -130,8 +130,18 @@ TARGET_GLOBS = [
 # not just matched literally against exactly 3.
 LIST_MARKER = r"(?:[-*+]|\d+[.)])\s+"
 FENCE_DELIM = r"(`{3,}|~{3,})"
-FENCE_OPEN_RE = re.compile(rf"^([\s>]*)((?:{LIST_MARKER})?)([\s>]*){FENCE_DELIM}rust(.*)$")
-FENCE_CLOSE_RE = re.compile(rf"^([\s>]*(?:{LIST_MARKER})?[\s>]*){FENCE_DELIM}\s*$")
+# \s* before "rust": CommonMark trims leading/trailing whitespace from a
+# fence's info string, so "``` rust" (a space before the language) is the
+# same Rust fence as "```rust", not a fence with no recognized language.
+FENCE_OPEN_RE = re.compile(rf"^([\s>]*)((?:{LIST_MARKER})?)([\s>]*){FENCE_DELIM}\s*rust(.*)$")
+# No LIST_MARKER here, unlike the opener: a closing fence line must consist
+# of nothing but its container's indentation/blockquote markers and the
+# delimiter itself. A line like "- ```" inside an still-open block is literal
+# fenced *content* per CommonMark, not a closer — list markers only start a
+# new list item outside of one. Accepting it as a closer as the opener does
+# would end the block early and let whatever comes after (up to a real
+# closer, or a wrong later one) escape checking as if it were never there.
+FENCE_CLOSE_RE = re.compile(rf"^([\s>]*){FENCE_DELIM}\s*$")
 
 
 def _blockquote_depth(prefix: str) -> int:
