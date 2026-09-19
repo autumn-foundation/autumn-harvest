@@ -1430,6 +1430,13 @@ fn parse_jump_event_query_field(raw: Option<&str>) -> (Option<i64>, Option<Strin
 /// or `jump_event` does not abort the page (issue #1627). Each degrades on
 /// its own and reports the bad value. A typo in one field never costs the
 /// operator the other field, or the rest of the page.
+///
+/// A valid `jump_event` also suppresses a bad `event_page`'s error.
+/// `jump_event` alone decides the shown page in that case. Naming the
+/// `event_page` fallback would claim a page other than the one on screen
+/// (Codex review, PR #1652). `dag_detail_ui` applies the same suppression
+/// to `refresh` alongside a bad `node`.
+///
 /// Returns `(event_page, event_page_error, jump_event_error)`.
 fn resolve_workflow_detail_event_page(
     event_page_raw: Option<&str>,
@@ -1443,6 +1450,11 @@ fn resolve_workflow_detail_event_page(
         let jump_zero = (jump - 1).max(0);
         jump_zero / page_size
     });
+    let event_page_error = if jump_event.is_some() {
+        None
+    } else {
+        event_page_error
+    };
     (event_page, event_page_error, jump_event_error)
 }
 
@@ -12170,10 +12182,11 @@ mod tests {
         assert_eq!(parse_jump_event_query_field(Some("   ")), (None, None));
     }
 
-    /// RED -> GREEN: a non-numeric `jump_event` must no longer abort the
-    /// whole `/workflows/{id}` response with axum's bare 400 (issue #1627).
-    /// It degrades to no jump -- `event_page` applies instead -- while
-    /// naming the bad value, matching `parse_dag_node_query_field`.
+    /// GREEN -- the fix under test: a non-numeric `jump_event` no longer
+    /// aborts the whole `/workflows/{id}` response with axum's bare 400
+    /// (issue #1627). It degrades to no jump -- `event_page` applies
+    /// instead -- while naming the bad value, matching
+    /// `parse_dag_node_query_field`.
     #[test]
     fn parse_jump_event_query_field_rejects_non_numeric_text_without_erroring() {
         let (jump_event, error) = parse_jump_event_query_field(Some("not-a-number"));
@@ -12188,6 +12201,14 @@ mod tests {
         );
     }
 
+    /// A negative `jump_event` parses -- it is a well-formed whole number --
+    /// and is clamped to page 0 downstream, not rejected. Matches
+    /// `parse_page_query_field_clamps_negative_values_to_zero`.
+    #[test]
+    fn parse_jump_event_query_field_accepts_negative_values() {
+        assert_eq!(parse_jump_event_query_field(Some("-5")), (Some(-5), None));
+    }
+
     /// `jump_event` wins over `event_page` when both are present and valid.
     #[test]
     fn resolve_workflow_detail_event_page_prefers_a_valid_jump_event() {
@@ -12198,11 +12219,27 @@ mod tests {
         assert_eq!(jump_error, None);
     }
 
+    /// Codex review, PR #1652: a valid `jump_event` must suppress a bad
+    /// `event_page`'s error. `event_page` plays no part in the shown page
+    /// once `jump_event` wins, so naming its fallback ("Showing page 1")
+    /// would contradict the page actually on screen.
+    #[test]
+    fn resolve_workflow_detail_event_page_suppresses_a_moot_event_page_error() {
+        let (page, page_error, jump_error) =
+            resolve_workflow_detail_event_page(Some("not-a-number"), Some("501"), 100);
+        assert_eq!(page, 5, "the valid jump_event alone decides the page");
+        assert_eq!(
+            page_error, None,
+            "a bad event_page must not report once jump_event overrides it"
+        );
+        assert_eq!(jump_error, None);
+    }
+
     /// GREEN -- the fix under test: a non-numeric `event_page` no longer
     /// aborts the page. It degrades to page 0 and reports the bad value,
     /// exactly like the four already-fixed sibling list pages.
     #[test]
-    fn resolve_workflow_detail_event_page_degrades_a_non_numeric_event_page() {
+    fn resolve_workflow_detail_event_page_rejects_non_numeric_event_page_without_erroring() {
         let (page, page_error, jump_error) =
             resolve_workflow_detail_event_page(Some("not-a-number"), None, 100);
         assert_eq!(page, 0);
@@ -12214,12 +12251,46 @@ mod tests {
     /// aborts the page. It degrades to `event_page`'s own value (or 0)
     /// instead, and reports the bad `jump_event` value.
     #[test]
-    fn resolve_workflow_detail_event_page_degrades_a_non_numeric_jump_event() {
+    fn resolve_workflow_detail_event_page_rejects_non_numeric_jump_event_without_erroring() {
         let (page, page_error, jump_error) =
             resolve_workflow_detail_event_page(Some("2"), Some("not-a-number"), 100);
         assert_eq!(page, 2, "falls back to the valid event_page");
         assert_eq!(page_error, None);
         assert!(jump_error.is_some_and(|e| e.contains("not-a-number")));
+    }
+
+    /// A bad `event_page` and a bad `jump_event` at the same time must both
+    /// report, not hide one another. The page still degrades to 0.
+    #[test]
+    fn resolve_workflow_detail_event_page_reports_both_errors_when_both_are_invalid() {
+        let (page, page_error, jump_error) =
+            resolve_workflow_detail_event_page(Some("nope"), Some("also-nope"), 100);
+        assert_eq!(page, 0);
+        assert!(page_error.is_some_and(|e| e.contains("nope")));
+        assert!(jump_error.is_some_and(|e| e.contains("also-nope")));
+    }
+
+    /// A negative `jump_event` degrades to page 0 with no error -- the same
+    /// pre-fix behavior `.max(0)` already gave a negative computed index.
+    #[test]
+    fn resolve_workflow_detail_event_page_clamps_a_negative_jump_event_to_zero() {
+        let (page, page_error, jump_error) =
+            resolve_workflow_detail_event_page(None, Some("-5"), 100);
+        assert_eq!(page, 0);
+        assert_eq!(page_error, None);
+        assert_eq!(jump_error, None);
+    }
+
+    /// `jump_event=0` is out of the documented 1-based range. It is left as
+    /// a lenient alias for the first page, not rejected. This matches the
+    /// pre-fix `(0 - 1).max(0)` arithmetic exactly.
+    #[test]
+    fn resolve_workflow_detail_event_page_treats_jump_event_zero_as_page_zero() {
+        let (page, page_error, jump_error) =
+            resolve_workflow_detail_event_page(None, Some("0"), 100);
+        assert_eq!(page, 0);
+        assert_eq!(page_error, None);
+        assert_eq!(jump_error, None);
     }
 
     #[test]
@@ -16674,6 +16745,41 @@ mod tests {
             label_open < input_pos && input_pos < label_close,
             "the jump_event input must be a descendant of its <label>, not a \
              sibling -- otherwise it has no programmatic accessible name"
+        );
+    }
+
+    /// GREEN -- the fix under test (issue #1627): `event_page_error` and
+    /// `jump_event_error` must render inline, matching
+    /// `render_dead_letter_pagination_shows_page_error`/
+    /// `render_worker_pagination_shows_page_error`.
+    #[test]
+    fn render_workflow_detail_shows_event_page_and_jump_event_errors() {
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let html = render_workflow_detail(
+            &execution,
+            0,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            Some("Invalid page 'nope'; expected a whole number. Showing page 1."),
+            Some("Invalid jump_event 'zap'; expected a whole number. Jump ignored."),
+            None,
+            &WorkflowLogsPanelData::default(),
+        )
+        .into_string();
+        assert!(
+            html.contains("field-error") && html.contains("Invalid page 'nope'"),
+            "the event_page error must render inline: {html}"
+        );
+        assert!(
+            html.contains("Invalid jump_event 'zap'"),
+            "the jump_event error must render inline: {html}"
         );
     }
 
