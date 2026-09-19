@@ -12,9 +12,9 @@
 //!    target concurrently needs its own connection from `dispatch_pool_for`.
 //!    On a single-shard deployment that pool is the same one.
 //!
-//! Neither connection is released until the whole function returns. A shard
-//! pool at or below the retained count (1 or 2) deadlocks forever:
-//! `deadpool` has no acquisition timeout configured anywhere in this crate.
+//! The function releases neither connection until it returns. A shard pool
+//! at or below the retained count (1 or 2) deadlocks forever: `deadpool` has
+//! no acquisition timeout configured anywhere in this crate.
 //!
 //! Each test bounds the call in [`tokio::time::timeout`] so a regression
 //! fails fast instead of hanging the suite.
@@ -202,11 +202,29 @@ async fn build_fixture(max_size: usize) -> Fixture {
     }
 }
 
+/// Assert the target ended up `CANCELLED`, and the job row reached
+/// `Completed` with exactly one counted completion.
+async fn assert_job_and_target_cancelled(url: &str, job_id: Uuid, exec_id: ExecutionId) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
+        .await
+        .expect("connect for assertions");
+    let job = get_batch_job(&mut conn, job_id)
+        .await
+        .expect("load batch job")
+        .expect("batch job row exists");
+    assert_eq!(job.status, "Completed");
+    assert_eq!(job.total, 1);
+    assert_eq!(job.completed, 1);
+    assert_eq!(job.failed, 0);
+    assert_eq!(state_of(&mut conn, exec_id).await, "CANCELLED");
+}
+
 #[tokio::test]
 async fn run_executor_once_does_not_self_deadlock_a_capacity_one_shard_pool() {
-    // Root cause #1: `run_executor_once` holds its job-listing connection
-    // while `process_job` needs a second one from the same pool. A pool of
-    // one connection cannot hand out that second connection.
+    // A pool of one connection cannot hand out a second one. This catches
+    // either root cause alone, or both together. The listing connection,
+    // `owning_conn`, and the dispatch task's own connection each already
+    // outnumber a single slot on their own.
     let fixture = build_fixture(1).await;
 
     let result = tokio::time::timeout(
@@ -216,30 +234,24 @@ async fn run_executor_once_does_not_self_deadlock_a_capacity_one_shard_pool() {
     .await;
 
     let outcome = result.expect(
-        "run_executor_once must not hang: the job-listing connection must be \
-         released before process_job needs a second one from the same pool",
+        "run_executor_once must not hang: no connection may be held across a \
+         checkout of a second one from the same pool",
     );
     outcome.expect("executor tick must succeed");
 
-    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&fixture.url)
-        .await
-        .expect("connect for assertions");
-    let job = get_batch_job(&mut conn, fixture.job_id)
-        .await
-        .expect("load batch job")
-        .expect("batch job row exists");
-    assert_eq!(job.status, "Completed");
-    assert_eq!(job.completed, 1);
-    assert_eq!(job.failed, 0);
-    assert_eq!(state_of(&mut conn, fixture.exec_id).await, "CANCELLED");
+    assert_job_and_target_cancelled(&fixture.url, fixture.job_id, fixture.exec_id).await;
 }
 
 #[tokio::test]
 async fn run_executor_once_does_not_self_deadlock_a_capacity_two_shard_pool() {
-    // Root cause #2: `process_job` holds `owning_conn` (acquired to claim the
-    // job) across the per-target dispatch loop. On a single-shard deployment,
-    // a pool of two connections is already full: the job-listing connection
-    // and `owning_conn` fill it. Nothing is left for the dispatch loop.
+    // This is the exact shape of the originally reported hang. Both root
+    // causes together permanently retain two connections (the listing
+    // connection, then `owning_conn`) before the dispatch loop asks for a
+    // third. That already fills a pool of two, so the dispatch loop's own
+    // checkout never succeeds. A single retained connection always leaves
+    // this pool's second slot free for the dispatch loop. So this test
+    // guards the combined regression. The capacity-one test above catches
+    // either cause alone.
     let fixture = build_fixture(2).await;
 
     let result = tokio::time::timeout(
@@ -254,15 +266,5 @@ async fn run_executor_once_does_not_self_deadlock_a_capacity_two_shard_pool() {
     );
     outcome.expect("executor tick must succeed");
 
-    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&fixture.url)
-        .await
-        .expect("connect for assertions");
-    let job = get_batch_job(&mut conn, fixture.job_id)
-        .await
-        .expect("load batch job")
-        .expect("batch job row exists");
-    assert_eq!(job.status, "Completed");
-    assert_eq!(job.completed, 1);
-    assert_eq!(job.failed, 0);
-    assert_eq!(state_of(&mut conn, fixture.exec_id).await, "CANCELLED");
+    assert_job_and_target_cancelled(&fixture.url, fixture.job_id, fixture.exec_id).await;
 }
