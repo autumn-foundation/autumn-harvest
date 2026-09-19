@@ -277,54 +277,16 @@ fn is_stalled_candidates_statement(row: &StatRow) -> bool {
     q.contains("harvest_signals") && q.contains("fires_at")
 }
 
-/// A literal-valued copy of `status_summary::count_stalled_candidates`'s SQL,
-/// for `EXPLAIN` only. Keep in sync with that function's private
-/// `count_stalled_candidates_query()` (issue #1643).
+/// `count_stalled_candidates_query()`'s `$1`/`$2` placeholders, replaced
+/// with literal values, for `EXPLAIN` only. Reads the same `pub const fn`
+/// `status_summary::count_stalled_candidates` itself calls. This cannot
+/// drift from the real query, unlike a hand-copied second source of truth
+/// (issue #1643, code review). Each placeholder appears exactly once in the
+/// source text, so a plain string replace is unambiguous.
 fn literal_count_stalled_candidates_sql(minutes: i64, cap: i64) -> String {
-    format!(
-        "WITH recent_event_execs AS MATERIALIZED ( \
-             SELECT DISTINCT workflow_exec_id FROM harvest_events \
-             WHERE timestamp >= NOW() - ({minutes} * INTERVAL '1 minute') \
-         ) \
-         SELECT COUNT(*)::BIGINT AS cnt FROM ( \
-             SELECT 1 FROM harvest_workflow_executions e \
-             WHERE e.state IN ('RUNNING', 'SUSPENDED') \
-             AND NOT EXISTS ( \
-                 SELECT 1 FROM recent_event_execs r \
-                 WHERE r.workflow_exec_id = e.id \
-             ) \
-             AND ( \
-                 EXISTS ( \
-                     SELECT 1 FROM harvest_task_queue \
-                     WHERE workflow_exec_id = e.id \
-                     AND state IN ('PENDING','CLAIMED','RUNNING','BACKOFF') \
-                 ) \
-              OR EXISTS ( \
-                     SELECT 1 FROM harvest_workflow_executions c \
-                     WHERE c.parent_id = e.id \
-                     AND c.state NOT IN ( \
-                         'COMPLETED','FAILED','CANCELLED', \
-                         'TIMED_OUT','CONTINUED_AS_NEW','TERMINATED' \
-                     ) \
-                 ) \
-              OR EXISTS ( \
-                     SELECT 1 FROM harvest_signals \
-                     WHERE workflow_exec_id = e.id AND consumed = false \
-                 ) \
-              OR NOT EXISTS ( \
-                     SELECT 1 FROM harvest_timers \
-                     WHERE workflow_exec_id = e.id \
-                     AND fired = false AND fires_at > NOW() \
-                 ) \
-              OR EXISTS ( \
-                     SELECT 1 FROM harvest_timers \
-                     WHERE workflow_exec_id = e.id \
-                     AND fired = false AND fires_at <= NOW() \
-                 ) \
-             ) \
-             LIMIT {cap} \
-         ) t"
-    )
+    autumn_harvest_plugin::status_summary::count_stalled_candidates_query()
+        .replacen("$1", &minutes.to_string(), 1)
+        .replacen("$2", &cap.to_string(), 1)
 }
 
 async fn capture_regime(

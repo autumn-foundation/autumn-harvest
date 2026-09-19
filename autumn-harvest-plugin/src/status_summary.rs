@@ -874,15 +874,17 @@ async fn count_stalled_candidates(
 
 /// SQL text for [`count_stalled_candidates`].
 ///
-/// Pulled into its own function so tests can pin the query shape without a
-/// database (issue #1643).
+/// Pulled into its own function, and `pub`. The in-crate unit tests and the
+/// external perf harness (`tests/status_summary_stalled_perf.rs`) both need
+/// to pin or `EXPLAIN` the exact query text. This avoids a hand-copied
+/// second source of truth that could drift from it (issue #1643).
 ///
 /// The `AND (... future-timer exclusion ...)` block mirrors the
 /// `!include_sleeping` filter in `crate::api::load_stalled_workflows` exactly
 /// (only the correlation alias differs: `e.id` here vs. the qualified
 /// `harvest_workflow_executions.id` there). Keep the two in sync.
 #[must_use]
-const fn count_stalled_candidates_query() -> &'static str {
+pub const fn count_stalled_candidates_query() -> &'static str {
     "WITH recent_event_execs AS MATERIALIZED ( \
          SELECT DISTINCT workflow_exec_id FROM harvest_events \
          WHERE timestamp >= NOW() - ($1 * INTERVAL '1 minute') \
@@ -1523,7 +1525,9 @@ mod tests {
 
     /// Pins the issue #1643 rewrite: the "no recent event" check must read a
     /// `MATERIALIZED` CTE, not a per-row correlated `NOT EXISTS` against
-    /// `harvest_events` directly.
+    /// `harvest_events` directly. The anti-join's full clause (including the
+    /// join column) is checked verbatim, not just its opening tokens, so a
+    /// mis-wired correlation predicate cannot pass silently.
     #[test]
     fn count_stalled_candidates_query_uses_materialized_recent_event_cte() {
         let sql = count_stalled_candidates_query();
@@ -1532,12 +1536,19 @@ mod tests {
             "expected a MATERIALIZED recent_event_execs CTE, got: {sql}"
         );
         assert!(
-            sql.contains("NOT EXISTS ( SELECT 1 FROM recent_event_execs r"),
-            "expected the outer anti-join to probe recent_event_execs, got: {sql}"
+            sql.contains(
+                "NOT EXISTS ( SELECT 1 FROM recent_event_execs r \
+                 WHERE r.workflow_exec_id = e.id )"
+            ),
+            "expected the outer anti-join to probe recent_event_execs by \
+             workflow_exec_id, got: {sql}"
         );
-        assert!(
-            !sql.contains("FROM harvest_events ev"),
-            "expected no direct per-row correlated scan of harvest_events, got: {sql}"
+        assert_eq!(
+            sql.matches("FROM harvest_events").count(),
+            1,
+            "expected exactly one scan of harvest_events -- the CTE's own \
+             base scan, not a second per-row correlated scan under a \
+             different alias, got: {sql}"
         );
     }
 
@@ -1558,6 +1569,12 @@ mod tests {
     /// The future-timer exclusion block must stay byte-identical to the one
     /// in `load_stalled_workflows` (only the correlation alias differs). The
     /// #1643 rewrite must not touch this block.
+    ///
+    /// Checking every gate's own text is not enough. It would still pass if
+    /// every connective were corrupted from `OR` to `AND`. That turns the
+    /// block from "any pending work keeps this stalled" into a
+    /// near-impossible "all conditions must hold". So the `OR` count is
+    /// pinned too.
     #[test]
     fn count_stalled_candidates_query_keeps_every_or_block_gate() {
         let sql = count_stalled_candidates_query();
@@ -1573,5 +1590,11 @@ mod tests {
                 "missing OR-block gate {gate:?} in: {sql}"
             );
         }
+        assert_eq!(
+            sql.matches(" OR ").count(),
+            4,
+            "the OR-block has 5 branches joined by 4 OR connectives; \
+             got: {sql}"
+        );
     }
 }

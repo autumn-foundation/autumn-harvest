@@ -486,10 +486,16 @@ async fn admin_status_localpg_end_to_end() {
     );
     eprintln!("PASS (f) stale-no-other-work: count={}", stalled["count"]);
 
-    // ── (g) an event just inside the window is NOT stalled ──────────────────
+    // ── (g) an event just inside the window is NOT stalled. ─────────────────
+    // This phase uses a wider margin than (h) does. Elapsed time between
+    // this seed's `NOW()` and the query's own `NOW()` only pushes this
+    // event closer to the boundary, never further from it. A slow CI runner
+    // could flip this specific assertion. 300s comfortably absorbs that.
+    // (h) has no such risk in its own direction, so it keeps a tighter
+    // margin.
     reset_and_migrate(&url).await;
     let exec = seed_running_execution(&url, 0).await;
-    seed_event_at_age(&url, exec, 0, WINDOW_SECS - 60).await; // 59 minutes old
+    seed_event_at_age(&url, exec, 0, WINDOW_SECS - 300).await; // 55 minutes old
     let app = build_app(HarvestDbPool::from(build_pool(&url)));
     let (status, body) = get_json(&app, "/admin/status").await;
     assert_eq!(status, StatusCode::OK);
