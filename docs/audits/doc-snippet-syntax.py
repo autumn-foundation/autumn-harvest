@@ -45,17 +45,26 @@ named entries in KNOWN_FRAGMENT_EXCEPTIONS below do, since `ignore` marks a
 block skipped by `rustdoc`, not a block whose Rust syntax stopped mattering.
 
 Each ```rust fenced block is wrapped as the body of its own function,
-`fn __snippet_N() { <block content> }`, and every block from one source
-file is concatenated into a single generated file, which is handed to
-`rustfmt --emit stdout`. Wrapping in a function body — rather than parsing
-as a sequence of top-level items — is deliberate: a fn body accepts local
-item declarations (`#[workflow] async fn ...`, `struct ...`, `use ...`)
-AND bare statements/expressions in the same scope, so one wrapper handles
-both a complete workflow definition and a short expression fragment
-without needing to first classify which kind of block it is. `rustfmt`
-fails on a genuine parse error (`error: expected expression, found ...`)
-and exits 0 on anything syntactically valid, whether or not it was already
-formatted — this script only cares about the former.
+`fn __snippet() { <block content> }`, and handed to `rustfmt --emit
+stdout` **on its own** — one subprocess call per block, not one call per
+file for the whole concatenated corpus. A single shared buffer was tried
+first and dropped: `rustfmt` reports a parse error at whatever line its
+recovery lands on, which for an unclosed brace or an unterminated string
+can be past the block that caused it — even past EOF of the buffer — so
+attributing an error back to "the block whose header line is the closest
+one at or before the error line" silently credited the fault to a later
+block, including an excepted one, and dropped it. Checking one block per
+process is the simplest fix that cannot misattribute: there is only ever
+one block in scope, so any diagnostic is unambiguously its own. Wrapping
+in a function body — rather than parsing as a sequence of top-level items
+— is deliberate: a fn body accepts local item declarations (`#[workflow]
+async fn ...`, `struct ...`, `use ...`) AND bare statements/expressions in
+the same scope, so one wrapper handles both a complete workflow definition
+and a short expression fragment without needing to first classify which
+kind of block it is. `rustfmt` fails on a genuine parse error (`error:
+expected expression, found ...`) and exits 0 on anything syntactically
+valid, whether or not it was already formatted — this script only cares
+about the former.
 
 ## Known, documented exceptions
 
@@ -165,34 +174,11 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
     return blocks
 
 
-def check_file(relpath: str) -> tuple[int, int, list[tuple[str, str, str]]]:
-    """Returns (blocks_checked, blocks_excepted, failures).
-
-    failures is a list of (first_line, rustfmt_location, rustfmt_message).
+def check_block(code: str) -> tuple[str, str] | None:
+    """Runs `rustfmt` on one wrapped block. None if it parses cleanly,
+    else (rustfmt_location, rustfmt_message) for its first diagnostic.
     """
-    text = (REPO_ROOT / relpath).read_text(encoding="utf-8")
-    blocks = find_rust_blocks(text, relpath)
-    if not blocks:
-        return 0, 0, []
-
-    buf_lines: list[str] = []
-    # block_meta[i] = (fn_header_line_in_buf, first_line, excepted)
-    block_meta = []
-    excepted_count = 0
-    for i, code in enumerate(blocks):
-        first_line = first_content_line(code)
-        excepted = (relpath, first_line) in KNOWN_FRAGMENT_EXCEPTIONS
-        if excepted:
-            excepted_count += 1
-        fn_name = f"__snippet_{i}"
-        buf_lines.append(f"fn {fn_name}() {{")
-        fn_header_line = len(buf_lines)
-        buf_lines.extend(code.split("\n"))
-        buf_lines.append("}")
-        buf_lines.append("")
-        block_meta.append((fn_header_line, first_line, excepted))
-
-    wrapped = "\n".join(buf_lines) + "\n"
+    wrapped = "fn __snippet() {\n" + code + "\n}\n"
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".rs", delete=False, encoding="utf-8"
     ) as tf:
@@ -208,27 +194,44 @@ def check_file(relpath: str) -> tuple[int, int, list[tuple[str, str, str]]]:
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
+    if proc.returncode == 0:
+        return None
+    msg, loc = "?", "?"
+    for el in proc.stderr.splitlines():
+        s = el.strip()
+        if s.startswith("error"):
+            msg = s
+        elif s.startswith("-->"):
+            loc = s
+            break
+    return loc, msg
+
+
+def check_file(relpath: str) -> tuple[int, int, list[tuple[str, str, str]]]:
+    """Returns (blocks_checked, blocks_excepted, failures).
+
+    failures is a list of (first_line, rustfmt_location, rustfmt_message).
+    Each block is checked in its own `rustfmt` invocation (see the module
+    docstring's "How a block is checked" for why a shared buffer is wrong):
+    that is what guarantees a diagnostic can never be credited to a
+    different block than the one that produced it.
+    """
+    text = (REPO_ROOT / relpath).read_text(encoding="utf-8")
+    blocks = find_rust_blocks(text, relpath)
+    if not blocks:
+        return 0, 0, []
+
+    excepted_count = 0
     failures: list[tuple[str, str, str]] = []
-    if proc.returncode != 0:
-        err_lines = proc.stderr.splitlines()
-        for j, el in enumerate(err_lines):
-            loc_match = re.search(r":(\d+):\d+$", el.strip())
-            if not (el.strip().startswith("-->") and loc_match):
-                continue
-            err_line_no = int(loc_match.group(1))
-            owner = None
-            for hdr, first_line, excepted in block_meta:
-                if err_line_no >= hdr:
-                    owner = (first_line, excepted)
-                else:
-                    break
-            if owner is None:
-                continue
-            first_line, excepted = owner
-            if excepted:
-                continue
-            msg = err_lines[j - 1].strip() if j > 0 else "?"
-            failures.append((first_line, el.strip(), msg))
+    for code in blocks:
+        first_line = first_content_line(code)
+        if (relpath, first_line) in KNOWN_FRAGMENT_EXCEPTIONS:
+            excepted_count += 1
+            continue
+        result = check_block(code)
+        if result is not None:
+            loc, msg = result
+            failures.append((first_line, loc, msg))
 
     return len(blocks), excepted_count, failures
 
