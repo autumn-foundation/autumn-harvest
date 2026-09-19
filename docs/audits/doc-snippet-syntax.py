@@ -117,7 +117,18 @@ TARGET_GLOBS = [
 # properly, and a hand-rolled line scanner is what stays within that.
 LIST_MARKER = r"(?:[-*+]|\d+[.)])\s+"
 FENCE_OPEN_RE = re.compile(rf"^([\s>]*(?:{LIST_MARKER})?[\s>]*)```rust(.*)$")
-FENCE_CLOSE_RE = re.compile(rf"^[\s>]*(?:{LIST_MARKER})?[\s>]*```\s*$")
+FENCE_CLOSE_RE = re.compile(rf"^([\s>]*(?:{LIST_MARKER})?[\s>]*)```\s*$")
+
+
+def _blockquote_depth(prefix: str) -> int:
+    """Counts ">" markers in a captured fence prefix, to tell a closing fence
+    at the opener's own blockquote depth from an unrelated one deeper or
+    shallower — for example a plain, unquoted "```" that happens to follow a
+    "> ```rust" opener, which is not that opener's close. A list marker does
+    not similarly need tracking: unlike ">", it is not repeated on every line
+    of the container, so it never appears on a closing fence line at all.
+    """
+    return prefix.count(">")
 
 # The only edition this corpus ever tells a reader to use: chapter 1's
 # Cargo.toml block pins `edition = "2021"` for the tutorial project every
@@ -189,9 +200,14 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
     anchored on an unindented close silently drops those. The same leading
     indentation/">" prefix the opening fence carried is stripped from every
     content line too, so a blockquote's "> " does not end up inside the Rust
-    source handed to `rustfmt`. Exits with an error if an opening fence has
-    no matching close before EOF: a block dropped that way would shrink the
-    "corpus" count with no signal that it happened.
+    source handed to `rustfmt`. A closing fence only ends the block if it is
+    at the same blockquote depth as the opener — otherwise an unrelated
+    fence at a different depth (a later top-level "```", say) could get
+    mistaken for this one's close and swallow everything up to it as this
+    block's content. Exits with an error if an opening fence has no matching
+    close before EOF: a block dropped that way would shrink the "corpus"
+    count with no signal that it happened, and so would one whose real close
+    was skipped over for depth mismatch with nothing compatible after it.
     """
     lines = text.split("\n")
     blocks: list[str] = []
@@ -203,12 +219,14 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
             i += 1
             continue
         prefix = m.group(1)
+        depth = _blockquote_depth(prefix)
         start_line = i + 1
         i += 1
         code_lines: list[str] = []
         closed = False
         while i < n:
-            if FENCE_CLOSE_RE.match(lines[i]):
+            cm = FENCE_CLOSE_RE.match(lines[i])
+            if cm and _blockquote_depth(cm.group(1)) == depth:
                 closed = True
                 i += 1
                 break
