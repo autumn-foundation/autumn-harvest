@@ -29,23 +29,28 @@ active-execution count, which is deployment-specific.
   `idx_harvest_events_recent_by_timestamp (timestamp, workflow_exec_id)`,
   supports the CTE's timestamp-range scan (neither existing `harvest_events`
   index leads with `timestamp`).
-* **Characterized against two regimes**, both with the same 3,000
-  active executions (2,970 healthy, 30 true positives) and the same
-  50,000-row terminal-execution dead weight, differing only in how many
-  recent events each healthy execution emits:
+* **Characterized against three regimes**, all with the same 3,000
+  active executions (2,970 healthy, 30 true positives):
 
-  | regime | events per healthy execution | recent-window rows | before (buffers) | after (buffers) | change |
-  |:--|--:|--:|--:|--:|--:|
-  | execution-heavy (issue's own fixture shape) | 1 | ~2,970 | 12,175 | 267 | **-97.8%** |
-  | event-write-heavy | 100 | ~297,000 | 12,175 | 5,724 | **-53.0%** |
+  | regime | events per healthy execution | terminal-execution event age | recent-window rows | before (buffers) | after (buffers) | change |
+  |:--|--:|--:|--:|--:|--:|--:|
+  | execution-heavy (issue's own fixture shape) | 1 | 30 days (out of window) | ~2,970 | 12,175 | 267 | **-97.8%** |
+  | event-write-heavy | 100 | 30 days (out of window) | ~297,000 | 12,175 | 5,724 | **-53.0%** |
+  | terminal-churn (PR review, issue #1643) | 1 | 5 minutes (in window) | ~152,970 | 12,175 | 2,094 | **-82.8%** |
 
   The rewrite is a large win in the execution-heavy regime (the common
   case: most deployments have far more active executions than any one of
   them emits events per minute) and remains a smaller but real win even at
-  100x the per-execution event-write rate. It is not a net loss in either
-  measured regime — the concern issue #1643 raised did not materialize at
-  either tested scale, though a fleet with an even higher event-write rate
-  relative to active-execution count could still cross over (see
+  100x the per-execution event-write rate, or when every one of 50,000
+  terminal executions finishes inside the no-progress window at once (the
+  terminal-churn regime — code review correctly pointed out the first two
+  regimes' fixture hid this axis by placing terminal-execution events well
+  outside the window; see
+  [Profile: terminal-churn regime](#profile-terminal-churn-regime)). It is
+  not a net loss in any measured regime — the concern issue #1643 raised
+  did not materialize at any tested scale, though a fleet with an even
+  higher event-write rate relative to active-execution count could still
+  cross over (see
   [Where this could stop being a win](#where-this-could-stop-being-a-win)).
 * **Result-equivalence**: the true-positive/healthy split (30 stalled, 0 of
   the 2,970 healthy rows) is asserted identical in both regimes and in a
@@ -88,14 +93,24 @@ database is created off it per regime, migrated via
 testcontainers instead (the harness falls back automatically when
 `HARVEST_TEST_DATABASE_URL` is unset).
 
-The "before" row was captured by checking out `count_stalled_candidates`'s
-pre-#1643 SQL and temporarily removing the new index, then running the
-identical harness — the harness itself only calls the public HTTP entry
-point and reads `pg_stat_statements`, so it is unchanged between the two
-runs; only the code and schema behind the endpoint moved. The pre-fix
-query's own `EXPLAIN (ANALYZE, BUFFERS)` plan (`Nested Loop Anti Join`,
-`loops=3000`) is reproduced in issue #1643 itself and is not re-captured
-here.
+The "before" row for the execution-heavy and event-write-heavy regimes was
+captured by checking out `count_stalled_candidates`'s pre-#1643 SQL and
+temporarily removing the new index, then running the identical harness —
+the harness itself only calls the public HTTP entry point and reads
+`pg_stat_statements`, so it is unchanged between the two runs; only the
+code and schema behind the endpoint moved. The pre-fix query's own
+`EXPLAIN (ANALYZE, BUFFERS)` plan (`Nested Loop Anti Join`, `loops=3000`)
+is reproduced in issue #1643 itself and is not re-captured here.
+
+The terminal-churn regime's "before" row was added after the other two
+(code review), once the harness already read the post-fix query via the
+new `pub` `count_stalled_candidates_query()`. Reverting the crate to
+capture it through the same HTTP path would have required a second full
+recompile cycle for one number, so it was captured directly: the identical
+fixture seeded via raw SQL against a `test_init_sql()`-migrated database,
+then `EXPLAIN (ANALYZE, BUFFERS)` of the pre-#1643 query text with the
+same bound values (`minutes=60`, `cap=51`). See
+`docs/perf-artifacts/status-summary-stalled-cte/before-terminal-churn-explain.txt`.
 
 ## Profile: execution-heavy regime
 
@@ -157,24 +172,61 @@ pre-fix per-row probe's 12,175. This is the planner working as intended,
 not a missing index: an index cannot make a majority-selectivity range scan
 cheaper than reading the table.
 
+## Profile: terminal-churn regime
+
+The first two regimes' terminal-execution population (50,000 `COMPLETED`
+executions) carries events dated 30 days in the past — well outside the
+window, dead weight for the `state` filter to skip. Code review on this PR
+pointed out that this hides a real cost axis: `recent_event_execs` scans
+`harvest_events` by timestamp alone, with no `state` filter, so a terminal
+execution's events cost exactly as much to scan as an active execution's
+do, if they happen to be recent. A deployment where many workflows finish
+inside the no-progress window — a burst of completions, not a steady
+trickle — inflates the window this way even though none of those
+executions can ever be a stalled candidate.
+
+This regime recreates that directly: the same 50,000 terminal executions,
+but their events are dated 5 minutes ago instead of 30 days, so the entire
+152,970-row `harvest_events` table falls inside the 60-minute window
+(`docs/perf-artifacts/status-summary-stalled-cte/after-terminal-churn-explain.txt`):
+
+```
+CTE recent_event_execs
+    -> HashAggregate (actual rows=52970 loops=1)
+          Buffers: shared hit=1889
+          -> Seq Scan on harvest_events (actual rows=152970 loops=1)
+                Filter: (timestamp >= (now() - '01:00:00'::interval))
+                Rows Removed by Filter: 30
+```
+
+Total: 2,094 buffers, an 82.8% reduction from the pre-fix 12,175 — still a
+large win even at this regime's extreme (100% of the table inside the
+window at once), though visibly worse than the execution-heavy regime's
+267 buffers for the identical active population. The mechanism code review
+named is real and now measured, not hypothetical; it did not flip the
+result at this scale.
+
 ## Where this could stop being a win
 
-Both regimes hold active-execution count constant (3,000) and vary only
-per-execution event-write rate. The two data points suggest the crossover
-is roughly where recent-window rows approach ~200x the active-execution
-count (interpolating: ~267 buffers at ~1x, ~5,724 buffers at ~100x, versus
-a constant ~12,175 pre-fix) — a fleet with active executions in the
-thousands but *extreme* per-execution write rates (tens of thousands of
-events per minute per execution) could tip the balance back. This is an
-approximation from two measured points, not an exhaustively characterized
-curve. A deployment with a workload shape far outside both regimes measured
-here should re-run this harness against its own fixture shape before
-relying on this rewrite being a win.
+All three regimes hold active-execution count constant (3,000) and vary
+only how many *other* rows fall inside the recent-events window —
+either from chattier active executions (event-write-heavy) or from a burst
+of terminal-execution completions (terminal-churn). Interpolating the
+three points (267 buffers at ~2,970 window rows, 2,094 at ~152,970, 5,724
+at ~297,000, versus a constant ~12,175 pre-fix) puts the crossover roughly
+where window rows approach 200,000-250,000 for this exact fixture shape —
+a fleet combining thousands of active executions with both high per-
+execution write rates AND high completion churn could tip the balance
+back. This is an approximation from three measured points on one fixture
+shape, not an exhaustively characterized curve. A deployment whose
+workload diverges materially from all three regimes measured here should
+re-run this harness against its own fixture shape before relying on this
+rewrite being a win.
 
 ## Equivalence
 
-Both regimes return `stalled_count = 30` — every seeded true positive, none
-of the 2,970 healthy executions — asserted directly in
+All three regimes return `stalled_count = 30` — every seeded true
+positive, none of the healthy executions — asserted directly in
 `capture_regime`'s evidence-capture path. Boundary conditions (an event
 just inside/just outside the 60-minute default window) and multiplicity
 (an old event coexisting with a fresh one on the same execution) are

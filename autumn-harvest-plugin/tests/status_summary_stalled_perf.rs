@@ -148,7 +148,16 @@ const WINDOW_MINUTES: i64 = 60;
 /// execution-heavy regime (1) from the event-write-heavy regime (100).
 /// Everything else — active-execution count, OR-block shape, true-positive
 /// count — is held constant. Only write volume changes between runs.
-async fn seed_fixture(conn: &mut AsyncPgConnection, events_per_healthy: i64) {
+/// `terminal_age` is a Postgres `INTERVAL` literal (e.g. `"30 days"` or
+/// `"5 minutes"`) for the terminal-execution population's event age. A
+/// recent value recreates a high-churn deployment: many workflows finish
+/// inside the no-progress window (issue #1643, code review). The default
+/// regimes instead use a well-outside-the-window history.
+async fn seed_fixture_with_terminal_age(
+    conn: &mut AsyncPgConnection,
+    events_per_healthy: i64,
+    terminal_age: &str,
+) {
     conn.batch_execute(&format!(
         "INSERT INTO harvest_workflow_executions (
              id, workflow_name, workflow_id, run_id, shard_id, state, input,
@@ -160,7 +169,7 @@ async fn seed_fixture(conn: &mut AsyncPgConnection, events_per_healthy: i64) {
          FROM generate_series(1, {TERMINAL_COUNT}) AS gs;
 
          INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp)
-         SELECT e.id, s, 'WorkflowStarted', '{{}}'::jsonb, NOW() - INTERVAL '30 days'
+         SELECT e.id, s, 'WorkflowStarted', '{{}}'::jsonb, NOW() - INTERVAL '{terminal_age}'
          FROM harvest_workflow_executions e
          CROSS JOIN generate_series(0, 2) AS s
          WHERE e.workflow_name = 'stalled_perf_terminal';
@@ -293,6 +302,7 @@ async fn capture_regime(
     admin_url: &str,
     label: &str,
     events_per_healthy: i64,
+    terminal_age: &str,
     out_dir: &std::path::Path,
 ) {
     let db_name = unique("status_summary_stalled_perf");
@@ -304,7 +314,7 @@ async fn capture_regime(
         .await
         .expect("seed connection");
     ensure_pg_stat_statements(&mut seed_conn).await;
-    seed_fixture(&mut seed_conn, events_per_healthy).await;
+    seed_fixture_with_terminal_age(&mut seed_conn, events_per_healthy, terminal_age).await;
 
     let mut stats_conn = AsyncPgConnection::establish(&url)
         .await
@@ -416,11 +426,33 @@ async fn zz_capture_status_summary_stalled_perf_evidence() {
     std::fs::create_dir_all(&out_dir).expect("create artifact output directory");
 
     let variant = std::env::var("PERF_VARIANT").unwrap_or_else(|_| "after".to_string());
-    capture_regime(&admin, &format!("{variant}-execution-heavy"), 1, &out_dir).await;
+    capture_regime(
+        &admin,
+        &format!("{variant}-execution-heavy"),
+        1,
+        "30 days",
+        &out_dir,
+    )
+    .await;
     capture_regime(
         &admin,
         &format!("{variant}-event-write-heavy"),
         100,
+        "30 days",
+        &out_dir,
+    )
+    .await;
+    // (issue #1643, code review): a high-churn deployment where many
+    // workflows finish inside the no-progress window, instead of the other
+    // two regimes' well-outside-the-window terminal history. Same active
+    // population (3,000) and per-healthy-execution event rate (1) as the
+    // execution-heavy regime; only the terminal population's event age
+    // changes.
+    capture_regime(
+        &admin,
+        &format!("{variant}-terminal-churn"),
+        1,
+        "5 minutes",
         &out_dir,
     )
     .await;
