@@ -97,18 +97,32 @@ TARGET_GLOBS = [
     "README.md",
 ]
 
-# [\s>]* absorbs both list indentation and Markdown blockquote markers ("> "),
-# including a blockquote nested inside a list item, ahead of the fence itself.
-# Captured so the same prefix can be stripped from the block's content lines
-# too — a blockquoted block's lines all carry "> ", which is Markdown syntax,
-# not part of the Rust source, and left in place would break every blockquoted
+# CONTAINER absorbs indentation and Markdown blockquote markers ("> "),
+# including a blockquote nested inside a list item, ahead of the fence
+# itself — captured so the same text can be stripped from the block's
+# content lines too, since a blockquote's "> " is Markdown syntax, not part
+# of the Rust source, and left in place would break every blockquoted
 # snippet's parse regardless of whether its actual code is valid.
+#
+# Each run of plain indentation, whether at the start or straight after a
+# ">", is capped at 3 columns: `docs/audits/comment-hygiene.py` already
+# implements this exact CommonMark rule (see its fence_delimiter, and its
+# own fixture tests around "four spaces is an indented code line, not a
+# fence opener" / "an over-indented \`\`\` inside a fence is content, not a
+# closer") for the same reason — 4+ columns of indent relative to the
+# container makes a delimiter-looking line indented CONTENT, not a fence
+# marker, opener or closer alike.
+CONTAINER = r"[ \t]{0,3}(?:>[ \t]{0,3})*"
 #
 # LIST_MARKER additionally allows a fence to be the first block of a list
 # item, opening on the marker's own line ("- ```rust", "1. ```rust") rather
 # than on a line under it — valid CommonMark, and unlike the marker's own
 # text there is no per-line repeat of it to strip back out of content lines,
-# so those are left to the plain indentation-stripping case above.
+# so those are left to the plain indentation-stripping case above. It is
+# never legal on a CLOSING fence line, which must consist of nothing but
+# its container's indentation/blockquote markers and the delimiter itself —
+# a line like "- ```" inside a still-open block is literal fenced content,
+# not a closer.
 #
 # This is deliberately not a full CommonMark container parser (no nesting
 # beyond one list level, no lazy continuation lines) — this script trades
@@ -124,24 +138,20 @@ TARGET_GLOBS = [
 # wrong; not stripping the indent/blockquote text would leave Markdown
 # syntax inside the Rust source handed to `rustfmt`.
 #
-# The delimiter itself (group 4) is 3+ backticks or 3+ tildes, matching
-# CommonMark: a closing fence must use the same character and be at least
-# as long as the opener's, so a run of 4 is also captured and compared,
-# not just matched literally against exactly 3.
+# The delimiter (group 4) is 3+ backticks or 3+ tildes, matching CommonMark:
+# a closing fence must use the same character and be at least as long as
+# the opener's, so a run of 4 is also captured and compared, not just
+# matched literally against exactly 3. Group 5 is the raw info string,
+# checked in Python (not baked into the regex as a literal "rust") so a
+# non-Rust fence can still be recognized AS a fence — its span tracked and
+# skipped whole — rather than left invisible to the scanner: an invisible
+# non-Rust fence containing a line that merely looks like a Rust fence
+# opener (a Markdown-about-Markdown example, say) would otherwise be misread
+# as a real one.
 LIST_MARKER = r"(?:[-*+]|\d+[.)])\s+"
 FENCE_DELIM = r"(`{3,}|~{3,})"
-# \s* before "rust": CommonMark trims leading/trailing whitespace from a
-# fence's info string, so "``` rust" (a space before the language) is the
-# same Rust fence as "```rust", not a fence with no recognized language.
-FENCE_OPEN_RE = re.compile(rf"^([\s>]*)((?:{LIST_MARKER})?)([\s>]*){FENCE_DELIM}\s*rust(.*)$")
-# No LIST_MARKER here, unlike the opener: a closing fence line must consist
-# of nothing but its container's indentation/blockquote markers and the
-# delimiter itself. A line like "- ```" inside an still-open block is literal
-# fenced *content* per CommonMark, not a closer — list markers only start a
-# new list item outside of one. Accepting it as a closer as the opener does
-# would end the block early and let whatever comes after (up to a real
-# closer, or a wrong later one) escape checking as if it were never there.
-FENCE_CLOSE_RE = re.compile(rf"^([\s>]*){FENCE_DELIM}\s*$")
+FENCE_OPEN_RE = re.compile(rf"^({CONTAINER})((?:{LIST_MARKER})?)({CONTAINER}){FENCE_DELIM}(.*)$")
+FENCE_CLOSE_RE = re.compile(rf"^({CONTAINER}){FENCE_DELIM}\s*$")
 
 
 def _blockquote_depth(prefix: str) -> int:
@@ -249,11 +259,19 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
     run at least as long as the opener's, per CommonMark — otherwise an
     unrelated fence (a different depth, or a bare "```" closing some other
     ```` ```` ````-delimited block) could get mistaken for this one's close
-    and swallow everything up to it as this block's content. Exits with an
-    error if an opening fence has no matching close before EOF: a block
-    dropped that way would shrink the "corpus" count with no signal that it
-    happened, and so would one whose real close was skipped over for a
-    depth or delimiter mismatch with nothing compatible after it.
+    and swallow everything up to it as this block's content.
+
+    Every fence is tracked this way, Rust-tagged or not: once a fence of any
+    language is open, the only thing that can end it is ITS OWN matching
+    closer — no other fence can open inside it, so a line that merely looks
+    like a nested ```rust opener, inside some outer fence used to show
+    Markdown-about-Markdown as a literal example, is correctly read as inert
+    content of the outer fence rather than a real block of its own.
+
+    Exits with an error if an opening fence has no matching close before
+    EOF: a block dropped that way would shrink the "corpus" count with no
+    signal that it happened, and so would one whose real close was skipped
+    over for a depth or delimiter mismatch with nothing compatible after it.
     """
     lines = text.split("\n")
     blocks: list[str] = []
@@ -264,7 +282,8 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
         if not m:
             i += 1
             continue
-        lead, marker, trail, delim = m.group(1), m.group(2), m.group(3), m.group(4)
+        lead, marker, trail, delim, info = m.groups()
+        is_rust = info.strip().startswith("rust")
         strip_prefix = lead + trail
         depth = _blockquote_depth(strip_prefix)
         delim_char, delim_len = delim[0], len(delim)
@@ -283,15 +302,17 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
                 closed = True
                 i += 1
                 break
-            line = _strip_marker_width(lines[i], len(marker))
-            code_lines.append(_strip_prefix(line, strip_prefix))
+            if is_rust:
+                line = _strip_marker_width(lines[i], len(marker))
+                code_lines.append(_strip_prefix(line, strip_prefix))
             i += 1
         if not closed:
             sys.exit(
-                f"{relpath}: ```rust fence opened at line {start_line} has no "
-                "closing ``` before end of file"
+                f"{relpath}: fence opened at line {start_line} has no "
+                "closing delimiter before end of file"
             )
-        blocks.append("\n".join(code_lines))
+        if is_rust:
+            blocks.append("\n".join(code_lines))
     return blocks
 
 
