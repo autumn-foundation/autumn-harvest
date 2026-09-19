@@ -156,6 +156,17 @@ BQ = r">[ \t]{0,3}"
 # wrong; not stripping the indent/blockquote text would leave Markdown
 # syntax inside the Rust source handed to `rustfmt`.
 #
+# The marker's own trailing `\s+` is unbounded in the regex, but CommonMark
+# only lets 1-4 columns of it count as padding (absorbed into the list
+# item's content column) — 5 or more means just ONE column separates marker
+# from content, per comment-hygiene.py's own list_content. This can only
+# ever make a same-line fence invalid, never valid: whatever is left after
+# that single column is the delimiter's own indent relative to the list
+# item's real content start, and 5 padding columns minus the 1 that counts
+# is already 4 — past the fence's own 3-column budget by construction, so
+# _list_marker_padding_valid below simply requires the whole run to be 1-4
+# columns; nothing past 4 could pass the indent budget anyway.
+#
 # The delimiter (group 4) is 3+ backticks or 3+ tildes, matching CommonMark:
 # a closing fence must use the same character and be at least as long as
 # the opener's, so a run of 4 is also captured and compared, not just
@@ -190,6 +201,17 @@ def _fence_indent_valid(prefix: str) -> bool:
     is an opener's lead+trail or a closer's single combined group.
     """
     return all(_valid_indent(chunk) for chunk in prefix.split(">"))
+
+
+def _list_marker_padding_valid(marker: str) -> bool:
+    """True if the whitespace between a list marker's glyph and whatever
+    follows it (empty string `marker` included: no marker at all) is within
+    CommonMark's 1-4 column padding allowance.
+    """
+    if not marker:
+        return True
+    padding = marker[len(marker.rstrip(" \t")) :]
+    return 1 <= len(padding.expandtabs(4)) <= 4
 
 
 def _blockquote_depth(prefix: str) -> int:
@@ -335,7 +357,11 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
     n = len(lines)
     while i < n:
         m = FENCE_OPEN_RE.match(lines[i])
-        if not m or not _fence_indent_valid(m.group(1) + m.group(3)):
+        if (
+            not m
+            or not _fence_indent_valid(m.group(1) + m.group(3))
+            or not _list_marker_padding_valid(m.group(2))
+        ):
             i += 1
             continue
         lead, marker, trail, delim, info = m.groups()
