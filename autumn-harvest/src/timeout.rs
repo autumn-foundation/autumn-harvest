@@ -2444,6 +2444,8 @@ enum DeliveryRoute {
         expected_live: bool,
         /// See [`DeliveryRoute::CrossShard::may_assert_key_state`].
         may_assert_key_state: bool,
+        /// See [`DeliveryRoute::CrossShard::reverify_after_cancel`].
+        reverify_after_cancel: bool,
     },
     /// Deliver on a fresh connection from `shard`'s pool.
     CrossShard {
@@ -2495,6 +2497,28 @@ enum DeliveryRoute {
         /// `true` whenever no global resolution ran — `ExecutionId` targets and
         /// the single-shard short-circuit — since neither case can arise.
         may_assert_key_state: bool,
+        /// This resolution came from a **cross-shard fan-out**, so a cancel
+        /// that ends a live run must not report from it (issue #1313).
+        ///
+        /// The fan-out reads each shard on its own connection to its own
+        /// database. Postgres offers no cross-shard transaction and this engine
+        /// adds no coordinator, so the reads share no snapshot. A run of the key
+        /// can start on a shard after that shard answered and before the merge
+        /// completes. `may_assert_key_state` cannot see that run: every shard
+        /// answered, and the selected run is live, so nothing disagrees.
+        ///
+        /// The gap only matters once the cancel changes the key's state.
+        /// Cancelling the run it found makes that run terminal. The run that
+        /// started during the fan-out then becomes the current run for the key,
+        /// and `ExternalCancelDelivered` claims that nothing runs under the key.
+        /// So the assertion is withheld and made by a LATER fan-out, which
+        /// observes the whole window this one ran in. The cancel itself stands,
+        /// exactly as it does for the other two withholding cases.
+        ///
+        /// A cancel that finds the goal already met changes nothing, so it
+        /// reports at once. `false` whenever no fan-out ran: `ExecutionId`
+        /// targets and the single-shard short-circuit.
+        reverify_after_cancel: bool,
     },
     /// Every expected shard was inspected and none holds a run for this
     /// business key. The caller applies its not-found policy (leave pending
@@ -2630,6 +2654,7 @@ async fn resolve_delivery_route(
         return DeliveryRoute::Caller {
             expected_live: false,
             may_assert_key_state: true,
+            reverify_after_cancel: false,
         };
     };
 
@@ -2662,14 +2687,17 @@ async fn resolve_delivery_route(
         };
     }
 
-    let (target_shard, expected_live, may_assert_key_state) = match target {
+    let (target_shard, expected_live, may_assert_key_state, reverify_after_cancel) = match target {
         ExternalTarget::ExecutionId(id) => {
             // Authoritative by construction: an id identifies exactly one run,
-            // and the residence below is a durable fact, not a prediction.
+            // and the residence below is a durable fact, not a prediction. An
+            // id names one run, never a business key, so no concurrent start
+            // can invalidate the answer (issue #1313).
             (
                 execution_id_residence(conn, pool, *id, caller_shard).await,
                 false,
                 true,
+                false,
             )
         }
         ExternalTarget::WorkflowId {
@@ -2689,8 +2717,10 @@ async fn resolve_delivery_route(
             if let [only] = expected.as_slice() {
                 // No global resolution ran, so there is no live-run expectation
                 // to compare a shard-local read against — and with one shard
-                // there is nowhere else for the key to be.
-                (*only, false, true)
+                // there is nowhere else for the key to be. One shard also means
+                // one snapshot, so the fan-out race of issue #1313 needs no
+                // second look here.
+                (*only, false, true, false)
             } else {
                 match crate::external_target_location::resolve_location_by_workflow_id_with(
                     pool,
@@ -2743,6 +2773,9 @@ async fn resolve_delivery_route(
                             // that found a SECOND live run of this key is equally
                             // unable to assert that nothing is running under it.
                             found.is_authoritative_for_key(),
+                            // A fan-out ran, so a cancel that ends a live run
+                            // reports from a later one instead (issue #1313).
+                            true,
                         )
                     }
                     crate::external_target_location::TargetLocation::NotFound => {
@@ -2815,12 +2848,14 @@ async fn resolve_delivery_route(
             DeliveryRoute::Caller {
                 expected_live,
                 may_assert_key_state,
+                reverify_after_cancel,
             }
         }
         (Some(_), _) => DeliveryRoute::CrossShard {
             shard: target_shard,
             expected_live,
             may_assert_key_state,
+            reverify_after_cancel,
         },
         (None, _) => DeliveryRoute::Retry {
             reason: format!("target shard {target_shard} has no storage pool in this process"),
@@ -3219,9 +3254,14 @@ pub async fn enforce_external_signals_outbox(
                     // delivery, and re-delivery is not idempotent without an
                     // idempotency key, so staying pending would duplicate the
                     // signal (issue #1146, Codex round 2).
+                    // `reverify_after_cancel` is likewise unused (issue
+                    // #1313). A signal reports a delivery to one run, never a
+                    // claim about the whole key. A run that starts during the
+                    // fan-out does not falsify that.
                     DeliveryRoute::Caller {
                         expected_live,
                         may_assert_key_state: _,
+                        reverify_after_cancel: _,
                     } => {
                         attempt_signal_delivery(
                             conn,
@@ -3241,6 +3281,7 @@ pub async fn enforce_external_signals_outbox(
                         shard: target_shard,
                         expected_live,
                         may_assert_key_state: _,
+                        reverify_after_cancel: _,
                     } => {
                         let Some(pool) = active_sharded_pool
                             .as_ref()
@@ -3396,6 +3437,14 @@ struct CancelDeliveryAccumulators {
     deferred_starts: Vec<crate::completion_trigger::DeferredTriggerStart>,
     deferred_checks: Vec<(ExecutionId, String)>,
     cancel_metrics: Vec<(String, String)>,
+    /// This delivery ended a run that was **live** when it read it, rather
+    /// than finding the goal already met (issue #1313).
+    ///
+    /// A cancel that changes the key's state invalidates the fan-out that
+    /// chose its target. The reads are sequential, on separate databases. A
+    /// run of the key can start on a shard after that shard answered.
+    /// See `DeliveryRoute::CrossShard::reverify_after_cancel`.
+    cancelled_live_run: bool,
 }
 
 /// Attempt one cancel delivery to `target` on `conn` (issue #751).
@@ -3443,6 +3492,7 @@ async fn attempt_cancel_delivery(
                     if let Some(m) = metrics_opt {
                         acc.cancel_metrics.push(m);
                     }
+                    acc.cancelled_live_run = true;
                     Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
                 }
                 Err(HarvestError::NotFound(_)) => not_found_terminal(),
@@ -3492,6 +3542,7 @@ async fn attempt_cancel_delivery(
                     if let Some(m) = metrics {
                         acc.cancel_metrics.push(m);
                     }
+                    acc.cancelled_live_run = true;
                     Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
                 }
                 // Already terminal = no-op success (goal already met) —
@@ -3728,16 +3779,20 @@ pub async fn enforce_external_cancels_outbox(
                     deferred_starts: Vec::new(),
                     deferred_checks: Vec::new(),
                     cancel_metrics: Vec::new(),
+                    cancelled_live_run: false,
                 };
 
                 let mut target_conn_opt = None;
                 let mut cancel_may_assert = true;
+                let mut cancel_reverify = false;
                 let terminal_opt = match route {
                     DeliveryRoute::Caller {
                         expected_live,
                         may_assert_key_state,
+                        reverify_after_cancel,
                     } => {
                     cancel_may_assert = may_assert_key_state;
+                    cancel_reverify = reverify_after_cancel;
                     attempt_cancel_delivery(
                         conn,
                         &target,
@@ -3786,8 +3841,10 @@ pub async fn enforce_external_cancels_outbox(
                         shard: target_shard,
                         expected_live,
                         may_assert_key_state,
+                        reverify_after_cancel,
                     } => {
                     cancel_may_assert = may_assert_key_state;
+                    cancel_reverify = reverify_after_cancel;
                     let Some(pool) = active_sharded_pool
                         .as_ref()
                         .and_then(|p| p.exact_pool_for(target_shard))
@@ -3869,15 +3926,45 @@ pub async fn enforce_external_cancels_outbox(
                 // The signal path deliberately does NOT do this: re-delivery is
                 // not idempotent without an idempotency key, so staying pending
                 // would deliver the signal twice.
+                //
+                // A third case withholds for the same reason, one step removed
+                // (issue #1313). The fan-out that chose this target read each
+                // shard on its own connection, and the reads share no snapshot.
+                // A run of the key can start on a shard after that shard
+                // answered. The two checks above cannot see such a run: every
+                // shard answered, and the run they selected really was live.
+                // The stale answer only becomes a wrong assertion once this
+                // cancel makes the selected run terminal. That promotes the run
+                // which started during the fan-out to current run for the key.
+                // So a cancel that ends a live run leaves the assertion to a
+                // LATER fan-out, one that observes the whole window this sweep
+                // ran in.
+                //
+                // That converges exactly as the other two do. The run just
+                // cancelled is terminal, so the next sweep either finds nothing
+                // live and reports, or cancels the next live copy and defers
+                // again. A cancel that found its target already terminal changed
+                // nothing and reports at once, which is what ends the chain. A
+                // deployment that starts fresh runs of one key faster than the
+                // outbox cancels them defers indefinitely. The two checks above
+                // already leave that deployment pending forever.
+                let withheld = if cancel_may_assert {
+                    (cancel_reverify && acc.cancelled_live_run).then_some(
+                        "this cancel ended a live run, so its own fan-out is older than the \
+                         state it asserts",
+                    )
+                } else {
+                    Some("a shard was uninspected, or another live run exists")
+                };
                 let terminal_opt = match terminal_opt {
                     Some(WorkflowEvent::ExternalCancelDelivered { .. })
-                        if !cancel_may_assert =>
+                        if withheld.is_some() =>
                     {
                         tracing::warn!(
                             caller_exec_id = %caller_exec_id,
-                            "by-id cancel: acted on the run found, but the resolution is not \
-                             authoritative for the key (a shard was uninspected, or another \
-                             live run exists); withholding the terminal and retrying"
+                            reason = withheld.unwrap_or_default(),
+                            "by-id cancel: acted on the run found, but the resolution cannot \
+                             assert the state of the key; withholding the terminal and retrying"
                         );
                         // This row is also left pending (issue #1307), so the
                         // "oldest stuck row" gauge must see its age too. It is
@@ -3896,6 +3983,7 @@ pub async fn enforce_external_cancels_outbox(
                     deferred_starts,
                     deferred_checks,
                     cancel_metrics,
+                    cancelled_live_run: _,
                 } = acc;
 
                 // Deferring a cross-pool cancellation's follow-ups past the
