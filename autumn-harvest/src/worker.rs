@@ -7415,18 +7415,22 @@ async fn update_workflow_execution_failed(
 /// lock (serialising with `pause_workflow_execution`'s own lock), and if so,
 /// re-park `task_id` under that same lock.
 ///
-/// Shared by `process_workflow_task`'s own pause-guarded persistence
-/// transaction and [`block_workflow_for_non_determinism`] (issue #603
-/// code-review fix — both previously duplicated this identical shape).
+/// Three call sites share this guard. `process_workflow_task`'s own
+/// pause-guarded persistence transaction is one.
+/// [`block_workflow_for_non_determinism`] is another (issue #603 code-review
+/// fix — both originally duplicated this shape).
+/// `process_workflow_task`'s early, non-locking pause fast path is the third
+/// (issue #1347). That path used to call [`queue::park_workflow_task`]
+/// directly, with no ownership guard.
 ///
 /// Must be called from inside an open transaction on `conn`. Returns `true`
 /// when the execution was `PAUSED` (the task has been re-parked and the
 /// caller should discard its pending decision); `false` otherwise.
 ///
 /// Discarding [`queue::park_workflow_task`]'s wake-requested return value is
-/// safe at both call sites: each shares `pause_workflow_execution`'s `FOR
-/// UPDATE` row lock, so a concurrent resume serialises after this check
-/// commits and issues its own wake.
+/// safe at every call site. Each call site shares
+/// `pause_workflow_execution`'s `FOR UPDATE` row lock. A concurrent resume
+/// therefore serialises after this check commits and issues its own wake.
 #[doc(hidden)]
 pub async fn check_paused_and_park(
     conn: &mut AsyncPgConnection,
@@ -20618,26 +20622,39 @@ async fn process_workflow_task(
             .optional()
             .map_err(crate::error::database_error)?;
         if current_state.as_deref() == Some("PAUSED") {
-            let sticky = if sticky_timeout.is_zero() {
-                None
-            } else {
-                Some(queue::StickyHint::new(worker_id, sticky_timeout))
-            };
-            // Unlike the persist-time PAUSED check further down, this
-            // fast-path read takes no lock, so it has no ordering guarantee
-            // against `resume_workflow_execution` (PR #901 review): if resume
-            // transitions PAUSED -> RUNNING and calls `wake_workflow_task`
-            // between this read and this park's own atomic UPDATE, the wake
-            // is captured as `wake_requested = TRUE` on this still-claimed
-            // row -- and resume's wake is the *only* wake for this event, so
-            // discarding it here (unlike other pause-discard sites) leaves a
-            // resumed execution parked with nothing left to re-wake it.
-            let had_wake_requested = queue::park_workflow_task(conn, task.id, sticky).await?;
-            if had_wake_requested {
-                queue::wake_workflow_task(conn, prepared.exec_id).await?;
+            // Issue #1347: the read above takes no lock and proves nothing
+            // about task ownership. A stale dispatcher's claim can already
+            // have moved to a new owner: a poison-pill reclaim, an operator
+            // requeue, or a concurrent claim race. This stale dispatcher
+            // must not park a row a new owner now drives.
+            //
+            // Route the park through `check_paused_and_park`, the same guard
+            // the persist-time check further down uses. It re-checks PAUSED
+            // under a `FOR UPDATE` lock on the execution row. It then
+            // re-derives the task claim under its own lock (issue #1184)
+            // before parking. A lost claim surfaces as
+            // `TerminalWriteClaimAmbiguous` instead of an unconditional park.
+            //
+            // This also removes the raced-wake gap the old fast-path park had
+            // (PR #901 review). The execution row lock here serializes with
+            // `resume_workflow_execution`'s own lock. A concurrent resume
+            // therefore always commits its own wake after this park commits.
+            let still_paused = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+                check_paused_and_park(
+                    conn,
+                    prepared.exec_id.as_uuid(),
+                    task.id,
+                    worker_id,
+                    task.crash_strikes,
+                    sticky_timeout,
+                )
+                .await
+            }))
+            .await?;
+            if still_paused {
+                drop(execute_span);
+                return Ok(());
             }
-            drop(execute_span);
-            return Ok(());
         }
     }
 

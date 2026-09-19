@@ -10492,16 +10492,29 @@ fn build_schedule_query_string(
 /// Query parameters for the preview drill-down.
 #[derive(Debug, Deserialize)]
 pub(crate) struct SchedulePreviewUiParams {
-    /// Number of fire times to project. Clamped to 1..=100 by the API.
+    // `count` is `String`, not `usize`. Same fix as `page`/`limit` on the
+    // Workflows, Workers, DLQ and Schedules pages. Same fix as `node`/
+    // `refresh` on the DAG detail page (#1333/#1378/#1420/#1437/#1540/
+    // #1560/#1588/#1619/#1630). A numeric-typed field fails axum's query
+    // deserialization on non-numeric text. It fails with a bare 400 before
+    // this handler ever runs. That discards the whole preview page for a
+    // bookmarked or hand-edited `?count=` value. Clamped to 1..=100 by the
+    // API.
     #[serde(default)]
-    count: Option<usize>,
+    count: Option<String>,
 }
 
 /// Query parameters for the run-history drill-down.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ScheduleRunsUiParams {
+    // `limit` is `String`, not `i64`. Same fix as `count` above and as
+    // `page`/`limit` on the list pages (#1333/#1378/#1420/#1437/#1540/
+    // #1560/#1588/#1619). A numeric-typed field fails axum's query
+    // deserialization on non-numeric text. It fails with a bare 400 before
+    // this handler ever runs. That discards the `origin`/`state` filters
+    // already on the URL, along with everything else on the page.
     #[serde(default)]
-    limit: Option<i64>,
+    limit: Option<String>,
     #[serde(default)]
     cursor: Option<String>,
     #[serde(default)]
@@ -10519,6 +10532,11 @@ pub(crate) struct ScheduleRunsUiParams {
 #[derive(Debug, Clone, Default)]
 struct ScheduleRunsView {
     limit: Option<i64>,
+    /// The raw, unparsed `limit` text on a parse failure. Echoed back into
+    /// the "Rows" field so the operator's own bad input stays visible,
+    /// instead of silently reverting to blank. Empty when `limit` parsed
+    /// cleanly or was omitted.
+    limit_raw: String,
     origin: Option<String>,
     state: Option<String>,
 }
@@ -10527,7 +10545,15 @@ impl ScheduleRunsView {
     /// Query-string suffix (leading `&`) carrying the filters, for the next-page link.
     fn query_suffix(&self) -> String {
         let mut out = String::new();
-        if let Some(limit) = self.limit {
+        // Codex review finding on this PR: prefer `limit_raw` over `limit`
+        // when a parse failure left it set. Otherwise the Next link would
+        // drop the operator's bad text, and its `role="alert"` context,
+        // on the very click meant to keep their place. It would silently
+        // revert to the default instead of carrying the correction
+        // forward.
+        if !self.limit_raw.is_empty() {
+            let _ = write!(out, "&limit={}", url_encode(&self.limit_raw));
+        } else if let Some(limit) = self.limit {
             let _ = write!(out, "&limit={limit}");
         }
         if let Some(ref origin) = self.origin {
@@ -10574,10 +10600,7 @@ async fn schedule_preview_ui(
     Query(params): Query<SchedulePreviewUiParams>,
 ) -> Result<Markup, AutumnError> {
     let (row, shard_id) = load_schedule_for_drilldown(&api_state, &id_str).await?;
-    let count = params
-        .count
-        .unwrap_or(SCHEDULE_PREVIEW_DEFAULT_COUNT)
-        .clamp(1, 100);
+    let (count, count_error) = parse_schedule_preview_count_query_field(params.count.as_deref());
     // Pass the row through rather than the id: `compute_schedule_preview`'s own
     // lookup stops at the first unreachable shard, which would fail a preview
     // for a schedule the resilient resolver above already found on a later one.
@@ -10589,12 +10612,42 @@ async fn schedule_preview_ui(
     )
     .await?;
     Ok(render_schedule_preview_page(
-        &row, shard_id, &preview, count,
+        &row,
+        shard_id,
+        &preview,
+        count,
+        count_error.as_deref(),
     ))
 }
 
 /// Default number of projected fire times on the preview drill-down.
 const SCHEDULE_PREVIEW_DEFAULT_COUNT: usize = 10;
+
+/// Parses the preview page's `count` query parameter — how many fire times
+/// to project.
+///
+/// A non-numeric value falls back to [`SCHEDULE_PREVIEW_DEFAULT_COUNT`] and
+/// reports the bad value inline, instead of aborting the whole page. Same
+/// contract as [`parse_dag_node_query_field`]. This page has no form field
+/// backing `count` — it is link/URL-driven only. So the caller renders the
+/// error as a page-level notice, rather than next to a control.
+fn parse_schedule_preview_count_query_field(raw: Option<&str>) -> (usize, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (SCHEDULE_PREVIEW_DEFAULT_COUNT, None);
+    };
+    trimmed.parse::<usize>().map_or_else(
+        |_| {
+            (
+                SCHEDULE_PREVIEW_DEFAULT_COUNT,
+                Some(format!(
+                    "Invalid count '{trimmed}'; expected a whole number. \
+                     Showing {SCHEDULE_PREVIEW_DEFAULT_COUNT} entries."
+                )),
+            )
+        },
+        |parsed| (parsed.clamp(1, 100), None),
+    )
+}
 
 #[allow(clippy::too_many_lines)]
 fn render_schedule_preview_page(
@@ -10602,9 +10655,13 @@ fn render_schedule_preview_page(
     shard_id: ShardId,
     preview: &crate::api::SchedulePreview,
     count: usize,
+    count_error: Option<&str>,
 ) -> Markup {
     let id_str = row.id.to_string();
     let body = html! {
+        @if let Some(error) = count_error {
+            span.field-error role="alert" { (error) }
+        }
         h2 { "Fire-time preview — " code { (schedule_target_name(row)) } }
         (render_schedule_drilldown_header(row, shard_id, "preview"))
 
@@ -10742,10 +10799,19 @@ async fn schedule_runs_ui(
 ) -> Result<Markup, AutumnError> {
     let (row, shard_id) = load_schedule_for_drilldown(&api_state, &id_str).await?;
 
-    // Build the query through the endpoint's own parser so the UI applies the
-    // same clamping, vocabulary validation and cursor format as the API.
+    // `limit` is parsed here, ahead of the endpoint's own parser below. A
+    // non-numeric value then degrades to the default, instead of ever
+    // reaching `from_query_pairs` as bad input. This matches how the list
+    // pages' `page`/`limit` fields are parsed before their own filters are
+    // built.
+    let (limit, limit_raw, limit_error) =
+        parse_schedule_runs_limit_query_field(params.limit.as_deref());
+
+    // Build the rest of the query through the endpoint's own parser. The UI
+    // then applies the same clamping, vocabulary validation and cursor
+    // format as the API.
     let mut pairs: Vec<(String, String)> = Vec::new();
-    if let Some(limit) = params.limit {
+    if let Some(limit) = limit {
         pairs.push(("limit".to_string(), limit.to_string()));
     }
     if let Some(ref cursor) = params.cursor {
@@ -10766,7 +10832,8 @@ async fn schedule_runs_ui(
             .map_err(AutumnError::bad_request_msg)?;
 
     let view = ScheduleRunsView {
-        limit: params.limit,
+        limit,
+        limit_raw,
         origin: params
             .origin
             .as_deref()
@@ -10788,7 +10855,58 @@ async fn schedule_runs_ui(
         &response,
         &view,
         params.flash.as_deref(),
+        limit_error.as_deref(),
     ))
+}
+
+/// Parses the run-history page's `limit` query parameter.
+///
+/// A non-numeric value falls back to no limit — the endpoint's own default,
+/// [`crate::schedule_runs::DEFAULT_LIMIT`]. It reports the bad value
+/// inline, next to the "Rows" field, instead of aborting the whole page.
+/// Same contract as [`parse_limit_query_field`] on the list pages,
+/// including echoing the raw text back for redisplay.
+///
+/// A numeric-but-out-of-range value (`limit=0`, `limit=100000`) is clamped
+/// silently to `[1, MAX_LIMIT]`, matching [`parse_limit_query_field`]'s own
+/// contract. It is not left for
+/// [`crate::schedule_runs::ScheduleRunsParams::from_query_pairs`] to
+/// reject.
+///
+/// Codex review finding on this PR: the "Rows" field used to be
+/// `type="number" min="1"`, which a browser refuses to submit below 1.
+/// The fix below switched it to a text control, to keep bad text visible
+/// (see `per_page_input_is_a_text_control_that_can_hold_invalid_text`).
+/// That drops the browser-side floor. Without clamping here, a `0` typed
+/// into the now-unconstrained field reaches `from_query_pairs`. It then
+/// rejects the value and aborts the whole page — reintroducing the exact
+/// defect class this PR exists to close.
+fn parse_schedule_runs_limit_query_field(
+    raw: Option<&str>,
+) -> (Option<i64>, String, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (None, String::new(), None);
+    };
+    trimmed.parse::<i64>().map_or_else(
+        |_| {
+            (
+                None,
+                trimmed.to_string(),
+                Some(format!(
+                    "Invalid limit '{trimmed}'; expected a whole number. \
+                     Showing {} per page.",
+                    crate::schedule_runs::DEFAULT_LIMIT
+                )),
+            )
+        },
+        |parsed| {
+            (
+                Some(parsed.clamp(1, crate::schedule_runs::MAX_LIMIT)),
+                String::new(),
+                None,
+            )
+        },
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -10798,6 +10916,7 @@ fn render_schedule_runs_page(
     response: &crate::schedule_runs::ScheduleRunsResponse,
     view: &ScheduleRunsView,
     flash: Option<&str>,
+    limit_error: Option<&str>,
 ) -> Markup {
     use crate::shard_fanout::FanoutStatus;
 
@@ -10820,7 +10939,7 @@ fn render_schedule_runs_page(
         }
 
         (render_schedule_drilldown_header(row, shard_id, "runs"))
-        (render_schedule_runs_filters(&id_str, view))
+        (render_schedule_runs_filters(&id_str, view, limit_error))
 
         // AC7: a partial cross-shard answer is always visible, never silently
         // truncated data.
@@ -10950,17 +11069,35 @@ fn render_schedule_runs_page(
 /// Filter/limit controls for the run history. The endpoint has always accepted
 /// `limit`/`origin`/`state`; without a form they were reachable only by editing
 /// the URL by hand.
-fn render_schedule_runs_filters(id_str: &str, view: &ScheduleRunsView) -> Markup {
-    let limit_val = view.limit.map(|l| l.to_string()).unwrap_or_default();
+fn render_schedule_runs_filters(
+    id_str: &str,
+    view: &ScheduleRunsView,
+    limit_error: Option<&str>,
+) -> Markup {
+    // Echo exactly what the operator typed on a parse failure, matching the
+    // Workers page's `render_worker_filters`. Fall back to the resolved
+    // value when the field was absent or already valid.
+    let limit_val = if view.limit_raw.is_empty() {
+        view.limit.map(|l| l.to_string()).unwrap_or_default()
+    } else {
+        view.limit_raw.clone()
+    };
     let origin_val = view.origin.as_deref().unwrap_or("");
     let state_val = view.state.as_deref().unwrap_or("");
     html! {
         form.filters method="get" action=(schedule_drilldown_href(id_str, "runs")) {
             label {
                 "Rows"
-                input type="number" name="limit" min="1"
-                    max=(crate::schedule_runs::MAX_LIMIT) value=(limit_val)
-                    placeholder=(crate::schedule_runs::DEFAULT_LIMIT);
+                // `type="text"`, not `type="number"`. A number input
+                // sanitizes an invalid value (e.g. "not-a-number") to
+                // blank at render time. The operator could then never see
+                // or correct their own bad input. Matches the Workers
+                // page's "Per page" field.
+                input type="text" inputmode="numeric" pattern="[0-9]*" name="limit"
+                    value=(limit_val) placeholder=(crate::schedule_runs::DEFAULT_LIMIT);
+                @if let Some(error) = limit_error {
+                    span.field-error role="alert" { (error) }
+                }
             }
             label {
                 "Origin"
@@ -11952,6 +12089,145 @@ mod tests {
             message.contains("not-a-number") && message.contains("refresh"),
             "the error names the bad value and the field: {message}"
         );
+    }
+
+    #[test]
+    fn parse_schedule_preview_count_query_field_accepts_valid_values() {
+        assert_eq!(
+            parse_schedule_preview_count_query_field(Some("25")),
+            (25, None)
+        );
+    }
+
+    #[test]
+    fn parse_schedule_preview_count_query_field_blank_or_missing_is_not_an_error() {
+        assert_eq!(
+            parse_schedule_preview_count_query_field(None),
+            (SCHEDULE_PREVIEW_DEFAULT_COUNT, None)
+        );
+        assert_eq!(
+            parse_schedule_preview_count_query_field(Some("   ")),
+            (SCHEDULE_PREVIEW_DEFAULT_COUNT, None)
+        );
+    }
+
+    /// A well-formed but out-of-range count is clamped, matching the
+    /// pre-fix `.clamp(1, 100)` behavior.
+    #[test]
+    fn parse_schedule_preview_count_query_field_clamps_out_of_range_values() {
+        assert_eq!(
+            parse_schedule_preview_count_query_field(Some("0")),
+            (1, None)
+        );
+        assert_eq!(
+            parse_schedule_preview_count_query_field(Some("1000")),
+            (100, None)
+        );
+    }
+
+    /// GREEN -- the fix under test: `count` was typed `Option<usize>`
+    /// directly on `SchedulePreviewUiParams`. A non-numeric value then
+    /// failed axum's own query deserialization with a bare 400. That
+    /// happened before `schedule_preview_ui` ever ran, aborting the whole
+    /// preview page. It now degrades to `SCHEDULE_PREVIEW_DEFAULT_COUNT`
+    /// while naming the bad value, matching `parse_dag_node_query_field`.
+    #[test]
+    fn parse_schedule_preview_count_query_field_rejects_non_numeric_text_without_erroring() {
+        let (count, error) = parse_schedule_preview_count_query_field(Some("not-a-number"));
+        assert_eq!(
+            count, SCHEDULE_PREVIEW_DEFAULT_COUNT,
+            "an invalid count falls back to the page's default"
+        );
+        let message = error.expect("an invalid count must carry a redisplayable error");
+        assert!(
+            message.contains("not-a-number") && message.contains("count"),
+            "the error names the bad value and the field: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_schedule_runs_limit_query_field_accepts_valid_values() {
+        assert_eq!(
+            parse_schedule_runs_limit_query_field(Some("50")),
+            (Some(50), String::new(), None)
+        );
+    }
+
+    #[test]
+    fn parse_schedule_runs_limit_query_field_blank_or_missing_is_not_an_error() {
+        assert_eq!(
+            parse_schedule_runs_limit_query_field(None),
+            (None, String::new(), None)
+        );
+        assert_eq!(
+            parse_schedule_runs_limit_query_field(Some("   ")),
+            (None, String::new(), None)
+        );
+    }
+
+    /// Codex review finding on this PR: a well-formed but out-of-range
+    /// limit (`0`, `100000`) is clamped here, not left for
+    /// `ScheduleRunsParams::from_query_pairs` to reject. The "Rows" field
+    /// is a text control with no browser-side floor. An unclamped `0`
+    /// would reach `from_query_pairs` and abort the whole page — the
+    /// exact defect class this PR exists to close.
+    #[test]
+    fn parse_schedule_runs_limit_query_field_clamps_out_of_range_values() {
+        assert_eq!(
+            parse_schedule_runs_limit_query_field(Some("0")),
+            (Some(1), String::new(), None)
+        );
+        assert_eq!(
+            parse_schedule_runs_limit_query_field(Some("100000")),
+            (Some(crate::schedule_runs::MAX_LIMIT), String::new(), None)
+        );
+    }
+
+    /// GREEN -- the fix under test: `limit` was typed `Option<i64>` directly
+    /// on `ScheduleRunsUiParams`. A non-numeric value then failed axum's
+    /// own query deserialization with a bare 400. That happened before
+    /// `schedule_runs_ui` ever ran, discarding the `origin`/`state`
+    /// filters already on the URL along with the rest of the page. It now
+    /// degrades to no limit (the endpoint's own default) while naming the
+    /// bad value. It also echoes the raw text back for redisplay, matching
+    /// `parse_limit_query_field`.
+    #[test]
+    fn parse_schedule_runs_limit_query_field_rejects_non_numeric_text_without_erroring() {
+        let (limit, raw, error) = parse_schedule_runs_limit_query_field(Some("not-a-number"));
+        assert_eq!(limit, None, "an invalid limit falls back to no override");
+        assert_eq!(raw, "not-a-number", "the raw text is echoed for redisplay");
+        let message = error.expect("an invalid limit must carry a redisplayable error");
+        assert!(
+            message.contains("not-a-number") && message.contains("limit"),
+            "the error names the bad value and the field: {message}"
+        );
+    }
+
+    /// Codex review finding on this PR: the Next link used to be built
+    /// from `limit` alone. A parse failure leaves `limit` at `None`. The
+    /// operator's bad text — and the error naming it — then silently
+    /// vanished on the very click meant to preserve their place.
+    #[test]
+    fn schedule_runs_view_query_suffix_carries_the_invalid_raw_limit() {
+        let view = ScheduleRunsView {
+            limit: None,
+            limit_raw: "not-a-number".to_string(),
+            origin: Some("scheduled".to_string()),
+            state: None,
+        };
+        assert_eq!(view.query_suffix(), "&limit=not-a-number&origin=scheduled");
+    }
+
+    /// A clean, already-resolved `limit` still round-trips as before.
+    #[test]
+    fn schedule_runs_view_query_suffix_carries_the_resolved_limit_when_valid() {
+        let view = ScheduleRunsView {
+            limit: Some(5),
+            limit_raw: String::new(),
+            origin: None,
+            state: None,
+        };
+        assert_eq!(view.query_suffix(), "&limit=5");
     }
 
     /// Codex review finding on this PR: a `type="number"` input sanitizes an
@@ -16705,7 +16981,8 @@ mod tests {
             remaining_runs: None,
             exhausted_reason: None,
         };
-        let html = render_schedule_preview_page(&row, ShardId::new(0), &preview, 10).into_string();
+        let html =
+            render_schedule_preview_page(&row, ShardId::new(0), &preview, 10, None).into_string();
         assert!(
             html.contains("2026-09-01 12:00:00"),
             "original instant missing: {html}"
@@ -16746,7 +17023,8 @@ mod tests {
             remaining_runs: Some(0),
             exhausted_reason: Some("max_runs_exhausted".to_string()),
         };
-        let html = render_schedule_preview_page(&row, ShardId::new(0), &preview, 10).into_string();
+        let html =
+            render_schedule_preview_page(&row, ShardId::new(0), &preview, 10, None).into_string();
         assert!(
             html.contains("max_runs_exhausted"),
             "must name the exhaustion reason: {html}"
@@ -16771,7 +17049,8 @@ mod tests {
             remaining_runs: None,
             exhausted_reason: None,
         };
-        let html = render_schedule_preview_page(&row, ShardId::new(0), &preview, 10).into_string();
+        let html =
+            render_schedule_preview_page(&row, ShardId::new(0), &preview, 10, None).into_string();
         assert!(html.contains("paused") || html.contains("Paused"));
         assert!(
             html.contains("operator hold"),
@@ -16844,6 +17123,7 @@ mod tests {
             &response,
             &ScheduleRunsView::default(),
             None,
+            None,
         )
         .into_string();
 
@@ -16911,6 +17191,7 @@ mod tests {
             &response,
             &ScheduleRunsView::default(),
             None,
+            None,
         )
         .into_string();
         assert!(
@@ -16939,6 +17220,7 @@ mod tests {
             &response,
             &ScheduleRunsView::default(),
             None,
+            None,
         )
         .into_string();
         assert!(
@@ -16965,6 +17247,7 @@ mod tests {
             ShardId::new(0),
             &response,
             &ScheduleRunsView::default(),
+            None,
             None,
         )
         .into_string();
@@ -17306,9 +17589,11 @@ mod tests {
             &response,
             &ScheduleRunsView {
                 limit: Some(5),
+                limit_raw: String::new(),
                 origin: Some("scheduled".to_string()),
                 state: None,
             },
+            None,
             None,
         )
         .into_string();
@@ -17352,6 +17637,7 @@ mod tests {
             &response,
             &ScheduleRunsView::default(),
             Some("Backfill dispatched 6 of 6 planned run(s); 0 skipped, 1 failed."),
+            None,
         )
         .into_string();
         assert!(
@@ -18059,7 +18345,8 @@ mod tests {
             remaining_runs: None,
             exhausted_reason: None,
         };
-        let html = render_schedule_preview_page(&row, ShardId::new(0), &preview, 10).into_string();
+        let html =
+            render_schedule_preview_page(&row, ShardId::new(0), &preview, 10, None).into_string();
         assert!(
             html.contains("auto-paused"),
             "the banner must name auto-pause: {html}"

@@ -5478,6 +5478,169 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
         .layer(Extension(api_state))
 }
 
+/// Admin-auth wiring a standalone mount declares for the management API
+/// (issue #1608).
+///
+/// [`HarvestPlugin`] installs the scoped-API-token layer (issue #942), the
+/// read-only-role layer (issue #776) and the [`HarvestApiState`] settings that
+/// `require_harvest_admin` reads. An embedder that mounts
+/// [`harvest_api_router`] on a raw Axum server reached none of them. The one
+/// credential Harvest has that needs no autumn-web `Session` was therefore
+/// unusable standalone.
+///
+/// The layer ordering is load-bearing, so this type applies it rather than
+/// documenting it. See [`Self::mount`].
+///
+/// ```rust,no_run
+/// use autumn_harvest_plugin::api::{HarvestApiState, StandaloneAdminAuth, harvest_api_router};
+///
+/// let api_state = HarvestApiState::new();
+/// let auth = StandaloneAdminAuth::new()
+///     .with_api_tokens()
+///     .with_deployment_profile("prod");
+/// let router = auth.mount(harvest_api_router(api_state.clone()), &api_state);
+/// ```
+///
+/// [`HarvestPlugin`]: crate::HarvestPlugin
+#[derive(Clone, Debug, Default)]
+pub struct StandaloneAdminAuth {
+    api_tokens: bool,
+    read_only_role: bool,
+    admin_auth_boundary: bool,
+    deployment_profile: Option<String>,
+    admin_auth_session_key: Option<String>,
+}
+
+impl StandaloneAdminAuth {
+    /// A mount that declares nothing. [`Self::mount`] then returns the router
+    /// unchanged, which is the pre-issue-#1608 standalone posture.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Install the scoped-API-token layer (issue #942).
+    ///
+    /// A request carrying a verified `hvst_` bearer reaches the admin routes
+    /// its scope allows. A `read` token is denied every mutating route with
+    /// 403, before any handler runs. The layer needs a token store, so install
+    /// the storage pool on the state as well.
+    #[must_use]
+    pub const fn with_api_tokens(mut self) -> Self {
+        self.api_tokens = true;
+        self
+    }
+
+    /// Install the class-aware read-only-role layer (issue #776).
+    ///
+    /// The layer reads an autumn-web `Session` that the embedder's own auth
+    /// middleware sets, so apply that middleware outside the mounted router.
+    #[must_use]
+    pub const fn with_read_only_role(mut self) -> Self {
+        self.read_only_role = true;
+        self
+    }
+
+    /// Declare that the embedder authenticates admin requests itself.
+    ///
+    /// This is the standalone equivalent of [`HarvestPlugin::api_with_auth`].
+    /// It reports a boundary to `preflight` and admits admin routes. Declare it
+    /// only when an auth layer really does wrap the mounted router.
+    ///
+    /// [`HarvestPlugin::api_with_auth`]: crate::HarvestPlugin::api_with_auth
+    #[must_use]
+    pub const fn with_admin_auth_boundary(mut self) -> Self {
+        self.admin_auth_boundary = true;
+        self
+    }
+
+    /// Declare the deployment profile `preflight` reports.
+    ///
+    /// The profile is `unknown` when undeclared, which `preflight` reports as a
+    /// warning. The `dev` profile allows an unauthenticated local management
+    /// API. See [`HarvestApiState::set_deployment_profile`].
+    #[must_use]
+    pub fn with_deployment_profile(mut self, profile: impl Into<String>) -> Self {
+        self.deployment_profile = Some(profile.into());
+        self
+    }
+
+    /// Declare the session key the built-in guards read.
+    ///
+    /// Relevant only when the embedder sets an autumn-web `Session`. See
+    /// [`HarvestApiState::set_admin_auth_session_key`].
+    #[must_use]
+    pub fn with_admin_auth_session_key(mut self, session_key: impl Into<String>) -> Self {
+        self.admin_auth_session_key = Some(session_key.into());
+        self
+    }
+
+    /// Apply the declaration to `api_state` and wrap `router` in the declared
+    /// layers.
+    ///
+    /// `router` is the composed Harvest router: [`harvest_api_router`], with
+    /// [`harvest_ui_router`] already nested inside it when Vantage is mounted.
+    /// Nesting first is what puts Vantage under the read-only-role layer, which
+    /// is how [`HarvestPlugin`] composes it.
+    ///
+    /// The returned router carries no embedder auth. Apply that outside, so the
+    /// request order is: embedder auth -> token layer -> read-only-role layer
+    /// -> per-route `require_admin` -> handler.
+    ///
+    /// [`harvest_ui_router`]: crate::harvest_ui_router
+    /// [`HarvestPlugin`]: crate::HarvestPlugin
+    pub fn mount(&self, router: Router<()>, api_state: &HarvestApiState) -> Router<()> {
+        api_state.set_admin_auth_boundary(self.admin_auth_boundary);
+        if let Some(profile) = &self.deployment_profile {
+            api_state.set_deployment_profile(profile.clone());
+        }
+        if let Some(session_key) = &self.admin_auth_session_key {
+            api_state.set_admin_auth_session_key(session_key.clone());
+        }
+        apply_admin_auth_layers(router, api_state, self.api_tokens, self.read_only_role)
+    }
+}
+
+/// Wrap a composed Harvest router in the admin-auth layer stack.
+///
+/// The one place the ordering is written down. `HarvestPlugin` and
+/// [`StandaloneAdminAuth::mount`] both call this, so the two mount paths cannot
+/// drift.
+///
+/// Issue #776: the class-aware read-only layer is installed BEFORE the
+/// embedder's auth middleware wraps the router. The request order is:
+/// embedder auth mw (sets Session), token layer, this layer, per-route
+/// `require_admin`, handler. This layer reads the Session, the method and the
+/// nest-stripped path. It is applied to the combined router, so it also covers
+/// a nested `/ui` sub-router. Vantage carries no route class, so it fails
+/// closed and answers 403 for a read-only principal.
+///
+/// Issue #942: the scoped-API-token verification and scope layer is installed
+/// OUTSIDE the read-only-class layer, so it runs first. It verifies the token,
+/// sets `TokenPrincipal` and the authoritative actor, then denies a read-scope
+/// mutation. It sits INSIDE the embedder's auth middleware.
+///
+/// Neither layer is installed unless asked for, so a deployment that declares
+/// neither does an identical amount of work as before.
+pub(crate) fn apply_admin_auth_layers(
+    router: Router<()>,
+    api_state: &HarvestApiState,
+    api_tokens: bool,
+    read_only_role: bool,
+) -> Router<()> {
+    let mut router = router;
+    if read_only_role {
+        router = router.layer(middleware::from_fn(enforce_read_only_class));
+    }
+    if api_tokens {
+        router = router.layer(middleware::from_fn_with_state(
+            api_state.clone(),
+            crate::api_token::enforce_token_scope,
+        ));
+    }
+    router
+}
+
 pub(crate) async fn require_harvest_admin(
     State(api_state): State<HarvestApiState>,
     request: axum::extract::Request,
@@ -5489,6 +5652,11 @@ pub(crate) async fn require_harvest_admin(
     // outer `enforce_token_scope` layer, so a `read` token attempting a mutating
     // admin route was denied 403 before reaching here; any principal that
     // reaches this point is authorized for the route it is on.
+    //
+    // A standalone mount installs that outer layer with
+    // `StandaloneAdminAuth::with_api_tokens` (issue #1608). The layer used to
+    // have exactly one call site, inside `HarvestPlugin`, which made this mode
+    // unreachable off the plugin path.
     if request
         .extensions()
         .get::<crate::api_token::TokenPrincipal>()

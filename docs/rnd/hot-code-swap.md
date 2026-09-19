@@ -360,7 +360,14 @@ it should be named rather than discovered later:
   Sharing one cache across executions is sound for the same reason the whole
   design is: the guest is a pure function of its request under deny-all
   capabilities, so two calls with the same key are two calls that must return the
-  same answer, whoever is asking. The bound is a count
+  same answer, whoever is asking. **Under deny-all only** — the fix behind
+  `key`'s identity binding does not extend to `with_capabilities` (issue
+  #1345). A guest granted a clock or randomness is not pure, so the host
+  skips the cache entirely rather than key it by capability grant: a
+  capability-enabled guest already fails replay for the same reason, and
+  caching would only mask when
+  (`a_capability_enabled_host_never_uses_the_decision_cache`). The bound is a
+  count
   (`MAX_CACHED_DECISIONS`) rather than a byte budget precisely because the key is
   a 32-byte digest rather than the request itself, which may be up to
   `MAX_DECIDE_REQUEST_BYTES`; eviction is oldest-first
@@ -404,16 +411,41 @@ it should be named rather than discovered later:
     on**: an over-budget `Await` acted on optimistically schedules a real
     activity the run then fails immediately afterwards, which is the worst of
     both outcomes. Guarded structurally, since reproducing it needs a guest slow
-    enough to exhaust a ten-second budget
+    enough to exhaust the cumulative budget
     (`the_run_budget_is_charged_and_checked_once_for_both_cache_paths`).
+
+    **The recorded cost is fuel, not wall-clock time (issue #1345, round 6).**
+    The first cut of the fix above stored the wall-clock `Duration` the
+    decision took to compute, and charged that same duration to every later
+    hit. Wall-clock time varies with host load, so residency still moved the
+    run's terminal outcome — now through the *charge* rather than through
+    whether it was charged at all: a decision recorded slow under a busy
+    runner cost every later hit that same slow charge, while the identical
+    guest recomputed fresh after eviction could cost far less and complete a
+    run the cached hit would have failed. Fuel is deterministic for a given
+    guest and request, so it does not carry host load into the charge. Fixing
+    this needed `invoke_wasm_guest_bytes` to report the fuel a decision
+    actually consumed, which the wall-clock-based first cut never asked for.
 
 The other cost is C5's: a decision runs inline on the decision-cycle thread —
 and, per C9 below, *must*, since the host may not introduce an await that records
-no command. `DECIDE_RUN_WALL_CLOCK` (10 s) is therefore the worst case for how
-long one workflow task can occupy a runtime worker, with `DECIDE_MAX_WALL_CLOCK`
-(5 s) bounding any single decision inside it. Those are policy numbers, not laws,
-and a deployment with many hosted workflows should size its worker pool knowing
-them. Fuel, not the clock, is the *operative* budget — see §8.4.
+no command. `DECIDE_RUN_FUEL_BUDGET` (twice `DECIDE_FUEL`) is the operative
+cumulative bound, with `DECIDE_MAX_WALL_CLOCK` (5 s) bounding any single
+decision inside it as a wall-clock backstop for the one class fuel cannot see
+(bulk-memory instructions). Fuel alone is not sufficient at the cumulative
+level either, and a bot review of the finding-5 fix caught the gap: a
+capability-enabled host (§8.5) or a cache miss recomputes every step fresh,
+so up to `MAX_DECIDE_STEPS` decisions could each spend close to
+`DECIDE_MAX_WALL_CLOCK` while staying under the fuel budget, wedging a
+runtime worker for minutes. `DECIDE_RUN_WALL_CLOCK_BACKSTOP` (10 s) closes
+that: measured live from `Instant::now()` at the top of the decide loop, on
+every step, never charged retroactively from a cached value — so a cache hit
+still costs it nothing, and it does not reinstate the residency-dependent
+terminal-outcome bug the fuel budget exists to avoid. Those are policy
+numbers, not laws, and a deployment with many hosted workflows should size
+its worker pool knowing them. Fuel is the *operative* budget, both
+per-decision and cumulative; the wall-clock pair at each level is a backstop
+for what fuel cannot see, not a second accounting mechanism.
 
 ### What a hosted workflow can and cannot express
 
@@ -727,12 +759,46 @@ The hazard is unloading a module while an in-flight task still holds its code.
 * **dylib:** use-after-free. A suspended execution's in-memory coroutine (DD-1)
   holds module code and data; `dlclose` unmaps it. There is no sound local policy
   — see §3.
-* **WASM (adopted):** structurally safe. `ModuleRegistry::get` hands out an `Arc`,
-  so `unload_build` removes the *binding* while an invocation that already
-  resolved the module keeps the code alive until it finishes
-  (`unloading_a_build_drops_its_modules_but_not_a_live_holder`). Unload is
-  therefore safe to call at any time; reachability decides when it is *useful*,
-  not when it is *legal*.
+* **WASM (adopted):** structurally safe against use-after-free. `ModuleRegistry::get`
+  hands out an `Arc`, so `unload_build` removes the *binding* while an
+  invocation that already resolved the module keeps the code alive until it
+  finishes (`unloading_a_build_drops_its_modules_but_not_a_live_holder`).
+  Unload is therefore legal to call at any time; reachability decides when it
+  is *useful*, not when it is *legal*.
+
+  **Legal is not the same as free (issue #1345).** A *suspended* execution
+  holds no `Arc`. Its next `process_workflow_task` does a fresh lookup, which
+  misses after an early unload — the typed capability miss (issue #804), not
+  a crash, but a redelivery round trip, and a terminal failure once no peer
+  still serves the build
+  (`unloading_a_build_misses_on_a_suspended_executions_next_lookup`). An
+  earlier revision of this report, and of `unload_build`'s own doc comment,
+  read the `Arc` guarantee as covering this case too. It does not: call
+  `unload_build` after `build_reachability` reports `safe_to_retire` to avoid
+  the cost, not merely to stay legal.
+
+  **The race guard was also scoped too widely (issue #1345 finding 7).**
+  `commit` refuses a load whose build was unloaded while it compiled, via one
+  registry-wide generation counter bumped by every `unload_build` call. A
+  single counter cannot tell a commit *which* build moved, so unloading
+  `wf-a` also bumped the generation a concurrent `wf-b` sync had captured —
+  failing `wf-b`'s commit with `UnloadedDuringLoad` and blaming `wf-b`, an
+  unrelated build never touched
+  (`unloading_the_build_being_loaded_still_fails_the_commit` pins the
+  original race the counter exists for;
+  `unloading_one_build_does_not_fail_an_unrelated_builds_in_flight_commit`
+  pins the fix). The registry now also records the generation at which each
+  build id was last unloaded, and `commit` checks only the builds its own
+  batch actually binds.
+
+  That record is itself unbounded — one entry per distinct build id ever
+  unloaded, for the life of the process, with no eviction (Codex review of
+  this same fix). Pruning it soundly needs proof that no in-flight `prepare`
+  still holds an older generation, which the registry does not track.
+  Growth is paced by `unload_build` calls, an operator action, not a guest
+  or a request, so it is bounded by deploy cadence rather than by execution
+  volume — a real but slow residual, in the same class as §8.3's
+  unautomated retirement, not a new hazard this fix introduces.
 
 ### 8.3 Memory growth under repeated swaps
 
@@ -752,6 +818,16 @@ Three bounds, none of them "hope":
    §8.3's last paragraph already names as the residual risk.
 3. **Per-invocation memory** is bounded by `DECIDE_MEMORY_BYTES` (4 MiB) against a
    fresh `Store` per decision, so a leaky guest leaks nothing across decisions.
+4. **Compiled artifacts accumulating during one sync** are bounded by
+   `MAX_WORKFLOW_NAMES_PER_BUILD` (256), refused before any module is fetched
+   (issue #1345 finding 6). `sync_build_into_registry` fetches source bytes
+   one payload at a time, which bounds *source* residency to one module. It
+   does not bound the compiled artifacts: atomic binding needs every module
+   compiled before any of them is bound, so a build with enough workflow
+   names could still accumulate unboundedly many resident compiled modules
+   before the batch commits. Calling that irreducible was true of needing to
+   hold them and false as a defence, since nothing bounded how many there
+   were (`a_sync_refuses_a_build_with_too_many_workflow_names`).
 
 The residual risk is operator discipline: nothing *forces* retirement. A GA
 version should reap automatically on the reachability signal.
@@ -800,6 +876,15 @@ axes:
 `a_guest_may_not_pick_the_queue_unless_the_host_allows_it`. A GA default should
 be narrower still: the activities the workflow's own registration declares.
 
+Allowing the override is not the same as allowing any *length* (issue #1345).
+`harvest_task_queue.queue_name` sits in a B-tree poll index, and Postgres
+refuses an index entry near a page-fraction limit — so a guest name long
+enough would make every future insert for that queue fail, not just this
+one. `resolve_activity_queue` now refuses a name over `MAX_QUEUE_NAME_BYTES`
+outright rather than truncating it, since a truncated name would route work
+to a queue nobody polls
+(`a_guest_may_not_pick_an_oversized_queue_name`).
+
 This section exists because the first version of this analysis reasoned carefully
 about the channel that is closed and never mentioned the one that is open by
 design — which is a worse failure in a safety analysis than an unmitigated risk
@@ -819,9 +904,22 @@ honestly named.
   only that an unbounded guest is stopped inside the budget; it does not (and
   cannot, with a `br`-looping guest that does consume fuel) distinguish which of
   the two bounds fired.
-* **Cumulative:** `DECIDE_RUN_WALL_CLOCK` bounds the guest time of a whole
-  decision cycle, so per-decision budgets cannot be composed into unbounded
-  occupancy of a runtime worker thread.
+* **Cumulative:** `DECIDE_RUN_FUEL_BUDGET` bounds the guest fuel of a whole
+  decision cycle, deterministically (issue #1345) — see §5's cache section
+  for why a wall-clock cumulative *charge* re-opened the same host-load
+  dependence the per-decision fuel bound exists to close. Fuel alone does
+  not bound wall-clock *occupancy*, though: a capability-enabled host or a
+  cache miss recomputes every step fresh, so a guest cheap in fuel but slow
+  in real time (bulk-memory instructions) could still occupy the thread for
+  minutes while staying under the fuel budget — a gap a bot review of that
+  same fix caught. `DECIDE_RUN_WALL_CLOCK_BACKSTOP` (10 s) closes it: a live
+  `Instant::now()` check, re-read every step and never charged from a cached
+  value, so it adds a real-time ceiling without reinstating the
+  residency-dependent bug the fuel budget fixed
+  (`the_wall_clock_backstop_still_bounds_a_cheap_in_fuel_slow_guest` pins
+  the ceiling itself;
+  `the_decide_loop_still_bounds_real_wall_clock_occupancy` pins where the
+  decide loop captures and checks it).
 * **Decision count:** `MAX_DECIDE_STEPS` (64). Without it a guest answering
   `Await` forever would append activity events without bound — a durable,
   replayable denial of service rather than a transient one
@@ -846,9 +944,9 @@ Two changes close it:
 1. **A task-scoped decision cache** (above), sound because the guest is a pure
    function of its request — the same property §7 rests on. A cycle now performs
    **one** new decision, not *n+1*.
-2. **`DECIDE_RUN_WALL_CLOCK`**, a cumulative guest budget for the whole cycle, so
-   per-decision budgets cannot be composed into unbounded occupancy even if the
-   cache is defeated.
+2. **`DECIDE_RUN_FUEL_BUDGET`**, a cumulative guest fuel budget for the whole
+   cycle, so per-decision budgets cannot be composed into unbounded occupancy
+   even if the cache is defeated.
 
 A third change was tried and **withdrawn as unsound**, and the reason is a
 constraint on this whole boundary rather than a detail of the fix:

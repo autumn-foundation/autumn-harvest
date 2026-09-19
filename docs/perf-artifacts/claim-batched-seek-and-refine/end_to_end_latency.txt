@@ -1,0 +1,2 @@
+single-row claim_task: n=400 mean=1874.035ms p50=1871.318ms p99=2042.438ms min=1747.105ms max=2440.389ms
+batched  claim_task_batched: n=400 mean=912.645ms p50=911.464ms p99=963.525ms min=872.928ms max=975.324ms

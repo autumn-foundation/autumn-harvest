@@ -51,6 +51,8 @@ mod child_policy_tests;
 mod child_timeout_tests;
 mod ci_run_coverage;
 mod circuit_breaker_wiring_tests;
+#[cfg(feature = "db")]
+mod claim_batched_tests;
 mod claim_bench_support;
 #[cfg(feature = "db")]
 mod claim_budget_tests;
@@ -256,6 +258,8 @@ mod workflow_id_targeted_tests;
 mod workflow_logger_tests;
 mod workflow_logs_tests;
 mod workflow_mutation_tests;
+#[cfg(feature = "db")]
+mod workflow_pause_claim_recheck_tests;
 #[cfg(feature = "db")]
 mod workflow_reachability_samples_tests;
 mod workflow_retry_tests;
