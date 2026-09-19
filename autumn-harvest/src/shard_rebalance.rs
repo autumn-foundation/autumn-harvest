@@ -3320,7 +3320,13 @@ mod db {
             list_migration_candidates(&mut source, scan_limit, after).await?
         };
 
-        let examined = candidates.len();
+        // `fetched` is the size of the scanned window, used below only to
+        // decide whether more candidates might remain past it. It is not
+        // the report's `examined` count (issue #1596 follow-up review,
+        // comment 4052737057). `moved >= limit` can break the loop long
+        // before the window is exhausted. The report must count only the
+        // candidates the loop actually reached, never the wider fetch.
+        let fetched = candidates.len();
         let mut outcomes = Vec::new();
         let mut moved = 0usize;
         // The cursor for the NEXT call must name the last candidate this one
@@ -3412,11 +3418,19 @@ mod db {
 
         // A full window means there may be more past the last row this scan
         // saw. Breaking early on `moved >= limit` means the same, even over
-        // a short window (issue #1317).
+        // a short window (issue #1317). This checks `fetched`, the window
+        // size, not the report's `examined` count below. A full window can
+        // still mean few rows were examined, if the loop broke early.
         let next_scan_cursor = (broke_early
-            || examined == usize::try_from(scan_limit).unwrap_or(usize::MAX))
+            || fetched == usize::try_from(scan_limit).unwrap_or(usize::MAX))
         .then_some(last_examined)
         .flatten();
+
+        // Every candidate the loop reaches, without breaking first, pushes
+        // exactly one outcome. This count matches the loop's own work,
+        // never the wider `fetched` window (issue #1596 follow-up review,
+        // comment 4052737057).
+        let examined = outcomes.len();
 
         Ok(MigrationBatchReport {
             source_shard,

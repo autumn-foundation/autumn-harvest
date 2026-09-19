@@ -2022,12 +2022,17 @@ async fn the_resume_cursor_names_the_last_processed_row_not_the_last_fetched_one
 
     // `limit = 1` and 5 eligible rows means `scan_limit` (4x) fetches the
     // oldest 4. The loop breaks after the very first one. Rows 2-4 of the
-    // window are fetched but never examined this call.
+    // window are fetched but never examined this call. `examined` must
+    // report 1, not the fetched window's size of 4 (issue #1596 follow-up
+    // review, comment 4052737057).
     let first =
         migrate_quiescent_executions(&shards.pool, SOURCE, TARGET, 1, true, "tester", &codecs())
             .await
             .expect("first dry run");
-    assert_eq!(first.examined, 4);
+    assert_eq!(
+        first.examined, 1,
+        "only the row the loop actually reached before breaking, not the wider fetched window"
+    );
     assert_eq!(first.would_migrate(), 1);
     match &first.outcomes[0] {
         MigrationOutcome::WouldMigrate { execution_id } => {
