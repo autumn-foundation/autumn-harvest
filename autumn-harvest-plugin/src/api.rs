@@ -43302,24 +43302,33 @@ async fn stream_execution_events(
                     // Comparing directly via `id > last_seen_id` could
                     // silently drop every later event (target ids lower)
                     // or replay copied history as duplicates (target ids
-                    // higher). Fail open to `-1`
-                    // (resume from the start, bounded by `buf_limit`), but
-                    // only if the stable `event_id` cannot be found there.
-                    // That case is normally unreachable once cutover has
-                    // copied the whole history, so this never runs in
-                    // practice.
-                    if let Some(event_id) = last_seen_event_id
-                        && let Ok(mut target_conn) =
-                            db_conn_for_execution(&api_clone, exec_id).await
-                        && let Ok(translated) = ::autumn_harvest::store::row_id_for_event_id(
-                            &mut target_conn,
-                            exec_id,
-                            event_id,
-                        )
-                        .await
-                    {
-                        last_seen_id = translated.unwrap_or(-1);
-                    }
+                    // higher).
+                    //
+                    // Reset to the documented `-1` fallback (resume from
+                    // the start, bounded by `buf_limit`) whenever
+                    // translation cannot complete for any reason (fresh
+                    // review, P1 follow-up). A resumed stream with an
+                    // empty backfill has no `last_seen_event_id` yet. A
+                    // transient checkout or query failure leaves the
+                    // lookup unresolved too. Either way, leaving the OLD
+                    // shard's cursor in place would compare it against
+                    // the new shard's own `id` sequence. That is the
+                    // exact bug this translation exists to prevent.
+                    last_seen_id = match last_seen_event_id {
+                        Some(event_id) => match db_conn_for_execution(&api_clone, exec_id).await {
+                            Ok(mut target_conn) => ::autumn_harvest::store::row_id_for_event_id(
+                                &mut target_conn,
+                                exec_id,
+                                event_id,
+                            )
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or(-1),
+                            Err(_) => -1,
+                        },
+                        None => -1,
+                    };
                     listener = l;
                     listener_shard = current_shard;
                 }

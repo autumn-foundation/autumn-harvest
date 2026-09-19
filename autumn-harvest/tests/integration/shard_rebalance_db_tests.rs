@@ -3599,6 +3599,92 @@ async fn an_allow_duplicate_failed_only_start_still_replaces_a_reconciled_failed
     assert_ne!(started.exec_id, exec_id);
 }
 
+#[tokio::test]
+async fn a_reconciled_seal_lookup_picks_the_newest_over_an_older_one() {
+    // Fresh review, P1 follow-up. A business key can accumulate more than
+    // one reconciled `MIGRATED` seal over time. Each repeat run gets its
+    // own row, and any of them may migrate and reconcile independently.
+    // The pre-check's lookup had no `ORDER BY`, so an unordered `LIMIT 1`
+    // could return either one. Seed an OLDER seal whose live copy
+    // succeeded, and a NEWER seal whose live copy failed. Then confirm
+    // `AllowDuplicateFailedOnly` acts on the newer (failed) one --
+    // replacing it -- rather than attaching to the stale successful one.
+    let shards = setup_two_shards().await;
+    let workflow_id = "reconciled-seal-picks-newest";
+
+    let older_exec_id = quiescent_fixture(&shards, workflow_id).await;
+    migrate_execution(&shards.pool, older_exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate the older run");
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(older_exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("complete the older migrated run");
+    let mut source = shards.source().await;
+    reconcile_migrated_seal_terminality(&mut source, &shards.pool, older_exec_id, SOURCE)
+        .await
+        .expect("reconcile the older seal")
+        .then_some(())
+        .expect("the older run must be observed terminal");
+
+    let newer_exec_id = quiescent_fixture(&shards, workflow_id).await;
+    migrate_execution(&shards.pool, newer_exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate the newer run");
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(newer_exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("fail the newer migrated run");
+    diesel::sql_query(
+        "INSERT INTO harvest_execution_summaries \
+             (execution_id, workflow_name, workflow_id, state, started_at, completed_at, \
+              duration_ms, shard_id, search_attrs, result, error, parent_id, \
+              migrated_from_shards) \
+         SELECT e.id, e.workflow_name, e.workflow_id, 'FAILED', e.started_at, NOW(), 0, \
+                e.shard_id, e.search_attrs, NULL, NULL, e.parent_id, e.migrated_from_shards \
+           FROM harvest_workflow_executions e WHERE e.id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(newer_exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("summarise the newer run");
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(newer_exec_id.as_uuid())
+        .execute(&mut target)
+        .await
+        .expect("retention-delete the newer run's execution row");
+    let mut source = shards.source().await;
+    reconcile_migrated_seal_terminality(&mut source, &shards.pool, newer_exec_id, SOURCE)
+        .await
+        .expect("reconcile the newer seal")
+        .then_some(())
+        .expect("the newer run must be observed terminal once summarised");
+
+    let started = autumn_harvest::execution::start_or_load_workflow_execution(
+        &mut source,
+        allow_duplicate_failed_only_start("entity_flow", workflow_id),
+        None,
+    )
+    .await
+    .expect("AllowDuplicateFailedOnly must act on the newest reconciled seal");
+    assert!(
+        started.created,
+        "the newest seal failed, so it must be replaced, not attached to"
+    );
+    assert_ne!(started.exec_id, older_exec_id);
+    assert_ne!(started.exec_id, newer_exec_id);
+}
+
 fn allow_duplicate_failed_only_start<'a>(
     workflow_name: &'a str,
     workflow_id: &'a str,

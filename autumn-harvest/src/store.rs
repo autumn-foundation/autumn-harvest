@@ -1231,22 +1231,23 @@ pub async fn load_events_after_row_id(
 ///
 /// An SSE resume cursor (`Last-Event-ID`) is a `harvest_events.id` value,
 /// local to whichever database currently holds the row. `stage_copy`
-/// deliberately does not carry `id` across a shard-rebalance migration; the
-/// target assigns fresh values from its own `BIGSERIAL` sequence. A live
-/// stream that rebinds to a migrated execution's new shard mid-flight must
-/// therefore re-resolve its cursor here before its next
-/// [`load_events_after_row_id`] call, or that call compares the OLD
-/// database's `id` against the NEW one's -- silently dropping every
-/// subsequent event if the target's ids happen to be lower, or replaying
+/// deliberately does not carry `id` across a shard-rebalance migration.
+/// The target assigns fresh values from its own `BIGSERIAL` sequence. A
+/// live stream that rebinds to a migrated execution's new shard
+/// mid-flight must therefore re-resolve its cursor here before its next
+/// [`load_events_after_row_id`] call. Otherwise that call compares the
+/// OLD database's `id` against the NEW one's. That silently drops every
+/// subsequent event if the target's ids happen to be lower, or replays
 /// already-seen history as duplicates if higher. `event_id` is copied
 /// byte-for-byte by `stage_copy`, so it is what identifies "the same event"
 /// across the move.
 ///
-/// Returns `None` if `exec_id` has no event with this `event_id` on `conn`'s
-/// database -- normally unreachable once a migration has cut over (the
-/// target holds the whole copied history), kept as an explicit `Option`
-/// rather than an error so a caller can fail open (e.g. resume from the
-/// start) instead of tearing down the stream over it.
+/// Returns `None` if `exec_id` has no event with this `event_id` on
+/// `conn`'s database. That case is normally unreachable once a migration
+/// has cut over, since the target holds the whole copied history. It is
+/// kept as an explicit `Option` rather than an error. That lets a
+/// caller fail open (e.g. resume from the start) instead of tearing
+/// down the stream over it.
 ///
 /// # Errors
 ///
