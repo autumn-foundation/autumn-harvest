@@ -144,7 +144,7 @@ a workflow function — no activity, no HTTP call, no hand-rolled outbox require
 ```rust
 #[workflow]
 async fn tenant_cancel(ctx: &WorkflowContext, input: Value) -> HarvestResult<Value> {
-    let onboarding_ids: Vec<ExecutionId> = /* load from input */;
+    let onboarding_ids: Vec<ExecutionId> = /* load from input */ Vec::new();
 
     for target in onboarding_ids {
         match ctx
