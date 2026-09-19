@@ -339,12 +339,18 @@ def _quote_prefix_present(line: str, depth: int) -> bool:
 def _list_prefix_present(line: str, marker_width: int) -> bool:
     """True if `line` is still indented to at least the list item's own
     content column (`marker_width`, 0 when the fence didn't open on a
-    marker's own line — trivially always present then). Same rule as the
-    sibling blockquote check above, for the other container type: a line
-    that dedents below the item's content column ends the item, and any
-    fence still open inside it, right there — this script does not
-    special-case a blank line as an exception, matching that check.
+    marker's own line — trivially always present then). Unlike the sibling
+    blockquote check above (a blank line there DOES end it — comment-
+    hygiene.py's own fixtures give each container its own answer: "an
+    unclosed fence ends when its block quote does" right next to "a blank
+    line does not end the list item a fence sits in"), a list item
+    tolerates an unindented blank line without ending — CommonMark lets a
+    list item's blocks be separated by blank lines the same way top-level
+    blocks are, so one appearing (still indented or not) inside an open
+    fence is just blank fence content, not a dedent out of the item.
     """
+    if line.strip() == "":
+        return True
     col = 0
     for ch in line:
         if not ch.isspace():
