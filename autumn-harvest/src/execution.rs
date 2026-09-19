@@ -3648,8 +3648,8 @@ pub async fn resolve_live_attempt(
 /// A retry successor is minted on its predecessor's shard. Nothing stops it
 /// from being rebalanced away afterwards. Shard rebalancing (issue #964)
 /// moves any quiescent execution, and a parked retry successor qualifies
-/// like any other. `conn`/`held_shard` are only ever resolved for the row
-/// the walk STARTS at.
+/// like any other. `conn`/`held_shard` are only ever resolved for `exec_id`
+/// as the CALLER understands its residence, typically its origin shard.
 ///
 /// Reading a later hop on that same connection would find whatever row
 /// physically exists there. After a rebalance, that is the origin shard's
@@ -3659,27 +3659,40 @@ pub async fn resolve_live_attempt(
 /// above all. A result waiter would poll a nonterminal seal forever. A
 /// listener rebind would keep watching the wrong execution.
 ///
+/// This holds for `exec_id` itself, the walk's seed, exactly as much as it
+/// holds for a later retry hop (issue #1596 follow-up review, comment
+/// 4053840606). The addressed execution can have been migrated
+/// independent of any retry of its own. A caller's `conn` is typically
+/// resolved for its origin shard alone, with no reason to know about a
+/// migration. Reading the seed there first, before any hop check ever
+/// runs, would see the same stale `MIGRATED` stub and stop the walk before
+/// it starts. The seed's own residence is therefore resolved first, via
+/// the same [`crate::shard_rebalance::resolve_execution_shard_holding`]
+/// every later hop uses.
+///
 /// So every hop's residence is resolved before its state is trusted, via
 /// [`crate::shard_rebalance::resolve_execution_shard_holding`]. A hop that
 /// lands on the connection already in hand costs nothing extra. Only a hop
 /// that has actually moved pays for a fresh checkout.
 ///
-/// Every checkout is guarded by
+/// Every checkout past the seed is guarded by
 /// [`crate::shard_rebalance::forwarding_hop_conflict`]. It checks both
 /// `held_shard` (the caller's own connection, held for this whole call) and
 /// the walk's own previous hop. This mirrors
 /// [`crate::shard_rebalance::live_copy_is_terminal`]'s identical discipline.
 /// Otherwise a hop landing back on either one could deadlock a
 /// pool-size-one shard against a connection this call already holds open.
+/// The seed's own checkout needs no such guard: it is the walk's first
+/// read, so no other hop's connection is open yet to alias.
 ///
 /// Each row is paired with the shard it was actually read from (issue #1596
 /// follow-up review, comment 4052389744). That shard is not necessarily
-/// `held_shard`, once a hop has moved. A caller that must act on a specific
-/// element needs that shard. [`retry_chain_ids`]'s own consumers sometimes must act on an
-/// element other than the last one. Use
+/// `held_shard`, once a hop has moved, or even for the seed itself, once
+/// its own migration is resolved. A caller that must act on a specific
+/// element needs that element's own shard. [`retry_chain_ids`]'s own
+/// consumers sometimes must act on an element other than the last one. Use
 /// [`crate::shard_rebalance::bind_to_shard`] before running any follow-up
-/// query against it. Only index 0 is guaranteed to sit on `conn`'s own
-/// shard.
+/// query against it. No index is guaranteed to sit on `conn`'s own shard.
 ///
 /// # Errors
 ///
@@ -3716,6 +3729,33 @@ pub async fn walk_retry_chain(
 
     let mut active = ActiveConn::Held(conn);
     let mut current_shard = held_shard;
+
+    // Resolve the SEED's own residence before trusting its state, exactly
+    // as every later hop already does below (issue #1596 follow-up
+    // review, comment 4053840606). The addressed execution can itself
+    // have been migrated, independent of any retry. Reading it on
+    // `held_shard` alone would then see the origin-side `MIGRATED` seal.
+    // `"MIGRATED" != "FAILED"` stops the walk immediately, before it ever
+    // reaches the seed's own retry successor on its new shard.
+    //
+    // No [`crate::shard_rebalance::forwarding_hop_conflict`] check is
+    // needed here, unlike every later hop. This is the walk's very first
+    // read. `held_shard` is the only connection held so far. It is also
+    // the reference point a move away from it is compared against, so
+    // aliasing it is not possible yet.
+    let seed_shard = crate::shard_rebalance::resolve_execution_shard_holding(
+        active.as_mut(),
+        pool,
+        exec_id,
+        held_shard,
+    )
+    .await?;
+    if seed_shard != held_shard && !pool.same_physical_pool(seed_shard, held_shard) {
+        active = ActiveConn::Owned(Box::new(
+            crate::shard_rebalance::conn_for_shard(pool, seed_shard).await?,
+        ));
+        current_shard = seed_shard;
+    }
     let mut chain = vec![(
         load_execution_row(active.as_mut(), exec_id).await?,
         current_shard,
@@ -3815,7 +3855,9 @@ pub async fn walk_retry_chain(
 /// Ordered `exec_id` first, live attempt last. A caller that must act on any
 /// element other than the last needs each one's own shard. The management
 /// API's search for which attempt carries a given update admission is one
-/// example. Only `conn`'s own shard is guaranteed for index 0.
+/// example. No index is guaranteed to sit on `conn`'s own shard. Even index
+/// 0 may have moved, if `exec_id` itself was migrated (issue #1596
+/// follow-up review, comment 4053840606).
 ///
 /// # Errors
 ///

@@ -6581,3 +6581,87 @@ async fn a_signal_against_a_migrated_retry_successor_reaches_its_live_shard() {
          meant for the live copy"
     );
 }
+
+/// Issue #1596 follow-up review (comment 4053840606): the fix above resolves
+/// every hop the walk follows AFTER its first read. The walk's own SEED
+/// read -- `exec_id` itself, before any hop -- had no such check. The
+/// ADDRESSED execution can itself be the one that migrated, rather than a
+/// retry successor of it. A caller's `conn`, typically resolved for the
+/// addressed execution's origin shard alone, then sees only the
+/// origin-side `MIGRATED` seal on that very first read. `MIGRATED !=
+/// FAILED`, so the walk stopped there and never reached the live copy's
+/// OWN retry successor on its new shard. This pins the fix for that seed
+/// read.
+#[tokio::test]
+async fn resolve_live_attempt_follows_the_seeds_own_migration_before_walking_retries() {
+    let shards = setup_two_shards().await;
+
+    // The ADDRESSED execution itself, not yet any retry's predecessor.
+    let mut source = shards.source().await;
+    let original = insert_execution(&mut source, "entity_flow", "migrate-then-fail").await;
+    append_history(&mut source, original, &[started(json!({"seed": 1}))]).await;
+    park_on_timer(&mut source, original).await;
+    drop(source);
+
+    let outcome = migrate_execution(&shards.pool, original, SOURCE, TARGET, &codecs())
+        .await
+        .expect("the addressed execution's own migration must not error");
+    assert!(
+        matches!(outcome, MigrationOutcome::Migrated { .. }),
+        "expected the addressed execution's migration to complete, got {outcome:?}"
+    );
+
+    // On its NEW shard, the live copy fails and spawns a retry successor --
+    // entirely independent of the migration above.
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(original.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("seal the migrated copy FAILED");
+    let retry = insert_execution_with_id(
+        &mut target,
+        "entity_flow",
+        "migrate-then-fail-retry",
+        ExecutionId::new_for_shard(TARGET),
+        TARGET,
+    )
+    .await;
+    diesel::sql_query("UPDATE harvest_workflow_executions SET retry_of_exec_id = $1 WHERE id = $2")
+        .bind::<diesel::sql_types::Uuid, _>(original.as_uuid())
+        .bind::<diesel::sql_types::Uuid, _>(retry.as_uuid())
+        .execute(&mut target)
+        .await
+        .expect("link the retry to the migrated original");
+    drop(target);
+
+    // Exactly what a generated signal or another public `conn`-accepting
+    // entry point does. It resolves a connection for the addressed id's
+    // own ORIGIN shard alone, with no idea it ever migrated.
+    let mut origin_conn = shards.source().await;
+
+    let (resolved, resolved_shard) = autumn_harvest::execution::resolve_live_attempt(
+        &mut origin_conn,
+        &shards.pool,
+        SOURCE,
+        original,
+    )
+    .await
+    .expect(
+        "the walk must follow the seed's own migration to its new shard, then on to its \
+         retry, not stop at the origin-side MIGRATED seal",
+    );
+
+    assert_eq!(
+        resolved.id, retry.as_uuid(),
+        "the live attempt is the retry on the migrated copy's new shard, not the \
+         stale MIGRATED seal left behind on the origin"
+    );
+    assert_eq!(
+        resolved_shard, TARGET,
+        "the resolved row must be reported on the shard it actually lives on"
+    );
+}
