@@ -97,22 +97,37 @@ TARGET_GLOBS = [
     "README.md",
 ]
 
-# CONTAINER absorbs indentation and Markdown blockquote markers ("> "),
-# including a blockquote nested inside a list item, ahead of the fence
-# itself — captured so the same text can be stripped from the block's
-# content lines too, since a blockquote's "> " is Markdown syntax, not part
-# of the Rust source, and left in place would break every blockquoted
-# snippet's parse regardless of whether its actual code is valid.
+# LEAD_INDENT is the fence's own plain indentation, consumed exactly ONCE
+# regardless of whether a list marker follows — not once before an optional
+# marker AND once again after, which would let two separate 3-character
+# budgets stack into 6 characters of indent for a plain (markerless) line,
+# well past CommonMark's actual per-container cap.
 #
-# Each run of plain indentation, whether at the start or straight after a
-# ">", is capped at 3 columns: `docs/audits/comment-hygiene.py` already
-# implements this exact CommonMark rule (see its fence_delimiter, and its
-# own fixture tests around "four spaces is an indented code line, not a
-# fence opener" / "an over-indented \`\`\` inside a fence is content, not a
-# closer") for the same reason — 4+ columns of indent relative to the
-# container makes a delimiter-looking line indented CONTENT, not a fence
-# marker, opener or closer alike.
-CONTAINER = r"[ \t]{0,3}(?:>[ \t]{0,3})*"
+# BQ is one level of Markdown blockquote marker (">") plus its own trailing
+# indentation, repeated for however many "> " a nested blockquote carries —
+# captured (with LEAD_INDENT) so the same text can be stripped from the
+# block's content lines too, since a blockquote's "> " is Markdown syntax,
+# not part of the Rust source, and left in place would break every
+# blockquoted snippet's parse regardless of whether its actual code is
+# valid.
+#
+# Each indentation run — LEAD_INDENT, and every BQ repetition's own trailing
+# whitespace — is capped at 3 COLUMNS, not 3 characters: a single leading
+# tab expands to a 4-column stop and so already exceeds the budget by
+# itself, which `{0,3}` alone (a character count) would not catch.
+# `docs/audits/comment-hygiene.py` already implements this exact CommonMark
+# rule (see its fence_delimiter, which validates with the equivalent of
+# `text.expandtabs(4)`, and its own fixture tests around "four spaces is an
+# indented code line, not a fence opener" / "an over-indented \`\`\` inside a
+# fence is content, not a closer") for the same reason — indent past the
+# container's budget makes a delimiter-looking line indented CONTENT, not a
+# fence marker, opener or closer alike. The regex itself still only bounds
+# each run to 3 *characters* (a plain, tab-free run of that length is
+# always within budget); _valid_indent below additionally rejects any run
+# whose tab-expanded width exceeds 3, since regex alone cannot do that
+# arithmetic.
+LEAD_INDENT = r"[ \t]{0,3}"
+BQ = r">[ \t]{0,3}"
 #
 # LIST_MARKER additionally allows a fence to be the first block of a list
 # item, opening on the marker's own line ("- ```rust", "1. ```rust") rather
@@ -122,7 +137,10 @@ CONTAINER = r"[ \t]{0,3}(?:>[ \t]{0,3})*"
 # never legal on a CLOSING fence line, which must consist of nothing but
 # its container's indentation/blockquote markers and the delimiter itself —
 # a line like "- ```" inside a still-open block is literal fenced content,
-# not a closer.
+# not a closer. An ordered marker is 1-9 ASCII digits (CommonMark's own
+# limit — a ten-digit run like "1234567890." is not a list marker at all,
+# just prose that happens to start with digits) followed by "." or ")";
+# `[0-9]`, not `\d`, so a Unicode digit character does not also qualify.
 #
 # This is deliberately not a full CommonMark container parser (no nesting
 # beyond one list level, no lazy continuation lines) — this script trades
@@ -148,10 +166,30 @@ CONTAINER = r"[ \t]{0,3}(?:>[ \t]{0,3})*"
 # non-Rust fence containing a line that merely looks like a Rust fence
 # opener (a Markdown-about-Markdown example, say) would otherwise be misread
 # as a real one.
-LIST_MARKER = r"(?:[-*+]|\d+[.)])\s+"
+LIST_MARKER = r"(?:[-*+]|[0-9]{1,9}[.)])\s+"
 FENCE_DELIM = r"(`{3,}|~{3,})"
-FENCE_OPEN_RE = re.compile(rf"^({CONTAINER})((?:{LIST_MARKER})?)({CONTAINER}){FENCE_DELIM}(.*)$")
-FENCE_CLOSE_RE = re.compile(rf"^({CONTAINER}){FENCE_DELIM}\s*$")
+FENCE_OPEN_RE = re.compile(
+    rf"^({LEAD_INDENT})((?:{LIST_MARKER})?)((?:{BQ})*){FENCE_DELIM}(.*)$"
+)
+FENCE_CLOSE_RE = re.compile(rf"^({LEAD_INDENT}(?:{BQ})*){FENCE_DELIM}\s*$")
+
+
+def _valid_indent(text: str) -> bool:
+    """True if pure-indentation `text` is within the 3-column fence budget
+    once tabs are expanded to 4-column stops. A literal character count
+    (what `{0,3}` alone gives the regex) under-counts a tab, which reaches
+    the next stop, and so can exceed the budget in a single character.
+    """
+    return len(text.expandtabs(4)) <= 3
+
+
+def _fence_indent_valid(prefix: str) -> bool:
+    """True if every indentation run in a captured fence prefix is within
+    budget: the lead indent before any blockquote marker, and each ">"'s
+    own trailing indent. Splitting on ">" recovers each run whether `prefix`
+    is an opener's lead+trail or a closer's single combined group.
+    """
+    return all(_valid_indent(chunk) for chunk in prefix.split(">"))
 
 
 def _blockquote_depth(prefix: str) -> int:
@@ -297,7 +335,7 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
     n = len(lines)
     while i < n:
         m = FENCE_OPEN_RE.match(lines[i])
-        if not m:
+        if not m or not _fence_indent_valid(m.group(1) + m.group(3)):
             i += 1
             continue
         lead, marker, trail, delim, info = m.groups()
@@ -317,6 +355,7 @@ def find_rust_blocks(text: str, relpath: str) -> list[str]:
             cm = FENCE_CLOSE_RE.match(line)
             if (
                 cm
+                and _fence_indent_valid(cm.group(1))
                 and _blockquote_depth(cm.group(1)) == depth
                 and cm.group(2)[0] == delim_char
                 and len(cm.group(2)) >= delim_len
