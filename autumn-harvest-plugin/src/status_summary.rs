@@ -838,77 +838,93 @@ struct CountRow {
 /// Bounded count of stalled *candidate* executions on this shard.
 ///
 /// Mirrors the candidate predicate of [`crate::api::load_stalled_workflows`]
-/// (its default `include_sleeping = false` shape): an active-state execution
-/// (`RUNNING`/`SUSPENDED`) with no `harvest_events` row newer than `minutes`,
-/// **and** which is not "correctly sleeping" — i.e. it either has other pending
-/// work (a claimable task-queue row, a non-terminal child, or an unconsumed
-/// signal) or has no sole future-dated durable timer to be legitimately parked
-/// on / has an already-overdue timer. The future-timer exclusion predicate
-/// below is copied verbatim from `load_stalled_workflows` so the two agree: a
-/// workflow idling on a long `ctx.timer`/`receive_signal_timeout` is **not**
-/// counted as stalled. Counting stops at `cap` so the status endpoint never
-/// scans an unbounded backlog; the drill-down link remains authoritative.
+/// (its default `include_sleeping = false` shape). An active-state execution
+/// (`RUNNING`/`SUSPENDED`) counts as a candidate when it has no recent
+/// `harvest_events` row, and it is not "correctly sleeping". "Correctly
+/// sleeping" means: no other pending work (task-queue row, non-terminal
+/// child, unconsumed signal), and a sole future-dated timer to wait on. The
+/// future-timer exclusion below copies `load_stalled_workflows` verbatim, so
+/// a workflow idling on a long `ctx.timer` or `receive_signal_timeout` never
+/// counts as stalled. The count stops at `cap`, so this endpoint never scans
+/// an unbounded backlog. The drill-down link stays authoritative for the
+/// full list.
 ///
-/// Cost note: this is a `NOT EXISTS` anti-join per `RUNNING`/`SUSPENDED` row
-/// (backed by the `idx_harvest_events_exec_last` covering index), so its cost
-/// scales with the active-execution count. `GET /admin/status` is an on-demand
-/// triage surface, not a per-second dashboard poll.
+/// Cost note (issue #1643): `recent_event_execs` is a `MATERIALIZED` CTE.
+/// Postgres builds it once per call, then anti-joins it by equality against
+/// active executions. This replaces a `NOT EXISTS` correlated on a
+/// `timestamp` range, which ran once per `RUNNING`/`SUSPENDED` row as a
+/// `Nested Loop Anti Join`. The CTE scans `harvest_events` by timestamp
+/// once, fleet-wide, so its cost tracks event-write volume in the window,
+/// not active-execution count. See
+/// `docs/performance-status-summary-stalled.md` for the measured trade-off
+/// across both workload shapes.
 async fn count_stalled_candidates(
     conn: &mut AsyncPgConnection,
     minutes: i64,
     cap: i64,
 ) -> Result<i64, String> {
-    // The `AND (... future-timer exclusion ...)` block mirrors the
-    // `!include_sleeping` filter in `crate::api::load_stalled_workflows` exactly
-    // (only the correlation alias differs: `e.id` here vs. the qualified
-    // `harvest_workflow_executions.id` there). Keep the two in sync.
-    let row: CountRow = diesel::sql_query(
-        "SELECT COUNT(*)::BIGINT AS cnt FROM ( \
-             SELECT 1 FROM harvest_workflow_executions e \
-             WHERE e.state IN ('RUNNING', 'SUSPENDED') \
-             AND NOT EXISTS ( \
-                 SELECT 1 FROM harvest_events ev \
-                 WHERE ev.workflow_exec_id = e.id \
-                 AND ev.timestamp >= NOW() - ($1 * INTERVAL '1 minute') \
-             ) \
-             AND ( \
-                 EXISTS ( \
-                     SELECT 1 FROM harvest_task_queue \
-                     WHERE workflow_exec_id = e.id \
-                     AND state IN ('PENDING','CLAIMED','RUNNING','BACKOFF') \
-                 ) \
-              OR EXISTS ( \
-                     SELECT 1 FROM harvest_workflow_executions c \
-                     WHERE c.parent_id = e.id \
-                     AND c.state NOT IN ( \
-                         'COMPLETED','FAILED','CANCELLED', \
-                         'TIMED_OUT','CONTINUED_AS_NEW','TERMINATED' \
-                     ) \
-                 ) \
-              OR EXISTS ( \
-                     SELECT 1 FROM harvest_signals \
-                     WHERE workflow_exec_id = e.id AND consumed = false \
-                 ) \
-              OR NOT EXISTS ( \
-                     SELECT 1 FROM harvest_timers \
-                     WHERE workflow_exec_id = e.id \
-                     AND fired = false AND fires_at > NOW() \
-                 ) \
-              OR EXISTS ( \
-                     SELECT 1 FROM harvest_timers \
-                     WHERE workflow_exec_id = e.id \
-                     AND fired = false AND fires_at <= NOW() \
-                 ) \
-             ) \
-             LIMIT $2 \
-         ) t",
-    )
-    .bind::<BigInt, _>(minutes)
-    .bind::<BigInt, _>(cap)
-    .get_result(conn)
-    .await
-    .map_err(|e| e.to_string())?;
+    let row: CountRow = diesel::sql_query(count_stalled_candidates_query())
+        .bind::<BigInt, _>(minutes)
+        .bind::<BigInt, _>(cap)
+        .get_result(conn)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(row.cnt)
+}
+
+/// SQL text for [`count_stalled_candidates`].
+///
+/// Pulled into its own function so tests can pin the query shape without a
+/// database (issue #1643).
+///
+/// The `AND (... future-timer exclusion ...)` block mirrors the
+/// `!include_sleeping` filter in `crate::api::load_stalled_workflows` exactly
+/// (only the correlation alias differs: `e.id` here vs. the qualified
+/// `harvest_workflow_executions.id` there). Keep the two in sync.
+#[must_use]
+const fn count_stalled_candidates_query() -> &'static str {
+    "WITH recent_event_execs AS MATERIALIZED ( \
+         SELECT DISTINCT workflow_exec_id FROM harvest_events \
+         WHERE timestamp >= NOW() - ($1 * INTERVAL '1 minute') \
+     ) \
+     SELECT COUNT(*)::BIGINT AS cnt FROM ( \
+         SELECT 1 FROM harvest_workflow_executions e \
+         WHERE e.state IN ('RUNNING', 'SUSPENDED') \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM recent_event_execs r \
+             WHERE r.workflow_exec_id = e.id \
+         ) \
+         AND ( \
+             EXISTS ( \
+                 SELECT 1 FROM harvest_task_queue \
+                 WHERE workflow_exec_id = e.id \
+                 AND state IN ('PENDING','CLAIMED','RUNNING','BACKOFF') \
+             ) \
+          OR EXISTS ( \
+                 SELECT 1 FROM harvest_workflow_executions c \
+                 WHERE c.parent_id = e.id \
+                 AND c.state NOT IN ( \
+                     'COMPLETED','FAILED','CANCELLED', \
+                     'TIMED_OUT','CONTINUED_AS_NEW','TERMINATED' \
+                 ) \
+             ) \
+          OR EXISTS ( \
+                 SELECT 1 FROM harvest_signals \
+                 WHERE workflow_exec_id = e.id AND consumed = false \
+             ) \
+          OR NOT EXISTS ( \
+                 SELECT 1 FROM harvest_timers \
+                 WHERE workflow_exec_id = e.id \
+                 AND fired = false AND fires_at > NOW() \
+             ) \
+          OR EXISTS ( \
+                 SELECT 1 FROM harvest_timers \
+                 WHERE workflow_exec_id = e.id \
+                 AND fired = false AND fires_at <= NOW() \
+             ) \
+         ) \
+         LIMIT $2 \
+     ) t"
 }
 
 #[cfg(test)]
@@ -1503,5 +1519,59 @@ mod tests {
             stalled.drill_down.as_deref(),
             Some("/workflows?no_progress_minutes=42")
         );
+    }
+
+    /// Pins the issue #1643 rewrite: the "no recent event" check must read a
+    /// `MATERIALIZED` CTE, not a per-row correlated `NOT EXISTS` against
+    /// `harvest_events` directly.
+    #[test]
+    fn count_stalled_candidates_query_uses_materialized_recent_event_cte() {
+        let sql = count_stalled_candidates_query();
+        assert!(
+            sql.contains("recent_event_execs AS MATERIALIZED"),
+            "expected a MATERIALIZED recent_event_execs CTE, got: {sql}"
+        );
+        assert!(
+            sql.contains("NOT EXISTS ( SELECT 1 FROM recent_event_execs r"),
+            "expected the outer anti-join to probe recent_event_execs, got: {sql}"
+        );
+        assert!(
+            !sql.contains("FROM harvest_events ev"),
+            "expected no direct per-row correlated scan of harvest_events, got: {sql}"
+        );
+    }
+
+    /// `recent_event_execs` must be defined once and referenced exactly once
+    /// more (issue #1643). A second reference would revert to a per-row
+    /// probe of the CTE instead of a single equality anti-join.
+    #[test]
+    fn recent_event_execs_cte_is_defined_and_referenced_exactly_once() {
+        let sql = count_stalled_candidates_query();
+        assert_eq!(
+            sql.matches("recent_event_execs").count(),
+            2,
+            "recent_event_execs: one CTE definition + one reference \
+             expected, got: {sql}"
+        );
+    }
+
+    /// The future-timer exclusion block must stay byte-identical to the one
+    /// in `load_stalled_workflows` (only the correlation alias differs). The
+    /// #1643 rewrite must not touch this block.
+    #[test]
+    fn count_stalled_candidates_query_keeps_every_or_block_gate() {
+        let sql = count_stalled_candidates_query();
+        for gate in [
+            "state IN ('PENDING','CLAIMED','RUNNING','BACKOFF')",
+            "c.parent_id = e.id",
+            "consumed = false",
+            "fired = false AND fires_at > NOW()",
+            "fired = false AND fires_at <= NOW()",
+        ] {
+            assert!(
+                sql.contains(gate),
+                "missing OR-block gate {gate:?} in: {sql}"
+            );
+        }
     }
 }
