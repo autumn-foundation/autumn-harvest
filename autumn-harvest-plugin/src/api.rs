@@ -14008,9 +14008,13 @@ pub(crate) async fn build_diagnosis_report(
         Err(err) => return Err(map_error(err)),
     };
 
-    // Snapshot `now` once so every deadline, age and backoff comparison in this
-    // response is judged against one consistent instant.
-    let now = chrono::Utc::now();
+    // This instant is reported, never compared. It backs only
+    // `last_event_age_seconds` below, and the same field on the terminal
+    // early return -- a display metric, not a deadline check. It may
+    // therefore run slightly ahead of `now`, captured further down. `now`
+    // (issue #1368) is the single instant every deadline, age and backoff
+    // COMPARISON in this response is judged against.
+    let report_started_at = chrono::Utc::now();
 
     let last_event_at: Option<chrono::DateTime<chrono::Utc>> = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
@@ -14018,8 +14022,11 @@ pub(crate) async fn build_diagnosis_report(
         .first::<Option<chrono::DateTime<chrono::Utc>>>(&mut conn)
         .await
         .map_err(database_error)?;
-    let last_event_age_seconds =
-        last_event_at.map(|ts| (now - ts).to_std().map_or(0.0, |d| d.as_secs_f64()));
+    let last_event_age_seconds = last_event_at.map(|ts| {
+        (report_started_at - ts)
+            .to_std()
+            .map_or(0.0, |d| d.as_secs_f64())
+    });
 
     let is_terminal = is_terminal_state(&execution.state);
     if is_terminal {
@@ -14196,17 +14203,24 @@ pub(crate) async fn build_diagnosis_report(
     // by dispatch), so consulting it here cannot perturb enforcement. A
     // cooled-down breaker therefore still reads "open" until a real probe is
     // admitted — a deliberate, documented read-only conservatism.
-    // Issue #1193 Codex round-5 P2: `time_until_probe_secs` on the snapshot
-    // below is a duration measured from THIS instant, not from `now` (which
-    // was captured well before the DB queries above ran). Combining that
-    // duration with the stale, earlier `now` when deriving `cooldown_until`
-    // would systematically UNDERESTIMATE the true deadline by however long
-    // those queries took -- enough, near the boundary, to make a row that
-    // hasn't actually cleared read as if it had. `snapshot_wall_now` is
-    // captured back-to-back with the monotonic instant so the two are always
-    // consistent with each other, and is what `circuit_cooldown_until` below
-    // is derived from -- never the outer `now`.
-    let snapshot_wall_now = chrono::Utc::now();
+    //
+    // `now` is captured here, back-to-back with the `list()` call below, not
+    // at the top of the function. `time_until_probe_secs` on the snapshot is
+    // a duration measured from THIS instant, so `cooldown_until` (derived
+    // from it below) and `now` are always mutually consistent.
+    //
+    // Issue #1368: every comparison this response makes against
+    // `cooldown_until` -- both `classify_execution` calls below included --
+    // MUST use this same `now`, never an earlier one. PR #1365 fixed
+    // `cooldown_until`'s own derivation this way, but left `classify_execution`
+    // reading a `now` captured before the DB queries above ran. For an
+    // ALREADY-CLEARED breaker
+    // (`time_until_probe_secs == 0.0`), `cooldown_until` then pinned to
+    // exactly this instant. That instant is always later than the stale
+    // `now`, so the "already cleared" comparison could never succeed. One
+    // `now`, used everywhere a comparison needs it, keeps that from
+    // recurring.
+    let now = chrono::Utc::now();
     let (cb_phase, cb_tracked): (
         std::collections::HashMap<String, autumn_harvest::circuit_breaker::CircuitSnapshot>,
         Vec<String>,
@@ -14424,10 +14438,9 @@ pub(crate) async fn build_diagnosis_report(
                     Some(BlockingCircuitPhase::Open),
                     snapshot
                         .and_then(|s| s.time_until_probe_secs)
-                        // `snapshot_wall_now`, NOT the outer `now` -- see the
-                        // comment where it's captured (issue #1193 Codex
-                        // round-5 P2).
-                        .and_then(|secs| circuit_cooldown_until(snapshot_wall_now, secs)),
+                        // See the comment where `now` is captured above
+                        // (issue #1193; issue #1368).
+                        .and_then(|secs| circuit_cooldown_until(now, secs)),
                 ),
                 Some("half_open") => (Some(BlockingCircuitPhase::HalfOpen), None),
                 _ => (None, None),

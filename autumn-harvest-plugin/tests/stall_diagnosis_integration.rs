@@ -192,6 +192,23 @@ fn breaker_activity() -> ActivityInfo {
     }
 }
 
+/// Same shape as [`breaker_activity`], but a millisecond-scale cooldown.
+/// Issue #1368: a test needs a breaker whose cooldown has genuinely elapsed
+/// in real time before the endpoint reads it. The short cooldown avoids an
+/// actual 30-second sleep.
+fn fast_cooldown_breaker_activity() -> ActivityInfo {
+    ActivityInfo {
+        name: "quick_probe",
+        default_queue: Some("quickpay"),
+        circuit_breaker: Some(CircuitBreakerPolicy::new(
+            3,
+            Duration::from_secs(60),
+            Duration::from_millis(150),
+        )),
+        ..breaker_activity()
+    }
+}
+
 /// A plain activity with NO circuit breaker. Required for the rate-limit tests:
 /// a breaker-tracked activity enforces its rate limit at DISPATCH (issue #369),
 /// so its bucket is deliberately never consulted at claim time.
@@ -302,6 +319,7 @@ fn build_api_state_without_local_worker(pool: &DbPool) -> (HarvestApiState, Arc<
         vec![wf_info("activity_wf", activity_workflow)],
         vec![
             breaker_activity(),
+            fast_cooldown_breaker_activity(),
             plain_activity(),
             registry_gated_activity(),
         ],
@@ -336,6 +354,7 @@ fn build_api_state_with_registry(
         ],
         vec![
             breaker_activity(),
+            fast_cooldown_breaker_activity(),
             plain_activity(),
             registry_gated_activity(),
         ],
@@ -879,6 +898,69 @@ async fn ac5_organically_tripped_circuit_reports_a_derived_cooldown_until() {
         parsed > before && parsed <= before + chrono::Duration::seconds(31),
         "cooldown must land inside the policy's 30s window: {parsed} vs {before}"
     );
+}
+
+/// Issue #1368. An organic breaker whose cooldown has ALREADY elapsed by the
+/// snapshot read, on an ALREADY-DUE row, must resolve to a healthy verdict.
+/// It must not resolve to `activity_circuit_open`.
+///
+/// `build_diagnosis_report` used to read two clocks. An early `now` came
+/// before the DB gathering queries. A later `now` came right before the
+/// circuit-breaker read, and `cooldown_until` was derived from it.
+/// `classify_execution` compared the EARLY `now` against a `cooldown_until`
+/// derived from the LATER one. For a breaker with zero remaining cooldown,
+/// `cooldown_until` pinned to the later instant, always after the stale
+/// early one. So the "already cleared" guard could never fire for this
+/// case. The fix collapses both captures into one later `now`.
+#[tokio::test]
+async fn ac5_organic_circuit_already_cleared_by_snapshot_reports_healthy() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let (api_state, registry) = build_api_state_with_registry(&pool, true);
+    // `fast_cooldown_breaker_activity()` trips at 3 failures, cooldown 150ms.
+    let trip_at = std::time::Instant::now();
+    for _ in 0..3 {
+        registry
+            .circuit_breakers()
+            .on_external_failure("quick_probe", trip_at);
+    }
+    // Sleep past the cooldown. This is the "already cleared" case: by the
+    // time the endpoint takes its snapshot, `time_until_probe_secs` reads
+    // exactly 0.0.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let app = build_api_app(api_state);
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_activity_task(
+        &pool,
+        exec_id,
+        "quick_probe",
+        "quickpay",
+        "PENDING",
+        1,
+        Some("gateway 503"),
+        "NOW() - INTERVAL '1 minute'",
+    )
+    .await;
+    // The co-located worker (see `LOCAL_WORKER_ID`) -- the single-replica shape
+    // in which this process's breaker is the one that gates dispatch.
+    seed_live_worker(&pool, LOCAL_WORKER_ID, "quickpay").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "healthy_in_progress",
+        "an organic breaker whose cooldown already cleared by the snapshot \
+         read, on an already-due row, must not still read as circuit-open: \
+         {body}"
+    );
+    assert_eq!(body["health"], "healthy", "body: {body}");
 }
 
 /// A backing-off task (future `scheduled_at`) on a covered queue with a closed
