@@ -43262,6 +43262,11 @@ async fn stream_execution_events(
         } else {
             // ── 3. Live-tail: LISTEN/NOTIFY loop ─────────────────────────────
             let mut last_seen_id = backfill.last().map_or(last_row_id, |r| r.id);
+            // The stable per-execution twin of `last_seen_id` (fresh
+            // review, P1 follow-up): kept in step with it below, purely so
+            // the shard-rebind block can translate the cursor. See
+            // `store::row_id_for_event_id`.
+            let mut last_seen_event_id: Option<i32> = backfill.last().map(|r| r.event_id);
             let mut listener = listener;
             let mut listener_shard = shard;
             let buf_limit = i64::try_from(api_clone.sse_buffer_depth()).ok();
@@ -43289,6 +43294,32 @@ async fn stream_execution_events(
                     && let Ok(url) = api_clone.sse_notification_url(current_shard)
                     && let Ok(l) = WorkflowEventListener::connect(&url).await
                 {
+                    // Translate the resume cursor to the shard being
+                    // rebound to (fresh review, P1 follow-up).
+                    // `last_seen_id` is `harvest_events.id`, local to
+                    // whichever database currently holds it. The NEW
+                    // shard has its own, unrelated `id` sequence.
+                    // Comparing directly via `id > last_seen_id` could
+                    // silently drop every later event (target ids lower)
+                    // or replay copied history as duplicates (target ids
+                    // higher). Fail open to `-1`
+                    // (resume from the start, bounded by `buf_limit`), but
+                    // only if the stable `event_id` cannot be found there.
+                    // That case is normally unreachable once cutover has
+                    // copied the whole history, so this never runs in
+                    // practice.
+                    if let Some(event_id) = last_seen_event_id
+                        && let Ok(mut target_conn) =
+                            db_conn_for_execution(&api_clone, exec_id).await
+                        && let Ok(translated) = ::autumn_harvest::store::row_id_for_event_id(
+                            &mut target_conn,
+                            exec_id,
+                            event_id,
+                        )
+                        .await
+                    {
+                        last_seen_id = translated.unwrap_or(-1);
+                    }
                     listener = l;
                     listener_shard = current_shard;
                 }
@@ -43329,6 +43360,9 @@ async fn stream_execution_events(
                         let (new_id, terminal_state, should_break) =
                             send_rows(&new_rows, last_seen_id, &mut tx);
                         last_seen_id = new_id;
+                        if let Some(row) = new_rows.last() {
+                            last_seen_event_id = Some(row.event_id);
+                        }
 
                         if should_break {
                             let err_data = serde_json::json!({
@@ -43372,6 +43406,9 @@ async fn stream_execution_events(
                         let (new_id, terminal_state, should_break) =
                             send_rows(&missed, last_seen_id, &mut tx);
                         last_seen_id = new_id;
+                        if let Some(row) = missed.last() {
+                            last_seen_event_id = Some(row.event_id);
+                        }
                         if should_break {
                             let err_data = serde_json::json!({
                                 "error": "slow_consumer",
@@ -43422,6 +43459,9 @@ async fn stream_execution_events(
                         let (new_id, terminal_state, should_break) =
                             send_rows(&missed, last_seen_id, &mut tx);
                         last_seen_id = new_id;
+                        if let Some(row) = missed.last() {
+                            last_seen_event_id = Some(row.event_id);
+                        }
                         if should_break {
                             let err_data = serde_json::json!({
                                 "error": "slow_consumer",

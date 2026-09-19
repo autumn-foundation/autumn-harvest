@@ -446,6 +446,9 @@ const LEGACY_INIT_SQL: &str = concat!(
     // issue #1317: WorkflowExecution::as_select() also references this
     // column, for the same reason as the three rebalancing columns above.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_run_terminal_at TIMESTAMPTZ NULL;\n",
+    // fresh review, P1 follow-up: WorkflowExecution::as_select() also
+    // references this column, for the same reason as the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_run_terminal_state TEXT NULL;\n",
     // issue #1317 review (P1 follow-up): WorkflowExecution::as_select() also
     // references this column, for the same reason as the column above.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_state TEXT NULL;\n"

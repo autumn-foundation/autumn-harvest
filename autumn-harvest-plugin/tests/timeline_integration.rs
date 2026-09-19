@@ -80,6 +80,10 @@ const INIT_SQL: &str = concat!(
     // by WorkflowExecution::as_select()), for the same reason as the three
     // rebalancing columns above.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_run_terminal_at TIMESTAMPTZ NULL;\n",
+    // fresh review, P1 follow-up: the observed live-copy outcome recorded
+    // alongside the marker above (read back by WorkflowExecution::as_select()),
+    // for the same reason as the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_run_terminal_state TEXT NULL;\n",
     // issue #1317 review (P1 follow-up): staging-vacate reversibility marker
     // (read back by WorkflowExecution::as_select()), for the same reason as
     // the column above.

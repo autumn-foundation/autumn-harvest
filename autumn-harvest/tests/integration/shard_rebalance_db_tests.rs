@@ -1402,6 +1402,83 @@ async fn every_id_holder_class_still_resolves_after_migration() {
 }
 
 #[tokio::test]
+async fn row_id_for_event_id_translates_an_sse_cursor_across_a_migration() {
+    // Fresh review, P1 follow-up. An SSE stream's resume cursor
+    // (`Last-Event-ID`) is `harvest_events.id`, the shard-local `BIGSERIAL`
+    // primary key. `stage_copy` deliberately omits `id` when copying
+    // history onto a migration target, so the target assigns entirely
+    // unrelated local values from its own sequence. A live stream that
+    // rebinds mid-flight must translate its cursor through a different
+    // column instead. That column is `event_id`, the stable per-execution
+    // sequence number `stage_copy` DOES carry byte-for-byte. Comparing the
+    // source's `id` against the target's own sequence directly is wrong.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "sse-cursor-translate").await;
+
+    let mut source = shards.source().await;
+    let source_rows: Vec<(i64, i32)> = diesel::sql_query(
+        "SELECT id, event_id FROM harvest_events WHERE workflow_exec_id = $1 ORDER BY event_id",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .load::<IdEventIdRow>(&mut source)
+    .await
+    .expect("load source rows")
+    .into_iter()
+    .map(|r| (r.id, r.event_id))
+    .collect();
+    assert!(
+        !source_rows.is_empty(),
+        "precondition: the quiescent fixture must have real history"
+    );
+
+    // Burn some values off the target's OWN `id` sequence before
+    // migrating. Its copied rows then land at ids that cannot
+    // coincidentally match the source's. Both databases are otherwise
+    // equally fresh throwaway fixtures. A translation bug that just
+    // forwarded the untranslated `id` would go undetected without this
+    // offset.
+    let mut target = shards.target().await;
+    diesel::sql_query("SELECT nextval('harvest_events_id_seq') FROM generate_series(1, 100)")
+        .execute(&mut target)
+        .await
+        .expect("burn target id sequence values");
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    for (source_id, event_id) in source_rows {
+        let target_id = store::row_id_for_event_id(&mut target, exec_id, event_id)
+            .await
+            .expect("lookup must not fail")
+            .unwrap_or_else(|| panic!("event_id {event_id} must exist on the target"));
+        assert_ne!(
+            target_id, source_id,
+            "the target's own BIGSERIAL sequence must not coincide with the \
+             source's for this fixture, or this test cannot tell a correct \
+             translation from a bug that just forwarded the untranslated id"
+        );
+    }
+
+    let missing = store::row_id_for_event_id(&mut target, exec_id, i32::MAX)
+        .await
+        .expect("lookup must not fail");
+    assert_eq!(
+        missing, None,
+        "an event_id absent on the target must resolve to None, not a wrong row"
+    );
+}
+
+#[derive(diesel::QueryableByName)]
+struct IdEventIdRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    id: i64,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    event_id: i32,
+}
+
+#[tokio::test]
 async fn a_twice_migrated_run_resolves_through_the_chain_and_collapses_it() {
     // A→B, then B→A (two shards is enough to exercise the chain: the second hop
     // makes the ORIGIN shard's pointer stale until the collapse fixes it).
@@ -3397,6 +3474,137 @@ fn reject_duplicate_start<'a>(
 ) -> autumn_harvest::execution::StartWorkflowParams<'a> {
     autumn_harvest::execution::StartWorkflowParams {
         reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::RejectDuplicate,
+        conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+        ..terminate_existing_start(workflow_name, workflow_id)
+    }
+}
+
+#[tokio::test]
+async fn an_allow_duplicate_failed_only_start_attaches_to_a_reconciled_successful_seal() {
+    // Fresh review, P1 follow-up (companion to the `RejectDuplicate` test
+    // above). `AllowDuplicateFailedOnly` promises to return a non-failed
+    // prior UNCHANGED, precisely so a successful run is never silently
+    // repeated. The widened active-uniqueness index lets the fresh
+    // `INSERT` succeed past a reconciled seal regardless of reuse policy.
+    // Without this check a `COMPLETED` live copy's reconciled seal would
+    // be silently replaced by a fresh (genuinely duplicate) run. That is
+    // the same class of gap `RejectDuplicate` had, just one level less
+    // severe: a real second admission, not merely a wrong handle back.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "failed-only-over-completed-seal").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("complete the migrated run");
+
+    let mut source = shards.source().await;
+    reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+        .await
+        .expect("reconcile")
+        .then_some(())
+        .expect("the finished target must be observed terminal");
+
+    let started = autumn_harvest::execution::start_or_load_workflow_execution(
+        &mut source,
+        allow_duplicate_failed_only_start("entity_flow", "failed-only-over-completed-seal"),
+        None,
+    )
+    .await
+    .expect("AllowDuplicateFailedOnly over a successful reconciled seal must succeed");
+    assert!(
+        !started.created,
+        "must attach to the successful prior, not create a second admission"
+    );
+    assert_eq!(
+        started.exec_id, exec_id,
+        "must return the reconciled seal's own identity"
+    );
+}
+
+#[tokio::test]
+async fn an_allow_duplicate_failed_only_start_still_replaces_a_reconciled_failed_seal() {
+    // Companion to the test above: a `FAILED` live copy must still be
+    // replaced with a fresh run. `AllowDuplicateFailedOnly` already does
+    // that for any other failed/cancelled prior. This is the ONE outcome
+    // the widened index's unconditional fast-path INSERT gets right by
+    // accident, so it stays correct without this check. It is pinned
+    // here as a regression guard, against the fix above overcorrecting
+    // into refusing this case too.
+    //
+    // A FAILED live copy only reconciles once retention has demoted it to
+    // a summary row (see `a_failed_target_reconciles_once_retention_
+    // demotes_it_to_a_summary` above). While its execution row still
+    // exists, `reset.rs` can still fork a fresh run from it, so
+    // `live_copy_is_terminal` deliberately holds the seal open. This
+    // fixture must demote the target the same way to reach a reconciled
+    // FAILED seal at all.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "failed-only-over-failed-seal").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("fail the migrated run");
+    diesel::sql_query(
+        "INSERT INTO harvest_execution_summaries \
+             (execution_id, workflow_name, workflow_id, state, started_at, completed_at, \
+              duration_ms, shard_id, search_attrs, result, error, parent_id, \
+              migrated_from_shards) \
+         SELECT e.id, e.workflow_name, e.workflow_id, 'FAILED', e.started_at, NOW(), 0, \
+                e.shard_id, e.search_attrs, NULL, NULL, e.parent_id, e.migrated_from_shards \
+           FROM harvest_workflow_executions e WHERE e.id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("summarise");
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut target)
+        .await
+        .expect("retention-delete the execution row");
+
+    let mut source = shards.source().await;
+    reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+        .await
+        .expect("reconcile")
+        .then_some(())
+        .expect("the finished target must be observed terminal");
+
+    let started = autumn_harvest::execution::start_or_load_workflow_execution(
+        &mut source,
+        allow_duplicate_failed_only_start("entity_flow", "failed-only-over-failed-seal"),
+        None,
+    )
+    .await
+    .expect("AllowDuplicateFailedOnly over a failed reconciled seal must succeed");
+    assert!(started.created, "a failed prior must still be replaced");
+    assert_ne!(started.exec_id, exec_id);
+}
+
+fn allow_duplicate_failed_only_start<'a>(
+    workflow_name: &'a str,
+    workflow_id: &'a str,
+) -> autumn_harvest::execution::StartWorkflowParams<'a> {
+    autumn_harvest::execution::StartWorkflowParams {
+        reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
         conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
         ..terminate_existing_start(workflow_name, workflow_id)
     }

@@ -1308,43 +1308,66 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         }
 
         // `RejectDuplicate` must refuse against a reconciled `MIGRATED`
-        // seal, not silently create past it (fresh review, P1 follow-up).
-        // The active-uniqueness index below excludes an observed-terminal
-        // seal. A fresh run can then succeed with a plain `INSERT` under
-        // every OTHER reuse policy. See
+        // seal. `AllowDuplicateFailedOnly` must attach to one whose live
+        // copy did NOT fail, not silently create past either (fresh
+        // review, P1 follow-up x2). The active-uniqueness index below
+        // excludes an observed-terminal seal, so a fresh run succeeds
+        // with a plain `INSERT` under every OTHER case. See
         // `an_allow_duplicate_start_creates_a_fresh_run_too_once_the_
         // seal_is_reconciled`, which deliberately pins that outcome for
-        // `AllowDuplicate` (attaching to the seal's own stale, un-refreshed
-        // row would be useless). `RejectDuplicate` has no such "let it
-        // through" case: a reconciled seal still means this business key
-        // has already run once, full stop. The `INSERT` below cannot see
-        // that on its own, since the index no longer protects it, so check
-        // explicitly first.
+        // plain `AllowDuplicate` (attaching to the seal's own stale,
+        // un-refreshed row would be useless there).
         //
-        // `FOR UPDATE` locks the row. A reconciler racing this exact
-        // check then blocks until this transaction commits or rolls
-        // back. It cannot reconcile the seal in the gap between this
-        // read and the insert.
-        if request.reuse_policy == WorkflowIdReusePolicy::RejectDuplicate {
-            let reconciled_seal: Option<(Uuid, String)> = harvest_workflow_executions::table
+        // Neither policy below shares that "attach is useless" reasoning.
+        // `RejectDuplicate` has no attach case at all: a reconciled seal
+        // still means this business key has already run once, full stop.
+        // `AllowDuplicateFailedOnly` promises to return a non-failed prior
+        // UNCHANGED, precisely so a successful run is never silently
+        // repeated. A fresh run for a `COMPLETED`/`TIMED_OUT` live copy
+        // would be a genuine second admission, not merely fresher data.
+        // Only a `FAILED`/`CANCELLED` live copy still wants the fresh
+        // `INSERT` below to run, exactly as it already does.
+        //
+        // The `INSERT` cannot see any of this on its own, since the index
+        // no longer protects a reconciled seal, so check explicitly
+        // first. `FOR UPDATE` locks the row. A reconciler racing this
+        // exact check then blocks until this transaction commits or
+        // rolls back. It cannot reconcile the seal in the gap between
+        // this read and the insert.
+        if matches!(
+            request.reuse_policy,
+            WorkflowIdReusePolicy::RejectDuplicate
+                | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+        ) {
+            let reconciled_seal: Option<WorkflowExecution> = harvest_workflow_executions::table
                 .filter(harvest_workflow_executions::workflow_name.eq(request.workflow_name))
                 .filter(harvest_workflow_executions::workflow_id.eq(request.workflow_id))
                 .filter(harvest_workflow_executions::state.eq("MIGRATED"))
                 .filter(harvest_workflow_executions::migrated_run_terminal_at.is_not_null())
-                .select((
-                    harvest_workflow_executions::id,
-                    harvest_workflow_executions::state,
-                ))
+                .select(WorkflowExecution::as_select())
                 .for_update()
                 .first(&mut *conn)
                 .await
                 .optional()
                 .map_err(database_error)?;
-            if let Some((id, state)) = reconciled_seal {
-                return Err(HarvestError::AlreadyExists {
-                    existing_exec_id: ExecutionId::from_uuid(id),
-                    existing_state: state,
-                });
+            if let Some(seal) = reconciled_seal {
+                if request.reuse_policy == WorkflowIdReusePolicy::RejectDuplicate {
+                    return Err(HarvestError::AlreadyExists {
+                        existing_exec_id: ExecutionId::from_uuid(seal.id),
+                        existing_state: seal.state,
+                    });
+                }
+                if !matches!(seal.effective_terminal_state(), "FAILED" | "CANCELLED") {
+                    return Ok((
+                        StartedWorkflowExecution::from_row(seal, false),
+                        Vec::new(),
+                        tx_deferred_checks,
+                        Vec::new(),
+                    ));
+                }
+                // FAILED/CANCELLED: fall through, the INSERT below
+                // replaces it exactly as `AllowDuplicateFailedOnly`
+                // already does for any other failed/cancelled prior.
             }
         }
 
