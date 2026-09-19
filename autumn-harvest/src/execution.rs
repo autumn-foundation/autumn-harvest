@@ -1259,6 +1259,18 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         // function's environment.
         let mut tx_deferred_checks = Vec::new();
 
+        // Serialize this whole admission decision against every other start
+        // racing the same business key (issue #948 Codex review, comment
+        // 4053489196, follow-up to c52d895). Taken unconditionally, before
+        // any occupant read. The occupant check below, the reconciled-seal
+        // lookup, and the fresh `INSERT`, are then all atomic. A concurrent
+        // transaction deciding the same key cannot interleave with any of
+        // them. The active-uniqueness index alone does not serialize that,
+        // because a reconciled seal is deliberately excluded from it. See
+        // `lock_execution_admission`'s own doc comment for the race this
+        // closes.
+        lock_execution_admission(conn, request.workflow_name, request.workflow_id).await?;
+
         // Authoritative locked gate (issue #618, PR #1014). For every
         // policy EXCEPT TerminateIfRunning (gated unlocked at POINT 1
         // above), take the `FOR UPDATE` lock on any non-sealed prior
@@ -7407,6 +7419,64 @@ async fn resolve_effective_signal_with_start_policy(
         // insert fresh, append WorkflowStarted) and the signal can land.
         Ok(WorkflowIdReusePolicy::TerminateIfRunning)
     }
+}
+
+/// Domain-separated advisory-lock namespace for one `(workflow_name,
+/// workflow_id)` business key (issue #948 Codex review, comment
+/// 4053489196).
+///
+/// Length-prefixes `workflow_name` so two distinct keys can never resolve to
+/// the same namespace string. A bare `format!("{workflow_name}:{workflow_id}")`
+/// would let `("ab", "c")` and `("a", "b:c")` hash identically, since both
+/// join to `"ab:c"`-shaped text once either field itself contains the `:`
+/// separator. Recording the decimal length up front fixes exactly where
+/// `workflow_name` ends, so no content in either field can shift the
+/// boundary.
+#[cfg(feature = "db")]
+fn admission_lock_namespace(workflow_name: &str, workflow_id: &str) -> String {
+    format!(
+        "exec_admission:v1:{}:{workflow_name}:{workflow_id}",
+        workflow_name.len()
+    )
+}
+
+/// Serialize the whole admission decision for one `(workflow_name,
+/// workflow_id)` business key behind a transaction-scoped advisory lock
+/// (issue #948 Codex review, comment 4053489196, follow-up to c52d895).
+///
+/// Taken unconditionally, first, inside the admission transaction in
+/// [`start_or_load_workflow_execution_collect_with_codecs_and_quota_override`].
+/// Every reuse policy funnels through that one transaction. This single
+/// call point therefore serializes the occupant check, the reconciled-seal
+/// lookup, and the fresh `INSERT`, against every other start racing the
+/// same key.
+///
+/// # Why the partial unique index does not already do this
+///
+/// The active-uniqueness index only covers non-sealed rows. A reconciled
+/// `MIGRATED` seal is deliberately excluded from it too (issue #1317). Two
+/// concurrent starts can therefore both find no occupant, and both read
+/// the same reconciled seal, and both act on it. A third transaction's
+/// plain `INSERT` for the same key can land in between. Nothing in the
+/// index serializes that interleaving. This lock closes the window for
+/// every reuse policy, not only the two that read the reconciled seal.
+///
+/// `pg_advisory_xact_lock` releases automatically at commit or rollback, so
+/// it needs no explicit unlock and cannot outlive the admission
+/// transaction it guards.
+#[cfg(feature = "db")]
+async fn lock_execution_admission(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> HarvestResult<()> {
+    let namespace = admission_lock_namespace(workflow_name, workflow_id);
+    diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind::<diesel::sql_types::Text, _>(namespace)
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+    Ok(())
 }
 
 /// Locking variant of [`try_load_by_key`] used by

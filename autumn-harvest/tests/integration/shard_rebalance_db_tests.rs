@@ -3862,6 +3862,172 @@ fn allow_duplicate_failed_only_start<'a>(
 }
 
 #[tokio::test]
+async fn a_concurrent_plain_start_cannot_land_inside_a_reconciled_seal_admission() {
+    // Codex review, comment 4053489196 (follow-up to c52d895). The prior
+    // fix made `AllowDuplicateFailedOnly` check for a current occupant
+    // before trusting a reconciled seal. That check is a `SELECT ... FOR
+    // UPDATE`, which locks nothing when it finds no row. Two concurrent
+    // transactions can both read "no occupant" and both proceed. One of
+    // them can land past the point where the other commits a brand-new
+    // active row for the same key. This test forces exactly that
+    // interleaving.
+    //
+    // The bug is not which admission "wins" -- it is that the two
+    // transactions could overlap at all. A held lock on the seal row
+    // pins the reconciled-seal admission (call it B) at the exact gap.
+    // That gap sits between its (now-stale) occupant check and its seal
+    // read. While B is pinned there, a concurrent plain `AllowDuplicate`
+    // start (call it A) is given every chance to insert and commit a
+    // fresh active row.
+    //
+    // Without a business-key lock, A completes while B is still
+    // mid-transaction: `a_handle.is_finished()` reads `true` before the
+    // seal row lock is ever released. With the fix, A cannot even begin
+    // its admission decision until B's transaction has committed. That
+    // transaction is the one that took the lock first, so A stays
+    // pending at that same point. Either of the two clean orderings can
+    // then result: B fully before A, or A fully before B. Both are fine
+    // -- only the overlap is the bug.
+    let shards = setup_two_shards().await;
+    let workflow_id = "reconciled-seal-race-vs-concurrent-start";
+
+    let seal_exec_id = quiescent_fixture(&shards, workflow_id).await;
+    migrate_execution(&shards.pool, seal_exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate the sealed run");
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(seal_exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("complete the migrated run");
+    let mut source = shards.source().await;
+    reconcile_migrated_seal_terminality(&mut source, &shards.pool, seal_exec_id, SOURCE)
+        .await
+        .expect("reconcile the seal")
+        .then_some(())
+        .expect("the sealed run must be observed terminal");
+
+    // Hold the exact row the reconciled-seal lookup locks with its own
+    // `FOR UPDATE`. This pins B at that lookup regardless of whether the
+    // fix's advisory lock exists. The pin point sits INSIDE B's
+    // transaction either way; only the earlier admission-lock wait
+    // differs.
+    let mut holder = shards.source().await;
+    let (lock_held_tx, lock_held_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let holder_task = tokio::spawn(async move {
+        Box::pin(holder.transaction::<(), HarvestError, _>(async |conn| {
+            diesel::sql_query(
+                "SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(seal_exec_id.as_uuid())
+            .execute(&mut *conn)
+            .await?;
+            let _ = lock_held_tx.send(());
+            let _ = release_rx.await;
+            Ok(())
+        }))
+        .await
+        .expect("holder transaction");
+    });
+    lock_held_rx.await.expect("lock-held signal");
+
+    // B: `AllowDuplicateFailedOnly` against the reconciled seal. Its
+    // occupant check finds nothing (truthfully, at this point) and then
+    // blocks reading the seal, behind `holder`.
+    let mut b_conn = shards.source().await;
+    let b_handle = tokio::spawn(async move {
+        autumn_harvest::execution::start_or_load_workflow_execution(
+            &mut b_conn,
+            allow_duplicate_failed_only_start("entity_flow", workflow_id),
+            None,
+        )
+        .await
+    });
+
+    // Let B actually reach the blocked seal read before A starts.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // A: a plain `AllowDuplicate` start for the SAME business key. It
+    // never reads the seal (that branch is `RejectDuplicate` /
+    // `AllowDuplicateFailedOnly` only). Nothing about `holder` blocks it
+    // directly -- only a business-key admission lock would.
+    let mut a_conn = shards.source().await;
+    let a_handle = tokio::spawn(async move {
+        autumn_harvest::execution::start_or_load_workflow_execution(
+            &mut a_conn,
+            allow_duplicate_default_conflict_start("entity_flow", workflow_id),
+            None,
+        )
+        .await
+    });
+
+    // Give A every opportunity to run to completion while B is still
+    // pinned mid-transaction on the held seal-row lock.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let a_raced_ahead_of_b = a_handle.is_finished();
+
+    release_tx.send(()).expect("release the held seal-row lock");
+    holder_task.await.expect("holder task");
+
+    let b_result = b_handle
+        .await
+        .expect("B task")
+        .expect("AllowDuplicateFailedOnly must resolve cleanly once unblocked");
+    let a_result = a_handle
+        .await
+        .expect("A task")
+        .expect("AllowDuplicate must still create a fresh run once unblocked");
+
+    assert!(
+        !a_raced_ahead_of_b,
+        "a concurrent AllowDuplicate start must not be able to insert and commit a fresh \
+         active row while a same-key AllowDuplicateFailedOnly admission is still deciding \
+         against a reconciled seal -- the two must serialize on the business key (issue \
+         #948, comment 4053489196)"
+    );
+    assert!(
+        !b_result.created,
+        "AllowDuplicateFailedOnly over a reconciled, non-failed seal must attach, not create"
+    );
+    assert_eq!(
+        b_result.exec_id, seal_exec_id,
+        "with A forced to wait, B's own read stays accurate through commit, so it correctly \
+         attaches to the seal"
+    );
+    assert!(
+        a_result.created,
+        "once unblocked, the concurrent AllowDuplicate start must still create its own \
+         fresh run"
+    );
+    assert_ne!(
+        a_result.exec_id, seal_exec_id,
+        "A's fresh run must be a new execution, not the seal"
+    );
+
+    let mut verify = shards.source().await;
+    let active_count: ScalarCount = diesel::sql_query(
+        "SELECT count(*)::BIGINT AS value FROM harvest_workflow_executions \
+          WHERE workflow_name = $1 AND workflow_id = $2 \
+            AND state NOT IN ('CONTINUED_AS_NEW', 'TERMINATED') \
+            AND migrated_run_terminal_at IS NULL",
+    )
+    .bind::<diesel::sql_types::Text, _>("entity_flow")
+    .bind::<diesel::sql_types::Text, _>(workflow_id)
+    .get_result(&mut verify)
+    .await
+    .expect("count active rows");
+    assert_eq!(
+        active_count.value, 1,
+        "exactly one active occupant must exist once both starts settle: A's fresh run"
+    );
+}
+
+#[tokio::test]
 async fn try_load_by_key_finds_a_live_replacement_over_a_reconciled_seal() {
     // Issue #1317 review (companion to `a_reconciled_seal_alone_does_not_
     // bypass_the_throttle_token` above). When a live replacement exists
