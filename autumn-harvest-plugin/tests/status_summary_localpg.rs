@@ -255,6 +255,27 @@ async fn seed_future_timer(url: &str, exec_id: Uuid) {
     .expect("seed future timer");
 }
 
+/// Insert a `harvest_events` row for `exec_id` at an explicit age, so a test
+/// can place an event just inside or just outside the no-progress window
+/// (issue #1643). `age_secs` is how many seconds before `NOW()` the event's
+/// `timestamp` is set to.
+async fn seed_event_at_age(url: &str, exec_id: Uuid, event_id: i32, age_secs: i64) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
+        .await
+        .expect("connect");
+    diesel::sql_query(
+        "INSERT INTO harvest_events \
+             (workflow_exec_id, event_id, event_type, event_data, timestamp) \
+         VALUES ($1, $2, 'WorkflowStarted', '{}'::jsonb, NOW() - ($3 * INTERVAL '1 second'))",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .bind::<diesel::sql_types::Integer, _>(event_id)
+    .bind::<diesel::sql_types::BigInt, _>(age_secs)
+    .execute(&mut conn)
+    .await
+    .expect("seed event at age");
+}
+
 async fn seed_dead_letter(url: &str) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
         .await
@@ -284,6 +305,10 @@ fn subsystem<'a>(body: &'a Value, name: &str) -> &'a Value {
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn admin_status_localpg_end_to_end() {
+    // StatusThresholds::default().stalled_no_progress_minutes, in seconds.
+    // Used by the issue #1643 phases ((f)-(i), below).
+    const WINDOW_SECS: i64 = 3600;
+
     let Ok(url) = std::env::var("DATABASE_URL") else {
         eprintln!("SKIP status_summary_localpg: DATABASE_URL not set");
         return;
@@ -435,6 +460,77 @@ async fn admin_status_localpg_end_to_end() {
         "PASS (e) sleeper-not-stalled: stalled_count={}",
         stalled["count"]
     );
+
+    // ── (f)-(i): issue #1643 rewrite coverage. `count_stalled_candidates`'s
+    // "no recent event" check now reads a `MATERIALIZED` CTE instead of a
+    // per-row correlated `NOT EXISTS`. These phases pin the boundary and
+    // multiplicity behavior the rewrite must preserve. Folded into this same
+    // test function (not a separate `#[tokio::test]`): every phase here
+    // resets and re-migrates the shared `postgres` database in place, so two
+    // test functions running concurrently would race on that reset.
+
+    // ── (f) a stale event, no other pending work: a true positive ───────────
+    reset_and_migrate(&url).await;
+    let exec = seed_running_execution(&url, 0).await;
+    seed_event_at_age(&url, exec, 0, WINDOW_SECS * 2).await; // 2 hours old
+    let app = build_app(HarvestDbPool::from(build_pool(&url)));
+    let (status, body) = get_json(&app, "/admin/status").await;
+    assert_eq!(status, StatusCode::OK);
+    let stalled = subsystem(&body, "stalled_workflows");
+    assert_eq!(
+        stalled["count"].as_i64().unwrap(),
+        1,
+        "a 2-hour-stale event with no other pending work is a true positive: {stalled}"
+    );
+    eprintln!("PASS (f) stale-no-other-work: count={}", stalled["count"]);
+
+    // ── (g) an event just inside the window is NOT stalled ──────────────────
+    reset_and_migrate(&url).await;
+    let exec = seed_running_execution(&url, 0).await;
+    seed_event_at_age(&url, exec, 0, WINDOW_SECS - 60).await; // 59 minutes old
+    let app = build_app(HarvestDbPool::from(build_pool(&url)));
+    let (status, body) = get_json(&app, "/admin/status").await;
+    assert_eq!(status, StatusCode::OK);
+    let stalled = subsystem(&body, "stalled_workflows");
+    assert_eq!(
+        stalled["count"].as_i64().unwrap(),
+        0,
+        "an event just inside the no-progress window must not count as stalled: {stalled}"
+    );
+    eprintln!("PASS (g) just-inside-window: count={}", stalled["count"]);
+
+    // ── (h) an event just outside the window IS stalled ─────────────────────
+    reset_and_migrate(&url).await;
+    let exec = seed_running_execution(&url, 0).await;
+    seed_event_at_age(&url, exec, 0, WINDOW_SECS + 60).await; // 61 minutes old
+    let app = build_app(HarvestDbPool::from(build_pool(&url)));
+    let (status, body) = get_json(&app, "/admin/status").await;
+    assert_eq!(status, StatusCode::OK);
+    let stalled = subsystem(&body, "stalled_workflows");
+    assert_eq!(
+        stalled["count"].as_i64().unwrap(),
+        1,
+        "an event just outside the no-progress window is stalled: {stalled}"
+    );
+    eprintln!("PASS (h) just-outside-window: count={}", stalled["count"]);
+
+    // ── (i) an old event AND a fresh event on the same execution: the fresh
+    // one must be found regardless of how many older rows also exist (guards
+    // against a rewrite that only looks at one event per execution) ─────────
+    reset_and_migrate(&url).await;
+    let exec = seed_running_execution(&url, 0).await;
+    seed_event_at_age(&url, exec, 0, WINDOW_SECS * 3).await; // 3 hours old
+    seed_event_at_age(&url, exec, 1, 30).await; // 30 seconds old
+    let app = build_app(HarvestDbPool::from(build_pool(&url)));
+    let (status, body) = get_json(&app, "/admin/status").await;
+    assert_eq!(status, StatusCode::OK);
+    let stalled = subsystem(&body, "stalled_workflows");
+    assert_eq!(
+        stalled["count"].as_i64().unwrap(),
+        0,
+        "a fresh event must exclude the execution even alongside an older one: {stalled}"
+    );
+    eprintln!("PASS (i) old-plus-fresh-event: count={}", stalled["count"]);
 
     eprintln!("ALL PHASES PASSED against local Postgres");
 }
