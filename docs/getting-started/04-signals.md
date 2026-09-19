@@ -145,6 +145,7 @@ a workflow function — no activity, no HTTP call, no hand-rolled outbox require
 #[workflow]
 async fn tenant_cancel(ctx: &WorkflowContext, input: Value) -> HarvestResult<Value> {
     let onboarding_ids: Vec<ExecutionId> = /* load from input */ Vec::new();
+    let cancelled_count = onboarding_ids.len();
 
     for target in onboarding_ids {
         match ctx
@@ -159,7 +160,7 @@ async fn tenant_cancel(ctx: &WorkflowContext, input: Value) -> HarvestResult<Val
             Err(e) => return Err(e),
         }
     }
-    Ok(json!({ "cancelled": onboarding_ids.len() }))
+    Ok(json!({ "cancelled": cancelled_count }))
 }
 ```
 
