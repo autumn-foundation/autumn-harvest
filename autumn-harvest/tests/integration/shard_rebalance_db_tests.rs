@@ -3309,6 +3309,117 @@ async fn a_later_hop_into_a_pool_aliased_to_the_current_hop_is_refused_not_deadl
 }
 
 #[tokio::test]
+async fn a_migration_between_aliased_physical_pools_is_refused_not_deadlocked() {
+    // Issue #1596 follow-up review, P2 (comment 5256791103). Two distinct
+    // shard ids can be backed by the SAME physical size-one pool during a
+    // pre-split staging rollout, just like the forwarding-hop cases above.
+    // `migrate_execution` checks out `source_shard` first and holds that
+    // connection for its whole run. Checking out `target_shard` too, when
+    // it aliases the same pool, would wait for a second connection the
+    // held one can never release. This pins the fast refusal instead.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "aliased-pool-migration").await;
+
+    // `aliased_shard` has no data of its own. What makes it dangerous is
+    // that the pool built below maps it to the exact same physical pool
+    // as `SOURCE`.
+    let aliased_shard = ShardId::new(97);
+    let source_pool = build_pool_capacity_one(&shards.source_url);
+    let aliased_pool = ShardedDbPool::from_map(
+        std::collections::BTreeMap::from([
+            (SOURCE, source_pool.clone()),
+            (aliased_shard, source_pool.clone()),
+        ]),
+        SOURCE,
+    );
+
+    // No externally held connection is needed here: `migrate_execution`
+    // checks out `source_shard` itself first. On the unfixed code, that
+    // single checkout already consumes this pool's only connection,
+    // leaving nothing for the second (aliased) checkout to wait on.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        migrate_execution(&aliased_pool, exec_id, SOURCE, aliased_shard, &codecs()),
+    )
+    .await
+    .expect("must not stall: aliased shards must be refused before either checkout")
+    .expect("refusal is a normal Aborted outcome, not an error");
+
+    match outcome {
+        MigrationOutcome::Aborted {
+            execution_id,
+            reason,
+        } => {
+            assert_eq!(execution_id, exec_id);
+            assert!(
+                reason.contains("physical pool"),
+                "the refusal must name the aliasing, got {reason}"
+            );
+        }
+        other => panic!("expected Aborted, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn conn_for_execution_forwarded_reuses_an_aliased_hop_instead_of_deadlocking() {
+    // Issue #1596 follow-up review, P2 (comment 4054062532). Companion to
+    // the reconciliation-walker aliasing tests above, for the id-routed
+    // read/write path instead. `conn_for_execution_forwarded_with_shard`
+    // replaces its own `conn` on every hop. A hop can alias the
+    // CURRENTLY HELD connection's own pool. An unconditional checkout for
+    // that hop would then wait for a second connection. That pool cannot
+    // hand one out until this call drops the connection it still holds.
+    // It never will, since this is the line meant to produce the next
+    // connection to use.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "aliased-forward-hop").await;
+
+    // Rewrite the row's own forwarding pointer to name a shard id that has
+    // no data of its own. What makes it dangerous is that the pool built
+    // below maps it to the exact same physical pool as `SOURCE`, the
+    // execution's own origin.
+    let aliased_shard = ShardId::new(97);
+    let mut raw_source = shards.source().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'MIGRATED', migrated_to_shard = $1, \
+              migrated_at = NOW() \
+          WHERE id = $2",
+    )
+    .bind::<diesel::sql_types::Integer, _>(aliased_shard.as_i32())
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut raw_source)
+    .await
+    .expect("rewrite the forwarding pointer onto the aliased shard id");
+    drop(raw_source);
+
+    let source_pool = build_pool_capacity_one(&shards.source_url);
+    let aliased_pool = ShardedDbPool::from_map(
+        std::collections::BTreeMap::from([
+            (SOURCE, source_pool.clone()),
+            (aliased_shard, source_pool.clone()),
+        ]),
+        SOURCE,
+    );
+
+    // `conn_for_execution_forwarded_with_shard` checks out its own first
+    // connection for the origin hop, consuming this pool's only slot. On
+    // the unfixed code, the loop's unconditional re-checkout for the
+    // aliased next hop would then wait on that same exhausted pool.
+    let (_conn, resolved_shard) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        conn_for_execution_forwarded_with_shard(&aliased_pool, exec_id),
+    )
+    .await
+    .expect("must not stall: an aliased hop must reuse the held connection, not re-checkout")
+    .expect("resolution must succeed by reusing the connection");
+
+    assert_eq!(
+        resolved_shard, aliased_shard,
+        "must resolve to the aliased shard the row's own pointer named"
+    );
+}
+
+#[tokio::test]
 async fn a_sweep_reports_a_seal_whose_target_is_unreachable_as_a_failure_not_a_silent_skip() {
     // Issue #1317 review: `Err` (a database or unreachable-target problem)
     // used to be treated exactly like `Ok(false)` (not yet terminal) --

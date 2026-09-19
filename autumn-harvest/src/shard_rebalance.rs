@@ -3259,6 +3259,24 @@ mod db {
                 reason: "source and target shard are the same".to_string(),
             });
         }
+        // Two distinct shard ids can still address the identical physical
+        // database (issue #1596 follow-up review, comment 5256791103), a
+        // supported pre-split staging shape. Checking out both connections
+        // below would then wait on the source checkout's own pool. It
+        // needs a second connection that pool cannot hand out until this
+        // call returns. Reject before either checkout, not just on
+        // literal id equality. A larger aliased pool is equally nonsensical: staging would find
+        // the source row itself already sitting in the "target" table.
+        if pool.same_physical_pool(source_shard, target_shard) {
+            return Ok(MigrationOutcome::Aborted {
+                execution_id: exec_id,
+                reason: format!(
+                    "source shard {source_shard} and target shard {target_shard} share a \
+                     physical pool; migrating between them would stage a run into the same \
+                     database that already holds it"
+                ),
+            });
+        }
 
         let mut source = checkout(pool, source_shard).await?;
         let mut target = checkout(pool, target_shard).await?;
@@ -4417,8 +4435,20 @@ mod db {
             let Some(next) = read_forward(&mut conn, exec_id).await? else {
                 return Ok((conn, current));
             };
+            // A pre-split staging rollout can alias `next` onto `current`'s
+            // own physical pool (issue #1596 follow-up review, comment
+            // 4054062532). An unconditional checkout here would wait on
+            // that same pool for a second connection, one this call
+            // itself already holds. `conn` already reads the identical
+            // physical row `next` would resolve to. Aliasing means the
+            // same underlying database; a fresh checkout would only read
+            // that same row again. Reuse `conn` and stop here rather
+            // than re-reading it for no new information.
+            if next == current || pool.same_physical_pool(next, current) {
+                return Ok((conn, next));
+            }
+            conn = checkout(pool, next).await?;
             current = next;
-            conn = checkout(pool, current).await?;
         }
         resolve_forward_chain(checkout_shard, |_| Some(current)).map(|_| (conn, current))
     }
