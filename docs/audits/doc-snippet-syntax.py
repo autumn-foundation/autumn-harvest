@@ -198,10 +198,20 @@ BQ = r">[ \t]{0,3}"
 # non-Rust fence containing a line that merely looks like a Rust fence
 # opener (a Markdown-about-Markdown example, say) would otherwise be misread
 # as a real one.
-LIST_MARKER = r"(?:[-*+]|[0-9]{1,9}[.)])\s+"
+# A fence can open inside SEVERAL list containers stacked on one line, not
+# just one — "- 1. ```rust" is a bullet item containing an ordered item
+# containing the fence, both containers opening together (comment-
+# hygiene.py's own fixture: "two list markers on one line both open
+# containers for the fence"). MARKER_GLYPH/LIST_MARKER are split so the
+# repeated group below can match any number of them, and so each one's own
+# padding can still be checked independently afterward. Unlike the
+# cross-line gaps noted above, this needs no state beyond the current
+# line, so it stays in scope.
+MARKER_GLYPH = r"(?:[-*+]|[0-9]{1,9}[.)])"
+LIST_MARKER = rf"{MARKER_GLYPH}\s+"
 FENCE_DELIM = r"(`{3,}|~{3,})"
 FENCE_OPEN_RE = re.compile(
-    rf"^({LEAD_INDENT})((?:{LIST_MARKER})?)((?:{BQ})*){FENCE_DELIM}(.*)$"
+    rf"^({LEAD_INDENT})((?:{LIST_MARKER})*)((?:{BQ})*){FENCE_DELIM}(.*)$"
 )
 FENCE_CLOSE_RE = re.compile(rf"^({LEAD_INDENT}(?:{BQ})*){FENCE_DELIM}\s*$")
 
@@ -225,14 +235,16 @@ def _fence_indent_valid(prefix: str) -> bool:
 
 
 def _list_marker_padding_valid(marker: str) -> bool:
-    """True if the whitespace between a list marker's glyph and whatever
-    follows it (empty string `marker` included: no marker at all) is within
-    CommonMark's 1-4 column padding allowance.
+    """True if EVERY list marker glyph in a captured marker run — possibly
+    several stacked on one line, as in "- 1. " — is followed by 1-4 columns
+    of padding, CommonMark's allowance checked independently per container
+    since each one opens on its own. Empty `marker` (no marker at all) is
+    trivially fine.
     """
-    if not marker:
-        return True
-    padding = marker[len(marker.rstrip(" \t")) :]
-    return 1 <= len(padding.expandtabs(4)) <= 4
+    return all(
+        1 <= len(m.group(1).expandtabs(4)) <= 4
+        for m in re.finditer(rf"{MARKER_GLYPH}(\s+)", marker)
+    )
 
 
 def _blockquote_depth(prefix: str) -> int:
