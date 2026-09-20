@@ -2969,6 +2969,106 @@ pub async fn requeue_for_retry(
     Ok(())
 }
 
+/// Reset a `RUNNING` workflow task to `PENDING` with a future `scheduled_at`.
+///
+/// This is the bounded backoff retry for a quota or shard-admission
+/// rejection (issue #956). It also clears a stale `mixed_signal_suspension`
+/// sentinel, and a mid-cycle wake flag, in the same update.
+///
+/// Mirrors [`requeue_for_retry`], restricted to `task_type = 'workflow'`
+/// rows (every caller holds a workflow task), with two extra clears:
+///
+/// - `activity_name`: without this clear, an old sentinel can survive. An
+///   earlier, unrelated cycle may stamp it during a timer-and-signal race
+///   (issue #476/#600). A surviving sentinel still matches the wake-forward
+///   arm of `primary_repend_workflow_task_query`. Any unrelated wake then
+///   resets `scheduled_at` to now. This defeats the backoff (issue #1391).
+/// - `wake_requested`: a wake captured mid-cycle must not short-circuit the
+///   backoff. The row is durably `PENDING`. It is deferred purely by
+///   `scheduled_at` (`claim_task` enforces `scheduled_at <= NOW()`). So a
+///   wake arriving during the backoff is not lost. The next claim's full
+///   history replay recovers it instead.
+///
+/// `requeue_workflow_task_nd_blocked` clears the same two columns for the
+/// similar ND-block backoff (issue #603).
+///
+/// No `pg_notify`: the task is deliberately not claimable until
+/// `scheduled_at`, so waking pollers early would be pure noise.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::NotFound`] when the task is not a
+/// claimed (`RUNNING`) workflow task, and
+/// [`crate::error::HarvestError::Database`] on update failure.
+pub async fn requeue_workflow_task_for_quota_retry(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    delay: Duration,
+    previous_error: &str,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let next_run = Utc::now() + delay;
+    let changeset = PendingRequeueChangeset::new(next_run, previous_error.to_string());
+
+    let updated = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::task_type.eq("workflow")),
+    )
+    .set((
+        changeset,
+        dsl::wake_requested.eq(false),
+        dsl::activity_name.eq(None::<String>),
+    ))
+    .returning((dsl::queue_name, dsl::priority))
+    .get_results::<(String, i32)>(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    let Some((queue_name, priority)) = updated.into_iter().next() else {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not a running workflow task"
+        )));
+    };
+
+    // Dispatch hint (issue #1312). No `pg_notify` fires here on purpose --
+    // same rationale as `requeue_workflow_task_nd_blocked`.
+    record_pending_hint(
+        task_id,
+        &queue_name,
+        next_run,
+        priority,
+        crate::dispatch::DispatchKind::Workflow,
+    );
+
+    Ok(())
+}
+
+/// Build the `SET` clause used by [`requeue_workflow_task_for_quota_retry`]
+/// so a no-DB unit test can assert the generated SQL shape (issue #1391).
+/// Mirrors the `requeue_after_panic_query` shape-test precedent.
+#[cfg(test)]
+fn requeue_workflow_task_for_quota_retry_query(changeset: PendingRequeueChangeset) -> String {
+    use crate::schema::harvest_task_queue::dsl;
+    use diesel::debug_query;
+    use diesel::pg::Pg;
+
+    let query = diesel::update(
+        dsl::harvest_task_queue
+            .find(Uuid::nil())
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::task_type.eq("workflow")),
+    )
+    .set((
+        changeset,
+        dsl::wake_requested.eq(false),
+        dsl::activity_name.eq(None::<String>),
+    ));
+    debug_query::<Pg, _>(&query).to_string()
+}
+
 /// Re-pend an ND-blocked workflow task with a future `scheduled_at` (issue
 /// #603).
 ///
@@ -10129,6 +10229,38 @@ mod tests {
         assert!(
             sql.matches("None").count() >= 7,
             "the seven null-ing columns must all bind to None (SQL NULL): {sql}"
+        );
+        assert!(
+            sql.contains("false"),
+            "wake_requested must bind to false: {sql}"
+        );
+        // Restricted to claimed (RUNNING) workflow rows.
+        assert!(sql.contains("\"task_type\""), "{sql}");
+        assert!(sql.contains("\"state\""), "{sql}");
+    }
+
+    /// Issue #1391: this must generate a `SET` clause that clears both
+    /// `wake_requested` and the stale `activity_name` sentinel. It also
+    /// restricts the update to `RUNNING` workflow rows. This mirrors
+    /// `requeue_workflow_task_after_panic`'s own pin above. A no-DB test
+    /// pins this so a future edit cannot silently drop either clear and
+    /// reopen issue #1391 or its #603 sibling.
+    #[test]
+    fn requeue_workflow_task_for_quota_retry_query_clears_sentinel_and_wake() {
+        let changeset =
+            PendingRequeueChangeset::new(chrono::Utc::now(), "quota exceeded".to_string());
+        let sql = requeue_workflow_task_for_quota_retry_query(changeset);
+
+        for column in ["wake_requested", "activity_name"] {
+            assert!(
+                sql.contains(&format!("\"{column}\" = $")),
+                "{column} must appear as a bound column in the SET clause: {sql}"
+            );
+        }
+        // activity_name binds `None` (SQL NULL); wake_requested binds `false`.
+        assert!(
+            sql.contains("None"),
+            "activity_name must bind to None (SQL NULL): {sql}"
         );
         assert!(
             sql.contains("false"),
