@@ -1132,6 +1132,47 @@ async fn ui_dead_letters_invalid_limit_redisplays_form_instead_of_aborting_page(
     );
 }
 
+/// RED (was): `refresh` was still typed `Option<u64>` directly on
+/// `DeadLetterListParams`. This is the same page-abort mechanism issue
+/// #1604 documents for the Schedules, DAG-detail and Schedule-runs pages,
+/// left open here on the sibling DLQ page. `?refresh=not-a-number` failed
+/// axum's own query deserialization with a bare 400 before
+/// `list_dead_letters_ui` ever ran, discarding the `workflow_name` filter
+/// the operator had already typed alongside it.
+///
+/// GREEN (this commit): the request still renders the DLQ page (`200`)
+/// and preserves the other filter. It surfaces a `role="alert"` message
+/// naming the bad value, reusing `parse_refresh_query_field` (the DAG
+/// detail page's own fix, issue #1630).
+#[tokio::test]
+async fn ui_dead_letters_invalid_refresh_redisplays_page_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(
+        &app,
+        "/dead-letters?refresh=not-a-number&workflow_name=invoice_workflow",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid refresh must not abort the whole DLQ page: {html}"
+    );
+    assert!(
+        html.contains("value=\"invoice_workflow\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must be present: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+}
+
 /// Same fix, the `page` field. No form field backs it; it drives the
 /// Previous/Next links instead, a distinct code path. Covered
 /// independently here rather than assumed symmetric with `limit`,
@@ -1504,6 +1545,43 @@ async fn ui_workers_invalid_limit_redisplays_form_instead_of_aborting_page() {
     assert!(
         html.contains("role=\"alert\""),
         "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+}
+
+/// RED (was): `refresh` was still typed `Option<u64>` directly on
+/// `WorkerListParams`. This is the same page-abort mechanism issue #1604
+/// documents for the Schedules, DAG-detail and Schedule-runs pages, left
+/// open here on the sibling Workers page. `?refresh=not-a-number` failed
+/// axum's own query deserialization with a bare 400 before
+/// `list_workers_ui` ever ran, discarding the `build_id` filter the
+/// operator had already typed alongside it.
+///
+/// GREEN (this commit): the request still renders the Workers page
+/// (`200`) and preserves the other filter. It surfaces a `role="alert"`
+/// message naming the bad value, reusing `parse_refresh_query_field` (the
+/// DAG detail page's own fix, issue #1630).
+#[tokio::test]
+async fn ui_workers_invalid_refresh_redisplays_page_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/workers?refresh=not-a-number&build_id=abc123").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid refresh must not abort the whole Workers page: {html}"
+    );
+    assert!(
+        html.contains("value=\"abc123\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must be present: {html}"
     );
     assert!(
         html.contains("not-a-number"),
@@ -2174,6 +2252,42 @@ async fn ui_schedules_invalid_limit_redisplays_form_instead_of_aborting_page() {
     assert!(
         html.contains("role=\"alert\""),
         "an inline, screen-reader-announced error must sit next to the field: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+}
+
+/// RED (was): `refresh` was still typed `Option<u64>` directly on
+/// `ScheduleListParams`. Issue #1604 fixed `page`/`limit` here. It also
+/// fixed `refresh` on the sibling DAG-detail page (issue #1630). This
+/// page's own `refresh` field stayed on the same raw-`u64` mechanism.
+/// `?refresh=not-a-number` failed axum's own query deserialization with a
+/// bare 400 before `list_schedules_ui` ever ran, discarding the `target`
+/// filter the operator had already typed alongside it.
+///
+/// GREEN (this commit): the request still renders the Schedules page
+/// (`200`) and preserves the other filter. It surfaces a `role="alert"`
+/// message naming the bad value, reusing `parse_refresh_query_field`.
+#[tokio::test]
+async fn ui_schedules_invalid_refresh_redisplays_page_instead_of_aborting_page() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/schedules?refresh=not-a-number&target=billing").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid refresh must not abort the whole Schedules page: {html}"
+    );
+    assert!(
+        html.contains("value=\"billing\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must be present: {html}"
     );
     assert!(
         html.contains("not-a-number"),
