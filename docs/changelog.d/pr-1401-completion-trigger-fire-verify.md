@@ -96,6 +96,14 @@ confirmed-delivered fires all land in one batch could otherwise turn into
 a single hundreds-of-megabytes request. The lookup stays set-based, just
 spread across bounded queries.
 
+Migration `20260920215812` also adds
+`idx_harvest_completion_trigger_outbox_source_trigger` on
+`harvest_completion_trigger_outbox(source_exec_id, trigger_id)` (Codex
+follow-up). The scan's `NOT EXISTS` outbox-pending check
+(`cf06f27`, above) had no supporting index — the table's only other index
+starts with `target_shard` — so each of up to 1,000 scan pages ran that
+anti-join against the whole outbox table.
+
 **No new `WorkflowEvent` variant, no engine-runtime behavior change beyond
 the two additive write-path fixes above.** Read-only in `backup_verify.rs`,
 reusing `execution::execution_exists_by_key` — the exact any-state

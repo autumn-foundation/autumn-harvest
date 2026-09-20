@@ -24,3 +24,13 @@
 ALTER TABLE harvest_completion_trigger_fires
     ADD COLUMN target_shard INTEGER,
     ADD COLUMN target_workflow_name VARCHAR(255);
+
+-- `backup verify`'s scan excludes a fire still awaiting relay with
+-- `NOT EXISTS (... WHERE o.source_exec_id = f.source_exec_id AND
+-- o.trigger_id = f.trigger_id)` against this table (Codex review,
+-- PR #1673). The table's only other index starts with `target_shard`, so
+-- that predicate cannot use it. The scan can run up to 1,000 pages; each
+-- page ran this anti-join against the whole outbox with no supporting
+-- index.
+CREATE INDEX idx_harvest_completion_trigger_outbox_source_trigger
+    ON harvest_completion_trigger_outbox (source_exec_id, trigger_id);
