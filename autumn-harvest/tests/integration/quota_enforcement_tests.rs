@@ -1966,10 +1966,11 @@ async fn awaited_child_spawn_quota_check_excludes_its_own_just_appended_history_
 
 // ---------------------------------------------------------------------------
 // Issue #1589: `persist_all_started_child_workflows`'s local-child loop
-// batches children whose OWN `enforce_quota_admission` call is a proven
-// no-op (no declared policy, no active cap, or no resolved key) into one
-// multi-row INSERT per table. A child with an active cap keeps the
-// original sequential insert-then-admit path instead. These tests are the
+// batches children into one multi-row INSERT per table when their OWN
+// `enforce_quota_admission` call is a proven no-op. That no-op case is:
+// no declared policy, no active cap, or no resolved key. A child with an
+// active cap keeps the original sequential insert-then-admit path
+// instead. These tests are the
 // direct proof that the split preserves `enforce_quota_admission`'s
 // graduated admission property, and its all-or-nothing rollback, when a
 // SINGLE decision mixes both groups. That mix is exactly the scenario the

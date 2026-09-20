@@ -379,10 +379,11 @@ const ROWS_PER_EVENT_INSERT_CHUNK: usize = POSTGRES_MAX_BIND_PARAMS / NEW_HARVES
 ///
 /// [`ROWS_PER_EVENT_INSERT_CHUNK`] alone bounds parameter count, not
 /// memory. A `WorkflowStarted` input may validly reach
-/// [`crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES`] (2 MiB), and offload
-/// (issue #524) only shrinks it when a `PayloadOffloader` is configured and
-/// the threshold is crossed. Without this bound, a fan-out of thousands of
-/// near-max-size children could still build one multi-gigabyte `INSERT`.
+/// [`crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES`] (2 MiB). Offload
+/// (issue #524) only shrinks it when a `PayloadOffloader` is configured,
+/// and only once the threshold is crossed. Without this bound, a fan-out
+/// of thousands of near-max-size children could still build one
+/// multi-gigabyte `INSERT`.
 #[cfg(feature = "db")]
 const MAX_EVENT_CHUNK_PAYLOAD_BYTES: usize = 8 * 1024 * 1024; // 4x DEFAULT_MAX_WORKFLOW_INPUT_BYTES
 

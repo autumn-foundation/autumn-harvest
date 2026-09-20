@@ -10336,12 +10336,12 @@ async fn persist_all_started_child_workflows(
         // sequential insert-then-admit path, or to a batched-insert path.
         // The routing checks whether its OWN `enforce_quota_admission` call
         // would touch the database at all. That function no-ops (zero
-        // queries) when the child declares no policy, its policy has no
-        // cap, or no key resolved -- exactly the three conditions checked
-        // below. A child in that shape can never reject a sibling or be
-        // rejected by one. The insert-then-admit ORDER carries no
-        // information for it, so the whole group can be inserted, appended,
-        // and enqueued as one batch each instead of one row each.
+        // queries) in exactly three cases: no declared policy, no active
+        // cap, or no resolved key -- checked below. A child in that shape
+        // can never reject a sibling or be rejected by one. The insert-
+        // then-admit ORDER carries no information for it. So the whole
+        // group can be inserted, appended, and enqueued as one batch each,
+        // instead of one row each.
         let mut sequential_children: Vec<LocalChildPlan<'_>> = Vec::new();
         let mut batchable_children: Vec<LocalChildPlan<'_>> = Vec::new();
         for child in &local_new_children {
@@ -10474,10 +10474,10 @@ async fn persist_all_started_child_workflows(
         }
 
         // Children whose admission is a proven no-op get one multi-row
-        // INSERT per table for the whole group (chunked under Postgres's
-        // bind-parameter ceiling), instead of one INSERT per child (issue
-        // #1589's own measured N -> 3N shape). `enforce_quota_admission` is
-        // not called here at all. The `admission_is_noop` routing above
+        // INSERT per table for the whole group, chunked under Postgres's
+        // bind-parameter ceiling. That replaces one INSERT per child --
+        // issue #1589's own measured N -> 3N shape. `enforce_quota_admission`
+        // is not called here at all. The `admission_is_noop` routing above
         // already proves it would return immediately without a query.
         if !batchable_children.is_empty() {
             let child_rows: Vec<NewWorkflowExecution<'_>> = batchable_children
@@ -10708,11 +10708,11 @@ const ROWS_PER_EXECUTION_INSERT_CHUNK: usize =
 ///
 /// [`ROWS_PER_EXECUTION_INSERT_CHUNK`] alone bounds parameter count, not
 /// memory. A child's input may validly reach
-/// [`crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES`] (2 MiB), and this
-/// row's `input` is never offloaded (offload, issue #524, applies to event
-/// history, not the execution row itself). Without this bound, a fan-out of
-/// thousands of near-max-size children could still build one multi-gigabyte
-/// `INSERT`.
+/// [`crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES`] (2 MiB). This row's
+/// `input` is never offloaded -- offload (issue #524) applies to event
+/// history, not the execution row itself. Without this bound, a fan-out of
+/// thousands of near-max-size children could still build one
+/// multi-gigabyte `INSERT`.
 const MAX_EXECUTION_CHUNK_PAYLOAD_BYTES: usize = 8 * 1024 * 1024; // 4x DEFAULT_MAX_WORKFLOW_INPUT_BYTES
 
 const _: () = assert!(
@@ -10769,9 +10769,10 @@ fn compute_execution_chunk_bounds(rows: &[NewWorkflowExecution<'_>]) -> Vec<(usi
 /// One local awaited child's precomputed spawn inputs (issue #1589).
 ///
 /// Built once per child in `persist_all_started_child_workflows`. Then
-/// routed to either the sequential insert-then-admit path or the
-/// batched-insert path, depending on whether its `enforce_quota_admission`
-/// call would be a no-op -- see that function's own early returns.
+/// routed to either the sequential insert-then-admit path, or the
+/// batched-insert path. The routing depends on whether its
+/// `enforce_quota_admission` call would be a no-op -- see that function's
+/// own early returns.
 struct LocalChildPlan<'a> {
     child: &'a StartedChildWorkflowCommand,
     defaults: ChildWorkflowDefaults,
@@ -10782,7 +10783,7 @@ struct LocalChildPlan<'a> {
 /// Builds one local awaited child's insert row from its [`LocalChildPlan`].
 ///
 /// Shared by both the sequential and the batched-insert paths in
-/// `persist_all_started_child_workflows` (issue #1589), so the two paths
+/// `persist_all_started_child_workflows` (issue #1589). So the two paths
 /// cannot drift on which fields a child row carries.
 fn build_child_row<'p>(
     plan: &'p LocalChildPlan<'_>,

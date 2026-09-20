@@ -3,12 +3,11 @@
 //! enqueue N+1 (issue #1589).
 //!
 //! `persist_all_started_child_workflows`'s local-child loop
-//! (`autumn-harvest/src/worker.rs`) used to call, per new local child: one
-//! single-row `INSERT INTO harvest_workflow_executions`; one single-row
-//! `INSERT INTO harvest_events` for the child's `WorkflowStarted`; and one
-//! `queue::enqueue`, itself one single-row `INSERT INTO harvest_task_queue`.
-//! A decision that fanned out to `n` awaited local children cost `3n`
-//! round trips to persist.
+//! (`autumn-harvest/src/worker.rs`) used to call, per new local child,
+//! three single-row `INSERT`s. One into `harvest_workflow_executions`.
+//! One into `harvest_events`, for the child's `WorkflowStarted`. One via
+//! `queue::enqueue`, into `harvest_task_queue`. A decision that fanned out
+//! to `n` awaited local children cost `3n` round trips to persist.
 //!
 //! The fix splits local children by whether their own
 //! `enforce_quota_admission` call would be a no-op. That is true when the
@@ -25,9 +24,10 @@
 //!
 //! Evidence here is `pg_stat_statements` call counts, driven end-to-end
 //! through a real `Worker` and a real workflow decision. This is not a
-//! direct call to an internal helper: the row-building logic is inlined in
-//! `persist_all_started_child_workflows`, matching every other per-child
-//! insert call site in this file (none of which are factored out either).
+//! direct call to an internal helper. The row-building logic is inlined in
+//! `persist_all_started_child_workflows`. That matches every other
+//! per-child insert call site in this file, none of which are factored
+//! out either.
 //! This harness follows the same shape as `activity_enqueue_batch_perf.rs`:
 //! a fresh, uniquely-named, fully-migrated database per measurement.
 //! `pg_stat_statements` is reset immediately before the measured decision,
@@ -348,11 +348,11 @@ fn fan_out_child<'a>(
     })
 }
 
-/// End-to-end: a real workflow decision fanning out to
-/// [`FAN_OUT_N`] awaited local children of a workflow type with NO declared
-/// quota policy must persist that decision with O(1) `INSERT` calls per
-/// table, not `O(FAN_OUT_N)`. This is the exact shape issue #1589 measured
-/// (3 calls per child, unbatched). It is driven through the real
+/// End-to-end: a real workflow decision fans out to [`FAN_OUT_N`] awaited
+/// local children, of a workflow type with NO declared quota policy. It
+/// must persist that decision with O(1) `INSERT` calls per table, not
+/// `O(FAN_OUT_N)`. This is the exact shape issue #1589 measured (3 calls
+/// per child, unbatched). It is driven through the real
 /// `persist_all_started_child_workflows` code path, not a direct call to
 /// an internal helper.
 #[tokio::test]
@@ -410,7 +410,7 @@ async fn awaited_local_child_fan_out_persists_with_one_insert_per_table() {
     handle.await.expect("worker join");
 
     // The two tables issue #1589 targets are each covered by exactly ONE
-    // multi-row `INSERT` for the whole FAN_OUT_N-wide group -- not one per
+    // multi-row `INSERT`, for the whole FAN_OUT_N-wide group. Not one per
     // child, and not merely "fewer than N".
     assert_eq!(
         workflow_execution_inserts, 1,
@@ -427,7 +427,7 @@ async fn awaited_local_child_fan_out_persists_with_one_insert_per_table() {
     // rows, 1 call. The PARENT's own per-event append loop is the fan_out
     // marker plus one ChildWorkflowStarted per child, `FAN_OUT_N + 1`
     // separate calls. That parent-side loop is deliberately out of scope
-    // for issue #1589 -- see its own text, scoped to the "Insert rows and
+    // for issue #1589. See its own text: scoped to the "Insert rows and
     // enqueue tasks for new children" section, not the parent's own
     // history append. That append re-reads `MAX(event_id) FOR UPDATE` per
     // event, to serialize against concurrent sibling completions. The
