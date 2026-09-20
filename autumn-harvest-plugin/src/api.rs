@@ -43570,6 +43570,11 @@ async fn stream_execution_events(
             } else {
                 None
             });
+        // Tracks the shard the close-audit below should attribute to
+        // (issue #1596 review, P2). Starts at the connect-time shard, and
+        // the live-tail loop below updates it on each rebind. Declared
+        // here so it still reads the right shard after that loop exits.
+        let mut listener_shard = shard;
         if let Some(state) = effective_terminal {
             let last_id = backfill.last().map_or(last_row_id, |r| r.id);
             send_stream_end(&api_clone, exec_id, &mut tx, last_id, state).await;
@@ -43582,7 +43587,6 @@ async fn stream_execution_events(
             // `store::row_id_for_event_id`.
             let mut last_seen_event_id: Option<i32> = backfill.last().map(|r| r.event_id);
             let mut listener = listener;
-            let mut listener_shard = shard;
             let buf_limit = i64::try_from(api_clone.sse_buffer_depth()).ok();
 
             'notify: loop {
