@@ -1073,6 +1073,135 @@ async fn a_fence_bump_cannot_commit_while_a_persist_holds_the_fence() {
     FenceRegistry::clear();
 }
 
+/// A [`PayloadStore`](autumn_harvest::payload_store::PayloadStore) whose
+/// `put` blocks until released. A test can hold a batched append mid-
+/// upload with it, and probe whether it holds the fence lock at that
+/// moment.
+struct BlockingStore {
+    started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl autumn_harvest::payload_store::PayloadStore for BlockingStore {
+    fn put(&self, bytes: &[u8]) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, String> {
+        let started = self.started.lock().unwrap().take();
+        let release = self.release.lock().unwrap().take();
+        let key = format!("blocked-{}", bytes.len());
+        Box::pin(async move {
+            if let Some(tx) = started {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = release {
+                let _ = rx.await;
+            }
+            Ok(key)
+        })
+    }
+    fn get(&self, _key: &str) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, Vec<u8>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn delete(&self, _key: &str) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A batched append must not hold the DR fence lock across its offload
+/// upload (issue #1589 review).
+///
+/// `append_new_execution_started_events_batch` offloads before opening its
+/// fenced transaction, per chunk. This mirrors the fix
+/// `append_events_offloaded_with_codecs` already applies to the single-
+/// execution append path. A concurrent `bump_generation` started while
+/// the upload is in flight must therefore succeed immediately. It must
+/// not block behind a fence read the pre-fix code would have held across
+/// the whole upload. That is exactly the barrier the previous test
+/// proves DOES block a persist that holds the fence.
+#[tokio::test]
+async fn a_batched_append_does_not_hold_the_fence_across_its_offload_upload() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("batchoffload");
+    let mut setup = connect(&url).await;
+    ensure_generation_row(&mut setup, ShardId::new(0))
+        .await
+        .unwrap();
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, state, input, shard_id) \
+         VALUES ($1, 'wf', 'k1', 'RUNNING', '{}'::jsonb, 0)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut setup)
+    .await
+    .unwrap();
+
+    FenceRegistry::clear();
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    FenceRegistry::set_default_shard(ShardId::new(0))
+        .expect("no conflicting default shard in this test");
+
+    let events = vec![(
+        exec_id,
+        autumn_harvest::event::WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({}),
+            timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+    )];
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let store = std::sync::Arc::new(BlockingStore {
+        started: std::sync::Mutex::new(Some(started_tx)),
+        release: std::sync::Mutex::new(Some(release_rx)),
+    });
+    // Threshold 0: even `input: {}` offloads, so `put` is guaranteed to run.
+    let offloader = autumn_harvest::payload_store::PayloadOffloader::new(
+        store,
+        0,
+        std::sync::Arc::new(NoOpMetrics),
+    );
+
+    let mut appender = connect(&url).await;
+    let append_handle = tokio::spawn(async move {
+        autumn_harvest::store::append_new_execution_started_events_batch(
+            &mut appender,
+            &events,
+            Some(&offloader),
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        )
+        .await
+    });
+
+    started_rx
+        .await
+        .expect("the offload upload must start before the append can proceed");
+
+    // The upload is in flight, blocked on `release_rx`. If the fence lock
+    // were held across it (the pre-fix bug), this bump would block behind
+    // it and time out. That is exactly what the previous test proves for
+    // a persist that DOES hold the fence across an in-progress
+    // transaction.
+    let mut bumper = connect(&url).await;
+    let generation = bump_generation(&mut bumper, ShardId::new(0), "concurrent bump", "test")
+        .await
+        .expect("a bump during the upload must not block on the fence lock");
+    assert_eq!(generation, ShardGeneration::new(1));
+
+    release_tx.send(()).expect("release the blocked upload");
+    let result = append_handle.await.expect("append task must not panic");
+    let err = result.expect_err("the fence must still catch the now-superseded generation");
+    assert!(
+        matches!(err, autumn_harvest::error::HarvestError::ShardFenced { .. }),
+        "expected ShardFenced, got {err:?}"
+    );
+    FenceRegistry::clear();
+}
+
 /// A sequence owned by a **view** must never reach the promotion helper.
 ///
 /// `ALTER SEQUENCE s OWNED BY <view>.<col>` is accepted by Postgres. Without a

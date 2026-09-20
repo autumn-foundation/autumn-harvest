@@ -475,8 +475,9 @@ fn compute_event_chunk_bounds(events: &[(ExecutionId, WorkflowEvent)]) -> Vec<(u
 ///
 /// `events` must share one shard -- true by construction for the only
 /// caller, since a local child always lands on its parent's shard (issue
-/// #956). The DR write-authority fence (issue #954) is asserted once for
-/// that shared shard, inside the same transaction as the `INSERT`s.
+/// #956). The DR write-authority fence (issue #954) is asserted for that
+/// shared shard once per chunk, each in its own transaction paired with
+/// that chunk's `INSERT`s.
 ///
 /// # Errors
 ///
@@ -504,44 +505,55 @@ pub async fn append_new_execution_started_events_batch(
     // chunk then builds, encodes, offloads, and inserts its own small row
     // `Vec`s in turn. Peak memory therefore stays bounded by one chunk's
     // payload, not the whole `events` slice.
-    Box::pin(
-        conn.transaction::<(), crate::error::HarvestError, _>(async |conn| {
-            crate::replication::assert_fence(conn, shard).await?;
-            for (start, end) in compute_event_chunk_bounds(events) {
-                let mut rows: Vec<NewHarvestEvent<'_>> = events[start..end]
-                    .iter()
-                    .map(|(exec_id, event)| {
-                        Ok(NewHarvestEvent {
-                            workflow_exec_id: exec_id.as_uuid(),
-                            event_id: 0,
-                            event_type: event.type_name(),
-                            event_data: codecs.encode_event(event)?,
-                        })
-                    })
-                    .collect::<Result<_, crate::error::HarvestError>>()?;
+    //
+    // The DR write-authority fence (issue #954) is asserted separately,
+    // per chunk, in its OWN transaction. That transaction opens AFTER
+    // that chunk's offload upload -- never one transaction wrapping
+    // every chunk (issue #1589). `assert_fence`'s `FOR SHARE` row lock
+    // is held until its transaction commits, not released between
+    // statements. One transaction around the whole loop would hold that
+    // lock across every chunk's network upload. That would block a
+    // concurrent DR fencing operation for the whole batch.
+    // `append_events_offloaded_with_codecs` fixed this identical hazard
+    // for the single-execution append path by uploading before the
+    // fenced transaction opens. This mirrors it once per chunk.
+    for (start, end) in compute_event_chunk_bounds(events) {
+        let mut rows: Vec<NewHarvestEvent<'_>> = events[start..end]
+            .iter()
+            .map(|(exec_id, event)| {
+                Ok(NewHarvestEvent {
+                    workflow_exec_id: exec_id.as_uuid(),
+                    event_id: 0,
+                    event_type: event.type_name(),
+                    event_data: codecs.encode_event(event)?,
+                })
+            })
+            .collect::<Result<_, crate::error::HarvestError>>()?;
 
-                // Offload runs before the INSERT below, exactly like
-                // `append_events_offloaded_with_codecs`
-                // (encode-then-offload, ADR-0003).
-                let mut ref_rows: Vec<NewHarvestPayloadRef> = Vec::new();
-                if let Some(offloader) = offloader {
-                    for row in &mut rows {
-                        let refs = offloader.offload_event_value(&mut row.event_data).await?;
-                        ref_rows.extend(refs.into_iter().map(|r| NewHarvestPayloadRef {
-                            blob_key: r.blob_key,
-                            workflow_exec_id: row.workflow_exec_id,
-                            store_id: r.store_id,
-                            byte_len: i64::try_from(r.byte_len).unwrap_or(i64::MAX),
-                        }));
-                    }
-                }
+        // Offload runs before the fenced transaction below, exactly like
+        // `append_events_offloaded_with_codecs` (encode-then-offload,
+        // ADR-0003).
+        let mut ref_rows: Vec<NewHarvestPayloadRef> = Vec::new();
+        if let Some(offloader) = offloader {
+            for row in &mut rows {
+                let refs = offloader.offload_event_value(&mut row.event_data).await?;
+                ref_rows.extend(refs.into_iter().map(|r| NewHarvestPayloadRef {
+                    blob_key: r.blob_key,
+                    workflow_exec_id: row.workflow_exec_id,
+                    store_id: r.store_id,
+                    byte_len: i64::try_from(r.byte_len).unwrap_or(i64::MAX),
+                }));
+            }
+        }
 
+        Box::pin(
+            conn.transaction::<(), crate::error::HarvestError, _>(async |conn| {
+                crate::replication::assert_fence(conn, shard).await?;
                 diesel::insert_into(harvest_events::table)
                     .values(&rows)
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
-                drop(rows);
 
                 for ref_chunk in ref_rows.chunks(ROWS_PER_PAYLOAD_REF_INSERT_CHUNK) {
                     diesel::insert_into(harvest_payload_refs::table)
@@ -551,11 +563,13 @@ pub async fn append_new_execution_started_events_batch(
                         .await
                         .map_err(crate::error::database_error)?;
                 }
-            }
-            Ok(())
-        }),
-    )
-    .await?;
+                Ok(())
+            }),
+        )
+        .await?;
+        drop(rows);
+        drop(ref_rows);
+    }
 
     for (exec_id, event) in events {
         crate::notify::notify_workflow_events_appended(
