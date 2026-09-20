@@ -121,6 +121,19 @@ fn build_test_pool(database_url: &str) -> DbPool {
         .expect("failed to build test pool")
 }
 
+/// Build a pool aimed at an address nothing listens on (issue #1362), so
+/// `.get()` fails fast with no live database. Mirrors `shard.rs`'s own
+/// `test_pool()` unit-test helper.
+fn unreachable_pool() -> DbPool {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+        "postgres://unused-host-for-test/db",
+    );
+    deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("pool builds without connecting")
+}
+
 /// A deliverer that returns a scripted sequence of outcomes (repeating the
 /// last one once exhausted) and records every call for assertions.
 #[derive(Default)]
@@ -1333,6 +1346,73 @@ async fn scanner_scopes_claims_to_the_assigned_shard_when_shards_share_a_pool() 
     assert_eq!(
         shard1_rows[0].state, "PENDING",
         "the shard-1 row must be left untouched by a shard-0-only scanner tick"
+    );
+}
+
+// No test (unit or integration) covered "shard A's connection fails under
+// `LogAndSkip`, and the loop still proceeds to shard B" before this. A
+// regression turning the `continue` in `fire_due_completion_deliveries` into
+// a `return`/`break` would pass every other existing test in this file.
+#[tokio::test]
+async fn scanner_skips_an_unreachable_shard_and_still_delivers_the_next() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    let deliverer = Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(200)]));
+    install_config(
+        deliverer.clone(),
+        RetryPolicy::exponential(3, Duration::from_secs(1)),
+    );
+
+    let exec_shard1 = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_shard1,
+        "wf-shard1-only",
+        "COMPLETED",
+        Some("{}"),
+        None,
+        Some(r#"[{"url":"https://api.example.com/shard1-only","filter":{"type":"AnyTerminal"}}]"#),
+    )
+    .await;
+    evaluate_triggers_for_execution(&mut conn, exec_shard1, TerminalState::Completed, None)
+        .await
+        .expect("evaluate triggers shard1");
+
+    // Move the only delivery onto logical shard 1; shard 0 has no row at all.
+    diesel::sql_query(
+        "UPDATE harvest_completion_deliveries SET shard_id = 1 WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_shard1.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("move delivery to shard 1");
+
+    // Shard 0's pool cannot connect; shard 1's pool points at the real database.
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), unreachable_pool());
+    pools.insert(ShardId::new(1), build_test_pool(&url));
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    let processed = fire_due_completion_deliveries(
+        &mut conn,
+        &Some(sharded_pool),
+        &[ShardId::new(0), ShardId::new(1)],
+    )
+    .await
+    .expect("shard 0's connect failure must be logged and skipped, not propagated");
+
+    assert_eq!(
+        processed, 1,
+        "shard 1's due row must still be delivered despite shard 0 being unreachable"
+    );
+    assert_eq!(deliverer.call_count(), 1);
+
+    let shard1_rows = load_deliveries(&mut conn, exec_shard1).await;
+    assert_eq!(shard1_rows.len(), 1);
+    assert_eq!(
+        shard1_rows[0].state, "DELIVERED",
+        "shard 1's row must be delivered despite shard 0's connect failure"
     );
 }
 

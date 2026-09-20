@@ -871,23 +871,31 @@ pub async fn fire_due_event_batches_with_codecs(
     let mut fired_count = 0usize;
     let mut deferred_to_spawn = Vec::new();
 
+    // Scans each assigned shard's own `harvest_event_batches` table in turn.
+    // Unlike debounce/throttle, a shard connection failure here aborts the
+    // whole scan. It does not log the failure and skip the shard
+    // (issue #1362).
     if let Some(pool) = sharded_pool {
         for shard_id in shard_assignments {
-            if let Some(shard_pool) = pool.exact_pool_for(*shard_id) {
-                let mut shard_conn = shard_pool
-                    .get()
-                    .await
-                    .map_err(|e| crate::error::HarvestError::Database(e.to_string()))?;
-                let (fired, deferred) = fire_due_on_conn(
-                    &mut shard_conn,
-                    Some(shard_id.as_i32()),
-                    Some(metrics),
-                    codecs,
-                )
-                .await?;
-                fired_count += fired.len();
-                deferred_to_spawn.extend(deferred);
-            }
+            let Some(mut shard_conn) = crate::shard::connect_to_shard(
+                pool,
+                *shard_id,
+                "event_batch",
+                crate::shard::ShardConnectError::Abort,
+            )
+            .await?
+            else {
+                continue;
+            };
+            let (fired, deferred) = fire_due_on_conn(
+                &mut shard_conn,
+                Some(shard_id.as_i32()),
+                Some(metrics),
+                codecs,
+            )
+            .await?;
+            fired_count += fired.len();
+            deferred_to_spawn.extend(deferred);
         }
     } else {
         let (fired, deferred) = fire_due_on_conn(conn, None, Some(metrics), codecs).await?;

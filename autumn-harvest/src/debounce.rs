@@ -952,17 +952,15 @@ pub async fn fire_due_debounced_starts_with_codecs(
         // Multi-shard: scan each assigned shard's own harvest_debounce table.
         Some(sp) if !shard_assignments.is_empty() => {
             for shard in shard_assignments {
-                let Some(pool) = sp.exact_pool_for(*shard).cloned() else {
+                let Some(mut shard_conn) = crate::shard::connect_to_shard(
+                    sp,
+                    *shard,
+                    "debounce",
+                    crate::shard::ShardConnectError::LogAndSkip,
+                )
+                .await?
+                else {
                     continue;
-                };
-                let mut shard_conn = match pool.get().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!(
-                            "[debounce] failed to get connection to shard {shard:?}: {e:?}"
-                        );
-                        continue;
-                    }
                 };
                 // Spawn this shard's results before moving on; on this shard's own
                 // error the transaction rolled back, so there is nothing committed

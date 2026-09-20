@@ -23,6 +23,7 @@
 //! AC11 — operator visibility: list_pending_debounce returns the pending record with
 //!         the expected fields
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -30,12 +31,15 @@ use autumn_harvest::debounce::{
     AdmitDebounceParams, DebounceStartOptions, admit_debounced_start, fire_due_debounced_starts,
     list_pending_debounce,
 };
+use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::MetricsRecorder;
-use autumn_harvest::types::{ExecutionId, WorkflowIdReusePolicy};
+use autumn_harvest::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
+use autumn_harvest::worker::DbPool;
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
 use chrono::Utc;
 use diesel_async::AsyncPgConnection;
 use diesel_async::SimpleAsyncConnection;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -85,6 +89,38 @@ async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
         .expect("migrations");
 
     (conn, container)
+}
+
+/// Derive a running container's own Postgres URL (issue #1362). Needed to
+/// build a second, independent `DbPool` aimed at the same physical database
+/// `setup_db` already connected to, for the multi-shard tests below.
+async fn container_url(container: &ContainerAsync<Postgres>) -> String {
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    format!("postgresql://postgres:postgres@{host}:{port}/postgres")
+}
+
+/// Build a connection pool for a database URL (issue #1362), to construct a
+/// `ShardedDbPool` test fixture.
+fn build_test_pool(database_url: &str) -> DbPool {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
+    deadpool::managed::Pool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("failed to build test pool")
+}
+
+/// Build a pool aimed at an address nothing listens on (issue #1362), so
+/// `.get()` fails fast with no live database. Mirrors `shard.rs`'s own
+/// `test_pool()` unit-test helper.
+fn unreachable_pool() -> DbPool {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+        "postgres://unused-host-for-test/db",
+    );
+    deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("pool builds without connecting")
 }
 
 /// Count rows in harvest_debounce for a given workflow_name + debounce_key.
@@ -913,4 +949,138 @@ async fn admit_rejects_empty_workflow_id_before_writing_a_row() {
 
     // No row was written.
     assert_eq!(debounce_row_count(&mut conn, wf, key).await, 0);
+}
+
+// ── Multi-shard scanning (issue #1362) ──────────────────────────────────────
+//
+// `harvest_debounce` shards by physical database, not by a `shard_id`
+// column (see `fire_due_debounced_starts`'s own doc comment). These tests
+// therefore use two genuinely separate Postgres containers, one per shard.
+
+// The multi-shard branch (`Some(sp) if !shard_assignments.is_empty()`) had
+// no integration coverage before this test: every existing call in this
+// file passes `&None` and `&[]`. Each shard's own due row must fire on a
+// single scanner tick that is assigned both shards.
+#[tokio::test]
+async fn fire_due_debounced_starts_fires_each_assigned_shards_own_due_row() {
+    let (mut conn0, container0) = setup_db().await;
+    let (mut conn1, container1) = setup_db().await;
+
+    let window = Duration::from_millis(1);
+    let max_wait = Duration::from_secs(60);
+
+    admit_debounced_start_ungated(
+        &mut conn0,
+        admit_params(
+            "shard0_wf",
+            "tenant:shard0",
+            "shard0-wf-1",
+            serde_json::json!({}),
+            window,
+            max_wait,
+        ),
+    )
+    .await
+    .expect("admit on shard 0");
+    admit_debounced_start_ungated(
+        &mut conn1,
+        admit_params(
+            "shard1_wf",
+            "tenant:shard1",
+            "shard1-wf-1",
+            serde_json::json!({}),
+            window,
+            max_wait,
+        ),
+    )
+    .await
+    .expect("admit on shard 1");
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    let mut pools = BTreeMap::new();
+    pools.insert(
+        ShardId::new(0),
+        build_test_pool(&container_url(&container0).await),
+    );
+    pools.insert(
+        ShardId::new(1),
+        build_test_pool(&container_url(&container1).await),
+    );
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    let metrics = no_op_metrics();
+    let fired = fire_due_debounced_starts(
+        &mut conn0,
+        &Some(sharded_pool),
+        &[ShardId::new(0), ShardId::new(1)],
+        &metrics,
+    )
+    .await
+    .expect("fire across both shards");
+
+    assert_eq!(fired, 2, "each assigned shard's own due row must fire");
+    assert_eq!(
+        execution_count(&mut conn0, "shard0_wf", "shard0-wf-1").await,
+        1
+    );
+    assert_eq!(
+        execution_count(&mut conn1, "shard1_wf", "shard1-wf-1").await,
+        1
+    );
+}
+
+// No test (unit or integration) covered "shard A's connection fails under
+// `LogAndSkip`, and the loop still proceeds to shard B" before this. A
+// regression turning the `continue` in `fire_due_debounced_starts_with_codecs`
+// into a `return`/`break` would pass every other existing test here.
+#[tokio::test]
+async fn fire_due_debounced_starts_skips_an_unreachable_shard_and_still_fires_the_next() {
+    let (mut conn1, container1) = setup_db().await;
+
+    let window = Duration::from_millis(1);
+    let max_wait = Duration::from_secs(60);
+
+    admit_debounced_start_ungated(
+        &mut conn1,
+        admit_params(
+            "shard1_only_wf",
+            "tenant:shard1-only",
+            "shard1-only-wf-1",
+            serde_json::json!({}),
+            window,
+            max_wait,
+        ),
+    )
+    .await
+    .expect("admit on shard 1");
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), unreachable_pool());
+    pools.insert(
+        ShardId::new(1),
+        build_test_pool(&container_url(&container1).await),
+    );
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    let metrics = no_op_metrics();
+    let fired = fire_due_debounced_starts(
+        &mut conn1,
+        &Some(sharded_pool),
+        &[ShardId::new(0), ShardId::new(1)],
+        &metrics,
+    )
+    .await
+    .expect("shard 0's connect failure must be logged and skipped, not propagated");
+
+    assert_eq!(
+        fired, 1,
+        "shard 1's due row must still fire despite shard 0 being unreachable"
+    );
+    assert_eq!(
+        execution_count(&mut conn1, "shard1_only_wf", "shard1-only-wf-1").await,
+        1
+    );
 }

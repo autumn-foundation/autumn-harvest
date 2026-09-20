@@ -2849,20 +2849,20 @@ pub async fn fire_due_completion_deliveries(
 
     let mut total = 0usize;
 
+    // Scans each assigned shard's own `harvest_completion_deliveries` table
+    // in turn (issue #1362).
     match sharded_pool {
         Some(sp) if !shard_assignments.is_empty() => {
             for shard in shard_assignments {
-                let Some(pool) = sp.exact_pool_for(*shard).cloned() else {
+                let Some(mut shard_conn) = crate::shard::connect_to_shard(
+                    sp,
+                    *shard,
+                    "completion_callback",
+                    crate::shard::ShardConnectError::LogAndSkip,
+                )
+                .await?
+                else {
                     continue;
-                };
-                let mut shard_conn = match pool.get().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!(
-                            "[completion_callback] failed to get connection to shard {shard:?}: {e:?}"
-                        );
-                        continue;
-                    }
                 };
                 total += fire_due_on_conn(&mut shard_conn, &config, Some(shard.as_i32())).await?;
             }
