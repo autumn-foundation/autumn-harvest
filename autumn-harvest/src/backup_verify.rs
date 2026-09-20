@@ -47,6 +47,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+#[cfg(all(feature = "db", feature = "testing"))]
 use uuid::Uuid;
 
 /// Maximum number of sample identifiers retained per [`Finding`].
@@ -882,6 +883,7 @@ pub fn compute_skew(latest: impl IntoIterator<Item = Option<DateTime<Utc>>>) -> 
 /// One completion-trigger fire the source shard recorded as delivered
 /// (`harvest_completion_trigger_fires.outcome IS NULL`), before its target
 /// shard is known.
+#[cfg(all(feature = "db", feature = "testing"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedFire {
     source_exec_id: Uuid,
@@ -898,6 +900,7 @@ struct ResolvedFire {
 /// row and the target execution row in one transaction. A skewed restore
 /// cannot split it. [`route_trigger_fires`] filters same-shard fires out
 /// before this type is ever constructed.
+#[cfg(all(feature = "db", feature = "testing"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingTriggerFire {
     source_shard: i32,
@@ -923,6 +926,14 @@ struct PendingTriggerFire {
 /// did. This is the same "supply every shard" assumption the
 /// event-reference scan already carries (see
 /// [`FindingClass::UninspectedShardReference`]).
+///
+/// Known limitation: `router` is built with `readable == writable`, since
+/// this tool has no record of which shards were writable AT FIRE TIME. A
+/// fire placed while some shard was drained (readable, not writable) can
+/// resolve to a different shard here than production picked then. This
+/// mirrors the same placement-vs-location caveat
+/// `shard::external_target_owning_shard` already documents.
+#[cfg(all(feature = "db", feature = "testing"))]
 fn route_trigger_fires(
     fires: Vec<(i32, ResolvedFire)>,
     router: &crate::shard::ShardRouter,
@@ -965,6 +976,7 @@ fn route_trigger_fires(
 /// evidentiary gap [`FindingClass::RetentionUnproven`] names for a recorded
 /// child terminal or delivered effect. It is resolved here from the fire's
 /// own `fired_at` (issue #1401), not a `harvest_execution_summaries` row.
+#[cfg(all(feature = "db", feature = "testing"))]
 #[must_use]
 fn absence_is_decisive_loss(
     fired_at: DateTime<Utc>,
@@ -1912,14 +1924,22 @@ mod probes {
     /// Scan this shard for completion-trigger fires it recorded as delivered
     /// (issue #1401).
     ///
-    /// `harvest_completion_trigger_fires.outcome IS NULL` is the row's own
-    /// claim that the relay reached the target. It is set only after
-    /// `relay_gate_checked_start` committed the source-side outbox delete.
-    /// That delete itself happens only after the target-shard start
-    /// committed, or an any-state existence check found the target already
-    /// there. A row with a RESOLVED outcome
-    /// (`condition_unmet`/`admission_blocked`) started nothing on any
-    /// shard, so it is excluded.
+    /// `outcome IS NULL` alone is NOT proof of delivery. It is set the
+    /// moment the trigger fires, in the same transaction that inserts the
+    /// cross-shard outbox row. This is before any relay attempt. A fire
+    /// still waiting on the outbox scanner, or parked behind a
+    /// `QuotaExceeded` backoff, has `outcome IS NULL` too. Adjudicating it
+    /// as delivered would report an ordinary backlog as a lost relay.
+    ///
+    /// The actual "confirmed delivered" signal is `outcome IS NULL` AND no
+    /// `harvest_completion_trigger_outbox` row remains for this
+    /// `(source_exec_id, trigger_id)`. `relay_gate_checked_start` deletes
+    /// that row only after the target-shard start committed, or an
+    /// any-state existence check found the target already there. A
+    /// same-shard fire never had an outbox row at all -- it is filtered out
+    /// later by [`super::route_trigger_fires`], not here. A row with a
+    /// RESOLVED outcome (`condition_unmet`/`admission_blocked`) started
+    /// nothing on any shard, so it is excluded outright.
     ///
     /// Each row stands alone. Unlike the event scan, no group spans more
     /// than one row, so plain keyset pagination on the primary key
@@ -1943,6 +1963,11 @@ mod probes {
                  FROM harvest_completion_trigger_fires f \
                  LEFT JOIN harvest_completion_triggers t ON t.id = f.trigger_id \
                  WHERE f.outcome IS NULL \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM harvest_completion_trigger_outbox o \
+                     WHERE o.source_exec_id = f.source_exec_id \
+                       AND o.trigger_id = f.trigger_id \
+                   ) \
                  {after}\
                  ORDER BY f.source_exec_id, f.trigger_id \
                  LIMIT {page}"
@@ -3466,6 +3491,7 @@ mod tests {
 
     // ─────────── completion-trigger fire routing (issue #1401) ───────────
 
+    #[cfg(all(feature = "db", feature = "testing"))]
     fn two_shard_router() -> crate::shard::ShardRouter {
         use crate::types::ShardId;
         crate::shard::ShardRouter::new(
@@ -3475,6 +3501,7 @@ mod tests {
         )
     }
 
+    #[cfg(all(feature = "db", feature = "testing"))]
     fn resolved_fire(target_workflow_name: &str) -> ResolvedFire {
         ResolvedFire {
             source_exec_id: Uuid::new_v4(),
@@ -3485,6 +3512,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
     fn route_trigger_fires_derives_the_same_target_workflow_id_as_the_relay() {
         let router = two_shard_router();
         let fire = resolved_fire("child_flow");
@@ -3508,6 +3536,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
     fn route_trigger_fires_drops_same_shard_fires() {
         let router = two_shard_router();
         let fire = resolved_fire("child_flow");
@@ -3529,6 +3558,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
     fn absence_is_decisive_loss_requires_a_restore_point_strictly_before_the_fire() {
         let fired_at = Utc::now();
 

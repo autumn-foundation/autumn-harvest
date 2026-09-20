@@ -295,9 +295,15 @@ ack, it refuses; with the ack, it still only reads.
   prefix: a single execution carrying more reference events than one page
   (raise `--probe-limit`), and hitting the internal page ceiling.
 - **(d) Completion-trigger relay coherence** (issue #1401). A
-  `harvest_completion_trigger_fires` row with `outcome IS NULL` is the source
-  shard's own claim that a cross-shard relay delivered. The target's business
-  key (`workflow_name` plus the deterministic
+  `harvest_completion_trigger_fires` row with `outcome IS NULL` is set the
+  moment the trigger fires, before any relay attempt — it is not by itself
+  proof of delivery. **Confirmed delivered** additionally requires the
+  matching `harvest_completion_trigger_outbox` row to be gone: the relay
+  deletes it only after the target-shard start commits, or an any-state
+  existence check finds the target already there. A fire still waiting on
+  the outbox scanner, or parked behind a quota backoff, keeps its outbox row
+  and is never adjudicated. For a confirmed-delivered fire, the target's
+  business key (`workflow_name` plus the deterministic
   `completion-trigger-{trigger_id}-{source_exec_id}`) is checked on the target
   shard the SAME rendezvous hash placed it on. An absent target with no
   timestamp evidence either way is `completion_trigger_fire_unproven`
@@ -308,6 +314,9 @@ ack, it refuses; with the ack, it still only reads.
   start and cannot be split by a skewed restore. This check needs every fleet
   shard supplied, the same convention `uninspected_shard_reference` already
   carries — a partial `--shard` list can route the hash prediction wrong.
+  Known limitation: the target-shard prediction assumes every supplied shard
+  was writable at fire time; a fire placed while some shard was drained can
+  resolve to a different shard than production actually used.
 - **(e) A machine-readable report** (`--format json`) with a nonzero exit on any
   failed check.
 

@@ -2377,6 +2377,33 @@ async fn seed_completion_trigger_fire(
     .expect("seed completion trigger fire");
 }
 
+/// Insert a `harvest_completion_trigger_outbox` row for a fire still
+/// waiting on the relay -- the row the source deletes only once the relay
+/// confirms delivery.
+async fn seed_completion_trigger_outbox(
+    conn: &mut AsyncPgConnection,
+    source_exec_id: ExecutionId,
+    trigger_id: Uuid,
+    target_shard: i32,
+    target_workflow_name: &str,
+    target_workflow_id: &str,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_trigger_outbox \
+         (source_exec_id, trigger_id, target_shard, target_workflow_name, \
+          target_workflow_id, target_input, priority, max_workflow_input_bytes) \
+         VALUES ($1, $2, $3, $4, $5, '{}'::jsonb, '{}'::jsonb, 1048576)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(source_exec_id.as_uuid())
+    .bind::<diesel::sql_types::Uuid, _>(trigger_id)
+    .bind::<diesel::sql_types::Integer, _>(target_shard)
+    .bind::<diesel::sql_types::Text, _>(target_workflow_name)
+    .bind::<diesel::sql_types::Text, _>(target_workflow_id)
+    .execute(conn)
+    .await
+    .expect("seed completion trigger outbox");
+}
+
 async fn append_event_at(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -2476,6 +2503,68 @@ async fn detects_a_lost_cross_shard_completion_trigger_fire() {
          proven loss: {report:#?}"
     );
     assert_eq!(report.status, VerifyStatus::Incoherent);
+}
+
+/// `outcome IS NULL` alone is set the moment a trigger fires, before any
+/// relay attempt. It is NOT proof of delivery. A fire whose
+/// `harvest_completion_trigger_outbox` row is still present is still
+/// waiting on the relay -- in flight, or backed off behind a quota retry.
+/// It must never be adjudicated. This holds even though its target is
+/// absent everywhere and its target shard's restore point predates
+/// `fired_at`. That is exactly the shape that would otherwise read as a
+/// proven loss.
+#[tokio::test]
+async fn a_fire_still_pending_relay_is_not_probed() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let (source, trigger_id, target_id) = find_fire_targeting("child_flow", 1);
+    let fired_at = Utc::now() - chrono::Duration::hours(1);
+
+    seed_execution(
+        &mut a,
+        source,
+        "parent_flow",
+        "ct-pending-1",
+        "COMPLETED",
+        0,
+    )
+    .await;
+    seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
+    seed_completion_trigger_fire(&mut a, source, trigger_id, fired_at, None).await;
+    seed_completion_trigger_outbox(&mut a, source, trigger_id, 1, "child_flow", &target_id).await;
+
+    // Shard 1's restore point predates the fire and has no row for the
+    // target. This is the exact shape
+    // `detects_a_lost_cross_shard_completion_trigger_fire` reports as a
+    // proven loss. EXCEPT the outbox row above proves the relay never
+    // delivered in the first place.
+    let stale = ExecutionId::new_for_shard(ShardId::new(1));
+    seed_execution(&mut b, stale, "unrelated", "un-pending-1", "COMPLETED", 1).await;
+    append_event_at(
+        &mut b,
+        stale,
+        1,
+        "WorkflowStarted",
+        json!({ "input": {} }),
+        fired_at - chrono::Duration::hours(1),
+    )
+    .await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::CompletionTriggerFireLost),
+        "a pending relay is not yet delivered, so it cannot be lost: {report:#?}"
+    );
+    assert!(
+        !report.detected(FindingClass::CompletionTriggerFireUnproven),
+        "a pending relay is not yet delivered, so it is not ambiguous \
+         either -- it is simply not adjudicated: {report:#?}"
+    );
 }
 
 /// The residual ambiguity issue #1401 calls out explicitly (same class as
