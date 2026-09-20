@@ -81,6 +81,23 @@ reproduces the transaction-frozen-clock path with `pg_sleep` standing in for
 real prior work. Confirmed red against `NOW()`, green against
 `clock_timestamp()`.
 
+**Third review round: sub-millisecond delays were truncated to zero.**
+`delay_secs` converted `delay` to seconds via `num_milliseconds()`, which
+truncates. `JitterPolicy::Full` picks a uniform value between zero and the
+base interval, so a sub-millisecond positive delay is reachable for a
+short-interval retry policy — truncation rounded it down to zero, an
+immediate retry instead of a brief one. Switched to `num_microseconds()`.
+New test `delay_secs_preserves_sub_millisecond_precision` pins it.
+
+A fourth finding — the in-process/Redis dispatch hint's `due` time compares
+`scheduled_at` (now DB-clock) against the dispatcher's host clock — was
+investigated and left out of this PR. `queue::due_dispatch_hints_page`, the
+reconcile sweep backing that hint, queries `scheduled_at <= NOW()` directly
+against Postgres on its own 1-second default interval, so a stale hint
+self-corrects within that bound regardless of the dispatcher's own clock.
+Real, but bounded, self-healing, and in a separate subsystem from this
+issue's own scope.
+
 No `WorkflowEvent` variant, no migration, no replay impact — the change is
 confined to how `scheduled_at` is computed before the write, and to the two
 retry-vs-timeout gates that must now agree with it.
