@@ -3808,6 +3808,82 @@ async fn quota_blocked_outbox_backoff_lands_on_the_database_clock() {
     drop(guard);
 }
 
+/// Issue #1392: a scan that cannot even ATTEMPT a relay must also stamp
+/// `next_attempt_at` from Postgres's own clock, via
+/// `stamp_outbox_relay_backoff`. Here, the target shard has no configured
+/// pool.
+///
+/// Distinct from `quota_blocked_outbox_backoff_lands_on_the_database_clock`
+/// above: that test drives `relay_gate_checked_start`'s `QuotaExceeded` arm.
+/// This one drives the separate missing-pool arm in
+/// `enforce_completion_triggers_outbox_with_codecs` itself.
+#[tokio::test]
+async fn outbox_relay_missing_pool_backoff_lands_on_the_database_clock() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    install_global_router(ShardRouter::single());
+
+    // Shard 7 is never registered with a pool. The per-row lookup inside
+    // the scanner then finds no target pool, and takes the missing-pool
+    // backoff path instead of attempting a relay.
+    let unreachable_shard = ShardId::new(7);
+    let mut pools = std::collections::BTreeMap::new();
+    pools.insert(ShardId::new(0), build_test_pool(&url));
+    let sharded_pool = Some(ShardedDbPool::from_map(pools, ShardId::new(0)));
+
+    let outbox_id = diesel::insert_into(harvest_completion_trigger_outbox::table)
+        .values(&NewCompletionTriggerOutboxDb {
+            source_exec_id: Uuid::new_v4(),
+            trigger_id: Uuid::new_v4(),
+            target_shard: unreachable_shard.as_i32(),
+            target_workflow_name: leaked("outbox_missing_pool").to_string(),
+            target_workflow_id: format!("target-{}", Uuid::new_v4().simple()),
+            target_input: serde_json::json!({}),
+            // A named queue skips the default-shard queue-name lookup this
+            // scan would otherwise attempt, keeping the test focused on the
+            // missing-pool backoff path alone.
+            queue_name: Some("outbox-missing-pool-queue".to_string()),
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: serde_json::to_value(Priority::default()).unwrap(),
+            max_workflow_input_bytes: 1_000_000,
+        })
+        .get_result::<CompletionTriggerOutboxDb>(&mut conn)
+        .await
+        .expect("insert outbox row")
+        .id;
+
+    enforce_completion_triggers_outbox(
+        &mut conn,
+        &NoOpMetrics,
+        &sharded_pool,
+        &[unreachable_shard],
+    )
+    .await
+    .expect("outbox scan hits the missing-pool target");
+
+    let deadline = outbox_next_attempt_at(&mut conn, outbox_id)
+        .await
+        .expect("a missing-pool scan must stamp next_attempt_at");
+    let db_now = queue::db_clock_now(&mut conn)
+        .await
+        .expect("probe database clock");
+
+    // Mirrors `OUTBOX_RELAY_FAILURE_BACKOFF` (5 seconds), the same value as
+    // `QUOTA_REDEFER_BACKOFF` above but a separate production constant.
+    let expected_backoff = chrono::Duration::seconds(5);
+    let held = deadline - db_now;
+    let drift = (held - expected_backoff).num_milliseconds().abs();
+    const TOLERANCE_MS: i64 = 750;
+    assert!(
+        drift <= TOLERANCE_MS,
+        "expected next_attempt_at ({deadline}) to land within \
+         {TOLERANCE_MS}ms of {expected_backoff} past the database's own \
+         NOW() ({db_now}), but held {held} -- drift {drift}ms"
+    );
+}
+
 /// Issue #1227 Finding 4, Codex round-1 P1 (PR #1386): ordering the claim
 /// batch by `created_at` ALONE (the initial fix above) is not enough. Once
 /// `WorkerRuntimeConfig::poll_interval` is at or above `QUOTA_REDEFER_BACKOFF`
