@@ -634,9 +634,9 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 // `activity_macro`'s arity-keyed dispatch block (0/1/N non-`ctx` params, plus
 // the `encode_err` branch for a plain vs. `ActivityFailure` return type) is
 // byte-identical to `workflow.rs`'s `workflow_macro` dispatch block. Issue
-// #1632 documents this as one decision, hand-mirrored across both macros, but
-// defers a merge until characterization tests exist here (this file had no
-// macro-expansion tests before this commit). Pinned here first so a
+// #1632 documents this as one decision, hand-mirrored across both macros.
+// It defers a merge until characterization tests exist here (this file had
+// no macro-expansion tests before this commit). Pinned here first so a
 // follow-up move to a shared `build_handler_dispatch` cannot silently change
 // what a handler's dispatch closure does.
 #[cfg(test)]
