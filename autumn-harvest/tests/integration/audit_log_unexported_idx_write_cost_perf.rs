@@ -281,7 +281,15 @@ fn fixture_row(i: usize) -> (String, String, String, String, String, String) {
     } else {
         "batch"
     };
-    let target_id = format!("{}-{i}", uuid::Uuid::new_v4());
+    // Deterministic, not `Uuid::new_v4()` -- review finding on PR #1666.
+    // `fixture_row(i)` must be a pure function of `i`. That way the
+    // measured window draws byte-identical `target_id` values in both
+    // scenarios. `harvest_audit_log.id`, the actual primary key, is a
+    // separate, irreducible source of randomness. This harness cannot
+    // control it without bypassing `audit::insert_audit`'s reliance on
+    // the schema's own `gen_random_uuid()` default. See that function's
+    // call site below for why that reliance is not optional here.
+    let target_id = format!("{}-{i}", uuid::Uuid::from_u128(i as u128));
     let route = format!(
         "POST /{target_type}s/{{id}}/{}",
         op.rsplit('.').next().unwrap()
@@ -499,6 +507,18 @@ async fn measure(
     // The REAL public entry point every mutating management-API handler
     // calls once per request (`audit::insert_audit`'s own doc comment:
     // "Called after every covered management mutation").
+    //
+    // `harvest_audit_log.id`, the primary key, is DB-defaulted
+    // (`gen_random_uuid()`), not a `NewAuditRecord` field. So each row
+    // inserted here still gets its own random `id`, unlike the now-
+    // deterministic `target_id` above. That randomness cannot be
+    // removed without inserting through something other than
+    // `audit::insert_audit` itself. It is also not a testing artifact.
+    // A real deployment's own inserts get the identical random `id`
+    // distribution. Measuring its effect is measuring the real
+    // workload, not adding noise to it. `fixture_row`'s own determinism
+    // fix still matters: it isolates this one irreducible source from
+    // every other, avoidable one.
     let wal_before = wal_bytes(&mut stats_conn).await;
     for i in 0..MEASURED_INSERTS {
         let (actor, operation, target_type, target_id, route, status) =
