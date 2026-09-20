@@ -2377,6 +2377,33 @@ async fn seed_completion_trigger_fire(
     .expect("seed completion trigger fire");
 }
 
+/// Like [`seed_completion_trigger_fire`], but also stamps `target_shard`
+/// and `target_workflow_name` -- the historical fact the relay persists at
+/// fire time since the issue #1401 migration.
+async fn seed_completion_trigger_fire_with_target(
+    conn: &mut AsyncPgConnection,
+    source_exec_id: ExecutionId,
+    trigger_id: Uuid,
+    fired_at: DateTime<Utc>,
+    target_shard: i32,
+    target_workflow_name: &str,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_trigger_fires \
+         (source_exec_id, trigger_id, fired_at, outcome, target_shard, \
+          target_workflow_name) \
+         VALUES ($1, $2, $3, NULL, $4, $5)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(source_exec_id.as_uuid())
+    .bind::<diesel::sql_types::Uuid, _>(trigger_id)
+    .bind::<diesel::sql_types::Timestamptz, _>(fired_at)
+    .bind::<diesel::sql_types::Integer, _>(target_shard)
+    .bind::<diesel::sql_types::Text, _>(target_workflow_name)
+    .execute(conn)
+    .await
+    .expect("seed completion trigger fire with target");
+}
+
 /// Insert a `harvest_completion_trigger_outbox` row for a fire still
 /// waiting on the relay -- the row the source deletes only once the relay
 /// confirms delivery.
@@ -2747,6 +2774,101 @@ async fn a_same_shard_completion_trigger_fire_is_not_probed() {
     assert!(
         !report.detected(FindingClass::CompletionTriggerFireUnproven),
         "a same-shard fire is atomic, never a restore-skew risk: {report:#?}"
+    );
+}
+
+/// The persisted `target_shard` (issue #1401 migration) must be used AS
+/// RECORDED, not re-derived. Pick a `(source, trigger_id)` pair whose
+/// rendezvous hash resolves to the SAME shard as the source. This is the
+/// exact shape `route_trigger_fires` would otherwise treat as same-shard
+/// and never adjudicate at all. Persist a DIFFERENT `target_shard`,
+/// simulating a historical drain that sent this fire cross-shard even
+/// though the hash, recomputed today, would not. If the persisted value is
+/// honored, this is adjudicated as cross-shard, and the absent,
+/// restore-point-stale target reads as a proven loss. If it were ignored,
+/// this would silently read as same-shard and never be checked at all.
+#[tokio::test]
+async fn a_persisted_target_shard_from_a_historical_drain_is_honored() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let (source, trigger_id, _target_id) = find_fire_targeting("child_flow", 0);
+    let fired_at = Utc::now() - chrono::Duration::hours(1);
+
+    seed_execution(&mut a, source, "parent_flow", "ct-drain-1", "COMPLETED", 0).await;
+    seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
+    seed_completion_trigger_fire_with_target(&mut a, source, trigger_id, fired_at, 1, "child_flow")
+        .await;
+
+    let stale = ExecutionId::new_for_shard(ShardId::new(1));
+    seed_execution(&mut b, stale, "unrelated", "un-drain-1", "COMPLETED", 1).await;
+    append_event_at(
+        &mut b,
+        stale,
+        1,
+        "WorkflowStarted",
+        json!({ "input": {} }),
+        fired_at - chrono::Duration::hours(1),
+    )
+    .await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        report.detected(FindingClass::CompletionTriggerFireLost),
+        "the persisted target_shard=1 must be honored even though the \
+         hash, recomputed today, would say shard 0: {report:#?}"
+    );
+    assert_eq!(report.status, VerifyStatus::Incoherent);
+}
+
+/// The persisted `target_workflow_name` (issue #1401 migration) must be
+/// used AS RECORDED, not re-derived from the CURRENT trigger definition.
+/// `sync_completion_triggers` can update `target_workflow_name` in place
+/// for an existing trigger id. The trigger's CURRENT name here
+/// (`child_flow_v2`) is deliberately different from the name the fire
+/// actually used (`child_flow_v1`). The target exists under the ORIGINAL
+/// name. Using the current name instead would look up the wrong business
+/// key and misreport a delivered relay as lost.
+#[tokio::test]
+async fn a_persisted_target_name_survives_a_later_trigger_update() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let (source, trigger_id, target_id) = find_fire_targeting("child_flow_v1", 1);
+    let fired_at = Utc::now() - chrono::Duration::hours(1);
+
+    seed_execution(&mut a, source, "parent_flow", "ct-rename-1", "COMPLETED", 0).await;
+    // The trigger definition has since been updated to a new target name.
+    seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow_v2").await;
+    seed_completion_trigger_fire_with_target(
+        &mut a,
+        source,
+        trigger_id,
+        fired_at,
+        1,
+        "child_flow_v1",
+    )
+    .await;
+
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    seed_execution(&mut b, target, "child_flow_v1", &target_id, "COMPLETED", 1).await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::CompletionTriggerFireLost),
+        "the persisted name must be used, so the target is found: {report:#?}"
+    );
+    assert!(
+        !report.detected(FindingClass::CompletionTriggerFireUnproven),
+        "the persisted name must be used, so the target is found: {report:#?}"
     );
 }
 

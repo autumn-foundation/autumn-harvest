@@ -881,8 +881,12 @@ pub fn compute_skew(latest: impl IntoIterator<Item = Option<DateTime<Utc>>>) -> 
 // (issue #1401).
 
 /// One completion-trigger fire the source shard recorded as delivered
-/// (`harvest_completion_trigger_fires.outcome IS NULL`), before its target
-/// shard is known.
+/// (`harvest_completion_trigger_fires.outcome IS NULL`).
+///
+/// `target_shard` is `Some` when the fires row itself recorded the shard
+/// the relay resolved at fire time (issue #1401 migration). It is `None`
+/// for a fire predating that migration, in which case
+/// [`route_trigger_fires`] falls back to re-deriving it.
 #[cfg(all(feature = "db", feature = "testing"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedFire {
@@ -890,6 +894,7 @@ struct ResolvedFire {
     trigger_id: Uuid,
     fired_at: DateTime<Utc>,
     target_workflow_name: String,
+    target_shard: Option<i32>,
 }
 
 /// A [`ResolvedFire`] whose target lands on a DIFFERENT shard than its
@@ -914,25 +919,29 @@ struct PendingTriggerFire {
 
 /// Route each fire to its target shard and drop the same-shard ones.
 ///
-/// `target_workflow_id` and the target-shard pick both replicate
-/// `completion_trigger.rs` exactly. The id is
-/// `format!("completion-trigger-{trigger_id}-{source_exec_id}")`. The shard
-/// is `router.pick_for_new_workflow(target_workflow_name,
-/// target_workflow_id)`. This is the same rendezvous hash the live relay
-/// used to place it.
+/// `target_workflow_id` replicates `completion_trigger.rs` exactly:
+/// `format!("completion-trigger-{trigger_id}-{source_exec_id}")`.
 ///
-/// `router` must cover every shard the live fleet can route to. A router
-/// built from a partial fleet can pick a different shard than production
-/// did. This is the same "supply every shard" assumption the
-/// event-reference scan already carries (see
+/// The target shard PREFERS `fire.target_shard` -- the shard the relay
+/// itself resolved and persisted at fire time (issue #1401 migration).
+/// That is the historical fact, not a reconstruction, so it is immune to a
+/// shard drain or rebalance that happened after the fire.
+///
+/// For a fire predating that migration (`target_shard: None`), this falls
+/// back to `router.pick_for_new_workflow(target_workflow_name,
+/// target_workflow_id)`. This is the same rendezvous hash the live relay
+/// used, re-derived rather than read.
+///
+/// `router` must cover every shard the live fleet can route to for that
+/// fallback to be trustworthy. A router built from a partial fleet can
+/// pick a different shard than production did. This is the same "supply
+/// every shard" assumption the event-reference scan already carries (see
 /// [`FindingClass::UninspectedShardReference`]).
 ///
-/// Known limitation: `router` is built with `readable == writable`, since
-/// this tool has no record of which shards were writable AT FIRE TIME. A
-/// fire placed while some shard was drained (readable, not writable) can
-/// resolve to a different shard here than production picked then. This
-/// mirrors the same placement-vs-location caveat
-/// `shard::external_target_owning_shard` already documents.
+/// The fallback also cannot see a HISTORICAL shard drain: readable, not
+/// writable, at fire time but not now. This is the same
+/// placement-vs-location caveat `shard::external_target_owning_shard`
+/// documents. It is a residual limitation for pre-migration data only.
 #[cfg(all(feature = "db", feature = "testing"))]
 fn route_trigger_fires(
     fires: Vec<(i32, ResolvedFire)>,
@@ -945,9 +954,11 @@ fn route_trigger_fires(
                 "completion-trigger-{}-{}",
                 fire.trigger_id, fire.source_exec_id
             );
-            let target_shard = router
-                .pick_for_new_workflow(&fire.target_workflow_name, &target_workflow_id)
-                .as_i32();
+            let target_shard = fire.target_shard.unwrap_or_else(|| {
+                router
+                    .pick_for_new_workflow(&fire.target_workflow_name, &target_workflow_id)
+                    .as_i32()
+            });
             (target_shard != source_shard).then_some(PendingTriggerFire {
                 source_shard,
                 source_exec_id: fire.source_exec_id,
@@ -1321,7 +1332,7 @@ mod probes {
 
     use chrono::{DateTime, Utc};
     use diesel::OptionalExtension as _;
-    use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz};
+    use diesel::sql_types::{BigInt, Integer, Nullable, Text, Timestamptz};
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
     use uuid::Uuid;
 
@@ -1905,8 +1916,14 @@ mod probes {
         })
     }
 
-    /// One row of the completion-trigger fire scan, before its target
-    /// trigger definition is confirmed to still exist.
+    /// One row of the completion-trigger fire scan, before its target name
+    /// is resolved to a final value.
+    ///
+    /// `fire_target_workflow_name` is the name the fires row itself
+    /// recorded at relay time (issue #1401 migration).
+    /// `trigger_target_workflow_name` is the CURRENT name on the trigger
+    /// definition, a fallback for a fire predating that migration. See
+    /// [`collect_trigger_fires`].
     #[derive(diesel::QueryableByName)]
     struct TriggerFireRow {
         #[diesel(sql_type = diesel::sql_types::Uuid)]
@@ -1915,8 +1932,12 @@ mod probes {
         trigger_id: Uuid,
         #[diesel(sql_type = Timestamptz)]
         fired_at: DateTime<Utc>,
+        #[diesel(sql_type = Nullable<Integer>)]
+        target_shard: Option<i32>,
         #[diesel(sql_type = Nullable<Text>)]
-        target_workflow_name: Option<String>,
+        fire_target_workflow_name: Option<String>,
+        #[diesel(sql_type = Nullable<Text>)]
+        trigger_target_workflow_name: Option<String>,
     }
 
     /// Cap on pages read scanning completion-trigger fires -- mirrors
@@ -1961,7 +1982,9 @@ mod probes {
             };
             let sql = format!(
                 "SELECT f.source_exec_id, f.trigger_id, f.fired_at, \
-                     t.target_workflow_name \
+                     f.target_shard, \
+                     f.target_workflow_name AS fire_target_workflow_name, \
+                     t.target_workflow_name AS trigger_target_workflow_name \
                  FROM harvest_completion_trigger_fires f \
                  LEFT JOIN harvest_completion_triggers t ON t.id = f.trigger_id \
                  WHERE f.outcome IS NULL \
@@ -2019,6 +2042,12 @@ mod probes {
     ///
     /// Split out of `verify_shard` to keep the scan and the per-row
     /// resolution separately readable, mirroring `collect_refs`.
+    ///
+    /// Prefers `fire_target_workflow_name` (recorded at relay time, issue
+    /// #1401 migration) over `trigger_target_workflow_name` (the trigger
+    /// definition's CURRENT name, a fallback for a pre-migration fire).
+    /// Only a pre-migration fire whose trigger definition has since been
+    /// deleted has neither.
     async fn collect_trigger_fires(
         conn: &mut AsyncPgConnection,
         limit: i64,
@@ -2027,12 +2056,16 @@ mod probes {
         let mut fires = Vec::with_capacity(rows.len());
         let mut missing_trigger = Vec::new();
         for row in rows {
-            match row.target_workflow_name {
+            match row
+                .fire_target_workflow_name
+                .or(row.trigger_target_workflow_name)
+            {
                 Some(target_workflow_name) => fires.push(super::ResolvedFire {
                     source_exec_id: row.source_exec_id,
                     trigger_id: row.trigger_id,
                     fired_at: row.fired_at,
                     target_workflow_name,
+                    target_shard: row.target_shard,
                 }),
                 None => missing_trigger.push(format!("{}/{}", row.source_exec_id, row.trigger_id)),
             }
@@ -3557,6 +3590,7 @@ mod tests {
             trigger_id: Uuid::new_v4(),
             fired_at: Utc::now(),
             target_workflow_name: target_workflow_name.to_string(),
+            target_shard: None,
         }
     }
 
@@ -3603,6 +3637,36 @@ mod tests {
             pending.is_empty(),
             "a same-shard fire is atomic with its target start and must not \
              be adjudicated: {pending:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
+    fn route_trigger_fires_prefers_the_persisted_shard_over_the_router_pick() {
+        let router = two_shard_router();
+        let mut fire = resolved_fire("child_flow");
+        let target_workflow_id = format!(
+            "completion-trigger-{}-{}",
+            fire.trigger_id, fire.source_exec_id
+        );
+        let router_pick = router
+            .pick_for_new_workflow("child_flow", &target_workflow_id)
+            .as_i32();
+        // A historical drain: the persisted shard disagrees with what the
+        // router would compute today.
+        let persisted_shard = 1 - router_pick;
+        fire.target_shard = Some(persisted_shard);
+
+        let pending = route_trigger_fires(vec![(router_pick, fire)], &router);
+
+        assert_eq!(
+            pending.len(),
+            1,
+            "the persisted shard differs from the source, so this is cross-shard"
+        );
+        assert_eq!(
+            pending[0].target_shard, persisted_shard,
+            "the persisted shard must win over a re-derived router pick"
         );
     }
 

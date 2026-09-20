@@ -1564,6 +1564,9 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                             source_exec_id: exec_id.as_uuid(),
                             trigger_id: trigger_db.id,
                             outcome: Some("condition_unmet".to_string()),
+                            // A resolved-skip never picks a target (issue #1401).
+                            target_shard: None,
+                            target_workflow_name: None,
                         })
                         .on_conflict_do_nothing()
                         .execute(conn)
@@ -1770,6 +1773,12 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                                 source_exec_id: exec_id.as_uuid(),
                                 trigger_id: trigger_db.id,
                                 outcome: Some("admission_blocked".to_string()),
+                                // The target was resolved before the gate
+                                // blocked it (issue #1401).
+                                target_shard: Some(target_shard.as_i32()),
+                                target_workflow_name: Some(
+                                    trigger_db.target_workflow_name.clone(),
+                                ),
                             })
                             .on_conflict_do_nothing()
                             .execute(conn)
@@ -1808,6 +1817,15 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                     // NULL outcome = fired (issue #810 reserves the column
                     // for resolved-skip reasons).
                     outcome: None,
+                    // Captured at relay time so a restore-verification pass
+                    // can read the historical target directly, instead of
+                    // reconstructing it from current, mutable state.
+                    // `target_shard` from a topology that may have changed
+                    // since. `target_workflow_name` from a trigger row
+                    // `sync_completion_triggers` can update in place (issue
+                    // #1401).
+                    target_shard: Some(target_shard.as_i32()),
+                    target_workflow_name: Some(trigger_db.target_workflow_name.clone()),
                 })
                 .on_conflict_do_nothing()
                 .execute(conn)

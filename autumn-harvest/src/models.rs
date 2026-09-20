@@ -1350,6 +1350,12 @@ pub struct CompletionTriggerFireDb {
     /// NULL = fired; `condition_unmet` / `condition_invalid` =
     /// resolved-skipped by the output guard (issue #810).
     pub outcome: Option<String>,
+    /// The target shard resolved at relay time (issue #1401). NULL on a
+    /// resolved-skip row or a pre-migration row.
+    pub target_shard: Option<i32>,
+    /// The target workflow name resolved at relay time (issue #1401). NULL
+    /// on a resolved-skip row or a pre-migration row.
+    pub target_workflow_name: Option<String>,
 }
 
 /// Insertable model for registering a fired completion trigger.
@@ -1360,6 +1366,13 @@ pub struct NewCompletionTriggerFireDb {
     pub trigger_id: Uuid,
     /// NULL = fired; Some(reason) = resolved-skipped (issue #810).
     pub outcome: Option<String>,
+    /// The target shard resolved at relay time. `None` for a resolved-skip
+    /// row, which never picks a target (issue #1401).
+    pub target_shard: Option<i32>,
+    /// `harvest_completion_triggers.target_workflow_name` at relay time,
+    /// captured because that column can change after the fire (issue
+    /// #1401). `None` for a resolved-skip row.
+    pub target_workflow_name: Option<String>,
 }
 
 /// Queryable model representing a deferred completion trigger outbox task.

@@ -302,32 +302,43 @@ ack, it refuses; with the ack, it still only reads.
   deletes it only after the target-shard start commits, or an any-state
   existence check finds the target already there. A fire still waiting on
   the outbox scanner, or parked behind a quota backoff, keeps its outbox row
-  and is never adjudicated. For a confirmed-delivered fire, the target's
-  business key (`workflow_name` plus the deterministic
-  `completion-trigger-{trigger_id}-{source_exec_id}`) is checked on the target
-  shard the SAME rendezvous hash placed it on. An absent target is checked
-  against `harvest_execution_summaries` by business key FIRST — proven
-  retention stays silent regardless of timestamps. Without a summary, an
-  absent target with no timestamp evidence either way is
-  `completion_trigger_fire_unproven` (`undetermined`, exit 2); an absent
-  target whose shard's restore point predates the fire is
+  and is never adjudicated. A permanently rejected relay (oversized input
+  payload) resolves the fires row too, the same way an admission-gate block
+  does, so it is excluded outright rather than misread as a lost delivery.
+
+  For a confirmed-delivered fire, the target's business key is
+  `target_workflow_name` plus the deterministic
+  `completion-trigger-{trigger_id}-{source_exec_id}`, checked on
+  `target_shard` — both recorded on the fires row itself AT RELAY TIME
+  (migration `20260920215812`). Reading the historical values this way,
+  rather than reconstructing them, closes two gaps a fleet-wide restore
+  drill can otherwise hit: a fire relayed while some shard was DRAINED
+  (readable, not writable) would resolve to a different shard if the
+  target shard were re-derived from today's topology; and
+  `sync_completion_triggers` can update an existing trigger's
+  `target_workflow_name` in place, so a fire predating that update would be
+  checked against the wrong name if joined to the CURRENT trigger row.
+
+  An absent target is checked against `harvest_execution_summaries` by
+  business key FIRST — proven retention stays silent regardless of
+  timestamps. Without a summary, an absent target with no timestamp
+  evidence either way is `completion_trigger_fire_unproven` (`undetermined`,
+  exit 2); an absent target whose shard's restore point predates the fire is
   `completion_trigger_fire_lost` (`incoherent`, exit 1) — the restore point
   proves the target snapshot cannot hold the delivery. A same-shard fire is
   never checked: it commits atomically with the target start and cannot be
-  split by a skewed restore. This check needs every fleet shard supplied,
+  split by a skewed restore.
+
+  **Pre-migration fires** (rows written before `20260920215812` shipped)
+  carry no recorded `target_shard`/`target_workflow_name` and fall back to
+  the old reconstruction: the target shard via
+  `ShardRouter::pick_for_new_workflow` (needs every fleet shard supplied,
   the same convention `uninspected_shard_reference` already carries — a
-  partial `--shard` list can route the hash prediction wrong.
-  Known limitations: the target-shard prediction assumes every supplied
-  shard was writable at fire time, so a fire placed while some shard was
-  drained can resolve to a different shard than production actually used;
-  and the target's business key is re-derived from the CURRENT
-  `harvest_completion_triggers.target_workflow_name`, so a trigger whose
-  target workflow name was changed since a historical fire is checked
-  against the wrong name. Both are accepted, documented gaps rather than a
-  fix in this drill — closing them durably would mean persisting the
-  resolved target shard and name on the fires row at relay time, a schema
-  and engine-write-path change out of scope for a read-only verification
-  tool.
+  partial `--shard` list can route the hash prediction wrong; also blind to
+  a HISTORICAL drain, same as above) and the target name via the CURRENT
+  trigger definition (blind to a since-changed name, same as above). These
+  are residual, unfixable-after-the-fact limitations for data written
+  before the migration only.
 - **(e) A machine-readable report** (`--format json`) with a nonzero exit on any
   failed check.
 
