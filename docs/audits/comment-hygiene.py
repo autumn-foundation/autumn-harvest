@@ -2858,6 +2858,22 @@ def nesting_shift(saved: list, nest: int, state: tuple) -> tuple[list, tuple]:
     return saved, state
 
 
+def close_pending(saved: list, index: int, value) -> list:
+    """`saved`, with FIELD `index` of the state tuple set to `value` in
+    every currently pending snapshot.
+
+    A close the ENCLOSING line drives -- a closer found in a nested
+    comment, or the line leaving the container an HTML block or table
+    opened in -- is a fact about the outer text, not about the nested
+    comment being read. `nesting_shift` restores an older snapshot when
+    nesting pops back to a shallower level, so a close made only to the
+    live value is undone right there unless the same close reaches every
+    snapshot still waiting to be restored. Opening new state while nested
+    is not this: `nesting_shift`'s own restore already keeps that isolated.
+    """
+    return [frame[:index] + (value,) + frame[index + 1:] for frame in saved]
+
+
 def comment_lines(pieces: list[Piece]):
     """Yield (lineno, text, in_fence) per comment piece, tracking ``` fences.
 
@@ -2938,12 +2954,9 @@ def comment_lines(pieces: list[Piece]):
                 if html not in (None, "tag") and html_closes(text, html):
                     html_closing_line = piece.line
                     html = None
-                    # `nesting_shift` restores a SNAPSHOT taken before this
-                    # piece's nest level was entered. Closing here would
-                    # otherwise be undone the moment a shallower piece pops
-                    # it back. The closer is definitive at every depth it is
-                    # still pending for, so it is applied to each one too.
-                    saved = [frame[:-1] + (None,) for frame in saved]
+                    # See `close_pending`: the closer is definitive at
+                    # every nest depth still pending for it, not only here.
+                    saved = close_pending(saved, 9, None)
                 # Still raw HTML if this piece is on the closer's own line,
                 # even after `html` above is cleared: text between the
                 # nested comment's own delimiters and the closer, or after
@@ -2963,8 +2976,14 @@ def comment_lines(pieces: list[Piece]):
             # neither state by the time either is asked.
             if html is not None and leaves_container(text, html_scope):
                 html = None
+                # See `close_pending`: this line may be a nested comment's
+                # OWN interior line -- one that starts its own source line
+                # despite sitting deeper than where the block opened -- so
+                # the close must reach every depth still pending for it.
+                saved = close_pending(saved, 9, None)
             if in_table and leaves_container(text, table_scope):
                 in_table = False
+                saved = close_pending(saved, 7, False)
             # Inside a raw HTML block nothing is Markdown, so no fence, list
             # or table opens here and the text is not prose. A type-6 block
             # ends AT a blank line, which is a block boundary in its own
@@ -3487,7 +3506,8 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                     if html not in (None, "tag") and html_closes(body, html):
                         html_closing_line = piece.line
                         html = None
-                        saved = [frame[:-1] + (None,) for frame in saved]
+                        # See `close_pending` in `comment_lines`.
+                        saved = close_pending(saved, 10, None)
                     flush()
                     in_list = False
                 elif body.strip():
@@ -3498,8 +3518,12 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # See `comment_lines`, which applies this the same way.
             if html is not None and leaves_container(body, html_scope):
                 html = None
+                # See `close_pending` in `comment_lines`: this may be a
+                # nested comment's own interior line.
+                saved = close_pending(saved, 10, None)
             if in_table and leaves_container(body, table_scope):
                 in_table = False
+                saved = close_pending(saved, 8, False)
             # Raw HTML is not Markdown and not prose -- see `comment_lines`,
             # which carries this state the same way.
             if html is not None:
@@ -6954,6 +6978,26 @@ RULE_TESTS = [
         " */\n",
         set(),
         "text after the closer on its own physical line stays inside the block",
+    ),
+    (
+        "/** > <pre>\n"
+        " * > raw /*\n"
+        " * unquoted text\n"
+        " * */\n"
+        " * > TODO: issue required\n"
+        " */\n",
+        {("CH002", 5)},
+        "leaving the container inside a nested comment still closes the block",
+    ),
+    (
+        "/** > <pre>\n"
+        " * > raw /*\n"
+        " * unquoted text\n"
+        " * */\n"
+        " * > " + " ".join(f"word{n}" for n in range(1, 27)) + ".\n"
+        " */\n",
+        {("CH007", 3)},
+        "and the prose scanner sees it too",
     ),
 ]
 
