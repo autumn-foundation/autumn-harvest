@@ -47,6 +47,8 @@ mod chaos_catalogue_drift;
 mod chaos_docs;
 #[cfg(feature = "chaos")]
 mod chaos_tests;
+#[cfg(feature = "db")]
+mod child_fanout_batch_perf;
 mod child_fanout_tests;
 mod child_policy_tests;
 #[cfg(feature = "db")]

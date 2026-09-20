@@ -358,6 +358,122 @@ pub async fn append_events_offloaded_with_codecs(
     Ok(inserted)
 }
 
+/// Postgres's per-statement bind-parameter ceiling (issue #1589). Mirrors
+/// `queue::enqueue_batch`'s identical constant -- kept as a separate copy
+/// here since the two chunkers bound different row shapes.
+#[cfg(feature = "db")]
+const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
+
+/// [`NewHarvestEvent`]'s field count. Pinned by a regression test below so
+/// an added column is caught, not silently under-counted.
+#[cfg(feature = "db")]
+const NEW_HARVEST_EVENT_COLUMNS: usize = 4;
+
+/// Rows per chunk, floored so `ROWS_PER_EVENT_INSERT_CHUNK *
+/// NEW_HARVEST_EVENT_COLUMNS` never reaches [`POSTGRES_MAX_BIND_PARAMS`].
+#[cfg(feature = "db")]
+const ROWS_PER_EVENT_INSERT_CHUNK: usize = POSTGRES_MAX_BIND_PARAMS / NEW_HARVEST_EVENT_COLUMNS;
+
+/// Append one `WorkflowStarted` event per execution, batched.
+///
+/// One multi-row `INSERT` per chunk, instead of one `INSERT` per execution
+/// (issue #1589 -- the local awaited-child fan-out loop in `worker.rs`'s
+/// `persist_all_started_child_workflows`).
+///
+/// Every execution here is brand new, so its history is empty and every row
+/// uses `event_id = 0`. Unlike a single execution's own event append, no row
+/// here re-reads `MAX(event_id) FOR UPDATE` to serialize against a sibling --
+/// there is no sibling sharing an execution id to serialize against.
+///
+/// `events` must share one shard -- true by construction for the only
+/// caller, since a local child always lands on its parent's shard (issue
+/// #956). The DR write-authority fence (issue #954) is asserted once for
+/// that shared shard, inside the same transaction as the `INSERT`s.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on `INSERT` failure, a
+/// codec error on encode failure, or a payload-store error on offload
+/// failure.
+#[cfg(feature = "db")]
+pub async fn append_new_execution_started_events_batch(
+    conn: &mut AsyncPgConnection,
+    events: &[(ExecutionId, WorkflowEvent)],
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
+    use crate::models::NewHarvestPayloadRef;
+    use crate::schema::harvest_payload_refs;
+
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let mut rows: Vec<NewHarvestEvent<'_>> = events
+        .iter()
+        .map(|(exec_id, event)| {
+            Ok(NewHarvestEvent {
+                workflow_exec_id: exec_id.as_uuid(),
+                event_id: 0,
+                event_type: event.type_name(),
+                event_data: codecs.encode_event(event)?,
+            })
+        })
+        .collect::<Result<_, crate::error::HarvestError>>()?;
+
+    // Offload runs before the INSERT below, exactly like
+    // `append_events_offloaded_with_codecs` (encode-then-offload, ADR-0003).
+    let mut ref_rows: Vec<NewHarvestPayloadRef> = Vec::new();
+    if let Some(offloader) = offloader {
+        for row in &mut rows {
+            let refs = offloader.offload_event_value(&mut row.event_data).await?;
+            ref_rows.extend(refs.into_iter().map(|r| NewHarvestPayloadRef {
+                blob_key: r.blob_key,
+                workflow_exec_id: row.workflow_exec_id,
+                store_id: r.store_id,
+                byte_len: i64::try_from(r.byte_len).unwrap_or(i64::MAX),
+            }));
+        }
+    }
+
+    let shard = events[0].0.shard();
+
+    Box::pin(
+        conn.transaction::<(), crate::error::HarvestError, _>(async |conn| {
+            crate::replication::assert_fence(conn, shard).await?;
+            for chunk in rows.chunks(ROWS_PER_EVENT_INSERT_CHUNK) {
+                diesel::insert_into(harvest_events::table)
+                    .values(chunk)
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            }
+            if !ref_rows.is_empty() {
+                diesel::insert_into(harvest_payload_refs::table)
+                    .values(&ref_rows)
+                    .on_conflict_do_nothing()
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            }
+            Ok(())
+        }),
+    )
+    .await?;
+
+    for (exec_id, event) in events {
+        crate::notify::notify_workflow_events_appended(
+            conn,
+            exec_id.as_uuid(),
+            1,
+            event.type_name(),
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 /// Record per-execution references to offloaded payload blobs (issue #524).
 ///
 /// Idempotent: a duplicate `(blob_key, workflow_exec_id)` row is ignored, so a
@@ -2297,6 +2413,36 @@ mod tests {
         assert_eq!(rows[1].event_id, 1);
         assert_eq!(rows[0].event_type, "WorkflowStarted");
         assert_eq!(rows[1].event_type, "ActivityScheduled");
+    }
+
+    /// Pins [`NEW_HARVEST_EVENT_COLUMNS`], and therefore
+    /// [`ROWS_PER_EVENT_INSERT_CHUNK`], to `NewHarvestEvent`'s real field
+    /// count, by exhaustive destructure (issue #1589, mirrors
+    /// `queue.rs`'s identical regression test for `NewTaskQueueItem`).
+    /// Adding, removing, or renaming a field breaks this match at compile
+    /// time, so the chunk size cannot silently drift out of sync with the
+    /// row width it bounds.
+    #[cfg(feature = "db")]
+    #[test]
+    fn new_harvest_event_column_count_matches_the_constant() {
+        let sample = NewHarvestEvent {
+            workflow_exec_id: uuid::Uuid::nil(),
+            event_id: 0,
+            event_type: "WorkflowStarted",
+            event_data: serde_json::Value::Null,
+        };
+        let NewHarvestEvent {
+            workflow_exec_id: _,
+            event_id: _,
+            event_type: _,
+            event_data: _,
+        } = sample;
+        const {
+            assert!(NEW_HARVEST_EVENT_COLUMNS == 4);
+            assert!(
+                ROWS_PER_EVENT_INSERT_CHUNK * NEW_HARVEST_EVENT_COLUMNS <= POSTGRES_MAX_BIND_PARAMS
+            );
+        }
     }
 
     #[test]

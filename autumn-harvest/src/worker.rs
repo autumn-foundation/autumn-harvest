@@ -10332,8 +10332,19 @@ async fn persist_all_started_child_workflows(
             .await?;
         }
 
+        // Issue #1589 (direction a): route each local child to the
+        // sequential insert-then-admit path, or to a batched-insert path,
+        // by whether its OWN `enforce_quota_admission` call would touch the
+        // database at all. That function no-ops (zero queries) when the
+        // child declares no policy, its policy has no cap, or no key
+        // resolved -- exactly the three conditions checked below. A child
+        // in that shape can never reject a sibling or be rejected by one,
+        // so the insert-then-admit ORDER carries no information for it, and
+        // the whole group can be inserted, appended, and enqueued as one
+        // batch each instead of one row each.
+        let mut sequential_children: Vec<LocalChildPlan<'_>> = Vec::new();
+        let mut batchable_children: Vec<LocalChildPlan<'_>> = Vec::new();
         for child in &local_new_children {
-            let child_workflow_id = child.child_id.to_string();
             let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
             // Resolve + bound the CHILD's own quota key from ITS OWN declared
             // policy (issue #946, Codex round-3 review) -- a spawned child
@@ -10356,35 +10367,59 @@ async fn persist_all_started_child_workflows(
                     activity_name: None,
                 });
             }
+            let admission_is_noop = defaults
+                .quota
+                .as_ref()
+                .is_none_or(|policy| !policy.has_any_cap() || child_quota_key.is_none());
+            let plan = LocalChildPlan {
+                child,
+                defaults,
+                child_workflow_id: child.child_id.to_string(),
+                child_quota_key,
+            };
+            if admission_is_noop {
+                batchable_children.push(plan);
+            } else {
+                sequential_children.push(plan);
+            }
+        }
+
+        // Children with an active cap on their own declared policy: the
+        // original sequential insert-then-admit contract, one child at a
+        // time, unchanged -- so `enforce_quota_admission`'s graduated
+        // "admit first K, reject the rest" property (see that function's
+        // own doc comment) is unaffected by this split.
+        for plan in &sequential_children {
+            let child = plan.child;
             let child_row = NewWorkflowExecution {
                 continued_from_exec_id: None,
                 first_exec_id: None,
-                chain_execution_timeout: defaults.chain_execution_timeout,
-                chain_deadline_at: defaults.chain_deadline_at,
+                chain_execution_timeout: plan.defaults.chain_execution_timeout,
+                chain_deadline_at: plan.defaults.chain_deadline_at,
                 id: child.child_id.as_uuid(),
                 workflow_name: &child.workflow_name,
-                workflow_id: &child_workflow_id,
+                workflow_id: &plan.child_workflow_id,
                 run_id: uuid::Uuid::new_v4(),
                 shard_id,
                 input: child.input.clone(),
                 parent_id: Some(parent_exec_id.as_uuid()),
                 queue_name: &queue_name,
-                execution_timeout: defaults.execution_timeout,
-                deadline_at: defaults.deadline_at,
-                sla: defaults.sla,
-                sla_deadline_at: defaults.sla_deadline_at,
+                execution_timeout: plan.defaults.execution_timeout,
+                deadline_at: plan.defaults.deadline_at,
+                sla: plan.defaults.sla,
+                sla_deadline_at: plan.defaults.sla_deadline_at,
                 memo: None,
                 search_attrs: None,
                 assigned_build_id: parent_execution.assigned_build_id.clone(),
                 parent_close_policy: None, // awaited child
-                owner: defaults.owner,
-                runbook_url: defaults.runbook_url,
-                severity: defaults.severity,
+                owner: plan.defaults.owner,
+                runbook_url: plan.defaults.runbook_url,
+                severity: plan.defaults.severity,
                 context_headers: parent_execution.context_headers.clone(),
                 schedule_id: None, // child workflows are not scheduled fires
                 scheduled_for: None,
                 workflow_attempt: 1,
-                workflow_retry_policy: defaults.retry_policy,
+                workflow_retry_policy: plan.defaults.retry_policy.clone(),
                 retry_of_exec_id: None,
                 origin: None, // child workflow, not a schedule fire (issue #534)
                 // Children get only builder-wide default callback
@@ -10400,7 +10435,7 @@ async fn persist_all_started_child_workflows(
                 // (rather than `None`) keeps the row correctly tagged for
                 // future usage accounting even on a re-park path where this
                 // child already exists and enforcement below is skipped.
-                quota_key: child_quota_key.as_deref(),
+                quota_key: plan.child_quota_key.as_deref(),
             };
             let child_started_event = WorkflowEvent::WorkflowStarted {
                 input: child.input.clone(),
@@ -10450,8 +10485,8 @@ async fn persist_all_started_child_workflows(
             // an unrelated tenant's quota (Codex round-3 review).
             crate::execution::enforce_quota_admission(
                 conn,
-                defaults.quota,
-                child_quota_key.as_deref(),
+                plan.defaults.quota,
+                plan.child_quota_key.as_deref(),
                 &child.workflow_name,
                 Some(registry.telemetry().metrics.as_ref()),
                 None, // no dry-run credit on a child spawn (children never declare cancel_running)
@@ -10468,6 +10503,112 @@ async fn persist_all_started_child_workflows(
             )
             .await?;
             queue::enqueue(conn, &params).await?;
+        }
+
+        // Children whose admission is a proven no-op: one multi-row INSERT
+        // per table for the whole group (chunked under Postgres's bind-
+        // parameter ceiling), instead of one INSERT per child (issue
+        // #1589's own measured N -> 3N shape). `enforce_quota_admission` is
+        // not called here at all -- the `admission_is_noop` routing above
+        // already proves it would return immediately without a query.
+        if !batchable_children.is_empty() {
+            let child_rows: Vec<NewWorkflowExecution<'_>> = batchable_children
+                .iter()
+                .map(|plan| {
+                    let child = plan.child;
+                    NewWorkflowExecution {
+                        continued_from_exec_id: None,
+                        first_exec_id: None,
+                        chain_execution_timeout: plan.defaults.chain_execution_timeout,
+                        chain_deadline_at: plan.defaults.chain_deadline_at,
+                        id: child.child_id.as_uuid(),
+                        workflow_name: &child.workflow_name,
+                        workflow_id: &plan.child_workflow_id,
+                        run_id: uuid::Uuid::new_v4(),
+                        shard_id,
+                        input: child.input.clone(),
+                        parent_id: Some(parent_exec_id.as_uuid()),
+                        queue_name: &queue_name,
+                        execution_timeout: plan.defaults.execution_timeout,
+                        deadline_at: plan.defaults.deadline_at,
+                        sla: plan.defaults.sla,
+                        sla_deadline_at: plan.defaults.sla_deadline_at,
+                        memo: None,
+                        search_attrs: None,
+                        assigned_build_id: parent_execution.assigned_build_id.clone(),
+                        parent_close_policy: None, // awaited child
+                        owner: plan.defaults.owner,
+                        runbook_url: plan.defaults.runbook_url,
+                        severity: plan.defaults.severity,
+                        context_headers: parent_execution.context_headers.clone(),
+                        schedule_id: None, // child workflows are not scheduled fires
+                        scheduled_for: None,
+                        workflow_attempt: 1,
+                        workflow_retry_policy: plan.defaults.retry_policy.clone(),
+                        retry_of_exec_id: None,
+                        origin: None, // child workflow, not a schedule fire (issue #534)
+                        completion_callbacks: None,
+                        start_source: Some(crate::types::StartSource::Child.as_str()),
+                        start_source_ref: Some(parent_exec_id_str.as_str()),
+                        started_by: None,
+                        quota_key: plan.child_quota_key.as_deref(),
+                    }
+                })
+                .collect();
+            for chunk in child_rows.chunks(ROWS_PER_EXECUTION_INSERT_CHUNK) {
+                diesel::insert_into(harvest_workflow_executions::table)
+                    .values(chunk)
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            }
+
+            let started_events: Vec<(ExecutionId, WorkflowEvent)> = batchable_children
+                .iter()
+                .map(|plan| {
+                    (
+                        plan.child.child_id,
+                        WorkflowEvent::WorkflowStarted {
+                            input: plan.child.input.clone(),
+                            timestamp: chrono::Utc::now(),
+                            last_completion_result: None,
+                            last_error: None,
+                            scheduled_time: None, // child workflows are not scheduler-fired
+                        },
+                    )
+                })
+                .collect();
+            store::append_new_execution_started_events_batch(
+                conn,
+                &started_events,
+                registry.payload_offloader(),
+                registry.payload_codecs(),
+            )
+            .await?;
+
+            let enqueue_params: Vec<queue::EnqueueParams> = batchable_children
+                .iter()
+                .map(|plan| {
+                    let child = plan.child;
+                    let mut params = queue::EnqueueParams::new(
+                        queue_name.clone(),
+                        TaskType::Workflow,
+                        child.input.clone(),
+                    );
+                    params.workflow_exec_id = Some(child.child_id.as_uuid());
+                    params
+                        .required_build_id
+                        .clone_from(&parent_execution.assigned_build_id);
+                    (params.concurrency_key, params.max_concurrent) =
+                        resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
+                    params.trace_context = child_trace_ctxs
+                        .get(&child.child_id.as_uuid())
+                        .cloned()
+                        .flatten();
+                    params
+                })
+                .collect();
+            queue::enqueue_batch(conn, &enqueue_params).await?;
         }
 
         // Check for already-terminal children only in the re-park path
@@ -10608,6 +10749,32 @@ struct ChildWorkflowDefaults {
     /// visible to the target type's own quota accounting exactly like any
     /// other registry-aware start path.
     quota: Option<crate::quota::QuotaPolicy>,
+}
+
+/// Postgres's per-statement bind-parameter ceiling (issue #1589). Mirrors
+/// `queue.rs`'s and `store.rs`'s identical constant -- kept as a separate
+/// copy here since each chunker bounds a different row shape.
+const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
+
+/// [`NewWorkflowExecution`]'s field count. Pinned by a regression test
+/// below so an added column is caught, not silently under-counted.
+const NEW_WORKFLOW_EXECUTION_COLUMNS: usize = 35;
+
+/// Rows per chunk, floored so `ROWS_PER_EXECUTION_INSERT_CHUNK *
+/// NEW_WORKFLOW_EXECUTION_COLUMNS` never reaches [`POSTGRES_MAX_BIND_PARAMS`].
+const ROWS_PER_EXECUTION_INSERT_CHUNK: usize =
+    POSTGRES_MAX_BIND_PARAMS / NEW_WORKFLOW_EXECUTION_COLUMNS;
+
+/// One local awaited child's precomputed spawn inputs (issue #1589). Built
+/// once per child in `persist_all_started_child_workflows`, then routed to
+/// either the sequential insert-then-admit path or the batched-insert path
+/// depending on whether its `enforce_quota_admission` call would be a
+/// no-op -- see that function's own early returns.
+struct LocalChildPlan<'a> {
+    child: &'a StartedChildWorkflowCommand,
+    defaults: ChildWorkflowDefaults,
+    child_workflow_id: String,
+    child_quota_key: Option<String>,
 }
 
 /// Apply `max_workflow_attempts_ceiling` to a detached child's serialized retry
@@ -29604,6 +29771,98 @@ pub(crate) fn under_provisioned_shard_pools(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins [`NEW_WORKFLOW_EXECUTION_COLUMNS`], and therefore
+    /// [`ROWS_PER_EXECUTION_INSERT_CHUNK`], to `NewWorkflowExecution`'s real
+    /// field count, by exhaustive destructure (issue #1589, mirrors
+    /// `queue.rs`'s identical regression test for `NewTaskQueueItem`).
+    /// Adding, removing, or renaming a field breaks this match at compile
+    /// time, so the chunk size cannot silently drift out of sync with the
+    /// row width it bounds.
+    #[test]
+    fn new_workflow_execution_column_count_matches_the_constant() {
+        let sample = crate::models::NewWorkflowExecution {
+            id: uuid::Uuid::nil(),
+            workflow_name: "wf",
+            workflow_id: "wf-id",
+            run_id: uuid::Uuid::nil(),
+            shard_id: 0,
+            input: serde_json::Value::Null,
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            deadline_at: None,
+            chain_execution_timeout: None,
+            chain_deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+            parent_close_policy: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            origin: None,
+            completion_callbacks: None,
+            continued_from_exec_id: None,
+            first_exec_id: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
+            quota_key: None,
+        };
+        let crate::models::NewWorkflowExecution {
+            id: _,
+            workflow_name: _,
+            workflow_id: _,
+            run_id: _,
+            shard_id: _,
+            input: _,
+            parent_id: _,
+            queue_name: _,
+            execution_timeout: _,
+            deadline_at: _,
+            chain_execution_timeout: _,
+            chain_deadline_at: _,
+            memo: _,
+            search_attrs: _,
+            assigned_build_id: _,
+            parent_close_policy: _,
+            owner: _,
+            runbook_url: _,
+            severity: _,
+            context_headers: _,
+            sla: _,
+            sla_deadline_at: _,
+            schedule_id: _,
+            scheduled_for: _,
+            workflow_attempt: _,
+            workflow_retry_policy: _,
+            retry_of_exec_id: _,
+            origin: _,
+            completion_callbacks: _,
+            continued_from_exec_id: _,
+            first_exec_id: _,
+            start_source: _,
+            start_source_ref: _,
+            started_by: _,
+            quota_key: _,
+        } = sample;
+        const {
+            assert!(NEW_WORKFLOW_EXECUTION_COLUMNS == 35);
+            assert!(
+                ROWS_PER_EXECUTION_INSERT_CHUNK * NEW_WORKFLOW_EXECUTION_COLUMNS
+                    <= POSTGRES_MAX_BIND_PARAMS
+            );
+        }
+    }
 
     /// The release and escalation branches must report OPPOSITE distinct-worker
     /// bases, and round 34 got it backwards on both (issue #804, round-35 P2).
