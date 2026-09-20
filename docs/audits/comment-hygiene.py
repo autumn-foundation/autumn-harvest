@@ -2996,6 +2996,10 @@ def comment_lines(pieces: list[Piece]):
                 inside = strip_quote(text, stack[-1][0] if stack else 0)
                 if html == "tag" and html_closes(inside, html):
                     html = None
+                    # See `close_pending`: a blank line closes a type-6
+                    # block the same way a closer does, and may be a
+                    # nested comment's own interior line just as one.
+                    saved = close_pending(saved, 9, None)
                 else:
                     if html_closes(inside, html):
                         html_closing_line = piece.line
@@ -3545,6 +3549,8 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 inside = strip_quote(body, stack[-1][0] if stack else 0)
                 if html == "tag" and html_closes(inside, html):
                     html = None
+                    # See `close_pending` in `comment_lines`.
+                    saved = close_pending(saved, 10, None)
                 else:
                     if html_closes(inside, html):
                         html_closing_line = piece.line
@@ -7043,6 +7049,26 @@ RULE_TESTS = [
         " */\n",
         set(),
         "and the prose scanner keeps it too",
+    ),
+    (
+        "/** <div>\n"
+        " * raw /*\n"
+        " *\n"
+        " * */\n"
+        " * TODO: issue required\n"
+        " */\n",
+        {("CH002", 5)},
+        "a blank line closing a type-6 block still closes it past a nested comment",
+    ),
+    (
+        "/** <div>\n"
+        " * raw /*\n"
+        " *\n"
+        " * */\n"
+        " * " + " ".join(f"word{n}" for n in range(1, 27)) + ".\n"
+        " */\n",
+        {("CH007", 5)},
+        "and the prose scanner sees the same close",
     ),
 ]
 
