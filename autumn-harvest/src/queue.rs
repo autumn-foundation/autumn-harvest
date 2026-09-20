@@ -3007,8 +3007,9 @@ pub async fn requeue_workflow_task_for_quota_retry(
     previous_error: &str,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Double, Timestamptz};
 
-    let next_run = Utc::now() + delay;
     let changeset = PendingRequeueChangeset::new(previous_error.to_string());
 
     let updated = diesel::update(
@@ -3019,16 +3020,20 @@ pub async fn requeue_workflow_task_for_quota_retry(
     )
     .set((
         changeset,
-        dsl::scheduled_at.eq(next_run),
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
     ))
-    .returning((dsl::queue_name, dsl::priority))
-    .get_results::<(String, i32)>(conn)
+    .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
+    .get_results::<(String, i32, chrono::DateTime<Utc>)>(conn)
     .await
     .map_err(crate::error::database_error)?;
 
-    let Some((queue_name, priority)) = updated.into_iter().next() else {
+    let Some((queue_name, priority, next_run)) = updated.into_iter().next() else {
         return Err(crate::error::HarvestError::NotFound(format!(
             "task queue item {task_id} is not a running workflow task"
         )));
@@ -3053,11 +3058,13 @@ pub async fn requeue_workflow_task_for_quota_retry(
 #[cfg(test)]
 fn requeue_workflow_task_for_quota_retry_query(
     changeset: PendingRequeueChangeset,
-    next_run: chrono::DateTime<Utc>,
+    delay: Duration,
 ) -> String {
     use crate::schema::harvest_task_queue::dsl;
     use diesel::debug_query;
+    use diesel::dsl::sql;
     use diesel::pg::Pg;
+    use diesel::sql_types::{Double, Timestamptz};
 
     let query = diesel::update(
         dsl::harvest_task_queue
@@ -3067,7 +3074,11 @@ fn requeue_workflow_task_for_quota_retry_query(
     )
     .set((
         changeset,
-        dsl::scheduled_at.eq(next_run),
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
     ));
@@ -10245,19 +10256,29 @@ mod tests {
     }
 
     /// Issue #1391: this must generate a `SET` clause that pushes
-    /// `scheduled_at` into the future and clears both `wake_requested` and
-    /// the stale `activity_name` sentinel. It also restricts the update to
-    /// `RUNNING` workflow rows. This mirrors `requeue_workflow_task_after_panic`'s
-    /// own pin above. A no-DB test pins this so a future edit cannot
-    /// silently drop the backoff or either clear, and reopen issue #1391 or
-    /// its #603 sibling.
+    /// `scheduled_at` into the future off the database clock. It must also
+    /// clear both `wake_requested` and the stale `activity_name` sentinel,
+    /// and restrict the update to `RUNNING` workflow rows. This mirrors
+    /// `requeue_workflow_task_after_panic`'s own pin above. A no-DB test
+    /// pins this so a future edit cannot silently drop the backoff or
+    /// either clear, and reopen issue #1391 or its #603 sibling.
+    ///
+    /// `scheduled_at` must bind off `clock_timestamp()`, not a host-computed
+    /// timestamp (Codex review, PR #1670). A worker clock that trails
+    /// Postgres would otherwise let a persistently quota-blocked task
+    /// satisfy `claim_task`'s eligibility check right away. The task would
+    /// then hot-spin instead of backing off.
     #[test]
     fn requeue_workflow_task_for_quota_retry_query_clears_sentinel_and_wake() {
         let changeset = PendingRequeueChangeset::new("quota exceeded".to_string());
-        let next_run = chrono::Utc::now();
-        let sql = requeue_workflow_task_for_quota_retry_query(changeset, next_run);
+        let sql = requeue_workflow_task_for_quota_retry_query(changeset, Duration::seconds(30));
 
-        for column in ["scheduled_at", "wake_requested", "activity_name"] {
+        assert!(
+            sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => "),
+            "scheduled_at must bind off the database clock, not a host-computed \
+             timestamp: {sql}"
+        );
+        for column in ["wake_requested", "activity_name"] {
             assert!(
                 sql.contains(&format!("\"{column}\" = $")),
                 "{column} must appear as a bound column in the SET clause: {sql}"
