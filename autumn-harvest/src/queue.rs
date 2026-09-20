@@ -56,9 +56,18 @@ const IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE: Duration =
 /// time `claim_task` checks it, when the host clock trails Postgres's.
 /// Computing the deadline on Postgres's own clock removes that mismatch by
 /// construction, for any `delay`.
-#[allow(clippy::cast_precision_loss)] // millisecond delay never approaches 2^53
+/// Microsecond precision, not millisecond (issue #1389 review). `JitterPolicy::Full`
+/// picks any value between zero and the base interval, so a sub-millisecond
+/// delay is a real, reachable case. Truncating to whole milliseconds would
+/// round such a delay down to zero: an immediate retry instead of a short one.
+#[allow(clippy::cast_precision_loss)] // microsecond delay never approaches 2^53
 fn delay_secs(delay: Duration) -> f64 {
-    delay.num_milliseconds() as f64 / 1000.0
+    delay.num_microseconds().map_or_else(
+        // Out of `i64` microsecond range (roughly 292,000 years): fall back
+        // to millisecond precision, which cannot overflow here either way.
+        || delay.num_milliseconds() as f64 / 1000.0,
+        |us| us as f64 / 1_000_000.0,
+    )
 }
 
 #[derive(diesel::QueryableByName)]
@@ -10226,6 +10235,15 @@ mod tests {
         assert!((delay_secs(Duration::milliseconds(500)) - 0.5).abs() < f64::EPSILON);
         assert!((delay_secs(Duration::zero()) - 0.0).abs() < f64::EPSILON);
         assert!((delay_secs(Duration::seconds(-3)) - (-3.0)).abs() < f64::EPSILON);
+    }
+
+    /// `JitterPolicy::Full` can pick a sub-millisecond delay (issue #1389
+    /// review). Truncating to whole milliseconds would round it down to
+    /// zero, turning a short retry into an immediate one.
+    #[test]
+    fn delay_secs_preserves_sub_millisecond_precision() {
+        assert!((delay_secs(Duration::microseconds(500)) - 0.0005).abs() < f64::EPSILON);
+        assert!((delay_secs(Duration::microseconds(1)) - 0.000_001).abs() < f64::EPSILON);
     }
 
     #[test]
