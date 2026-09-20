@@ -5015,10 +5015,29 @@ fn has_activity_terminal_event(history: &[WorkflowEvent], activity_id: ActivityE
 /// `true` if any id in `activity_waits` already has a terminal event in
 /// `history`.
 ///
-/// Shared by both of this module's post-park re-checks (issue #950 mixed
-/// suspension batches, and the cancel-race-loser check ahead of them): each
+/// Shared by both of this module's post-park re-checks: issue #950 mixed
+/// suspension batches, and the cancel-race-loser check ahead of them. Each
 /// asks whether anything in a just-parked `join!`/`race()` fan-out resolved
 /// in the window between the history load and the park's own atomic write.
+///
+/// A per-id call to [`has_activity_terminal_event`] would rescan the full
+/// history once per id in `activity_waits`. That is O(`activity_waits.len()`
+/// * `history.len()`). It has no short circuit in the common case: nothing
+/// resolved yet, which is exactly the case this check exists to rule out. A
+/// wide `join!`/`race()` fan-out can put dozens of ids in `activity_waits`
+/// at once. This instead makes one pass over `history`, and only pays an
+/// `activity_waits.len()`-sized membership check on the events that are
+/// actually terminal. That is O(`history.len()` + `terminal_event_count` *
+/// `activity_waits.len()`).
+///
+/// `activity_waits.contains` (a linear scan) rather than a `HashSet`,
+/// deliberately. `activity_waits` is small (a `join!`/`race()` fan-out, not
+/// the full history). A first pass building a hash set of every terminal id
+/// in `history` measurably *lost* to this shape. See the "Rejected
+/// alternative" section of `benches/activity_wait_resolution_profile.rs`'s
+/// own doc comment for the measured numbers. A linear scan over a small
+/// slice costs nothing this history-dominated function's profile can see.
+/// It also allocates zero bytes doing it.
 ///
 /// `#[doc(hidden)]`: exposed for the Bolt performance harness
 /// (`benches/activity_wait_resolution_profile.rs`); not a stable API -- same
@@ -5029,9 +5048,18 @@ pub fn any_activity_wait_already_resolved(
     history: &[WorkflowEvent],
     activity_waits: &[ActivityExecId],
 ) -> bool {
-    activity_waits
-        .iter()
-        .any(|activity_id| has_activity_terminal_event(history, *activity_id))
+    if activity_waits.is_empty() {
+        return false;
+    }
+    history.iter().any(|event| {
+        matches!(
+            event,
+            WorkflowEvent::ActivityCompleted { activity_id, .. }
+                | WorkflowEvent::ActivityFailed { activity_id, .. }
+                | WorkflowEvent::ActivityTimedOut { activity_id, .. }
+                if activity_waits.contains(activity_id)
+        )
+    })
 }
 
 async fn lock_workflow_execution_and_load_history(
@@ -29587,6 +29615,98 @@ pub(crate) fn under_provisioned_shard_pools(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scheduled(
+        activity_id: ActivityExecId,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> (chrono::DateTime<chrono::Utc>, WorkflowEvent) {
+        (
+            at,
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge_card".to_string(),
+                input: serde_json::Value::Null,
+                queue: "default".to_string(),
+            },
+        )
+    }
+
+    fn completed(
+        activity_id: ActivityExecId,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> (chrono::DateTime<chrono::Utc>, WorkflowEvent) {
+        (
+            at,
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::Value::Null,
+            },
+        )
+    }
+
+    #[test]
+    fn any_activity_wait_already_resolved_is_false_on_an_empty_wait_set() {
+        let now = chrono::Utc::now();
+        let open = ActivityExecId::new();
+        let history: Vec<WorkflowEvent> = vec![scheduled(open, now).1];
+        assert!(!any_activity_wait_already_resolved(&history, &[]));
+    }
+
+    #[test]
+    fn any_activity_wait_already_resolved_is_false_when_none_have_terminated() {
+        let now = chrono::Utc::now();
+        let open_a = ActivityExecId::new();
+        let open_b = ActivityExecId::new();
+        let history: Vec<WorkflowEvent> = vec![scheduled(open_a, now).1, scheduled(open_b, now).1];
+        assert!(!any_activity_wait_already_resolved(
+            &history,
+            &[open_a, open_b]
+        ));
+    }
+
+    #[test]
+    fn any_activity_wait_already_resolved_is_true_when_one_of_several_has_completed() {
+        let now = chrono::Utc::now();
+        let open = ActivityExecId::new();
+        let resolved = ActivityExecId::new();
+        let unrelated = ActivityExecId::new();
+        let history: Vec<WorkflowEvent> = vec![
+            scheduled(open, now).1,
+            scheduled(resolved, now).1,
+            completed(resolved, now).1,
+            scheduled(unrelated, now).1,
+            completed(unrelated, now).1,
+        ];
+        // `resolved` is in the wait set and has a terminal event.
+        // `unrelated` also has a terminal event, but was never in the wait
+        // set -- the single-pass rewrite must not report a match on it.
+        assert!(any_activity_wait_already_resolved(
+            &history,
+            &[open, resolved]
+        ));
+    }
+
+    #[test]
+    fn any_activity_wait_already_resolved_matches_failed_and_timed_out_too() {
+        let failed = ActivityExecId::new();
+        let timed_out = ActivityExecId::new();
+        let history: Vec<WorkflowEvent> = vec![
+            WorkflowEvent::ActivityFailed {
+                activity_id: failed,
+                error: "boom".to_string(),
+                attempt: 1,
+                error_type: "Error".to_string(),
+                non_retryable: false,
+                details: None,
+            },
+            WorkflowEvent::ActivityTimedOut {
+                activity_id: timed_out,
+                timeout_type: crate::error::TimeoutType::StartToClose,
+            },
+        ];
+        assert!(any_activity_wait_already_resolved(&history, &[failed]));
+        assert!(any_activity_wait_already_resolved(&history, &[timed_out]));
+    }
 
     /// The release and escalation branches must report OPPOSITE distinct-worker
     /// bases, and round 34 got it backwards on both (issue #804, round-35 P2).
