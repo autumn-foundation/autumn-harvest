@@ -435,7 +435,7 @@ async fn workflow_list_shows_an_orphaned_staged_migration_and_also_finds_it_expl
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let live = seed_workflow(
         &database_url,
