@@ -3056,10 +3056,15 @@ pub async fn requeue_workflow_task_for_quota_retry(
 /// so a no-DB unit test can assert the generated SQL shape (issue #1391).
 /// Mirrors the `requeue_after_panic_query` shape-test precedent.
 #[cfg(test)]
-fn requeue_workflow_task_for_quota_retry_query(changeset: PendingRequeueChangeset) -> String {
+fn requeue_workflow_task_for_quota_retry_query(
+    changeset: PendingRequeueChangeset,
+    delay: Duration,
+) -> String {
     use crate::schema::harvest_task_queue::dsl;
     use diesel::debug_query;
+    use diesel::dsl::sql;
     use diesel::pg::Pg;
+    use diesel::sql_types::{Double, Timestamptz};
 
     let query = diesel::update(
         dsl::harvest_task_queue
@@ -3069,6 +3074,11 @@ fn requeue_workflow_task_for_quota_retry_query(changeset: PendingRequeueChangese
     )
     .set((
         changeset,
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
     ));
@@ -10254,7 +10264,7 @@ mod tests {
     #[test]
     fn requeue_workflow_task_for_quota_retry_query_clears_sentinel_and_wake() {
         let changeset = PendingRequeueChangeset::new("quota exceeded".to_string());
-        let sql = requeue_workflow_task_for_quota_retry_query(changeset);
+        let sql = requeue_workflow_task_for_quota_retry_query(changeset, Duration::seconds(5));
 
         for column in ["wake_requested", "activity_name"] {
             assert!(
@@ -10274,6 +10284,12 @@ mod tests {
         // Restricted to claimed (RUNNING) workflow rows.
         assert!(sql.contains("\"task_type\""), "{sql}");
         assert!(sql.contains("\"state\""), "{sql}");
+        // `scheduled_at` is computed on Postgres's own clock (issue #1389),
+        // not the host clock, mirroring the panic-retry sibling pin above.
+        assert!(
+            sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => $"),
+            "scheduled_at must be computed from Postgres's own clock: {sql}"
+        );
     }
 
     #[test]
