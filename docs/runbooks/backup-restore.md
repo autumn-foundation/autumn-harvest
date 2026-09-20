@@ -329,6 +329,16 @@ ack, it refuses; with the ack, it still only reads.
   fire is never checked: it commits atomically with the target start and
   cannot be split by a skewed restore.
 
+  **Residual limitation, summary-free retention only** (Codex follow-up). A
+  target that ran, completed, and was retention-collected can itself have
+  been its shard's newest event. If nothing else touched that shard
+  afterward, deleting it pulls the visible restore point back to before
+  `fired_at`, misreading a coherent restore as `completion_trigger_fire_lost`.
+  Enabling `harvest_execution_summaries` closes this, since it is checked
+  first and wins regardless of the timestamp. Closing it with summaries
+  disabled needs a genuine durable restore-point marker — exactly the
+  durable-marker work issue #1401 chose not to require.
+
   **Pre-migration fires** (rows written before `20260920215812` shipped)
   carry no recorded `target_shard`/`target_workflow_name` and fall back to
   the old reconstruction: the target shard via

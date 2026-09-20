@@ -1013,8 +1013,8 @@ fn route_trigger_fires(
 /// The relay can only start the target AT OR AFTER `fired_at`. `fired_at`
 /// is set when the source recorded the fire, before any relay attempt. So a
 /// target shard whose newest event PREDATES `fired_at` cannot possibly
-/// contain the delivery. The restore point proves the target shard's
-/// snapshot is too old, whatever else is true.
+/// contain the delivery, PROVIDED that newest-event timestamp itself is
+/// trustworthy.
 ///
 /// Otherwise, absence stays ambiguous: the target shard has progressed past
 /// `fired_at`, or carries no event to compare at all. It may be ordinary
@@ -1024,6 +1024,17 @@ fn route_trigger_fires(
 /// exists, resolved from the fire's own `fired_at` instead (issue #1401).
 /// This is the same evidentiary gap [`FindingClass::RetentionUnproven`]
 /// names for a recorded child terminal or delivered effect.
+///
+/// Residual limitation, summary-free retention only (issue #1401, Codex
+/// follow-up). A target that ran, completed, and was retention-collected
+/// with no other traffic on its shard afterward can itself have been the
+/// shard's newest event. Its deletion then pulls the visible newest-event
+/// timestamp back to before `fired_at`. This proxy then misreads a
+/// coherent restore as decisive loss. `harvest_execution_summaries`
+/// (checked by the caller first) closes this when enabled. Closing it
+/// unconditionally needs a real durable restore-point marker, the exact
+/// durable-marker
+/// work issue #1401 explicitly chose not to require.
 #[cfg(all(feature = "db", feature = "testing"))]
 #[must_use]
 fn absence_is_decisive_loss(

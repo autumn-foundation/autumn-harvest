@@ -19,6 +19,17 @@ never received, with no scanner and, until now, no drill check to catch it.
   evidentiary gap `retention_unproven` names, resolved here from the fire's
   own `fired_at` as a fallback rather than requiring a summary.
 
+**Residual limitation, summary-free retention only** (Codex follow-up). A
+target that completed and was retention-collected can itself have been its
+shard's newest event. With no other shard traffic since, deleting it pulls
+the visible restore point back to before `fired_at`, misreading a coherent
+restore as `completion_trigger_fire_lost`. `harvest_execution_summaries`
+closes this when enabled, since it is checked before the timestamp
+heuristic runs. Closing it with summaries disabled needs a genuine durable
+restore-point marker — exactly the durable-marker work issue #1401 chose
+not to require. Documented in `docs/runbooks/backup-restore.md` §4.2(d)
+and in `absence_is_decisive_loss`'s doc comment.
+
 A same-shard fire is never adjudicated: `evaluate_triggers_for_execution`'s
 inline path inserts the fires row and starts the target in one transaction,
 so it is atomic and immune by construction (scope: cross-shard only, per the
