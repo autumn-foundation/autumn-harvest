@@ -122,8 +122,29 @@ async fn create_fresh_db(admin_url: &str, name: &str, cleanup: &DbCleanupGuard) 
     url
 }
 
+/// Postgres truncates every identifier -- quoted or not -- to
+/// `NAMEDATALEN - 1` (63) bytes at the lexer level. `CREATE DATABASE
+/// "<name>"` with a longer `name` then creates a shorter database than
+/// this function returns. Every later `with_db_name(admin, name)` call
+/// builds a connection URL for the untruncated name, so it fails to
+/// connect to the database `CREATE DATABASE` actually made. Review
+/// finding on PR #1666: the full 32-hex-character `Uuid::simple()` form
+/// pushed both scenario labels' names to 69-70 bytes. 16 hex characters
+/// (64 bits) keeps every current prefix well under the limit. That is
+/// still, for the two or three names one test run creates, effectively
+/// collision-free. The assertion below still catches it explicitly, not
+/// silently via a Postgres-side truncation, if a future longer prefix
+/// pushes the total over the limit again.
 fn unique(prefix: &str) -> String {
-    format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
+    let suffix = &uuid::Uuid::new_v4().simple().to_string()[..16];
+    let name = format!("{prefix}_{suffix}");
+    assert!(
+        name.len() <= 63,
+        "database name {name:?} ({} bytes) exceeds Postgres's 63-byte identifier limit -- \
+         shorten the prefix",
+        name.len(),
+    );
+    name
 }
 
 /// Best-effort `DROP DATABASE IF EXISTS` for every name given. One
@@ -221,9 +242,15 @@ impl DbCleanupGuard {
 }
 
 impl Drop for DbCleanupGuard {
-    /// The panic-path fallback, for when nothing called
-    /// `cleanup().await` first. `Drop::drop` is synchronous. So it
-    /// cannot `.await` the connections above closing, before it
+    /// A last-resort fallback only. The main test body no longer relies
+    /// on this path for its own panics -- review finding on PR #1666.
+    /// `tokio::spawn`ing the measurement work catches a panic there as
+    /// an `Err(JoinError)`, instead of unwinding past this guard. So the
+    /// test function itself can `.await` `cleanup()` in response. What
+    /// is left for `Drop::drop` to cover is narrower: a panic inside
+    /// `cleanup()` itself, or a path that reaches neither `cleanup()`
+    /// nor the `tokio::spawn`/`Err` arm. `Drop::drop` is synchronous, so
+    /// it cannot `.await` the connections above closing before it
     /// attempts `DROP DATABASE` itself.
     ///
     /// An earlier revision spawned a thread and blocked on it with
@@ -239,10 +266,9 @@ impl Drop for DbCleanupGuard {
     /// The fix here does not block. It spawns a detached thread and
     /// returns immediately, so it cannot deadlock. The cost: cleanup
     /// is no longer guaranteed to finish before the process can exit.
-    /// On a panic, in this manually-invoked, single-test,
-    /// `--ignored`-filtered harness, the test process keeps running
-    /// briefly to report the failure. That is normally enough time,
-    /// but this remains genuinely best-effort, not guaranteed.
+    /// This is now a narrow, last-resort path rather than the main
+    /// panic-path handler, so that cost applies to a correspondingly
+    /// narrower set of failures.
     fn drop(&mut self) {
         let names = self.take_names();
         if names.is_empty() {
@@ -756,27 +782,57 @@ async fn measure(
 async fn zz_capture_audit_log_unexported_idx_write_cost_evidence() {
     let (admin, guard) = setup_server().await;
     let owns_server = guard.is_some();
-    let cleanup = DbCleanupGuard::new(admin.clone());
-    let base_name = seed_base_db(&admin, &cleanup).await;
+    // `Arc`, not a plain local -- review finding on PR #1666. `cleanup`
+    // must survive a panic anywhere in the `tokio::spawn`ed block below,
+    // so the `Err` arm can still call its real `async fn cleanup(&self)`.
+    // A plain local would itself be dropped while unwinding that block,
+    // reaching only `Drop::drop`'s detached, un-joined thread -- exactly
+    // the gap this restructuring closes. See `Drop for DbCleanupGuard`'s
+    // own doc comment for why that thread cannot be a reliable substitute.
+    let cleanup = std::sync::Arc::new(DbCleanupGuard::new(admin.clone()));
 
-    let before = measure(
-        &admin,
-        &base_name,
-        "before_index_present",
-        false,
-        owns_server,
-        &cleanup,
-    )
+    // The measurement work runs as its own task -- review finding on PR
+    // #1666. `tokio::spawn` catches a panic internally and reports it as
+    // `Err(JoinError)` instead of unwinding this function's own stack.
+    // That leaves this `async fn` itself un-panicked. It can still
+    // `.await` real cleanup in the `Err` arm below, no matter where
+    // inside the spawned block the panic came from. A plain
+    // `std::thread` would not help here. This is `tokio::spawn`,
+    // another task on the same single-threaded runtime, not another OS
+    // thread. So it carries none of `Drop`'s own self-deadlock risk.
+    let spawned_admin = admin.clone();
+    let spawned_cleanup = std::sync::Arc::clone(&cleanup);
+    let measured = tokio::spawn(async move {
+        let base_name = seed_base_db(&spawned_admin, &spawned_cleanup).await;
+        let before = measure(
+            &spawned_admin,
+            &base_name,
+            "before_index_present",
+            false,
+            owns_server,
+            &spawned_cleanup,
+        )
+        .await;
+        let after = measure(
+            &spawned_admin,
+            &base_name,
+            "after_index_dropped",
+            true,
+            owns_server,
+            &spawned_cleanup,
+        )
+        .await;
+        (before, after)
+    })
     .await;
-    let after = measure(
-        &admin,
-        &base_name,
-        "after_index_dropped",
-        true,
-        owns_server,
-        &cleanup,
-    )
-    .await;
+
+    let (before, after) = match measured {
+        Ok(pair) => pair,
+        Err(join_err) => {
+            cleanup.cleanup().await;
+            std::panic::resume_unwind(join_err.into_panic());
+        }
+    };
 
     for m in [&before, &after] {
         eprintln!(
@@ -821,13 +877,11 @@ async fn zz_capture_audit_log_unexported_idx_write_cost_evidence() {
 
     // Explicit, awaited cleanup here, ahead of the assertions below,
     // rather than waiting for `cleanup`'s own end-of-scope `Drop`. A
-    // positive-control or zero-scan assertion failure should still
+    // positive-control or zero-scan assertion failure below should still
     // leave the server clean immediately, not just eventually.
-    // `DbCleanupGuard::drop` still covers a panic anywhere before this
-    // point, on a strictly best-effort basis. Its own doc comment says
-    // why an awaited call, not `Drop`, is what makes this one call
-    // reliable. Review finding on PR #1666, and a further, self-found
-    // fix to the first attempt at satisfying it.
+    // `DbCleanupGuard::drop` remains a last-resort fallback only.
+    // Panics from the measurement work itself are already handled by
+    // the `tokio::spawn`/`Err` arm above, which awaits this same method.
     cleanup.cleanup().await;
 
     // Positive control (review finding on PR #1666). If the read path
