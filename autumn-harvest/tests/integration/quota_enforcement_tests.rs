@@ -3742,6 +3742,72 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
     drop(guard);
 }
 
+/// Issue #1392: a `QuotaBlocked` outcome must stamp `next_attempt_at` from
+/// Postgres's own clock, not the scanning replica's host clock.
+///
+/// A host-computed deadline can already be due by the time a peer replica
+/// checks it, when that replica's clock runs ahead. This test compares the
+/// written deadline against the database's own `NOW()`, never this test
+/// process's `chrono::Utc::now()`. It then catches a regression back to the
+/// host clock, regardless of which replica's clock the regression favors.
+#[tokio::test]
+async fn quota_blocked_outbox_backoff_lands_on_the_database_clock() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    install_global_router(ShardRouter::single());
+    let sharded_pool = Some(ShardedDbPool::single(build_test_pool(&url)));
+
+    let blocked_wf = leaked("outbox_backoff_clock");
+    let quota_policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    let guard = MetadataGuard::install_one(blocked_wf, quota_policy).await;
+
+    // Occupy the one slot so the outbox relay's admission attempt below
+    // hits `QuotaExceeded`.
+    let blocker = start_root(
+        &mut conn,
+        blocked_wf,
+        &format!("blocker-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"tenant_id": "acme"}),
+    )
+    .await;
+
+    let outbox_id = insert_outbox_row(
+        &mut conn,
+        blocked_wf,
+        serde_json::json!({"tenant_id": "acme"}),
+    )
+    .await;
+
+    enforce_completion_triggers_outbox(&mut conn, &NoOpMetrics, &sharded_pool, &[ShardId::new(0)])
+        .await
+        .expect("outbox scan hits the quota-blocked target");
+
+    let deadline = outbox_next_attempt_at(&mut conn, outbox_id)
+        .await
+        .expect("a QuotaBlocked outcome must stamp next_attempt_at");
+    let db_now = queue::db_clock_now(&mut conn)
+        .await
+        .expect("probe database clock");
+
+    // Mirrors `QUOTA_REDEFER_BACKOFF` (5 seconds). This tracks that
+    // production constant the same way `CLAIM_BATCH_LIMIT` above does, so
+    // a changed backoff value fails this test loudly.
+    let expected_backoff = chrono::Duration::seconds(5);
+    let held = deadline - db_now;
+    let drift = (held - expected_backoff).num_milliseconds().abs();
+    const TOLERANCE_MS: i64 = 750;
+    assert!(
+        drift <= TOLERANCE_MS,
+        "expected next_attempt_at ({deadline}) to land within \
+         {TOLERANCE_MS}ms of {expected_backoff} past the database's own \
+         NOW() ({db_now}), but held {held} -- drift {drift}ms"
+    );
+
+    mark_terminal(&mut conn, blocker, "CANCELLED").await;
+    drop(guard);
+}
+
 /// Issue #1227 Finding 4, Codex round-1 P1 (PR #1386): ordering the claim
 /// batch by `created_at` ALONE (the initial fix above) is not enough. Once
 /// `WorkerRuntimeConfig::poll_interval` is at or above `QUOTA_REDEFER_BACKOFF`
