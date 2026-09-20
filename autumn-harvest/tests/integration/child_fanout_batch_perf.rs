@@ -4,33 +4,34 @@
 //!
 //! `persist_all_started_child_workflows`'s local-child loop
 //! (`autumn-harvest/src/worker.rs`) used to call, per new local child: one
-//! single-row `INSERT INTO harvest_workflow_executions`, one single-row
-//! `INSERT INTO harvest_events` (the child's `WorkflowStarted`), and one
-//! `queue::enqueue` (one single-row `INSERT INTO harvest_task_queue`). A
-//! decision that fanned out to `n` awaited local children cost `3n` round
-//! trips to persist.
+//! single-row `INSERT INTO harvest_workflow_executions`; one single-row
+//! `INSERT INTO harvest_events` for the child's `WorkflowStarted`; and one
+//! `queue::enqueue`, itself one single-row `INSERT INTO harvest_task_queue`.
+//! A decision that fanned out to `n` awaited local children cost `3n`
+//! round trips to persist.
 //!
 //! The fix splits local children by whether their own
-//! `enforce_quota_admission` call would be a no-op (no declared policy, no
-//! active cap, or no resolved key). A child in that shape is batched: one
-//! multi-row `INSERT` per table for the whole group, via
+//! `enforce_quota_admission` call would be a no-op. That is true when the
+//! child declares no policy, its policy has no active cap, or no key
+//! resolved. A child in that shape is batched: one multi-row `INSERT` per
+//! table for the whole group. This goes via
 //! [`autumn_harvest::store::append_new_execution_started_events_batch`] and
 //! [`autumn_harvest::queue::enqueue_batch`] (already built for the sibling
 //! `ScheduleActivity` fan-out, PR #1447). A child with an active cap on its
-//! own declared policy keeps the original sequential insert-then-admit path
-//! unchanged, so `enforce_quota_admission`'s graduated "admit first K,
-//! reject the rest" property survives -- proven separately in
+//! own declared policy keeps the original sequential insert-then-admit
+//! path, unchanged. `enforce_quota_admission`'s graduated "admit first K,
+//! reject the rest" property therefore survives -- proven separately in
 //! `quota_enforcement_tests.rs`.
 //!
 //! Evidence here is `pg_stat_statements` call counts, driven end-to-end
-//! through a real `Worker` and a real workflow decision -- not a direct
-//! call to an internal helper, since the row-building logic is inlined in
-//! `persist_all_started_child_workflows` (matching every other per-child
-//! insert call site in this file, none of which are factored out either).
+//! through a real `Worker` and a real workflow decision. This is not a
+//! direct call to an internal helper: the row-building logic is inlined in
+//! `persist_all_started_child_workflows`, matching every other per-child
+//! insert call site in this file (none of which are factored out either).
 //! This harness follows the same shape as `activity_enqueue_batch_perf.rs`:
 //! a fresh, uniquely-named, fully-migrated database per measurement.
-//! `pg_stat_statements` is reset immediately before the measured decision
-//! and snapshotted immediately after it.
+//! `pg_stat_statements` is reset immediately before the measured decision,
+//! then snapshotted immediately after it.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -241,9 +242,9 @@ async fn wait_for_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId, stat
     panic!("execution {exec_id} never reached {states:?}; current state: {state}");
 }
 
-/// Poll until `exec_id`'s workflow task row is parked (claimed and released:
-/// `RUNNING` with no `worker_id`) -- the state a decision cycle leaves
-/// behind once it has persisted and suspended.
+/// Poll until `exec_id`'s workflow task row is parked: `RUNNING` with no
+/// `worker_id` (claimed, then released). This is the state a decision
+/// cycle leaves behind once it has persisted and suspended.
 async fn wait_for_workflow_task_parked(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
     use autumn_harvest::schema::harvest_task_queue;
 
@@ -298,6 +299,14 @@ fn registry(infos: Vec<WorkflowInfo>) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(infos, vec![]))
 }
 
+/// A unique, process-leaked workflow type name (mirrors `quota_enforcement_tests.rs`'s
+/// `leaked` helper). `HandlerRegistry::new` mirrors every registered
+/// `WorkflowInfo` into the process-global `GLOBAL_WORKFLOW_METADATA` map, so
+/// a fixed literal name risks colliding with another test's registration.
+fn leaked(prefix: &str) -> &'static str {
+    Box::leak(format!("{prefix}_{}", uuid::Uuid::new_v4().simple()).into_boxed_str())
+}
+
 // ── Fixture workflows ───────────────────────────────────────────────────────
 
 const FAN_OUT_N: usize = 12;
@@ -323,12 +332,12 @@ fn fan_out_parent<'a>(
 }
 
 /// Never completes: the child's own first decision cycle suspends on a
-/// signal that is never sent. This keeps every child parked in `RUNNING`
-/// once spawned, so nothing beyond the parent's ONE fan-out decision
-/// touches `harvest_events`/`harvest_workflow_executions`/
-/// `harvest_task_queue` during the measurement window below -- a child
-/// completing (or the parent reacting to that completion) would add its
-/// own, unrelated `INSERT`s and mask the signal this test is isolating.
+/// signal that is never sent. Every child stays parked in `RUNNING` once
+/// spawned. So nothing beyond the parent's ONE fan-out decision touches
+/// `harvest_events`/`harvest_workflow_executions`/`harvest_task_queue`
+/// during the measurement window below. A child completing (or the parent
+/// reacting to that completion) would add its own, unrelated `INSERT`s,
+/// masking the signal this test is isolating.
 fn fan_out_child<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -343,17 +352,17 @@ fn fan_out_child<'a>(
 /// [`FAN_OUT_N`] awaited local children of a workflow type with NO declared
 /// quota policy must persist that decision with O(1) `INSERT` calls per
 /// table, not `O(FAN_OUT_N)`. This is the exact shape issue #1589 measured
-/// (3 calls per child, unbatched) driven through the real
-/// `persist_all_started_child_workflows` code path, not a direct call to an
-/// internal helper.
+/// (3 calls per child, unbatched). It is driven through the real
+/// `persist_all_started_child_workflows` code path, not a direct call to
+/// an internal helper.
 #[tokio::test]
 async fn awaited_local_child_fan_out_persists_with_one_insert_per_table() {
     let (admin, _guard) = setup_server().await;
     let db_name = unique("child_fanout_batch_perf");
     let url = create_fresh_db(&admin, &db_name).await;
 
-    let parent_wf = "fan_out_batch_perf_parent";
-    let child_wf = "fan_out_batch_perf_child";
+    let parent_wf = leaked("fan_out_batch_perf_parent");
+    let child_wf = leaked("fan_out_batch_perf_child");
     let reg = registry(vec![
         wf_info(parent_wf, fan_out_parent),
         wf_info(child_wf, fan_out_child),
@@ -381,8 +390,8 @@ async fn awaited_local_child_fan_out_persists_with_one_insert_per_table() {
 
     // The parent's ONE decision cycle spawns all FAN_OUT_N children, then
     // parks waiting on them. Every child immediately suspends on a signal
-    // that never arrives (see `fan_out_child`), so once the parent's task
-    // is parked, nothing further will touch these three tables -- the
+    // that never arrives (see `fan_out_child`). So once the parent's task
+    // is parked, nothing further will touch these three tables. The
     // snapshot below captures exactly the one spawn decision, not any
     // later child-completion traffic.
     wait_for_workflow_task_parked(&mut start_conn, parent_id).await;
@@ -413,16 +422,17 @@ async fn awaited_local_child_fan_out_persists_with_one_insert_per_table() {
         "harvest_task_queue INSERT calls must be exactly 1 for the whole {FAN_OUT_N}-child \
          batch, not one per child"
     );
-    // harvest_events carries both the batched insert this issue targets
-    // (the children's own WorkflowStarted rows, 1 call) AND the PARENT's
-    // own per-event append loop (the fan_out marker + one
-    // ChildWorkflowStarted per child, `FAN_OUT_N + 1` separate calls) --
-    // deliberately out of scope for issue #1589 (see its own text: scoped
-    // to the "Insert rows and enqueue tasks for new children" section, not
-    // the parent's own history append, which re-reads `MAX(event_id) FOR
-    // UPDATE` per event to serialize against concurrent sibling
-    // completions). The bound below is exact given that shape, proving the
-    // children's own batch adds exactly one call on top of it.
+    // harvest_events carries both parts of this decision. The batched
+    // insert this issue targets is the children's own WorkflowStarted
+    // rows, 1 call. The PARENT's own per-event append loop is the fan_out
+    // marker plus one ChildWorkflowStarted per child, `FAN_OUT_N + 1`
+    // separate calls. That parent-side loop is deliberately out of scope
+    // for issue #1589 -- see its own text, scoped to the "Insert rows and
+    // enqueue tasks for new children" section, not the parent's own
+    // history append. That append re-reads `MAX(event_id) FOR UPDATE` per
+    // event, to serialize against concurrent sibling completions. The
+    // bound below is exact given that shape. It proves the children's own
+    // batch adds exactly one call on top of the parent-side loop.
     let fan_out_n_i64 = i64::try_from(FAN_OUT_N).expect("FAN_OUT_N fits in i64");
     assert_eq!(
         event_inserts,
@@ -446,4 +456,96 @@ async fn awaited_local_child_fan_out_persists_with_one_insert_per_table() {
         child_count.n, fan_out_n_i64,
         "every one of the {FAN_OUT_N} batched children must exist and be RUNNING"
     );
+}
+
+// ── Direct: append_new_execution_started_events_batch past the parameter ───
+// ── ceiling ──────────────────────────────────────────────────────────────
+
+/// A batch past Postgres's bind-parameter ceiling must still succeed.
+///
+/// `NewHarvestEvent` carries 4 columns, so one unchunked multi-row `INSERT`
+/// hits Postgres's 65,535-bind-parameter ceiling at 16,383 rows
+/// (`65_535 / 4 = 16_383`, floor). This drives `N` past that boundary:
+/// two chunks, not one. Mirrors
+/// `activity_enqueue_batch_perf.rs::enqueue_batch_handles_a_batch_past_the_parameter_ceiling`,
+/// the direct regression test for the same pre-chunking bug class in the
+/// sibling batch-insert path.
+#[tokio::test]
+async fn append_new_execution_started_events_batch_handles_a_batch_past_the_parameter_ceiling() {
+    use autumn_harvest::event::WorkflowEvent;
+    use autumn_harvest::payload_codec::PayloadCodecs;
+    use autumn_harvest::schema::harvest_events;
+    use autumn_harvest::store;
+    use chrono::Utc;
+
+    const N: i64 = 16_400; // > 65_535 / 4 = 16_383
+
+    let (admin, _guard) = setup_server().await;
+    let url = create_fresh_db(&admin, &unique("event_batch_over_ceiling")).await;
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect to fresh database");
+
+    // Bulk-seed N real harvest_workflow_executions rows in one round trip
+    // (the FK `harvest_events.workflow_exec_id` references), and read back
+    // their ids.
+    let wf_name = unique("event_batch_over_ceiling_wf");
+    let rows: Vec<CountRowUuid> = diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, run_id, shard_id, state, input, queue_name, \
+              started_at, created_at) \
+         SELECT gen_random_uuid(), $1, $1 || '_' || g, gen_random_uuid(), 0, 'RUNNING', \
+                '{}'::jsonb, 'default', NOW(), NOW() \
+         FROM generate_series(1, $2) AS g \
+         RETURNING id",
+    )
+    .bind::<diesel::sql_types::Text, _>(&wf_name)
+    .bind::<diesel::sql_types::BigInt, _>(N)
+    .load(&mut conn)
+    .await
+    .expect("bulk seed executions");
+    assert_eq!(rows.len(), usize::try_from(N).unwrap());
+
+    let events: Vec<(ExecutionId, WorkflowEvent)> = rows
+        .iter()
+        .map(|r| {
+            (
+                ExecutionId::from_uuid(r.id),
+                WorkflowEvent::WorkflowStarted {
+                    input: json!({}),
+                    timestamp: Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
+                    scheduled_time: None,
+                },
+            )
+        })
+        .collect();
+
+    store::append_new_execution_started_events_batch(
+        &mut conn,
+        &events,
+        None,
+        &PayloadCodecs::default(),
+    )
+    .await
+    .expect(
+        "append_new_execution_started_events_batch must not fail once its INSERT is chunked \
+         under the parameter ceiling",
+    );
+
+    let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.id).collect();
+    let event_count: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq_any(&ids))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count inserted events");
+    assert_eq!(event_count, N, "every chunk's INSERT must commit");
+}
+
+#[derive(diesel::QueryableByName)]
+struct CountRowUuid {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: uuid::Uuid,
 }

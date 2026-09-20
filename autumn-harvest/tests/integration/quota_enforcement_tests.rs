@@ -1968,12 +1968,12 @@ async fn awaited_child_spawn_quota_check_excludes_its_own_just_appended_history_
 // Issue #1589: `persist_all_started_child_workflows`'s local-child loop
 // batches children whose OWN `enforce_quota_admission` call is a proven
 // no-op (no declared policy, no active cap, or no resolved key) into one
-// multi-row INSERT per table, while a child with an active cap keeps the
-// original sequential insert-then-admit path. These tests are the direct
-// proof that the split preserves `enforce_quota_admission`'s graduated
-// admission property -- and its all-or-nothing rollback -- when a SINGLE
-// decision mixes both groups, which is exactly the scenario the split's
-// own safety argument depends on.
+// multi-row INSERT per table. A child with an active cap keeps the
+// original sequential insert-then-admit path instead. These tests are the
+// direct proof that the split preserves `enforce_quota_admission`'s
+// graduated admission property, and its all-or-nothing rollback, when a
+// SINGLE decision mixes both groups. That mix is exactly the scenario the
+// split's own safety argument depends on.
 // ---------------------------------------------------------------------------
 
 fn mixed_fan_out_parent<'a>(
@@ -2075,11 +2075,11 @@ async fn mixed_fan_out_admits_the_batched_group_and_exactly_caps_the_sequential_
 }
 
 /// Over the cap: 3 uncapped children (batched) plus 3 capped children
-/// sharing one key against a cap of 2 -- the 3rd capped child's admission
-/// must fail, and that failure must roll back the WHOLE decision,
-/// including the already-batched uncapped group, since both groups
-/// persist inside the same outer transaction. The parent parks and
-/// retries rather than completing with a partial fan-out.
+/// sharing one key against a cap of 2. The 3rd capped child's admission
+/// must fail. That failure must roll back the WHOLE decision, including
+/// the already-batched uncapped group, since both groups persist inside
+/// the same outer transaction. The parent parks and retries rather than
+/// completing with a partial fan-out.
 #[tokio::test]
 async fn mixed_fan_out_rolls_back_the_whole_decision_when_the_sequential_group_exceeds_cap() {
     let (url, _c) = setup_test_database_url_or_env().await;
@@ -2113,10 +2113,10 @@ async fn mixed_fan_out_rolls_back_the_whole_decision_when_the_sequential_group_e
     let worker = build_runtime_worker("w-1589-mixed-reject", 2, 1, reg);
     let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
 
-    // The rejection parks + backoff-retries the parent (never completes,
-    // since every retry hits the identical over-cap decision) -- give the
-    // worker a few cycles, then assert nothing from either group ever
-    // committed.
+    // The rejection parks + backoff-retries the parent. It never
+    // completes, since every retry hits the identical over-cap decision.
+    // Give the worker a few cycles, then assert nothing from either group
+    // ever committed.
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
     assert_eq!(

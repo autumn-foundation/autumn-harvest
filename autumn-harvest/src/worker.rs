@@ -10333,15 +10333,15 @@ async fn persist_all_started_child_workflows(
         }
 
         // Issue #1589 (direction a): route each local child to the
-        // sequential insert-then-admit path, or to a batched-insert path,
-        // by whether its OWN `enforce_quota_admission` call would touch the
-        // database at all. That function no-ops (zero queries) when the
-        // child declares no policy, its policy has no cap, or no key
-        // resolved -- exactly the three conditions checked below. A child
-        // in that shape can never reject a sibling or be rejected by one,
-        // so the insert-then-admit ORDER carries no information for it, and
-        // the whole group can be inserted, appended, and enqueued as one
-        // batch each instead of one row each.
+        // sequential insert-then-admit path, or to a batched-insert path.
+        // The routing checks whether its OWN `enforce_quota_admission` call
+        // would touch the database at all. That function no-ops (zero
+        // queries) when the child declares no policy, its policy has no
+        // cap, or no key resolved -- exactly the three conditions checked
+        // below. A child in that shape can never reject a sibling or be
+        // rejected by one. The insert-then-admit ORDER carries no
+        // information for it, so the whole group can be inserted, appended,
+        // and enqueued as one batch each instead of one row each.
         let mut sequential_children: Vec<LocalChildPlan<'_>> = Vec::new();
         let mut batchable_children: Vec<LocalChildPlan<'_>> = Vec::new();
         for child in &local_new_children {
@@ -10384,59 +10384,27 @@ async fn persist_all_started_child_workflows(
             }
         }
 
-        // Children with an active cap on their own declared policy: the
+        // Children with an active cap on their own declared policy keep the
         // original sequential insert-then-admit contract, one child at a
-        // time, unchanged -- so `enforce_quota_admission`'s graduated
-        // "admit first K, reject the rest" property (see that function's
-        // own doc comment) is unaffected by this split.
+        // time, unchanged. `enforce_quota_admission`'s graduated "admit
+        // first K, reject the rest" property (see that function's own doc
+        // comment) is therefore unaffected by this split.
         for plan in &sequential_children {
             let child = plan.child;
-            let child_row = NewWorkflowExecution {
-                continued_from_exec_id: None,
-                first_exec_id: None,
-                chain_execution_timeout: plan.defaults.chain_execution_timeout,
-                chain_deadline_at: plan.defaults.chain_deadline_at,
-                id: child.child_id.as_uuid(),
-                workflow_name: &child.workflow_name,
-                workflow_id: &plan.child_workflow_id,
-                run_id: uuid::Uuid::new_v4(),
+            // A spawned child is enforced against its OWN declared quota
+            // policy (issue #946, Codex round-3 review) -- resolved and
+            // bound-checked above via `child_quota_key`. Stamping it here
+            // (rather than `None`) keeps the row correctly tagged for
+            // future usage accounting even on a re-park path where this
+            // child already exists and enforcement below is skipped.
+            let child_row = build_child_row(
+                plan,
                 shard_id,
-                input: child.input.clone(),
-                parent_id: Some(parent_exec_id.as_uuid()),
-                queue_name: &queue_name,
-                execution_timeout: plan.defaults.execution_timeout,
-                deadline_at: plan.defaults.deadline_at,
-                sla: plan.defaults.sla,
-                sla_deadline_at: plan.defaults.sla_deadline_at,
-                memo: None,
-                search_attrs: None,
-                assigned_build_id: parent_execution.assigned_build_id.clone(),
-                parent_close_policy: None, // awaited child
-                owner: plan.defaults.owner,
-                runbook_url: plan.defaults.runbook_url,
-                severity: plan.defaults.severity,
-                context_headers: parent_execution.context_headers.clone(),
-                schedule_id: None, // child workflows are not scheduled fires
-                scheduled_for: None,
-                workflow_attempt: 1,
-                workflow_retry_policy: plan.defaults.retry_policy.clone(),
-                retry_of_exec_id: None,
-                origin: None, // child workflow, not a schedule fire (issue #534)
-                // Children get only builder-wide default callback
-                // targets, resolved at their own terminal transition
-                // (issue #605) — no per-execution override here.
-                completion_callbacks: None,
-                start_source: Some(crate::types::StartSource::Child.as_str()),
-                start_source_ref: Some(parent_exec_id_str.as_str()),
-                started_by: None,
-                // A spawned child is enforced against its OWN declared quota
-                // policy (issue #946, Codex round-3 review) -- resolved and
-                // bound-checked above via `child_quota_key`. Stamping it here
-                // (rather than `None`) keeps the row correctly tagged for
-                // future usage accounting even on a re-park path where this
-                // child already exists and enforcement below is skipped.
-                quota_key: plan.child_quota_key.as_deref(),
-            };
+                &queue_name,
+                parent_exec_id,
+                parent_execution,
+                &parent_exec_id_str,
+            );
             let child_started_event = WorkflowEvent::WorkflowStarted {
                 input: child.input.clone(),
                 timestamp: chrono::Utc::now(),
@@ -10505,59 +10473,29 @@ async fn persist_all_started_child_workflows(
             queue::enqueue(conn, &params).await?;
         }
 
-        // Children whose admission is a proven no-op: one multi-row INSERT
-        // per table for the whole group (chunked under Postgres's bind-
-        // parameter ceiling), instead of one INSERT per child (issue
+        // Children whose admission is a proven no-op get one multi-row
+        // INSERT per table for the whole group (chunked under Postgres's
+        // bind-parameter ceiling), instead of one INSERT per child (issue
         // #1589's own measured N -> 3N shape). `enforce_quota_admission` is
-        // not called here at all -- the `admission_is_noop` routing above
+        // not called here at all. The `admission_is_noop` routing above
         // already proves it would return immediately without a query.
         if !batchable_children.is_empty() {
             let child_rows: Vec<NewWorkflowExecution<'_>> = batchable_children
                 .iter()
                 .map(|plan| {
-                    let child = plan.child;
-                    NewWorkflowExecution {
-                        continued_from_exec_id: None,
-                        first_exec_id: None,
-                        chain_execution_timeout: plan.defaults.chain_execution_timeout,
-                        chain_deadline_at: plan.defaults.chain_deadline_at,
-                        id: child.child_id.as_uuid(),
-                        workflow_name: &child.workflow_name,
-                        workflow_id: &plan.child_workflow_id,
-                        run_id: uuid::Uuid::new_v4(),
+                    build_child_row(
+                        plan,
                         shard_id,
-                        input: child.input.clone(),
-                        parent_id: Some(parent_exec_id.as_uuid()),
-                        queue_name: &queue_name,
-                        execution_timeout: plan.defaults.execution_timeout,
-                        deadline_at: plan.defaults.deadline_at,
-                        sla: plan.defaults.sla,
-                        sla_deadline_at: plan.defaults.sla_deadline_at,
-                        memo: None,
-                        search_attrs: None,
-                        assigned_build_id: parent_execution.assigned_build_id.clone(),
-                        parent_close_policy: None, // awaited child
-                        owner: plan.defaults.owner,
-                        runbook_url: plan.defaults.runbook_url,
-                        severity: plan.defaults.severity,
-                        context_headers: parent_execution.context_headers.clone(),
-                        schedule_id: None, // child workflows are not scheduled fires
-                        scheduled_for: None,
-                        workflow_attempt: 1,
-                        workflow_retry_policy: plan.defaults.retry_policy.clone(),
-                        retry_of_exec_id: None,
-                        origin: None, // child workflow, not a schedule fire (issue #534)
-                        completion_callbacks: None,
-                        start_source: Some(crate::types::StartSource::Child.as_str()),
-                        start_source_ref: Some(parent_exec_id_str.as_str()),
-                        started_by: None,
-                        quota_key: plan.child_quota_key.as_deref(),
-                    }
+                        &queue_name,
+                        parent_exec_id,
+                        parent_execution,
+                        &parent_exec_id_str,
+                    )
                 })
                 .collect();
-            for chunk in child_rows.chunks(ROWS_PER_EXECUTION_INSERT_CHUNK) {
+            for (start, end) in compute_execution_chunk_bounds(&child_rows) {
                 diesel::insert_into(harvest_workflow_executions::table)
-                    .values(chunk)
+                    .values(&child_rows[start..end])
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
@@ -10765,16 +10703,136 @@ const NEW_WORKFLOW_EXECUTION_COLUMNS: usize = 35;
 const ROWS_PER_EXECUTION_INSERT_CHUNK: usize =
     POSTGRES_MAX_BIND_PARAMS / NEW_WORKFLOW_EXECUTION_COLUMNS;
 
-/// One local awaited child's precomputed spawn inputs (issue #1589). Built
-/// once per child in `persist_all_started_child_workflows`, then routed to
-/// either the sequential insert-then-admit path or the batched-insert path
-/// depending on whether its `enforce_quota_admission` call would be a
-/// no-op -- see that function's own early returns.
+/// Byte budget on one chunk's summed `input` size. Mirrors
+/// `queue::enqueue_batch`'s identical-purpose `MAX_CHUNK_PAYLOAD_BYTES`.
+///
+/// [`ROWS_PER_EXECUTION_INSERT_CHUNK`] alone bounds parameter count, not
+/// memory. A child's input may validly reach
+/// [`crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES`] (2 MiB), and this
+/// row's `input` is never offloaded (offload, issue #524, applies to event
+/// history, not the execution row itself). Without this bound, a fan-out of
+/// thousands of near-max-size children could still build one multi-gigabyte
+/// `INSERT`.
+const MAX_EXECUTION_CHUNK_PAYLOAD_BYTES: usize = 8 * 1024 * 1024; // 4x DEFAULT_MAX_WORKFLOW_INPUT_BYTES
+
+const _: () = assert!(
+    MAX_EXECUTION_CHUNK_PAYLOAD_BYTES as u64
+        == 4 * crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES
+);
+
+/// Exact byte length `serde_json::to_vec(value)` would produce, without
+/// allocating that `Vec`. Mirrors `queue.rs`'s identical helper.
+fn json_byte_len(value: &serde_json::Value) -> usize {
+    struct CountingWriter(usize);
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = CountingWriter(0);
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+
+/// Splits `rows` into `[start, end)` index ranges, each within both
+/// [`ROWS_PER_EXECUTION_INSERT_CHUNK`] rows and
+/// [`MAX_EXECUTION_CHUNK_PAYLOAD_BYTES`] of summed `input`. Whichever bound
+/// is reached first ends a chunk.
+///
+/// Mirrors `queue.rs`'s `compute_chunk_bounds` shape. A non-empty `rows`
+/// always returns at least one range, and every row falls into exactly one
+/// of them, in order.
+fn compute_execution_chunk_bounds(rows: &[NewWorkflowExecution<'_>]) -> Vec<(usize, usize)> {
+    let mut chunk_bounds = Vec::new();
+    let mut chunk_start = 0_usize;
+    while chunk_start < rows.len() {
+        let mut chunk_end = chunk_start + 1;
+        let mut payload_bytes = json_byte_len(&rows[chunk_start].input);
+        while chunk_end < rows.len() && chunk_end - chunk_start < ROWS_PER_EXECUTION_INSERT_CHUNK {
+            let next_bytes = json_byte_len(&rows[chunk_end].input);
+            if payload_bytes + next_bytes > MAX_EXECUTION_CHUNK_PAYLOAD_BYTES {
+                break;
+            }
+            payload_bytes += next_bytes;
+            chunk_end += 1;
+        }
+        chunk_bounds.push((chunk_start, chunk_end));
+        chunk_start = chunk_end;
+    }
+    chunk_bounds
+}
+
+/// One local awaited child's precomputed spawn inputs (issue #1589).
+///
+/// Built once per child in `persist_all_started_child_workflows`. Then
+/// routed to either the sequential insert-then-admit path or the
+/// batched-insert path, depending on whether its `enforce_quota_admission`
+/// call would be a no-op -- see that function's own early returns.
 struct LocalChildPlan<'a> {
     child: &'a StartedChildWorkflowCommand,
     defaults: ChildWorkflowDefaults,
     child_workflow_id: String,
     child_quota_key: Option<String>,
+}
+
+/// Builds one local awaited child's insert row from its [`LocalChildPlan`].
+///
+/// Shared by both the sequential and the batched-insert paths in
+/// `persist_all_started_child_workflows` (issue #1589), so the two paths
+/// cannot drift on which fields a child row carries.
+fn build_child_row<'p>(
+    plan: &'p LocalChildPlan<'_>,
+    shard_id: i32,
+    queue_name: &'p str,
+    parent_exec_id: ExecutionId,
+    parent_execution: &'p WorkflowExecution,
+    parent_exec_id_str: &'p str,
+) -> NewWorkflowExecution<'p> {
+    let child = plan.child;
+    NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
+        chain_execution_timeout: plan.defaults.chain_execution_timeout,
+        chain_deadline_at: plan.defaults.chain_deadline_at,
+        id: child.child_id.as_uuid(),
+        workflow_name: &child.workflow_name,
+        workflow_id: &plan.child_workflow_id,
+        run_id: uuid::Uuid::new_v4(),
+        shard_id,
+        input: child.input.clone(),
+        parent_id: Some(parent_exec_id.as_uuid()),
+        queue_name,
+        execution_timeout: plan.defaults.execution_timeout,
+        deadline_at: plan.defaults.deadline_at,
+        sla: plan.defaults.sla,
+        sla_deadline_at: plan.defaults.sla_deadline_at,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: parent_execution.assigned_build_id.clone(),
+        parent_close_policy: None, // awaited child
+        owner: plan.defaults.owner,
+        runbook_url: plan.defaults.runbook_url,
+        severity: plan.defaults.severity,
+        context_headers: parent_execution.context_headers.clone(),
+        schedule_id: None, // child workflows are not scheduled fires
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: plan.defaults.retry_policy.clone(),
+        retry_of_exec_id: None,
+        origin: None, // child workflow, not a schedule fire (issue #534)
+        // Children get only builder-wide default callback targets,
+        // resolved at their own terminal transition (issue #605) -- no
+        // per-execution override here.
+        completion_callbacks: None,
+        start_source: Some(crate::types::StartSource::Child.as_str()),
+        start_source_ref: Some(parent_exec_id_str),
+        started_by: None,
+        quota_key: plan.child_quota_key.as_deref(),
+    }
 }
 
 /// Apply `max_workflow_attempts_ceiling` to a detached child's serialized retry
@@ -29777,7 +29835,7 @@ mod tests {
     /// field count, by exhaustive destructure (issue #1589, mirrors
     /// `queue.rs`'s identical regression test for `NewTaskQueueItem`).
     /// Adding, removing, or renaming a field breaks this match at compile
-    /// time, so the chunk size cannot silently drift out of sync with the
+    /// time. The chunk size then cannot silently drift out of sync with the
     /// row width it bounds.
     #[test]
     fn new_workflow_execution_column_count_matches_the_constant() {
@@ -29862,6 +29920,90 @@ mod tests {
                     <= POSTGRES_MAX_BIND_PARAMS
             );
         }
+    }
+
+    /// Mirrors `queue.rs`'s `chunk_bounds_splits_near_max_size_inputs_into_many_small_chunks`
+    /// (issue #1589). A run of near-max-size child inputs must split into
+    /// many small chunks under [`MAX_EXECUTION_CHUNK_PAYLOAD_BYTES`], not
+    /// all land in one chunk sized only by
+    /// [`ROWS_PER_EXECUTION_INSERT_CHUNK`].
+    #[test]
+    fn execution_chunk_bounds_splits_near_max_size_inputs_into_many_small_chunks() {
+        let near_max_bytes =
+            usize::try_from(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES).unwrap();
+        let ids: Vec<String> = (0..200).map(|i| format!("wf-id-{i}")).collect();
+        let rows: Vec<crate::models::NewWorkflowExecution<'_>> = ids
+            .iter()
+            .map(|workflow_id| crate::models::NewWorkflowExecution {
+                id: uuid::Uuid::nil(),
+                workflow_name: "wf",
+                workflow_id,
+                run_id: uuid::Uuid::nil(),
+                shard_id: 0,
+                input: serde_json::json!("x".repeat(near_max_bytes)),
+                parent_id: None,
+                queue_name: "default",
+                execution_timeout: None,
+                deadline_at: None,
+                chain_execution_timeout: None,
+                chain_deadline_at: None,
+                memo: None,
+                search_attrs: None,
+                assigned_build_id: None,
+                parent_close_policy: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                context_headers: None,
+                sla: None,
+                sla_deadline_at: None,
+                schedule_id: None,
+                scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: None,
+                retry_of_exec_id: None,
+                origin: None,
+                completion_callbacks: None,
+                continued_from_exec_id: None,
+                first_exec_id: None,
+                start_source: None,
+                start_source_ref: None,
+                started_by: None,
+                quota_key: None,
+            })
+            .collect();
+
+        let bounds = compute_execution_chunk_bounds(&rows);
+
+        assert!(
+            bounds.len() > 10,
+            "200 near-max-size rows must split into many small chunks, got {} chunk(s)",
+            bounds.len()
+        );
+        for &(start, end) in &bounds {
+            let row_sizes: Vec<usize> = rows[start..end]
+                .iter()
+                .map(|r| json_byte_len(&r.input))
+                .collect();
+            let chunk_payload: usize = row_sizes.iter().sum();
+            let largest_row = row_sizes.iter().copied().max().unwrap_or(0);
+            assert!(
+                chunk_payload <= MAX_EXECUTION_CHUNK_PAYLOAD_BYTES + largest_row,
+                "chunk [{start}, {end}) carries {chunk_payload} bytes, over the \
+                 {MAX_EXECUTION_CHUNK_PAYLOAD_BYTES}-byte budget by more than one row's allowance"
+            );
+        }
+        let mut next_expected = 0;
+        for &(start, end) in &bounds {
+            assert_eq!(start, next_expected, "chunks must be contiguous, no gaps");
+            assert!(end > start, "every chunk must carry at least one row");
+            next_expected = end;
+        }
+        assert_eq!(
+            next_expected,
+            rows.len(),
+            "every row must fall into a chunk"
+        );
     }
 
     /// The release and escalation branches must report OPPOSITE distinct-worker

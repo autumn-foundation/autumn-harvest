@@ -374,6 +374,72 @@ const NEW_HARVEST_EVENT_COLUMNS: usize = 4;
 #[cfg(feature = "db")]
 const ROWS_PER_EVENT_INSERT_CHUNK: usize = POSTGRES_MAX_BIND_PARAMS / NEW_HARVEST_EVENT_COLUMNS;
 
+/// Byte budget on one chunk's summed `event_data` size. Mirrors
+/// `queue::enqueue_batch`'s identical-purpose `MAX_CHUNK_PAYLOAD_BYTES`.
+///
+/// [`ROWS_PER_EVENT_INSERT_CHUNK`] alone bounds parameter count, not
+/// memory. A `WorkflowStarted` input may validly reach
+/// [`crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES`] (2 MiB), and offload
+/// (issue #524) only shrinks it when a `PayloadOffloader` is configured and
+/// the threshold is crossed. Without this bound, a fan-out of thousands of
+/// near-max-size children could still build one multi-gigabyte `INSERT`.
+#[cfg(feature = "db")]
+const MAX_EVENT_CHUNK_PAYLOAD_BYTES: usize = 8 * 1024 * 1024; // 4x DEFAULT_MAX_WORKFLOW_INPUT_BYTES
+
+#[cfg(feature = "db")]
+const _: () = assert!(
+    MAX_EVENT_CHUNK_PAYLOAD_BYTES as u64 == 4 * crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES
+);
+
+/// Exact byte length `serde_json::to_vec(value)` would produce, without
+/// allocating that `Vec`. Mirrors `queue.rs`'s identical helper.
+#[cfg(feature = "db")]
+fn json_byte_len(value: &serde_json::Value) -> usize {
+    struct CountingWriter(usize);
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = CountingWriter(0);
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+
+/// Splits `rows` into `[start, end)` index ranges, each within both
+/// [`ROWS_PER_EVENT_INSERT_CHUNK`] rows and
+/// [`MAX_EVENT_CHUNK_PAYLOAD_BYTES`] of summed `event_data`. Whichever
+/// bound is reached first ends a chunk. Measured post-offload, on the rows
+/// actually about to be inserted -- exactly what the `INSERT` pays for.
+///
+/// Mirrors `queue.rs`'s `compute_chunk_bounds` shape. A non-empty `rows`
+/// always returns at least one range, and every row falls into exactly one
+/// of them, in order.
+#[cfg(feature = "db")]
+fn compute_event_chunk_bounds(rows: &[NewHarvestEvent<'_>]) -> Vec<(usize, usize)> {
+    let mut chunk_bounds = Vec::new();
+    let mut chunk_start = 0_usize;
+    while chunk_start < rows.len() {
+        let mut chunk_end = chunk_start + 1;
+        let mut payload_bytes = json_byte_len(&rows[chunk_start].event_data);
+        while chunk_end < rows.len() && chunk_end - chunk_start < ROWS_PER_EVENT_INSERT_CHUNK {
+            let next_bytes = json_byte_len(&rows[chunk_end].event_data);
+            if payload_bytes + next_bytes > MAX_EVENT_CHUNK_PAYLOAD_BYTES {
+                break;
+            }
+            payload_bytes += next_bytes;
+            chunk_end += 1;
+        }
+        chunk_bounds.push((chunk_start, chunk_end));
+        chunk_start = chunk_end;
+    }
+    chunk_bounds
+}
+
 /// Append one `WorkflowStarted` event per execution, batched.
 ///
 /// One multi-row `INSERT` per chunk, instead of one `INSERT` per execution
@@ -382,8 +448,8 @@ const ROWS_PER_EVENT_INSERT_CHUNK: usize = POSTGRES_MAX_BIND_PARAMS / NEW_HARVES
 ///
 /// Every execution here is brand new, so its history is empty and every row
 /// uses `event_id = 0`. Unlike a single execution's own event append, no row
-/// here re-reads `MAX(event_id) FOR UPDATE` to serialize against a sibling --
-/// there is no sibling sharing an execution id to serialize against.
+/// here re-reads `MAX(event_id) FOR UPDATE` to serialize against a sibling.
+/// There is no sibling sharing an execution id to serialize against.
 ///
 /// `events` must share one shard -- true by construction for the only
 /// caller, since a local child always lands on its parent's shard (issue
@@ -441,9 +507,9 @@ pub async fn append_new_execution_started_events_batch(
     Box::pin(
         conn.transaction::<(), crate::error::HarvestError, _>(async |conn| {
             crate::replication::assert_fence(conn, shard).await?;
-            for chunk in rows.chunks(ROWS_PER_EVENT_INSERT_CHUNK) {
+            for (start, end) in compute_event_chunk_bounds(&rows) {
                 diesel::insert_into(harvest_events::table)
-                    .values(chunk)
+                    .values(&rows[start..end])
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
@@ -2420,7 +2486,7 @@ mod tests {
     /// count, by exhaustive destructure (issue #1589, mirrors
     /// `queue.rs`'s identical regression test for `NewTaskQueueItem`).
     /// Adding, removing, or renaming a field breaks this match at compile
-    /// time, so the chunk size cannot silently drift out of sync with the
+    /// time. The chunk size then cannot silently drift out of sync with the
     /// row width it bounds.
     #[cfg(feature = "db")]
     #[test]
@@ -2443,6 +2509,74 @@ mod tests {
                 ROWS_PER_EVENT_INSERT_CHUNK * NEW_HARVEST_EVENT_COLUMNS <= POSTGRES_MAX_BIND_PARAMS
             );
         }
+    }
+
+    /// Mirrors `queue.rs`'s `chunk_bounds_splits_near_max_size_inputs_into_many_small_chunks`
+    /// (issue #1589). A run of near-max-size `WorkflowStarted` inputs must
+    /// split into many small chunks under [`MAX_EVENT_CHUNK_PAYLOAD_BYTES`],
+    /// not all land in one chunk sized only by
+    /// [`ROWS_PER_EVENT_INSERT_CHUNK`].
+    #[cfg(feature = "db")]
+    #[test]
+    fn event_chunk_bounds_splits_near_max_size_inputs_into_many_small_chunks() {
+        let near_max_bytes =
+            usize::try_from(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES).unwrap();
+        let events: Vec<(ExecutionId, WorkflowEvent)> = (0..200)
+            .map(|_| {
+                let payload = "x".repeat(near_max_bytes);
+                (
+                    ExecutionId::new(),
+                    WorkflowEvent::WorkflowStarted {
+                        input: serde_json::json!(payload),
+                        timestamp: Utc::now(),
+                        last_completion_result: None,
+                        last_error: None,
+                        scheduled_time: None,
+                    },
+                )
+            })
+            .collect();
+        let rows: Vec<NewHarvestEvent<'_>> = events
+            .iter()
+            .map(|(exec_id, event)| NewHarvestEvent {
+                workflow_exec_id: exec_id.as_uuid(),
+                event_id: 0,
+                event_type: event.type_name(),
+                event_data: DEFAULT_PAYLOAD_CODECS.encode_event(event).unwrap(),
+            })
+            .collect();
+
+        let bounds = compute_event_chunk_bounds(&rows);
+
+        assert!(
+            bounds.len() > 10,
+            "200 near-max-size rows must split into many small chunks, got {} chunk(s)",
+            bounds.len()
+        );
+        for &(start, end) in &bounds {
+            let row_sizes: Vec<usize> = rows[start..end]
+                .iter()
+                .map(|r| json_byte_len(&r.event_data))
+                .collect();
+            let chunk_payload: usize = row_sizes.iter().sum();
+            let largest_row = row_sizes.iter().copied().max().unwrap_or(0);
+            assert!(
+                chunk_payload <= MAX_EVENT_CHUNK_PAYLOAD_BYTES + largest_row,
+                "chunk [{start}, {end}) carries {chunk_payload} bytes, over the \
+                 {MAX_EVENT_CHUNK_PAYLOAD_BYTES}-byte budget by more than one row's allowance"
+            );
+        }
+        let mut next_expected = 0;
+        for &(start, end) in &bounds {
+            assert_eq!(start, next_expected, "chunks must be contiguous, no gaps");
+            assert!(end > start, "every chunk must carry at least one row");
+            next_expected = end;
+        }
+        assert_eq!(
+            next_expected,
+            rows.len(),
+            "every row must fall into a chunk"
+        );
     }
 
     #[test]
