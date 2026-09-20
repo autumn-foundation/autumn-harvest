@@ -2654,6 +2654,23 @@ async fn run_shard_tick(
                     .await?;
                     continue;
                 }
+                Ok(CandidateDeleteOutcome::SkippedStaging) => {
+                    // A shard-rebalance staging vacate landed after selection
+                    // (issue #1317 review, P1): the delete-tx FOR UPDATE
+                    // re-check found `staging_vacated_state` set and aborted
+                    // the delete. Treat exactly like a routine skip, for the
+                    // same reason as `SkippedHeld` above.
+                    routine_skip_candidate(
+                        &mut conn,
+                        candidate.id,
+                        candidate_cursor,
+                        has_failed,
+                        &mut outcome,
+                        &guard.active_ids,
+                    )
+                    .await?;
+                    continue;
+                }
                 Ok(CandidateDeleteOutcome::Deleted { summarized }) => {
                     // A summary row was written in the delete tx (issue #752).
                     if summarized {
@@ -2735,6 +2752,11 @@ enum CandidateDeleteOutcome {
     /// execution row, no summary). The caller treats this exactly like a
     /// routine skip.
     SkippedHeld,
+    /// A shard-rebalance staging vacate was found in flight under the
+    /// delete-tx row lock (`staging_vacated_state` set). The delete was
+    /// aborted and NOTHING was touched, for the same reason as
+    /// [`Self::SkippedHeld`] (issue #1317 review, P1).
+    SkippedStaging,
 }
 
 /// The two legal-hold timestamp columns `(legal_hold_set_at, legal_hold_until)`.
@@ -2775,6 +2797,14 @@ async fn delete_candidate_execution(
     let summary = summary.copied();
     Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
         let mut summarized = false;
+        // Set alongside `summarized` when this candidate hits the forced
+        // migration-target tombstone below. It is set even on the `ON
+        // CONFLICT DO NOTHING` path, where `summarized` itself stays
+        // `false` (issue #1317 review, P1 follow-up). The child-lineage
+        // check near the end of this function needs to know a summary row
+        // exists for this row. It is not enough to know THIS call
+        // inserted one.
+        let mut preserve_child_lineage_for_migration_tombstone = false;
         // ── Authoritative legal-hold re-check under a row lock (issue #747
         // BLOCKER 1) ─────────────────────────────────────────────────────
         // The candidate SELECT read the hold columns then committed and
@@ -2799,52 +2829,96 @@ async fn delete_candidate_execution(
         // (e.g. a delete error below) discards the summary too, so no
         // orphan can result. The summary INSERT happens AFTER the hold
         // re-check (a held row is never summarized) and BEFORE the deletes.
-        if let Some(policy) = summary {
-            let row: Option<SummarySourceRow> = harvest_workflow_executions::table
-                .find(candidate_id)
-                .select((
-                    harvest_workflow_executions::legal_hold_set_at,
-                    harvest_workflow_executions::legal_hold_until,
-                    harvest_workflow_executions::workflow_name,
-                    harvest_workflow_executions::workflow_id,
-                    harvest_workflow_executions::state,
-                    harvest_workflow_executions::started_at,
-                    harvest_workflow_executions::completed_at,
-                    harvest_workflow_executions::shard_id,
-                    harvest_workflow_executions::output,
-                    harvest_workflow_executions::error,
-                    harvest_workflow_executions::search_attrs,
-                    harvest_workflow_executions::parent_id,
-                    harvest_workflow_executions::migrated_from_shards,
-                ))
-                .for_update()
-                .first::<SummarySourceRow>(conn)
-                .await
-                .optional()
-                .map_err(database_error)?;
+        // The row read and hold re-check are unconditional (issue #1317
+        // review, P1): whether a summary gets written now has TWO
+        // independent triggers, not one. Summary retention being
+        // configured is the original (#752) trigger.
+        //
+        // The other trigger is new. `migrated_from_shards` non-empty means
+        // this row was itself the TARGET of a shard-rebalance migration at
+        // some point. A source shard elsewhere can still hold a `MIGRATED`
+        // seal whose forwarding chain resolves here, not yet observed
+        // terminal (`reconcile_migrated_seal_terminality` /
+        // `live_copy_is_terminal`).
+        //
+        // Hard-deleting this row with no trace at all breaks reconciliation
+        // for that seal permanently. Every future attempt would fail with
+        // "neither its execution row nor its summary exists" forever. The
+        // seal's business key would stay blocked past any operator's reach.
+        //
+        // So this one case gets a minimal, payload-free summary even when
+        // summary retention is otherwise disabled. That is just enough for
+        // reconciliation to read a terminal state. Every other row's
+        // behavior, and this row's own retention age/eligibility, is
+        // unchanged.
+        let row: Option<SummarySourceRow> = harvest_workflow_executions::table
+            .find(candidate_id)
+            .select((
+                harvest_workflow_executions::legal_hold_set_at,
+                harvest_workflow_executions::legal_hold_until,
+                harvest_workflow_executions::workflow_name,
+                harvest_workflow_executions::workflow_id,
+                harvest_workflow_executions::state,
+                harvest_workflow_executions::started_at,
+                harvest_workflow_executions::completed_at,
+                harvest_workflow_executions::shard_id,
+                harvest_workflow_executions::output,
+                harvest_workflow_executions::error,
+                harvest_workflow_executions::search_attrs,
+                harvest_workflow_executions::parent_id,
+                harvest_workflow_executions::migrated_from_shards,
+                harvest_workflow_executions::staging_vacated_state,
+            ))
+            .for_update()
+            .first::<SummarySourceRow>(conn)
+            .await
+            .optional()
+            .map_err(database_error)?;
 
-            // `None` = row concurrently deleted: nothing to summarize; the
-            // deletes below are harmless no-ops (matches the hold-only
-            // path's missing-row behavior).
-            if let Some((
-                set_at,
-                until,
-                workflow_name,
-                workflow_id,
-                state,
-                started_at,
-                completed_at,
-                shard_id,
-                output,
-                error,
-                search_attrs,
-                parent_id,
-                migrated_from_shards,
-            )) = row
-            {
-                if legal_hold_active(set_at, until, now) {
-                    return Ok(CandidateDeleteOutcome::SkippedHeld);
-                }
+        // `None` = row concurrently deleted: nothing to summarize; the
+        // deletes below are harmless no-ops (matches the pre-#752 missing-
+        // row behavior).
+        if let Some((
+            set_at,
+            until,
+            workflow_name,
+            workflow_id,
+            state,
+            started_at,
+            completed_at,
+            shard_id,
+            output,
+            error,
+            search_attrs,
+            parent_id,
+            migrated_from_shards,
+            staging_vacated_state,
+        )) = row
+        {
+            if legal_hold_active(set_at, until, now) {
+                return Ok(CandidateDeleteOutcome::SkippedHeld);
+            }
+            // A shard-rebalance staging vacate re-check under the SAME row
+            // lock (issue #1317 review, P1). `stage_copy` can seal this row
+            // `CONTINUED_AS_NEW` mid-flight to free its business key for a
+            // copy being staged elsewhere. It records the row's real prior
+            // state in `staging_vacated_state`, so an abort can restore it.
+            // The candidate SELECT that chose this row for deletion ran
+            // before that vacate, released its lock, and never saw it. If
+            // the delete proceeded here, the row would vanish before
+            // `discard_staged_copy_restoring_seal` could restore it on
+            // abort. Any summary would record the transient
+            // `CONTINUED_AS_NEW` instead of the run's real outcome.
+            // Abort exactly like an active legal hold: touch nothing.
+            if staging_vacated_state.is_some() {
+                return Ok(CandidateDeleteOutcome::SkippedStaging);
+            }
+            let was_ever_migrated_here = migrated_from_shards
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|hops| !hops.is_empty());
+            if summary.is_some() || was_ever_migrated_here {
+                preserve_child_lineage_for_migration_tombstone = was_ever_migrated_here;
                 // completed_at is NOT NULL by the candidate query's WHERE
                 // clause; fall back to started_at defensively so the NOT
                 // NULL summary column always has a value.
@@ -2852,15 +2926,17 @@ async fn delete_candidate_execution(
                 // Clamp at 0: a `completed_at` before `started_at` (clock
                 // skew across nodes) must never produce a negative duration.
                 let duration_ms = Some((completed - started_at).num_milliseconds().max(0));
-                // Payload capture is opt-in (AC3): a policy with capture
-                // disabled leaves result/error NULL.
-                let (result, error_out) = if policy.capture_payload {
-                    (
+                // Payload capture is opt-in (AC3), and only ever happens
+                // under an explicit policy that asked for it. The
+                // migration-target tombstone case has no policy, so it
+                // always leaves result/error NULL -- identity and timing
+                // only, exactly like a `capture_payload: false` policy.
+                let (result, error_out) = match summary {
+                    Some(policy) if policy.capture_payload => (
                         cap_result_payload(output, policy.max_payload_bytes),
                         cap_error_text(error.as_deref(), policy.max_payload_bytes),
-                    )
-                } else {
-                    (None, None)
+                    ),
+                    _ => (None, None),
                 };
                 // Codec caveat (issue #752): the summary stores the
                 // `output`/`search_attrs` COLUMNS verbatim — these are
@@ -2869,6 +2945,21 @@ async fn delete_candidate_execution(
                 // encryption-at-rest is preserved: the longer-retained
                 // summary tier can never hold plaintext that the event
                 // history encrypts.
+                //
+                // The forced migration-target tombstone (no `SummaryPolicy`
+                // configured) drops `search_attrs` too, not just the
+                // result/error payload above (issue #1317 review, P1
+                // follow-up). Those attributes can carry plaintext
+                // business/PII data. This row's whole purpose is to be the
+                // minimum an un-reconciled seal needs -- identity, state,
+                // and timing. An explicit policy's own choice to capture
+                // search attrs is unaffected; this only strips the forced
+                // case that never opted into anything.
+                let search_attrs = if summary.is_some() {
+                    search_attrs
+                } else {
+                    None
+                };
                 let new_summary = NewExecutionSummary {
                     execution_id: candidate_id,
                     workflow_name,
@@ -2902,25 +2993,6 @@ async fn delete_candidate_execution(
                     .map_err(database_error)?;
                 summarized = inserted > 0;
             }
-        } else {
-            // Summary retention disabled: byte-for-byte the pre-#752
-            // hold-only re-check.
-            let hold: Option<HoldTimestamps> = harvest_workflow_executions::table
-                .find(candidate_id)
-                .select((
-                    harvest_workflow_executions::legal_hold_set_at,
-                    harvest_workflow_executions::legal_hold_until,
-                ))
-                .for_update()
-                .first::<HoldTimestamps>(conn)
-                .await
-                .optional()
-                .map_err(database_error)?;
-            if let Some((set_at, until)) = hold
-                && legal_hold_active(set_at, until, now)
-            {
-                return Ok(CandidateDeleteOutcome::SkippedHeld);
-            }
         }
 
         // Orphan the deleted parent's terminal children so their `parent_id`
@@ -2936,7 +3008,15 @@ async fn delete_candidate_execution(
         // of whether the parent or child is processed first. The retained
         // `parent_id` on a to-be-deleted terminal child is harmless (no FK;
         // `should_skip_candidate` only reads `parent_id` downward).
-        if summary.is_none() {
+        //
+        // The forced migration-target tombstone above is a THIRD trigger
+        // for a surviving summary row, besides `summary` being configured
+        // (issue #1317 review, P1 follow-up). `summary.is_none()` alone
+        // does not see it, so this null-out ran even when a summary row
+        // for this exact candidate had just been inserted. A later #495
+        // erase of that summary would then find no child to cascade to.
+        // It could report success over a child payload it never reached.
+        if summary.is_none() && !preserve_child_lineage_for_migration_tombstone {
             diesel::update(
                 harvest_workflow_executions::table
                     .filter(harvest_workflow_executions::parent_id.eq(Some(candidate_id)))
@@ -3036,6 +3116,7 @@ type SummarySourceRow = (
     Option<serde_json::Value>, // search_attrs
     Option<uuid::Uuid>,        // parent_id
     Option<serde_json::Value>, // migrated_from_shards
+    Option<String>,            // staging_vacated_state
 );
 
 /// Garbage-collect execution summaries older than the summary horizon (issue
@@ -3061,6 +3142,22 @@ pub(crate) async fn purge_expired_summaries(
         workflow_name: String,
     }
 
+    // Issue #1317 review, P1 follow-up. A summary demoted from a row that
+    // was EVER a shard-rebalance migration target
+    // (`migrated_from_shards` non-empty) is excluded from this horizon's
+    // DELETE entirely.
+    //
+    // It can still be the only surviving evidence a source shard's
+    // un-reconciled `MIGRATED` seal needs to resolve
+    // (`live_copy_is_terminal`). Hard-deleting it past an operator's
+    // configured horizon reopens the exact "seal blocked forever" gap the
+    // retention fix above exists to close. This mirrors the codebase's
+    // existing rule for the row itself: retention already never
+    // hard-deletes a `MIGRATED` seal row outright, for the identical
+    // reason.
+    const NOT_A_MIGRATION_TARGET: &str =
+        "(migrated_from_shards IS NULL OR jsonb_array_length(migrated_from_shards) = 0)";
+
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     let Ok(chrono_age) = chrono::Duration::from_std(summary_age) else {
         // Unrepresentable age (unreachable for validated horizons, bounded by
@@ -3072,9 +3169,10 @@ pub(crate) async fn purge_expired_summaries(
     let batch = i64::try_from(batch_size).unwrap_or(i64::MAX).max(1);
 
     if dry_run {
-        let rows = diesel::sql_query(
-            "SELECT workflow_name FROM harvest_execution_summaries WHERE completed_at < $1",
-        )
+        let rows = diesel::sql_query(format!(
+            "SELECT workflow_name FROM harvest_execution_summaries \
+              WHERE completed_at < $1 AND {NOT_A_MIGRATION_TARGET}"
+        ))
         .bind::<Timestamptz, _>(cutoff)
         .load::<NameRow>(conn)
         .await
@@ -3086,16 +3184,16 @@ pub(crate) async fn purge_expired_summaries(
     }
 
     loop {
-        let rows = diesel::sql_query(
+        let rows = diesel::sql_query(format!(
             "DELETE FROM harvest_execution_summaries
              WHERE execution_id IN (
                  SELECT execution_id FROM harvest_execution_summaries
-                 WHERE completed_at < $1
+                 WHERE completed_at < $1 AND {NOT_A_MIGRATION_TARGET}
                  ORDER BY completed_at ASC, execution_id ASC
                  LIMIT $2
              )
-             RETURNING workflow_name",
-        )
+             RETURNING workflow_name"
+        ))
         .bind::<Timestamptz, _>(cutoff)
         .bind::<BigInt, _>(batch)
         .load::<NameRow>(conn)
@@ -3109,6 +3207,44 @@ pub(crate) async fn purge_expired_summaries(
         // EFFECTIVE limit `batch` (clamped `.max(1)`), not the raw `batch_size`:
         // a `batch_size` of 0 makes the LIMIT 1 while `n < 0` is impossible, so
         // an `n == 0` early break is required or the loop would spin forever.
+        if n == 0 || i64::try_from(n).unwrap_or(i64::MAX) < batch {
+            break;
+        }
+    }
+
+    // Issue #1317 review, P1 follow-up to the exemption above. Excluding a
+    // migration-target summary from the DELETE protects the minimal
+    // reconciliation evidence. It also protects that row's OPT-IN payload
+    // fields (`result`/`error`/`search_attrs`) forever whenever a
+    // `SummaryPolicy` captures them. That silently turns a finite,
+    // operator-configured summary horizon into unbounded payload retention
+    // for any execution a shard rebalance ever touched.
+    //
+    // Past the SAME cutoff, strip the payload fields on those rows instead
+    // of leaving them untouched. `state`/`workflow_name`/`workflow_id`/
+    // `migrated_from_shards`/timestamps stay, matching the exact shape
+    // `retention.rs`'s own fallback-summary write already produces when
+    // summary retention is disabled outright. `live_copy_is_terminal` reads
+    // only those columns, never the payload ones, so reconciliation is
+    // unaffected.
+    loop {
+        let n = diesel::sql_query(
+            "UPDATE harvest_execution_summaries
+             SET result = NULL, error = NULL, search_attrs = NULL
+             WHERE execution_id IN (
+                 SELECT execution_id FROM harvest_execution_summaries
+                 WHERE completed_at < $1
+                   AND NOT (migrated_from_shards IS NULL OR jsonb_array_length(migrated_from_shards) = 0)
+                   AND (result IS NOT NULL OR error IS NOT NULL OR search_attrs IS NOT NULL)
+                 ORDER BY completed_at ASC, execution_id ASC
+                 LIMIT $2
+             )",
+        )
+        .bind::<Timestamptz, _>(cutoff)
+        .bind::<BigInt, _>(batch)
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
         if n == 0 || i64::try_from(n).unwrap_or(i64::MAX) < batch {
             break;
         }

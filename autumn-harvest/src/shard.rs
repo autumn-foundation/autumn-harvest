@@ -1608,6 +1608,26 @@ impl ShardedDbPool {
             .collect()
     }
 
+    /// Whether `a` and `b` name the same physical pool (issue #1266).
+    ///
+    /// Two distinct [`ShardId`]s can be aliased to one physical database
+    /// during a pre-split staging rollout (see [`Self::pool_groups`]). A
+    /// caller holding a checked-out connection for `a` must not check out
+    /// `b` too when this returns `true`. On a size-one pool, that would
+    /// wait for a second connection the held one can never release. It
+    /// would deadlock until the checkout times out. Comparing `a == b`
+    /// alone misses this,
+    /// since the aliasing is about physical pool identity, not shard-id
+    /// equality. Unknown shards (absent from `pool_group`) compare unequal
+    /// to everything, including themselves.
+    #[must_use]
+    pub fn same_physical_pool(&self, a: ShardId, b: ShardId) -> bool {
+        match (self.pool_group.get(&a), self.pool_group.get(&b)) {
+            (Some(ga), Some(gb)) => ga == gb,
+            _ => false,
+        }
+    }
+
     /// The default shard used when an `ExecutionId` carries the unencoded
     /// sentinel or references a shard that isn't configured locally.
     #[must_use]

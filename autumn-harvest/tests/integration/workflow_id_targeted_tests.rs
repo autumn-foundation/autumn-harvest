@@ -638,6 +638,44 @@ async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
     assert_eq!(resolved.state, "CONTINUED_AS_NEW");
 }
 
+/// Issue #1317 review, P1 follow-up: a reconciled `MIGRATED` seal
+/// (`migrated_run_terminal_at` set) no longer represents anything current
+/// for this business key. It must be excluded from the terminal fallback
+/// outright, not merely lose an ordinary `started_at` tie-break. The seal
+/// can be the ONLY row for this key on this shard, with no newer run to
+/// naturally outrank it.
+#[tokio::test]
+async fn resolver_never_returns_a_reconciled_seal() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (url, _c) = setup_test_database_url().await;
+    let mut conn = connect(&url).await;
+
+    let workflow_id = "res-reconciled-seal-only";
+    let seal = ExecutionId::new_for_shard(ShardId::new(0));
+    insert_running_row(&mut conn, "resolver_wf", workflow_id, seal).await;
+    diesel::update(harvest_workflow_executions::table.find(seal.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("MIGRATED"),
+            harvest_workflow_executions::migrated_to_shard.eq(1),
+            harvest_workflow_executions::migrated_at.eq(chrono::Utc::now()),
+            harvest_workflow_executions::migrated_run_terminal_at.eq(chrono::Utc::now()),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("seed a reconciled seal as the only row for this key");
+
+    let resolved =
+        execution::resolve_execution_id_by_workflow_id(&mut conn, "resolver_wf", workflow_id)
+            .await
+            .expect("resolve should succeed");
+
+    assert!(
+        resolved.is_none(),
+        "a reconciled seal must never be returned, even as the sole \
+         candidate on this shard; got {resolved:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolver_signal_races_to_successor_exactly_mid_delivery() {
     // Deterministic, lock-choreographed proof of the exact race window (AC3):

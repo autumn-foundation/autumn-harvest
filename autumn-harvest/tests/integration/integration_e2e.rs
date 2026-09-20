@@ -297,7 +297,32 @@ const INIT_SQL: &str = concat!(
     ),
     // issue #1312: the fenced by-id claim reads the DR generation row, so this
     // bundle carries the cross-region DR tables.
-    include_str!("../../migrations/20260726000000_harvest_shard_generation/up.sql")
+    include_str!("../../migrations/20260726000000_harvest_shard_generation/up.sql"),
+    "\n",
+    // issue #1317: migrated_run_terminal_at column on
+    // harvest_workflow_executions. REQUIRED for the same reason as the
+    // #945/#964/#1127/#1227 columns above. `WorkflowExecution::as_select()`
+    // names every column, so every read-back in this suite (and in every
+    // suite that borrows `setup_test_database_url_or_env` from here) fails.
+    // The failure names `column
+    // harvest_workflow_executions.migrated_run_terminal_at does not exist`,
+    // even for a plain root start with nothing to do with shard
+    // rebalancing. This gap goes uncaught locally with
+    // `HARVEST_TEST_DATABASE_URL` set, since that path migrates from the
+    // full `migrations/` directory, not from this partial bundle.
+    include_str!("../../migrations/20260915231809_harvest_migrated_seal_terminal_at/up.sql"),
+    "\n",
+    // issue #1317 review (P1 follow-up): staging_vacated_state column on
+    // harvest_workflow_executions, required for the same reason as the
+    // migrated_run_terminal_at column above -- `WorkflowExecution::as_select()`
+    // names it unconditionally.
+    include_str!("../../migrations/20260916151612_harvest_staging_vacated_state/up.sql"),
+    "\n",
+    // issue #1596 review: staging_vacated_by column on
+    // harvest_workflow_executions, required for the same reason as the
+    // staging_vacated_state column above -- `WorkflowExecution::as_select()`
+    // names it unconditionally.
+    include_str!("../../migrations/20260920014641_harvest_staging_vacated_by/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -423,7 +448,19 @@ const LEGACY_INIT_SQL: &str = concat!(
     // every deployment that never runs a rebalance.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_to_shard INTEGER NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMPTZ NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_from_shards JSONB NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_from_shards JSONB NULL;\n",
+    // issue #1317: WorkflowExecution::as_select() also references this
+    // column, for the same reason as the three rebalancing columns above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_run_terminal_at TIMESTAMPTZ NULL;\n",
+    // fresh review, P1 follow-up: WorkflowExecution::as_select() also
+    // references this column, for the same reason as the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_run_terminal_state TEXT NULL;\n",
+    // issue #1317 review (P1 follow-up): WorkflowExecution::as_select() also
+    // references this column, for the same reason as the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_state TEXT NULL;\n",
+    // issue #1596 review: WorkflowExecution::as_select() also references
+    // this column, for the same reason as the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_by UUID NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return

@@ -179,6 +179,38 @@ diesel::table! {
         /// of shards still holding a copy of this run's bytes. That is what a
         /// cross-residence payload erasure has to traverse.
         migrated_from_shards -> Nullable<Jsonb>,
+        /// Wall-clock a reconciler observed this seal's live copy as terminal
+        /// (issue #1317). NULL until observed.
+        ///
+        /// `is_active_conflict_state` treats `MIGRATED` as active forever, on
+        /// purpose -- the run is still live, just elsewhere. Nothing else
+        /// propagates the live copy's terminal completion back here. So a
+        /// start of the same business key attached to this seal forever,
+        /// long past the point the real run finished. Non-NULL releases the
+        /// row from that classification.
+        ///
+        /// Deliberately NOT a `state` change. Retention and erasure key off
+        /// `state = 'MIGRATED'` to protect the forwarding pointer from
+        /// deletion; this column carries the fact separately so that
+        /// protection stays intact.
+        migrated_run_terminal_at -> Nullable<Timestamptz>,
+        /// The live copy's own terminal state, recorded alongside
+        /// `migrated_run_terminal_at` (fresh review, P2 follow-up). `state`
+        /// on this row stays `MIGRATED` forever. A reuse-policy decision
+        /// that needs to distinguish a failed live copy from a successful
+        /// one reads this column instead.
+        migrated_run_terminal_state -> Nullable<Text>,
+        /// The state a shard-rebalance staging vacate sealed over (issue
+        /// #1317 review). Non-NULL only while the migration that vacated
+        /// this row is still in flight. An abort restores `state` to this
+        /// value and clears it; a successful cutover just clears it.
+        staging_vacated_state -> Nullable<Text>,
+        /// The execution id of the migration whose staging vacated this row
+        /// (issue #1596 review). Non-NULL exactly when
+        /// `staging_vacated_state` is. Lets `activate_target` finalize this
+        /// row's marker with a direct match on the vacating migration's own
+        /// execution id, with no cross-database write and no retry race.
+        staging_vacated_by -> Nullable<Uuid>,
     }
 }
 

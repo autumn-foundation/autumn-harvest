@@ -958,7 +958,9 @@ impl WorkflowHandleClient {
             // `options.shard` -- a probe hit never produces deferred
             // follow-ups (below), so this is inert for `finish()` today, but
             // it is the semantically correct value if that ever changes.
-            shard: claim_exec_id.shard(),
+            // Read off `execution.shard_id`, not `claim_exec_id.shard()`
+            // (issue #1317): the id's origin bits do not track a rebalance.
+            shard: ShardId::new(execution.shard_id),
             deferred: PendingStartFollowUps::default(),
         })
     }
@@ -1702,14 +1704,13 @@ impl WorkflowHandle {
     /// [`HarvestError::Config`] when the execution is already terminal, and
     /// [`HarvestError::Database`] for persistence failures.
     pub async fn cancel(&self, reason: &str) -> HarvestResult<CancelledWorkflowExecution> {
-        let mut conn = self
-            .client
-            .inner
-            .pools
-            .pool_for(self.shard())
-            .get()
-            .await
-            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        // Resolve residence, not origin (issue #1317): `self.shard()` names
+        // where `exec_id` was minted, not where a rebalanced run lives now.
+        let mut conn = crate::shard_rebalance::conn_for_execution_forwarded(
+            &self.client.inner.pools,
+            self.exec_id,
+        )
+        .await?;
         crate::execution::cancel_live_attempt(
             &mut conn,
             self.exec_id,
@@ -1733,14 +1734,12 @@ impl WorkflowHandle {
     /// Returns [`HarvestError::NotFound`] when the execution does not exist and
     /// [`HarvestError::Database`] for persistence failures.
     pub async fn terminate(&self, reason: &str) -> HarvestResult<CancelledWorkflowExecution> {
-        let mut conn = self
-            .client
-            .inner
-            .pools
-            .pool_for(self.shard())
-            .get()
-            .await
-            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        // Resolve residence, not origin (issue #1317): see `cancel` above.
+        let mut conn = crate::shard_rebalance::conn_for_execution_forwarded(
+            &self.client.inner.pools,
+            self.exec_id,
+        )
+        .await?;
         crate::execution::terminate_live_attempt(
             &mut conn,
             self.exec_id,
@@ -1815,6 +1814,7 @@ impl WorkflowHandle {
             return Ok(None);
         }
 
+        let mut listener_shard = self.shard().await?;
         let mut listener = self.connect_listener().await?;
 
         loop {
@@ -1828,23 +1828,64 @@ impl WorkflowHandle {
                 return Ok(None);
             }
             let remaining = deadline.saturating_duration_since(now);
-            match listener.wait_for_notification_timeout(remaining).await? {
+
+            // Shard-residence rebind (issue #1317 review, P1 follow-up),
+            // the same mechanism `result_raw` uses via
+            // `RESULT_WAIT_SAFETY_NET`. A listener stays bound to whichever
+            // shard it resolved at connect time. A mid-wait migration
+            // would otherwise go unnoticed for this call's entire
+            // (potentially very long) caller-supplied timeout.
+            let current_shard = self.shard().await?;
+            if current_shard != listener_shard {
+                listener = self.connect_listener().await?;
+                listener_shard = current_shard;
+            }
+            let wait_for = remaining.min(Self::RESULT_WAIT_SAFETY_NET);
+
+            match listener.wait_for_notification_timeout(wait_for).await? {
                 WorkflowEventWaitOutcome::Notification(_payload) => {}
                 WorkflowEventWaitOutcome::TimedOut => {
-                    let snapshot =
-                        WorkflowResult::from_execution(&self.load_effective_execution().await?);
-                    return if snapshot.is_terminal() {
-                        Ok(Some(snapshot))
-                    } else {
-                        Ok(None)
-                    };
+                    // Distinguish the safety-net tick from the caller's
+                    // real deadline: only the latter ends the wait.
+                    if Instant::now() >= deadline {
+                        let snapshot =
+                            WorkflowResult::from_execution(&self.load_effective_execution().await?);
+                        return if snapshot.is_terminal() {
+                            Ok(Some(snapshot))
+                        } else {
+                            Ok(None)
+                        };
+                    }
                 }
                 WorkflowEventWaitOutcome::ChannelClosed => {
                     listener = self.connect_listener().await?;
+                    listener_shard = self.shard().await?;
                 }
             }
         }
     }
+
+    /// Upper bound on how long each of [`result_raw`](Self::result_raw),
+    /// [`result_raw_with_timeout`](Self::result_raw_with_timeout), and
+    /// [`result_snapshot_with_wait`](Self::result_snapshot_with_wait)
+    /// blocks on one listener tick. Each re-checks residence and terminal
+    /// state on its own before continuing (issue #1317 review, P1).
+    ///
+    /// This is the whole mechanism, not merely a fallback. The shard-change
+    /// check that rebinds the listener only runs BETWEEN ticks, never while
+    /// one is in flight. A migration that lands mid-tick is invisible until
+    /// the current tick ends one way or another.
+    ///
+    /// An earlier version of this constant used 30 seconds. A long interval
+    /// starves that check for the entire duration of whatever tick was
+    /// already running when the migration happened. That defeats the
+    /// point, since the check exists to notice the migration promptly.
+    ///
+    /// A few seconds bounds that blind spot to something a caller waiting
+    /// on a live workflow result would not perceive as a stall. The cost
+    /// is one cheap residence/state read per tick in the overwhelmingly
+    /// common case where nothing unusual happens for the whole interval.
+    const RESULT_WAIT_SAFETY_NET: Duration = Duration::from_secs(3);
 
     /// Wait until the workflow reaches a terminal state and return its raw JSON
     /// output. Failure terminal states are returned as typed [`HarvestError`]
@@ -1862,6 +1903,7 @@ impl WorkflowHandle {
                 .await;
         }
 
+        let mut listener_shard = self.shard().await?;
         let mut listener = self.connect_listener().await?;
 
         loop {
@@ -1872,11 +1914,34 @@ impl WorkflowHandle {
                     .await;
             }
 
-            match listener.wait_for_notification().await? {
+            // A listener stays bound to whichever shard it resolved at
+            // connect time (issue #1317 review, P1). If the execution
+            // migrates mid-wait, that connection stays healthy, with no
+            // `ChannelClosed`. But nothing fires on it again: every future
+            // event notifies the NEW shard's channel instead. Rebind
+            // whenever the resolved shard changes.
+            //
+            // `RESULT_WAIT_SAFETY_NET` bounds the wait regardless. A
+            // residence change this check narrowly misses is still caught
+            // on the very next tick. That covers a migration landing
+            // between this read and the wait below. It is not stuck until
+            // the next real notification on a channel that may never fire
+            // again.
+            let current_shard = self.shard().await?;
+            if current_shard != listener_shard {
+                listener = self.connect_listener().await?;
+                listener_shard = current_shard;
+            }
+
+            match listener
+                .wait_for_notification_timeout(Self::RESULT_WAIT_SAFETY_NET)
+                .await?
+            {
                 WorkflowEventWaitOutcome::Notification(_payload) => {}
                 WorkflowEventWaitOutcome::TimedOut => {}
                 WorkflowEventWaitOutcome::ChannelClosed => {
                     listener = self.connect_listener().await?;
+                    listener_shard = self.shard().await?;
                 }
             }
         }
@@ -1904,6 +1969,7 @@ impl WorkflowHandle {
             return Err(wait_timeout_error(&execution));
         }
 
+        let mut listener_shard = self.shard().await?;
         let mut listener = self.connect_listener().await?;
 
         loop {
@@ -1919,19 +1985,40 @@ impl WorkflowHandle {
                 return Err(wait_timeout_error(&execution));
             }
             let remaining = deadline.saturating_duration_since(now);
-            match listener.wait_for_notification_timeout(remaining).await? {
+
+            // Shard-residence rebind (issue #1317 review, P1 follow-up),
+            // the same mechanism `result_raw` uses via
+            // `RESULT_WAIT_SAFETY_NET`. Without it a mid-wait migration
+            // would go unnoticed for this call's entire caller-supplied
+            // timeout, which can run minutes or hours.
+            let current_shard = self.shard().await?;
+            if current_shard != listener_shard {
+                listener = self.connect_listener().await?;
+                listener_shard = current_shard;
+            }
+            let wait_for = remaining.min(Self::RESULT_WAIT_SAFETY_NET);
+
+            match listener.wait_for_notification_timeout(wait_for).await? {
                 WorkflowEventWaitOutcome::Notification(_payload) => {}
                 WorkflowEventWaitOutcome::TimedOut => {
-                    let execution = self.load_effective_execution().await?;
-                    if let Some(result) = terminal_raw_result(&execution) {
-                        return self
-                            .enrich_terminal_result(ExecutionId::from_uuid(execution.id), result)
-                            .await;
+                    // Distinguish the safety-net tick from the caller's
+                    // real deadline: only the latter ends the wait.
+                    if Instant::now() >= deadline {
+                        let execution = self.load_effective_execution().await?;
+                        if let Some(result) = terminal_raw_result(&execution) {
+                            return self
+                                .enrich_terminal_result(
+                                    ExecutionId::from_uuid(execution.id),
+                                    result,
+                                )
+                                .await;
+                        }
+                        return Err(wait_timeout_error(&execution));
                     }
-                    return Err(wait_timeout_error(&execution));
                 }
                 WorkflowEventWaitOutcome::ChannelClosed => {
                     listener = self.connect_listener().await?;
+                    listener_shard = self.shard().await?;
                 }
             }
         }
@@ -1960,15 +2047,10 @@ impl WorkflowHandle {
         &self,
         exec_id: ExecutionId,
     ) -> HarvestResult<Option<crate::failure::DecodedWorkflowFailure>> {
-        let shard = self.client.inner.router.shard_for_execution(exec_id);
-        let mut conn = self
-            .client
-            .inner
-            .pools
-            .pool_for(shard)
-            .get()
-            .await
-            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        // Resolve residence, not origin (issue #1317): see `cancel` above.
+        let mut conn =
+            crate::shard_rebalance::conn_for_execution_forwarded(&self.client.inner.pools, exec_id)
+                .await?;
         let history = crate::store::load_history_with_codecs(
             &mut conn,
             exec_id,
@@ -2053,12 +2135,17 @@ impl WorkflowHandle {
         }
     }
 
-    fn shard(&self) -> ShardId {
-        self.client.inner.router.shard_for_execution(self.exec_id)
+    /// The shard `exec_id` currently lives on (issue #1317). A rebalanced
+    /// run's `ExecutionId` still encodes its ORIGIN. Callers needing the
+    /// live residence must resolve through the forwarding pointer rather
+    /// than decode the id directly.
+    async fn shard(&self) -> HarvestResult<ShardId> {
+        crate::shard_rebalance::resolve_execution_shard(&self.client.inner.pools, self.exec_id)
+            .await
     }
 
-    fn notification_database_url(&self) -> HarvestResult<String> {
-        let shard = self.shard();
+    async fn notification_database_url(&self) -> HarvestResult<String> {
+        let shard = self.shard().await?;
         self.client
             .inner
             .notification_database_urls
@@ -2072,7 +2159,7 @@ impl WorkflowHandle {
     }
 
     async fn connect_listener(&self) -> HarvestResult<WorkflowEventListener> {
-        WorkflowEventListener::connect(&self.notification_database_url()?).await
+        WorkflowEventListener::connect(&self.notification_database_url().await?).await
     }
 
     /// Load the *effective* execution for this handle: the **live attempt** of
@@ -2084,16 +2171,36 @@ impl WorkflowHandle {
     /// management API cannot drift on what "the live attempt" means (#843).
     /// For workflows without a retry policy this is exactly `load_execution()`
     /// — the original row — so behavior is unchanged for the non-retry case.
+    ///
+    /// Passes the shard `conn` was actually checked out from (issue #1596
+    /// review). A retry successor found mid-walk can itself have been
+    /// rebalanced away from that shard.
+    /// [`crate::execution::resolve_live_attempt`] must follow it there,
+    /// rather than trust the origin-side `MIGRATED` stub it would otherwise
+    /// read.
     async fn load_effective_execution(&self) -> HarvestResult<WorkflowExecution> {
-        let mut conn = self
-            .client
-            .inner
-            .pools
-            .pool_for(self.shard())
-            .get()
-            .await
-            .map_err(|error| HarvestError::Database(error.to_string()))?;
-        crate::execution::resolve_live_attempt(&mut conn, self.exec_id).await
+        // Resolve residence, not origin (issue #1317): see `cancel` above.
+        let (mut conn, shard) = crate::shard_rebalance::conn_for_execution_forwarded_with_shard(
+            &self.client.inner.pools,
+            self.exec_id,
+        )
+        .await?;
+        // Only the row is needed here (issue #1596 follow-up review, comment
+        // 4052389744). Every caller of this method reads fields off the
+        // returned `WorkflowExecution` directly. None reuses a connection
+        // carried over from this resolution. A caller that DOES need to
+        // follow up against the resolved execution, such as
+        // `execute_query_in_process` below, re-resolves its own connection
+        // for that execution's own id. That re-resolve already follows ITS
+        // forwarding pointer correctly.
+        crate::execution::resolve_live_attempt(
+            &mut conn,
+            &self.client.inner.pools,
+            shard,
+            self.exec_id,
+        )
+        .await
+        .map(|(execution, _shard)| execution)
     }
 
     /// Execute a registered query handler in-process by replaying event history.
@@ -2132,15 +2239,12 @@ impl WorkflowHandle {
             return Err(HarvestError::WorkflowNotRunning(target));
         }
 
-        let shard = self.shard();
-        let mut conn = self
-            .client
-            .inner
-            .pools
-            .pool_for(shard)
-            .get()
-            .await
-            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        // Resolve residence for `target` -- the effective execution after the
+        // retry-chain walk above, which can differ from `self.exec_id`. Not
+        // its origin (issue #1317): see `cancel` above.
+        let mut conn =
+            crate::shard_rebalance::conn_for_execution_forwarded(&self.client.inner.pools, target)
+                .await?;
         let history = crate::store::load_history_with_codecs(
             &mut conn,
             target,
@@ -2278,8 +2382,27 @@ impl WorkflowHandle {
         // `RUNNING` under a `FOR UPDATE` lock and rolls back otherwise, so
         // re-driving against a freshly resolved live attempt can never admit
         // the same update twice.
-        let mut target = crate::execution::resolve_live_attempt_id(conn, self.exec_id).await?;
-        self.validate_workflow_type_for(conn, target, workflow_name)
+        //
+        // `conn` is supplied by the caller (generated typed-update code
+        // predating sharding), so its shard is not known here the way
+        // `load_effective_execution` knows its own. `shard_of_held_row`
+        // recovers it from the row itself. It falls back to `self.exec_id`'s
+        // own encoded shard (the pre-#964 behavior) when the row is not
+        // visible on `conn` at all.
+        //
+        // Every follow-up operation below runs through `bound`, not `conn`
+        // directly (issue #1596 follow-up review, comment 4052389744). The
+        // resolved live attempt can live on a different shard than `conn`.
+        // `conn` itself does not move there on its own.
+        let pool = &self.client.inner.pools;
+        let held_shard = crate::shard_rebalance::shard_of_held_row(conn, self.exec_id)
+            .await
+            .unwrap_or_else(|| self.exec_id.shard());
+        let (mut target, mut target_shard) =
+            crate::execution::resolve_live_attempt_id(conn, pool, held_shard, self.exec_id).await?;
+        let mut bound =
+            crate::shard_rebalance::bind_to_shard(conn, pool, held_shard, target_shard).await?;
+        self.validate_workflow_type_for(bound.as_mut(), target, workflow_name)
             .await?;
         let update_id = crate::types::UpdateId::new();
         // Issue #684: emit harvest.update.admitted post-commit for the in-process
@@ -2288,7 +2411,7 @@ impl WorkflowHandle {
         // without recording admitted would leave this path asymmetric. The
         // recorder defaults to a no-op when the client was built without one.
         let mut admit = crate::store::admit_update_event_with_codecs(
-            conn,
+            bound.as_mut(),
             target,
             update_id,
             name.to_string(),
@@ -2299,17 +2422,22 @@ impl WorkflowHandle {
         .await;
         for _ in 0..crate::execution::RETRY_CHAIN_MAX_REDRIVES {
             let Err(error) = admit else { break };
-            let fresh = crate::execution::resolve_live_attempt_id(conn, self.exec_id)
-                .await
-                .unwrap_or(target);
+            drop(bound);
+            let (fresh, fresh_shard) =
+                crate::execution::resolve_live_attempt_id(conn, pool, held_shard, self.exec_id)
+                    .await
+                    .unwrap_or((target, target_shard));
             if !crate::execution::redrive_target(target, fresh) {
                 return Err(error);
             }
             target = fresh;
-            self.validate_workflow_type_for(conn, target, workflow_name)
+            target_shard = fresh_shard;
+            bound =
+                crate::shard_rebalance::bind_to_shard(conn, pool, held_shard, target_shard).await?;
+            self.validate_workflow_type_for(bound.as_mut(), target, workflow_name)
                 .await?;
             admit = crate::store::admit_update_event_with_codecs(
-                conn,
+                bound.as_mut(),
                 target,
                 update_id,
                 name.to_string(),
@@ -2320,14 +2448,14 @@ impl WorkflowHandle {
             .await;
         }
         admit?;
-        crate::queue::wake_workflow_task(conn, target).await?;
+        crate::queue::wake_workflow_task(bound.as_mut(), target).await?;
         let start = Instant::now();
         let poll_interval = Duration::from_millis(100);
 
         loop {
             let result = {
                 let h = crate::store::load_history_with_codecs(
-                    conn,
+                    bound.as_mut(),
                     target,
                     &self.client.inner.payload_codecs,
                 )
