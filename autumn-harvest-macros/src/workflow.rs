@@ -1517,3 +1517,115 @@ mod rate_validation_tests {
         }
     }
 }
+
+// ── Dispatch-block characterization tests (issue #1632) ─────────────────────
+//
+// `workflow_macro`'s arity-keyed dispatch block (0/1/N non-`ctx` params, plus
+// the `encode_err` branch for a plain vs. `WorkflowFailure` return type) is
+// byte-identical to `activity.rs`'s `activity_macro` dispatch block, and
+// shares its 0/1/N structure with `query.rs`/`update.rs`. Issue #1632
+// documents this as one decision, hand-mirrored across all four macros, but
+// defers a merge until characterization tests exist for `workflow.rs` and
+// `activity.rs` (neither had macro-expansion tests before this commit).
+// Pinned here first so a follow-up move to a shared `build_handler_dispatch`
+// cannot silently change what a handler's dispatch closure does.
+#[cfg(test)]
+mod dispatch_characterization_tests {
+    use super::workflow_macro;
+    use quote::quote;
+
+    /// Isolate the `async move { ... }` dispatch body from `#companion_name`'s
+    /// `handler` closure, ignoring the module-normalized whitespace `quote!`'s
+    /// `Display` impl already collapses. Brace-depth walk, mirroring
+    /// `query.rs`'s `extract_impl_body`.
+    fn extract_dispatch_body(full: &str) -> String {
+        let marker = "Box :: pin (async move {";
+        let start = full
+            .find(marker)
+            .unwrap_or_else(|| panic!("no dispatch marker in generated output:\n{full}"))
+            + marker.len();
+        let mut depth = 1i32;
+        let bytes = full.as_bytes();
+        let mut i = start;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] as char {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        full[start..i - 1].trim().to_string()
+    }
+
+    fn generate(item: proc_macro2::TokenStream) -> String {
+        workflow_macro(quote! {}, item).to_string()
+    }
+
+    const WORKFLOW_DISPATCH_0_LEGACY: &str = "let result = my_workflow (ctx) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const WORKFLOW_DISPATCH_0_TYPED: &str = "let result = my_workflow (ctx) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoWorkflowErrorString :: into_workflow_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const WORKFLOW_DISPATCH_1_LEGACY: &str = "let n = :: autumn_harvest :: serde_json :: from_value (input) . map_err (| e | e . to_string ()) ? ; let result = my_workflow (ctx , n) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const WORKFLOW_DISPATCH_1_TYPED: &str = "let n = :: autumn_harvest :: serde_json :: from_value (input) . map_err (| e | e . to_string ()) ? ; let result = my_workflow (ctx , n) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoWorkflowErrorString :: into_workflow_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const WORKFLOW_DISPATCH_N_LEGACY: &str = "let args : :: autumn_harvest :: serde_json :: Value = input ; let a = :: autumn_harvest :: serde_json :: from_value (args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_workflow (ctx , a , b) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const WORKFLOW_DISPATCH_N_TYPED: &str = "let args : :: autumn_harvest :: serde_json :: Value = input ; let a = :: autumn_harvest :: serde_json :: from_value (args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_workflow (ctx , a , b) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoWorkflowErrorString :: into_workflow_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+
+    #[test]
+    fn zero_params_legacy_error_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_workflow(ctx: &WorkflowContext) -> Result<u32, String> {
+                Ok(1)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), WORKFLOW_DISPATCH_0_LEGACY);
+    }
+
+    #[test]
+    fn zero_params_typed_failure_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_workflow(ctx: &WorkflowContext) -> Result<u32, WorkflowFailure> {
+                Ok(1)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), WORKFLOW_DISPATCH_0_TYPED);
+    }
+
+    #[test]
+    fn one_param_legacy_error_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_workflow(ctx: &WorkflowContext, n: u32) -> Result<u32, String> {
+                Ok(n)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), WORKFLOW_DISPATCH_1_LEGACY);
+    }
+
+    #[test]
+    fn one_param_typed_failure_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_workflow(ctx: &WorkflowContext, n: u32) -> Result<u32, WorkflowFailure> {
+                Ok(n)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), WORKFLOW_DISPATCH_1_TYPED);
+    }
+
+    #[test]
+    fn multi_param_legacy_error_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_workflow(ctx: &WorkflowContext, a: u32, b: u32) -> Result<u32, String> {
+                Ok(a + b)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), WORKFLOW_DISPATCH_N_LEGACY);
+    }
+
+    #[test]
+    fn multi_param_typed_failure_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_workflow(ctx: &WorkflowContext, a: u32, b: u32) -> Result<u32, WorkflowFailure> {
+                Ok(a + b)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), WORKFLOW_DISPATCH_N_TYPED);
+    }
+}
