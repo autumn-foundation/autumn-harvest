@@ -16,15 +16,23 @@
 //! "The insert-path index cost is separate (issue #1272)."
 //!
 //! This harness is that measurement. It seeds a production-shaped
-//! `harvest_audit_log` in two otherwise-identical fresh databases. One
-//! keeps the shipped schema, index present. The other drops the index --
-//! the "lazily created, only on opt-in" counterfactual. The fixture has
-//! 500,000 pre-existing rows, realistic operation-name and actor
-//! cardinality, and `occurred_at` spread across the 90-day default
-//! retention window. `export_seq` stays `NULL` throughout — the exact
-//! steady state of an unconfigured deployment. The harness then drives the
-//! REAL public entry point every mutating management-API handler calls,
-//! `audit::insert_audit`, for a batch of new rows in both databases. It
+//! `harvest_audit_log` once. The fixture has 500,000 pre-existing rows,
+//! realistic operation-name and actor cardinality, and `occurred_at`
+//! spread across the 90-day default retention window. `export_seq` stays
+//! `NULL` throughout -- the exact steady state of an unconfigured
+//! deployment.
+//!
+//! It then physically clones that one seeded database, with `CREATE
+//! DATABASE ... TEMPLATE`, into two byte-identical scenario databases.
+//! One keeps the shipped schema, index present. The other drops the
+//! index -- the "lazily created, only on opt-in" counterfactual. The
+//! clone, not independent re-seeding, is what makes the two scenarios
+//! comparable. Independent seeding would build two physically different
+//! B-trees, for reasons unrelated to the index under test.
+//!
+//! The harness then drives the REAL public entry point every mutating
+//! management-API handler calls, `audit::insert_audit`, for a batch of
+//! new rows in both databases. It
 //! reports the buffer/WAL delta `pg_stat_statements` attributes to the
 //! `INSERT INTO harvest_audit_log` statement itself, plus the index's own
 //! size and its `idx_scan` count. `idx_scan` is observed across a
@@ -367,14 +375,61 @@ struct Measurement {
     occurred_at_idx_scans_after_reads: i64,
 }
 
-async fn measure(admin: &str, label: &'static str, drop_unexported_idx: bool) -> Measurement {
-    let db_name = unique(&format!("audit_write_cost_{label}"));
-    let url = create_fresh_db(admin, &db_name).await;
-
+/// Seeds one shared, fully-prepared fixture database: the real batched
+/// insert entry point, the backdating `UPDATE`, `VACUUM`, `REINDEX TABLE`
+/// -- everything `seed_fixture` does, run exactly once.
+///
+/// Review finding on PR #1666: the earlier revision called `seed_fixture`
+/// independently inside each of the two `measure` calls. Each call draws
+/// its own `random()` timestamps. The database assigns its own
+/// `gen_random_uuid()` primary keys too. So the two runs built
+/// physically different B-trees, even before the target index was added
+/// or dropped. Page occupancy and split points could differ for reasons
+/// that have nothing to do with the index under test.
+///
+/// Seeding once here, then physically cloning this exact database with
+/// `CREATE DATABASE ... TEMPLATE` for each scenario below, fixes that.
+/// It makes the two scenario databases byte-identical up to the one
+/// index difference this harness measures.
+async fn seed_base_db(admin: &str) -> String {
+    let base_name = unique("audit_write_cost_base");
+    let url = create_fresh_db(admin, &base_name).await;
     let mut seed_conn = AsyncPgConnection::establish(&url)
         .await
         .expect("seed connection");
     ensure_pg_stat_statements(&mut seed_conn).await;
+    seed_fixture(&mut seed_conn, FIXTURE_ROWS).await;
+    // `CREATE DATABASE ... TEMPLATE` requires zero other backends
+    // connected to the source. Drop this connection now so the clones
+    // below never race it.
+    drop(seed_conn);
+    base_name
+}
+
+async fn measure(
+    admin: &str,
+    base_name: &str,
+    label: &'static str,
+    drop_unexported_idx: bool,
+    owns_server: bool,
+) -> Measurement {
+    let db_name = unique(&format!("audit_write_cost_{label}"));
+    let (prefix, _) = admin.rsplit_once('/').expect("admin url has a db segment");
+    let mut admin_conn = AsyncPgConnection::establish(admin)
+        .await
+        .expect("connect to admin database");
+    diesel::sql_query(format!(
+        "CREATE DATABASE \"{db_name}\" TEMPLATE \"{base_name}\""
+    ))
+    .execute(&mut admin_conn)
+    .await
+    .expect("clone the shared, already-seeded fixture for this scenario");
+    drop(admin_conn);
+    let url = format!("{prefix}/{db_name}");
+
+    let mut seed_conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("seed connection");
 
     if drop_unexported_idx {
         diesel::sql_query("DROP INDEX harvest_audit_log_unexported_idx")
@@ -382,8 +437,6 @@ async fn measure(admin: &str, label: &'static str, drop_unexported_idx: bool) ->
             .await
             .expect("drop the counterfactual index");
     }
-
-    seed_fixture(&mut seed_conn, FIXTURE_ROWS).await;
 
     let unexported_idx_bytes = if drop_unexported_idx {
         0
@@ -404,14 +457,27 @@ async fn measure(admin: &str, label: &'static str, drop_unexported_idx: bool) ->
     // image. Under this fixture's write load, that image can arrive from
     // an autovacuum-triggered checkpoint firing unpredictably mid-window,
     // rather than from the code under test. Forcing one here puts both
-    // scenarios' measured windows on the same footing. Never run
-    // `CHECKPOINT` on a shared production server outside a diagnostic
-    // session; this is a disposable per-scenario database. Otherwise the
-    // delta would be at the mercy of checkpoint timing.
-    diesel::sql_query("CHECKPOINT")
-        .execute(&mut stats_conn)
-        .await
-        .expect("checkpoint before the measured window");
+    // scenarios' measured windows on the same footing.
+    //
+    // Only when this harness owns the whole server -- the testcontainer
+    // path. Review finding on PR #1666: `CHECKPOINT` flushes every
+    // database on the server, not just this scenario's. The
+    // `HARVEST_TEST_DATABASE_URL` path may point at a shared server.
+    // Skip the checkpoint there instead. That trades away some
+    // checkpoint-timing noise control. The alternative -- an I/O spike,
+    // and a WAL-delta confound from unrelated activity -- would land on
+    // a server this harness does not own.
+    if owns_server {
+        diesel::sql_query("CHECKPOINT")
+            .execute(&mut stats_conn)
+            .await
+            .expect("checkpoint before the measured window");
+    } else {
+        eprintln!(
+            "note: HARVEST_TEST_DATABASE_URL set, server not owned by this harness -- \
+             skipping CHECKPOINT; WAL numbers may carry more checkpoint-timing noise"
+        );
+    }
 
     // The REAL public entry point every mutating management-API handler
     // calls once per request (`audit::insert_audit`'s own doc comment:
@@ -504,10 +570,19 @@ async fn measure(admin: &str, label: &'static str, drop_unexported_idx: bool) ->
 #[ignore = "evidence generator, not a CI assertion -- Ledger findings issue, \
             harvest_audit_log_unexported_idx write-path cost (issue #1272)"]
 async fn zz_capture_audit_log_unexported_idx_write_cost_evidence() {
-    let (admin, _guard) = setup_server().await;
+    let (admin, guard) = setup_server().await;
+    let owns_server = guard.is_some();
+    let base_name = seed_base_db(&admin).await;
 
-    let before = measure(&admin, "before_index_present", false).await;
-    let after = measure(&admin, "after_index_dropped", true).await;
+    let before = measure(
+        &admin,
+        &base_name,
+        "before_index_present",
+        false,
+        owns_server,
+    )
+    .await;
+    let after = measure(&admin, &base_name, "after_index_dropped", true, owns_server).await;
 
     for m in [&before, &after] {
         eprintln!(
