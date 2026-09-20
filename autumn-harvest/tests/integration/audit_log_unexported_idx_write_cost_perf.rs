@@ -285,15 +285,29 @@ fn fixture_row(i: usize) -> (String, String, String, String, String, String) {
 /// hand-writing `INSERT` statements that bypass the code path under test.
 /// The backdating `UPDATE` runs once, outside the measured window.
 ///
-/// `occurred_at` is a key column of `harvest_audit_log_unexported_idx`. So
-/// the backdating `UPDATE` leaves one dead index entry per row behind, a
-/// non-`HOT` update on an indexed column. Without an explicit `VACUUM`, the
-/// index-size and insert-cost measurements below would read a transient,
-/// bloated shape. That shape's exact bloat would depend on autovacuum's own
-/// timing rather than on the fixture -- review finding on PR #1666. A plain
-/// `VACUUM` reclaims the dead entries, never `VACUUM FULL`, which takes
-/// `ACCESS EXCLUSIVE`. It puts both fixtures in the same steady state
-/// before either is measured.
+/// `occurred_at` is a key column of four of this table's five indexes,
+/// `harvest_audit_log_unexported_idx` among them. So the backdating
+/// `UPDATE` leaves one dead entry per row behind, in each of those
+/// indexes -- a non-`HOT` update on an indexed column. Without cleanup,
+/// the index-size and insert-cost measurements below would read a
+/// transient, bloated shape. That shape's exact bloat would depend on
+/// autovacuum's own timing rather than on the fixture -- review finding
+/// on PR #1666.
+///
+/// A plain `VACUUM` (never `VACUUM FULL`, which takes `ACCESS EXCLUSIVE`)
+/// marks the dead entries reusable. It does not shrink the relation.
+/// `pg_relation_size` still reports the growth from the update. A later
+/// insert could reuse a freed page instead of paying a real allocation.
+/// That is a second review finding on PR #1666. A plain `VACUUM` alone
+/// does not put the fixture in the same physical shape a table built
+/// directly from this data would have. `REINDEX TABLE` rebuilds every
+/// index compactly from the table's current, already-backdated
+/// contents, closing that gap.
+///
+/// `REINDEX TABLE` takes `ACCESS EXCLUSIVE` on this table. That is
+/// acceptable only because this connection is the sole client of this
+/// disposable per-scenario database at this point in setup, before
+/// `op_conn`/`stats_conn` exist.
 async fn seed_fixture(conn: &mut AsyncPgConnection, n: usize) {
     const CHUNK: usize = 4999;
     let mut done = 0;
@@ -333,7 +347,11 @@ async fn seed_fixture(conn: &mut AsyncPgConnection, n: usize) {
     diesel::sql_query("VACUUM harvest_audit_log")
         .execute(conn)
         .await
-        .expect("reclaim dead index entries left by the backdating UPDATE");
+        .expect("reclaim dead heap tuples left by the backdating UPDATE");
+    diesel::sql_query("REINDEX TABLE harvest_audit_log")
+        .execute(conn)
+        .await
+        .expect("rebuild every index compactly from the backdated data");
 }
 
 const FIXTURE_ROWS: usize = 500_000;
