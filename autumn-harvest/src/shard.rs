@@ -3573,6 +3573,7 @@ mod tests {
     // exercises today: a shard whose connection cannot be obtained.
     // `test_pool()` builds a pool that never connects, so `.get()` fails
     // fast with no live database.
+    #[cfg(feature = "db")]
     mod connect_to_shard_tests {
         use super::*;
 
