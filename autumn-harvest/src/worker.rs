@@ -10485,7 +10485,20 @@ async fn persist_all_started_child_workflows(
         // `Vec`s for all three tables, inserts them, and drops them. Peak
         // memory therefore stays bounded by one chunk's payload, not the
         // whole batchable group's.
-        for (start, end) in compute_local_child_chunk_bounds(&batchable_children) {
+        //
+        // `shared_context_headers_bytes` (Codex review): `build_child_row`
+        // clones the PARENT's own `context_headers` into every row. Unlike
+        // `child.input`, that clone is never validated against
+        // `payload_max_workflow_input`. It must be counted once per row
+        // too. Otherwise a large inherited header could build an oversized
+        // chunk the byte budget never saw coming.
+        let shared_context_headers_bytes = parent_execution
+            .context_headers
+            .as_ref()
+            .map_or(0, json_byte_len);
+        for (start, end) in
+            compute_local_child_chunk_bounds(&batchable_children, shared_context_headers_bytes)
+        {
             let plan_chunk = &batchable_children[start..end];
 
             let child_rows: Vec<NewWorkflowExecution<'_>> = plan_chunk
@@ -10762,26 +10775,34 @@ struct LocalChildPlan<'a> {
 
 /// Splits `plans` into `[start, end)` index ranges, each within both
 /// [`ROWS_PER_EXECUTION_INSERT_CHUNK`] rows and
-/// [`MAX_EXECUTION_CHUNK_PAYLOAD_BYTES`] of summed child `input`. Whichever
+/// [`MAX_EXECUTION_CHUNK_PAYLOAD_BYTES`] of summed row payload. Whichever
 /// bound is reached first ends a chunk.
 ///
-/// Measured directly from each plan's own `child.input` (Codex review,
-/// issue #1589), before any `NewWorkflowExecution`/event/enqueue row is
-/// built. The batched-insert loop then builds, inserts, and drops each
-/// chunk's own small row `Vec`s in turn. Peak memory therefore stays
-/// bounded by one chunk's payload, not the whole group's.
+/// Measured directly from each plan's own `child.input`, plus
+/// `shared_row_bytes` once per row (Codex review, issue #1589). This runs
+/// before any `NewWorkflowExecution`/event/enqueue row is built.
+/// `shared_row_bytes` is [`build_child_row`]'s per-row clone of the
+/// PARENT's own `context_headers` -- identical for every row in the
+/// batch, but still paid once per row. It belongs in the per-row budget
+/// the same way `child.input` does. The batched-insert loop then builds,
+/// inserts, and drops each chunk's own small row `Vec`s in turn. Peak
+/// memory therefore stays bounded by one chunk's payload, not the whole
+/// group's.
 ///
 /// Mirrors `queue.rs`'s `compute_chunk_bounds` shape. A non-empty `plans`
 /// always returns at least one range, and every plan falls into exactly
 /// one of them, in order.
-fn compute_local_child_chunk_bounds(plans: &[LocalChildPlan<'_>]) -> Vec<(usize, usize)> {
+fn compute_local_child_chunk_bounds(
+    plans: &[LocalChildPlan<'_>],
+    shared_row_bytes: usize,
+) -> Vec<(usize, usize)> {
     let mut chunk_bounds = Vec::new();
     let mut chunk_start = 0_usize;
     while chunk_start < plans.len() {
         let mut chunk_end = chunk_start + 1;
-        let mut payload_bytes = json_byte_len(&plans[chunk_start].child.input);
+        let mut payload_bytes = json_byte_len(&plans[chunk_start].child.input) + shared_row_bytes;
         while chunk_end < plans.len() && chunk_end - chunk_start < ROWS_PER_EXECUTION_INSERT_CHUNK {
-            let next_bytes = json_byte_len(&plans[chunk_end].child.input);
+            let next_bytes = json_byte_len(&plans[chunk_end].child.input) + shared_row_bytes;
             if payload_bytes + next_bytes > MAX_EXECUTION_CHUNK_PAYLOAD_BYTES {
                 break;
             }
@@ -29975,7 +29996,7 @@ mod tests {
             })
             .collect();
 
-        let bounds = compute_local_child_chunk_bounds(&plans);
+        let bounds = compute_local_child_chunk_bounds(&plans, 0);
 
         assert!(
             bounds.len() > 10,
@@ -30006,6 +30027,75 @@ mod tests {
             plans.len(),
             "every plan must fall into a chunk"
         );
+    }
+
+    /// Codex review, issue #1589: `build_child_row` clones the PARENT's own
+    /// `context_headers` into every row. A large inherited header must
+    /// therefore shrink the chunk size the same way a large `child.input`
+    /// does, even when every child's own input is tiny. Proves
+    /// `shared_row_bytes` actually participates in the budget, not just
+    /// `child.input`.
+    #[test]
+    fn execution_chunk_bounds_accounts_for_shared_per_row_bytes() {
+        let commands: Vec<StartedChildWorkflowCommand> = (0..200)
+            .map(|_| StartedChildWorkflowCommand {
+                child_id: ExecutionId::new(),
+                workflow_name: "wf".to_string(),
+                input: serde_json::json!("tiny"),
+            })
+            .collect();
+        let plans: Vec<LocalChildPlan<'_>> = commands
+            .iter()
+            .map(|child| LocalChildPlan {
+                child,
+                defaults: ChildWorkflowDefaults {
+                    owner: None,
+                    runbook_url: None,
+                    severity: None,
+                    sla: None,
+                    sla_deadline_at: None,
+                    execution_timeout: None,
+                    deadline_at: None,
+                    chain_execution_timeout: None,
+                    chain_deadline_at: None,
+                    retry_policy: None,
+                    quota: None,
+                },
+                child_workflow_id: child.child_id.to_string(),
+                child_quota_key: None,
+            })
+            .collect();
+
+        // Every child's own input is 6 bytes -- 200 of them would trivially
+        // fit in one row-count-bounded chunk with `shared_row_bytes = 0`.
+        let bounds_without_shared = compute_local_child_chunk_bounds(&plans, 0);
+        assert_eq!(
+            bounds_without_shared.len(),
+            1,
+            "tiny inputs alone must fit in one chunk"
+        );
+
+        // A large shared per-row payload (e.g. inherited `context_headers`)
+        // must still force many small chunks, exactly like a large
+        // `child.input` would.
+        let near_max_bytes =
+            usize::try_from(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES).unwrap();
+        let bounds_with_shared = compute_local_child_chunk_bounds(&plans, near_max_bytes);
+        assert!(
+            bounds_with_shared.len() > 10,
+            "a large shared per-row payload must split 200 plans into many small chunks, \
+             got {} chunk(s)",
+            bounds_with_shared.len()
+        );
+        for &(start, end) in &bounds_with_shared {
+            let chunk_payload = (end - start) * near_max_bytes;
+            assert!(
+                chunk_payload <= MAX_EXECUTION_CHUNK_PAYLOAD_BYTES + near_max_bytes,
+                "chunk [{start}, {end}) carries {chunk_payload} bytes of shared payload alone, \
+                 over the {MAX_EXECUTION_CHUNK_PAYLOAD_BYTES}-byte budget by more than one \
+                 row's allowance"
+            );
+        }
     }
 
     /// The release and escalation branches must report OPPOSITE distinct-worker
