@@ -47,6 +47,7 @@
 // reporting. None comes near `f64`'s 2^52 mantissa limit.
 #![allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 
+use super::claim_bench_support::with_db_name;
 use autumn_harvest::audit::{self, AuditFilters};
 use autumn_harvest::models::NewAuditRecord;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
@@ -99,8 +100,12 @@ async fn create_fresh_db(admin_url: &str, name: &str) -> String {
         .execute(&mut admin)
         .await;
 
-    let (prefix, _) = admin_url.rsplit_once('/').expect("url has a db segment");
-    let url = format!("{prefix}/{name}");
+    // `with_db_name`, not a naive `rsplit_once('/')` -- review finding on
+    // PR #1666. A raw split panics on a legal libpq keyword/value DSN,
+    // which has no `/` at all. It also silently drops query-string
+    // options (`sslmode`, `application_name`, certs) from a URL-form
+    // DSN that carries them.
+    let url = with_db_name(admin_url, name).expect("admin url selects a database");
     let mut conn = AsyncPgConnection::establish(&url)
         .await
         .expect("connect to fresh database");
@@ -462,7 +467,6 @@ async fn measure(
     owns_server: bool,
 ) -> Measurement {
     let db_name = unique(&format!("audit_write_cost_{label}"));
-    let (prefix, _) = admin.rsplit_once('/').expect("admin url has a db segment");
     let mut admin_conn = AsyncPgConnection::establish(admin)
         .await
         .expect("connect to admin database");
@@ -473,7 +477,9 @@ async fn measure(
     .await
     .expect("clone the shared, already-seeded fixture for this scenario");
     drop(admin_conn);
-    let url = format!("{prefix}/{db_name}");
+    // `with_db_name`, not a naive `rsplit_once('/')` -- same review
+    // finding on PR #1666 as `create_fresh_db` above.
+    let url = with_db_name(admin, &db_name).expect("admin url selects a database");
 
     let mut seed_conn = AsyncPgConnection::establish(&url)
         .await
