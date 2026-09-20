@@ -346,25 +346,28 @@ fn fixture_row(i: usize) -> (String, String, String, String, String, String) {
 /// The backdating `UPDATE` runs once, outside the measured window.
 ///
 /// `occurred_at` is a key column of four of this table's five indexes,
-/// `harvest_audit_log_unexported_idx` among them. So the backdating
-/// `UPDATE` leaves one dead entry per row behind, in each of those
-/// indexes -- a non-`HOT` update on an indexed column. Without cleanup,
-/// the index-size and insert-cost measurements below would read a
-/// transient, bloated shape. That shape's exact bloat would depend on
-/// autovacuum's own timing rather than on the fixture -- review finding
-/// on PR #1666.
+/// `harvest_audit_log_unexported_idx` among them. A non-`HOT` update on
+/// an indexed column touches both the heap and the index. So the
+/// backdating `UPDATE` leaves one dead entry per row in each of those
+/// four indexes. It also leaves one dead heap tuple per row in the
+/// table itself. Without cleanup, the measurements below would read a
+/// transient, bloated shape. That bloat's exact size would depend on
+/// autovacuum's own timing, not on the fixture -- review finding on PR
+/// #1666.
 ///
-/// A plain `VACUUM` (never `VACUUM FULL`, which takes `ACCESS EXCLUSIVE`)
-/// marks the dead entries reusable. It does not shrink the relation.
-/// `pg_relation_size` still reports the growth from the update. A later
-/// insert could reuse a freed page instead of paying a real allocation.
-/// That is a second review finding on PR #1666. A plain `VACUUM` alone
-/// does not put the fixture in the same physical shape a table built
-/// directly from this data would have. `REINDEX TABLE` rebuilds every
-/// index compactly from the table's current, already-backdated
-/// contents, closing that gap.
+/// A plain `VACUUM` marks the dead entries reusable, in the heap and
+/// in every index. It does not shrink either one. `pg_relation_size`
+/// would still report the growth from the update. A later insert
+/// could reuse a freed page instead of paying a real allocation cost.
+/// That is a second review finding on PR #1666, for the indexes. A
+/// third finding, for the heap, followed once the index-only fix did
+/// not close the gap on its own. `VACUUM FULL` rewrites the heap into
+/// a compact file. As part of that rewrite it always rebuilds every
+/// index too. That gives the fixture the shape a table built directly
+/// from this data would have. Heap and indexes both, not just the
+/// indexes.
 ///
-/// `REINDEX TABLE` takes `ACCESS EXCLUSIVE` on this table. That is
+/// `VACUUM FULL` takes `ACCESS EXCLUSIVE` on this table. That is
 /// acceptable only because this connection is the sole client of this
 /// disposable per-scenario database at this point in setup, before
 /// `op_conn`/`stats_conn` exist.
@@ -404,14 +407,15 @@ async fn seed_fixture(conn: &mut AsyncPgConnection, n: usize) {
     .execute(conn)
     .await
     .expect("backdate fixture rows across the retention window");
-    diesel::sql_query("VACUUM harvest_audit_log")
+    // `VACUUM FULL`, not plain `VACUUM` or a separate `REINDEX TABLE`.
+    // See this function's own doc comment above for why. It compacts
+    // both the heap and every index in one pass. The disposable,
+    // single-connection database this runs against is why the
+    // `ACCESS EXCLUSIVE` lock it takes is acceptable here.
+    diesel::sql_query("VACUUM FULL harvest_audit_log")
         .execute(conn)
         .await
-        .expect("reclaim dead heap tuples left by the backdating UPDATE");
-    diesel::sql_query("REINDEX TABLE harvest_audit_log")
-        .execute(conn)
-        .await
-        .expect("rebuild every index compactly from the backdated data");
+        .expect("compact the heap and every index after the backdating UPDATE");
 }
 
 const FIXTURE_ROWS: usize = 500_000;
