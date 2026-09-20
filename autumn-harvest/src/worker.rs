@@ -5012,6 +5012,28 @@ fn has_activity_terminal_event(history: &[WorkflowEvent], activity_id: ActivityE
     })
 }
 
+/// `true` if any id in `activity_waits` already has a terminal event in
+/// `history`.
+///
+/// Shared by both of this module's post-park re-checks (issue #950 mixed
+/// suspension batches, and the cancel-race-loser check ahead of them): each
+/// asks whether anything in a just-parked `join!`/`race()` fan-out resolved
+/// in the window between the history load and the park's own atomic write.
+///
+/// `#[doc(hidden)]`: exposed for the Bolt performance harness
+/// (`benches/activity_wait_resolution_profile.rs`); not a stable API -- same
+/// convention as `WorkflowTaskPersistence::new_for_test` above.
+#[doc(hidden)]
+#[must_use]
+pub fn any_activity_wait_already_resolved(
+    history: &[WorkflowEvent],
+    activity_waits: &[ActivityExecId],
+) -> bool {
+    activity_waits
+        .iter()
+        .any(|activity_id| has_activity_terminal_event(history, *activity_id))
+}
+
 async fn lock_workflow_execution_and_load_history(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -9152,9 +9174,7 @@ async fn persist_activity_wait_park(
 
         let history =
             store::load_history_with_codecs(conn, exec_id, registry.payload_codecs()).await?;
-        let has_terminal = activity_ids
-            .iter()
-            .any(|activity_id| has_activity_terminal_event(&history.events, *activity_id));
+        let has_terminal = any_activity_wait_already_resolved(&history.events, activity_ids);
 
         let mut next_event_id = history.next_event_id;
         let (deferred, _race_loser_events) =
@@ -11856,10 +11876,7 @@ async fn persist_mixed_suspension_batch(
         // and `activity_id` only, never on a payload field (see the loader's
         // docs).
         let history = store::load_history_undecoded(conn, exec_id).await?;
-        needs_wake = batch
-            .activity_waits
-            .iter()
-            .any(|activity_id| has_activity_terminal_event(&history.events, *activity_id));
+        needs_wake = any_activity_wait_already_resolved(&history.events, &batch.activity_waits);
     }
 
     if !needs_wake && !batch.children.is_empty() {
