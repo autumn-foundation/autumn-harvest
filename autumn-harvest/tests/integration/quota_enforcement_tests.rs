@@ -2435,17 +2435,25 @@ async fn quota_retry_backoff_survives_stale_mixed_signal_suspension_sentinel() {
     );
 
     // The regression check: an unrelated wake during the backoff window must
-    // be a no-op. Before the fix, the surviving sentinel matched
-    // `primary_repend_workflow_task_query`'s wake-forward arm and reset
-    // `scheduled_at` to now, defeating the backoff entirely.
+    // never pull `scheduled_at` backward. Before the fix, the surviving
+    // sentinel matched `primary_repend_workflow_task_query`'s wake-forward
+    // arm and reset `scheduled_at` to now, defeating the backoff entirely.
+    //
+    // This asserts `>=`, not `==`. The backoff may nearly have elapsed when
+    // the wake fires. Then the worker's own poll can reclaim the row first.
+    // A correct, unrelated retry cycle then moves `scheduled_at` further
+    // into the future. That case must not fail this test. Only a wake
+    // pulling the schedule earlier is the bug (issue #1391).
     queue::wake_workflow_task(&mut conn, parent)
         .await
         .expect("simulated unrelated wake");
     let after_wake = task_queue_state(&mut conn, parent).await;
-    assert_eq!(
-        after_wake.scheduled_at, retried_scheduled_at,
+    assert!(
+        after_wake.scheduled_at >= retried_scheduled_at,
         "an unrelated wake must not pull a quota-backoff's scheduled_at \
-         forward via a stale mixed_signal_suspension sentinel"
+         backward via a stale mixed_signal_suspension sentinel: before \
+         wake {retried_scheduled_at}, after wake {}",
+        after_wake.scheduled_at
     );
 
     // Free the quota slot and let the parent finish normally.
