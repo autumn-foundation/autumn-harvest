@@ -34,7 +34,10 @@
 //! Evidence is `pg_stat_statements` buffers, WAL bytes and `pg_relation_size`.
 //! Wall-clock alone is never evidence, per this persona's charter.
 
-#![allow(clippy::too_many_lines)]
+// `cast_precision_loss`: every `as f64` cast below is a small, bounded
+// evidence count (buffers, WAL bytes, insert calls), for ratio/percentage
+// reporting. None comes near `f64`'s 2^52 mantissa limit.
+#![allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 
 use autumn_harvest::audit::{self, AuditFilters};
 use autumn_harvest::models::NewAuditRecord;
@@ -229,7 +232,9 @@ const OPERATION_WEIGHTS: &[(&str, u32)] = &[
 
 fn weighted_operation(i: usize) -> &'static str {
     let total: u32 = OPERATION_WEIGHTS.iter().map(|(_, w)| w).sum();
-    let mut n = (i as u32) % total;
+    // Reduce modulo `total` in `usize` first, so the result fits `u32`
+    // (`total` itself is a `u32`) before the narrowing cast below.
+    let mut n = u32::try_from(i % (total as usize)).expect("value taken modulo a u32 fits u32");
     for (op, w) in OPERATION_WEIGHTS {
         if n < *w {
             return op;
@@ -256,7 +261,11 @@ fn fixture_row(i: usize) -> (String, String, String, String, String, String) {
         "POST /{target_type}s/{{id}}/{}",
         op.rsplit('.').next().unwrap()
     );
-    let status = if i % 20 == 0 { "failed" } else { "succeeded" };
+    let status = if i.is_multiple_of(20) {
+        "failed"
+    } else {
+        "succeeded"
+    };
     (
         actor,
         op.to_string(),
