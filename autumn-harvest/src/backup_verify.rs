@@ -47,6 +47,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use uuid::Uuid;
 
 /// Maximum number of sample identifiers retained per [`Finding`].
 ///
@@ -210,6 +211,12 @@ pub enum FindingClass {
     /// so this is the newly deployed handler erroring where the live run had
     /// not — resuming it fails the run immediately.
     ReplayWorkflowFailed,
+    /// The source shard confirms a cross-shard completion-trigger relay
+    /// delivered (issue #1401). The target execution is absent, and the
+    /// target shard's restore point predates the fire. The target shard
+    /// cannot hold the triggered workflow. The loss is provable, not merely
+    /// likely.
+    CompletionTriggerFireLost,
 
     // ── Advisory: operator judgement ────────────────────────────────────────
     /// A caller recorded an external *signal* as delivered and the target's
@@ -254,11 +261,16 @@ pub enum FindingClass {
     /// cross-shard break. A retention summary is durable proof of the first.
     /// Without one, a silent pass would hide the second (issue #1205).
     RetentionUnproven,
+    /// The source shard confirms a cross-shard completion-trigger relay
+    /// delivered (issue #1401). The target execution is absent. The target
+    /// shard's restore point does not rule out ordinary retention. Ordinary
+    /// retention and a lost fire cannot be told apart from here.
+    CompletionTriggerFireUnproven,
 }
 
 impl FindingClass {
     /// Every class, in a stable order. Used by tests and by the runbook table.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 27] = [
         Self::DeadWorkerRunningTask,
         Self::TimedOutTask,
         Self::WorkflowDeadlineExpired,
@@ -276,6 +288,7 @@ impl FindingClass {
         Self::ExternalEffectRolledBack,
         Self::ReplayDivergence,
         Self::ReplayWorkflowFailed,
+        Self::CompletionTriggerFireLost,
         Self::ExternalEffectUnverifiable,
         Self::RestorePointSkew,
         Self::ReplaySkippedNoHandler,
@@ -284,6 +297,7 @@ impl FindingClass {
         Self::WorkflowIdTargetUnchecked,
         Self::ProbeFailed,
         Self::RetentionUnproven,
+        Self::CompletionTriggerFireUnproven,
     ];
 
     /// The fixed severity of this class.
@@ -311,7 +325,8 @@ impl FindingClass {
             | Self::ChildTerminalRolledBack
             | Self::ExternalEffectRolledBack
             | Self::ReplayDivergence
-            | Self::ReplayWorkflowFailed => FindingSeverity::Incoherent,
+            | Self::ReplayWorkflowFailed
+            | Self::CompletionTriggerFireLost => FindingSeverity::Incoherent,
 
             Self::ExternalEffectUnverifiable
             | Self::RestorePointSkew
@@ -320,7 +335,9 @@ impl FindingClass {
             | Self::UninspectedShardReference
             | Self::WorkflowIdTargetUnchecked => FindingSeverity::Advisory,
 
-            Self::ProbeFailed | Self::RetentionUnproven => FindingSeverity::Undetermined,
+            Self::ProbeFailed | Self::RetentionUnproven | Self::CompletionTriggerFireUnproven => {
+                FindingSeverity::Undetermined
+            }
         }
     }
 
@@ -353,6 +370,8 @@ impl FindingClass {
             Self::WorkflowIdTargetUnchecked => "workflow_id_target_unchecked",
             Self::ProbeFailed => "probe_failed",
             Self::RetentionUnproven => "retention_unproven",
+            Self::CompletionTriggerFireLost => "completion_trigger_fire_lost",
+            Self::CompletionTriggerFireUnproven => "completion_trigger_fire_unproven",
         }
     }
 
@@ -441,6 +460,17 @@ impl FindingClass {
                 "a recorded child terminal or delivered effect targets an absent \
                  execution with no retention summary on record; retention and a \
                  pre-creation rollback cannot be told apart from here"
+            }
+            Self::CompletionTriggerFireLost => {
+                "the source shard confirms a completion-trigger relay delivered, but \
+                 the target shard's restore point predates the fire, so the target \
+                 execution cannot be in that snapshot -- a lost cross-shard relay \
+                 (issue #1401)"
+            }
+            Self::CompletionTriggerFireUnproven => {
+                "the source shard confirms a completion-trigger relay delivered, but \
+                 the target execution is absent and the target shard's restore point \
+                 does not rule out ordinary retention (issue #1401)"
             }
         }
     }
@@ -837,6 +867,110 @@ pub fn compute_skew(latest: impl IntoIterator<Item = Option<DateTime<Utc>>>) -> 
     let first = *seen.first()?;
     let last = *seen.last()?;
     Some((last - first).num_seconds().abs())
+}
+
+// ── Completion-trigger fire routing and adjudication (pure) ────────────────
+//
+// `completion_trigger.rs::relay_gate_checked_start` relays a completion
+// trigger across two shards. It uses two independent transactions. The
+// source deletes its outbox row only after the target start commits. Or, an
+// any-state existence check finds the target already there. A restore can
+// skew the two shards to different points in time. This can leave the
+// source shard confirming a delivery the target shard never received
+// (issue #1401).
+
+/// One completion-trigger fire the source shard recorded as delivered
+/// (`harvest_completion_trigger_fires.outcome IS NULL`), before its target
+/// shard is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedFire {
+    source_exec_id: Uuid,
+    trigger_id: Uuid,
+    fired_at: DateTime<Utc>,
+    target_workflow_name: String,
+}
+
+/// A [`ResolvedFire`] whose target lands on a DIFFERENT shard than its
+/// source, pending cross-shard adjudication.
+///
+/// A same-shard fire commits atomically with its target start.
+/// `evaluate_triggers_for_execution`'s inline path inserts both the fires
+/// row and the target execution row in one transaction. A skewed restore
+/// cannot split it. [`route_trigger_fires`] filters same-shard fires out
+/// before this type is ever constructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingTriggerFire {
+    source_shard: i32,
+    source_exec_id: Uuid,
+    trigger_id: Uuid,
+    target_workflow_name: String,
+    target_workflow_id: String,
+    target_shard: i32,
+    fired_at: DateTime<Utc>,
+}
+
+/// Route each fire to its target shard and drop the same-shard ones.
+///
+/// `target_workflow_id` and the target-shard pick both replicate
+/// `completion_trigger.rs` exactly. The id is
+/// `format!("completion-trigger-{trigger_id}-{source_exec_id}")`. The shard
+/// is `router.pick_for_new_workflow(target_workflow_name,
+/// target_workflow_id)`. This is the same rendezvous hash the live relay
+/// used to place it.
+///
+/// `router` must cover every shard the live fleet can route to. A router
+/// built from a partial fleet can pick a different shard than production
+/// did. This is the same "supply every shard" assumption the
+/// event-reference scan already carries (see
+/// [`FindingClass::UninspectedShardReference`]).
+fn route_trigger_fires(
+    fires: Vec<(i32, ResolvedFire)>,
+    router: &crate::shard::ShardRouter,
+) -> Vec<PendingTriggerFire> {
+    fires
+        .into_iter()
+        .filter_map(|(source_shard, fire)| {
+            let target_workflow_id = format!(
+                "completion-trigger-{}-{}",
+                fire.trigger_id, fire.source_exec_id
+            );
+            let target_shard = router
+                .pick_for_new_workflow(&fire.target_workflow_name, &target_workflow_id)
+                .as_i32();
+            (target_shard != source_shard).then_some(PendingTriggerFire {
+                source_shard,
+                source_exec_id: fire.source_exec_id,
+                trigger_id: fire.trigger_id,
+                target_workflow_name: fire.target_workflow_name,
+                target_workflow_id,
+                target_shard,
+                fired_at: fire.fired_at,
+            })
+        })
+        .collect()
+}
+
+/// Is an absent completion-trigger target a PROVEN loss, given the target
+/// shard's own restore-point proxy?
+///
+/// The relay can only start the target AT OR AFTER `fired_at`. `fired_at`
+/// is set when the source recorded the fire, before any relay attempt. So a
+/// target shard whose newest event PREDATES `fired_at` cannot possibly
+/// contain the delivery. The restore point proves the target shard's
+/// snapshot is too old, whatever else is true.
+///
+/// Otherwise, absence stays ambiguous: the target shard has progressed past
+/// `fired_at`, or carries no event to compare at all. It may be ordinary
+/// retention -- the run completed and was collected. This is the same
+/// evidentiary gap [`FindingClass::RetentionUnproven`] names for a recorded
+/// child terminal or delivered effect. It is resolved here from the fire's
+/// own `fired_at` (issue #1401), not a `harvest_execution_summaries` row.
+#[must_use]
+fn absence_is_decisive_loss(
+    fired_at: DateTime<Utc>,
+    target_latest_event_at: Option<DateTime<Utc>>,
+) -> bool {
+    matches!(target_latest_event_at, Some(latest) if latest < fired_at)
 }
 
 // ── Production-DSN guard ────────────────────────────────────────────────────
@@ -1421,13 +1555,19 @@ mod probes {
         target: &ShardTarget,
         options: &VerifyOptions,
         replayer: &WorkflowReplayer,
-    ) -> (ShardVerifyReport, Vec<PendingRef>) {
+    ) -> (ShardVerifyReport, Vec<PendingRef>, Vec<super::ResolvedFire>) {
         let shard_id = target.shard_id;
         let dsn = redact_dsn(&target.dsn);
 
         let mut conn = match connect_read_only(&target.dsn).await {
             Ok(c) => c,
-            Err(e) => return (ShardVerifyReport::unreachable(shard_id, dsn, e), Vec::new()),
+            Err(e) => {
+                return (
+                    ShardVerifyReport::unreachable(shard_id, dsn, e),
+                    Vec::new(),
+                    Vec::new(),
+                );
+            }
         };
 
         let mut findings = Vec::new();
@@ -1669,6 +1809,21 @@ mod probes {
             Err(e) => soft_errors.push(e),
         }
 
+        // ── Completion-trigger fires this shard confirms it delivered ───────
+        let mut trigger_fires = Vec::new();
+        match collect_trigger_fires(&mut conn, limit).await {
+            Ok(collected) => {
+                trigger_fires = collected.fires;
+                if let Some(note) = collected.truncation {
+                    soft_errors.push(note);
+                }
+                if let Some(note) = collected.undecodable {
+                    soft_errors.push(note);
+                }
+            }
+            Err(e) => soft_errors.push(e),
+        }
+
         // ── Replay a bounded sample of non-terminal histories ───────────────
         let replay = match replay_sample(&mut conn, options, replayer, shard_id).await {
             Ok((summary, mut divergences)) => {
@@ -1707,6 +1862,7 @@ mod probes {
                 findings,
             },
             refs,
+            trigger_fires,
         )
     }
 
@@ -1731,6 +1887,140 @@ mod probes {
             refs: build_refs(scan, shard_id, default_shard),
             truncation,
             workflow_id_targets,
+            undecodable,
+        })
+    }
+
+    /// One row of the completion-trigger fire scan, before its target
+    /// trigger definition is confirmed to still exist.
+    #[derive(diesel::QueryableByName)]
+    struct TriggerFireRow {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        source_exec_id: Uuid,
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        trigger_id: Uuid,
+        #[diesel(sql_type = Timestamptz)]
+        fired_at: DateTime<Utc>,
+        #[diesel(sql_type = Nullable<Text>)]
+        target_workflow_name: Option<String>,
+    }
+
+    /// Cap on pages read scanning completion-trigger fires -- mirrors
+    /// [`MAX_REFERENCE_SCAN_PAGES`]. A runaway guard, not a tuning knob.
+    const MAX_TRIGGER_FIRE_SCAN_PAGES: usize = 1_000;
+
+    /// Scan this shard for completion-trigger fires it recorded as delivered
+    /// (issue #1401).
+    ///
+    /// `harvest_completion_trigger_fires.outcome IS NULL` is the row's own
+    /// claim that the relay reached the target. It is set only after
+    /// `relay_gate_checked_start` committed the source-side outbox delete.
+    /// That delete itself happens only after the target-shard start
+    /// committed, or an any-state existence check found the target already
+    /// there. A row with a RESOLVED outcome
+    /// (`condition_unmet`/`admission_blocked`) started nothing on any
+    /// shard, so it is excluded.
+    ///
+    /// Each row stands alone. Unlike the event scan, no group spans more
+    /// than one row, so plain keyset pagination on the primary key
+    /// `(source_exec_id, trigger_id)` cannot split anything.
+    async fn scan_completion_trigger_fires(
+        conn: &mut AsyncPgConnection,
+        limit: i64,
+    ) -> Result<(Vec<TriggerFireRow>, Option<String>), String> {
+        let page = limit.max(1);
+        let mut rows: Vec<TriggerFireRow> = Vec::new();
+        let mut cursor: Option<(Uuid, Uuid)> = None;
+
+        for _ in 0..MAX_TRIGGER_FIRE_SCAN_PAGES {
+            let after = match cursor {
+                Some(_) => "AND (f.source_exec_id, f.trigger_id) > ($1, $2) ",
+                None => "",
+            };
+            let sql = format!(
+                "SELECT f.source_exec_id, f.trigger_id, f.fired_at, \
+                     t.target_workflow_name \
+                 FROM harvest_completion_trigger_fires f \
+                 LEFT JOIN harvest_completion_triggers t ON t.id = f.trigger_id \
+                 WHERE f.outcome IS NULL \
+                 {after}\
+                 ORDER BY f.source_exec_id, f.trigger_id \
+                 LIMIT {page}"
+            );
+            let query = diesel::sql_query(sql);
+            let loaded: Vec<TriggerFireRow> = match cursor {
+                Some((exec, trig)) => {
+                    query
+                        .bind::<diesel::sql_types::Uuid, _>(exec)
+                        .bind::<diesel::sql_types::Uuid, _>(trig)
+                        .load(conn)
+                        .await
+                }
+                None => query.load(conn).await,
+            }
+            .map_err(|e| format!("completion-trigger fire scan failed: {e}"))?;
+
+            let exhausted = i64::try_from(loaded.len()).unwrap_or(i64::MAX) < page;
+            if let Some(last) = loaded.last() {
+                cursor = Some((last.source_exec_id, last.trigger_id));
+            }
+            rows.extend(loaded);
+            if exhausted {
+                return Ok((rows, None));
+            }
+        }
+
+        let truncation = format!(
+            "completion-trigger fire scan hit its page ceiling after {} rows \
+             ({MAX_TRIGGER_FIRE_SCAN_PAGES} pages of probe_limit={page}); the \
+             remainder was NOT adjudicated (raise --probe-limit)",
+            rows.len()
+        );
+        Ok((rows, Some(truncation)))
+    }
+
+    /// What one shard's completion-trigger fire scan produced.
+    struct CollectedTriggerFires {
+        fires: Vec<super::ResolvedFire>,
+        truncation: Option<String>,
+        /// Fail-closed note when a fire names a trigger definition that no
+        /// longer exists, so its target could not be derived.
+        undecodable: Option<String>,
+    }
+
+    /// Scan and resolve this shard's completion-trigger fires.
+    ///
+    /// Split out of `verify_shard` to keep the scan and the per-row
+    /// resolution separately readable, mirroring `collect_refs`.
+    async fn collect_trigger_fires(
+        conn: &mut AsyncPgConnection,
+        limit: i64,
+    ) -> Result<CollectedTriggerFires, String> {
+        let (rows, truncation) = scan_completion_trigger_fires(conn, limit).await?;
+        let mut fires = Vec::with_capacity(rows.len());
+        let mut missing_trigger = Vec::new();
+        for row in rows {
+            match row.target_workflow_name {
+                Some(target_workflow_name) => fires.push(super::ResolvedFire {
+                    source_exec_id: row.source_exec_id,
+                    trigger_id: row.trigger_id,
+                    fired_at: row.fired_at,
+                    target_workflow_name,
+                }),
+                None => missing_trigger.push(format!("{}/{}", row.source_exec_id, row.trigger_id)),
+            }
+        }
+        let undecodable = (!missing_trigger.is_empty()).then(|| {
+            format!(
+                "{} completion-trigger fire(s) name a trigger definition that no \
+                 longer exists, so their target could not be derived: {}",
+                missing_trigger.len(),
+                missing_trigger.join(", ")
+            )
+        });
+        Ok(CollectedTriggerFires {
+            fires,
+            truncation,
             undecodable,
         })
     }
@@ -2893,6 +3183,153 @@ mod probes {
         findings
     }
 
+    /// Verdict buckets for one target shard's pending completion-trigger fires.
+    #[derive(Default)]
+    struct TriggerFireBuckets {
+        lost: Vec<String>,
+        unproven: Vec<String>,
+        lookup_errors: Vec<String>,
+    }
+
+    /// Check each fire's target for existence and bucket the verdict. Split
+    /// out of `resolve_trigger_fires` so the per-shard connection handling
+    /// and the per-fire verdict logic stay separately readable, mirroring
+    /// `adjudicate_refs`.
+    ///
+    /// `execution_exists_by_key` mirrors the ANY-STATE existence check
+    /// `relay_gate_checked_start` itself runs before starting the target.
+    /// It runs read-only against a restored snapshot, not a live claim.
+    async fn adjudicate_trigger_fires(
+        conn: &mut AsyncPgConnection,
+        owned: &[&super::PendingTriggerFire],
+        latest_by_shard: &std::collections::BTreeMap<i32, Option<DateTime<Utc>>>,
+    ) -> TriggerFireBuckets {
+        let mut out = TriggerFireBuckets::default();
+        for fire in owned {
+            match crate::execution::execution_exists_by_key(
+                conn,
+                &fire.target_workflow_name,
+                &fire.target_workflow_id,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    let target_latest = latest_by_shard.get(&fire.target_shard).copied().flatten();
+                    let sample = format!(
+                        "{} (fired by {} on shard {} at {}) absent on shard {}",
+                        fire.target_workflow_id,
+                        fire.source_exec_id,
+                        fire.source_shard,
+                        fire.fired_at,
+                        fire.target_shard
+                    );
+                    if super::absence_is_decisive_loss(fire.fired_at, target_latest) {
+                        out.lost.push(sample);
+                    } else {
+                        out.unproven.push(sample);
+                    }
+                }
+                Err(e) => out.lookup_errors.push(format!(
+                    "{} existence check failed: {e}",
+                    fire.target_workflow_id
+                )),
+            }
+        }
+        out
+    }
+
+    /// Cross-shard adjudication for [`super::PendingTriggerFire`]s (issue
+    /// #1401). The source shard confirms the relay delivered. The target
+    /// execution is absent from the target shard's restored snapshot.
+    pub(super) async fn resolve_trigger_fires(
+        pending: &[super::PendingTriggerFire],
+        targets: &[ShardTarget],
+        shards: &[ShardVerifyReport],
+    ) -> Vec<Finding> {
+        use std::collections::BTreeSet;
+
+        let mut findings = Vec::new();
+        let known: BTreeSet<i32> = targets.iter().map(|t| t.shard_id).collect();
+
+        let uninspected: Vec<String> = pending
+            .iter()
+            .filter(|p| !known.contains(&p.target_shard))
+            .map(|p| {
+                format!(
+                    "{} (fired by {} on shard {}) -> shard {}",
+                    p.target_workflow_id, p.source_exec_id, p.source_shard, p.target_shard
+                )
+            })
+            .collect();
+        if !uninspected.is_empty() {
+            findings.push(Finding::new(
+                FindingClass::UninspectedShardReference,
+                None,
+                uninspected.len() as u64,
+                uninspected,
+            ));
+        }
+
+        let latest_by_shard: std::collections::BTreeMap<i32, Option<DateTime<Utc>>> = shards
+            .iter()
+            .map(|s| (s.shard_id, s.latest_event_at))
+            .collect();
+
+        for target in targets {
+            let owned: Vec<&super::PendingTriggerFire> = pending
+                .iter()
+                .filter(|p| p.target_shard == target.shard_id)
+                .collect();
+            if owned.is_empty() {
+                continue;
+            }
+
+            // A SECOND, independent connection. `verify_shard` opened and
+            // dropped its own long before we got here. A failure now must
+            // still surface. Silently skipping would drop every
+            // completion-trigger check for this shard at exit 0.
+            let mut conn = match connect_read_only(&target.dsn).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    findings.push(Finding::new(
+                        FindingClass::ProbeFailed,
+                        Some(target.shard_id),
+                        1,
+                        vec![format!(
+                            "completion-trigger fire resolution could not connect to \
+                             shard {}: {e}",
+                            target.shard_id
+                        )],
+                    ));
+                    continue;
+                }
+            };
+
+            let TriggerFireBuckets {
+                lost,
+                unproven,
+                lookup_errors,
+            } = adjudicate_trigger_fires(&mut conn, &owned, &latest_by_shard).await;
+
+            for (class, samples) in [
+                (FindingClass::CompletionTriggerFireLost, lost),
+                (FindingClass::CompletionTriggerFireUnproven, unproven),
+                (FindingClass::ProbeFailed, lookup_errors),
+            ] {
+                if !samples.is_empty() {
+                    findings.push(Finding::new(
+                        class,
+                        Some(target.shard_id),
+                        samples.len() as u64,
+                        samples,
+                    ));
+                }
+            }
+        }
+        findings
+    }
+
     /// Assemble the full report: per-shard probes, then cross-shard resolution.
     pub(super) async fn run(
         targets: &[ShardTarget],
@@ -2901,13 +3338,32 @@ mod probes {
     ) -> RestoreVerifyReport {
         let mut shards = Vec::new();
         let mut refs = Vec::new();
+        let mut fires: Vec<(i32, super::ResolvedFire)> = Vec::new();
         for target in targets {
-            let (report, mut shard_refs) = verify_shard(target, options, replayer).await;
+            let (report, mut shard_refs, shard_fires) =
+                verify_shard(target, options, replayer).await;
             refs.append(&mut shard_refs);
+            fires.extend(shard_fires.into_iter().map(|f| (target.shard_id, f)));
             shards.push(report);
         }
 
         let mut cross_shard = resolve_refs(&refs, targets).await;
+
+        // Route and adjudicate completion-trigger fires (issue #1401). A
+        // router is built from the SUPPLIED shards only, so this depends on
+        // the same "supply every shard" convention as `UninspectedShardReference`.
+        let router_shards: Vec<ShardId> =
+            targets.iter().map(|t| ShardId::new(t.shard_id)).collect();
+        if !router_shards.is_empty() {
+            let router = crate::shard::ShardRouter::new(
+                router_shards.clone(),
+                router_shards,
+                ShardId::new(options.default_shard),
+            );
+            let pending = super::route_trigger_fires(fires, &router);
+            let mut trigger_findings = resolve_trigger_fires(&pending, targets, &shards).await;
+            cross_shard.append(&mut trigger_findings);
+        }
 
         // Guard the library entry point too, not only the CLI. `VerifyOptions`
         // is public and `default_shard` a plain field. A caller of
@@ -3006,6 +3462,93 @@ mod tests {
                 "{outcome} must be adjudicated, not skipped"
             );
         }
+    }
+
+    // ─────────── completion-trigger fire routing (issue #1401) ───────────
+
+    fn two_shard_router() -> crate::shard::ShardRouter {
+        use crate::types::ShardId;
+        crate::shard::ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(0),
+        )
+    }
+
+    fn resolved_fire(target_workflow_name: &str) -> ResolvedFire {
+        ResolvedFire {
+            source_exec_id: Uuid::new_v4(),
+            trigger_id: Uuid::new_v4(),
+            fired_at: Utc::now(),
+            target_workflow_name: target_workflow_name.to_string(),
+        }
+    }
+
+    #[test]
+    fn route_trigger_fires_derives_the_same_target_workflow_id_as_the_relay() {
+        let router = two_shard_router();
+        let fire = resolved_fire("child_flow");
+        let expected_id = format!(
+            "completion-trigger-{}-{}",
+            fire.trigger_id, fire.source_exec_id
+        );
+        let target_shard = router
+            .pick_for_new_workflow("child_flow", &expected_id)
+            .as_i32();
+        // Force cross-shard by picking a source different from the hash's
+        // pick: the id derivation must not depend on which shard is "source".
+        let source_shard = 1 - target_shard;
+
+        let pending = route_trigger_fires(vec![(source_shard, fire)], &router);
+
+        assert_eq!(pending.len(), 1, "a cross-shard fire must be kept");
+        assert_eq!(pending[0].target_workflow_id, expected_id);
+        assert_eq!(pending[0].target_shard, target_shard);
+        assert_eq!(pending[0].source_shard, source_shard);
+    }
+
+    #[test]
+    fn route_trigger_fires_drops_same_shard_fires() {
+        let router = two_shard_router();
+        let fire = resolved_fire("child_flow");
+        let target_workflow_id = format!(
+            "completion-trigger-{}-{}",
+            fire.trigger_id, fire.source_exec_id
+        );
+        let same_shard = router
+            .pick_for_new_workflow("child_flow", &target_workflow_id)
+            .as_i32();
+
+        let pending = route_trigger_fires(vec![(same_shard, fire)], &router);
+
+        assert!(
+            pending.is_empty(),
+            "a same-shard fire is atomic with its target start and must not \
+             be adjudicated: {pending:?}"
+        );
+    }
+
+    #[test]
+    fn absence_is_decisive_loss_requires_a_restore_point_strictly_before_the_fire() {
+        let fired_at = Utc::now();
+
+        assert!(
+            !absence_is_decisive_loss(fired_at, None),
+            "no timestamp signal at all must not be treated as proof of loss"
+        );
+        assert!(
+            absence_is_decisive_loss(fired_at, Some(fired_at - chrono::Duration::seconds(1))),
+            "a target restore point strictly before the fire proves the loss"
+        );
+        assert!(
+            !absence_is_decisive_loss(fired_at, Some(fired_at)),
+            "a restore point exactly at the fire is not proof of loss"
+        );
+        assert!(
+            !absence_is_decisive_loss(fired_at, Some(fired_at + chrono::Duration::seconds(1))),
+            "a target shard that progressed past the fire may simply have \
+             retained and collected the run"
+        );
     }
 
     /// Codex round 1, P2. `host=alias-a&hostaddr=X` and `host=alias-b&hostaddr=X`
@@ -3155,6 +3698,7 @@ mod tests {
             (FindingClass::ExternalEffectRolledBack, Incoherent),
             (FindingClass::ReplayDivergence, Incoherent),
             (FindingClass::ReplayWorkflowFailed, Incoherent),
+            (FindingClass::CompletionTriggerFireLost, Incoherent),
             (FindingClass::ExternalEffectUnverifiable, Advisory),
             // Worth an operator's eye; does not fail the gate.
             (FindingClass::RestorePointSkew, Advisory),
@@ -3165,6 +3709,7 @@ mod tests {
             // Looked at nothing -- never a pass.
             (FindingClass::ProbeFailed, Undetermined),
             (FindingClass::RetentionUnproven, Undetermined),
+            (FindingClass::CompletionTriggerFireUnproven, Undetermined),
         ];
         assert_eq!(
             expected.len(),

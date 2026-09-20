@@ -21,8 +21,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use autumn_harvest::backup_verify::{
     FindingClass, FindingSeverity, ShardTarget, VerifyOptions, VerifyStatus, verify_restore,
 };
+use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::testing::WorkflowReplayer;
 use autumn_harvest::types::{ExecutionId, ShardId};
+use chrono::{DateTime, Utc};
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::json;
@@ -2331,4 +2333,306 @@ async fn pagination_still_detects_a_rollback_beyond_the_first_page() {
         "pagination must reach the final owner group: {report:#?}"
     );
     assert_eq!(report.status, VerifyStatus::Incoherent);
+}
+
+// ──────────────── completion-trigger relay fires (issue #1401) ────────────────
+
+async fn seed_completion_trigger(
+    conn: &mut AsyncPgConnection,
+    trigger_id: Uuid,
+    source_workflow_name: &str,
+    target_workflow_name: &str,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_triggers \
+         (id, source_workflow_name, terminal_states, target_workflow_name, input_mapping) \
+         VALUES ($1, $2, '[\"COMPLETED\"]'::jsonb, $3, '{}'::jsonb)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(trigger_id)
+    .bind::<diesel::sql_types::Text, _>(source_workflow_name)
+    .bind::<diesel::sql_types::Text, _>(target_workflow_name)
+    .execute(conn)
+    .await
+    .expect("seed completion trigger");
+}
+
+async fn seed_completion_trigger_fire(
+    conn: &mut AsyncPgConnection,
+    source_exec_id: ExecutionId,
+    trigger_id: Uuid,
+    fired_at: DateTime<Utc>,
+    outcome: Option<&str>,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_trigger_fires \
+         (source_exec_id, trigger_id, fired_at, outcome) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(source_exec_id.as_uuid())
+    .bind::<diesel::sql_types::Uuid, _>(trigger_id)
+    .bind::<diesel::sql_types::Timestamptz, _>(fired_at)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(outcome)
+    .execute(conn)
+    .await
+    .expect("seed completion trigger fire");
+}
+
+async fn append_event_at(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    event_id: i32,
+    event_type: &str,
+    data: serde_json::Value,
+    timestamp: DateTime<Utc>,
+) {
+    let payload = json!({ "type": event_type, "data": data });
+    diesel::sql_query(
+        "INSERT INTO harvest_events \
+         (workflow_exec_id, event_id, event_type, event_data, timestamp) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Integer, _>(event_id)
+    .bind::<diesel::sql_types::Text, _>(event_type)
+    .bind::<diesel::sql_types::Jsonb, _>(payload)
+    .bind::<diesel::sql_types::Timestamptz, _>(timestamp)
+    .execute(conn)
+    .await
+    .expect("append event at");
+}
+
+/// A router over shards 0 and 1, matching every test's `targets` list. Used
+/// only to pick `(source_exec_id, trigger_id)` pairs whose deterministic
+/// target lands on a chosen shard -- the same hash `completion_trigger.rs`
+/// uses to place the relay.
+fn two_shard_router() -> ShardRouter {
+    ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    )
+}
+
+/// Search for a `(source_exec_id, trigger_id)` pair on shard 0 whose
+/// completion-trigger target hashes to `want_shard`.
+fn find_fire_targeting(target_workflow_name: &str, want_shard: i32) -> (ExecutionId, Uuid, String) {
+    let router = two_shard_router();
+    loop {
+        let source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+        let trigger_id = Uuid::new_v4();
+        let target_workflow_id = format!("completion-trigger-{trigger_id}-{source_exec_id}");
+        if router
+            .pick_for_new_workflow(target_workflow_name, &target_workflow_id)
+            .as_i32()
+            == want_shard
+        {
+            return (source_exec_id, trigger_id, target_workflow_id);
+        }
+    }
+}
+
+/// The gap issue #1401 names directly: `backup_verify.rs` has zero references
+/// to `harvest_completion_trigger_fires`. A fire with `outcome IS NULL` is the
+/// source shard's own claim that the cross-shard relay delivered. The outbox
+/// row is gone specifically BECAUSE the target-shard start committed, or
+/// because an any-state existence check found it already there. If the
+/// target shard was restored to a point strictly before `fired_at`, the
+/// target execution cannot possibly be in that snapshot. The restore point
+/// proves the loss, so this must be Incoherent.
+#[tokio::test]
+async fn detects_a_lost_cross_shard_completion_trigger_fire() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let (source, trigger_id, _target_id) = find_fire_targeting("child_flow", 1);
+    let fired_at = Utc::now() - chrono::Duration::hours(1);
+
+    seed_execution(&mut a, source, "parent_flow", "ct-lost-1", "COMPLETED", 0).await;
+    seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
+    seed_completion_trigger_fire(&mut a, source, trigger_id, fired_at, None).await;
+
+    // Shard 1's restore point predates the fire, and it has no row for the
+    // target -- the target shard cannot hold the triggered workflow.
+    let stale = ExecutionId::new_for_shard(ShardId::new(1));
+    seed_execution(&mut b, stale, "unrelated", "un-1", "COMPLETED", 1).await;
+    append_event_at(
+        &mut b,
+        stale,
+        1,
+        "WorkflowStarted",
+        json!({ "input": {} }),
+        fired_at - chrono::Duration::hours(1),
+    )
+    .await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        report.detected(FindingClass::CompletionTriggerFireLost),
+        "a fire whose target shard restore point predates fired_at is a \
+         proven loss: {report:#?}"
+    );
+    assert_eq!(report.status, VerifyStatus::Incoherent);
+}
+
+/// The residual ambiguity issue #1401 calls out explicitly (same class as
+/// #1205 finding 3). The target shard progressed PAST `fired_at`, but the
+/// target execution is still absent. That is consistent with ordinary
+/// retention (the run completed and was collected) just as much as a lost
+/// relay. This tool cannot tell them apart. Result: `Undetermined`, never a
+/// silent pass and never a false `Incoherent`.
+#[tokio::test]
+async fn an_absent_completion_trigger_target_past_the_fire_is_unproven() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let (source, trigger_id, _target_id) = find_fire_targeting("child_flow", 1);
+    let fired_at = Utc::now() - chrono::Duration::hours(1);
+
+    seed_execution(
+        &mut a,
+        source,
+        "parent_flow",
+        "ct-unproven-1",
+        "COMPLETED",
+        0,
+    )
+    .await;
+    seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
+    seed_completion_trigger_fire(&mut a, source, trigger_id, fired_at, None).await;
+
+    // Shard 1 has activity AFTER fired_at, so its restore point cannot rule
+    // out the target having run and already been retained.
+    let recent = ExecutionId::new_for_shard(ShardId::new(1));
+    seed_execution(&mut b, recent, "unrelated", "un-2", "COMPLETED", 1).await;
+    append_event_at(
+        &mut b,
+        recent,
+        1,
+        "WorkflowStarted",
+        json!({ "input": {} }),
+        fired_at + chrono::Duration::minutes(30),
+    )
+    .await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        report.detected(FindingClass::CompletionTriggerFireUnproven),
+        "an absence the restore point cannot resolve must be Undetermined: \
+         {report:#?}"
+    );
+    assert!(
+        !report.detected(FindingClass::CompletionTriggerFireLost),
+        "the target shard progressed past fired_at, so this is not a proven \
+         loss: {report:#?}"
+    );
+    assert_eq!(report.status, VerifyStatus::Unavailable, "{report:#?}");
+}
+
+/// The control: the target execution actually exists (any state, mirroring
+/// `execution_exists_by_key`'s own idempotence check), so the relay plainly
+/// landed. Must stay silent.
+#[tokio::test]
+async fn a_delivered_completion_trigger_fire_stays_silent() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let (source, trigger_id, target_id) = find_fire_targeting("child_flow", 1);
+    let fired_at = Utc::now() - chrono::Duration::hours(1);
+
+    seed_execution(&mut a, source, "parent_flow", "ct-ok-1", "COMPLETED", 0).await;
+    seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
+    seed_completion_trigger_fire(&mut a, source, trigger_id, fired_at, None).await;
+
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    seed_execution(&mut b, target, "child_flow", &target_id, "COMPLETED", 1).await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::CompletionTriggerFireLost),
+        "the target execution exists, so the relay landed: {report:#?}"
+    );
+    assert!(
+        !report.detected(FindingClass::CompletionTriggerFireUnproven),
+        "an existing target is not ambiguous: {report:#?}"
+    );
+}
+
+/// Scope guard: a same-shard fire is committed atomically with the target
+/// start (`evaluate_triggers_for_execution`'s inline path), so it is immune
+/// to cross-shard restore skew by construction. The probe must not adjudicate
+/// it at all, even when the target is absent everywhere.
+#[tokio::test]
+async fn a_same_shard_completion_trigger_fire_is_not_probed() {
+    let (url_a, _ca) = setup().await;
+    let mut a = connect(&url_a).await;
+
+    let (source, trigger_id, _target_id) = find_fire_targeting("child_flow", 0);
+    let fired_at = Utc::now() - chrono::Duration::hours(1);
+
+    seed_execution(&mut a, source, "parent_flow", "ct-same-1", "COMPLETED", 0).await;
+    seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
+    seed_completion_trigger_fire(&mut a, source, trigger_id, fired_at, None).await;
+    // No execution row anywhere for the target -- if this were adjudicated at
+    // all it would report as lost or unproven.
+
+    let report = verify_restore(&one_shard(&url_a), &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::CompletionTriggerFireLost),
+        "a same-shard fire is atomic, never a restore-skew risk: {report:#?}"
+    );
+    assert!(
+        !report.detected(FindingClass::CompletionTriggerFireUnproven),
+        "a same-shard fire is atomic, never a restore-skew risk: {report:#?}"
+    );
+}
+
+/// A fire with a RESOLVED outcome (`condition_unmet`/`admission_blocked`)
+/// never started anything on any shard. It asserts nothing about a target
+/// and must never be adjudicated as a fire.
+#[tokio::test]
+async fn a_resolved_completion_trigger_fire_is_not_probed() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+
+    let (source, trigger_id, _target_id) = find_fire_targeting("child_flow", 1);
+    let fired_at = Utc::now() - chrono::Duration::hours(1);
+
+    seed_execution(&mut a, source, "parent_flow", "ct-skip-1", "COMPLETED", 0).await;
+    seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
+    seed_completion_trigger_fire(
+        &mut a,
+        source,
+        trigger_id,
+        fired_at,
+        Some("admission_blocked"),
+    )
+    .await;
+    // No execution row anywhere for the target -- a resolved-skip row is not
+    // a delivered relay, so this must stay silent regardless.
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::CompletionTriggerFireLost),
+        "a resolved-skip row asserts no delivery: {report:#?}"
+    );
+    assert!(
+        !report.detected(FindingClass::CompletionTriggerFireUnproven),
+        "a resolved-skip row asserts no delivery: {report:#?}"
+    );
 }
