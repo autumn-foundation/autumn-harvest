@@ -25579,10 +25579,22 @@ async fn hydrate_ctx_for_query(
             .await
             .map_err(map_error)?;
 
-    // Drop the DB connection before driving user code — prevents holding a
-    // pool slot during replay, which would starve other management and worker
-    // DB operations for the entire duration of the workflow replay.
+    // Drop the DB connection before driving user code (issue #1596
+    // review, comment_id 4056047329). This prevents holding a pool slot
+    // during replay, which would starve other management and worker DB
+    // operations for the entire replay duration.
+    //
+    // `drop(bound)` alone is not enough. `ResidentConn::Held` is the
+    // overwhelmingly common case, per `bind_to_shard`'s own doc comment.
+    // It holds only a `&mut` borrow of `conn`, so dropping it ends the
+    // borrow without releasing `conn`'s own pool checkout. Even the
+    // `Fresh` sibling variant leaves `conn` itself untouched: it owns a
+    // SEPARATE checkout on the target shard. So `conn`'s original
+    // checkout stays held regardless of which variant this resolved to.
+    // Ending `bound`'s borrow first, then dropping `conn` explicitly,
+    // releases both pool slots before the replay below runs.
     drop(bound);
+    drop(conn);
 
     // Whether the recorded history reached a terminal seal (issue #612). A run
     // the engine seals while its function is parked mid-command (TIMED_OUT,
