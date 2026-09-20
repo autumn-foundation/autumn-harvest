@@ -10479,8 +10479,16 @@ async fn persist_all_started_child_workflows(
         // issue #1589's own measured N -> 3N shape. `enforce_quota_admission`
         // is not called here at all. The `admission_is_noop` routing above
         // already proves it would return immediately without a query.
-        if !batchable_children.is_empty() {
-            let child_rows: Vec<NewWorkflowExecution<'_>> = batchable_children
+        // Chunk boundaries are decided up front from `batchable_children`'s
+        // own borrowed `child.input` (Codex review, issue #1589), before
+        // any row is built. Each chunk then builds its own small row
+        // `Vec`s for all three tables, inserts them, and drops them. Peak
+        // memory therefore stays bounded by one chunk's payload, not the
+        // whole batchable group's.
+        for (start, end) in compute_local_child_chunk_bounds(&batchable_children) {
+            let plan_chunk = &batchable_children[start..end];
+
+            let child_rows: Vec<NewWorkflowExecution<'_>> = plan_chunk
                 .iter()
                 .map(|plan| {
                     build_child_row(
@@ -10493,15 +10501,14 @@ async fn persist_all_started_child_workflows(
                     )
                 })
                 .collect();
-            for (start, end) in compute_execution_chunk_bounds(&child_rows) {
-                diesel::insert_into(harvest_workflow_executions::table)
-                    .values(&child_rows[start..end])
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-            }
+            diesel::insert_into(harvest_workflow_executions::table)
+                .values(&child_rows)
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            drop(child_rows);
 
-            let started_events: Vec<(ExecutionId, WorkflowEvent)> = batchable_children
+            let started_events: Vec<(ExecutionId, WorkflowEvent)> = plan_chunk
                 .iter()
                 .map(|plan| {
                     (
@@ -10523,8 +10530,9 @@ async fn persist_all_started_child_workflows(
                 registry.payload_codecs(),
             )
             .await?;
+            drop(started_events);
 
-            let enqueue_params: Vec<queue::EnqueueParams> = batchable_children
+            let enqueue_params: Vec<queue::EnqueueParams> = plan_chunk
                 .iter()
                 .map(|plan| {
                     let child = plan.child;
@@ -10738,34 +10746,6 @@ fn json_byte_len(value: &serde_json::Value) -> usize {
     counter.0
 }
 
-/// Splits `rows` into `[start, end)` index ranges, each within both
-/// [`ROWS_PER_EXECUTION_INSERT_CHUNK`] rows and
-/// [`MAX_EXECUTION_CHUNK_PAYLOAD_BYTES`] of summed `input`. Whichever bound
-/// is reached first ends a chunk.
-///
-/// Mirrors `queue.rs`'s `compute_chunk_bounds` shape. A non-empty `rows`
-/// always returns at least one range, and every row falls into exactly one
-/// of them, in order.
-fn compute_execution_chunk_bounds(rows: &[NewWorkflowExecution<'_>]) -> Vec<(usize, usize)> {
-    let mut chunk_bounds = Vec::new();
-    let mut chunk_start = 0_usize;
-    while chunk_start < rows.len() {
-        let mut chunk_end = chunk_start + 1;
-        let mut payload_bytes = json_byte_len(&rows[chunk_start].input);
-        while chunk_end < rows.len() && chunk_end - chunk_start < ROWS_PER_EXECUTION_INSERT_CHUNK {
-            let next_bytes = json_byte_len(&rows[chunk_end].input);
-            if payload_bytes + next_bytes > MAX_EXECUTION_CHUNK_PAYLOAD_BYTES {
-                break;
-            }
-            payload_bytes += next_bytes;
-            chunk_end += 1;
-        }
-        chunk_bounds.push((chunk_start, chunk_end));
-        chunk_start = chunk_end;
-    }
-    chunk_bounds
-}
-
 /// One local awaited child's precomputed spawn inputs (issue #1589).
 ///
 /// Built once per child in `persist_all_started_child_workflows`. Then
@@ -10778,6 +10758,40 @@ struct LocalChildPlan<'a> {
     defaults: ChildWorkflowDefaults,
     child_workflow_id: String,
     child_quota_key: Option<String>,
+}
+
+/// Splits `plans` into `[start, end)` index ranges, each within both
+/// [`ROWS_PER_EXECUTION_INSERT_CHUNK`] rows and
+/// [`MAX_EXECUTION_CHUNK_PAYLOAD_BYTES`] of summed child `input`. Whichever
+/// bound is reached first ends a chunk.
+///
+/// Measured directly from each plan's own `child.input` (Codex review,
+/// issue #1589), before any `NewWorkflowExecution`/event/enqueue row is
+/// built. The batched-insert loop then builds, inserts, and drops each
+/// chunk's own small row `Vec`s in turn. Peak memory therefore stays
+/// bounded by one chunk's payload, not the whole group's.
+///
+/// Mirrors `queue.rs`'s `compute_chunk_bounds` shape. A non-empty `plans`
+/// always returns at least one range, and every plan falls into exactly
+/// one of them, in order.
+fn compute_local_child_chunk_bounds(plans: &[LocalChildPlan<'_>]) -> Vec<(usize, usize)> {
+    let mut chunk_bounds = Vec::new();
+    let mut chunk_start = 0_usize;
+    while chunk_start < plans.len() {
+        let mut chunk_end = chunk_start + 1;
+        let mut payload_bytes = json_byte_len(&plans[chunk_start].child.input);
+        while chunk_end < plans.len() && chunk_end - chunk_start < ROWS_PER_EXECUTION_INSERT_CHUNK {
+            let next_bytes = json_byte_len(&plans[chunk_end].child.input);
+            if payload_bytes + next_bytes > MAX_EXECUTION_CHUNK_PAYLOAD_BYTES {
+                break;
+            }
+            payload_bytes += next_bytes;
+            chunk_end += 1;
+        }
+        chunk_bounds.push((chunk_start, chunk_end));
+        chunk_start = chunk_end;
+    }
+    chunk_bounds
 }
 
 /// Builds one local awaited child's insert row from its [`LocalChildPlan`].
@@ -29932,59 +29946,46 @@ mod tests {
     fn execution_chunk_bounds_splits_near_max_size_inputs_into_many_small_chunks() {
         let near_max_bytes =
             usize::try_from(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES).unwrap();
-        let ids: Vec<String> = (0..200).map(|i| format!("wf-id-{i}")).collect();
-        let rows: Vec<crate::models::NewWorkflowExecution<'_>> = ids
-            .iter()
-            .map(|workflow_id| crate::models::NewWorkflowExecution {
-                id: uuid::Uuid::nil(),
-                workflow_name: "wf",
-                workflow_id,
-                run_id: uuid::Uuid::nil(),
-                shard_id: 0,
+        let commands: Vec<StartedChildWorkflowCommand> = (0..200)
+            .map(|_| StartedChildWorkflowCommand {
+                child_id: ExecutionId::new(),
+                workflow_name: "wf".to_string(),
                 input: serde_json::json!("x".repeat(near_max_bytes)),
-                parent_id: None,
-                queue_name: "default",
-                execution_timeout: None,
-                deadline_at: None,
-                chain_execution_timeout: None,
-                chain_deadline_at: None,
-                memo: None,
-                search_attrs: None,
-                assigned_build_id: None,
-                parent_close_policy: None,
-                owner: None,
-                runbook_url: None,
-                severity: None,
-                context_headers: None,
-                sla: None,
-                sla_deadline_at: None,
-                schedule_id: None,
-                scheduled_for: None,
-                workflow_attempt: 1,
-                workflow_retry_policy: None,
-                retry_of_exec_id: None,
-                origin: None,
-                completion_callbacks: None,
-                continued_from_exec_id: None,
-                first_exec_id: None,
-                start_source: None,
-                start_source_ref: None,
-                started_by: None,
-                quota_key: None,
+            })
+            .collect();
+        let plans: Vec<LocalChildPlan<'_>> = commands
+            .iter()
+            .map(|child| LocalChildPlan {
+                child,
+                defaults: ChildWorkflowDefaults {
+                    owner: None,
+                    runbook_url: None,
+                    severity: None,
+                    sla: None,
+                    sla_deadline_at: None,
+                    execution_timeout: None,
+                    deadline_at: None,
+                    chain_execution_timeout: None,
+                    chain_deadline_at: None,
+                    retry_policy: None,
+                    quota: None,
+                },
+                child_workflow_id: child.child_id.to_string(),
+                child_quota_key: None,
             })
             .collect();
 
-        let bounds = compute_execution_chunk_bounds(&rows);
+        let bounds = compute_local_child_chunk_bounds(&plans);
 
         assert!(
             bounds.len() > 10,
-            "200 near-max-size rows must split into many small chunks, got {} chunk(s)",
+            "200 near-max-size plans must split into many small chunks, got {} chunk(s)",
             bounds.len()
         );
         for &(start, end) in &bounds {
-            let row_sizes: Vec<usize> = rows[start..end]
+            let row_sizes: Vec<usize> = plans[start..end]
                 .iter()
-                .map(|r| json_byte_len(&r.input))
+                .map(|p| json_byte_len(&p.child.input))
                 .collect();
             let chunk_payload: usize = row_sizes.iter().sum();
             let largest_row = row_sizes.iter().copied().max().unwrap_or(0);
@@ -29997,13 +29998,13 @@ mod tests {
         let mut next_expected = 0;
         for &(start, end) in &bounds {
             assert_eq!(start, next_expected, "chunks must be contiguous, no gaps");
-            assert!(end > start, "every chunk must carry at least one row");
+            assert!(end > start, "every chunk must carry at least one plan");
             next_expected = end;
         }
         assert_eq!(
             next_expected,
-            rows.len(),
-            "every row must fall into a chunk"
+            plans.len(),
+            "every plan must fall into a chunk"
         );
     }
 

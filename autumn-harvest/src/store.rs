@@ -374,6 +374,18 @@ const NEW_HARVEST_EVENT_COLUMNS: usize = 4;
 #[cfg(feature = "db")]
 const ROWS_PER_EVENT_INSERT_CHUNK: usize = POSTGRES_MAX_BIND_PARAMS / NEW_HARVEST_EVENT_COLUMNS;
 
+/// [`crate::models::NewHarvestPayloadRef`]'s field count (issue #1589
+/// Codex review: a batch's offloaded refs need their own chunk bound, not
+/// just the event rows). Pinned by a regression test below.
+#[cfg(feature = "db")]
+const NEW_HARVEST_PAYLOAD_REF_COLUMNS: usize = 4;
+
+/// Rows per chunk, floored so `ROWS_PER_PAYLOAD_REF_INSERT_CHUNK *
+/// NEW_HARVEST_PAYLOAD_REF_COLUMNS` never reaches [`POSTGRES_MAX_BIND_PARAMS`].
+#[cfg(feature = "db")]
+const ROWS_PER_PAYLOAD_REF_INSERT_CHUNK: usize =
+    POSTGRES_MAX_BIND_PARAMS / NEW_HARVEST_PAYLOAD_REF_COLUMNS;
+
 /// Byte budget on one chunk's summed `event_data` size. Mirrors
 /// `queue::enqueue_batch`'s identical-purpose `MAX_CHUNK_PAYLOAD_BYTES`.
 ///
@@ -515,9 +527,9 @@ pub async fn append_new_execution_started_events_batch(
                     .await
                     .map_err(crate::error::database_error)?;
             }
-            if !ref_rows.is_empty() {
+            for ref_chunk in ref_rows.chunks(ROWS_PER_PAYLOAD_REF_INSERT_CHUNK) {
                 diesel::insert_into(harvest_payload_refs::table)
-                    .values(&ref_rows)
+                    .values(ref_chunk)
                     .on_conflict_do_nothing()
                     .execute(conn)
                     .await
@@ -2508,6 +2520,34 @@ mod tests {
             assert!(NEW_HARVEST_EVENT_COLUMNS == 4);
             assert!(
                 ROWS_PER_EVENT_INSERT_CHUNK * NEW_HARVEST_EVENT_COLUMNS <= POSTGRES_MAX_BIND_PARAMS
+            );
+        }
+    }
+
+    /// Pins [`NEW_HARVEST_PAYLOAD_REF_COLUMNS`], and therefore
+    /// [`ROWS_PER_PAYLOAD_REF_INSERT_CHUNK`], to `NewHarvestPayloadRef`'s
+    /// real field count, by exhaustive destructure (issue #1589). Adding,
+    /// removing, or renaming a field breaks this match at compile time.
+    #[cfg(feature = "db")]
+    #[test]
+    fn new_harvest_payload_ref_column_count_matches_the_constant() {
+        let sample = crate::models::NewHarvestPayloadRef {
+            blob_key: String::new(),
+            workflow_exec_id: uuid::Uuid::nil(),
+            store_id: String::new(),
+            byte_len: 0,
+        };
+        let crate::models::NewHarvestPayloadRef {
+            blob_key: _,
+            workflow_exec_id: _,
+            store_id: _,
+            byte_len: _,
+        } = sample;
+        const {
+            assert!(NEW_HARVEST_PAYLOAD_REF_COLUMNS == 4);
+            assert!(
+                ROWS_PER_PAYLOAD_REF_INSERT_CHUNK * NEW_HARVEST_PAYLOAD_REF_COLUMNS
+                    <= POSTGRES_MAX_BIND_PARAMS
             );
         }
     }
