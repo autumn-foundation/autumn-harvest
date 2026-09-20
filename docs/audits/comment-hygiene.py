@@ -2932,7 +2932,7 @@ def comment_lines(pieces: list[Piece]):
                 if html not in (None, "tag") and html_closes(text, html):
                     html = None
                     # `nesting_shift` restores a SNAPSHOT taken before this
-                    # piece's nest level was entered, so closing here would
+                    # piece's nest level was entered. Closing here would
                     # otherwise be undone the moment a shallower piece pops
                     # it back. The closer is definitive at every depth it is
                     # still pending for, so it is applied to each one too.
@@ -2974,11 +2974,15 @@ def comment_lines(pieces: list[Piece]):
                 # asymmetry, now with the structure to tell them apart.
                 enclosing = stack[-1][0] if stack else 0
                 body = strip_quote(text, enclosing)
+                # `table_scope` is set below, once `stack` has THIS line's own
+                # marker in it -- a table opening on the same line as the list
+                # item that holds it ("- | h |") must not measure the item's
+                # column against the frame the line arrived in.
+                table_opened = False
                 if in_table:
                     in_table = not starts_block(body, enclosing)
                 elif table_header(run, index, piece.nest, body, enclosing):
-                    in_table = True
-                    table_scope = (enclosing, enclosing, quote_depth(text, enclosing))
+                    in_table = table_opened = True
                 # Peeled, and measured in the frame the peel leaves: a code
                 # block may begin on the marker line itself, and
                 # "-     let x = compute();" is an item holding four columns
@@ -3016,9 +3020,14 @@ def comment_lines(pieces: list[Piece]):
                 # quote inside a list item, and reading the raw line reports
                 # depth zero because the marker comes first -- one loop then
                 # believes the line left the quote and the other does not.
-                peeled_now, _, quoted, _ = strip_containers(
+                peeled_now, _, quoted, reached_column = strip_containers(
                     text, stack, stack[-1][0] if stack else 0, open_paragraph
                 )
+                # Read AFTER `update_containers`, like `html_scope` -- a table
+                # opened by this same line's own list marker is scoped to the
+                # column that marker just pushed, not the frame it arrived in.
+                if table_opened:
+                    table_scope = (stack[-1][0] if stack else 0, reached_column, quoted)
                 # A quoted paragraph may carry on across a line with no ">"
                 # of its own, and that line LEAVES the quote by depth while
                 # staying inside the block. Cutting the span there split one
@@ -3153,7 +3162,8 @@ def comment_lines(pieces: list[Piece]):
             ):
                 # The container this line opened the block in, read the same
                 # way a fence's own `scope` is: `leaves_container` ends the
-                # block the line the container ends, opener or not.
+                # block on the line the container ends, whether or not that
+                # line carries a closer of its own.
                 html_scope = (container, reached_column, reached_depth)
                 html = html_kind(peeled)
                 if html != "tag" and html_closes(peeled, html):
@@ -3494,11 +3504,13 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 # refused its container and the fence under it went unseen.
                 enclosing = stack[-1][0] if stack else 0
                 peek = strip_quote(body, enclosing)
+                # `table_scope` is set below, once `stack` has THIS line's own
+                # marker in it -- see the matching comment in `comment_lines`.
+                table_opened = False
                 if in_table:
                     in_table = not starts_block(peek, enclosing)
                 elif table_header(block, index, piece.nest, peek, enclosing):
-                    in_table = True
-                    table_scope = (enclosing, enclosing, quote_depth(body, enclosing))
+                    in_table = table_opened = True
                 code_text, code_container = strip_containers(body, stack, enclosing, paragraph)[:2]
                 indented = indented_code(
                     code_text,
@@ -3569,6 +3581,10 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             peeled, _, depth, reached_column = strip_containers(
                 body, stack, container, open_paragraph
             )
+            # Read AFTER `update_containers`, like `html_scope` -- see the
+            # matching comment in `comment_lines`.
+            if table_opened:
+                table_scope = (container, reached_column, depth)
             # Lazy continuation: a quoted paragraph may carry on across a line
             # that has no marker of its own, so long as that line is ordinary
             # paragraph text. Flushing there splits one quoted sentence into
@@ -6875,6 +6891,44 @@ RULE_TESTS = [
         "/// " + " ".join(f"word{n}" for n in range(1, 27)) + ".\n",
         {("CH007", 3)},
         "and a table there the same way",
+    ),
+    (
+        "/** <pre>\n"
+        " * sample\n"
+        " * /* </pre> */\n"
+        " * " + " ".join(f"word{n}" for n in range(1, 27)) + ".\n"
+        " */\n",
+        {("CH007", 4)},
+        "and the prose scanner sees a nested closer too",
+    ),
+    (
+        "/// - <pre>\n"
+        "/// " + " ".join(f"word{n}" for n in range(1, 27)) + ".\n",
+        {("CH007", 2)},
+        "an HTML block opened by its own list marker is scoped to it",
+    ),
+    (
+        "/// - item\n"
+        "///   > | h |\n"
+        "///   > | - |\n"
+        "/// " + " ".join(f"word{n}" for n in range(1, 27)) + ".\n",
+        {("CH007", 4)},
+        "a table's scope survives leaving the quote it opened in, inside a list",
+    ),
+    (
+        "/// - | h |\n"
+        "///   | - |\n"
+        "/// " + " ".join(f"word{n}" for n in range(1, 27)) + ".\n",
+        {("CH007", 3)},
+        "a table opened by its own list marker is scoped to it",
+    ),
+    (
+        "/// Intro paragraph\n"
+        "/// > 2. ```rust\n"
+        "/// >    TODO: fixture placeholder\n"
+        "/// >    ```\n",
+        set(),
+        "a marker right after a quote crossing is not refused the paragraph's veto",
     ),
 ]
 
