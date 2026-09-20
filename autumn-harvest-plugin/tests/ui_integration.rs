@@ -1171,6 +1171,10 @@ async fn ui_dead_letters_invalid_refresh_redisplays_page_instead_of_aborting_pag
         html.contains("not-a-number"),
         "the error must name the bad value: {html}"
     );
+    assert!(
+        !html.contains("http-equiv=\"refresh\""),
+        "an invalid refresh must not set a meta refresh: {html}"
+    );
 }
 
 /// Same fix, the `page` field. No form field backs it; it drives the
@@ -1586,6 +1590,10 @@ async fn ui_workers_invalid_refresh_redisplays_page_instead_of_aborting_page() {
     assert!(
         html.contains("not-a-number"),
         "the error must name the bad value: {html}"
+    );
+    assert!(
+        !html.contains("http-equiv=\"refresh\""),
+        "an invalid refresh must not set a meta refresh: {html}"
     );
 }
 
@@ -2292,6 +2300,10 @@ async fn ui_schedules_invalid_refresh_redisplays_page_instead_of_aborting_page()
     assert!(
         html.contains("not-a-number"),
         "the error must name the bad value: {html}"
+    );
+    assert!(
+        !html.contains("http-equiv=\"refresh\""),
+        "an invalid refresh must not set a meta refresh: {html}"
     );
 }
 
