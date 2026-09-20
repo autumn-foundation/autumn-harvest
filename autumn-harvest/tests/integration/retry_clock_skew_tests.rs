@@ -1,7 +1,7 @@
 #![cfg(feature = "db")]
 //! Regression tests for issue #1389 — quota retry backoff via
-//! `requeue_for_retry` (and its two siblings) can be defeated by host/Postgres
-//! clock skew.
+//! `requeue_for_retry` (and its three siblings) can be defeated by
+//! host/Postgres clock skew.
 //!
 //! Each retry-requeue function used to compute `scheduled_at` on the
 //! **host** clock, but `claim_task` checks `scheduled_at <= NOW()` on
@@ -252,6 +252,24 @@ async fn requeue_workflow_task_after_panic_computes_scheduled_at_on_the_db_clock
     queue::requeue_workflow_task_after_panic(&mut conn, task, delay, "handler panic")
         .await
         .expect("requeue after panic");
+
+    assert_scheduled_at_matches_delay_on_db_clock(&mut conn, task, delay).await;
+}
+
+/// `requeue_workflow_task_for_quota_retry` (issue #1391) uses the same
+/// `clock_timestamp() + make_interval(...)` pattern as its siblings above.
+/// This pins it against the same clock-skew regression.
+#[tokio::test]
+async fn requeue_workflow_task_for_quota_retry_computes_scheduled_at_on_the_db_clock() {
+    let (mut conn, _c) = setup_db().await;
+    let q = unique_queue("quota-retry-skew");
+    let task = enqueue_workflow_task(&mut conn, &q).await;
+    assert_eq!(claim_one(&mut conn, &q).await, task);
+
+    let delay = Duration::seconds(2);
+    queue::requeue_workflow_task_for_quota_retry(&mut conn, task, delay, "quota exceeded")
+        .await
+        .expect("requeue for quota retry");
 
     assert_scheduled_at_matches_delay_on_db_clock(&mut conn, task, delay).await;
 }
