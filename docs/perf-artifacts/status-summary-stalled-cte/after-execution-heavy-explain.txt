@@ -1,0 +1,60 @@
+-- after-execution-heavy --
+WITH recent_event_execs AS MATERIALIZED ( SELECT DISTINCT workflow_exec_id FROM harvest_events WHERE timestamp >= NOW() - (60 * INTERVAL '1 minute') ) SELECT COUNT(*)::BIGINT AS cnt FROM ( SELECT 1 FROM harvest_workflow_executions e WHERE e.state IN ('RUNNING', 'SUSPENDED') AND NOT EXISTS ( SELECT 1 FROM recent_event_execs r WHERE r.workflow_exec_id = e.id ) AND ( EXISTS ( SELECT 1 FROM harvest_task_queue WHERE workflow_exec_id = e.id AND state IN ('PENDING','CLAIMED','RUNNING','BACKOFF') ) OR EXISTS ( SELECT 1 FROM harvest_workflow_executions c WHERE c.parent_id = e.id AND c.state NOT IN ( 'COMPLETED','FAILED','CANCELLED', 'TIMED_OUT','CONTINUED_AS_NEW','TERMINATED' ) ) OR EXISTS ( SELECT 1 FROM harvest_signals WHERE workflow_exec_id = e.id AND consumed = false ) OR NOT EXISTS ( SELECT 1 FROM harvest_timers WHERE workflow_exec_id = e.id AND fired = false AND fires_at > NOW() ) OR EXISTS ( SELECT 1 FROM harvest_timers WHERE workflow_exec_id = e.id AND fired = false AND fires_at <= NOW() ) ) LIMIT 51 ) t
+
+Aggregate  (cost=5478.39..5478.40 rows=1 width=8) (actual time=6.803..6.807 rows=1 loops=1)
+  Buffers: shared hit=269
+  CTE recent_event_execs
+    ->  HashAggregate  (cost=2095.79..2126.08 rows=3029 width=16) (actual time=1.332..1.588 rows=2970 loops=1)
+          Group Key: harvest_events.workflow_exec_id
+          Batches: 1  Memory Usage: 241kB
+          Buffers: shared hit=64
+          ->  Bitmap Heap Scan on harvest_events  (cost=72.38..2088.06 rows=3091 width=16) (actual time=0.223..0.683 rows=2970 loops=1)
+                Recheck Cond: ("timestamp" >= (now() - '01:00:00'::interval))
+                Heap Blocks: exact=38
+                Buffers: shared hit=64
+                ->  Bitmap Index Scan on idx_harvest_events_recent_by_timestamp  (cost=0.00..71.61 rows=3091 width=0) (actual time=0.211..0.211 rows=2970 loops=1)
+                      Index Cond: ("timestamp" >= (now() - '01:00:00'::interval))
+                      Buffers: shared hit=26
+  ->  Limit  (cost=98.72..3351.68 rows=51 width=4) (actual time=6.777..6.801 rows=30 loops=1)
+        Buffers: shared hit=269
+        ->  Hash Anti Join  (cost=98.72..176140.97 rows=2760 width=4) (actual time=6.776..6.797 rows=30 loops=1)
+              Hash Cond: (e.id = r.workflow_exec_id)
+              Buffers: shared hit=269
+              ->  Index Scan using idx_harvest_we_non_terminal_wf_name on harvest_workflow_executions e  (cost=0.28..175944.02 rows=2927 width=16) (actual time=1.324..3.614 rows=3000 loops=1)
+                    Filter: ((state = ANY ('{RUNNING,SUSPENDED}'::text[])) AND ((hashed SubPlan 3) OR (hashed SubPlan 5) OR (hashed SubPlan 7) OR (NOT (hashed SubPlan 9)) OR (hashed SubPlan 11)))
+                    Buffers: shared hit=205
+                    SubPlan 3
+                      ->  Seq Scan on harvest_task_queue  (cost=0.00..105.55 rows=2970 width=16) (actual time=0.006..0.705 rows=2970 loops=1)
+                            Filter: (state = ANY ('{PENDING,CLAIMED,RUNNING,BACKOFF}'::text[]))
+                            Buffers: shared hit=61
+                    SubPlan 5
+                      ->  Bitmap Heap Scan on harvest_workflow_executions c  (cost=36.14..1267.01 rows=3021 width=16) (actual time=0.090..0.559 rows=3000 loops=1)
+                            Recheck Cond: (state <> ALL ('{COMPLETED,FAILED,CANCELLED,TIMED_OUT,CONTINUED_AS_NEW,TERMINATED}'::text[]))
+                            Heap Blocks: exact=67
+                            Buffers: shared hit=71
+                            ->  Bitmap Index Scan on idx_harvest_we_non_terminal_wf_name  (cost=0.00..35.39 rows=3021 width=0) (actual time=0.077..0.078 rows=3000 loops=1)
+                                  Buffers: shared hit=4
+                    SubPlan 7
+                      ->  Seq Scan on harvest_signals  (cost=0.00..14.90 rows=245 width=16) (actual time=0.011..0.011 rows=0 loops=1)
+                            Filter: (NOT consumed)
+                    SubPlan 9
+                      ->  Bitmap Heap Scan on harvest_timers  (cost=4.17..16.16 rows=133 width=16) (actual time=0.003..0.003 rows=0 loops=1)
+                            Recheck Cond: ((fires_at > now()) AND (NOT fired))
+                            Buffers: shared hit=2
+                            ->  Bitmap Index Scan on idx_harvest_timers_pending  (cost=0.00..4.14 rows=133 width=0) (actual time=0.003..0.003 rows=0 loops=1)
+                                  Index Cond: (fires_at > now())
+                                  Buffers: shared hit=2
+                    SubPlan 11
+                      ->  Bitmap Heap Scan on harvest_timers harvest_timers_1  (cost=4.17..16.16 rows=133 width=16) (never executed)
+                            Recheck Cond: ((fires_at <= now()) AND (NOT fired))
+                            ->  Bitmap Index Scan on idx_harvest_timers_pending  (cost=0.00..4.14 rows=133 width=0) (never executed)
+                                  Index Cond: (fires_at <= now())
+              ->  Hash  (cost=60.58..60.58 rows=3029 width=16) (actual time=2.641..2.641 rows=2970 loops=1)
+                    Buckets: 4096  Batches: 1  Memory Usage: 172kB
+                    Buffers: shared hit=64
+                    ->  CTE Scan on recent_event_execs r  (cost=0.00..60.58 rows=3029 width=16) (actual time=1.334..2.263 rows=2970 loops=1)
+                          Buffers: shared hit=64
+Planning:
+  Buffers: shared hit=1417
+Planning Time: 4.286 ms
+Execution Time: 7.192 ms

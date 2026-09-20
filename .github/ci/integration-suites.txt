@@ -200,6 +200,7 @@ linux        autumn-harvest-plugin  start_idempotency_integration    -          
 linux        autumn-harvest-plugin  start_source_integration         -                          -
 linux        autumn-harvest-plugin  start_throttle_integration       -                          -
 linux        autumn-harvest-plugin  status_summary_integration       -                          -
+linux        autumn-harvest-plugin  status_summary_stalled_perf      -                          -
 linux        autumn-harvest-plugin  timeline_integration             -                          -
 linux        autumn-harvest-plugin  token_auth_integration           -                          -
 linux        autumn-harvest-plugin  triage_integration               -                          -
