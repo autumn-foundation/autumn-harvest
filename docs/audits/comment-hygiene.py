@@ -3222,6 +3222,10 @@ def comment_lines(pieces: list[Piece]):
                 html_scope = (container, reached_column, reached_depth)
                 html = html_kind(peeled)
                 if html != "tag" and html_closes(peeled, html):
+                    # Self-closing on the OPENER's own piece: a nested
+                    # comment may still split the rest of this physical
+                    # line into later pieces, and those stay raw HTML too.
+                    html_closing_line = piece.line
                     html = None
                 # The opener's line is inside the block it opens. Rustdoc
                 # renders "<pre>TODO: x</pre>" preformatted, so the line
@@ -3705,6 +3709,8 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 html_scope = (container, reached_column, depth)
                 html = html_kind(peeled)
                 if html != "tag" and html_closes(peeled, html):
+                    # See the matching comment in `comment_lines`.
+                    html_closing_line = piece.line
                     html = None
                 flush()
                 in_list = False
@@ -7098,6 +7104,19 @@ RULE_TESTS = [
         " */\n",
         {("CH007", 6)},
         "and the prose scanner sees the same close",
+    ),
+    (
+        "/** <pre></pre> /* TODO: inner */ TODO: suffix\n"
+        " */\n",
+        set(),
+        "a self-closing opener still keeps the rest of its own line",
+    ),
+    (
+        "/** <pre></pre> /* inner */ "
+        + " ".join(f"word{n}" for n in range(1, 27)) + ".\n"
+        " */\n",
+        set(),
+        "and the prose scanner keeps it too",
     ),
 ]
 
