@@ -1,0 +1,126 @@
+diff --git a/autumn-harvest/src/det_check.rs b/autumn-harvest/src/det_check.rs
+index 1a6da4e..05e1e59 100644
+--- a/autumn-harvest/src/det_check.rs
++++ b/autumn-harvest/src/det_check.rs
+@@ -672,6 +672,65 @@ enum ScopeKind {
+     Opaque,
+ }
+ 
++/// Trims leading/trailing whitespace, byte-identical to [`str::trim`], with an
++/// ASCII fast path for the common case.
++///
++/// `str::trim()` dispatches through the generic `Pattern`/`Searcher`
++/// machinery for the `char::is_whitespace` predicate, which a self-scan
++/// profile of this module's own workload (`docs/perf-artifacts/
++/// det-check-line-trim/`) attributes over 5% of total instructions to
++/// (`core::str::trim_matches`) -- called once per source line from both the
++/// module-scope scan below and the per-line function-body loop it inlines.
++/// Every `cargo fmt`-formatted Rust source line is ASCII-whitespace-only at
++/// its edges, so this strips ASCII whitespace with `str::trim_ascii` first,
++/// then falls back to the general `str::trim()` only when a residual
++/// Unicode-whitespace codepoint is still sitting at an edge afterward --
++/// which can only happen for non-ASCII whitespace or for `0x0B` (vertical
++/// tab) -- the one byte `u8::is_ascii_whitespace`/`str::trim_ascii` omit that
++/// `char::is_whitespace` still counts as whitespace -- so the result is
++/// exactly what `line.trim()` would have produced, on every input.
++fn trim_line(line: &str) -> &str {
++    // `str::trim_ascii` (stable since 1.80, within this crate's 1.88 MSRV) is
++    // std's own ASCII-whitespace trim. Its internal implementation slices the
++    // result with `from_utf8_unchecked` (sound: trimming ASCII bytes off a
++    // valid UTF-8 string cannot break UTF-8 validity), skipping the
++    // char-boundary check every `&str` range index normally pays -- cheaper
++    // than an equivalent hand-rolled byte scan built from safe indexing.
++    let candidate = line.trim_ascii();
++    let bytes = candidate.as_bytes();
++    // A byte can survive `trim_ascii` while still being whitespace: 0x0B
++    // (vertical tab) is `char::is_whitespace` but not `u8::is_ascii_whitespace`.
++    // So "ASCII and not 0x0B" -- not just "ASCII" -- is what proves an edge
++    // byte is definitely not whitespace of any kind.
++    let is_definitely_non_whitespace = |b: u8| b < 0x80 && b != 0x0B;
++    let edges_are_ascii = bytes
++        .first()
++        .is_none_or(|&f| is_definitely_non_whitespace(f))
++        && bytes
++            .last()
++            .is_none_or(|&l| is_definitely_non_whitespace(l));
++    if edges_are_ascii {
++        // Neither edge survived the ASCII-whitespace trim above while also
++        // being a definitely-non-whitespace ASCII byte, so neither is
++        // whitespace of any kind. This is the common case (every `cargo
++        // fmt`-formatted line), and it skips the char-decode + `is_whitespace`
++        // table lookup below entirely.
++        return candidate;
++    }
++    // Rare: a non-ASCII byte, or a vertical tab, sits at an edge. Only then
++    // pay for a real decode + `char::is_whitespace` check.
++    let edge_has_unicode_ws = candidate.chars().next().is_some_and(char::is_whitespace)
++        || candidate
++            .chars()
++            .next_back()
++            .is_some_and(char::is_whitespace);
++    if edge_has_unicode_ws {
++        candidate.trim()
++    } else {
++        candidate
++    }
++}
++
+ /// Returns every **module-scope** function definition (top level and inside
+ /// `mod NAME { … }` blocks, at any nesting), with a flag for whether it carries
+ /// `#[workflow]` / `#[activity]`. Methods inside `impl`/`trait` blocks are
+@@ -715,7 +774,7 @@ fn extract_all_functions(lines: &[&str]) -> Vec<FnDef> {
+             continue;
+         }
+ 
+-        let trimmed = lines[i].trim();
++        let trimmed = trim_line(lines[i]);
+ 
+         // Accumulate the workflow/activity attribute state, keeping it across
+         // intervening attributes, doc comments, and blank lines.
+@@ -764,7 +823,7 @@ fn extract_all_functions(lines: &[&str]) -> Vec<FnDef> {
+         pending_wf = false;
+         pending_act = false;
+         let stripped = strip_unparseable_content(lines[i]);
+-        let trimmed_stripped = stripped.trim();
++        let trimmed_stripped = trim_line(&stripped);
+         // Resolve the module name for a `Module` scope this line may open: either
+         // continuing a `pending_mod` from a prior line, or a fresh `mod NAME {`.
+         let (mod_first, mod_name) = if pending_mod {
+@@ -843,10 +902,10 @@ fn extract_fn_body(lines: &[&str], fn_idx: usize) -> Option<(Vec<(u32, String)>,
+ 
+         if let Some(pos) = scan_braces_outside_literals(line, &mut depth) {
+             let before = &line[..pos];
+-            if !before.trim().is_empty() {
++            if !trim_line(before).is_empty() {
+                 body.push((line_num, before.to_string()));
+             }
+-        } else if !line.trim().is_empty() {
++        } else if !trim_line(line).is_empty() {
+             body.push((line_num, line.to_string()));
+         }
+ 
+@@ -3124,6 +3183,24 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn trim_line_matches_str_trim_including_vertical_tab_and_unicode_whitespace() {
++        // 0x0B (vertical tab) is `char::is_whitespace` but survives
++        // `str::trim_ascii` untouched -- the exact gap this helper's ASCII
++        // fast path must not fall into (docs/perf-artifacts/
++        // det-check-line-trim/, Codex review on the reproduction diff).
++        let vt = "\u{0B}payload\u{0B}";
++        assert_eq!(trim_line(vt), vt.trim());
++        assert_eq!(trim_line(vt), "payload");
++        // Non-ASCII Unicode whitespace (already covered by the fallback path).
++        let nbsp = "\u{A0}payload\u{A0}";
++        assert_eq!(trim_line(nbsp), nbsp.trim());
++        // Plain ASCII, the common fast-path case.
++        assert_eq!(trim_line("  payload  "), "payload");
++        assert_eq!(trim_line(""), "");
++        assert_eq!(trim_line("   "), "");
++    }
++
+     #[test]
+     fn parse_suppression_comment_handles_inline_trailing_comment() {
+         // Same-line trailing suppression comment.
