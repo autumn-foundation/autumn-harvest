@@ -2660,13 +2660,17 @@ def strip_containers(
     for -- a quoted list item, say -- and its column is the one recorded
     there.
 
-    `paragraph` says a paragraph is open going INTO this line, exactly as
-    `update_containers` reads it. It gates only the FIRST marker this loop
-    would peel: a "2." right after open prose cannot interrupt it, so
-    `update_containers` opens no container for it, and stripping it here
-    anyway invented a fence `update_containers` never agreed to. A marker
-    reached after a quote or another list has already been peeled opens
-    fresh content of its own, so the gate applies once and stops.
+    `paragraph` says the FIRST list marker this loop would peel is not
+    entitled to interrupt an open paragraph: a "2." right after open prose
+    cannot interrupt it, so `update_containers` opens no container for it,
+    and stripping it here anyway invented a fence `update_containers`
+    never agreed to. A quote marker leaves the gate in force. A paragraph
+    open at the SAME depth the quote reaches is the same paragraph, so
+    "2." still cannot interrupt it past one. Entering or leaving a quote
+    IS a block boundary, though, so the CALLER passes `False` once a quote
+    marker here reaches a depth the paragraph was not open at. A marker
+    past a LIST peel opens fresh content regardless, so the gate applies
+    once and stops there.
 
     Returns the remaining text, the container to measure the delimiter
     against, the quote depth reached, and the column the content sits at.
@@ -2686,7 +2690,6 @@ def strip_containers(
             depth += quote.group(2).count(">")
             container = column = container_at_depth(stack, depth)
             origin = 0
-            first = False
             continue
         content = list_content(text, container)
         if content:
@@ -2995,7 +2998,9 @@ def comment_lines(pieces: list[Piece]):
                     html = None
                 else:
                     if html_closes(inside, html):
+                        html_closing_line = piece.line
                         html = None
+                        saved = close_pending(saved, 9, None)
                     yield piece.line, text, True, False, None
                     continue
             if fence is not None and leaves_container(text, scope):
@@ -3048,18 +3053,25 @@ def comment_lines(pieces: list[Piece]):
                     in_table or indented,
                     piece.marker in DOC_MARKERS,
                 )
+                container = stack[-1][0] if stack else 0
+                # `strip_containers`'s marker veto still applies past a
+                # quote that lands BACK at the depth the paragraph was
+                # already open at -- entering or leaving a quote is what
+                # ends a paragraph, not the marker behind it, so the veto
+                # is only ever the caller's to drop here.
+                marker_paragraph = open_paragraph and quote_depth(text, container) == before_quoted
                 # From the PEEL, as `prose_units` reads it. "- > text" is a
                 # quote inside a list item, and reading the raw line reports
                 # depth zero because the marker comes first -- one loop then
                 # believes the line left the quote and the other does not.
                 peeled_now, _, quoted, reached_column = strip_containers(
-                    text, stack, stack[-1][0] if stack else 0, open_paragraph
+                    text, stack, container, marker_paragraph
                 )
                 # Read AFTER `update_containers`, like `html_scope` -- a table
                 # opened by this same line's own list marker is scoped to the
                 # column that marker just pushed, not the frame it arrived in.
                 if table_opened:
-                    table_scope = (stack[-1][0] if stack else 0, reached_column, quoted)
+                    table_scope = (container, reached_column, quoted)
                 # A quoted paragraph may carry on across a line with no ">"
                 # of its own, and that line LEAVES the quote by depth while
                 # staying inside the block. Cutting the span there split one
@@ -3121,9 +3133,12 @@ def comment_lines(pieces: list[Piece]):
                         and (in_table or setext)
                     )
                 )
+            # Recomputed unconditionally: the block above is skipped while
+            # `fence` is already open, and this line still needs a fresh
+            # container to test the delimiter against.
             container = stack[-1][0] if stack else 0
             delimiter = fence_delimiter(
-                text, container, fence is not None, scope[2], stack, open_paragraph
+                text, container, fence is not None, scope[2], stack, marker_paragraph
             )
             # The whole LINE decides a delimiter, not this piece alone. A
             # closer may be followed only by spaces, and an opener's info
@@ -3180,7 +3195,7 @@ def comment_lines(pieces: list[Piece]):
             # peel that takes only quote markers leaves the list marker in
             # front of the tag and recognizes neither.
             peeled, _, reached_depth, reached_column = strip_containers(
-                text, stack, container, open_paragraph
+                text, stack, container, marker_paragraph
             )
             # DOC COMMENTS ONLY, as indented code and Setext are. Rustdoc
             # renders no `//` comment, so "<pre>" in one is text rather than
@@ -3532,7 +3547,9 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                     html = None
                 else:
                     if html_closes(inside, html):
+                        html_closing_line = piece.line
                         html = None
+                        saved = close_pending(saved, 10, None)
                     flush()
                     in_list = False
                     continue
@@ -3575,8 +3592,14 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                     piece.marker in DOC_MARKERS,
                 )
             container = stack[-1][0] if stack else 0
+            # `strip_containers`'s marker veto still applies past a quote
+            # that lands BACK at the depth the paragraph was already open
+            # at -- see the matching comment in `comment_lines`. `quoted`
+            # is still the value this line ARRIVED with here, not yet
+            # reassigned to what it leaves with.
+            marker_paragraph = open_paragraph and quote_depth(body, container) == quoted
             delimiter = fence_delimiter(
-                body, container, fence is not None, scope[2], stack, open_paragraph
+                body, container, fence is not None, scope[2], stack, marker_paragraph
             )
             # The whole LINE decides a delimiter, not this piece alone. A
             # closer may be followed only by spaces, and an opener's info
@@ -3621,7 +3644,7 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # reason: "- > text" carries two markers, and stripping only the
             # one that comes first leaves the other as a word of the sentence.
             peeled, _, depth, reached_column = strip_containers(
-                body, stack, container, open_paragraph
+                body, stack, container, marker_paragraph
             )
             # Read AFTER `update_containers`, like `html_scope` -- see the
             # matching comment in `comment_lines`.
@@ -6998,6 +7021,28 @@ RULE_TESTS = [
         " */\n",
         {("CH007", 3)},
         "and the prose scanner sees it too",
+    ),
+    (
+        "/// > Intro paragraph\n"
+        "/// > 2. ```rust\n"
+        "/// >    TODO: issue required\n",
+        {("CH002", 3)},
+        "the paragraph veto survives a quote that stays at the same depth",
+    ),
+    (
+        "/** <pre>\n"
+        " * </pre> /* TODO: inner */ TODO: suffix\n"
+        " */\n",
+        set(),
+        "a closer that starts its own piece still keeps the rest of its line",
+    ),
+    (
+        "/** <pre>\n"
+        " * </pre> /* inner */ "
+        + " ".join(f"word{n}" for n in range(1, 27)) + ".\n"
+        " */\n",
+        set(),
+        "and the prose scanner keeps it too",
     ),
 ]
 
