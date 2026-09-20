@@ -1898,9 +1898,7 @@ pub(crate) async fn connect_to_shard(
                 tracing::error!("[{log_tag}] failed to get connection to shard {shard:?}: {e:?}");
                 Ok(None)
             }
-            ShardConnectError::Abort => {
-                Err(crate::error::HarvestError::Database(e.to_string()))
-            }
+            ShardConnectError::Abort => Err(crate::error::HarvestError::Database(e.to_string())),
         },
     }
 }
@@ -3616,10 +3614,9 @@ mod tests {
             let unconfigured = ShardId::new(5);
             let sharded = ShardedDbPool::from_map(unreachable_pools(&[configured]), configured);
 
-            let result =
-                connect_to_shard(&sharded, unconfigured, "test", ShardConnectError::Abort)
-                    .await
-                    .expect("an unconfigured shard is not a connect failure");
+            let result = connect_to_shard(&sharded, unconfigured, "test", ShardConnectError::Abort)
+                .await
+                .expect("an unconfigured shard is not a connect failure");
 
             assert!(
                 result.is_none(),
