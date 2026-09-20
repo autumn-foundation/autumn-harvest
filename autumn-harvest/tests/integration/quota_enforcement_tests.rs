@@ -96,7 +96,7 @@ use uuid::Uuid;
 
 use crate::integration_e2e::{
     build_runtime_worker, build_test_pool, load_history_from_url, setup_test_database_url_or_env,
-    spawn_test_worker, wait_for_execution_state,
+    spawn_test_worker, wait_for_execution_state, wait_for_execution_state_with_timeout,
 };
 
 // ---------------------------------------------------------------------------
@@ -2459,7 +2459,14 @@ async fn quota_retry_backoff_survives_stale_mixed_signal_suspension_sentinel() {
     // Free the quota slot and let the parent finish normally.
     mark_terminal(&mut conn, blocker, "CANCELLED").await;
 
-    wait_for_execution_state(&url, parent, "COMPLETED").await;
+    // This test's own sentinel stamp, polling wait, and wake round trip run
+    // before this point. That is on top of the shared setup every sibling
+    // quota test also pays for. That extra time can push the 10s default
+    // past its budget under a resource-constrained runner. So give this
+    // step a wider timeout, the same way
+    // `wait_for_execution_state_with_timeout`'s own doc comment describes.
+    wait_for_execution_state_with_timeout(&url, parent, "COMPLETED", std::time::Duration::from_secs(20))
+        .await;
     worker.shutdown();
     handle.await.expect("worker join");
 }

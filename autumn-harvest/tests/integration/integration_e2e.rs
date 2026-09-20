@@ -1326,7 +1326,7 @@ pub(crate) async fn wait_for_execution_state(
 /// for tests whose expected wall-clock (e.g. many genuinely-concurrent
 /// children each sleeping for real time) can exceed the 10s default under
 /// resource-constrained CI runners.
-async fn wait_for_execution_state_with_timeout(
+pub(crate) async fn wait_for_execution_state_with_timeout(
     database_url: &str,
     exec_id: ExecutionId,
     expected_state: &str,
