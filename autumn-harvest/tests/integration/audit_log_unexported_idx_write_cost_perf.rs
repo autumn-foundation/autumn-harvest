@@ -63,8 +63,25 @@ async fn setup_server() -> (String, DbGuard) {
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         return (url, None);
     }
+    // Preload `pg_stat_statements` so the fallback path works too, not
+    // just an external `HARVEST_TEST_DATABASE_URL` that happens to
+    // already have it configured. Review finding on PR #1666, mirroring
+    // `claim_bench_support.rs`'s own identical fix: the extension's C
+    // hooks only exist once preloaded at postmaster start. A later
+    // `CREATE EXTENSION` (which `ensure_pg_stat_statements` still runs,
+    // to register the SQL-level objects) cannot retroactively enable
+    // them. `.with_cmd(...)` replaces `Image::cmd()` rather than merging
+    // with it. So the image's own `fsync=off` default is repeated here
+    // explicitly. Otherwise fsync would silently re-enable, slowing
+    // down every Docker-fallback run.
     let container = Postgres::default()
         .with_tag("16")
+        .with_cmd([
+            "-c",
+            "shared_preload_libraries=pg_stat_statements",
+            "-c",
+            "fsync=off",
+        ])
         .start()
         .await
         .expect("postgres container should start");
