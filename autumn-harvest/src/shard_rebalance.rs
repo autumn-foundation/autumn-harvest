@@ -2040,7 +2040,7 @@ mod db {
 
     /// Resolve what a `(workflow_name, workflow_id)` chain actually
     /// finished as (issue #1317 review, P1 follow-up; extended to reset
-    /// chains, issue #1596 review, comment_id 4055896564). Chases past both
+    /// chains, issue #1596 review, `comment_id` 4055896564). Chases past both
     /// kinds of link that never block the key by themselves.
     ///
     /// Neither `CONTINUED_AS_NEW` nor `TERMINATED` blocks the business key
