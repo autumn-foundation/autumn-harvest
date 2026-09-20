@@ -305,18 +305,29 @@ ack, it refuses; with the ack, it still only reads.
   and is never adjudicated. For a confirmed-delivered fire, the target's
   business key (`workflow_name` plus the deterministic
   `completion-trigger-{trigger_id}-{source_exec_id}`) is checked on the target
-  shard the SAME rendezvous hash placed it on. An absent target with no
-  timestamp evidence either way is `completion_trigger_fire_unproven`
-  (`undetermined`, exit 2); an absent target whose shard's restore point
-  predates the fire is `completion_trigger_fire_lost` (`incoherent`, exit 1) —
-  the restore point proves the target snapshot cannot hold the delivery. A
-  same-shard fire is never checked: it commits atomically with the target
-  start and cannot be split by a skewed restore. This check needs every fleet
-  shard supplied, the same convention `uninspected_shard_reference` already
-  carries — a partial `--shard` list can route the hash prediction wrong.
-  Known limitation: the target-shard prediction assumes every supplied shard
-  was writable at fire time; a fire placed while some shard was drained can
-  resolve to a different shard than production actually used.
+  shard the SAME rendezvous hash placed it on. An absent target is checked
+  against `harvest_execution_summaries` by business key FIRST — proven
+  retention stays silent regardless of timestamps. Without a summary, an
+  absent target with no timestamp evidence either way is
+  `completion_trigger_fire_unproven` (`undetermined`, exit 2); an absent
+  target whose shard's restore point predates the fire is
+  `completion_trigger_fire_lost` (`incoherent`, exit 1) — the restore point
+  proves the target snapshot cannot hold the delivery. A same-shard fire is
+  never checked: it commits atomically with the target start and cannot be
+  split by a skewed restore. This check needs every fleet shard supplied,
+  the same convention `uninspected_shard_reference` already carries — a
+  partial `--shard` list can route the hash prediction wrong.
+  Known limitations: the target-shard prediction assumes every supplied
+  shard was writable at fire time, so a fire placed while some shard was
+  drained can resolve to a different shard than production actually used;
+  and the target's business key is re-derived from the CURRENT
+  `harvest_completion_triggers.target_workflow_name`, so a trigger whose
+  target workflow name was changed since a historical fire is checked
+  against the wrong name. Both are accepted, documented gaps rather than a
+  fix in this drill — closing them durably would mean persisting the
+  resolved target shard and name on the fires row at relay time, a schema
+  and engine-write-path change out of scope for a read-only verification
+  tool.
 - **(e) A machine-readable report** (`--format json`) with a nonzero exit on any
   failed check.
 

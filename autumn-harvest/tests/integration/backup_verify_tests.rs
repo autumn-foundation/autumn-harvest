@@ -2658,6 +2658,68 @@ async fn a_delivered_completion_trigger_fire_stays_silent() {
     );
 }
 
+/// A `harvest_execution_summaries` row is durable proof of retention. It
+/// wins over the timestamp heuristic even in the exact shape
+/// `detects_a_lost_cross_shard_completion_trigger_fire` reports as a proven
+/// loss. Target absent, target shard's restore point predates `fired_at`.
+#[tokio::test]
+async fn an_absent_completion_trigger_target_with_a_summary_stays_silent() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let (source, trigger_id, target_id) = find_fire_targeting("child_flow", 1);
+    let fired_at = Utc::now() - chrono::Duration::hours(1);
+
+    seed_execution(
+        &mut a,
+        source,
+        "parent_flow",
+        "ct-summary-1",
+        "COMPLETED",
+        0,
+    )
+    .await;
+    seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
+    seed_completion_trigger_fire(&mut a, source, trigger_id, fired_at, None).await;
+
+    let stale = ExecutionId::new_for_shard(ShardId::new(1));
+    seed_execution(&mut b, stale, "unrelated", "un-summary-1", "COMPLETED", 1).await;
+    append_event_at(
+        &mut b,
+        stale,
+        1,
+        "WorkflowStarted",
+        json!({ "input": {} }),
+        fired_at - chrono::Duration::hours(1),
+    )
+    .await;
+    exec_sql(
+        &mut b,
+        &format!(
+            "INSERT INTO harvest_execution_summaries \
+             (execution_id, workflow_name, workflow_id, state, started_at, completed_at, shard_id) \
+             VALUES ('{}', 'child_flow', '{target_id}', 'COMPLETED', NOW(), NOW(), 1)",
+            Uuid::new_v4()
+        ),
+    )
+    .await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::CompletionTriggerFireLost),
+        "a proven-retained target must stay silent, even though the \
+         restore point alone would read as a proven loss: {report:#?}"
+    );
+    assert!(
+        !report.detected(FindingClass::CompletionTriggerFireUnproven),
+        "a proven-retained target is not ambiguous either: {report:#?}"
+    );
+}
+
 /// Scope guard: a same-shard fire is committed atomically with the target
 /// start (`evaluate_triggers_for_execution`'s inline path), so it is immune
 /// to cross-shard restore skew by construction. The probe must not adjudicate

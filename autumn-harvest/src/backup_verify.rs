@@ -972,10 +972,12 @@ fn route_trigger_fires(
 ///
 /// Otherwise, absence stays ambiguous: the target shard has progressed past
 /// `fired_at`, or carries no event to compare at all. It may be ordinary
-/// retention -- the run completed and was collected. This is the same
-/// evidentiary gap [`FindingClass::RetentionUnproven`] names for a recorded
-/// child terminal or delivered effect. It is resolved here from the fire's
-/// own `fired_at` (issue #1401), not a `harvest_execution_summaries` row.
+/// retention -- the run completed and was collected. The caller already
+/// checked for a `harvest_execution_summaries` row (durable proof) before
+/// reaching this function. This is the fallback for when no such row
+/// exists, resolved from the fire's own `fired_at` instead (issue #1401).
+/// This is the same evidentiary gap [`FindingClass::RetentionUnproven`]
+/// names for a recorded child terminal or delivered effect.
 #[cfg(all(feature = "db", feature = "testing"))]
 #[must_use]
 fn absence_is_decisive_loss(
@@ -2816,6 +2818,33 @@ mod probes {
         Ok(row.present)
     }
 
+    /// Does a `harvest_execution_summaries` row prove retention collected
+    /// the completion-trigger target named by `workflow_name`/`workflow_id`
+    /// (issue #1401)?
+    ///
+    /// A completion-trigger fire has no target execution id to look up by.
+    /// The id is minted only at start time, and the fires row never
+    /// records it. The business key is the only handle this tool has, and
+    /// `harvest_execution_summaries` carries one (`workflow_name`,
+    /// `workflow_id`) for exactly this reason.
+    async fn retention_summary_exists_by_key(
+        conn: &mut AsyncPgConnection,
+        workflow_name: &str,
+        workflow_id: &str,
+    ) -> Result<bool, diesel::result::Error> {
+        let row: ExistsRow = diesel::sql_query(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM harvest_execution_summaries \
+                 WHERE workflow_name = $1 AND workflow_id = $2 \
+               ) AS present",
+        )
+        .bind::<diesel::sql_types::Text, _>(workflow_name)
+        .bind::<diesel::sql_types::Text, _>(workflow_id)
+        .get_result(conn)
+        .await?;
+        Ok(row.present)
+    }
+
     /// Look up each reference's target on its owning shard and bucket the
     /// verdict. Split out of `resolve_refs` so the per-shard connection
     /// handling and the per-reference verdict logic stay separately readable.
@@ -3239,22 +3268,42 @@ mod probes {
             .await
             {
                 Ok(true) => {}
-                Ok(false) => {
-                    let target_latest = latest_by_shard.get(&fire.target_shard).copied().flatten();
-                    let sample = format!(
-                        "{} (fired by {} on shard {} at {}) absent on shard {}",
-                        fire.target_workflow_id,
-                        fire.source_exec_id,
-                        fire.source_shard,
-                        fire.fired_at,
-                        fire.target_shard
-                    );
-                    if super::absence_is_decisive_loss(fire.fired_at, target_latest) {
-                        out.lost.push(sample);
-                    } else {
-                        out.unproven.push(sample);
+                // The execution row is gone entirely. A completed, retained
+                // run is one explanation; a genuinely lost relay is another.
+                // Check the durable marker FIRST. Proven retention stays
+                // silent regardless of what the timestamp heuristic below
+                // would otherwise conclude. This mirrors `RetentionUnproven`
+                // winning over a rolled-back verdict for child/external refs.
+                Ok(false) => match retention_summary_exists_by_key(
+                    conn,
+                    &fire.target_workflow_name,
+                    &fire.target_workflow_id,
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let target_latest =
+                            latest_by_shard.get(&fire.target_shard).copied().flatten();
+                        let sample = format!(
+                            "{} (fired by {} on shard {} at {}) absent on shard {}",
+                            fire.target_workflow_id,
+                            fire.source_exec_id,
+                            fire.source_shard,
+                            fire.fired_at,
+                            fire.target_shard
+                        );
+                        if super::absence_is_decisive_loss(fire.fired_at, target_latest) {
+                            out.lost.push(sample);
+                        } else {
+                            out.unproven.push(sample);
+                        }
                     }
-                }
+                    Err(e) => out.lookup_errors.push(format!(
+                        "{} retention-summary lookup failed: {e}",
+                        fire.target_workflow_id
+                    )),
+                },
                 Err(e) => out.lookup_errors.push(format!(
                     "{} existence check failed: {e}",
                     fire.target_workflow_id
