@@ -2787,3 +2787,50 @@ async fn a_resolved_completion_trigger_fire_is_not_probed() {
         "a resolved-skip row asserts no delivery: {report:#?}"
     );
 }
+
+/// A cross-shard trigger input that permanently exceeds its payload limit
+/// is rejected the same way `admission_blocked` is. The outbox row is
+/// deleted and the fires row is resolved (`payload_too_large`). This is not
+/// a delivered relay either, even though no target was ever created.
+#[tokio::test]
+async fn a_payload_too_large_completion_trigger_fire_is_not_probed() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+
+    let (source, trigger_id, _target_id) = find_fire_targeting("child_flow", 1);
+    let fired_at = Utc::now() - chrono::Duration::hours(1);
+
+    seed_execution(
+        &mut a,
+        source,
+        "parent_flow",
+        "ct-oversized-1",
+        "COMPLETED",
+        0,
+    )
+    .await;
+    seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
+    seed_completion_trigger_fire(
+        &mut a,
+        source,
+        trigger_id,
+        fired_at,
+        Some("payload_too_large"),
+    )
+    .await;
+    // No execution row anywhere for the target -- a permanent rejection is
+    // not a delivered relay, so this must stay silent regardless.
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::CompletionTriggerFireLost),
+        "a permanently rejected relay asserts no delivery: {report:#?}"
+    );
+    assert!(
+        !report.detected(FindingClass::CompletionTriggerFireUnproven),
+        "a permanently rejected relay asserts no delivery: {report:#?}"
+    );
+}

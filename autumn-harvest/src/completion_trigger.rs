@@ -2558,8 +2558,15 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                 cap_bytes,
                 ..
             }) => {
+                use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
+
                 // Permanent error: payload will never fit regardless of retries.
-                // Delete the outbox row so it does not retry forever.
+                // Delete the outbox row so it does not retry forever, and
+                // resolve the fires row the same way `admission_blocked`
+                // does. Without this, the fires row stays `outcome IS NULL`
+                // forever. A restore-verification pass then reads this
+                // permanent, correctly-handled rejection as a delivered
+                // relay whose target is missing (issue #1401).
                 tracing::error!(
                     target_workflow = %task.target_workflow_name,
                     kind = %kind,
@@ -2571,6 +2578,14 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                     .filter(outbox_dsl::id.eq(task.id))
                     .execute(conn)
                     .await;
+                let _ = diesel::update(
+                    fires_dsl::harvest_completion_trigger_fires
+                        .filter(fires_dsl::source_exec_id.eq(task.source_exec_id))
+                        .filter(fires_dsl::trigger_id.eq(task.trigger_id)),
+                )
+                .set(fires_dsl::outcome.eq(Some("payload_too_large")))
+                .execute(conn)
+                .await;
                 processed_count += 1;
             }
             Err(e) => {
