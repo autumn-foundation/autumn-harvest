@@ -3009,7 +3009,7 @@ pub async fn requeue_workflow_task_for_quota_retry(
     use crate::schema::harvest_task_queue::dsl;
 
     let next_run = Utc::now() + delay;
-    let changeset = PendingRequeueChangeset::new(next_run, previous_error.to_string());
+    let changeset = PendingRequeueChangeset::new(previous_error.to_string());
 
     let updated = diesel::update(
         dsl::harvest_task_queue
@@ -3019,6 +3019,7 @@ pub async fn requeue_workflow_task_for_quota_retry(
     )
     .set((
         changeset,
+        dsl::scheduled_at.eq(next_run),
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
     ))
@@ -3050,7 +3051,10 @@ pub async fn requeue_workflow_task_for_quota_retry(
 /// so a no-DB unit test can assert the generated SQL shape (issue #1391).
 /// Mirrors the `requeue_after_panic_query` shape-test precedent.
 #[cfg(test)]
-fn requeue_workflow_task_for_quota_retry_query(changeset: PendingRequeueChangeset) -> String {
+fn requeue_workflow_task_for_quota_retry_query(
+    changeset: PendingRequeueChangeset,
+    next_run: chrono::DateTime<Utc>,
+) -> String {
     use crate::schema::harvest_task_queue::dsl;
     use diesel::debug_query;
     use diesel::pg::Pg;
@@ -3063,6 +3067,7 @@ fn requeue_workflow_task_for_quota_retry_query(changeset: PendingRequeueChangese
     )
     .set((
         changeset,
+        dsl::scheduled_at.eq(next_run),
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
     ));
@@ -10239,19 +10244,20 @@ mod tests {
         assert!(sql.contains("\"state\""), "{sql}");
     }
 
-    /// Issue #1391: this must generate a `SET` clause that clears both
-    /// `wake_requested` and the stale `activity_name` sentinel. It also
-    /// restricts the update to `RUNNING` workflow rows. This mirrors
-    /// `requeue_workflow_task_after_panic`'s own pin above. A no-DB test
-    /// pins this so a future edit cannot silently drop either clear and
-    /// reopen issue #1391 or its #603 sibling.
+    /// Issue #1391: this must generate a `SET` clause that pushes
+    /// `scheduled_at` into the future and clears both `wake_requested` and
+    /// the stale `activity_name` sentinel. It also restricts the update to
+    /// `RUNNING` workflow rows. This mirrors `requeue_workflow_task_after_panic`'s
+    /// own pin above. A no-DB test pins this so a future edit cannot
+    /// silently drop the backoff or either clear, and reopen issue #1391 or
+    /// its #603 sibling.
     #[test]
     fn requeue_workflow_task_for_quota_retry_query_clears_sentinel_and_wake() {
-        let changeset =
-            PendingRequeueChangeset::new(chrono::Utc::now(), "quota exceeded".to_string());
-        let sql = requeue_workflow_task_for_quota_retry_query(changeset);
+        let changeset = PendingRequeueChangeset::new("quota exceeded".to_string());
+        let next_run = chrono::Utc::now();
+        let sql = requeue_workflow_task_for_quota_retry_query(changeset, next_run);
 
-        for column in ["wake_requested", "activity_name"] {
+        for column in ["scheduled_at", "wake_requested", "activity_name"] {
             assert!(
                 sql.contains(&format!("\"{column}\" = $")),
                 "{column} must appear as a bound column in the SET clause: {sql}"
