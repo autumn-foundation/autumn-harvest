@@ -2577,6 +2577,7 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                 ..
             }) => {
                 use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
+                use diesel_async::AsyncConnection as _;
 
                 // Permanent error: payload will never fit regardless of retries.
                 // Delete the outbox row so it does not retry forever, and
@@ -2585,6 +2586,15 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                 // forever. A restore-verification pass then reads this
                 // permanent, correctly-handled rejection as a delivered
                 // relay whose target is missing (issue #1401).
+                //
+                // Both writes commit or roll back TOGETHER (issue #1401,
+                // Codex follow-up). Two separate autocommitted statements
+                // left a crash window between them. The outbox row gone
+                // but the fires row still `outcome IS NULL` is EXACTLY the
+                // shape a restore-verification pass reads as a lost
+                // delivery. A rolled-back transaction leaves the outbox row
+                // in place, so the next scanner tick retries this same
+                // rejection from scratch.
                 tracing::error!(
                     target_workflow = %task.target_workflow_name,
                     kind = %kind,
@@ -2592,18 +2602,33 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                     cap_bytes,
                     "[completion_trigger outbox] permanent error: oversized input payload; deleting outbox row"
                 );
-                let _ = diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
-                    .filter(outbox_dsl::id.eq(task.id))
-                    .execute(conn)
-                    .await;
-                let _ = diesel::update(
-                    fires_dsl::harvest_completion_trigger_fires
-                        .filter(fires_dsl::source_exec_id.eq(task.source_exec_id))
-                        .filter(fires_dsl::trigger_id.eq(task.trigger_id)),
-                )
-                .set(fires_dsl::outcome.eq(Some("payload_too_large")))
-                .execute(conn)
+                let resolved = Box::pin(conn.transaction(async |tx| {
+                    diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
+                        .filter(outbox_dsl::id.eq(task.id))
+                        .execute(tx)
+                        .await
+                        .map_err(crate::error::database_error)?;
+                    diesel::update(
+                        fires_dsl::harvest_completion_trigger_fires
+                            .filter(fires_dsl::source_exec_id.eq(task.source_exec_id))
+                            .filter(fires_dsl::trigger_id.eq(task.trigger_id)),
+                    )
+                    .set(fires_dsl::outcome.eq(Some("payload_too_large")))
+                    .execute(tx)
+                    .await
+                    .map_err(crate::error::database_error)
+                }))
                 .await;
+                if let Err(e) = resolved {
+                    tracing::error!(
+                        source_exec_id = %task.source_exec_id,
+                        trigger_id = %task.trigger_id,
+                        error = ?e,
+                        "[completion_trigger outbox] failed to resolve the \
+                         permanently-rejected fire; the outbox row is untouched \
+                         and the next scan retries it"
+                    );
+                }
                 processed_count += 1;
             }
             Err(e) => {

@@ -2685,6 +2685,89 @@ async fn a_delivered_completion_trigger_fire_stays_silent() {
     );
 }
 
+/// The adjudication batches every fire targeting one shard into a single
+/// existence check and a single retention check (issue #1401, Codex
+/// follow-up). It does this rather than one query pair per fire. Two
+/// DISTINCT fires targeting the same shard must not cross-contaminate.
+/// One delivered (target exists, stays silent) and one lost (target
+/// absent, decisive timestamp) are in the same batch. Each must get its
+/// own correct verdict.
+#[tokio::test]
+async fn a_batch_of_fires_on_one_shard_adjudicates_each_independently() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let fired_at = Utc::now() - chrono::Duration::hours(1);
+
+    let (delivered_source, delivered_trigger, delivered_target_id) =
+        find_fire_targeting("child_flow", 1);
+    seed_execution(
+        &mut a,
+        delivered_source,
+        "parent_flow",
+        "ct-batch-delivered",
+        "COMPLETED",
+        0,
+    )
+    .await;
+    seed_completion_trigger(&mut a, delivered_trigger, "parent_flow", "child_flow").await;
+    seed_completion_trigger_fire(&mut a, delivered_source, delivered_trigger, fired_at, None).await;
+    let delivered_target = ExecutionId::new_for_shard(ShardId::new(1));
+    seed_execution(
+        &mut b,
+        delivered_target,
+        "child_flow",
+        &delivered_target_id,
+        "COMPLETED",
+        1,
+    )
+    .await;
+
+    let (lost_source, lost_trigger, _lost_target_id) = find_fire_targeting("child_flow", 1);
+    seed_execution(
+        &mut a,
+        lost_source,
+        "parent_flow",
+        "ct-batch-lost",
+        "COMPLETED",
+        0,
+    )
+    .await;
+    seed_completion_trigger(&mut a, lost_trigger, "parent_flow", "child_flow").await;
+    seed_completion_trigger_fire(&mut a, lost_source, lost_trigger, fired_at, None).await;
+
+    let stale = ExecutionId::new_for_shard(ShardId::new(1));
+    seed_execution(&mut b, stale, "unrelated", "un-batch-1", "COMPLETED", 1).await;
+    append_event_at(
+        &mut b,
+        stale,
+        1,
+        "WorkflowStarted",
+        json!({ "input": {} }),
+        fired_at - chrono::Duration::hours(1),
+    )
+    .await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert_eq!(
+        report
+            .all_findings()
+            .filter(|f| f.class == FindingClass::CompletionTriggerFireLost)
+            .map(|f| f.count)
+            .sum::<u64>(),
+        1,
+        "exactly the lost fire must be flagged, not the delivered one: {report:#?}"
+    );
+    assert!(
+        !report.detected(FindingClass::CompletionTriggerFireUnproven),
+        "{report:#?}"
+    );
+}
+
 /// A `harvest_execution_summaries` row is durable proof of retention. It
 /// wins over the timestamp heuristic even in the exact shape
 /// `detects_a_lost_cross_shard_completion_trigger_fire` reports as a proven

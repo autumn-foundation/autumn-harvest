@@ -2851,31 +2851,50 @@ mod probes {
         Ok(row.present)
     }
 
-    /// Does a `harvest_execution_summaries` row prove retention collected
-    /// the completion-trigger target named by `workflow_name`/`workflow_id`
-    /// (issue #1401)?
+    /// One `(workflow_name, workflow_id)` business key, matched against a
+    /// batch of candidates via `UNNEST` (issue #1401, Codex follow-up).
+    #[derive(diesel::QueryableByName)]
+    struct WorkflowKeyRow {
+        #[diesel(sql_type = Text)]
+        workflow_name: String,
+        #[diesel(sql_type = Text)]
+        workflow_id: String,
+    }
+
+    /// Which of the given business keys exist in `table_name`, in ONE
+    /// round trip.
     ///
-    /// A completion-trigger fire has no target execution id to look up by.
-    /// The id is minted only at start time, and the fires row never
-    /// records it. The business key is the only handle this tool has, and
-    /// `harvest_execution_summaries` carries one (`workflow_name`,
-    /// `workflow_id`) for exactly this reason.
-    async fn retention_summary_exists_by_key(
+    /// `table_name` is never caller input. Both call sites below pass a
+    /// fixed literal. String interpolation here carries no injection
+    /// surface, matching every other dynamic-SQL helper in this file.
+    ///
+    /// `UNNEST($1::text[], $2::text[])` pairs `names[i]` with `ids[i]`
+    /// positionally. A whole shard's batch of completion-trigger fires is
+    /// checked as one query, not one query per fire. A completion-trigger
+    /// fire has no target execution id to look up by -- it is minted only
+    /// at start time. The business key is the only handle this tool has
+    /// for either `harvest_workflow_executions` or
+    /// `harvest_execution_summaries`. Both are keyed here the same way.
+    async fn matching_workflow_keys(
         conn: &mut AsyncPgConnection,
-        workflow_name: &str,
-        workflow_id: &str,
-    ) -> Result<bool, diesel::result::Error> {
-        let row: ExistsRow = diesel::sql_query(
-            "SELECT EXISTS ( \
-                 SELECT 1 FROM harvest_execution_summaries \
-                 WHERE workflow_name = $1 AND workflow_id = $2 \
-               ) AS present",
-        )
-        .bind::<diesel::sql_types::Text, _>(workflow_name)
-        .bind::<diesel::sql_types::Text, _>(workflow_id)
-        .get_result(conn)
+        table_name: &str,
+        names: &[String],
+        ids: &[String],
+    ) -> Result<std::collections::HashSet<(String, String)>, diesel::result::Error> {
+        let rows: Vec<WorkflowKeyRow> = diesel::sql_query(format!(
+            "SELECT DISTINCT e.workflow_name, e.workflow_id \
+             FROM {table_name} e \
+             JOIN UNNEST($1::text[], $2::text[]) AS t(workflow_name, workflow_id) \
+               ON e.workflow_name = t.workflow_name AND e.workflow_id = t.workflow_id"
+        ))
+        .bind::<diesel::sql_types::Array<Text>, _>(names)
+        .bind::<diesel::sql_types::Array<Text>, _>(ids)
+        .load(conn)
         .await?;
-        Ok(row.present)
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.workflow_name, r.workflow_id))
+            .collect())
     }
 
     /// Look up each reference's target on its owning shard and bucket the
@@ -3278,69 +3297,120 @@ mod probes {
         lookup_errors: Vec<String>,
     }
 
-    /// Check each fire's target for existence and bucket the verdict. Split
-    /// out of `resolve_trigger_fires` so the per-shard connection handling
-    /// and the per-fire verdict logic stay separately readable, mirroring
-    /// `adjudicate_refs`.
+    /// Check every fire's target for existence and bucket the verdict.
+    /// Split out of `resolve_trigger_fires` so the per-shard connection
+    /// handling and the per-fire verdict logic stay separately readable,
+    /// mirroring `adjudicate_refs`.
     ///
-    /// `execution_exists_by_key` mirrors the ANY-STATE existence check
-    /// `relay_gate_checked_start` itself runs before starting the target.
-    /// It runs read-only against a restored snapshot, not a live claim.
+    /// Batched, not per-fire (issue #1401, Codex follow-up).
+    /// `harvest_completion_trigger_fires` has no cleanup path. A busy
+    /// fleet's confirmed-delivered fire count can reach into the hundreds
+    /// of thousands. One query per fire, plus a second for every absent
+    /// target, would make a routine restore drill issue up to two round
+    /// trips per row.
+    ///
+    /// `matching_workflow_keys` checks the whole `owned` batch in one
+    /// query against `harvest_workflow_executions`. This is the same
+    /// ANY-STATE existence check `relay_gate_checked_start` itself runs
+    /// before starting the target, read-only against a restored snapshot.
+    /// It checks the absent remainder in one more query against
+    /// `harvest_execution_summaries`.
     async fn adjudicate_trigger_fires(
         conn: &mut AsyncPgConnection,
         owned: &[&super::PendingTriggerFire],
         latest_by_shard: &std::collections::BTreeMap<i32, Option<DateTime<Utc>>>,
     ) -> TriggerFireBuckets {
         let mut out = TriggerFireBuckets::default();
-        for fire in owned {
-            match crate::execution::execution_exists_by_key(
-                conn,
-                &fire.target_workflow_name,
-                &fire.target_workflow_id,
-            )
-            .await
-            {
-                Ok(true) => {}
-                // The execution row is gone entirely. A completed, retained
-                // run is one explanation; a genuinely lost relay is another.
-                // Check the durable marker FIRST. Proven retention stays
-                // silent regardless of what the timestamp heuristic below
-                // would otherwise conclude. This mirrors `RetentionUnproven`
-                // winning over a rolled-back verdict for child/external refs.
-                Ok(false) => match retention_summary_exists_by_key(
-                    conn,
-                    &fire.target_workflow_name,
-                    &fire.target_workflow_id,
-                )
-                .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let target_latest =
-                            latest_by_shard.get(&fire.target_shard).copied().flatten();
-                        let sample = format!(
-                            "{} (fired by {} on shard {} at {}) absent on shard {}",
-                            fire.target_workflow_id,
-                            fire.source_exec_id,
-                            fire.source_shard,
-                            fire.fired_at,
-                            fire.target_shard
-                        );
-                        if super::absence_is_decisive_loss(fire.fired_at, target_latest) {
-                            out.lost.push(sample);
-                        } else {
-                            out.unproven.push(sample);
-                        }
+        if owned.is_empty() {
+            return out;
+        }
+
+        let names: Vec<String> = owned
+            .iter()
+            .map(|f| f.target_workflow_name.clone())
+            .collect();
+        let ids: Vec<String> = owned.iter().map(|f| f.target_workflow_id.clone()).collect();
+
+        let existing =
+            match matching_workflow_keys(conn, "harvest_workflow_executions", &names, &ids).await {
+                Ok(keys) => keys,
+                Err(e) => {
+                    for fire in owned {
+                        out.lookup_errors.push(format!(
+                            "{} existence check failed: {e}",
+                            fire.target_workflow_id
+                        ));
                     }
-                    Err(e) => out.lookup_errors.push(format!(
+                    return out;
+                }
+            };
+
+        let absent: Vec<&&super::PendingTriggerFire> = owned
+            .iter()
+            .filter(|f| {
+                !existing.contains(&(f.target_workflow_name.clone(), f.target_workflow_id.clone()))
+            })
+            .collect();
+        if absent.is_empty() {
+            return out;
+        }
+
+        let absent_names: Vec<String> = absent
+            .iter()
+            .map(|f| f.target_workflow_name.clone())
+            .collect();
+        let absent_ids: Vec<String> = absent
+            .iter()
+            .map(|f| f.target_workflow_id.clone())
+            .collect();
+
+        // The execution row is gone entirely for every fire in `absent`. A
+        // completed, retained run is one explanation; a genuinely lost
+        // relay is another. Check the durable marker FIRST. Proven
+        // retention stays silent regardless of what the timestamp
+        // heuristic below would otherwise conclude. This mirrors
+        // `RetentionUnproven` winning over a rolled-back verdict for
+        // child/external refs.
+        let retained = match matching_workflow_keys(
+            conn,
+            "harvest_execution_summaries",
+            &absent_names,
+            &absent_ids,
+        )
+        .await
+        {
+            Ok(keys) => keys,
+            Err(e) => {
+                for fire in absent {
+                    out.lookup_errors.push(format!(
                         "{} retention-summary lookup failed: {e}",
                         fire.target_workflow_id
-                    )),
-                },
-                Err(e) => out.lookup_errors.push(format!(
-                    "{} existence check failed: {e}",
-                    fire.target_workflow_id
-                )),
+                    ));
+                }
+                return out;
+            }
+        };
+
+        for fire in absent {
+            if retained.contains(&(
+                fire.target_workflow_name.clone(),
+                fire.target_workflow_id.clone(),
+            )) {
+                continue;
+            }
+            let target_latest = latest_by_shard.get(&fire.target_shard).copied().flatten();
+            let sample = format!(
+                "{} (fired by {} on shard {} at {}) absent on shard {}",
+                fire.target_workflow_id,
+                fire.source_exec_id,
+                fire.source_shard,
+                fire.fired_at,
+                fire.target_shard
+            );
+            if super::absence_is_decisive_loss(fire.fired_at, target_latest) {
+                out.lost.push(sample);
+            } else {
+                out.unproven.push(sample);
             }
         }
         out
