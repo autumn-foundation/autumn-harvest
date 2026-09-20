@@ -335,3 +335,15 @@ Use the workflow detail page at `/workflows/{exec_id}` to investigate a workflow
 3. Check the worker fleet at `/workers` — if workers are shown as `Degraded` or `Unhealthy`, the activity tasks may not be getting picked up.
 4. If the timeout was caused by the activity taking too long, consider increasing the `start_to_close` timeout in the `#[activity]` annotation and deploying the update.
 5. If the worker is healthy and the activity should complete quickly, the task may have been lost during a worker crash. Cancel the workflow and restart it, or use **Reset to event N** to roll back past the activity scheduling event.
+
+---
+
+## UX audit history
+
+Recurring Wayfinder sweeps over this dashboard, most recent first:
+
+- [`docs/ux-vantage-sweep-2026-09-20.md`](ux-vantage-sweep-2026-09-20.md) — negative
+  result. Re-verified the `Query<..>` broken-error-path class (#1333 through #1641)
+  stays closed, extended the same inventory to `Path<..>` extractors, and rejected
+  the one outlier found (`lift_gate_ui`) against the impact floor for lack of a
+  reachable failure mechanism.
