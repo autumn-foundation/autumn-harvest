@@ -3124,6 +3124,161 @@ async fn a_summarised_failed_successor_records_its_own_outcome_not_the_predecess
     );
 }
 
+/// Issue #1596 review, `comment_id` 4055896564 (P1). `reset.rs` forks a
+/// successor exactly like continue-as-new does: it seals the source row
+/// `TERMINATED` and inserts a fresh same-key execution in the same
+/// transaction. Before this fix, a `TERMINATED` predecessor's own state
+/// was reported as the final answer without ever chasing to the fork.
+/// A fork that is already COMPLETED never occupies the business key at
+/// all, so that reconciled the predecessor's seal as `TERMINATED`
+/// instead of `COMPLETED`.
+#[tokio::test]
+async fn a_reset_terminated_predecessor_resolves_through_to_its_forks_completed_outcome() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "reset-then-completed-fork").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    // Seal the predecessor exactly as `reset.rs`'s `terminate_source_
+    // execution` does: TERMINATED, not CONTINUED_AS_NEW.
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'TERMINATED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("seal the predecessor as reset-terminated");
+    let fork = insert_execution_with_id(
+        &mut target,
+        "entity_flow",
+        "reset-then-completed-fork",
+        ExecutionId::new_for_shard(TARGET),
+        TARGET,
+    )
+    .await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(fork.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("complete the fork");
+
+    let mut source = shards.source().await;
+    let reconciled =
+        reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+            .await
+            .expect("reconcile must not fail once the fork is COMPLETED");
+    assert!(
+        reconciled,
+        "a COMPLETED fork never occupies the business key, so the \
+         predecessor's seal must release immediately"
+    );
+    assert_eq!(
+        terminal_state_of(&mut source, exec_id).await.as_deref(),
+        Some("COMPLETED"),
+        "the seal must record the fork's own COMPLETED outcome, not the \
+         predecessor's stale TERMINATED state"
+    );
+}
+
+/// Issue #1596 review, `comment_id` 4055896564 (P1), companion to the
+/// COMPLETED-fork test above. The fork's own row can also be
+/// retention-demoted to a summary before the predecessor ever reconciles,
+/// exactly as `a_summarised_failed_successor_records_its_own_outcome_not_
+/// the_predecessors` already covers for a CONTINUED_AS_NEW predecessor.
+/// The `occupied` check then sees nothing: no execution row, and a
+/// summary carries no active state. Before this fix, the predecessor's
+/// own `TERMINATED` was then reported as final, instead of chasing
+/// through to the fork's real `FAILED` outcome.
+#[tokio::test]
+async fn a_reset_terminated_predecessor_resolves_through_to_its_forks_summarised_failed_outcome() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "reset-then-summarised-fork").await;
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'TERMINATED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("seal the predecessor as reset-terminated");
+    let fork = insert_execution_with_id(
+        &mut target,
+        "entity_flow",
+        "reset-then-summarised-fork",
+        ExecutionId::new_for_shard(TARGET),
+        TARGET,
+    )
+    .await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', completed_at = now() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(fork.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("fail the fork");
+
+    let mut source = shards.source().await;
+    let reconciled_while_row_exists =
+        reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+            .await
+            .expect("reconcile must not fail merely because the fork failed");
+    assert!(
+        !reconciled_while_row_exists,
+        "a FAILED fork remains resettable while its execution row exists"
+    );
+
+    // Demote the fork exactly as retention does: a summary row carrying
+    // its last state, and no execution row. The predecessor's own row is
+    // untouched, so it still resolves as TERMINATED.
+    diesel::sql_query(
+        "INSERT INTO harvest_execution_summaries \
+             (execution_id, workflow_name, workflow_id, state, started_at, completed_at, \
+              duration_ms, shard_id, search_attrs, result, error, parent_id, \
+              migrated_from_shards) \
+         SELECT e.id, e.workflow_name, e.workflow_id, 'FAILED', e.started_at, NOW(), 0, \
+                e.shard_id, e.search_attrs, NULL, NULL, e.parent_id, e.migrated_from_shards \
+           FROM harvest_workflow_executions e WHERE e.id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(fork.as_uuid())
+    .execute(&mut target)
+    .await
+    .expect("summarise the fork");
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(fork.as_uuid())
+        .execute(&mut target)
+        .await
+        .expect("retention-delete the fork's execution row");
+
+    let reconciled_after_summarised =
+        reconcile_migrated_seal_terminality(&mut source, &shards.pool, exec_id, SOURCE)
+            .await
+            .expect("reconcile must not fail once only a summary remains");
+    assert!(
+        reconciled_after_summarised,
+        "the business key is no longer occupied once the summary-only \
+         fork replaces the deleted row"
+    );
+    assert_eq!(
+        terminal_state_of(&mut source, exec_id).await.as_deref(),
+        Some("FAILED"),
+        "the seal must record the fork's own FAILED outcome, not the \
+         predecessor's stale TERMINATED state -- an AllowDuplicateFailedOnly \
+         start must retry the fork's failure, not attach to the old seal"
+    );
+}
+
 #[tokio::test]
 async fn a_hop_that_loops_back_to_the_held_shard_is_refused_not_deadlocked() {
     // Issue #1317 review: the committed window of a reverse migration

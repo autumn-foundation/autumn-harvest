@@ -259,6 +259,13 @@ pub struct WorkflowExecution {
     /// clears it. A successful cutover just clears it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub staging_vacated_state: Option<String>,
+    /// The execution id of the migration whose staging vacated this row
+    /// (issue #1596 review). Non-`None` exactly when `staging_vacated_state`
+    /// is. Lets `activate_target` finalize this row's marker with a direct
+    /// match on the vacating migration's own execution id, with no
+    /// cross-database write and no retry race.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub staging_vacated_by: Option<Uuid>,
 }
 
 impl WorkflowExecution {
@@ -1891,6 +1898,7 @@ mod effective_terminal_state_tests {
             migrated_run_terminal_at: None,
             migrated_run_terminal_state: None,
             staging_vacated_state: None,
+            staging_vacated_by: None,
         }
     }
 

@@ -38259,6 +38259,7 @@ mod tests {
             migrated_run_terminal_at: None,
             migrated_run_terminal_state: None,
             staging_vacated_state: None,
+            staging_vacated_by: None,
         }
     }
 

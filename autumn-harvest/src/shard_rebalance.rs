@@ -1968,6 +1968,17 @@ mod db {
         // business key is still live under a successor. Confirm no active
         // occupant remains for `(workflow_name, workflow_id)` here first.
         //
+        // `TERMINATED` forks a successor exactly the same way (issue #1596
+        // review, comment_id 4055896564). `reset.rs` seals its source row
+        // `TERMINATED` and inserts a fresh same-key execution in the same
+        // transaction. That fork can itself become non-occupied later --
+        // COMPLETED immediately, or FAILED/CANCELLED after retention
+        // demotes it to a summary. Treating this row's own `TERMINATED` as
+        // the answer would then report the STALE seal's outcome instead of
+        // the fork's. A later `AllowDuplicateFailedOnly` start would attach
+        // to the old seal instead of retrying the fork's own latest
+        // failure.
+        //
         // "Active" is close to `is_active_conflict_state`, but not
         // identical (issue #1317 review, P1 follow-up). A COMPLETED
         // successor is genuinely final, so it does not occupy this check.
@@ -2006,12 +2017,14 @@ mod db {
             return Ok(None);
         }
         // Not occupied does not mean this row's OWN state is the answer
-        // (fresh review, P1 follow-up). `CONTINUED_AS_NEW` means a
-        // successor was inserted. Every OTHER terminal state here
-        // genuinely belongs to THIS row, whether it is `COMPLETED`,
-        // `TERMINATED`, or a resettable state already demoted to a summary
-        // above. Report it as-is.
-        if row.state != "CONTINUED_AS_NEW" {
+        // (fresh review, P1 follow-up). `CONTINUED_AS_NEW` and `TERMINATED`
+        // both mean a successor MAY have been inserted under this key, by
+        // a continuation or a reset respectively. Both therefore chase to
+        // the chain's actual newest row, rather than trusting this row's
+        // own state. Every OTHER terminal state here genuinely belongs to
+        // THIS row, whether it is `COMPLETED` or a resettable state already
+        // demoted to a summary above. Report it as-is.
+        if !matches!(row.state.as_str(), "CONTINUED_AS_NEW" | "TERMINATED") {
             return Ok(Some(row.state));
         }
         resolve_continuation_outcome(&mut conn, &row.workflow_name, &row.workflow_id).await
@@ -2025,32 +2038,39 @@ mod db {
         migrated_run_terminal_state: Option<String>,
     }
 
-    /// Resolve what a `CONTINUED_AS_NEW` chain under `(workflow_name,
-    /// workflow_id)` actually finished as (issue #1317 review, P1
-    /// follow-up).
+    /// Resolve what a `(workflow_name, workflow_id)` chain actually
+    /// finished as (issue #1317 review, P1 follow-up; extended to reset
+    /// chains, issue #1596 review, comment_id 4055896564). Chases past both
+    /// kinds of link that never block the key by themselves.
     ///
-    /// `CONTINUED_AS_NEW` never blocks the business key by itself. The
-    /// successor inserted in the same transaction does. The `occupied`
-    /// check in [`live_copy_is_terminal`] already confirmed no row under
-    /// this key is still active, resettable, or an unreconciled `MIGRATED`
-    /// seal. Every remaining row is therefore safe to read at face value.
-    /// `COMPLETED`/`TERMINATED` are final in themselves. A `MIGRATED` row
-    /// reached here is reconciled by construction, so its sibling
-    /// `migrated_run_terminal_state` column already carries the real
-    /// answer. This reads that column directly, instead of chasing
-    /// `migrated_to_shard` again. A chased hop can land on a shard an
-    /// operator has since decommissioned. The cached column survives that
-    /// case; it never depends on the target shard being reachable.
+    /// Neither `CONTINUED_AS_NEW` nor `TERMINATED` blocks the business key
+    /// on its own. Each names a row whose successor was inserted under the
+    /// SAME key, in the SAME transaction that sealed it. That successor is
+    /// a continuation for the former, a reset fork for the latter. The
+    /// `occupied` check in [`live_copy_is_terminal`] already confirmed no
+    /// row under this key
+    /// is still active, resettable, or an unreconciled `MIGRATED` seal.
+    /// Every remaining row is therefore safe to read at face value.
+    /// `COMPLETED` is final in itself, and so is a `TERMINATED` row with no
+    /// fork of its own. A `MIGRATED` row reached here is reconciled by
+    /// construction, so its sibling `migrated_run_terminal_state` column
+    /// already carries the real answer. This reads that column directly,
+    /// instead of chasing `migrated_to_shard` again. A chased hop can land
+    /// on a shard an operator has since decommissioned. The cached column
+    /// survives that case; it never depends on the target shard being
+    /// reachable.
     ///
-    /// A chain can hold any number of `CONTINUED_AS_NEW` links before its
-    /// true final node, including one itself later migrated and
-    /// reconciled. The partial unique index on `(workflow_name,
-    /// workflow_id)` allows at most one row outside
-    /// `CONTINUED_AS_NEW`/`TERMINATED` at a time. So the newest row under
-    /// the key that is not itself `CONTINUED_AS_NEW` is always that true
-    /// final node. Reading it directly resolves the whole chain in one
-    /// query, with no need to walk it link by link. This also reaches a
-    /// successor retention already demoted to a
+    /// A chain can hold any number of `CONTINUED_AS_NEW` and `TERMINATED`
+    /// links before its true final node, including one itself later
+    /// migrated and reconciled. The partial unique index on
+    /// `(workflow_name, workflow_id)` allows at most one row outside
+    /// `CONTINUED_AS_NEW`/`TERMINATED` at a time. Each fork's `started_at`
+    /// is also later than the row it replaces. So the newest row under the
+    /// key that is not itself `CONTINUED_AS_NEW` is always that true final
+    /// node. That holds whether the chain reached it through continuations,
+    /// resets, or a mix of both. Reading it directly resolves the whole
+    /// chain in one query, with no need to walk it link by link. This also
+    /// reaches a successor retention already demoted to a
     /// `harvest_execution_summaries` row, which carries no forward link of
     /// its own to walk.
     ///
