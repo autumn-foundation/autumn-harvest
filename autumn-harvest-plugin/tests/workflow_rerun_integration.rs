@@ -31,7 +31,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -179,7 +178,6 @@ fn api_state_with(
 
 fn build_app(pool: &DbPool, infos: Vec<WorkflowInfo>) -> HarvestApiApp {
     harvest_api_router(api_state_with(infos, pool, true))
-        .with_state(AppState::for_test().with_profile("test"))
 }
 
 /// Extra knobs a few tests need beyond `build_app`'s defaults.
@@ -223,14 +221,13 @@ fn build_app_with(pool: &DbPool, infos: Vec<WorkflowInfo>, opts: &AppOpts) -> Ha
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// An app whose admin-auth boundary is NOT installed, so the `require_admin`
 /// route layer rejects an unauthenticated caller (mirrors `security.rs`).
 fn build_app_no_admin(pool: &DbPool, infos: Vec<WorkflowInfo>) -> HarvestApiApp {
     harvest_api_router(api_state_with(infos, pool, false))
-        .with_state(AppState::for_test().with_profile("test"))
 }
 
 /// An app whose completion-callback SSRF policy allowlists `hook.example`
@@ -244,7 +241,7 @@ fn build_app_allowing_hook_example(pool: &DbPool, infos: Vec<WorkflowInfo>) -> H
             autumn_harvest::completion_callback::HostAllowlist::new().with_pattern("hook.example"),
         ),
     );
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 async fn post_json(app: &HarvestApiApp, uri: &str, body: Value) -> (StatusCode, Value) {
@@ -757,7 +754,7 @@ fn build_multi_shard_app(
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         two_shard_router(),
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Variant of [`build_multi_shard_app`] whose SHARDED-POOL default is shard 1
@@ -793,7 +790,7 @@ fn build_multi_shard_app_default_shard1(
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         two_shard_router(),
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Seed a terminal (COMPLETED) source directly on shard 0's connection, with
@@ -905,7 +902,7 @@ fn build_multi_shard_app_pool0_only(pool0: &DbPool, infos: Vec<WorkflowInfo>) ->
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         two_shard_router(),
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Issue #1308: a `workflow_id` override that hashes to a DIFFERENT shard
@@ -1391,7 +1388,7 @@ fn build_multi_shard_app_with_router(
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Codex review finding (PR #1152, P1): the DEFAULT (no `workflow_id`
@@ -2223,7 +2220,7 @@ async fn rerun_respects_admission_gate() {
         expires_at: None,
     }]);
     set_global_admission_gate_cache(Some(api_state.gate_cache()));
-    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(api_state);
 
     let mut conn = pool.get().await.unwrap();
     let wf_id = unique("rr-gated");

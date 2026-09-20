@@ -697,6 +697,10 @@ checking against this hot path's documented advisory-lock-ordering,
 exactly-once-claim, and `SKIP LOCKED`-concurrency-safety invariants by
 someone with full context on `queue.rs`. It is out of scope for this page and
 is not decided here; it is tracked separately as issue #1340.
+`docs/assays/0005-claim-batched-seek-and-refine.md` prototyped that shape and
+`docs/performance-claim-batched-seek-and-refine.md` measures a real,
+DB-tested implementation (`queue::claim_task_batched`, additive, not wired
+into the default claim path) against the single-row query above.
 
 This also corrects, without fully resolving, the
 [known limitations](#known-limitations) bullet that called `schedule_to_close`
@@ -1766,6 +1770,14 @@ from the benchmark are directly comparable.
   per RUNNING execution on every timeout-scanner tick.
 * Issue #1177 — reproduction and full `EXPLAIN` captures for
   [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
+* [`docs/performance-claim-batched-seek-and-refine.md`](performance-claim-batched-seek-and-refine.md) —
+  issue #1340's batched seek-and-refine claim (`queue::claim_task_batched`,
+  additive, not wired into the default claim path), measured against the
+  single-row query above.
+* `docs/perf-artifacts/claim-batched-seek-and-refine/` — committed `EXPLAIN`
+  evidence for that measurement.
+* `autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh` —
+  regenerates that evidence from a clean checkout.
 
 ### Other profiling notes
 
@@ -1781,6 +1793,12 @@ standalone note rather than part of the claim-path attribution table above:
   — lazy JSON-Pointer path construction in schema validation (issue #373).
 * [`docs/performance-det-check.md`](performance-det-check.md) — fusing a
   redundant per-line comment scan in `harvest det-check` (issue #778).
+* [`docs/performance-det-check-line-trim.md`](performance-det-check-line-trim.md)
+  — an ASCII-fast-path `str::trim()` replacement for the same scan's
+  per-line whitespace trim; a real but sub-floor win (best corrected
+  variant: 2.35% instruction reduction against a >=5% floor) — a negative
+  result. An earlier cut of the same variant had a real vertical-tab
+  correctness bug, caught by review before it shipped.
 * [`docs/performance-dag-graph.md`](performance-dag-graph.md) — hoisting a
   per-node rebuild out of `GET /dag-run-graph` (issue #690).
 * [`docs/performance-dlq-aggregate.md`](performance-dlq-aggregate.md) — DLQ
@@ -1890,3 +1908,8 @@ standalone note rather than part of the claim-path attribution table above:
   actually admits; `nodes` and `by_parent` stay growing from empty after a
   post-review correction (instructions -2.37%, alloc bytes -27.12%, this
   fix's final fifth-round-corrected numbers).
+* [`docs/performance-harvest-verify-split-top.md`](performance-harvest-verify-split-top.md)
+  — `autumn-harvest-verify`'s `util::split_top`, the balanced-delimiter
+  splitter every path/type decomposition in the MIR-level determinism
+  analyzer goes through (issue #962), guarded with a first-byte check
+  before its `starts_with` call (instructions -13.54%, PR #1597).

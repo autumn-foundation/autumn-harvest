@@ -221,6 +221,9 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_external_signal_by_id_oldest_pending_indeterminate_age",
     "harvest_external_cancel_by_id_oldest_pending_indeterminate_age",
     "harvest_external_signal_by_id_found_over_incomplete_fanout_total",
+    // Issue #1313 — the observable proxy for the by-id fan-out race's
+    // precondition.
+    "harvest_external_signal_by_id_other_live_observed_total",
 ];
 
 /// Per-series label ground truth (Prometheus-normalized label names),
@@ -415,6 +418,10 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ),
     (
         "harvest_external_signal_by_id_found_over_incomplete_fanout",
+        &["shard"],
+    ),
+    (
+        "harvest_external_signal_by_id_other_live_observed",
         &["shard"],
     ),
 ];

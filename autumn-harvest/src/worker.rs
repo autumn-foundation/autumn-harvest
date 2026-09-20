@@ -7415,18 +7415,22 @@ async fn update_workflow_execution_failed(
 /// lock (serialising with `pause_workflow_execution`'s own lock), and if so,
 /// re-park `task_id` under that same lock.
 ///
-/// Shared by `process_workflow_task`'s own pause-guarded persistence
-/// transaction and [`block_workflow_for_non_determinism`] (issue #603
-/// code-review fix — both previously duplicated this identical shape).
+/// Three call sites share this guard. `process_workflow_task`'s own
+/// pause-guarded persistence transaction is one.
+/// [`block_workflow_for_non_determinism`] is another (issue #603 code-review
+/// fix — both originally duplicated this shape).
+/// `process_workflow_task`'s early, non-locking pause fast path is the third
+/// (issue #1347). That path used to call [`queue::park_workflow_task`]
+/// directly, with no ownership guard.
 ///
 /// Must be called from inside an open transaction on `conn`. Returns `true`
 /// when the execution was `PAUSED` (the task has been re-parked and the
 /// caller should discard its pending decision); `false` otherwise.
 ///
 /// Discarding [`queue::park_workflow_task`]'s wake-requested return value is
-/// safe at both call sites: each shares `pause_workflow_execution`'s `FOR
-/// UPDATE` row lock, so a concurrent resume serialises after this check
-/// commits and issues its own wake.
+/// safe at every call site. Each call site shares
+/// `pause_workflow_execution`'s `FOR UPDATE` row lock. A concurrent resume
+/// therefore serialises after this check commits and issues its own wake.
 #[doc(hidden)]
 pub async fn check_paused_and_park(
     conn: &mut AsyncPgConnection,
@@ -18209,6 +18213,15 @@ enum TerminalMetricsKind {
 /// persist transaction has actually committed (the `Persisted` arm), never
 /// speculatively -- mirrors the discipline issue #684 already established
 /// for `harvest.update.completed`/`.failed` and `harvest.signal.unhandled`.
+///
+/// Issue #1348 adds the other half of the ordering. Call this BEFORE any
+/// `.await` in the `Persisted` arm, right after the commit. A
+/// `workflow_task_timeout` cancellation
+/// (`run_under_workflow_body_budget`) drops the whole decision cycle if it
+/// fires while the cycle is parked on a later `.await` in that arm. The
+/// outcome is durable by then, but the metrics call never runs. Calling
+/// this first closes that window: two statements with no `.await`
+/// between them cannot be split by a cancellation.
 fn emit_pending_workflow_metrics(
     telemetry: &crate::telemetry::TelemetryConfig,
     execution: &WorkflowExecution,
@@ -20624,26 +20637,39 @@ async fn process_workflow_task(
             .optional()
             .map_err(crate::error::database_error)?;
         if current_state.as_deref() == Some("PAUSED") {
-            let sticky = if sticky_timeout.is_zero() {
-                None
-            } else {
-                Some(queue::StickyHint::new(worker_id, sticky_timeout))
-            };
-            // Unlike the persist-time PAUSED check further down, this
-            // fast-path read takes no lock, so it has no ordering guarantee
-            // against `resume_workflow_execution` (PR #901 review): if resume
-            // transitions PAUSED -> RUNNING and calls `wake_workflow_task`
-            // between this read and this park's own atomic UPDATE, the wake
-            // is captured as `wake_requested = TRUE` on this still-claimed
-            // row -- and resume's wake is the *only* wake for this event, so
-            // discarding it here (unlike other pause-discard sites) leaves a
-            // resumed execution parked with nothing left to re-wake it.
-            let had_wake_requested = queue::park_workflow_task(conn, task.id, sticky).await?;
-            if had_wake_requested {
-                queue::wake_workflow_task(conn, prepared.exec_id).await?;
+            // Issue #1347: the read above takes no lock and proves nothing
+            // about task ownership. A stale dispatcher's claim can already
+            // have moved to a new owner: a poison-pill reclaim, an operator
+            // requeue, or a concurrent claim race. This stale dispatcher
+            // must not park a row a new owner now drives.
+            //
+            // Route the park through `check_paused_and_park`, the same guard
+            // the persist-time check further down uses. It re-checks PAUSED
+            // under a `FOR UPDATE` lock on the execution row. It then
+            // re-derives the task claim under its own lock (issue #1184)
+            // before parking. A lost claim surfaces as
+            // `TerminalWriteClaimAmbiguous` instead of an unconditional park.
+            //
+            // This also removes the raced-wake gap the old fast-path park had
+            // (PR #901 review). The execution row lock here serializes with
+            // `resume_workflow_execution`'s own lock. A concurrent resume
+            // therefore always commits its own wake after this park commits.
+            let still_paused = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+                check_paused_and_park(
+                    conn,
+                    prepared.exec_id.as_uuid(),
+                    task.id,
+                    worker_id,
+                    task.crash_strikes,
+                    sticky_timeout,
+                )
+                .await
+            }))
+            .await?;
+            if still_paused {
+                drop(execute_span);
+                return Ok(());
             }
-            drop(execute_span);
-            return Ok(());
         }
     }
 
@@ -21263,6 +21289,29 @@ async fn process_workflow_task(
                     had_nd_details: false,
                 };
             }
+
+            // Issue #1348: call this first in the arm. No `.await` sits
+            // between it and the persist commit above. Every later step in
+            // this arm has an `.await`. A `workflow_task_timeout`
+            // cancellation (issue #494, `run_under_workflow_body_budget`)
+            // can drop the whole cycle while it is parked on one of those.
+            // The outcome is durable by then, but a dropped cycle never
+            // resumes, so a later emit call can be lost. No `.await` sits
+            // between the commit and this call, so nothing can drop the
+            // cycle here.
+            //
+            // Issue #1184 established the other half of this order: never
+            // emit before the commit, or a rolled-back attempt double-
+            // counts. See `emit_pending_workflow_metrics`'s doc comment for
+            // both halves.
+            emit_pending_workflow_metrics(
+                &telemetry,
+                &prepared.execution,
+                &task.queue_name,
+                build_id,
+                &pending_workflow_metrics,
+            );
+
             // Chaos: kill/delay after the outer persist commit but before the
             // deferred-trigger fan-out — committed work whose in-process
             // follow-up side effects have not fired yet. Convergence must still
@@ -21400,19 +21449,6 @@ async fn process_workflow_task(
                 should_warn_history_bloat,
             )
             .await;
-
-            // Issue #1184 (Codex review round 2, P2): the terminal/canary
-            // metrics this cycle computed above, captured before `outcome`
-            // moved into the transaction -- emitted only now that the
-            // transaction has actually committed. See
-            // `emit_pending_workflow_metrics`'s doc comment.
-            emit_pending_workflow_metrics(
-                &telemetry,
-                &prepared.execution,
-                &task.queue_name,
-                build_id,
-                &pending_workflow_metrics,
-            );
         }
         Err(error) => {
             // Issue #1182 (Codex review round 3): an ambiguous suspended-
@@ -29403,6 +29439,74 @@ pub async fn chaos_drive_one_workflow_task(
         .await
     })
     .await
+}
+
+/// Chaos-only (issue #1348): a [`chaos_drive_one_workflow_task`] variant that
+/// cancels the cycle deterministically, at a chosen point, instead of
+/// letting it run to completion.
+///
+/// Drops the cycle the instant it reaches `hold`'s rendezvous. Mirrors the
+/// drop [`run_under_workflow_body_budget`] performs when
+/// `workflow_task_timeout` elapses mid-cycle: the cycle future is
+/// abandoned while parked on an `.await`, never polled again. A `Hold`
+/// rendezvous fires only once its chaos point is reached. So every
+/// earlier `.await` the cycle crossed has already resolved -- in
+/// particular, the persist transaction's commit.
+///
+/// Returns `true` when the cycle was cancelled at the hold: the intended
+/// race. Returns `false` if the cycle finished on its own first. This is a
+/// non-vacuity guard. A `false` result means the workload never reaches
+/// the hold's chaos point, so the caller's race assertion would
+/// otherwise pass vacuously.
+#[cfg(feature = "chaos")]
+pub async fn chaos_drive_one_workflow_task_cancel_at_hold(
+    db_url: &str,
+    registry: Arc<HandlerRegistry>,
+    task: TaskQueueItem,
+    worker_id: String,
+    hold: crate::chaos::HoldHandle,
+) -> bool {
+    let db_url = db_url.to_string();
+    tokio::spawn(async move {
+        let mut conn = AsyncPgConnection::establish(&db_url)
+            .await
+            .expect("chaos: establish owned workflow-task connection");
+        let workflow_cache = Arc::new(tokio::sync::Mutex::new(crate::cache::WorkflowCache::new(
+            16,
+        )));
+        let workflow_panic_strikes = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            uuid::Uuid,
+            u32,
+        >::new()));
+        let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
+        // Boxed for the same reason as `chaos_drive_one_workflow_task`
+        // (clippy::large_futures).
+        let mut cycle = Box::pin(process_workflow_task(
+            &mut conn,
+            registry.as_ref(),
+            &task,
+            &worker_id,
+            "",
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            workflow_cache,
+            std::time::Instant::now(),
+            &workflow_panic_strikes,
+            3,
+            None,
+            &frontier_reset_committed,
+        ));
+        let cancelled_at_hold = tokio::select! {
+            () = hold.reached() => true,
+            _ = &mut cycle => false,
+        };
+        // `cycle`, and its owned connection, drop here -- still parked on the
+        // hold's rendezvous on the `true` arm. Exactly what
+        // `tokio::time::timeout` does to a timed-out body.
+        cancelled_at_hold
+    })
+    .await
+    .expect("chaos: cancel-at-hold drive task must not panic")
 }
 
 // ---------------------------------------------------------------------------

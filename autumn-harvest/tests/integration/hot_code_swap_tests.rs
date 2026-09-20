@@ -136,6 +136,24 @@ const QUEUE_HOPPER_WAT: &str = r#"
           (else (call $pack (i32.const 1280) (i32.const 38))))))
 "#;
 
+/// A guest that opts for the queue override but names a 250-byte queue — the
+/// unbounded-queue-name probe (issue #1345 finding 3).
+const LONG_QUEUE_NAME_WAT: &str = r#"
+    (module
+      (memory (export "memory") 1)
+      (data (i32.const 1024) "{\"kind\":\"await\",\"activity\":\"charge\",\"input\":{\"amount\":100},\"queue\":\"QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ\"}")
+      (global $bump (mut i32) (i32.const 4096))
+      (func (export "alloc") (param $len i32) (result i32)
+        (local $ptr i32)
+        (local.set $ptr (global.get $bump))
+        (global.set $bump (i32.add (global.get $bump) (local.get $len)))
+        (local.get $ptr))
+      (func (export "run") (param i32) (param i32) (result i64)
+        (i64.or
+          (i64.shl (i64.extend_i32_u (i32.const 1024)) (i64.const 32))
+          (i64.extend_i32_u (i32.const 320)))))
+"#;
+
 fn pipeline_v1_bytes() -> Vec<u8> {
     wat::parse_str(PIPELINE_V1_WAT).expect("pipeline_v1.wat assembles")
 }
@@ -652,10 +670,120 @@ fn unloading_a_build_drops_its_modules_but_not_a_live_holder() {
 }
 
 #[test]
+fn unloading_a_build_misses_on_a_suspended_executions_next_lookup() {
+    // Issue #1345 finding 1. The test above pins the case the doc comment on
+    // `unload_build` used to describe without a caveat. A caller that already
+    // holds an `Arc` keeps running. This pins the case the caveat now names: a
+    // suspended execution holds no `Arc`. Its next `process_workflow_task`
+    // does a fresh lookup. An early unload makes that lookup miss — the
+    // typed capability miss (issue #804), not a crash. It is a cost the doc
+    // must not paper over as "safe".
+    let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
+
+    // No holder resolved the module before this unload — the suspended case.
+    assert_eq!(registry.unload_build("wf-v1"), 1);
+
+    assert!(
+        registry.get("wf-v1", "pipeline").is_none(),
+        "a suspended execution's resumed lookup must miss after an early unload"
+    );
+}
+
+#[test]
+fn unload_builds_doc_states_the_suspended_execution_caveat() {
+    // Issue #1345 finding 1. `unload_build`'s doc comment claimed early
+    // unload is safe for in-flight invocations, because a resolved caller
+    // holds an `Arc`. That is true against use-after-free. It reads, though,
+    // as covering a *suspended* execution too, which holds no `Arc` and
+    // misses on resume. This guard keeps the doc honest about the distinction rather than
+    // relying on a reviewer to notice the claim drifted again.
+    let src = include_str!("../../src/hot_swap.rs");
+    let start = src
+        .find("pub fn unload_build(")
+        .expect("unload_build is where the guard expects it");
+    let doc_start = src[..start]
+        .rfind("/// Drop every binding")
+        .expect("unload_build's doc comment is where the guard expects it");
+    let doc = &src[doc_start..start];
+    assert!(
+        doc.contains("suspended"),
+        "unload_build's doc must name the suspended-execution case, not just \
+         the in-flight-invocation one"
+    );
+}
+
+#[test]
 fn unloading_an_unknown_build_is_a_no_op() {
     let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
     assert_eq!(registry.unload_build("wf-does-not-exist"), 0);
     assert_eq!(registry.len(), 1);
+}
+
+#[test]
+fn unloading_the_build_being_loaded_still_fails_the_commit() {
+    // The race `UnloadedDuringLoad` exists to catch: a retirement lands while
+    // THIS build is still mid-compile. Failing closed here is correct — a
+    // successful commit would silently revive a build an operator just
+    // retired.
+    let registry = Arc::new(ModuleRegistry::new());
+    let generation = registry.load_generation();
+    let prepared = registry
+        .prepare_module(
+            "wf-a",
+            "pipeline",
+            &pipeline_v1_bytes(),
+            &ModuleVerification::none(),
+        )
+        .expect("prepare wf-a");
+
+    assert_eq!(registry.unload_build("wf-a"), 0, "nothing was bound yet");
+
+    let err = registry
+        .commit_prepared(vec![prepared], generation)
+        .expect_err("the build that raced its own load must fail the commit");
+    assert!(
+        matches!(err, HotSwapError::UnloadedDuringLoad { .. }),
+        "unexpected error: {err}"
+    );
+    assert!(registry.get("wf-a", "pipeline").is_none());
+}
+
+#[test]
+fn unloading_one_build_does_not_fail_an_unrelated_builds_in_flight_commit() {
+    // Issue #1345 finding 7. `generation` used to be one counter shared by
+    // every build. Unloading `wf-a` therefore also bumped the generation
+    // `wf-b`'s sync had captured. `wf-b`'s commit then failed with
+    // `UnloadedDuringLoad`, reporting that `wf-b` was unloaded, when it was
+    // `wf-a` all along.
+    let registry = Arc::new(ModuleRegistry::new());
+    registry
+        .load_module(
+            "wf-a",
+            "pipeline",
+            &pipeline_v1_bytes(),
+            &ModuleVerification::none(),
+        )
+        .expect("load wf-a");
+
+    // wf-b's sync reads the generation before compiling...
+    let generation = registry.load_generation();
+    let prepared = registry
+        .prepare_module(
+            "wf-b",
+            "pipeline",
+            &pipeline_v2_bytes(),
+            &ModuleVerification::none(),
+        )
+        .expect("prepare wf-b");
+
+    // ...and an UNRELATED build is retired while wf-b is still mid-compile.
+    assert_eq!(registry.unload_build("wf-a"), 1);
+
+    // wf-b's own build was never unloaded, so its commit must succeed.
+    registry
+        .commit_prepared(vec![prepared], generation)
+        .expect("an unrelated build's unload must not fail this commit");
+    assert!(registry.get("wf-b", "pipeline").is_some());
 }
 
 #[test]
@@ -1141,6 +1269,35 @@ async fn a_guest_may_not_pick_the_queue_unless_the_host_allows_it() {
     assert_eq!(queues, ["other-queue"]);
 }
 
+#[tokio::test]
+async fn a_guest_may_not_pick_an_oversized_queue_name() {
+    // Issue #1345 finding 3. `harvest_task_queue.queue_name` sits in a B-tree
+    // index (`idx_harvest_tq_poll`); a name long enough makes every future
+    // insert for it fail at the index, not just this one. The host must
+    // refuse the name, not truncate it — a truncated name would silently
+    // route work to a queue nobody polls.
+    let bytes = wat::parse_str(LONG_QUEUE_NAME_WAT).expect("wat assembles");
+    let registry = registry_with(&[("wf-long-queue", "pipeline", bytes)]);
+
+    let outcome = with_module_host(
+        host(&registry, "wf-long-queue").allowing_queue_override(),
+        env().run(module_workflow_handler, json!({})),
+    )
+    .await;
+    let scheduled_any = outcome
+        .events()
+        .iter()
+        .any(|e| matches!(e, WorkflowEvent::ActivityScheduled { .. }));
+    let err = outcome
+        .result
+        .expect_err("a queue name over the ceiling must be refused");
+    assert!(err.contains("queue"), "{err}");
+    assert!(
+        !scheduled_any,
+        "an oversized queue name must be refused before anything is scheduled onto it"
+    );
+}
+
 #[test]
 fn a_host_cannot_lift_the_resource_ceilings_only_tighten_them() {
     let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
@@ -1316,6 +1473,45 @@ async fn syncing_a_build_discovers_verifies_and_loads_every_module() {
         .expect("sync");
     assert_eq!(loaded.len(), 1);
     assert!(registry.get("wf-v1", "pipeline").is_some());
+}
+
+#[tokio::test]
+async fn a_sync_refuses_a_build_with_too_many_workflow_names() {
+    // Issue #1345 finding 6. Fetching one payload at a time bounds SOURCE
+    // residency. It does not bound the COMPILED artifacts. Those stay
+    // resident for the whole batch, because atomic binding needs every
+    // module compiled before any of them is bound. A build with enough workflow
+    // names could still accumulate unboundedly many resident compiled
+    // modules before the batch ever commits. The ceiling refuses the sync
+    // outright, before fetching or compiling a single module.
+    let (mut conn, _c) = db().await;
+    let bytes = pipeline_v1_bytes();
+    for i in 0..=autumn_harvest::hot_swap::MAX_WORKFLOW_NAMES_PER_BUILD {
+        publish_workflow_module(
+            &mut conn,
+            "wf-huge",
+            &format!("pipeline-{i}"),
+            &bytes,
+            None,
+            None,
+        )
+        .await
+        .expect("publish");
+    }
+
+    let registry = Arc::new(ModuleRegistry::new());
+    let err = sync_build_into_registry(&mut conn, &registry, "wf-huge", None)
+        .await
+        .expect_err("a build over the workflow-name ceiling must be refused");
+    assert!(
+        err.to_string().contains("ceiling"),
+        "error should name the ceiling: {err}"
+    );
+    assert_eq!(
+        registry.len(),
+        0,
+        "a refused sync must bind nothing at all, not even a partial batch"
+    );
 }
 
 #[tokio::test]
@@ -2456,6 +2652,45 @@ async fn decisions_are_reused_across_separate_workflow_tasks() {
     );
 }
 
+#[tokio::test]
+async fn a_capability_enabled_host_never_uses_the_decision_cache() {
+    // Issue #1345 finding 2. The cache's soundness argument is "the guest is
+    // a pure function of its request" — true only under deny-all
+    // capabilities. `with_capabilities` lets a host grant a clock or
+    // randomness. A guest granted either is not pure. Serving a prior
+    // execution's answer from the cache would hand out a stale time- or
+    // random-dependent decision instead of asking the guest again. The host
+    // must skip the cache entirely rather than key it by capability grant. A
+    // capability-enabled guest already fails replay for the same reason.
+    // Caching would only mask when.
+    let registry = registry_with(&[("wf-v2", "pipeline", pipeline_v2_bytes())]);
+    let capable = autumn_harvest::wasm_activities::WasmCapabilities {
+        allow_clock: true,
+        ..autumn_harvest::wasm_activities::WasmCapabilities::default()
+    };
+
+    for _ in 0..2 {
+        let outcome = with_module_host(
+            ModuleHost::new(Arc::clone(&registry))
+                .with_build_id("wf-v2")
+                .with_capabilities(capable.clone()),
+            env().run(module_workflow_handler, json!({"order": 1})),
+        )
+        .await;
+        assert_eq!(outcome.result.expect("completes"), json!("v2-done"));
+    }
+
+    let (hits, misses) = registry.decisions().expect("cache is not poisoned").stats();
+    assert_eq!(
+        hits, 0,
+        "a capability-enabled host must never read a decision from the cache"
+    );
+    assert_eq!(
+        misses, 0,
+        "a capability-enabled host must never populate the cache either"
+    );
+}
+
 #[test]
 fn the_run_budget_is_charged_and_checked_once_for_both_cache_paths() {
     // Codex review round 5, correcting round 4. Charging cache hits was the
@@ -2465,9 +2700,10 @@ fn the_run_budget_is_charged_and_checked_once_for_both_cache_paths() {
     // total served from cache was rejected — the residency dependence surviving
     // inside its own fix.
     //
-    // Guarded structurally rather than functionally: reproducing it needs a
-    // guest slow enough to exhaust a ten-second budget, which is not a test
-    // anyone should wait for. The invariant is that the cost is charged and the
+    // Guarded structurally rather than functionally. Reproducing it needs a
+    // guest expensive enough to exhaust the cumulative fuel budget, which is
+    // not a test anyone should wait for. The invariant is that the cost is
+    // charged and the
     // budget checked in exactly ONE place, on the path both branches join, and
     // *before* the response is acted on — an over-budget `Await` acted on
     // optimistically schedules a real activity the run then fails immediately
@@ -2498,7 +2734,7 @@ fn the_run_budget_is_charged_and_checked_once_for_both_cache_paths() {
     let charges: Vec<usize> = live
         .iter()
         .enumerate()
-        .filter(|(_, line)| line.contains("guest_time = guest_time.saturating_add"))
+        .filter(|(_, line)| line.contains("guest_fuel = guest_fuel.saturating_add"))
         .map(|(i, _)| i)
         .collect();
     assert_eq!(
@@ -2517,6 +2753,48 @@ fn the_run_budget_is_charged_and_checked_once_for_both_cache_paths() {
         "order must be charge -> check -> act (charge at {}, check at {}, act at          {acted_on}); checking after acting lets an over-budget `Await` schedule          a real activity the run then fails",
         charges[0],
         checks[0]
+    );
+}
+
+#[test]
+fn the_decide_loop_still_bounds_real_wall_clock_occupancy() {
+    // Issue #1345. A bot review of the finding-5 fix flagged a real
+    // regression. Replacing the wall-clock cumulative budget with a
+    // fuel-only one removed the one thing bounding a guest cheap in fuel
+    // but expensive in real time. Bulk-memory instructions cost one fuel
+    // unit regardless of bytes moved. A capability-enabled host or a cache
+    // miss recomputes every step fresh. Up to `MAX_DECIDE_STEPS` decisions
+    // could each spend close to `DECIDE_MAX_WALL_CLOCK` while staying
+    // under the fuel budget, wedging a runtime worker for minutes.
+    //
+    // Guarded structurally rather than functionally. Reproducing it needs
+    // a guest that actually occupies the thread for real time, which is
+    // not a test anyone should wait for.
+    let src = include_str!("../../src/hot_swap.rs");
+    let start = src
+        .find("pub fn module_workflow_handler(")
+        .expect("the trampoline is where the guard expects it");
+    let body = &src[start..];
+    let live: Vec<&str> = body
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect();
+
+    let cycle_started = live
+        .iter()
+        .position(|line| line.contains("let cycle_started = Instant::now()"))
+        .expect("the decide loop must capture a live wall-clock start");
+    let backstop_check = live
+        .iter()
+        .position(|line| line.contains("cycle_started.elapsed() >= DECIDE_RUN_WALL_CLOCK_BACKSTOP"))
+        .expect("the decide loop must check the live wall-clock backstop every step");
+    let acted_on = live
+        .iter()
+        .position(|line| line.trim_start().starts_with("match response"))
+        .expect("the trampoline acts on the response with `match response`");
+    assert!(
+        cycle_started < backstop_check && backstop_check < acted_on,
+        "the wall-clock backstop must be captured before the loop and checked          before the response is acted on"
     );
 }
 
@@ -2573,7 +2851,7 @@ fn the_decision_cache_is_bounded_in_bytes_not_just_entries() {
         !cache.insert(
             DecisionCache::key("wf-v1", "hash", b"fat"),
             DecideResponse::Complete { output: json!(fat) },
-            Duration::ZERO,
+            0,
         ),
         "a response over the per-entry ceiling must be refused, not cached"
     );
@@ -2588,7 +2866,7 @@ fn the_decision_cache_is_bounded_in_bytes_not_just_entries() {
             DecideResponse::Complete {
                 output: json!(format!("{chunky}{i}")),
             },
-            Duration::ZERO,
+            0,
         );
         assert!(
             cache.retained_bytes() <= MAX_CACHED_DECISION_BYTES,
@@ -2614,7 +2892,7 @@ fn a_cache_hit_is_charged_to_the_run_budget_like_a_recomputation() {
     // not change what the run decides.
     let mut cache = DecisionCache::new();
     let key = DecisionCache::key("wf-v1", "hash", b"step-0");
-    let spent = Duration::from_millis(250);
+    let spent: u64 = 250_000;
 
     assert!(cache.insert(
         key,
@@ -2643,7 +2921,7 @@ fn the_decision_cache_evicts_oldest_first() {
             DecideResponse::Complete {
                 output: json!(i as u64),
             },
-            Duration::ZERO,
+            0,
         );
     }
 
@@ -2793,10 +3071,15 @@ fn the_example_readme_documents_the_wire_format_the_host_actually_sends() {
     // request, and would push a guest that does parse it onto `error` — a
     // diagnostic string that differs between the inline and replayed delivery
     // paths, so branching on it behaves differently on replay than it did live.
-    let err_example = readme
+    let err_examples: Vec<&str> = readme
         .lines()
-        .find(|line| line.starts_with(r#"{"kind":"err""#))
-        .expect("the README shows a failed DecideOutcome");
+        .filter(|line| line.starts_with(r#"{"kind":"err""#))
+        .collect();
+    assert_eq!(
+        err_examples.len(),
+        2,
+        "the README must show both failure shapes: with and without `details`"
+    );
     let encoded_err = serde_json::to_string(&DecideOutcome::Err {
         error_type: "CircuitOpen".to_string(),
         details: Some(json!({"retry_after_secs": 30})),
@@ -2804,10 +3087,33 @@ fn the_example_readme_documents_the_wire_format_the_host_actually_sends() {
     })
     .expect("encodes");
     assert_eq!(
-        field_names(err_example),
+        field_names(err_examples[0]),
         field_names(&encoded_err),
-        "the README's failure example must name exactly the fields, in the \
-         order, that `DecideOutcome::Err` serialises"
+        "the README's first failure example must name exactly the fields, in \
+         the order, that `DecideOutcome::Err` serialises when `details` is set"
+    );
+
+    // Issue #1345 finding 4. `details` is `skip_serializing_if = "Option::is_none"`,
+    // so a failure without structured detail omits the key entirely — it never
+    // serialises as `"details":null`. A guest written against a `"details":null`
+    // example would carry a field the host never sends.
+    let encoded_no_details = serde_json::to_string(&DecideOutcome::Err {
+        error_type: "harvest.timeout.StartToClose".to_string(),
+        details: None,
+        error: "...".to_string(),
+    })
+    .expect("encodes");
+    assert!(
+        !err_examples[1].contains("null"),
+        "the no-details example must not show `\"details\":null`; the host \
+         omits the key rather than emitting null: {}",
+        err_examples[1]
+    );
+    assert_eq!(
+        field_names(err_examples[1]),
+        field_names(&encoded_no_details),
+        "the README's second failure example must name exactly the fields, in \
+         the order, that `DecideOutcome::Err` serialises when `details` is `None`"
     );
     assert!(
         readme.contains("Branch on `error_type`, never on `error`"),

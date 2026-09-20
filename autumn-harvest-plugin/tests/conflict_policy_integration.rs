@@ -51,7 +51,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -197,7 +196,7 @@ fn build_app_inner(pool: &DbPool, infos: Vec<WorkflowInfo>, admin: bool) -> Harv
         ShardRouter::default(),
     ));
 
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// POST a start (body carries all fields, incl. `conflict_policy` when set).

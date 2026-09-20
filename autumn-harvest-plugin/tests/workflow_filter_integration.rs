@@ -14,7 +14,6 @@ use autumn_harvest::worker::DbPool;
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -43,10 +42,6 @@ fn init_sql() -> Vec<u8> {
 }
 
 type HarvestApiApp = axum::Router;
-
-fn test_app_state_without_database() -> AppState {
-    AppState::for_test().with_profile("test")
-}
 
 async fn setup_single_database() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(admin_url) = std::env::var(LOCAL_PG_URL_ENV) {
@@ -284,7 +279,7 @@ async fn workflow_list_filters_match_expected_subsets() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let onboarding_acme = seed_workflow(
         &database_url,
@@ -484,7 +479,7 @@ async fn workflow_list_invalid_filters_return_400() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let (status, body) = get_json(&app, "/workflows?state=NOT_A_STATE").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -516,7 +511,7 @@ async fn workflow_list_filters_apply_across_shards() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let _ = seed_workflow(
         &shard0_url,
@@ -620,7 +615,7 @@ async fn workflow_list_filter_failure_cause() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let _nd_wf = seed_workflow(
         &database_url,
@@ -662,7 +657,7 @@ async fn workflow_list_filter_nd_blocked() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     // A RUNNING execution blocked on divergence.
     let blocked = seed_workflow(
@@ -791,7 +786,7 @@ async fn workflow_list_started_after_before_filters_are_applied() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let old = seed_workflow(&database_url, ShardId::new(0), "billing", "wf-old", None).await;
     let new_wf = seed_workflow(&database_url, ShardId::new(0), "billing", "wf-new", None).await;
@@ -839,7 +834,7 @@ async fn workflow_list_exec_id_prefix_filter_applied() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let exec_id = seed_workflow(
         &database_url,
@@ -873,7 +868,7 @@ async fn workflow_list_legacy_call_returns_bare_array() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let _ = seed_workflow(&database_url, ShardId::new(0), "billing", "wf-leg", None).await;
 
@@ -889,7 +884,7 @@ async fn workflow_list_pagination_returns_envelope() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     // Seed 5 workflows with controlled created_at order.
     for i in 0..5u64 {
@@ -949,7 +944,7 @@ async fn workflow_list_pagination_asc_order() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     for i in 0..4u64 {
         let exec_id = seed_workflow(
@@ -999,7 +994,7 @@ async fn workflow_list_pagination_keyset_stability_under_concurrent_inserts() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     // Seed 4 "old" workflows with ts < 2026.
     for i in 0..4u64 {
@@ -1062,7 +1057,7 @@ async fn workflow_list_pagination_sharded_global_order() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     // Shard 0: 3 workflows, timestamps t+0, t+20, t+40.
     // Shard 1: 3 workflows, timestamps t+10, t+30, t+50.
@@ -1160,7 +1155,7 @@ async fn workflow_search_attr_predicate_comparison_and_set() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     // amount/phase/retry_count fixtures. `small-amount` deliberately probes the
     // string-vs-number coercion regression: amount=100 must sort ABOVE amount=20
@@ -1263,7 +1258,7 @@ async fn workflow_search_attr_predicate_invalid_returns_400() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     // Unknown operator.
     let (status, body) = get_json(&app, "/workflows?search_attr_filter=amount:between:1").await;
@@ -1347,7 +1342,7 @@ async fn workflow_search_attr_predicate_applies_across_shards_with_pagination() 
     let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     // Three matching rows spread across two shards, plus one non-matching row.
     for (url, shard, id, amount) in [
@@ -1424,7 +1419,7 @@ async fn stalled_workflow_path_applies_search_attr_predicate() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let blocked = seed_workflow(
         &database_url,

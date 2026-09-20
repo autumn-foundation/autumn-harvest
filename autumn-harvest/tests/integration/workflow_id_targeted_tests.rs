@@ -2435,15 +2435,19 @@ async fn cross_shard_cancel_reports_unfinished_handlers_on_the_target_shard() {
         &mut caller_conn,
         recorder.as_ref(),
         Duration::from_secs(60),
-        &Some(sharded_pool),
+        &Some(sharded_pool.clone()),
         &[caller_exec_id.shard()],
         &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("cancel outbox sweep should succeed");
+    // The sweep that ends a live run cancels and runs its follow-ups, and
+    // leaves the terminal event to the next fan-out (issue #1313). The
+    // deferred check under test belongs to the sweep that cancelled, so it has
+    // already run here.
     assert_eq!(
-        processed, 1,
-        "exactly one cancel-by-id delivery should be processed"
+        processed, 0,
+        "the cancelling sweep resolves nothing yet, by design"
     );
 
     // The target must actually be CANCELLED on its own database.
@@ -2466,6 +2470,21 @@ async fn cross_shard_cancel_reports_unfinished_handlers_on_the_target_shard() {
         "the unfinished-handler check must run against the target's own \
          shard and report exactly the one still-admitted update handler; \
          got: {calls:?}"
+    );
+
+    let processed = autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut caller_conn,
+        recorder.as_ref(),
+        Duration::from_secs(60),
+        &Some(sharded_pool),
+        &[caller_exec_id.shard()],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("second cancel outbox sweep should succeed");
+    assert_eq!(
+        processed, 1,
+        "exactly one cancel-by-id delivery should be processed"
     );
 }
 
@@ -2642,6 +2661,23 @@ async fn cross_shard_cancel_target_followups_survive_a_failed_caller_side_commit
         .expect("seed deliberately undecodable third row");
 
     let recorder = Arc::new(CrossPoolFollowupRecorder::default());
+    // Sweep 1 does the cross-pool cancel and its follow-ups. It appends no
+    // terminal event, because a cancel that ends a live run leaves that to the
+    // next fan-out (issue #1313). So it never reaches the undecodable row.
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut caller_conn,
+        recorder.as_ref(),
+        Duration::from_secs(60),
+        &Some(sharded_pool.clone()),
+        &[caller_exec_id.shard()],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("the cancelling sweep should succeed");
+
+    // Sweep 2 loads the caller's history to append the terminal event, and
+    // fails on that row. The follow-ups under test belong to sweep 1 and are
+    // already recorded, which is exactly what this failure must not undo.
     let outcome = autumn_harvest::timeout::enforce_external_cancels_outbox(
         &mut caller_conn,
         recorder.as_ref(),

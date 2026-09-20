@@ -47,6 +47,45 @@ fn is_excluded_impl(date: NaiveDate, excluded_dates: &[NaiveDate], exclude_weeke
         || excluded_dates.contains(&date)
 }
 
+/// Shared skip-search: advances `date` per `skip_policy` using `is_excluded`
+/// as the exclusion check. Factored out so the two `excluded_dates`
+/// representations below share one 365-day scan implementation rather than
+/// two copies that could drift. Those representations are `&[NaiveDate]`
+/// for a single lookup, and `&BTreeSet<NaiveDate>` for a caller repeating
+/// this check across many dates.
+fn apply_skip_policy_with(
+    date: NaiveDate,
+    skip_policy: SkipPolicy,
+    is_excluded: impl Fn(NaiveDate) -> bool,
+) -> Option<NaiveDate> {
+    if !is_excluded(date) {
+        return Some(date);
+    }
+    match skip_policy {
+        SkipPolicy::Skip => None,
+        SkipPolicy::RunNextBusinessDay => {
+            let mut candidate = date + chrono::Duration::days(1);
+            for _ in 0..365 {
+                if !is_excluded(candidate) {
+                    return Some(candidate);
+                }
+                candidate += chrono::Duration::days(1);
+            }
+            None
+        }
+        SkipPolicy::RunPrevBusinessDay => {
+            let mut candidate = date - chrono::Duration::days(1);
+            for _ in 0..365 {
+                if !is_excluded(candidate) {
+                    return Some(candidate);
+                }
+                candidate -= chrono::Duration::days(1);
+            }
+            None
+        }
+    }
+}
+
 /// Adjust a scheduled fire date according to a calendar and skip policy.
 ///
 /// - When `date` is not excluded, returns `Some(date)` unchanged.
@@ -62,6 +101,12 @@ fn is_excluded_impl(date: NaiveDate, excluded_dates: &[NaiveDate], exclude_weeke
 /// Scans up to 365 days in either direction; returns `None` if no non-excluded
 /// day can be found within that window (degenerate calendar with 365 consecutive
 /// exclusions).
+///
+/// Checks `excluded_dates` with an O(n) linear scan per date. A caller that
+/// invokes this once per date in a loop over the *same* `excluded_dates`
+/// should instead index it once into a `BTreeSet`. Such a caller should
+/// call [`apply_skip_policy_indexed`] instead — see that function for why.
+/// Backfill planning and firing previews are two such loop callers.
 #[must_use]
 pub fn apply_skip_policy(
     date: NaiveDate,
@@ -69,32 +114,40 @@ pub fn apply_skip_policy(
     excluded_dates: &[NaiveDate],
     exclude_weekends: bool,
 ) -> Option<NaiveDate> {
-    if !is_excluded_impl(date, excluded_dates, exclude_weekends) {
-        return Some(date);
-    }
-    match skip_policy {
-        SkipPolicy::Skip => None,
-        SkipPolicy::RunNextBusinessDay => {
-            let mut candidate = date + chrono::Duration::days(1);
-            for _ in 0..365 {
-                if !is_excluded_impl(candidate, excluded_dates, exclude_weekends) {
-                    return Some(candidate);
-                }
-                candidate += chrono::Duration::days(1);
-            }
-            None
-        }
-        SkipPolicy::RunPrevBusinessDay => {
-            let mut candidate = date - chrono::Duration::days(1);
-            for _ in 0..365 {
-                if !is_excluded_impl(candidate, excluded_dates, exclude_weekends) {
-                    return Some(candidate);
-                }
-                candidate -= chrono::Duration::days(1);
-            }
-            None
-        }
-    }
+    apply_skip_policy_with(date, skip_policy, |d| {
+        is_excluded_impl(d, excluded_dates, exclude_weekends)
+    })
+}
+
+/// Same contract as [`apply_skip_policy`], but checks `excluded` — a
+/// `BTreeSet` built once by the caller — with an O(log n) lookup per
+/// date. `apply_skip_policy` itself does an O(n) linear scan instead.
+///
+/// A calendar's exclusion list only grows over the calendar's lifetime.
+/// There is no date-range bound and no retention path — see
+/// [`load_exclusions_for_calendar`]. A single backfill or preview call
+/// checks it once per generated slot, up to `max_count`. That count is
+/// client-suppliable and not hard-capped by the admin handler.
+/// Re-scanning the whole list from scratch on every slot makes that call's
+/// cost the product of two values that both grow independently of each
+/// other. That product is quadratic in the callers this function serves.
+///
+/// `cfg(feature = "db")`. Its only two callers,
+/// [`plan_backfill_with_calendar`] and [`preview_schedule_firings`], are
+/// both gated on `db`. A `db`-off build — the corpus crates under
+/// `autumn-harvest-verify` build this way — would otherwise see it as
+/// dead code.
+#[cfg(feature = "db")]
+fn apply_skip_policy_indexed(
+    date: NaiveDate,
+    skip_policy: SkipPolicy,
+    excluded: &std::collections::BTreeSet<NaiveDate>,
+    exclude_weekends: bool,
+) -> Option<NaiveDate> {
+    apply_skip_policy_with(date, skip_policy, |d| {
+        (exclude_weekends && matches!(d.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun))
+            || excluded.contains(&d)
+    })
 }
 
 /// Returns `true` when the calendar name implies Saturday/Sunday are always excluded.
@@ -625,6 +678,18 @@ pub fn preview_schedule_firings(
 
     let mut entries = Vec::with_capacity(count);
     let mut cursor = from;
+    let exclude_weekends = calendar_name.is_some_and(calendar_excludes_weekends);
+    // Indexed once for the whole preview: `apply_skip_policy_indexed` below
+    // is called up to `count` times against this same list. Skipped when
+    // `calendar_name` is `None`. The loop below then never reads `excluded`
+    // at all. A caller disabling calendar filtering while still holding a
+    // large `excluded_dates` snapshot must not pay to index a list it
+    // asked not to be checked.
+    let excluded: std::collections::BTreeSet<NaiveDate> = if calendar_name.is_some() {
+        excluded_dates.iter().copied().collect()
+    } else {
+        std::collections::BTreeSet::new()
+    };
 
     while entries.len() < count {
         let Some(fire_time) = next_run_after_pub(Some(schedule), cursor) else {
@@ -633,13 +698,12 @@ pub fn preview_schedule_firings(
         cursor = fire_time;
         let fire_date = fire_time.date_naive();
 
-        let exclude_weekends = calendar_name.is_some_and(calendar_excludes_weekends);
         let (effective_at, reason) = calendar_name.map_or_else(
             || (Some(fire_time), "Fired".to_string()),
-            |cal_name| match apply_skip_policy(
+            |cal_name| match apply_skip_policy_indexed(
                 fire_date,
                 skip_policy,
-                excluded_dates,
+                &excluded,
                 exclude_weekends,
             ) {
                 None => (None, format!("SkippedByCalendar:{cal_name}")),
@@ -697,17 +761,31 @@ pub fn plan_backfill_with_calendar(
     exclude_weekends: bool,
 ) -> Result<Vec<BackfillSlot>, crate::scheduler::BackfillPlanError> {
     let raw = crate::scheduler::plan_backfill_timestamps(schedule, from, to, max_count)?;
+    if raw.is_empty() {
+        // No slot to check against `excluded_dates` at all -- a `Manual`
+        // schedule, or a cron/interval schedule with no occurrence in
+        // `[from, to]`. Building the index below would be pure waste. A
+        // caller can reach this on every call for a schedule outside its
+        // active window, still carrying its full (long-lived, unbounded)
+        // calendar exclusion list.
+        return Ok(Vec::new());
+    }
+    // Indexed once for the whole backfill: `apply_skip_policy_indexed` below
+    // is called once per raw slot (up to `max_count`) against this same list.
+    let excluded: std::collections::BTreeSet<NaiveDate> = excluded_dates.iter().copied().collect();
     let pairs = raw
         .into_iter()
         .filter_map(|ts| {
             let date = ts.date_naive();
-            apply_skip_policy(date, skip_policy, excluded_dates, exclude_weekends).map(|adj_date| {
-                if adj_date == date {
-                    (ts, ts)
-                } else {
-                    (ts, rebase_to_date(ts, adj_date, schedule))
-                }
-            })
+            apply_skip_policy_indexed(date, skip_policy, &excluded, exclude_weekends).map(
+                |adj_date| {
+                    if adj_date == date {
+                        (ts, ts)
+                    } else {
+                        (ts, rebase_to_date(ts, adj_date, schedule))
+                    }
+                },
+            )
         })
         .collect();
     Ok(pairs)

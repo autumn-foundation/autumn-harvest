@@ -6531,6 +6531,55 @@
         }
       ],
       "description": "Cross-workflow cancel dispatch outcomes (issue #1307's adjacent fix: this counter previously had no MetricsRsRecorder bridge and silently no-opped). Mirrors the \"External signals sent\" panel."
+    },
+    {
+      "id": 967,
+      "type": "timeseries",
+      "title": "By-id fan-out observed more than one live run",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 191
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (shard) (rate(harvest_external_signal_by_id_other_live_observed_total{shard=~\"$shard\"}[$__rate_interval]))",
+          "legendFormat": "shard {{shard}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "A complete by-id fan-out found more than one live run of one business key (issue #1313). Evidence of a key pinned to one shard while an unpinned start of it hashed to another, or of a shard drained during a topology change while an unpinned start of the same key stayed live elsewhere -- neither requires the other. Not the race issue #1313 names, which is invisible to any single fan-out by construction; this is the observable proxy for its precondition."
     }
   ]
 }

@@ -62,6 +62,8 @@ allos        autumn-harvest-plugin  gate_no_global_install           -          
 allos        autumn-harvest-plugin  openapi_spec                     -                          -
 allos        autumn-harvest-plugin  security                         -                          -
 allos        autumn-harvest-plugin  sse_stream_tests                 -                          -
+allos        autumn-harvest-plugin  standalone_admin_auth            -                          -
+allos        autumn-harvest-plugin  standalone_mount                 -                          -
 compileonly  autumn-harvest-plugin  dev_runtime_managed              dev-runtime-managed        -
 compileonly  autumn-harvest-plugin  mcp_tools_integration            mcp,unified-dag-execution  -
 compileonly  autumn-harvest-plugin  status_summary_localpg           -                          -
@@ -74,12 +76,14 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          admission_gate_authoritative
 linux        autumn-harvest         integration                      -                          audit_export_tests
 linux        autumn-harvest         integration                      -                          auto_heartbeat_tests
+linux        autumn-harvest         integration                      -                          batch_executor_pool_exhaustion_tests
 linux        autumn-harvest         integration                      -                          build_reachability_fanout_perf
 linux        autumn-harvest         integration                      -                          business_day_timer_tests
 linux        autumn-harvest         integration                      -                          canary_tests
 linux        autumn-harvest         integration                      -                          capability_miss_tests
 linux        autumn-harvest         integration                      -                          chain_timeout_tests
 linux        autumn-harvest         integration                      -                          child_timeout_tests
+linux        autumn-harvest         integration                      -                          claim_batched_tests
 linux        autumn-harvest         integration                      -                          claim_budget_tests
 linux        autumn-harvest         integration                      -                          completion_callback_tests
 linux        autumn-harvest         integration                      -                          completion_trigger_outbox_queue_perf
@@ -134,6 +138,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          usage_report_activity_lookback_tests
 linux        autumn-harvest         integration                      -                          workflow_id_targeted_tests
 linux        autumn-harvest         integration                      -                          workflow_logs_tests
+linux        autumn-harvest         integration                      -                          workflow_pause_claim_recheck_tests
 linux        autumn-harvest         integration                      -                          workflow_reachability_samples_tests
 linux        autumn-harvest         integration                      -                          workflow_retry_tests
 linux        autumn-harvest         integration                      hot-code-swap,testing      hot_code_swap_tests
@@ -196,6 +201,7 @@ linux        autumn-harvest-plugin  start_idempotency_integration    -          
 linux        autumn-harvest-plugin  start_source_integration         -                          -
 linux        autumn-harvest-plugin  start_throttle_integration       -                          -
 linux        autumn-harvest-plugin  status_summary_integration       -                          -
+linux        autumn-harvest-plugin  status_summary_stalled_perf      -                          -
 linux        autumn-harvest-plugin  timeline_integration             -                          -
 linux        autumn-harvest-plugin  token_auth_integration           -                          -
 linux        autumn-harvest-plugin  triage_integration               -                          -

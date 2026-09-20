@@ -169,7 +169,6 @@ fn build_api_state(
 
 fn build_api_app(pool: HarvestDbPool, router: ShardRouter) -> HarvestApiApp {
     harvest_api_router(build_api_state(pool, router, vec![]))
-        .with_state(autumn_web::AppState::for_test())
 }
 
 async fn read_json_response(response: axum::response::Response) -> Value {
@@ -1289,8 +1288,7 @@ async fn sample_ids_are_capped_at_five_and_reference_real_rows() {
 #[tokio::test]
 async fn endpoint_requires_admin_auth() {
     // No admin boundary set -> the shared `/admin/*` guard must reject.
-    let app =
-        harvest_api_router(HarvestApiState::new()).with_state(autumn_web::AppState::for_test());
+    let app = harvest_api_router(HarvestApiState::new());
     let (status, _) = get_json(&app, "/admin/queue-coverage").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

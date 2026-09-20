@@ -383,6 +383,18 @@ name = "critical_path_profile"
 harness = false
 
 # Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `calendar::plan_backfill_with_calendar` -- the calendar-aware backfill
+# planner behind `POST /admin/schedules/{id}/backfill`. `plan_backfill_with_calendar`
+# is `cfg(feature = "db")` (calendar.rs's DB-dependent section), so
+# `required-features` makes `cargo bench --no-default-features` skip it
+# cleanly instead of failing to compile, mirroring `dlq_aggregate_profile`
+# below. See `benches/calendar_backfill_profile.rs`.
+[[bench]]
+name = "calendar_backfill_profile"
+required-features = ["db"]
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
 # for `dlq::group_dead_letter_rows` -- the in-memory grouping core behind
 # `GET /admin/dead-letters/aggregate` (issue #385 / #613). `dlq.rs` uses
 # `diesel_async` unconditionally (no per-item `cfg(feature = "db")` gates), so

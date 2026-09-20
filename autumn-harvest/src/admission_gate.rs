@@ -59,6 +59,10 @@
 //! a previous process lifetime are invisible until a local create/lift happens
 //! on the same replica.
 //!
+//! Such an integration declares its admin credential with
+//! `StandaloneAdminAuth` (issue #1608), which installs the scoped-API-token
+//! layer and the read-only-role layer in the one correct order.
+//!
 //! ## Scope semantics
 //!
 //! | Scope | Blocks |

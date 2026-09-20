@@ -6,7 +6,6 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use autumn_web::AppState;
 use autumn_web::error::AutumnError;
 use autumn_web::reexports::axum;
 use autumn_web::session::Session;
@@ -4766,7 +4765,7 @@ async fn by_id_missing_workflow_id(Path(_workflow_name): Path<String>) -> axum::
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
+pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
     let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
     // issue #1278: the Vantage dead-letter page's bulk-action forms submit
     // here directly (a relative `../dead-letters/replay` /
@@ -5479,6 +5478,169 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .layer(Extension(api_state))
 }
 
+/// Admin-auth wiring a standalone mount declares for the management API
+/// (issue #1608).
+///
+/// [`HarvestPlugin`] installs the scoped-API-token layer (issue #942), the
+/// read-only-role layer (issue #776) and the [`HarvestApiState`] settings that
+/// `require_harvest_admin` reads. An embedder that mounts
+/// [`harvest_api_router`] on a raw Axum server reached none of them. The one
+/// credential Harvest has that needs no autumn-web `Session` was therefore
+/// unusable standalone.
+///
+/// The layer ordering is load-bearing, so this type applies it rather than
+/// documenting it. See [`Self::mount`].
+///
+/// ```rust,no_run
+/// use autumn_harvest_plugin::api::{HarvestApiState, StandaloneAdminAuth, harvest_api_router};
+///
+/// let api_state = HarvestApiState::new();
+/// let auth = StandaloneAdminAuth::new()
+///     .with_api_tokens()
+///     .with_deployment_profile("prod");
+/// let router = auth.mount(harvest_api_router(api_state.clone()), &api_state);
+/// ```
+///
+/// [`HarvestPlugin`]: crate::HarvestPlugin
+#[derive(Clone, Debug, Default)]
+pub struct StandaloneAdminAuth {
+    api_tokens: bool,
+    read_only_role: bool,
+    admin_auth_boundary: bool,
+    deployment_profile: Option<String>,
+    admin_auth_session_key: Option<String>,
+}
+
+impl StandaloneAdminAuth {
+    /// A mount that declares nothing. [`Self::mount`] then returns the router
+    /// unchanged, which is the pre-issue-#1608 standalone posture.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Install the scoped-API-token layer (issue #942).
+    ///
+    /// A request carrying a verified `hvst_` bearer reaches the admin routes
+    /// its scope allows. A `read` token is denied every mutating route with
+    /// 403, before any handler runs. The layer needs a token store, so install
+    /// the storage pool on the state as well.
+    #[must_use]
+    pub const fn with_api_tokens(mut self) -> Self {
+        self.api_tokens = true;
+        self
+    }
+
+    /// Install the class-aware read-only-role layer (issue #776).
+    ///
+    /// The layer reads an autumn-web `Session` that the embedder's own auth
+    /// middleware sets, so apply that middleware outside the mounted router.
+    #[must_use]
+    pub const fn with_read_only_role(mut self) -> Self {
+        self.read_only_role = true;
+        self
+    }
+
+    /// Declare that the embedder authenticates admin requests itself.
+    ///
+    /// This is the standalone equivalent of [`HarvestPlugin::api_with_auth`].
+    /// It reports a boundary to `preflight` and admits admin routes. Declare it
+    /// only when an auth layer really does wrap the mounted router.
+    ///
+    /// [`HarvestPlugin::api_with_auth`]: crate::HarvestPlugin::api_with_auth
+    #[must_use]
+    pub const fn with_admin_auth_boundary(mut self) -> Self {
+        self.admin_auth_boundary = true;
+        self
+    }
+
+    /// Declare the deployment profile `preflight` reports.
+    ///
+    /// The profile is `unknown` when undeclared, which `preflight` reports as a
+    /// warning. The `dev` profile allows an unauthenticated local management
+    /// API. See [`HarvestApiState::set_deployment_profile`].
+    #[must_use]
+    pub fn with_deployment_profile(mut self, profile: impl Into<String>) -> Self {
+        self.deployment_profile = Some(profile.into());
+        self
+    }
+
+    /// Declare the session key the built-in guards read.
+    ///
+    /// Relevant only when the embedder sets an autumn-web `Session`. See
+    /// [`HarvestApiState::set_admin_auth_session_key`].
+    #[must_use]
+    pub fn with_admin_auth_session_key(mut self, session_key: impl Into<String>) -> Self {
+        self.admin_auth_session_key = Some(session_key.into());
+        self
+    }
+
+    /// Apply the declaration to `api_state` and wrap `router` in the declared
+    /// layers.
+    ///
+    /// `router` is the composed Harvest router: [`harvest_api_router`], with
+    /// [`harvest_ui_router`] already nested inside it when Vantage is mounted.
+    /// Nesting first is what puts Vantage under the read-only-role layer, which
+    /// is how [`HarvestPlugin`] composes it.
+    ///
+    /// The returned router carries no embedder auth. Apply that outside, so the
+    /// request order is: embedder auth -> token layer -> read-only-role layer
+    /// -> per-route `require_admin` -> handler.
+    ///
+    /// [`harvest_ui_router`]: crate::harvest_ui_router
+    /// [`HarvestPlugin`]: crate::HarvestPlugin
+    pub fn mount(&self, router: Router<()>, api_state: &HarvestApiState) -> Router<()> {
+        api_state.set_admin_auth_boundary(self.admin_auth_boundary);
+        if let Some(profile) = &self.deployment_profile {
+            api_state.set_deployment_profile(profile.clone());
+        }
+        if let Some(session_key) = &self.admin_auth_session_key {
+            api_state.set_admin_auth_session_key(session_key.clone());
+        }
+        apply_admin_auth_layers(router, api_state, self.api_tokens, self.read_only_role)
+    }
+}
+
+/// Wrap a composed Harvest router in the admin-auth layer stack.
+///
+/// The one place the ordering is written down. `HarvestPlugin` and
+/// [`StandaloneAdminAuth::mount`] both call this, so the two mount paths cannot
+/// drift.
+///
+/// Issue #776: the class-aware read-only layer is installed BEFORE the
+/// embedder's auth middleware wraps the router. The request order is:
+/// embedder auth mw (sets Session), token layer, this layer, per-route
+/// `require_admin`, handler. This layer reads the Session, the method and the
+/// nest-stripped path. It is applied to the combined router, so it also covers
+/// a nested `/ui` sub-router. Vantage carries no route class, so it fails
+/// closed and answers 403 for a read-only principal.
+///
+/// Issue #942: the scoped-API-token verification and scope layer is installed
+/// OUTSIDE the read-only-class layer, so it runs first. It verifies the token,
+/// sets `TokenPrincipal` and the authoritative actor, then denies a read-scope
+/// mutation. It sits INSIDE the embedder's auth middleware.
+///
+/// Neither layer is installed unless asked for, so a deployment that declares
+/// neither does an identical amount of work as before.
+pub(crate) fn apply_admin_auth_layers(
+    router: Router<()>,
+    api_state: &HarvestApiState,
+    api_tokens: bool,
+    read_only_role: bool,
+) -> Router<()> {
+    let mut router = router;
+    if read_only_role {
+        router = router.layer(middleware::from_fn(enforce_read_only_class));
+    }
+    if api_tokens {
+        router = router.layer(middleware::from_fn_with_state(
+            api_state.clone(),
+            crate::api_token::enforce_token_scope,
+        ));
+    }
+    router
+}
+
 pub(crate) async fn require_harvest_admin(
     State(api_state): State<HarvestApiState>,
     request: axum::extract::Request,
@@ -5490,6 +5652,11 @@ pub(crate) async fn require_harvest_admin(
     // outer `enforce_token_scope` layer, so a `read` token attempting a mutating
     // admin route was denied 403 before reaching here; any principal that
     // reaches this point is authorized for the route it is on.
+    //
+    // A standalone mount installs that outer layer with
+    // `StandaloneAdminAuth::with_api_tokens` (issue #1608). The layer used to
+    // have exactly one call site, inside `HarvestPlugin`, which made this mode
+    // unreachable off the plugin path.
     if request
         .extensions()
         .get::<crate::api_token::TokenPrincipal>()
@@ -8524,11 +8691,33 @@ pub const fn management_api_response_fields()
     ]
 }
 
-async fn preflight(
-    Extension(api_state): Extension<HarvestApiState>,
-    axum::extract::State(autumn_state): axum::extract::State<AppState>,
-) -> Json<PreflightReport> {
-    api_state.set_deployment_profile(autumn_state.profile().to_string());
+// Issue #1609: this handler used to reset the deployment profile from
+// `AppState::profile()` on every call.
+//
+// The reset was redundant on the `HarvestPlugin` path. `plugin.rs`'s
+// `start_harvest_runtime` sets the profile once at startup, before this
+// handler can run.
+//
+// The reset was harmful on a standalone mount. The admin gate
+// (`require_admin`, a `route_layer`) reads the profile before this handler
+// runs. The reset here can never open the gate for its own request.
+//
+// The reset could also close a gate an embedder had opened. Some mounts use
+// a placeholder `AppState`, for example `AppState::for_test()`. Its
+// `profile()` method returns `"default"`. A first request could pass
+// through a profile the embedder set with
+// `HarvestApiState::set_deployment_profile`. The handler would then
+// overwrite that profile with `"default"` as a side effect of the response.
+// Every later request would then fail the gate.
+//
+// A preflight check reports the current profile. It must not also change
+// the profile.
+//
+// Issue #1606: that reset was also the only reader of the router's
+// `autumn_web::AppState`. Removing it is what lets both routers be
+// `Router<()>`, so an embedder no longer constructs an `AppState` it has no
+// other use for.
+async fn preflight(Extension(api_state): Extension<HarvestApiState>) -> Json<PreflightReport> {
     Json(build_preflight_report(&api_state).await)
 }
 
@@ -13846,9 +14035,13 @@ pub(crate) async fn build_diagnosis_report(
         Err(err) => return Err(map_error(err)),
     };
 
-    // Snapshot `now` once so every deadline, age and backoff comparison in this
-    // response is judged against one consistent instant.
-    let now = chrono::Utc::now();
+    // This instant is reported, never compared. It backs only
+    // `last_event_age_seconds` below, and the same field on the terminal
+    // early return -- a display metric, not a deadline check. It may
+    // therefore run slightly ahead of `now`, captured further down. `now`
+    // (issue #1368) is the single instant every deadline, age and backoff
+    // COMPARISON in this response is judged against.
+    let report_started_at = chrono::Utc::now();
 
     let last_event_at: Option<chrono::DateTime<chrono::Utc>> = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
@@ -13856,8 +14049,11 @@ pub(crate) async fn build_diagnosis_report(
         .first::<Option<chrono::DateTime<chrono::Utc>>>(&mut conn)
         .await
         .map_err(database_error)?;
-    let last_event_age_seconds =
-        last_event_at.map(|ts| (now - ts).to_std().map_or(0.0, |d| d.as_secs_f64()));
+    let last_event_age_seconds = last_event_at.map(|ts| {
+        (report_started_at - ts)
+            .to_std()
+            .map_or(0.0, |d| d.as_secs_f64())
+    });
 
     let is_terminal = is_terminal_state(&execution.state);
     if is_terminal {
@@ -14034,17 +14230,24 @@ pub(crate) async fn build_diagnosis_report(
     // by dispatch), so consulting it here cannot perturb enforcement. A
     // cooled-down breaker therefore still reads "open" until a real probe is
     // admitted — a deliberate, documented read-only conservatism.
-    // Issue #1193 Codex round-5 P2: `time_until_probe_secs` on the snapshot
-    // below is a duration measured from THIS instant, not from `now` (which
-    // was captured well before the DB queries above ran). Combining that
-    // duration with the stale, earlier `now` when deriving `cooldown_until`
-    // would systematically UNDERESTIMATE the true deadline by however long
-    // those queries took -- enough, near the boundary, to make a row that
-    // hasn't actually cleared read as if it had. `snapshot_wall_now` is
-    // captured back-to-back with the monotonic instant so the two are always
-    // consistent with each other, and is what `circuit_cooldown_until` below
-    // is derived from -- never the outer `now`.
-    let snapshot_wall_now = chrono::Utc::now();
+    //
+    // `now` is captured here, back-to-back with the `list()` call below, not
+    // at the top of the function. `time_until_probe_secs` on the snapshot is
+    // a duration measured from THIS instant, so `cooldown_until` (derived
+    // from it below) and `now` are always mutually consistent.
+    //
+    // Issue #1368: every comparison this response makes against
+    // `cooldown_until` -- both `classify_execution` calls below included --
+    // MUST use this same `now`, never an earlier one. PR #1365 fixed
+    // `cooldown_until`'s own derivation this way, but left `classify_execution`
+    // reading a `now` captured before the DB queries above ran. For an
+    // ALREADY-CLEARED breaker
+    // (`time_until_probe_secs == 0.0`), `cooldown_until` then pinned to
+    // exactly this instant. That instant is always later than the stale
+    // `now`, so the "already cleared" comparison could never succeed. One
+    // `now`, used everywhere a comparison needs it, keeps that from
+    // recurring.
+    let now = chrono::Utc::now();
     let (cb_phase, cb_tracked): (
         std::collections::HashMap<String, autumn_harvest::circuit_breaker::CircuitSnapshot>,
         Vec<String>,
@@ -14262,10 +14465,9 @@ pub(crate) async fn build_diagnosis_report(
                     Some(BlockingCircuitPhase::Open),
                     snapshot
                         .and_then(|s| s.time_until_probe_secs)
-                        // `snapshot_wall_now`, NOT the outer `now` -- see the
-                        // comment where it's captured (issue #1193 Codex
-                        // round-5 P2).
-                        .and_then(|secs| circuit_cooldown_until(snapshot_wall_now, secs)),
+                        // See the comment where `now` is captured above
+                        // (issue #1193; issue #1368).
+                        .and_then(|secs| circuit_cooldown_until(now, secs)),
                 ),
                 Some("half_open") => (Some(BlockingCircuitPhase::HalfOpen), None),
                 _ => (None, None),

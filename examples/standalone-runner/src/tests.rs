@@ -1,9 +1,15 @@
 use autumn_harvest::{WorkflowEvent, WorkflowSimulator};
+use autumn_harvest_plugin::HarvestApiState;
 use autumn_harvest_plugin::prelude::HarvestMode;
+use autumn_web::reexports::axum;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use serde_json::json;
+use tower::ServiceExt;
 
 use crate::domain::{RUNNER_QUEUE, StandaloneOrder};
 use crate::runtime::{standalone_builder, standalone_runtime_config};
+use crate::server::{build_router, declare_deployment_profile};
 use crate::workflows;
 
 #[test]
@@ -76,4 +82,81 @@ async fn standalone_order_uses_version_gate_saga_and_child_workflow() {
         WorkflowEvent::ChildWorkflowStarted { workflow_name, .. }
             if workflow_name == "standalone_shipping"
     )));
+}
+
+/// HTTP-level coverage for the assembled router `server.rs` mounts (issue
+/// #1610). The three tests above assert only the workflow and config layer.
+/// Nothing before this exercised the router itself. That gap let two live
+/// defects go unnoticed until a real embedder hit them. The first was the
+/// `AppState::for_test()` call in the production entry point, now removed
+/// (issue #1607). The second was the always-`401` documented `preflight`
+/// step (issue #1609). No database is needed here. `HarvestApiState::new()`
+/// with nothing installed matches a router that has never received traffic.
+/// That is exactly the state these three routes must tolerate.
+fn router_under_test() -> axum::Router {
+    build_router(HarvestApiState::new())
+}
+
+async fn get_status(app: axum::Router, uri: &str) -> StatusCode {
+    app.oneshot(
+        Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request should build"),
+    )
+    .await
+    .expect("router should serve the request")
+    .status()
+}
+
+#[tokio::test]
+async fn health_route_needs_no_database() {
+    assert_eq!(
+        get_status(router_under_test(), "/api/harvest/health").await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn openapi_document_is_ungated() {
+    assert_eq!(
+        get_status(router_under_test(), "/api/harvest/openapi.json").await,
+        StatusCode::OK
+    );
+}
+
+/// Pins issue #1609's fail-closed default. `router_under_test` never
+/// declares a profile, so the admin gate has nothing to open on.
+#[tokio::test]
+async fn preflight_without_a_credential_is_rejected() {
+    assert_eq!(
+        get_status(router_under_test(), "/api/harvest/admin/preflight").await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// Closes issue #1609. `declare_deployment_profile` is what `run` calls
+/// before installing the runner's API runtime, so this reproduces the
+/// exact posture the README's `AUTUMN_PROFILE=dev` command produces.
+///
+/// The request runs twice. The `preflight` handler used to reset the
+/// deployment profile from the router's `autumn_web::AppState` on every
+/// call, and a placeholder `AppState::for_test()` reports `"default"`, not
+/// `"dev"`. That would have closed the gate again after the first request.
+/// The router now carries no `AppState` at all (issue #1606), so the reset
+/// has no source left. This pins its absence.
+#[tokio::test]
+async fn preflight_succeeds_once_dev_profile_is_declared() {
+    let api_state = HarvestApiState::new();
+    declare_deployment_profile(&api_state, Some("dev"));
+    let app = build_router(api_state);
+
+    assert_eq!(
+        get_status(app.clone(), "/api/harvest/admin/preflight").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        get_status(app, "/api/harvest/admin/preflight").await,
+        StatusCode::OK
+    );
 }

@@ -208,14 +208,22 @@ step 7.
 `workflow_id` (what `ctx.info().workflow_id` reports — idempotency-key material,
 cross-backend-identical).
 
-> **v0.1 non-idempotent-start contract.** This backend does **not** enforce
-> `(workflow_name, workflow_id)` uniqueness and does **not** apply the core's
-> `WorkflowIdReusePolicy` matrix. **Every call creates a new, independent
-> execution**, even when `workflow_id` matches a prior run — so a duplicate
-> delivery (e.g. a retried webhook) starts a second run and repeats its side
-> effects. The `workflow_id` is observability + idempotency-key *material*, not
-> an enforced start-boundary uniqueness key. **Dedupe upstream for now.** The
-> reuse-policy matrix is a tracked follow-up (issue #1068).
+> **Idempotent starts by default (issue #1068).** `start_workflow_with_id`
+> applies the `AllowDuplicate` reuse policy. A non-blank `workflow_id` that
+> matches an existing, non-sealed execution for the same `workflow_name`
+> **attaches** to it. The call returns the SAME `ExecutionId`. No second run
+> starts. **The new `input` is discarded** — a duplicate delivery, e.g. a
+> retried webhook, does not repeat side effects.
+>
+> A blank or whitespace-only `workflow_id` has no reuse key. It always
+> creates a fresh, distinct run.
+>
+> For a different policy — reject the duplicate, replace a failed run, or
+> terminate and restart — use `start_workflow_with_reuse_policy`. It applies
+> the full `WorkflowIdReusePolicy` matrix and returns a `StartOutcome`, which
+> reports whether the call attached to a prior run or started a fresh one.
+> See the rustdoc on both methods for the full matrix
+> (`cargo doc --open -p autumn-harvest-sqlite`).
 
 An oversized start input (over the 2 MiB default cap) is rejected with
 `SqliteError::PayloadTooLarge` before anything is persisted, matching the core.
@@ -392,10 +400,11 @@ caller; neither drops it.
 
 Backend-level non-goals: distributed / multi-writer workers, `LISTEN`/`NOTIFY`
 push wake-ups, multi-server crash recovery, schedules, the management API,
-retention, worker sessions, sharding, DAGs, and the `WorkflowIdReusePolicy`
-matrix (see [§6](#6-starting-a-workflow)). These are tracked as issue #1068
-follow-ups — rejection is deliberate, so a partial, silently-wrong implementation
-never ships.
+retention, worker sessions, sharding, and DAGs. Rejection is deliberate, so a
+partial, silently-wrong implementation never ships.
+
+The `WorkflowIdReusePolicy` matrix (see [§6](#6-starting-a-workflow)) shipped
+under issue #1068. It is no longer a non-goal.
 
 Two benign bookkeeping commands are silently no-ops (they append no event and
 gate no control flow): `ctx.set_current_details(...)` and a re-park

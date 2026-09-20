@@ -36,15 +36,17 @@ run(DecideRequest) -> DecideResponse
 // DecideOutcome — one of:
 {"kind":"ok","output":{...}}
 
-// A failure carries THREE fields, not one. `error_type` is always present.
+// `error_type` and `error` are always present. `details` appears only when
+// the failure carries structured detail; the host OMITS the key otherwise.
+// A failure without detail does NOT serialize as `"details":null`.
 {"kind":"err","error_type":"CircuitOpen","details":{"retry_after_secs":30},"error":"..."}
-{"kind":"err","error_type":"harvest.timeout.StartToClose","details":null,"error":"..."}
+{"kind":"err","error_type":"harvest.timeout.StartToClose","error":"..."}
 ```
 
 **Branch on `error_type`, never on `error`.** `error_type` is the stable class —
 the activity's own failure type, or `harvest.timeout.<TimeoutType>` for an
-activity timeout — and `details` is its structured payload (`null` when there is
-none). `error` is a human-readable string for diagnostics only: it is not part of
+activity timeout — and `details` is its structured payload, present only when
+there is one. `error` is a human-readable string for diagnostics only: it is not part of
 the contract and differs between the inline and replayed delivery paths, so a
 guest that parses it will behave differently on replay than it did live. A guest
 with a strict schema must also expect `error_type` on every `err` outcome; an
