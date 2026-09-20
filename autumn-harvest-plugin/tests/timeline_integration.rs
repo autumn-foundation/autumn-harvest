@@ -87,6 +87,9 @@ const INIT_SQL: &str = concat!(
     // (read back by WorkflowExecution::as_select()), for the same reason as
     // the column above.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_state TEXT NULL;\n",
+    // issue #1596 review: WorkflowExecution::as_select() also references
+    // this column, for the same reason as the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_by UUID NULL;\n",
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260619000000_harvest_task_queue_created_at/up.sql"

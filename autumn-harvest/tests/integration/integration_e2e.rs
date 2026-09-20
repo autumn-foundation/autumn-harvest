@@ -316,7 +316,13 @@ const INIT_SQL: &str = concat!(
     // harvest_workflow_executions, required for the same reason as the
     // migrated_run_terminal_at column above -- `WorkflowExecution::as_select()`
     // names it unconditionally.
-    include_str!("../../migrations/20260916151612_harvest_staging_vacated_state/up.sql")
+    include_str!("../../migrations/20260916151612_harvest_staging_vacated_state/up.sql"),
+    "\n",
+    // issue #1596 review: staging_vacated_by column on
+    // harvest_workflow_executions, required for the same reason as the
+    // staging_vacated_state column above -- `WorkflowExecution::as_select()`
+    // names it unconditionally.
+    include_str!("../../migrations/20260920014641_harvest_staging_vacated_by/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -451,7 +457,10 @@ const LEGACY_INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_run_terminal_state TEXT NULL;\n",
     // issue #1317 review (P1 follow-up): WorkflowExecution::as_select() also
     // references this column, for the same reason as the column above.
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_state TEXT NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_state TEXT NULL;\n",
+    // issue #1596 review: WorkflowExecution::as_select() also references
+    // this column, for the same reason as the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_by UUID NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return
