@@ -92,13 +92,19 @@ async fn setup_server() -> (String, DbGuard) {
     (url, Some(container))
 }
 
-async fn create_fresh_db(admin_url: &str, name: &str) -> String {
+async fn create_fresh_db(admin_url: &str, name: &str, cleanup: &DbCleanupGuard) -> String {
     let mut admin = AsyncPgConnection::establish(admin_url)
         .await
         .expect("connect to admin database");
     let _ = diesel::sql_query(format!("CREATE DATABASE \"{name}\""))
         .execute(&mut admin)
         .await;
+    // Registered right after the statement above, succeeded or not --
+    // review finding on PR #1666. A panic in migration below must not
+    // skip cleanup for a database that `CREATE DATABASE` already made.
+    // Registering an unmade name is harmless: `drop_databases_impl` runs
+    // `DROP DATABASE IF EXISTS`.
+    cleanup.register(name);
 
     // `with_db_name`, not a naive `rsplit_once('/')` -- review finding on
     // PR #1666. A raw split panics on a legal libpq keyword/value DSN,
@@ -120,25 +126,136 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
 }
 
-/// Best-effort `DROP DATABASE IF EXISTS` for every name given. A
-/// persistent `HARVEST_TEST_DATABASE_URL` server would otherwise
-/// accumulate this harness's large scenario databases across repeated
-/// runs -- review finding on PR #1666. One connection error, or one
-/// drop failure, does not stop the rest. Each name gets its own
-/// attempt. A failure is logged, not panicked: this cleanup step runs
-/// after the evidence has already been captured.
-async fn drop_databases(admin_url: &str, names: &[&str]) {
+/// Best-effort `DROP DATABASE IF EXISTS` for every name given. One
+/// connection error, or one drop failure, does not stop the rest. Each
+/// name gets its own attempt. A failure is logged, not panicked. This
+/// runs during cleanup. By then the evidence it would report on is
+/// already captured, or the run has already failed.
+async fn drop_databases_impl(admin_url: &str, names: &[String]) {
     let Ok(mut admin) = AsyncPgConnection::establish(admin_url).await else {
         eprintln!("cleanup: could not connect to admin database, leaving {names:?} in place");
         return;
     };
     for name in names {
-        if let Err(e) = diesel::sql_query(format!("DROP DATABASE IF EXISTS \"{name}\""))
-            .execute(&mut admin)
-            .await
-        {
-            eprintln!("cleanup: failed to drop database {name}: {e}");
+        // Self-found running this fix. `DROP DATABASE` can race a
+        // just-dropped `AsyncPgConnection` whose own backend has not
+        // finished closing on the server yet. It then fails with "is
+        // being accessed by other users", even though nothing in this
+        // process still holds it open. A few short retries absorb that
+        // race without turning a best-effort cleanup step into one that
+        // blocks indefinitely.
+        let mut attempts_left = 30;
+        loop {
+            let result = diesel::sql_query(format!("DROP DATABASE IF EXISTS \"{name}\""))
+                .execute(&mut admin)
+                .await;
+            match result {
+                Ok(_) => break,
+                Err(_) if attempts_left > 1 => {
+                    attempts_left -= 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(e) => {
+                    eprintln!("cleanup: failed to drop database {name}: {e}");
+                    break;
+                }
+            }
         }
+    }
+}
+
+/// Registers every scenario database this harness creates. `register`
+/// is called immediately after each `CREATE DATABASE` succeeds. That
+/// is before anything else in that function can fail. So a panic
+/// partway through `seed_base_db`/`measure` still leaves this guard
+/// knowing what to clean up, not just the success path. Review finding
+/// on PR #1666: an earlier revision cleaned up only after both `measure`
+/// calls returned normally. A mid-measurement panic on the
+/// `HARVEST_TEST_DATABASE_URL` path still leaked whatever had already
+/// been created.
+///
+/// Two ways to actually run that cleanup, for two different cases --
+/// see `cleanup` and `Drop::drop` below for why they differ.
+struct DbCleanupGuard {
+    admin_url: String,
+    names: std::sync::Mutex<Vec<String>>,
+}
+
+impl DbCleanupGuard {
+    const fn new(admin_url: String) -> Self {
+        Self {
+            admin_url,
+            names: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn register(&self, name: &str) {
+        self.names
+            .lock()
+            .expect("cleanup registry mutex")
+            .push(name.to_string());
+    }
+
+    fn take_names(&self) -> Vec<String> {
+        std::mem::take(&mut *self.names.lock().expect("cleanup registry mutex"))
+    }
+
+    /// The success-path cleanup call. Self-found running the first
+    /// version of this guard: a blocking `Drop`, below, self-deadlocks
+    /// here. This test's default `#[tokio::test]` runtime is
+    /// single-threaded. A connection's own graceful async shutdown
+    /// needs that same thread to be polled again. Only then can its
+    /// background I/O driver task notice the handle was dropped, and
+    /// actually close the socket. Only then does Postgres see the
+    /// backend go away. A plain `.await` here does that naturally. That
+    /// is why the retries inside `drop_databases_impl` then succeed
+    /// quickly, instead of timing out. `Drop::drop` cannot `.await`.
+    /// That is exactly why it cannot do this the same way -- see its
+    /// own doc comment.
+    async fn cleanup(&self) {
+        let names = self.take_names();
+        if !names.is_empty() {
+            drop_databases_impl(&self.admin_url, &names).await;
+        }
+    }
+}
+
+impl Drop for DbCleanupGuard {
+    /// The panic-path fallback, for when nothing called
+    /// `cleanup().await` first. `Drop::drop` is synchronous. So it
+    /// cannot `.await` the connections above closing, before it
+    /// attempts `DROP DATABASE` itself.
+    ///
+    /// An earlier revision spawned a thread and blocked on it with
+    /// `JoinHandle::join`. That was an attempt to get a synchronous
+    /// call out of an async cleanup -- review finding on PR #1666's
+    /// own testing, not Codex's. `join` blocks this OS thread. That
+    /// thread is the only one the `current_thread` runtime has, to run
+    /// anything on. That includes the very connection-shutdown tasks
+    /// the spawned thread's retries were waiting on. That is a real
+    /// deadlock, not a slow retry. It reproduced identically at every
+    /// retry budget tried, up to 15 seconds.
+    ///
+    /// The fix here does not block. It spawns a detached thread and
+    /// returns immediately, so it cannot deadlock. The cost: cleanup
+    /// is no longer guaranteed to finish before the process can exit.
+    /// On a panic, in this manually-invoked, single-test,
+    /// `--ignored`-filtered harness, the test process keeps running
+    /// briefly to report the failure. That is normally enough time,
+    /// but this remains genuinely best-effort, not guaranteed.
+    fn drop(&mut self) {
+        let names = self.take_names();
+        if names.is_empty() {
+            return;
+        }
+        let admin_url = self.admin_url.clone();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build a runtime for panic-safe cleanup")
+                .block_on(drop_databases_impl(&admin_url, &names));
+        });
     }
 }
 
@@ -173,12 +290,15 @@ struct StatRow {
     shared_blks_read: i64,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     total_buffers: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    wal_bytes: i64,
 }
 
 async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec<StatRow> {
     diesel::sql_query(format!(
         "SELECT query, calls, shared_blks_hit, shared_blks_read, \
-                (shared_blks_hit + shared_blks_read) AS total_buffers \
+                (shared_blks_hit + shared_blks_read) AS total_buffers, \
+                wal_bytes::bigint AS wal_bytes \
          FROM pg_stat_statements \
          WHERE dbid = (SELECT oid FROM pg_database WHERE datname = '{db_name}') \
            AND query NOT ILIKE '%pg_stat_statements%' \
@@ -195,23 +315,6 @@ async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec
 fn is_audit_insert_statement(row: &StatRow) -> bool {
     let q = row.query.to_ascii_lowercase();
     q.contains("insert into") && q.contains("harvest_audit_log") && !q.contains("select")
-}
-
-/// Current WAL insert position, in bytes since the log's start. See
-/// `activity_enqueue_batch_perf.rs::wal_bytes` for why this, not wall-clock,
-/// is the admissible write-path measurement.
-async fn wal_bytes(conn: &mut AsyncPgConnection) -> i64 {
-    #[derive(diesel::QueryableByName)]
-    struct WalRow {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        bytes: i64,
-    }
-    let row: WalRow =
-        diesel::sql_query("SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::bigint AS bytes")
-            .get_result(conn)
-            .await
-            .expect("read WAL insert position");
-    row.bytes
 }
 
 async fn relation_size(conn: &mut AsyncPgConnection, name: &str) -> i64 {
@@ -448,9 +551,9 @@ struct Measurement {
 /// `CREATE DATABASE ... TEMPLATE` for each scenario below, fixes that.
 /// It makes the two scenario databases byte-identical up to the one
 /// index difference this harness measures.
-async fn seed_base_db(admin: &str) -> String {
+async fn seed_base_db(admin: &str, cleanup: &DbCleanupGuard) -> String {
     let base_name = unique("audit_write_cost_base");
-    let url = create_fresh_db(admin, &base_name).await;
+    let url = create_fresh_db(admin, &base_name, cleanup).await;
     let mut seed_conn = AsyncPgConnection::establish(&url)
         .await
         .expect("seed connection");
@@ -469,17 +572,21 @@ async fn measure(
     label: &'static str,
     drop_unexported_idx: bool,
     owns_server: bool,
+    cleanup: &DbCleanupGuard,
 ) -> Measurement {
     let db_name = unique(&format!("audit_write_cost_{label}"));
     let mut admin_conn = AsyncPgConnection::establish(admin)
         .await
         .expect("connect to admin database");
-    diesel::sql_query(format!(
+    let create_result = diesel::sql_query(format!(
         "CREATE DATABASE \"{db_name}\" TEMPLATE \"{base_name}\""
     ))
     .execute(&mut admin_conn)
-    .await
-    .expect("clone the shared, already-seeded fixture for this scenario");
+    .await;
+    // Registered before `.expect()` below can panic -- same reasoning
+    // as `create_fresh_db`'s own registration.
+    cleanup.register(&db_name);
+    create_result.expect("clone the shared, already-seeded fixture for this scenario");
     drop(admin_conn);
     // `with_db_name`, not a naive `rsplit_once('/')` -- same review
     // finding on PR #1666 as `create_fresh_db` above.
@@ -552,7 +659,6 @@ async fn measure(
     // workload, not adding noise to it. `fixture_row`'s own determinism
     // fix still matters: it isolates this one irreducible source from
     // every other, avoidable one.
-    let wal_before = wal_bytes(&mut stats_conn).await;
     for i in 0..MEASURED_INSERTS {
         let (actor, operation, target_type, target_id, route, status) =
             fixture_row(FIXTURE_ROWS + i);
@@ -573,8 +679,14 @@ async fn measure(
             .await
             .expect("insert_audit should succeed");
     }
-    let wal_after = wal_bytes(&mut stats_conn).await;
-
+    // Review finding on PR #1666: `pg_current_wal_lsn()` (the earlier
+    // approach) advances for writes to every database on the server,
+    // not just this one. On the `HARVEST_TEST_DATABASE_URL` path that
+    // server may be shared. Unrelated concurrent traffic could then
+    // dwarf or reverse the delta this harness reports. `wal_bytes`,
+    // read below from the same `pg_stat_statements` snapshot the
+    // buffer counters already come from, is per-statement instead --
+    // attributable only to the matched `INSERT` calls.
     let stat_rows = snapshot_statements(&mut stats_conn, &db_name).await;
     let insert_rows: Vec<&StatRow> = stat_rows
         .iter()
@@ -587,6 +699,7 @@ async fn measure(
     );
     let insert_calls: i64 = insert_rows.iter().map(|r| r.calls).sum();
     let insert_buffers: i64 = insert_rows.iter().map(|r| r.total_buffers).sum();
+    let insert_wal_bytes: i64 = insert_rows.iter().map(|r| r.wal_bytes).sum();
 
     // Representative read workload: the real `GET /audit` entry point,
     // `audit::list_audit`, with filters an operator actually uses --
@@ -630,7 +743,7 @@ async fn measure(
         db_name,
         insert_calls,
         insert_buffers,
-        insert_wal_bytes: wal_after - wal_before,
+        insert_wal_bytes,
         unexported_idx_bytes,
         unexported_idx_scans_after_reads,
         occurred_at_idx_scans_after_reads,
@@ -643,7 +756,8 @@ async fn measure(
 async fn zz_capture_audit_log_unexported_idx_write_cost_evidence() {
     let (admin, guard) = setup_server().await;
     let owns_server = guard.is_some();
-    let base_name = seed_base_db(&admin).await;
+    let cleanup = DbCleanupGuard::new(admin.clone());
+    let base_name = seed_base_db(&admin, &cleanup).await;
 
     let before = measure(
         &admin,
@@ -651,9 +765,18 @@ async fn zz_capture_audit_log_unexported_idx_write_cost_evidence() {
         "before_index_present",
         false,
         owns_server,
+        &cleanup,
     )
     .await;
-    let after = measure(&admin, &base_name, "after_index_dropped", true, owns_server).await;
+    let after = measure(
+        &admin,
+        &base_name,
+        "after_index_dropped",
+        true,
+        owns_server,
+        &cleanup,
+    )
+    .await;
 
     for m in [&before, &after] {
         eprintln!(
@@ -696,16 +819,16 @@ async fn zz_capture_audit_log_unexported_idx_write_cost_evidence() {
         before.unexported_idx_scans_after_reads
     );
 
-    // Best-effort cleanup, ahead of the assertions below (review finding
-    // on PR #1666). On the `HARVEST_TEST_DATABASE_URL` path this
-    // harness creates one 500,000-row base database plus two full
-    // clones. Every name carries a fresh UUID. So repeated runs
-    // against a persistent server would otherwise accumulate large
-    // databases forever. Placed before the assertions, so a positive-
-    // control or zero-scan failure still leaves the server clean. A
-    // hard crash inside `measure` itself, before reaching here, is the
-    // one case this does not cover.
-    drop_databases(&admin, &[&base_name, &before.db_name, &after.db_name]).await;
+    // Explicit, awaited cleanup here, ahead of the assertions below,
+    // rather than waiting for `cleanup`'s own end-of-scope `Drop`. A
+    // positive-control or zero-scan assertion failure should still
+    // leave the server clean immediately, not just eventually.
+    // `DbCleanupGuard::drop` still covers a panic anywhere before this
+    // point, on a strictly best-effort basis. Its own doc comment says
+    // why an awaited call, not `Drop`, is what makes this one call
+    // reliable. Review finding on PR #1666, and a further, self-found
+    // fix to the first attempt at satisfying it.
+    cleanup.cleanup().await;
 
     // Positive control (review finding on PR #1666). If the read path
     // never registers on ANY index here, a zero on the target index is
