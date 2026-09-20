@@ -3021,7 +3021,11 @@ def comment_lines(pieces: list[Piece]):
                 # column against the frame the line arrived in.
                 table_opened = False
                 if in_table:
-                    in_table = not starts_block(body, enclosing)
+                    if starts_block(body, enclosing):
+                        in_table = False
+                        # See `close_pending`: this may be a nested
+                        # comment's own interior line ending the table.
+                        saved = close_pending(saved, 7, False)
                 elif table_header(run, index, piece.nest, body, enclosing):
                     in_table = table_opened = True
                 # Peeled, and measured in the frame the peel leaves: a code
@@ -3573,7 +3577,10 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 # marker in it -- see the matching comment in `comment_lines`.
                 table_opened = False
                 if in_table:
-                    in_table = not starts_block(peek, enclosing)
+                    if starts_block(peek, enclosing):
+                        in_table = False
+                        # See `close_pending` in `comment_lines`.
+                        saved = close_pending(saved, 8, False)
                 elif table_header(block, index, piece.nest, peek, enclosing):
                     in_table = table_opened = True
                 code_text, code_container = strip_containers(body, stack, enclosing, paragraph)[:2]
@@ -7068,6 +7075,28 @@ RULE_TESTS = [
         " * " + " ".join(f"word{n}" for n in range(1, 27)) + ".\n"
         " */\n",
         {("CH007", 5)},
+        "and the prose scanner sees the same close",
+    ),
+    (
+        "/** | h |\n"
+        " * | - |\n"
+        " * raw /*\n"
+        " * # Heading\n"
+        " * */\n"
+        " * TODO: issue required\n"
+        " */\n",
+        {("CH002", 6)},
+        "a block starting inside a nested comment still ends the table past it",
+    ),
+    (
+        "/** | h |\n"
+        " * | - |\n"
+        " * raw /*\n"
+        " * # Heading\n"
+        " * */\n"
+        " * " + " ".join(f"word{n}" for n in range(1, 27)) + ".\n"
+        " */\n",
+        {("CH007", 6)},
         "and the prose scanner sees the same close",
     ),
 ]
