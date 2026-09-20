@@ -130,16 +130,14 @@ KNOWN LIMITATIONS:
   findings rather than adding them -- and the corpus diff, not the
   self-test, is what catches it.
 
-- The Markdown block layer is hand-rolled and deliberately partial. Two
-  known gaps are recorded in the follow-up issue rather than fixed here,
-  and both UNDER-report, which is the safe direction for a gate: an HTML
-  block is not scoped to the container that opened it, so leaving a quote
-  does not end one; an HTML closer inside an inline nested comment is not
-  seen, because a mid-line piece carries no block syntax; and a table is
-  not scoped to its container either, so a quoted table survives the line
-  that leaves the quote. None of those shapes occurs in this tree -- no
-  `*.rs` comment here holds raw HTML or a table -- and every fix in this
-  seam has cost more than it returned.
+- The Markdown block layer is hand-rolled and deliberately partial. One
+  known gap remains, recorded in issue #1383 rather than fixed here. It
+  UNDER-reports, which is the safe direction for a gate: a delimiter row
+  may be read from a fragment beside its header, on the SAME source line,
+  when an empty nested comment sits between the two. Fixing it needs
+  `next_row` to require the delimiter on a LATER line. That is a small
+  change, deferred anyway -- the reasoning is in the issue, not the size
+  of the patch.
 
 - CH001 is deliberately HIGH-PRECISION AND INCOMPLETE, and should stay
   that way. It recognizes commented-out Rust by line shape: item headers,
@@ -2647,7 +2645,7 @@ def lazy_continuation(
 
 
 def strip_containers(
-    text: str, stack: list[tuple[int, int]], container: int
+    text: str, stack: list[tuple[int, int]], container: int, paragraph: bool = False
 ) -> tuple[str, int, int]:
     """Peel container markers off `text` until a fence delimiter could show.
 
@@ -2662,6 +2660,18 @@ def strip_containers(
     for -- a quoted list item, say -- and its column is the one recorded
     there.
 
+    `paragraph` says the FIRST list marker this loop would peel is not
+    entitled to interrupt an open paragraph: a "2." right after open prose
+    cannot interrupt it, so `update_containers` opens no container for it,
+    and stripping it here anyway invented a fence `update_containers`
+    never agreed to. A quote marker leaves the gate in force. A paragraph
+    open at the SAME depth the quote reaches is the same paragraph, so
+    "2." still cannot interrupt it past one. Entering or leaving a quote
+    IS a block boundary, though, so the CALLER passes `False` once a quote
+    marker here reaches a depth the paragraph was not open at. A marker
+    past a LIST peel opens fresh content regardless, so the gate applies
+    once and stops there.
+
     Returns the remaining text, the container to measure the delimiter
     against, the quote depth reached, and the column the content sits at.
     The last two are the fence's scope, and neither can be recovered from the
@@ -2671,6 +2681,7 @@ def strip_containers(
     depth = 0
     column = container
     origin = 0
+    first = True
     while True:
         quote = quote_marker(text, container)
         if quote:
@@ -2682,9 +2693,12 @@ def strip_containers(
             continue
         content = list_content(text, container)
         if content:
+            if first and paragraph and not interrupts_paragraph(LIST_MARKER_RE.match(text)):
+                return text, container, depth, column
             text = text[content[1]:]
             column = origin = origin + content[0]
             container = 0
+            first = False
             continue
         return text, container, depth, column
 
@@ -2695,6 +2709,7 @@ def fence_delimiter(
     in_fence: bool = False,
     depth: int = 0,
     stack: list[tuple[int, int]] | None = None,
+    paragraph: bool = False,
 ) -> tuple["re.Match[str]", str, int, int] | None:
     """The fence delimiter on `text`, or None if the line is not one.
 
@@ -2706,6 +2721,10 @@ def fence_delimiter(
     indented content -- fenced content while a fence is open, an indented code
     line while one is not. Returns the match and the text it was matched
     against, which carries the info string.
+
+    `paragraph` is passed straight to `strip_containers`: a marker that
+    cannot interrupt the paragraph open on entry to this line opens no
+    container, so no fence behind it is real either.
     """
     # Markers are peeled only as far as they are syntax. Inside a fence the
     # sample text is literal: "- ```" is a hyphen and three backticks of
@@ -2714,7 +2733,7 @@ def fence_delimiter(
     if in_fence:
         tail, reached, column = strip_quote_levels(text, depth, container), depth, container
     else:
-        tail, container, reached, column = strip_containers(text, stack or [], container)
+        tail, container, reached, column = strip_containers(text, stack or [], container, paragraph)
     match = FENCE_RE.match(tail)
     if not match:
         return None
@@ -2842,6 +2861,22 @@ def nesting_shift(saved: list, nest: int, state: tuple) -> tuple[list, tuple]:
     return saved, state
 
 
+def close_pending(saved: list, index: int, value) -> list:
+    """`saved`, with FIELD `index` of the state tuple set to `value` in
+    every currently pending snapshot.
+
+    A close the ENCLOSING line drives -- a closer found in a nested
+    comment, or the line leaving the container an HTML block or table
+    opened in -- is a fact about the outer text, not about the nested
+    comment being read. `nesting_shift` restores an older snapshot when
+    nesting pops back to a shallower level, so a close made only to the
+    live value is undone right there unless the same close reaches every
+    snapshot still waiting to be restored. Opening new state while nested
+    is not this: `nesting_shift`'s own restore already keeps that isolated.
+    """
+    return [frame[:index] + (value,) + frame[index + 1:] for frame in saved]
+
+
 def comment_lines(pieces: list[Piece]):
     """Yield (lineno, text, in_fence) per comment piece, tracking ``` fences.
 
@@ -2854,6 +2889,12 @@ def comment_lines(pieces: list[Piece]):
     for run in comment_runs(pieces):
         fence: tuple[str, int] | None = None
         scope = (0, 0, 0)
+        # The container an open HTML block or table started in, read by
+        # `leaves_container` exactly as the fence's own `scope` is. Issue
+        # #1383: without this, leaving the quote or list item that opened
+        # one left it open over every later line in the run.
+        html_scope = (0, 0, 0)
+        table_scope = (0, 0, 0)
         stack: list[tuple[int, int]] = []
         paragraph = False
         quoted = 0
@@ -2867,16 +2908,25 @@ def comment_lines(pieces: list[Piece]):
         after_block = False
         saved: list = []
         nest = run[0].nest
+        # The physical LINE a closer was last found on. CommonMark ends an
+        # HTML block AT its closing line, not at the closer's own column, so
+        # a piece that follows the closer on the SAME line -- after a nested
+        # comment resumes the enclosing one, say -- is raw HTML too, even
+        # though `html` itself is already cleared by the time it is reached.
+        html_closing_line: int | None = None
         for index, piece in enumerate(run):
             if piece.nest != nest:
                 saved, (
-                    fence, scope, stack, paragraph, quoted, in_table, indented, html
+                    fence, scope, html_scope, table_scope, stack, paragraph,
+                    quoted, in_table, indented, html,
                 ) = nesting_shift(
                     saved,
                     piece.nest,
                     (
                         fence,
                         scope,
+                        html_scope,
+                        table_scope,
                         list(stack),
                         paragraph,
                         quoted,
@@ -2897,12 +2947,46 @@ def comment_lines(pieces: list[Piece]):
             # Rustdoc renders the whole line as a paragraph; opening a fence
             # there exempts every line until the next delimiter.
             if not piece.line_start:
-                yield piece.line, text, fence is not None or html is not None, False, None
+                # The closer's characters are literal HTML text, so they
+                # close the block wherever they sit, even mid-line inside a
+                # nested comment. Issue #1383: a piece that does not start
+                # its own line used to return before this was ever asked.
+                # A blank PHYSICAL line is what ends a "tag" block, and a
+                # mid-line piece is never that, so it is not asked here.
+                was_html = html is not None
+                if html not in (None, "tag") and html_closes(text, html):
+                    html_closing_line = piece.line
+                    html = None
+                    # See `close_pending`: the closer is definitive at
+                    # every nest depth still pending for it, not only here.
+                    saved = close_pending(saved, 9, None)
+                # Still raw HTML if this piece is on the closer's own line,
+                # even after `html` above is cleared: text between the
+                # nested comment's own delimiters and the closer, or after
+                # the closer, is part of the closing line CommonMark keeps
+                # inside the block.
+                closing_line = html_closing_line == piece.line
+                yield piece.line, text, fence is not None or was_html or closing_line, False, None
                 continue
             # Carried from the previous LINE, and cleared here so it applies
             # exactly once. A piece that does not begin its own line is the
             # same line, so it must not consume the carry.
             opens, after_block = after_block, False
+            # Left the container an open HTML block or table started in?
+            # CommonMark ends both with their container, same as a fence --
+            # see `leaves_container`. Checked before anything below reads
+            # `html` or `in_table`, so a line that already left holds
+            # neither state by the time either is asked.
+            if html is not None and leaves_container(text, html_scope):
+                html = None
+                # See `close_pending`: this line may be a nested comment's
+                # OWN interior line -- one that starts its own source line
+                # despite sitting deeper than where the block opened -- so
+                # the close must reach every depth still pending for it.
+                saved = close_pending(saved, 9, None)
+            if in_table and leaves_container(text, table_scope):
+                in_table = False
+                saved = close_pending(saved, 7, False)
             # Inside a raw HTML block nothing is Markdown, so no fence, list
             # or table opens here and the text is not prose. A type-6 block
             # ends AT a blank line, which is a block boundary in its own
@@ -2912,9 +2996,15 @@ def comment_lines(pieces: list[Piece]):
                 inside = strip_quote(text, stack[-1][0] if stack else 0)
                 if html == "tag" and html_closes(inside, html):
                     html = None
+                    # See `close_pending`: a blank line closes a type-6
+                    # block the same way a closer does, and may be a
+                    # nested comment's own interior line just as one.
+                    saved = close_pending(saved, 9, None)
                 else:
                     if html_closes(inside, html):
+                        html_closing_line = piece.line
                         html = None
+                        saved = close_pending(saved, 9, None)
                     yield piece.line, text, True, False, None
                     continue
             if fence is not None and leaves_container(text, scope):
@@ -2925,15 +3015,24 @@ def comment_lines(pieces: list[Piece]):
                 # asymmetry, now with the structure to tell them apart.
                 enclosing = stack[-1][0] if stack else 0
                 body = strip_quote(text, enclosing)
+                # `table_scope` is set below, once `stack` has THIS line's own
+                # marker in it -- a table opening on the same line as the list
+                # item that holds it ("- | h |") must not measure the item's
+                # column against the frame the line arrived in.
+                table_opened = False
                 if in_table:
-                    in_table = not starts_block(body, enclosing)
-                else:
-                    in_table = table_header(run, index, piece.nest, body, enclosing)
+                    if starts_block(body, enclosing):
+                        in_table = False
+                        # See `close_pending`: this may be a nested
+                        # comment's own interior line ending the table.
+                        saved = close_pending(saved, 7, False)
+                elif table_header(run, index, piece.nest, body, enclosing):
+                    in_table = table_opened = True
                 # Peeled, and measured in the frame the peel leaves: a code
                 # block may begin on the marker line itself, and
                 # "-     let x = compute();" is an item holding four columns
                 # of indented code, not a bullet with a defect in it.
-                code_text, code_container = strip_containers(text, stack, enclosing)[:2]
+                code_text, code_container = strip_containers(text, stack, enclosing, paragraph)[:2]
                 indented = indented_code(
                     code_text,
                     code_container,
@@ -2962,13 +3061,25 @@ def comment_lines(pieces: list[Piece]):
                     in_table or indented,
                     piece.marker in DOC_MARKERS,
                 )
+                container = stack[-1][0] if stack else 0
+                # `strip_containers`'s marker veto still applies past a
+                # quote that lands BACK at the depth the paragraph was
+                # already open at -- entering or leaving a quote is what
+                # ends a paragraph, not the marker behind it, so the veto
+                # is only ever the caller's to drop here.
+                marker_paragraph = open_paragraph and quote_depth(text, container) == before_quoted
                 # From the PEEL, as `prose_units` reads it. "- > text" is a
                 # quote inside a list item, and reading the raw line reports
                 # depth zero because the marker comes first -- one loop then
                 # believes the line left the quote and the other does not.
-                peeled_now, _, quoted, _ = strip_containers(
-                    text, stack, stack[-1][0] if stack else 0
+                peeled_now, _, quoted, reached_column = strip_containers(
+                    text, stack, container, marker_paragraph
                 )
+                # Read AFTER `update_containers`, like `html_scope` -- a table
+                # opened by this same line's own list marker is scoped to the
+                # column that marker just pushed, not the frame it arrived in.
+                if table_opened:
+                    table_scope = (container, reached_column, quoted)
                 # A quoted paragraph may carry on across a line with no ">"
                 # of its own, and that line LEAVES the quote by depth while
                 # staying inside the block. Cutting the span there split one
@@ -3030,8 +3141,13 @@ def comment_lines(pieces: list[Piece]):
                         and (in_table or setext)
                     )
                 )
+            # Recomputed unconditionally: the block above is skipped while
+            # `fence` is already open, and this line still needs a fresh
+            # container to test the delimiter against.
             container = stack[-1][0] if stack else 0
-            delimiter = fence_delimiter(text, container, fence is not None, scope[2], stack)
+            delimiter = fence_delimiter(
+                text, container, fence is not None, scope[2], stack, marker_paragraph
+            )
             # The whole LINE decides a delimiter, not this piece alone. A
             # closer may be followed only by spaces, and an opener's info
             # string runs to the end of the line, where a backtick makes it
@@ -3086,7 +3202,9 @@ def comment_lines(pieces: list[Piece]):
             # and "> <pre>" both open the block their container holds, and a
             # peel that takes only quote markers leaves the list marker in
             # front of the tag and recognizes neither.
-            peeled = strip_containers(text, stack, container)[0]
+            peeled, _, reached_depth, reached_column = strip_containers(
+                text, stack, container, marker_paragraph
+            )
             # DOC COMMENTS ONLY, as indented code and Setext are. Rustdoc
             # renders no `//` comment, so "<pre>" in one is text rather than
             # markup -- and exempting the run took CH001 and CH002 off every
@@ -3097,8 +3215,17 @@ def comment_lines(pieces: list[Piece]):
                 fence is None
                 and html_block(peeled, container, piece.marker in DOC_MARKERS)
             ):
+                # The container this line opened the block in, read the same
+                # way a fence's own `scope` is: `leaves_container` ends the
+                # block on the line the container ends, whether or not that
+                # line carries a closer of its own.
+                html_scope = (container, reached_column, reached_depth)
                 html = html_kind(peeled)
                 if html != "tag" and html_closes(peeled, html):
+                    # Self-closing on the OPENER's own piece: a nested
+                    # comment may still split the rest of this physical
+                    # line into later pieces, and those stay raw HTML too.
+                    html_closing_line = piece.line
                     html = None
                 # The opener's line is inside the block it opens. Rustdoc
                 # renders "<pre>TODO: x</pre>" preformatted, so the line
@@ -3321,6 +3448,10 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
         run_lines: list[int] = []
         fence: tuple[str, int] | None = None
         scope = (0, 0, 0)
+        # The container an open HTML block or table started in -- see
+        # `comment_lines`, which tracks this the same way. Issue #1383.
+        html_scope = (0, 0, 0)
+        table_scope = (0, 0, 0)
         stack: list[tuple[int, int]] = []
         paragraph = False
         in_list = False
@@ -3351,6 +3482,10 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
         # changes -- and the absolute rules need it to know whether inline
         # HTML in this text is markup or just characters.
         run_marker = block[0].marker
+        # See the matching comment in `comment_lines`: the line a closer was
+        # last found on, so a piece that follows it on the SAME line stays
+        # inside the block even after `html` itself is already cleared.
+        html_closing_line: int | None = None
         for index, piece in enumerate(block):
             if piece.nest != nest:
                 # No flush: a sentence that crosses an inline nested comment
@@ -3360,6 +3495,8 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 saved, (
                     fence,
                     scope,
+                    html_scope,
+                    table_scope,
                     stack,
                     paragraph,
                     quoted,
@@ -3373,6 +3510,8 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                     (
                         fence,
                         scope,
+                        html_scope,
+                        table_scope,
                         list(stack),
                         paragraph,
                         quoted,
@@ -3388,22 +3527,43 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # The text is still part of the line's sentence, so it joins the
             # run rather than starting one.
             if not piece.line_start:
-                if fence is not None or html is not None:
+                if fence is not None or html is not None or html_closing_line == piece.line:
+                    # The closer's characters are literal HTML text, so they
+                    # close the block wherever they sit -- see `comment_lines`.
+                    if html not in (None, "tag") and html_closes(body, html):
+                        html_closing_line = piece.line
+                        html = None
+                        # See `close_pending` in `comment_lines`.
+                        saved = close_pending(saved, 10, None)
                     flush()
                     in_list = False
                 elif body.strip():
                     run.append(body.strip())
                     run_lines.append(piece.line)
                 continue
+            # Left the container an open HTML block or table started in?
+            # See `comment_lines`, which applies this the same way.
+            if html is not None and leaves_container(body, html_scope):
+                html = None
+                # See `close_pending` in `comment_lines`: this may be a
+                # nested comment's own interior line.
+                saved = close_pending(saved, 10, None)
+            if in_table and leaves_container(body, table_scope):
+                in_table = False
+                saved = close_pending(saved, 8, False)
             # Raw HTML is not Markdown and not prose -- see `comment_lines`,
             # which carries this state the same way.
             if html is not None:
                 inside = strip_quote(body, stack[-1][0] if stack else 0)
                 if html == "tag" and html_closes(inside, html):
                     html = None
+                    # See `close_pending` in `comment_lines`.
+                    saved = close_pending(saved, 10, None)
                 else:
                     if html_closes(inside, html):
+                        html_closing_line = piece.line
                         html = None
+                        saved = close_pending(saved, 10, None)
                     flush()
                     in_list = False
                     continue
@@ -3417,11 +3577,17 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 # refused its container and the fence under it went unseen.
                 enclosing = stack[-1][0] if stack else 0
                 peek = strip_quote(body, enclosing)
+                # `table_scope` is set below, once `stack` has THIS line's own
+                # marker in it -- see the matching comment in `comment_lines`.
+                table_opened = False
                 if in_table:
-                    in_table = not starts_block(peek, enclosing)
-                else:
-                    in_table = table_header(block, index, piece.nest, peek, enclosing)
-                code_text, code_container = strip_containers(body, stack, enclosing)[:2]
+                    if starts_block(peek, enclosing):
+                        in_table = False
+                        # See `close_pending` in `comment_lines`.
+                        saved = close_pending(saved, 8, False)
+                elif table_header(block, index, piece.nest, peek, enclosing):
+                    in_table = table_opened = True
+                code_text, code_container = strip_containers(body, stack, enclosing, paragraph)[:2]
                 indented = indented_code(
                     code_text,
                     code_container,
@@ -3429,6 +3595,10 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                     indented,
                     piece.marker in DOC_MARKERS,
                 )
+                # Saved before `update_containers` reassigns it, same as
+                # `comment_lines`: a marker on THIS line is judged against
+                # the paragraph it arrived in, not the one it leaves behind.
+                open_paragraph = paragraph
                 # Both are blocks, so neither leaves a paragraph open.
                 stack, paragraph = update_containers(
                     body,
@@ -3439,7 +3609,15 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                     piece.marker in DOC_MARKERS,
                 )
             container = stack[-1][0] if stack else 0
-            delimiter = fence_delimiter(body, container, fence is not None, scope[2], stack)
+            # `strip_containers`'s marker veto still applies past a quote
+            # that lands BACK at the depth the paragraph was already open
+            # at -- see the matching comment in `comment_lines`. `quoted`
+            # is still the value this line ARRIVED with here, not yet
+            # reassigned to what it leaves with.
+            marker_paragraph = open_paragraph and quote_depth(body, container) == quoted
+            delimiter = fence_delimiter(
+                body, container, fence is not None, scope[2], stack, marker_paragraph
+            )
             # The whole LINE decides a delimiter, not this piece alone. A
             # closer may be followed only by spaces, and an opener's info
             # string runs to the end of the line, where a backtick makes it
@@ -3482,7 +3660,13 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # Peeled the same way the fence path peels, and for the same
             # reason: "- > text" carries two markers, and stripping only the
             # one that comes first leaves the other as a word of the sentence.
-            peeled, _, depth, _ = strip_containers(body, stack, container)
+            peeled, _, depth, reached_column = strip_containers(
+                body, stack, container, marker_paragraph
+            )
+            # Read AFTER `update_containers`, like `html_scope` -- see the
+            # matching comment in `comment_lines`.
+            if table_opened:
+                table_scope = (container, reached_column, depth)
             # Lazy continuation: a quoted paragraph may carry on across a line
             # that has no marker of its own, so long as that line is ordinary
             # paragraph text. Flushing there splits one quoted sentence into
@@ -3522,8 +3706,11 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
                 # The opener's own line is a block, and everything to its
                 # closer is raw HTML. `comment_lines` opens the block at the
                 # same point and by the same test, on the same full peel.
+                html_scope = (container, reached_column, depth)
                 html = html_kind(peeled)
                 if html != "tag" and html_closes(peeled, html):
+                    # See the matching comment in `comment_lines`.
+                    html_closing_line = piece.line
                     html = None
                 flush()
                 in_list = False
@@ -6707,6 +6894,229 @@ RULE_TESTS = [
         "// TODO: run at 9 a.m. Then check #123\n",
         set(),
         "in lower case as well as capitals",
+    ),
+    # Issue #1383: the block layer must end a container-scoped state (HTML,
+    # a table) at the same line a fence would end, and must not peel a list
+    # marker that the paragraph it sits in refuses to let interrupt.
+    (
+        "/// > <pre>\n"
+        "/// TODO: issue required\n",
+        {("CH002", 2)},
+        "an HTML block is scoped to the container that opened it",
+    ),
+    (
+        "/// > <pre>\n"
+        "/// > TODO: exempt, the block never closed\n",
+        set(),
+        "but stays open across a quote that never ends",
+    ),
+    (
+        "/** <pre>\n"
+        " * sample\n"
+        " * /* </pre> */\n"
+        " * TODO: issue required\n"
+        " */\n",
+        {("CH002", 4)},
+        "an HTML closer inside a nested comment still closes the block",
+    ),
+    (
+        "/** <pre>\n"
+        " * sample\n"
+        " * /* note */\n"
+        " * TODO: exempt, still inside the block\n"
+        " */\n",
+        set(),
+        "but only when the nested comment actually carries one",
+    ),
+    (
+        "/// > | h |\n"
+        "/// > | - |\n"
+        "/// ordinary paragraph\n"
+        "/// 22. item\n"
+        "///     ```\n"
+        "///     TODO: issue required\n",
+        {("CH002", 6)},
+        "a table is scoped to the container that opened it",
+    ),
+    (
+        "/// > | h |\n"
+        "/// > | - |\n"
+        "/// > 22. item\n"
+        "/// >     ```\n"
+        "/// >     TODO: fixture placeholder\n"
+        "/// >     ```\n",
+        set(),
+        "but a confirmed table still ends the paragraph inside one quote",
+    ),
+    (
+        "/// Intro paragraph\n"
+        "/// 2. ```rust\n"
+        "///    TODO: add retry\n",
+        {("CH002", 3)},
+        "a marker the paragraph refuses is not peeled into a fence",
+    ),
+    (
+        "/// Intro paragraph\n"
+        "/// 1. ```rust\n"
+        "///    TODO: fixture placeholder\n"
+        "///    ```\n",
+        set(),
+        "but a marker of value one still opens one",
+    ),
+    (
+        "/// > <pre>\n"
+        "/// " + " ".join(f"word{n}" for n in range(1, 27)) + ".\n",
+        {("CH007", 2)},
+        "the prose scanner scopes an HTML block to its container too",
+    ),
+    (
+        "/// > | h |\n"
+        "/// > | - |\n"
+        "/// " + " ".join(f"word{n}" for n in range(1, 27)) + ".\n",
+        {("CH007", 3)},
+        "and a table there the same way",
+    ),
+    (
+        "/** <pre>\n"
+        " * sample\n"
+        " * /* </pre> */\n"
+        " * " + " ".join(f"word{n}" for n in range(1, 27)) + ".\n"
+        " */\n",
+        {("CH007", 4)},
+        "and the prose scanner sees a nested closer too",
+    ),
+    (
+        "/// - <pre>\n"
+        "/// " + " ".join(f"word{n}" for n in range(1, 27)) + ".\n",
+        {("CH007", 2)},
+        "an HTML block opened by its own list marker is scoped to it",
+    ),
+    (
+        "/// - item\n"
+        "///   > | h |\n"
+        "///   > | - |\n"
+        "/// " + " ".join(f"word{n}" for n in range(1, 27)) + ".\n",
+        {("CH007", 4)},
+        "a table's scope survives leaving the quote it opened in, inside a list",
+    ),
+    (
+        "/// - | h |\n"
+        "///   | - |\n"
+        "/// " + " ".join(f"word{n}" for n in range(1, 27)) + ".\n",
+        {("CH007", 3)},
+        "a table opened by its own list marker is scoped to it",
+    ),
+    (
+        "/// Intro paragraph\n"
+        "/// > 2. ```rust\n"
+        "/// >    TODO: fixture placeholder\n"
+        "/// >    ```\n",
+        set(),
+        "a marker right after a quote crossing is not refused the paragraph's veto",
+    ),
+    (
+        "/** <pre>\n"
+        " * raw /* </pre> */ TODO: issue required\n"
+        " */\n",
+        set(),
+        "text after the closer on its own physical line stays inside the block",
+    ),
+    (
+        "/** > <pre>\n"
+        " * > raw /*\n"
+        " * unquoted text\n"
+        " * */\n"
+        " * > TODO: issue required\n"
+        " */\n",
+        {("CH002", 5)},
+        "leaving the container inside a nested comment still closes the block",
+    ),
+    (
+        "/** > <pre>\n"
+        " * > raw /*\n"
+        " * unquoted text\n"
+        " * */\n"
+        " * > " + " ".join(f"word{n}" for n in range(1, 27)) + ".\n"
+        " */\n",
+        {("CH007", 3)},
+        "and the prose scanner sees it too",
+    ),
+    (
+        "/// > Intro paragraph\n"
+        "/// > 2. ```rust\n"
+        "/// >    TODO: issue required\n",
+        {("CH002", 3)},
+        "the paragraph veto survives a quote that stays at the same depth",
+    ),
+    (
+        "/** <pre>\n"
+        " * </pre> /* TODO: inner */ TODO: suffix\n"
+        " */\n",
+        set(),
+        "a closer that starts its own piece still keeps the rest of its line",
+    ),
+    (
+        "/** <pre>\n"
+        " * </pre> /* inner */ "
+        + " ".join(f"word{n}" for n in range(1, 27)) + ".\n"
+        " */\n",
+        set(),
+        "and the prose scanner keeps it too",
+    ),
+    (
+        "/** <div>\n"
+        " * raw /*\n"
+        " *\n"
+        " * */\n"
+        " * TODO: issue required\n"
+        " */\n",
+        {("CH002", 5)},
+        "a blank line closing a type-6 block still closes it past a nested comment",
+    ),
+    (
+        "/** <div>\n"
+        " * raw /*\n"
+        " *\n"
+        " * */\n"
+        " * " + " ".join(f"word{n}" for n in range(1, 27)) + ".\n"
+        " */\n",
+        {("CH007", 5)},
+        "and the prose scanner sees the same close",
+    ),
+    (
+        "/** | h |\n"
+        " * | - |\n"
+        " * raw /*\n"
+        " * # Heading\n"
+        " * */\n"
+        " * TODO: issue required\n"
+        " */\n",
+        {("CH002", 6)},
+        "a block starting inside a nested comment still ends the table past it",
+    ),
+    (
+        "/** | h |\n"
+        " * | - |\n"
+        " * raw /*\n"
+        " * # Heading\n"
+        " * */\n"
+        " * " + " ".join(f"word{n}" for n in range(1, 27)) + ".\n"
+        " */\n",
+        {("CH007", 6)},
+        "and the prose scanner sees the same close",
+    ),
+    (
+        "/** <pre></pre> /* TODO: inner */ TODO: suffix\n"
+        " */\n",
+        set(),
+        "a self-closing opener still keeps the rest of its own line",
+    ),
+    (
+        "/** <pre></pre> /* inner */ "
+        + " ".join(f"word{n}" for n in range(1, 27)) + ".\n"
+        " */\n",
+        set(),
+        "and the prose scanner keeps it too",
     ),
 ]
 
