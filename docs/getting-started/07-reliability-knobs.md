@@ -84,7 +84,7 @@ back-off sleeps combined:
     retry = RetryPolicy::exponential(10, Duration::from_secs(1)),
 )]
 async fn call_payment_api(ctx: &ActivityContext, req: PaymentRequest)
-    -> Result<PaymentId, String> { … }
+    -> Result<PaymentId, String> { /* … */ }
 ```
 
 If the deadline elapses while the task is queued (PENDING) or running (RUNNING),
