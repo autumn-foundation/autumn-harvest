@@ -14782,7 +14782,7 @@ pub(crate) async fn build_diagnosis_report(
         decode_outcome.merged(decode_surfaced_activity_error(&mut blocked_on, decoder));
     let health = blocked_on.health();
     let summary = summarize(&blocked_on);
-    let contributing_reason_codes = contributing_reasons_for(&inputs.activities);
+    let contributing_reason_codes = contributing_reasons_for(&inputs.activities, now);
 
     Ok(WorkflowDiagnoseResponse {
         execution_id: exec_id.to_string(),
@@ -14815,8 +14815,16 @@ pub(crate) async fn build_diagnosis_report(
 /// Delegates to the eligibility explainer's own pure
 /// [`task_intrinsic_impediment_reasons`] (issue #611) so this list and
 /// `blocked_on` can never drift apart in how an impediment is named.
+///
+/// A row enters the `phases` map only when
+/// [`autumn_harvest::stall_diagnosis::activity_circuit_currently_blocks`]
+/// says its breaker still blocks dispatch (issue #1371). An
+/// organically-tripped breaker whose cooldown clears by the row's own
+/// effective dispatch instant no longer blocks. Its `circuit_open` reason
+/// must not appear once the headline verdict stops reporting it.
 fn contributing_reasons_for(
     activities: &[autumn_harvest::stall_diagnosis::PendingActivityFacts],
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<String> {
     // Derived from the FACTS, never from the raw in-process snapshot: a phase
     // reaches a fact only when the local breaker is authoritative for that row
@@ -14833,6 +14841,9 @@ fn contributing_reasons_for(
                 autumn_harvest::stall_diagnosis::BlockingCircuitPhase::HalfOpen => "half_open",
                 _ => return None,
             };
+            if !autumn_harvest::stall_diagnosis::activity_circuit_currently_blocks(f, now) {
+                return None;
+            }
             Some((name, phase))
         })
         .collect();
@@ -57728,7 +57739,7 @@ mod tests {
         let mut b = base("dead-q");
         b.has_live_worker = false;
 
-        let reasons = contributing_reasons_for(&[a, b]);
+        let reasons = contributing_reasons_for(&[a, b], chrono::Utc::now());
         assert!(
             reasons.iter().any(|r| r == "queue_paused"),
             "expected queue_paused in {reasons:?}"
@@ -57764,7 +57775,7 @@ mod tests {
             rate_limit_bucket_missing: false,
             concurrency_saturated: false,
         };
-        assert!(contributing_reasons_for(&[facts]).is_empty());
+        assert!(contributing_reasons_for(&[facts], chrono::Utc::now()).is_empty());
     }
 
     #[test]
@@ -57794,7 +57805,7 @@ mod tests {
             concurrency_saturated: false,
         };
         assert_eq!(
-            contributing_reasons_for(&[facts]),
+            contributing_reasons_for(&[facts], chrono::Utc::now()),
             vec!["no_live_worker".to_string()]
         );
     }
@@ -57831,7 +57842,7 @@ mod tests {
             concurrency_saturated: false,
         };
         assert!(
-            contributing_reasons_for(&[facts]).is_empty(),
+            contributing_reasons_for(&[facts], chrono::Utc::now()).is_empty(),
             "a held row whose own claimant is alive is progressing; \
              reporting no_live_worker would contradict `healthy_in_progress`"
         );
@@ -57866,10 +57877,113 @@ mod tests {
             concurrency_saturated: false,
         };
         assert_eq!(
-            contributing_reasons_for(&[facts]),
+            contributing_reasons_for(&[facts], chrono::Utc::now()),
             vec!["no_live_worker".to_string()],
             "an orphan held by a dead claimant must surface no_live_worker even \
              when a live Active peer covers the queue"
+        );
+    }
+
+    #[test]
+    fn contributing_reasons_omit_circuit_open_once_the_organic_cooldown_clears_by_dispatch() {
+        use autumn_harvest::stall_diagnosis::{BlockingCircuitPhase, PendingActivityFacts};
+        // Issue #1371: the headline verdict already skips `circuit_open` for
+        // an organic trip whose cooldown clears by the row's own effective
+        // dispatch instant. The reason codes must agree, or the response
+        // contradicts its documented "currently holds" contract.
+        let now = chrono::Utc::now();
+        let facts = PendingActivityFacts {
+            activity_name: Some("charge_card".to_string()),
+            queue: "billing".to_string(),
+            task_state: "PENDING".to_string(),
+            claimant_is_live: None,
+            attempt: 1,
+            last_error: Some("boom".to_string()),
+            scheduled_at: now - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: false,
+            activity_paused: false,
+            has_live_worker: true,
+            circuit_phase: Some(BlockingCircuitPhase::Open),
+            circuit_cooldown_until: Some(now - chrono::Duration::seconds(1)),
+            circuit_forced_open: false,
+            rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
+            concurrency_saturated: false,
+        };
+        let reasons = contributing_reasons_for(&[facts], now);
+        assert!(
+            !reasons.iter().any(|r| r == "circuit_open"),
+            "an already-cleared organic cooldown must not contribute circuit_open: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn contributing_reasons_still_report_circuit_open_before_the_organic_cooldown_clears() {
+        use autumn_harvest::stall_diagnosis::{BlockingCircuitPhase, PendingActivityFacts};
+        // The converse case: a cooldown that has not yet reached the
+        // effective dispatch instant still fast-fails dispatch, so
+        // `circuit_open` must still be reported.
+        let now = chrono::Utc::now();
+        let facts = PendingActivityFacts {
+            activity_name: Some("charge_card".to_string()),
+            queue: "billing".to_string(),
+            task_state: "PENDING".to_string(),
+            claimant_is_live: None,
+            attempt: 1,
+            last_error: Some("boom".to_string()),
+            scheduled_at: now - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: false,
+            activity_paused: false,
+            has_live_worker: true,
+            circuit_phase: Some(BlockingCircuitPhase::Open),
+            circuit_cooldown_until: Some(now + chrono::Duration::seconds(60)),
+            circuit_forced_open: false,
+            rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
+            concurrency_saturated: false,
+        };
+        let reasons = contributing_reasons_for(&[facts], now);
+        assert!(
+            reasons.iter().any(|r| r == "circuit_open"),
+            "a still-cooling-down organic trip must contribute circuit_open: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn contributing_reasons_report_circuit_open_for_a_forced_open_breaker_regardless_of_cooldown() {
+        use autumn_harvest::stall_diagnosis::{BlockingCircuitPhase, PendingActivityFacts};
+        // A forced-open breaker never admits a probe on a timer; only
+        // `force-close` clears it. A stray `cooldown_until` must not exempt
+        // it the way an organic trip's does.
+        let now = chrono::Utc::now();
+        let facts = PendingActivityFacts {
+            activity_name: Some("charge_card".to_string()),
+            queue: "billing".to_string(),
+            task_state: "PENDING".to_string(),
+            claimant_is_live: None,
+            attempt: 1,
+            last_error: Some("boom".to_string()),
+            scheduled_at: now - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: false,
+            activity_paused: false,
+            has_live_worker: true,
+            circuit_phase: Some(BlockingCircuitPhase::Open),
+            circuit_cooldown_until: Some(now - chrono::Duration::seconds(1)),
+            circuit_forced_open: true,
+            rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
+            concurrency_saturated: false,
+        };
+        let reasons = contributing_reasons_for(&[facts], now);
+        assert!(
+            reasons.iter().any(|r| r == "circuit_open"),
+            "a forced-open breaker must still contribute circuit_open: {reasons:?}"
         );
     }
 
