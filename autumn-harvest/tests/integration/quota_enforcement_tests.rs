@@ -2465,8 +2465,13 @@ async fn quota_retry_backoff_survives_stale_mixed_signal_suspension_sentinel() {
     // past its budget under a resource-constrained runner. So give this
     // step a wider timeout, the same way
     // `wait_for_execution_state_with_timeout`'s own doc comment describes.
-    wait_for_execution_state_with_timeout(&url, parent, "COMPLETED", std::time::Duration::from_secs(20))
-        .await;
+    wait_for_execution_state_with_timeout(
+        &url,
+        parent,
+        "COMPLETED",
+        std::time::Duration::from_secs(20),
+    )
+    .await;
     worker.shutdown();
     handle.await.expect("worker join");
 }
