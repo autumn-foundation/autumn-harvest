@@ -1,0 +1,487 @@
+#![cfg(feature = "db")]
+//! Ledger performance investigation: the write-path cost of
+//! `harvest_audit_log_unexported_idx` on a deployment that never configures
+//! audit export.
+//!
+//! Issue #1272 (closed via PR #1518, documentation only) established that
+//! `harvest_audit_log_unexported_idx` — `(occurred_at, id) WHERE export_seq
+//! IS NULL` — matches every row in `harvest_audit_log` when no audit-export
+//! sink is configured, because `export_seq` then stays `NULL` forever. The
+//! issue text is explicit that options (1) lazy index creation on opt-in and
+//! (4) a separate operator-applied migration are "the real fixes if the cost
+//! proves material on a large audit table — which wants a measurement, not a
+//! guess." `audit_export_tests.rs`'s own module doc repeats the same
+//! deferral: "The insert-path index cost is separate (issue #1272)."
+//!
+//! This harness is that measurement. It seeds a production-shaped
+//! `harvest_audit_log` (500,000 pre-existing rows, realistic operation-name
+//! and actor cardinality, occurred_at spread across the 90-day default
+//! retention window, `export_seq` left `NULL` throughout — the exact steady
+//! state of an unconfigured deployment) in two otherwise-identical fresh
+//! databases: one with the shipped schema (index present), one with the
+//! index dropped (the "lazily created, only on opt-in" counterfactual). It
+//! then drives the REAL public entry point every mutating management-API
+//! handler calls — `audit::insert_audit` — for a batch of new rows in both,
+//! and reports the buffer/WAL delta `pg_stat_statements` attributes to the
+//! `INSERT INTO harvest_audit_log` statement itself, plus the index's own
+//! size and its `idx_scan` count observed across a representative read
+//! workload (`audit::list_audit`, the real `GET /audit` handler's own
+//! entry point).
+//!
+//! Evidence is `pg_stat_statements` buffers, WAL bytes and `pg_relation_size`
+//! — never wall-clock alone, per this persona's charter.
+
+#![allow(clippy::too_many_lines)]
+
+use autumn_harvest::audit::{self, AuditFilters};
+use autumn_harvest::models::NewAuditRecord;
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+// ── DB bootstrap (mirrors activity_enqueue_batch_perf.rs) ──────────────────
+
+type DbGuard = Option<ContainerAsync<Postgres>>;
+
+async fn setup_server() -> (String, DbGuard) {
+    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        return (url, None);
+    }
+    let container = Postgres::default()
+        .with_tag("16")
+        .start()
+        .await
+        .expect("postgres container should start");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    (url, Some(container))
+}
+
+async fn create_fresh_db(admin_url: &str, name: &str) -> String {
+    let mut admin = AsyncPgConnection::establish(admin_url)
+        .await
+        .expect("connect to admin database");
+    let _ = diesel::sql_query(format!("CREATE DATABASE \"{name}\""))
+        .execute(&mut admin)
+        .await;
+
+    let (prefix, _) = admin_url.rsplit_once('/').expect("url has a db segment");
+    let url = format!("{prefix}/{name}");
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect to fresh database");
+    conn.batch_execute(&autumn_harvest::test_init_sql())
+        .await
+        .expect("apply migration bundle");
+    drop(conn);
+    url
+}
+
+fn unique(prefix: &str) -> String {
+    format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
+}
+
+async fn ensure_pg_stat_statements(conn: &mut AsyncPgConnection) {
+    let _ = diesel::sql_query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+        .execute(conn)
+        .await;
+}
+
+async fn reset_stats_for_db(conn: &mut AsyncPgConnection, db_name: &str) {
+    diesel::sql_query(format!(
+        "SELECT pg_stat_statements_reset(0, \
+                (SELECT oid FROM pg_database WHERE datname = '{db_name}'), 0)"
+    ))
+    .execute(conn)
+    .await
+    .expect(
+        "pg_stat_statements_reset(...) failed -- the HARVEST_TEST_DATABASE_URL role must be \
+         able to reset statistics (superuser, or granted EXECUTE on this function)",
+    );
+}
+
+#[derive(diesel::QueryableByName, Debug)]
+struct StatRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    query: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    calls: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    shared_blks_hit: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    shared_blks_read: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    total_buffers: i64,
+}
+
+async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec<StatRow> {
+    diesel::sql_query(format!(
+        "SELECT query, calls, shared_blks_hit, shared_blks_read, \
+                (shared_blks_hit + shared_blks_read) AS total_buffers \
+         FROM pg_stat_statements \
+         WHERE dbid = (SELECT oid FROM pg_database WHERE datname = '{db_name}') \
+           AND query NOT ILIKE '%pg_stat_statements%' \
+         ORDER BY total_buffers DESC"
+    ))
+    .load(conn)
+    .await
+    .expect(
+        "pg_stat_statements query failed -- it must be preloaded via shared_preload_libraries \
+         for this capture to produce real evidence rather than fail outright",
+    )
+}
+
+fn is_audit_insert_statement(row: &StatRow) -> bool {
+    let q = row.query.to_ascii_lowercase();
+    q.contains("insert into") && q.contains("harvest_audit_log") && !q.contains("select")
+}
+
+/// Current WAL insert position, in bytes since the log's start. See
+/// `activity_enqueue_batch_perf.rs::wal_bytes` for why this, not wall-clock,
+/// is the admissible write-path measurement.
+async fn wal_bytes(conn: &mut AsyncPgConnection) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct WalRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        bytes: i64,
+    }
+    let row: WalRow =
+        diesel::sql_query("SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::bigint AS bytes")
+            .get_result(conn)
+            .await
+            .expect("read WAL insert position");
+    row.bytes
+}
+
+async fn relation_size(conn: &mut AsyncPgConnection, name: &str) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct SizeRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        bytes: i64,
+    }
+    let row: SizeRow = diesel::sql_query(format!("SELECT pg_relation_size('{name}') AS bytes"))
+        .get_result(conn)
+        .await
+        .unwrap_or(SizeRow { bytes: -1 });
+    row.bytes
+}
+
+#[derive(diesel::QueryableByName, Debug)]
+struct IdxScanRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    indexrelname: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    idx_scan: i64,
+}
+
+async fn index_scan_counts(conn: &mut AsyncPgConnection) -> Vec<IdxScanRow> {
+    diesel::sql_query(
+        "SELECT indexrelname, idx_scan FROM pg_stat_user_indexes \
+         WHERE relname = 'harvest_audit_log' ORDER BY indexrelname",
+    )
+    .load(conn)
+    .await
+    .expect("pg_stat_user_indexes query failed")
+}
+
+// ── Production-shaped fixture ───────────────────────────────────────────────
+
+/// Realistic operation-name cardinality and skew: `workflow.start` and
+/// `workflow.signal` dominate a real deployment's mutating traffic; the rest
+/// of the management surface (schedules, DLQ, batch, audit-export admin) is
+/// the long tail. 14 distinct operations, weighted, not a uniform draw.
+const OPERATION_WEIGHTS: &[(&str, u32)] = &[
+    (audit::OP_WORKFLOW_START, 40),
+    (audit::OP_WORKFLOW_SIGNAL, 20),
+    (audit::OP_WORKFLOW_CANCEL, 8),
+    (audit::OP_WORKFLOW_TERMINATE, 3),
+    (audit::OP_WORKFLOW_RESET, 2),
+    (audit::OP_WORKFLOW_PAUSE, 4),
+    (audit::OP_WORKFLOW_RESUME, 4),
+    (audit::OP_SCHEDULE_CREATE, 3),
+    (audit::OP_SCHEDULE_UPDATE, 3),
+    (audit::OP_SCHEDULE_DELETE, 1),
+    (audit::OP_DLQ_REPLAY, 5),
+    (audit::OP_DLQ_REPLAY_BULK, 1),
+    (audit::OP_BATCH_SUBMIT, 5),
+    (audit::OP_RETENTION_RUN_NOW, 1),
+];
+
+fn weighted_operation(i: usize) -> &'static str {
+    let total: u32 = OPERATION_WEIGHTS.iter().map(|(_, w)| w).sum();
+    let mut n = (i as u32) % total;
+    for (op, w) in OPERATION_WEIGHTS {
+        if n < *w {
+            return op;
+        }
+        n -= w;
+    }
+    OPERATION_WEIGHTS[0].0
+}
+
+fn fixture_row(i: usize) -> (String, String, String, String, String, String) {
+    let op = weighted_operation(i);
+    let actor = format!("operator-{}@example.com", i % 47);
+    let target_type = if op.starts_with("workflow") {
+        "workflow"
+    } else if op.starts_with("schedule") {
+        "schedule"
+    } else if op.starts_with("dlq") {
+        "dead_letter"
+    } else {
+        "batch"
+    };
+    let target_id = format!("{}-{i}", uuid::Uuid::new_v4());
+    let route = format!(
+        "POST /{target_type}s/{{id}}/{}",
+        op.rsplit('.').next().unwrap()
+    );
+    let status = if i % 20 == 0 { "failed" } else { "succeeded" };
+    (
+        actor,
+        op.to_string(),
+        target_type.to_string(),
+        target_id,
+        route,
+        status.to_string(),
+    )
+}
+
+/// Seeds `n` pre-existing audit rows through the REAL batched entry point
+/// (`audit::insert_audit_batch`), then backdates `occurred_at` with a single
+/// bulk `UPDATE` to spread them across the 90-day default retention window —
+/// `occurred_at` is DB-defaulted to `NOW()` at insert time and is not a
+/// `NewAuditRecord` field, so this is the only way to give the fixture
+/// realistic time-density without hand-writing `INSERT` statements that
+/// bypass the code path under test. The backdating `UPDATE` runs once,
+/// outside the measured window.
+async fn seed_fixture(conn: &mut AsyncPgConnection, n: usize) {
+    const CHUNK: usize = 4999;
+    let mut done = 0;
+    while done < n {
+        let take = CHUNK.min(n - done);
+        let rows: Vec<(String, String, String, String, String, String)> =
+            (done..done + take).map(fixture_row).collect();
+        let records: Vec<NewAuditRecord<'_>> = rows
+            .iter()
+            .map(
+                |(actor, operation, target_type, target_id, route, status)| NewAuditRecord {
+                    actor,
+                    operation,
+                    target_type,
+                    target_id: Some(target_id),
+                    route_or_command: route,
+                    request_id: None,
+                    idempotency_key: None,
+                    status,
+                    error_summary: None,
+                    shard_id: Some(0),
+                    source: "api",
+                },
+            )
+            .collect();
+        audit::insert_audit_batch(conn, &records)
+            .await
+            .expect("seed batch insert");
+        done += take;
+    }
+    diesel::sql_query(
+        "UPDATE harvest_audit_log SET occurred_at = NOW() - (random() * interval '90 days')",
+    )
+    .execute(conn)
+    .await
+    .expect("backdate fixture rows across the retention window");
+}
+
+const FIXTURE_ROWS: usize = 500_000;
+const MEASURED_INSERTS: usize = 3_000;
+
+struct Measurement {
+    label: &'static str,
+    insert_calls: i64,
+    insert_buffers: i64,
+    insert_wal_bytes: i64,
+    unexported_idx_bytes: i64,
+    unexported_idx_scans_after_reads: i64,
+    occurred_at_idx_scans_after_reads: i64,
+}
+
+async fn measure(admin: &str, label: &'static str, drop_unexported_idx: bool) -> Measurement {
+    let db_name = unique(&format!("audit_write_cost_{label}"));
+    let url = create_fresh_db(admin, &db_name).await;
+
+    let mut seed_conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("seed connection");
+    ensure_pg_stat_statements(&mut seed_conn).await;
+
+    if drop_unexported_idx {
+        diesel::sql_query("DROP INDEX harvest_audit_log_unexported_idx")
+            .execute(&mut seed_conn)
+            .await
+            .expect("drop the counterfactual index");
+    }
+
+    seed_fixture(&mut seed_conn, FIXTURE_ROWS).await;
+
+    let unexported_idx_bytes = if drop_unexported_idx {
+        0
+    } else {
+        relation_size(&mut seed_conn, "harvest_audit_log_unexported_idx").await
+    };
+
+    let mut op_conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("op connection");
+    let mut stats_conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("stats connection");
+    reset_stats_for_db(&mut stats_conn, &db_name).await;
+
+    // The REAL public entry point every mutating management-API handler
+    // calls once per request (`audit::insert_audit`'s own doc comment:
+    // "Called after every covered management mutation").
+    let wal_before = wal_bytes(&mut stats_conn).await;
+    for i in 0..MEASURED_INSERTS {
+        let (actor, operation, target_type, target_id, route, status) =
+            fixture_row(FIXTURE_ROWS + i);
+        let record = NewAuditRecord {
+            actor: &actor,
+            operation: &operation,
+            target_type: &target_type,
+            target_id: Some(&target_id),
+            route_or_command: &route,
+            request_id: None,
+            idempotency_key: None,
+            status: &status,
+            error_summary: None,
+            shard_id: Some(0),
+            source: "api",
+        };
+        audit::insert_audit(&mut op_conn, &record)
+            .await
+            .expect("insert_audit should succeed");
+    }
+    let wal_after = wal_bytes(&mut stats_conn).await;
+
+    let stat_rows = snapshot_statements(&mut stats_conn, &db_name).await;
+    let insert_rows: Vec<&StatRow> = stat_rows
+        .iter()
+        .filter(|r| is_audit_insert_statement(r))
+        .collect();
+    assert!(
+        !insert_rows.is_empty(),
+        "pg_stat_statements returned zero rows matching the audit INSERT shape -- check \
+         pg_stat_statements.track and shared_preload_libraries",
+    );
+    let insert_calls: i64 = insert_rows.iter().map(|r| r.calls).sum();
+    let insert_buffers: i64 = insert_rows.iter().map(|r| r.total_buffers).sum();
+
+    // Representative read workload: the real `GET /audit` entry point,
+    // `audit::list_audit`, with filters an operator actually uses
+    // (recency, actor, operation). None of these touch
+    // `harvest_audit_log_unexported_idx` -- it is not eligible for any of
+    // them, exactly as it would not be for the real handler in production.
+    let _ = audit::list_audit(&mut op_conn, &AuditFilters::default())
+        .await
+        .expect("list_audit default");
+    let _ = audit::list_audit(
+        &mut op_conn,
+        &AuditFilters {
+            actor: Some("operator-3@example.com".to_string()),
+            ..AuditFilters::default()
+        },
+    )
+    .await
+    .expect("list_audit by actor");
+    let _ = audit::list_audit(
+        &mut op_conn,
+        &AuditFilters {
+            operation: Some(audit::OP_WORKFLOW_CANCEL.to_string()),
+            ..AuditFilters::default()
+        },
+    )
+    .await
+    .expect("list_audit by operation");
+
+    let idx_scans = index_scan_counts(&mut op_conn).await;
+    let unexported_idx_scans_after_reads = idx_scans
+        .iter()
+        .find(|r| r.indexrelname == "harvest_audit_log_unexported_idx")
+        .map_or(-1, |r| r.idx_scan);
+    let occurred_at_idx_scans_after_reads = idx_scans
+        .iter()
+        .find(|r| r.indexrelname == "harvest_audit_occurred_at_idx")
+        .map_or(-1, |r| r.idx_scan);
+
+    Measurement {
+        label,
+        insert_calls,
+        insert_buffers,
+        insert_wal_bytes: wal_after - wal_before,
+        unexported_idx_bytes,
+        unexported_idx_scans_after_reads,
+        occurred_at_idx_scans_after_reads,
+    }
+}
+
+#[tokio::test]
+#[ignore = "evidence generator, not a CI assertion -- Ledger findings issue, \
+            harvest_audit_log_unexported_idx write-path cost (issue #1272)"]
+async fn zz_capture_audit_log_unexported_idx_write_cost_evidence() {
+    let (admin, _guard) = setup_server().await;
+
+    let before = measure(&admin, "before_index_present", false).await;
+    let after = measure(&admin, "after_index_dropped", true).await;
+
+    for m in [&before, &after] {
+        eprintln!(
+            "label={} insert_calls={} insert_buffers={} insert_wal_bytes={} \
+             unexported_idx_bytes={} unexported_idx_scans_after_reads={} \
+             occurred_at_idx_scans_after_reads={}",
+            m.label,
+            m.insert_calls,
+            m.insert_buffers,
+            m.insert_wal_bytes,
+            m.unexported_idx_bytes,
+            m.unexported_idx_scans_after_reads,
+            m.occurred_at_idx_scans_after_reads,
+        );
+    }
+
+    let buffers_per_insert_before = before.insert_buffers as f64 / before.insert_calls as f64;
+    let buffers_per_insert_after = after.insert_buffers as f64 / after.insert_calls as f64;
+    let wal_per_insert_before = before.insert_wal_bytes as f64 / MEASURED_INSERTS as f64;
+    let wal_per_insert_after = after.insert_wal_bytes as f64 / MEASURED_INSERTS as f64;
+
+    eprintln!(
+        "buffers/insert: before={buffers_per_insert_before:.3} after={buffers_per_insert_after:.3} \
+         delta={:.2}%",
+        (buffers_per_insert_after - buffers_per_insert_before) / buffers_per_insert_before * 100.0
+    );
+    eprintln!(
+        "wal_bytes/insert: before={wal_per_insert_before:.1} after={wal_per_insert_after:.1} \
+         delta={:.2}%",
+        (wal_per_insert_after - wal_per_insert_before) / wal_per_insert_before * 100.0
+    );
+    eprintln!(
+        "harvest_audit_log_unexported_idx size at {FIXTURE_ROWS} rows: {} bytes ({:.2} MiB)",
+        before.unexported_idx_bytes,
+        before.unexported_idx_bytes as f64 / (1024.0 * 1024.0)
+    );
+    eprintln!(
+        "idx_scan(harvest_audit_log_unexported_idx) after seed+{MEASURED_INSERTS} inserts+3 \
+         real list_audit reads: {}",
+        before.unexported_idx_scans_after_reads
+    );
+
+    assert_eq!(
+        before.unexported_idx_scans_after_reads, 0,
+        "harvest_audit_log_unexported_idx must never be scanned by the real read path \
+         (audit::list_audit) when export is unconfigured -- if this fails, the index is not \
+         the pure write tax this investigation assumes",
+    );
+}

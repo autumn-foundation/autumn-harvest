@@ -18,6 +18,8 @@ mod alert_pack_docs;
 mod audit_export_docs;
 #[cfg(feature = "db")]
 mod audit_export_tests;
+#[cfg(feature = "db")]
+mod audit_log_unexported_idx_write_cost_perf;
 mod audit_tests;
 #[cfg(feature = "db")]
 mod auto_heartbeat_tests;
