@@ -10,7 +10,8 @@
     clippy::significant_drop_tightening,
     clippy::too_many_lines,
     clippy::too_many_arguments,
-    clippy::cast_precision_loss
+    clippy::cast_precision_loss,
+    clippy::ref_option
 )]
 //! Workflow-start throttle integration tests — issue #607.
 //!
@@ -24,6 +25,7 @@
 //! - **Independent keys** — distinct keys throttle independently.
 //! - **Operator visibility** — the per-key backlog read returns the counts.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -31,6 +33,7 @@ use std::time::Duration;
 use autumn_harvest::debounce::DebounceStartOptions;
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::schema::harvest_schedules;
+use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::throttle::{
     AdmitThrottleParams, THROTTLE_FIRE_BATCH_SIZE, THROTTLE_FIRE_PER_KEY_CAP, ThrottleAdmission,
@@ -290,6 +293,24 @@ async fn drain(conn: &mut AsyncPgConnection, metrics: &RecordingMetrics) -> usiz
     fire_due_throttled_starts(conn, &None, &[] as &[ShardId], metrics)
         .await
         .expect("fire due")
+}
+
+/// Like `drain`, but scans an assigned sharded pool instead of the single
+/// default connection (issue #1362 multi-shard tests below).
+#[allow(clippy::await_holding_lock, clippy::future_not_send)]
+async fn drain_sharded(
+    conn: &mut AsyncPgConnection,
+    sharded_pool: &Option<ShardedDbPool>,
+    shard_assignments: &[ShardId],
+    metrics: &RecordingMetrics,
+) -> usize {
+    let _serial = crate::admission_gate_authoritative_tests::TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
+    fire_due_throttled_starts(conn, sharded_pool, shard_assignments, metrics)
+        .await
+        .expect("fire due across assigned shards")
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1899,6 +1920,20 @@ fn make_scheduler_pool(url: &str) -> autumn_harvest::worker::DbPool {
         .expect("pool")
 }
 
+/// Build a pool aimed at an address nothing listens on (issue #1362), so
+/// `.get()` fails fast with no live database. Mirrors `shard.rs`'s own
+/// `test_pool()` unit-test helper.
+fn unreachable_pool() -> autumn_harvest::worker::DbPool {
+    use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+        "postgres://unused-host-for-test/db",
+    );
+    deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("pool builds without connecting")
+}
+
 /// Insert a due schedule row (interval:60, overdue by 5s) whose
 /// `workflow_input` is the caller-supplied JSON value.
 async fn insert_schedule_with_input(
@@ -2633,4 +2668,191 @@ async fn reserve_rejects_empty_workflow_id_before_reserving_or_deferring() {
 
     // No token was reserved and no row was written.
     assert_eq!(throttle_row_count(&mut conn, key).await, 0);
+}
+
+// ── Multi-shard scanning (issue #1362) ──────────────────────────────────────
+//
+// `harvest_start_throttle` shards by physical database, not by a `shard_id`
+// column (see `fire_due_on_conn`, which takes no shard filter). These tests
+// therefore use two genuinely separate Postgres containers, one per shard.
+
+// The multi-shard branch (`Some(sp) if !shard_assignments.is_empty()`) had
+// no integration coverage before this test: every existing call in this
+// file passes `&None` and `&[]`. Each shard's own due row must fire on a
+// single scanner tick that is assigned both shards.
+#[tokio::test]
+async fn fire_due_throttled_starts_fires_each_assigned_shards_own_due_row() {
+    let (mut conn0, url0, _c0) = setup_db().await;
+    let (mut conn1, url1, _c1) = setup_db().await;
+    let metrics = RecordingMetrics::default();
+
+    let wf = "shard_throttle_wf";
+    let key0 = "tenant:shard0";
+    let key1 = "tenant:shard1";
+    let bkey0 = bucket_key(wf, key0);
+    let bkey1 = bucket_key(wf, key1);
+
+    // Shard 0: seed consumes the sole burst token, the second admission
+    // defers -- a due row on shard 0's own database.
+    reserve_or_defer(
+        &mut conn0,
+        params(
+            wf,
+            key0,
+            "seed-0",
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("seed shard0");
+    let admit0 = reserve_or_defer(
+        &mut conn0,
+        params(
+            wf,
+            key0,
+            "job-0",
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("defer shard0");
+    assert!(matches!(admit0, ThrottleAdmission::Deferred(_)));
+    set_bucket_tokens(&mut conn0, &bkey0, 1.0).await;
+
+    // Same setup on shard 1's own, separate database.
+    reserve_or_defer(
+        &mut conn1,
+        params(
+            wf,
+            key1,
+            "seed-1",
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("seed shard1");
+    let admit1 = reserve_or_defer(
+        &mut conn1,
+        params(
+            wf,
+            key1,
+            "job-1",
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("defer shard1");
+    assert!(matches!(admit1, ThrottleAdmission::Deferred(_)));
+    set_bucket_tokens(&mut conn1, &bkey1, 1.0).await;
+
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), make_scheduler_pool(&url0));
+    pools.insert(ShardId::new(1), make_scheduler_pool(&url1));
+    let sharded_pool = Some(ShardedDbPool::from_map(pools, ShardId::new(0)));
+
+    let fired = drain_sharded(
+        &mut conn0,
+        &sharded_pool,
+        &[ShardId::new(0), ShardId::new(1)],
+        &metrics,
+    )
+    .await;
+
+    assert_eq!(fired, 2, "each assigned shard's own due row must fire");
+    // The seed admission only reserves a token; it starts no execution
+    // (production starts it at the relay layer, not inside `reserve_or_defer`).
+    // Each shard's own execution count is therefore exactly its fired row.
+    assert_eq!(
+        execution_count(&mut conn0, wf).await,
+        1,
+        "shard 0's job fired"
+    );
+    assert_eq!(
+        execution_count(&mut conn1, wf).await,
+        1,
+        "shard 1's job fired"
+    );
+}
+
+// No test (unit or integration) covered "shard A's connection fails under
+// `LogAndSkip`, and the loop still proceeds to shard B" before this. A
+// regression turning the `continue` in `fire_due_throttled_starts_with_codecs`
+// into a `return`/`break` would pass every other existing test here.
+#[tokio::test]
+async fn fire_due_throttled_starts_skips_an_unreachable_shard_and_still_fires_the_next() {
+    let (mut conn1, url1, _c1) = setup_db().await;
+    let metrics = RecordingMetrics::default();
+
+    let wf = "shard_skip_throttle_wf";
+    let key = "tenant:shard-skip";
+    let bkey = bucket_key(wf, key);
+
+    reserve_or_defer(
+        &mut conn1,
+        params(
+            wf,
+            key,
+            "seed",
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("seed");
+    let admit = reserve_or_defer(
+        &mut conn1,
+        params(
+            wf,
+            key,
+            "job-0",
+            serde_json::json!({}),
+            0.0001,
+            1.0,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("defer");
+    assert!(matches!(admit, ThrottleAdmission::Deferred(_)));
+    set_bucket_tokens(&mut conn1, &bkey, 1.0).await;
+
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), unreachable_pool());
+    pools.insert(ShardId::new(1), make_scheduler_pool(&url1));
+    let sharded_pool = Some(ShardedDbPool::from_map(pools, ShardId::new(0)));
+
+    let fired = drain_sharded(
+        &mut conn1,
+        &sharded_pool,
+        &[ShardId::new(0), ShardId::new(1)],
+        &metrics,
+    )
+    .await;
+
+    assert_eq!(
+        fired, 1,
+        "shard 1's due row must still fire despite shard 0 being unreachable"
+    );
+    // The seed admission only reserves a token; it starts no execution.
+    assert_eq!(execution_count(&mut conn1, wf).await, 1, "job-0 fired");
 }
