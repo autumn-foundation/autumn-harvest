@@ -2889,6 +2889,12 @@ def comment_lines(pieces: list[Piece]):
         after_block = False
         saved: list = []
         nest = run[0].nest
+        # The physical LINE a closer was last found on. CommonMark ends an
+        # HTML block AT its closing line, not at the closer's own column, so
+        # a piece that follows the closer on the SAME line -- after a nested
+        # comment resumes the enclosing one, say -- is raw HTML too, even
+        # though `html` itself is already cleared by the time it is reached.
+        html_closing_line: int | None = None
         for index, piece in enumerate(run):
             if piece.nest != nest:
                 saved, (
@@ -2930,6 +2936,7 @@ def comment_lines(pieces: list[Piece]):
                 # mid-line piece is never that, so it is not asked here.
                 was_html = html is not None
                 if html not in (None, "tag") and html_closes(text, html):
+                    html_closing_line = piece.line
                     html = None
                     # `nesting_shift` restores a SNAPSHOT taken before this
                     # piece's nest level was entered. Closing here would
@@ -2937,7 +2944,13 @@ def comment_lines(pieces: list[Piece]):
                     # it back. The closer is definitive at every depth it is
                     # still pending for, so it is applied to each one too.
                     saved = [frame[:-1] + (None,) for frame in saved]
-                yield piece.line, text, fence is not None or was_html, False, None
+                # Still raw HTML if this piece is on the closer's own line,
+                # even after `html` above is cleared: text between the
+                # nested comment's own delimiters and the closer, or after
+                # the closer, is part of the closing line CommonMark keeps
+                # inside the block.
+                closing_line = html_closing_line == piece.line
+                yield piece.line, text, fence is not None or was_html or closing_line, False, None
                 continue
             # Carried from the previous LINE, and cleared here so it applies
             # exactly once. A piece that does not begin its own line is the
@@ -3423,6 +3436,10 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
         # changes -- and the absolute rules need it to know whether inline
         # HTML in this text is markup or just characters.
         run_marker = block[0].marker
+        # See the matching comment in `comment_lines`: the line a closer was
+        # last found on, so a piece that follows it on the SAME line stays
+        # inside the block even after `html` itself is already cleared.
+        html_closing_line: int | None = None
         for index, piece in enumerate(block):
             if piece.nest != nest:
                 # No flush: a sentence that crosses an inline nested comment
@@ -3464,10 +3481,11 @@ def prose_units(pieces: list[Piece]) -> list[tuple[int, str]]:
             # The text is still part of the line's sentence, so it joins the
             # run rather than starting one.
             if not piece.line_start:
-                if fence is not None or html is not None:
+                if fence is not None or html is not None or html_closing_line == piece.line:
                     # The closer's characters are literal HTML text, so they
                     # close the block wherever they sit -- see `comment_lines`.
                     if html not in (None, "tag") and html_closes(body, html):
+                        html_closing_line = piece.line
                         html = None
                         saved = [frame[:-1] + (None,) for frame in saved]
                     flush()
@@ -6929,6 +6947,13 @@ RULE_TESTS = [
         "/// >    ```\n",
         set(),
         "a marker right after a quote crossing is not refused the paragraph's veto",
+    ),
+    (
+        "/** <pre>\n"
+        " * raw /* </pre> */ TODO: issue required\n"
+        " */\n",
+        set(),
+        "text after the closer on its own physical line stays inside the block",
     ),
 ]
 
