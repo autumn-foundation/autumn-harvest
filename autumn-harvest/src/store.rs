@@ -405,9 +405,11 @@ const _: () = assert!(
 );
 
 /// Exact byte length `serde_json::to_vec(value)` would produce, without
-/// allocating that `Vec`. Mirrors `queue.rs`'s identical helper.
+/// allocating that `Vec`. Mirrors `queue.rs`'s identical helper, generic
+/// over anything `Serialize` (issue #1589 Codex review) so it can measure
+/// a `WorkflowEvent` directly, before that event is ever encoded.
 #[cfg(feature = "db")]
-fn json_byte_len(value: &serde_json::Value) -> usize {
+fn json_byte_len<T: serde::Serialize>(value: &T) -> usize {
     struct CountingWriter(usize);
     impl std::io::Write for CountingWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -423,24 +425,31 @@ fn json_byte_len(value: &serde_json::Value) -> usize {
     counter.0
 }
 
-/// Splits `rows` into `[start, end)` index ranges, each within both
+/// Splits `events` into `[start, end)` index ranges, each within both
 /// [`ROWS_PER_EVENT_INSERT_CHUNK`] rows and
-/// [`MAX_EVENT_CHUNK_PAYLOAD_BYTES`] of summed `event_data`. Whichever
-/// bound is reached first ends a chunk. Measured post-offload, on the rows
-/// actually about to be inserted -- exactly what the `INSERT` pays for.
+/// [`MAX_EVENT_CHUNK_PAYLOAD_BYTES`] of summed event size.
 ///
-/// Mirrors `queue.rs`'s `compute_chunk_bounds` shape. A non-empty `rows`
-/// always returns at least one range, and every row falls into exactly one
-/// of them, in order.
+/// Measured directly from each `WorkflowEvent` (Codex review, issue
+/// #1589), before any [`NewHarvestEvent`] row is built, encoded, or
+/// offloaded. Peak memory during that build therefore stays bounded by
+/// one chunk, not the whole `events` slice. This is a size ESTIMATE, not
+/// the exact post-encode/post-offload byte count -- a codec or an offload
+/// can shrink or grow a payload. The budget is wide enough to absorb that
+/// slack, the same way `queue.rs`'s own pre-transformation measurement
+/// does for `enqueue_batch`.
+///
+/// Mirrors `queue.rs`'s `compute_chunk_bounds` shape. A non-empty `events`
+/// always returns at least one range, and every event falls into exactly
+/// one of them, in order.
 #[cfg(feature = "db")]
-fn compute_event_chunk_bounds(rows: &[NewHarvestEvent<'_>]) -> Vec<(usize, usize)> {
+fn compute_event_chunk_bounds(events: &[(ExecutionId, WorkflowEvent)]) -> Vec<(usize, usize)> {
     let mut chunk_bounds = Vec::new();
     let mut chunk_start = 0_usize;
-    while chunk_start < rows.len() {
+    while chunk_start < events.len() {
         let mut chunk_end = chunk_start + 1;
-        let mut payload_bytes = json_byte_len(&rows[chunk_start].event_data);
-        while chunk_end < rows.len() && chunk_end - chunk_start < ROWS_PER_EVENT_INSERT_CHUNK {
-            let next_bytes = json_byte_len(&rows[chunk_end].event_data);
+        let mut payload_bytes = json_byte_len(&events[chunk_start].1);
+        while chunk_end < events.len() && chunk_end - chunk_start < ROWS_PER_EVENT_INSERT_CHUNK {
+            let next_bytes = json_byte_len(&events[chunk_end].1);
             if payload_bytes + next_bytes > MAX_EVENT_CHUNK_PAYLOAD_BYTES {
                 break;
             }
@@ -488,52 +497,60 @@ pub async fn append_new_execution_started_events_batch(
         return Ok(());
     }
 
-    let mut rows: Vec<NewHarvestEvent<'_>> = events
-        .iter()
-        .map(|(exec_id, event)| {
-            Ok(NewHarvestEvent {
-                workflow_exec_id: exec_id.as_uuid(),
-                event_id: 0,
-                event_type: event.type_name(),
-                event_data: codecs.encode_event(event)?,
-            })
-        })
-        .collect::<Result<_, crate::error::HarvestError>>()?;
-
-    // Offload runs before the INSERT below, exactly like
-    // `append_events_offloaded_with_codecs` (encode-then-offload, ADR-0003).
-    let mut ref_rows: Vec<NewHarvestPayloadRef> = Vec::new();
-    if let Some(offloader) = offloader {
-        for row in &mut rows {
-            let refs = offloader.offload_event_value(&mut row.event_data).await?;
-            ref_rows.extend(refs.into_iter().map(|r| NewHarvestPayloadRef {
-                blob_key: r.blob_key,
-                workflow_exec_id: row.workflow_exec_id,
-                store_id: r.store_id,
-                byte_len: i64::try_from(r.byte_len).unwrap_or(i64::MAX),
-            }));
-        }
-    }
-
     let shard = events[0].0.shard();
 
+    // Chunk boundaries are decided up front from `events` itself (Codex
+    // review, issue #1589), before any row is encoded or offloaded. Each
+    // chunk then builds, encodes, offloads, and inserts its own small row
+    // `Vec`s in turn. Peak memory therefore stays bounded by one chunk's
+    // payload, not the whole `events` slice.
     Box::pin(
         conn.transaction::<(), crate::error::HarvestError, _>(async |conn| {
             crate::replication::assert_fence(conn, shard).await?;
-            for (start, end) in compute_event_chunk_bounds(&rows) {
+            for (start, end) in compute_event_chunk_bounds(events) {
+                let mut rows: Vec<NewHarvestEvent<'_>> = events[start..end]
+                    .iter()
+                    .map(|(exec_id, event)| {
+                        Ok(NewHarvestEvent {
+                            workflow_exec_id: exec_id.as_uuid(),
+                            event_id: 0,
+                            event_type: event.type_name(),
+                            event_data: codecs.encode_event(event)?,
+                        })
+                    })
+                    .collect::<Result<_, crate::error::HarvestError>>()?;
+
+                // Offload runs before the INSERT below, exactly like
+                // `append_events_offloaded_with_codecs`
+                // (encode-then-offload, ADR-0003).
+                let mut ref_rows: Vec<NewHarvestPayloadRef> = Vec::new();
+                if let Some(offloader) = offloader {
+                    for row in &mut rows {
+                        let refs = offloader.offload_event_value(&mut row.event_data).await?;
+                        ref_rows.extend(refs.into_iter().map(|r| NewHarvestPayloadRef {
+                            blob_key: r.blob_key,
+                            workflow_exec_id: row.workflow_exec_id,
+                            store_id: r.store_id,
+                            byte_len: i64::try_from(r.byte_len).unwrap_or(i64::MAX),
+                        }));
+                    }
+                }
+
                 diesel::insert_into(harvest_events::table)
-                    .values(&rows[start..end])
+                    .values(&rows)
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
-            }
-            for ref_chunk in ref_rows.chunks(ROWS_PER_PAYLOAD_REF_INSERT_CHUNK) {
-                diesel::insert_into(harvest_payload_refs::table)
-                    .values(ref_chunk)
-                    .on_conflict_do_nothing()
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
+                drop(rows);
+
+                for ref_chunk in ref_rows.chunks(ROWS_PER_PAYLOAD_REF_INSERT_CHUNK) {
+                    diesel::insert_into(harvest_payload_refs::table)
+                        .values(ref_chunk)
+                        .on_conflict_do_nothing()
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
+                }
             }
             Ok(())
         }),
@@ -2577,27 +2594,17 @@ mod tests {
                 )
             })
             .collect();
-        let rows: Vec<NewHarvestEvent<'_>> = events
-            .iter()
-            .map(|(exec_id, event)| NewHarvestEvent {
-                workflow_exec_id: exec_id.as_uuid(),
-                event_id: 0,
-                event_type: event.type_name(),
-                event_data: DEFAULT_PAYLOAD_CODECS.encode_event(event).unwrap(),
-            })
-            .collect();
-
-        let bounds = compute_event_chunk_bounds(&rows);
+        let bounds = compute_event_chunk_bounds(&events);
 
         assert!(
             bounds.len() > 10,
-            "200 near-max-size rows must split into many small chunks, got {} chunk(s)",
+            "200 near-max-size events must split into many small chunks, got {} chunk(s)",
             bounds.len()
         );
         for &(start, end) in &bounds {
-            let row_sizes: Vec<usize> = rows[start..end]
+            let row_sizes: Vec<usize> = events[start..end]
                 .iter()
-                .map(|r| json_byte_len(&r.event_data))
+                .map(|(_, event)| json_byte_len(event))
                 .collect();
             let chunk_payload: usize = row_sizes.iter().sum();
             let largest_row = row_sizes.iter().copied().max().unwrap_or(0);
@@ -2610,13 +2617,13 @@ mod tests {
         let mut next_expected = 0;
         for &(start, end) in &bounds {
             assert_eq!(start, next_expected, "chunks must be contiguous, no gaps");
-            assert!(end > start, "every chunk must carry at least one row");
+            assert!(end > start, "every chunk must carry at least one event");
             next_expected = end;
         }
         assert_eq!(
             next_expected,
-            rows.len(),
-            "every row must fall into a chunk"
+            events.len(),
+            "every event must fall into a chunk"
         );
     }
 

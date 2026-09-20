@@ -10829,11 +10829,30 @@ fn build_child_row<'p>(
     parent_exec_id_str: &'p str,
 ) -> NewWorkflowExecution<'p> {
     let child = plan.child;
+    // Absolute deadlines are anchored HERE, not read from `plan.defaults`
+    // (Codex review, issue #1589). `plan.defaults` is resolved once, up
+    // front, for every local child before any is inserted. A later chunk's
+    // row can be built well after that -- behind the sequential group's
+    // own admission checks, or behind earlier batched chunks' round trips.
+    // Reading a deadline computed that early would anchor it to a stale
+    // "now", not the row's real `started_at`. A short-timeout child could
+    // then be born already overdue. `execution_timeout`/`sla`/
+    // `chain_execution_timeout` are plain durations. Recomputing the
+    // absolute deadline from `Utc::now()` at build time is exactly what
+    // `resolve_child_workflow_defaults` itself does for every other,
+    // immediate-use caller.
+    let now = chrono::Utc::now();
+    let deadline_at = plan.defaults.execution_timeout.map(|d| now + d);
+    let sla_deadline_at = plan.defaults.sla.map(|d| now + d);
+    let chain_deadline_at = plan
+        .defaults
+        .chain_execution_timeout
+        .and_then(|d| now.checked_add_signed(d));
     NewWorkflowExecution {
         continued_from_exec_id: None,
         first_exec_id: None,
         chain_execution_timeout: plan.defaults.chain_execution_timeout,
-        chain_deadline_at: plan.defaults.chain_deadline_at,
+        chain_deadline_at,
         id: child.child_id.as_uuid(),
         workflow_name: &child.workflow_name,
         workflow_id: &plan.child_workflow_id,
@@ -10843,9 +10862,9 @@ fn build_child_row<'p>(
         parent_id: Some(parent_exec_id.as_uuid()),
         queue_name,
         execution_timeout: plan.defaults.execution_timeout,
-        deadline_at: plan.defaults.deadline_at,
+        deadline_at,
         sla: plan.defaults.sla,
-        sla_deadline_at: plan.defaults.sla_deadline_at,
+        sla_deadline_at,
         memo: None,
         search_attrs: None,
         assigned_build_id: parent_execution.assigned_build_id.clone(),
