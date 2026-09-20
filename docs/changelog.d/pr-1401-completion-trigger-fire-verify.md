@@ -51,9 +51,14 @@ two real gaps a Codex review found:
   so a fire predating that update would be checked against the wrong name.
 
 A fire predating this migration (`target_shard`/`target_workflow_name` both
-NULL) falls back to the old reconstruction, so both gaps remain a residual,
-unfixable-after-the-fact limitation for pre-migration data only — documented
-in `docs/runbooks/backup-restore.md` §4.2(d) and in the relevant doc comments.
+NULL) falls back to the old reconstruction, so both gaps remain a residual
+limitation for pre-migration data only. `route_trigger_fires` narrows the
+blast radius of the shard gap: a re-derived pick that lands on the fire's
+own source shard is not trusted as proof of an atomic same-shard commit.
+It is reported as `completion_trigger_fire_unproven` instead of being
+dropped silently, so a historical drain can no longer hide a lost relay
+behind a coincidental same-shard pick. This is documented in
+`docs/runbooks/backup-restore.md` §4.2(d) and in the relevant doc comments.
 
 **Design.** `route_trigger_fires` (target-shard routing, now preferring the
 persisted shard) and `absence_is_decisive_loss` (the `fired_at`-vs-

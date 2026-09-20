@@ -942,34 +942,69 @@ struct PendingTriggerFire {
 /// writable, at fire time but not now. This is the same
 /// placement-vs-location caveat `shard::external_target_owning_shard`
 /// documents. It is a residual limitation for pre-migration data only.
+///
+/// A RECORDED same-shard fire (`fire.target_shard == Some(source_shard)`)
+/// is dropped outright: it is a historical fact, not a guess, so the
+/// atomic-commit argument above genuinely applies. A RE-DERIVED pick that
+/// happens to equal `source_shard` is different (issue #1401, Codex
+/// follow-up). The same historical-drain blind spot can point the fallback
+/// at the wrong CROSS-shard target. It can just as easily land the pick on
+/// `source_shard` by coincidence, which would silently drop a fire that
+/// was actually lost. Such a fire goes to `uncertain` instead of being
+/// silently skipped or adjudicated against a shard pick this function
+/// cannot vouch for.
+#[cfg(all(feature = "db", feature = "testing"))]
+struct RoutedTriggerFires {
+    pending: Vec<PendingTriggerFire>,
+    /// A pre-migration fire whose re-derived shard landed on its own
+    /// source shard -- a same-shard conclusion this function cannot
+    /// trust. Sample identifiers, for a [`FindingClass::CompletionTriggerFireUnproven`].
+    uncertain: Vec<String>,
+}
+
 #[cfg(all(feature = "db", feature = "testing"))]
 fn route_trigger_fires(
     fires: Vec<(i32, ResolvedFire)>,
     router: &crate::shard::ShardRouter,
-) -> Vec<PendingTriggerFire> {
-    fires
-        .into_iter()
-        .filter_map(|(source_shard, fire)| {
-            let target_workflow_id = format!(
-                "completion-trigger-{}-{}",
-                fire.trigger_id, fire.source_exec_id
-            );
-            let target_shard = fire.target_shard.unwrap_or_else(|| {
+) -> RoutedTriggerFires {
+    let mut pending = Vec::new();
+    let mut uncertain = Vec::new();
+    for (source_shard, fire) in fires {
+        let target_workflow_id = format!(
+            "completion-trigger-{}-{}",
+            fire.trigger_id, fire.source_exec_id
+        );
+        let (target_shard, reconstructed) = match fire.target_shard {
+            Some(shard) => (shard, false),
+            None => (
                 router
                     .pick_for_new_workflow(&fire.target_workflow_name, &target_workflow_id)
-                    .as_i32()
-            });
-            (target_shard != source_shard).then_some(PendingTriggerFire {
-                source_shard,
-                source_exec_id: fire.source_exec_id,
-                trigger_id: fire.trigger_id,
-                target_workflow_name: fire.target_workflow_name,
-                target_workflow_id,
-                target_shard,
-                fired_at: fire.fired_at,
-            })
-        })
-        .collect()
+                    .as_i32(),
+                true,
+            ),
+        };
+        if target_shard == source_shard {
+            if reconstructed {
+                uncertain.push(format!(
+                    "{target_workflow_id} (fired by {} on shard {source_shard}; pre-migration \
+                     fire, re-derived shard pick cannot be trusted to rule out a cross-shard \
+                     relay)",
+                    fire.source_exec_id
+                ));
+            }
+            continue;
+        }
+        pending.push(PendingTriggerFire {
+            source_shard,
+            source_exec_id: fire.source_exec_id,
+            trigger_id: fire.trigger_id,
+            target_workflow_name: fire.target_workflow_name,
+            target_workflow_id,
+            target_shard,
+            fired_at: fire.fired_at,
+        });
+    }
+    RoutedTriggerFires { pending, uncertain }
 }
 
 /// Is an absent completion-trigger target a PROVEN loss, given the target
@@ -3537,9 +3572,18 @@ mod probes {
                 router_shards,
                 ShardId::new(options.default_shard),
             );
-            let pending = super::route_trigger_fires(fires, &router);
+            let super::RoutedTriggerFires { pending, uncertain } =
+                super::route_trigger_fires(fires, &router);
             let mut trigger_findings = resolve_trigger_fires(&pending, targets, &shards).await;
             cross_shard.append(&mut trigger_findings);
+            if !uncertain.is_empty() {
+                cross_shard.push(Finding::new(
+                    FindingClass::CompletionTriggerFireUnproven,
+                    None,
+                    uncertain.len() as u64,
+                    uncertain,
+                ));
+            }
         }
 
         // Guard the library entry point too, not only the CLI. `VerifyOptions`
@@ -3680,18 +3724,51 @@ mod tests {
         // pick: the id derivation must not depend on which shard is "source".
         let source_shard = 1 - target_shard;
 
-        let pending = route_trigger_fires(vec![(source_shard, fire)], &router);
+        let routing = route_trigger_fires(vec![(source_shard, fire)], &router);
 
-        assert_eq!(pending.len(), 1, "a cross-shard fire must be kept");
-        assert_eq!(pending[0].target_workflow_id, expected_id);
-        assert_eq!(pending[0].target_shard, target_shard);
-        assert_eq!(pending[0].source_shard, source_shard);
+        assert_eq!(routing.pending.len(), 1, "a cross-shard fire must be kept");
+        assert_eq!(routing.pending[0].target_workflow_id, expected_id);
+        assert_eq!(routing.pending[0].target_shard, target_shard);
+        assert_eq!(routing.pending[0].source_shard, source_shard);
     }
 
     #[test]
     #[cfg(all(feature = "db", feature = "testing"))]
-    fn route_trigger_fires_drops_same_shard_fires() {
+    fn route_trigger_fires_drops_a_recorded_same_shard_fire() {
         let router = two_shard_router();
+        let mut fire = resolved_fire("child_flow");
+        let target_workflow_id = format!(
+            "completion-trigger-{}-{}",
+            fire.trigger_id, fire.source_exec_id
+        );
+        let same_shard = router
+            .pick_for_new_workflow("child_flow", &target_workflow_id)
+            .as_i32();
+        // A RECORDED same-shard fire is a historical fact, not a guess.
+        fire.target_shard = Some(same_shard);
+
+        let routing = route_trigger_fires(vec![(same_shard, fire)], &router);
+
+        assert!(
+            routing.pending.is_empty(),
+            "a same-shard fire is atomic with its target start and must not \
+             be adjudicated: {:?}",
+            routing.pending
+        );
+        assert!(
+            routing.uncertain.is_empty(),
+            "a RECORDED same-shard fire is a historical fact, not a guess, \
+             so it must not be flagged uncertain: {:?}",
+            routing.uncertain
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
+    fn route_trigger_fires_flags_a_reconstructed_same_shard_pick_as_uncertain() {
+        let router = two_shard_router();
+        // A pre-migration fire: `target_shard` is unset, so this must be
+        // re-derived from the router.
         let fire = resolved_fire("child_flow");
         let target_workflow_id = format!(
             "completion-trigger-{}-{}",
@@ -3701,12 +3778,19 @@ mod tests {
             .pick_for_new_workflow("child_flow", &target_workflow_id)
             .as_i32();
 
-        let pending = route_trigger_fires(vec![(same_shard, fire)], &router);
+        let routing = route_trigger_fires(vec![(same_shard, fire)], &router);
 
         assert!(
-            pending.is_empty(),
-            "a same-shard fire is atomic with its target start and must not \
-             be adjudicated: {pending:?}"
+            routing.pending.is_empty(),
+            "a re-derived same-shard pick must not be adjudicated as a \
+             normal cross-shard fire: {:?}",
+            routing.pending
+        );
+        assert_eq!(
+            routing.uncertain.len(),
+            1,
+            "a re-derived same-shard pick cannot rule out a lost cross-shard \
+             relay, so it must be flagged uncertain instead of dropped"
         );
     }
 
@@ -3727,15 +3811,15 @@ mod tests {
         let persisted_shard = 1 - router_pick;
         fire.target_shard = Some(persisted_shard);
 
-        let pending = route_trigger_fires(vec![(router_pick, fire)], &router);
+        let routing = route_trigger_fires(vec![(router_pick, fire)], &router);
 
         assert_eq!(
-            pending.len(),
+            routing.pending.len(),
             1,
             "the persisted shard differs from the source, so this is cross-shard"
         );
         assert_eq!(
-            pending[0].target_shard, persisted_shard,
+            routing.pending[0].target_shard, persisted_shard,
             "the persisted shard must win over a re-derived router pick"
         );
     }

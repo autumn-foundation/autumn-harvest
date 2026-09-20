@@ -325,9 +325,9 @@ ack, it refuses; with the ack, it still only reads.
   evidence either way is `completion_trigger_fire_unproven` (`undetermined`,
   exit 2); an absent target whose shard's restore point predates the fire is
   `completion_trigger_fire_lost` (`incoherent`, exit 1) — the restore point
-  proves the target snapshot cannot hold the delivery. A same-shard fire is
-  never checked: it commits atomically with the target start and cannot be
-  split by a skewed restore.
+  proves the target snapshot cannot hold the delivery. A RECORDED same-shard
+  fire is never checked: it commits atomically with the target start and
+  cannot be split by a skewed restore.
 
   **Pre-migration fires** (rows written before `20260920215812` shipped)
   carry no recorded `target_shard`/`target_workflow_name` and fall back to
@@ -336,9 +336,13 @@ ack, it refuses; with the ack, it still only reads.
   the same convention `uninspected_shard_reference` already carries — a
   partial `--shard` list can route the hash prediction wrong; also blind to
   a HISTORICAL drain, same as above) and the target name via the CURRENT
-  trigger definition (blind to a since-changed name, same as above). These
-  are residual, unfixable-after-the-fact limitations for data written
-  before the migration only.
+  trigger definition (blind to a since-changed name, same as above). A
+  drain-blind pick that happens to land on the fire's own source shard is
+  NOT treated as a same-shard commit. It is reported as
+  `completion_trigger_fire_unproven` instead, since a historical drain could
+  make that pick wrong in either direction. These reconstruction gaps are
+  residual, unfixable-after-the-fact limitations for data written before the
+  migration only.
 - **(e) A machine-readable report** (`--format json`) with a nonzero exit on any
   failed check.
 
