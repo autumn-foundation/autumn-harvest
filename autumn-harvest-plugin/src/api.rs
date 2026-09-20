@@ -43807,7 +43807,16 @@ async fn stream_execution_events(
             }
         }
 
-        // Audit stream close (issue #158) — fires on every producer exit path
+        // Audit stream close (issue #158) — fires on every producer exit path.
+        //
+        // Stamped with `listener_shard`, not `shard` (issue #1596 review,
+        // P2). `shard` is the shard this stream started on. A rebind
+        // earlier in the loop may have since moved `listener_shard` on,
+        // and `db_conn_for_execution` above already checks out that
+        // CURRENT shard. Using `shard` here would write the close record
+        // to the target database while attributing it to the source
+        // shard. That corrupts per-shard audit attribution for every
+        // migrated long-lived stream.
         if let Ok(mut conn) = db_conn_for_execution(&api_clone, exec_id).await {
             let target = exec_id.to_string();
             let ar = NewAuditRecord {
@@ -43820,7 +43829,7 @@ async fn stream_execution_events(
                 idempotency_key: None,
                 status: STATUS_SUCCEEDED,
                 error_summary: None,
-                shard_id: Some(shard.as_i32()),
+                shard_id: Some(listener_shard.as_i32()),
                 source: &audit_source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;

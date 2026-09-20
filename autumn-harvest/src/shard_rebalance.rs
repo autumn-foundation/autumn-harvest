@@ -1574,43 +1574,52 @@ mod db {
                 .get_result(&mut *conn)
                 .await
                 .optional_row()?;
-        let Some(row) = row else {
-            return Ok(());
-        };
-        if row.state != "MIGRATING" {
-            return Ok(());
-        }
-
-        for sql in STAGED_CHILD_DELETES.iter().copied() {
-            diesel::sql_query(sql)
+        // The staged-copy cleanup below applies only to a row still
+        // standing in `MIGRATING`. A row already gone, or moved on to some
+        // other state, has already left the active-uniqueness slot for
+        // this business key on its own. `TERMINATED` is one such state: a
+        // force-terminate can race this abort before cutover (issue #1596
+        // review, P1). Neither case owes this function any row cleanup.
+        // Both still owe the vacated-row restoration after this `if`. That
+        // restoration depends only on the slot being free, not on how it
+        // became free.
+        if let Some(row) = row {
+            if row.state == "MIGRATING" {
+                for sql in STAGED_CHILD_DELETES.iter().copied() {
+                    diesel::sql_query(sql)
+                        .bind::<SqlUuid, _>(exec_id.as_uuid())
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(database_error)?;
+                }
+                // A carried pointer is the tell: the staged row stands where
+                // a seal stood, so restore the seal instead of removing the
+                // row.
+                let restored = diesel::sql_query(
+                    "UPDATE harvest_workflow_executions \
+                        SET state = 'MIGRATED', completed_at = COALESCE(completed_at, NOW()) \
+                      WHERE id = $1 AND state = 'MIGRATING' AND migrated_to_shard IS NOT NULL",
+                )
                 .bind::<SqlUuid, _>(exec_id.as_uuid())
                 .execute(&mut *conn)
                 .await
                 .map_err(database_error)?;
-        }
-        // A carried pointer is the tell: the staged row stands where a seal
-        // stood, so restore the seal instead of removing the row.
-        let restored = diesel::sql_query(
-            "UPDATE harvest_workflow_executions \
-                SET state = 'MIGRATED', completed_at = COALESCE(completed_at, NOW()) \
-              WHERE id = $1 AND state = 'MIGRATING' AND migrated_to_shard IS NOT NULL",
-        )
-        .bind::<SqlUuid, _>(exec_id.as_uuid())
-        .execute(&mut *conn)
-        .await
-        .map_err(database_error)?;
-        if restored == 0 {
-            // No pointer was carried: this row is a first-time staged copy,
-            // not a restored seal. Deleting it is safe. The guard above
-            // already confirmed the row is `MIGRATING`, so this cannot match
-            // a pre-existing `MIGRATED` seal (issue #1317).
-            diesel::sql_query(
-                "DELETE FROM harvest_workflow_executions WHERE id = $1 AND state = 'MIGRATING'",
-            )
-            .bind::<SqlUuid, _>(exec_id.as_uuid())
-            .execute(&mut *conn)
-            .await
-            .map_err(database_error)?;
+                if restored == 0 {
+                    // No pointer was carried: this row is a first-time
+                    // staged copy, not a restored seal. Deleting it is
+                    // safe. The check above already confirmed the row is
+                    // `MIGRATING`, so this cannot match a pre-existing
+                    // `MIGRATED` seal (issue #1317).
+                    diesel::sql_query(
+                        "DELETE FROM harvest_workflow_executions \
+                          WHERE id = $1 AND state = 'MIGRATING'",
+                    )
+                    .bind::<SqlUuid, _>(exec_id.as_uuid())
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(database_error)?;
+                }
+            }
         }
 
         // Restore an unrelated same-key row `stage_copy` vacated to make
@@ -1621,12 +1630,14 @@ mod db {
         // statement as the vacate itself. This match needs no
         // continuous-occupancy argument to be safe.
         //
-        // This runs LAST, after the staged row above is gone or sealed
-        // back to `MIGRATED`. Both states already free this business
-        // key's slot in the active-uniqueness index once. Restoring the
-        // vacated row any earlier would briefly hold two active rows for
-        // the same key at once. That fails against the very index this
-        // whole scheme exists to respect.
+        // This runs LAST, after the `if let` above resolves the staged
+        // row. That row may end up gone, sealed back to `MIGRATED`,
+        // deleted outright, or left untouched in some other terminal state
+        // (issue #1596 review, P1). Every one of those outcomes already
+        // frees this business key's slot in the active-uniqueness index
+        // once. Restoring the vacated row any earlier would briefly hold
+        // two active rows for the same key at once. That fails against the
+        // very index this whole scheme exists to respect.
         diesel::sql_query(
             "UPDATE harvest_workflow_executions \
               SET state = staging_vacated_state, staging_vacated_state = NULL, \

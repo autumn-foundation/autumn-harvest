@@ -1360,9 +1360,16 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                     .map_err(database_error)?;
                 if let Some(seal) = reconciled_seal {
                     if request.reuse_policy == WorkflowIdReusePolicy::RejectDuplicate {
+                        // Report the effective terminal state, not the
+                        // seal's own `MIGRATED` marker (issue #1596 review,
+                        // P2), matching the attach path just below.
+                        // `MIGRATED` is an internal forwarding state; a
+                        // caller checking this refusal for a specific
+                        // outcome must not be told the run is still
+                        // migrating.
                         return Err(HarvestError::AlreadyExists {
                             existing_exec_id: ExecutionId::from_uuid(seal.id),
-                            existing_state: seal.state,
+                            existing_state: seal.effective_terminal_state().to_string(),
                         });
                     }
                     if !matches!(seal.effective_terminal_state(), "FAILED" | "CANCELLED") {
