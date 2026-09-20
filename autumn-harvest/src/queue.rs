@@ -37,6 +37,34 @@ const IMMEDIATE_SCHEDULE_SKEW_SECS: i32 = 5;
 const IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE: Duration =
     Duration::seconds(IMMEDIATE_SCHEDULE_SKEW_SECS as i64);
 
+/// Skew allowance for a retry deadline (issue #1389). Same magnitude as
+/// [`IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE`], applied in the opposite direction.
+const RETRY_SCHEDULE_SKEW_ALLOWANCE: Duration = IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE;
+
+/// Compute a retry `scheduled_at` that holds its delay under clock skew.
+///
+/// `claim_task` checks `scheduled_at <= NOW()` on Postgres's clock. This
+/// function runs on the host's clock instead. Pad a positive delay by
+/// [`RETRY_SCHEDULE_SKEW_ALLOWANCE`]. The deadline then still holds `delay`
+/// past Postgres's clock, even when the host clock trails it by up to that
+/// allowance. See issue #1389.
+///
+/// A zero or negative delay carries no backoff to protect. This function
+/// does not pad it: the row stays immediately eligible, matching a caller's
+/// explicit "no backoff" request.
+///
+/// This also protects a queue-pause resume. The resume's credited-wait
+/// formula only shifts a row that is already due. A padded zero-delay reset
+/// would look like a backoff still in progress, and the resume would skip
+/// it.
+fn retry_scheduled_at(delay: Duration) -> DateTime<Utc> {
+    if delay > Duration::zero() {
+        Utc::now() + delay + RETRY_SCHEDULE_SKEW_ALLOWANCE
+    } else {
+        Utc::now() + delay
+    }
+}
+
 /// Compute the **DB-clock** portion of schedule-to-start latency in seconds: the
 /// wait from a task's *true* eligibility to when it was claimed (`claimed_at`),
 /// clamped to `0`.
@@ -2852,7 +2880,7 @@ pub async fn requeue_for_retry(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let next_run = Utc::now() + delay;
+    let next_run = retry_scheduled_at(delay);
     let changeset = PendingRequeueChangeset::new(next_run, previous_error.to_string());
 
     let (queue_name, priority, task_type) = diesel::update(
@@ -2932,7 +2960,7 @@ pub async fn requeue_workflow_task_nd_blocked(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let next_run = Utc::now() + delay;
+    let next_run = retry_scheduled_at(delay);
     let changeset = PendingRequeueChangeset::new(next_run, reason.to_string());
 
     let updated = diesel::update(
@@ -3039,7 +3067,7 @@ pub async fn requeue_workflow_task_after_panic(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let next_run = Utc::now() + delay;
+    let next_run = retry_scheduled_at(delay);
     let changeset = PendingRequeueChangeset::new(next_run, reason.to_string());
 
     let updated = diesel::update(
@@ -10127,6 +10155,42 @@ mod tests {
                 Some(now - Duration::seconds(300)),
                 now
             ) < f64::EPSILON
+        );
+    }
+
+    /// `retry_scheduled_at` must pad `delay` by the skew allowance (issue
+    /// #1389). Without the padding, a `next_run` computed on a trailing host
+    /// clock can already be due by the time `claim_task` checks it. The
+    /// backoff would then never apply.
+    #[test]
+    fn retry_scheduled_at_pads_the_delay_by_the_skew_allowance() {
+        let before = Utc::now();
+        let delay = Duration::seconds(2);
+        let deadline = retry_scheduled_at(delay);
+        let after = Utc::now();
+
+        let min_expected = before + delay + RETRY_SCHEDULE_SKEW_ALLOWANCE;
+        let max_expected = after + delay + RETRY_SCHEDULE_SKEW_ALLOWANCE;
+        assert!(
+            deadline >= min_expected && deadline <= max_expected,
+            "expected a deadline padded by the skew allowance in \
+             [{min_expected}, {max_expected}], got {deadline}"
+        );
+    }
+
+    /// A zero delay carries no backoff to protect. `retry_scheduled_at` must
+    /// not pad it (issue #1389). A queue-pause resume credits held wait only
+    /// to a row that is already due. Padding a zero-delay reset would look
+    /// like a backoff still in progress, and the resume would strand it.
+    #[test]
+    fn retry_scheduled_at_does_not_pad_a_zero_delay() {
+        let before = Utc::now();
+        let deadline = retry_scheduled_at(Duration::zero());
+        let after = Utc::now();
+
+        assert!(
+            deadline >= before && deadline <= after,
+            "expected an unpadded deadline in [{before}, {after}], got {deadline}"
         );
     }
 
