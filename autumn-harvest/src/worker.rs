@@ -10392,8 +10392,23 @@ async fn persist_all_started_child_workflows(
         // instead of one row each.
         let mut sequential_children: Vec<LocalChildPlan<'_>> = Vec::new();
         let mut batchable_children: Vec<LocalChildPlan<'_>> = Vec::new();
+        // Issue #1589: `RetryPolicy::non_retryable_errors` is an unbounded
+        // `Vec<String>`. Without this cache, a same-type fan-out would
+        // resolve and hold one independent deep copy per child. All
+        // copies stay alive at once before the first insert chunk runs.
+        // The cache lets same-type children in this fan-out share ONE
+        // resolved `Arc`. Peak memory then scales with distinct workflow
+        // types, not with child count.
+        let mut retry_policy_cache: HashMap<&str, Arc<serde_json::Value>> = HashMap::new();
         for child in &local_new_children {
-            let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
+            let mut defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
+            if let Some(policy) = defaults.retry_policy.take() {
+                defaults.retry_policy = Some(cached_retry_policy(
+                    &mut retry_policy_cache,
+                    child.workflow_name.as_str(),
+                    policy,
+                ));
+            }
             // Resolve + bound the CHILD's own quota key from ITS OWN declared
             // policy (issue #946, Codex round-3 review) -- a spawned child
             // accumulates its own history/DLQ/active-execution footprint
@@ -10747,7 +10762,13 @@ struct ChildWorkflowDefaults {
     deadline_at: Option<chrono::DateTime<chrono::Utc>>,
     chain_execution_timeout: Option<chrono::Duration>,
     chain_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
-    retry_policy: Option<serde_json::Value>,
+    /// Shared, not owned per child (issue #1589).
+    /// `RetryPolicy::non_retryable_errors` is an unbounded `Vec<String>`.
+    /// A same-type fan-out with a large policy would otherwise hold one
+    /// independent deep copy per `LocalChildPlan`. All copies stay alive
+    /// at once before the first insert chunk runs. `Arc` lets same-type
+    /// children in one fan-out share the one resolved value.
+    retry_policy: Option<Arc<serde_json::Value>>,
     /// The child's OWN declared quota policy (issue #946), resolved from its
     /// registered `WorkflowInfo` — never inherited from the parent. A child
     /// spawn is a genuine fresh admission from a resource-accumulation
@@ -10863,6 +10884,23 @@ fn compute_local_child_chunk_bounds(
     chunk_bounds
 }
 
+/// Returns the cached retry-policy `Arc` for `workflow_name`, storing
+/// `policy` as the entry on first use (issue #1589).
+///
+/// `RetryPolicy::non_retryable_errors` is an unbounded `Vec<String>`.
+/// Without this cache, a same-type fan-out would resolve and hold one
+/// independent deep copy per child. All copies stay alive at once
+/// before the first insert chunk runs. Same-type children in one
+/// fan-out then share ONE `Arc`. Peak memory then scales with distinct
+/// workflow types, not with child count.
+fn cached_retry_policy<'a>(
+    cache: &mut HashMap<&'a str, Arc<serde_json::Value>>,
+    workflow_name: &'a str,
+    policy: Arc<serde_json::Value>,
+) -> Arc<serde_json::Value> {
+    Arc::clone(cache.entry(workflow_name).or_insert(policy))
+}
+
 /// Builds one local awaited child's insert row from its [`LocalChildPlan`].
 ///
 /// Shared by both the sequential and the batched-insert paths in
@@ -10924,7 +10962,7 @@ fn build_child_row<'p>(
         schedule_id: None, // child workflows are not scheduled fires
         scheduled_for: None,
         workflow_attempt: 1,
-        workflow_retry_policy: plan.defaults.retry_policy.clone(),
+        workflow_retry_policy: plan.defaults.retry_policy.as_deref().cloned(),
         retry_of_exec_id: None,
         origin: None, // child workflow, not a schedule fire (issue #534)
         // Children get only builder-wide default callback targets,
@@ -11057,9 +11095,9 @@ fn cross_shard_child_spec(
         // without this a workflow whose declared policy exceeds the ceiling would
         // get all its declared attempts purely because it was placed remotely.
         retry_policy: if detached {
-            clamp_detached_retry_policy(registry, defaults.retry_policy.clone())
+            clamp_detached_retry_policy(registry, defaults.retry_policy.as_deref().cloned())
         } else {
-            defaults.retry_policy.clone()
+            defaults.retry_policy.as_deref().cloned()
         },
         trace_context,
         quota_key,
@@ -11158,7 +11196,9 @@ fn resolve_child_workflow_defaults(
         deadline_at,
         chain_execution_timeout,
         chain_deadline_at,
-        retry_policy: retry_policy.and_then(|p| serde_json::to_value(&p).ok()),
+        retry_policy: retry_policy
+            .and_then(|p| serde_json::to_value(&p).ok())
+            .map(Arc::new),
         quota,
     }
 }
@@ -11275,7 +11315,7 @@ async fn insert_awaited_child_execution(
         schedule_id: None, // child workflows are not scheduled fires
         scheduled_for: None,
         workflow_attempt: 1,
-        workflow_retry_policy: defaults.retry_policy,
+        workflow_retry_policy: defaults.retry_policy.as_deref().cloned(),
         retry_of_exec_id: None,
         origin: None, // child workflow, not a schedule fire (issue #534)
         // Children get only builder-wide default callback targets, resolved at
@@ -30160,6 +30200,35 @@ mod tests {
                  row's allowance"
             );
         }
+    }
+
+    /// Issue #1589: a same-type fan-out must share one retry-policy
+    /// `Arc`, not hold an independent deep copy per child. `Arc::ptr_eq`
+    /// proves the second lookup for the same workflow name reused the
+    /// first `Arc` instead of allocating a new one.
+    #[test]
+    fn cached_retry_policy_shares_the_arc_across_same_type_children() {
+        let mut cache: HashMap<&str, Arc<serde_json::Value>> = HashMap::new();
+        let first_child_policy = Arc::new(serde_json::json!({"max_attempts": 5}));
+        let shared_a = cached_retry_policy(&mut cache, "wf", first_child_policy);
+
+        // The second child of the same type resolves its OWN fresh `Arc`.
+        // This mirrors `resolve_child_workflow_defaults` serializing again
+        // per child. The cache must discard it and hand back the first.
+        let second_child_policy = Arc::new(serde_json::json!({"max_attempts": 5}));
+        let shared_b = cached_retry_policy(&mut cache, "wf", second_child_policy);
+        assert!(
+            Arc::ptr_eq(&shared_a, &shared_b),
+            "same workflow type must reuse the cached Arc, not hold an independent copy"
+        );
+
+        // A different workflow type must not reuse another type's policy.
+        let other_type_policy = Arc::new(serde_json::json!({"max_attempts": 1}));
+        let shared_c = cached_retry_policy(&mut cache, "other_wf", other_type_policy);
+        assert!(
+            !Arc::ptr_eq(&shared_a, &shared_c),
+            "distinct workflow types must not share a cached Arc"
+        );
     }
 
     fn scheduled(
