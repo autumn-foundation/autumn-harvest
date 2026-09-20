@@ -13378,11 +13378,28 @@ fn deadline_would_be_exceeded(
 /// candidate: [`record_schedule_to_close_activity_timeout`] re-validates
 /// against the fresh row value under the execution row lock before failing
 /// the task terminally.
-fn schedule_to_close_deadline_exceeded(
+///
+/// Reads Postgres's own clock (issue #1389), not the host's: a fall-through
+/// here ends in [`queue::requeue_for_retry`], which stamps `scheduled_at`
+/// from that same DB clock. A host-clock decision could pass this gate and
+/// still write a `scheduled_at` past `schedule_to_close_at`, stranding the
+/// row until a timeout scanner sweeps it. No query when the task carries no
+/// deadline — the common case, and [`deadline_would_be_exceeded`] would
+/// short-circuit to `false` on it regardless.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+async fn schedule_to_close_deadline_exceeded(
+    conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     retry_delay: chrono::Duration,
-) -> bool {
-    deadline_would_be_exceeded(task.schedule_to_close_at, chrono::Utc::now(), retry_delay)
+) -> HarvestResult<bool> {
+    let Some(deadline) = task.schedule_to_close_at else {
+        return Ok(false);
+    };
+    let now = queue::db_clock_now(conn).await?;
+    Ok(deadline_would_be_exceeded(Some(deadline), now, retry_delay))
 }
 
 /// Non-locking read of whether the owning execution is currently `PAUSED`.
@@ -13549,10 +13566,19 @@ async fn record_schedule_to_close_activity_timeout(
             // owning execution was paused after the caller's non-locking
             // fast-path read, or a concurrent resume shifted the deadline
             // into the future (this attempt still has budget).
+            //
+            // `db_clock_now`, not the host clock (issue #1389): a
+            // `DeadlineShifted` verdict here falls through to
+            // `queue::requeue_for_retry`, which stamps `scheduled_at` from
+            // Postgres's own clock. This transaction has already done other
+            // work above, so a plain `NOW()` query would also be wrong here.
+            // `db_clock_now` reads `clock_timestamp()` for exactly that
+            // reason.
+            let now = queue::db_clock_now(conn).await?;
             if let Some(outcome) = schedule_to_close_recheck_outcome(
                 &execution.state,
                 task_row.as_ref(),
-                chrono::Utc::now(),
+                now,
                 retry_delay,
             ) {
                 return Ok(outcome);
@@ -13647,7 +13673,7 @@ async fn handle_activity_result(
                 // the owning execution is PAUSED (issue #609, AC5): the pause
                 // suspends the deadline clock, so requeue normally and let the
                 // resume-time shift push the deadline forward.
-                if schedule_to_close_deadline_exceeded(task, delay)
+                if schedule_to_close_deadline_exceeded(conn, task, delay).await?
                     && !owning_execution_is_paused(conn, exec_id).await?
                 {
                     match record_schedule_to_close_activity_timeout(

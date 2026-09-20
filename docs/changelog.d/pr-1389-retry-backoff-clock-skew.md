@@ -13,7 +13,7 @@ Two siblings share the identical defect: `requeue_workflow_task_nd_blocked`
 and `requeue_workflow_task_after_panic` compute their deadlines the same
 way.
 
-**Fix.** All three now compute `scheduled_at` as `NOW() +
+**Fix.** All three now compute `scheduled_at` as `clock_timestamp() +
 make_interval(secs => $N)` inside the `UPDATE` statement itself, stamping
 it on Postgres's own clock — the same clock `claim_task` later checks it
 against. This mirrors the pre-existing `release_task_for_capability_miss_query`
@@ -55,5 +55,32 @@ Also fixed: the new integration suite was initially missing from
 `.github/ci/integration-suites.txt`, so it compiled but never actually
 ran in CI — caught by `ci_run_coverage`'s own guard test before merge.
 
+**Second review round found two more clock-consistency gaps in the DB-clock
+fix itself.**
+
+1. `schedule_to_close_deadline_exceeded` — the gate deciding whether a retry
+   still fits before `schedule_to_close_at`, short-circuiting to a terminal
+   timeout otherwise — still evaluated the host clock, while
+   `requeue_for_retry` now stamps `scheduled_at` from Postgres's clock.
+   Under real host/DB skew the gate could pass while the written
+   `scheduled_at` actually lands past the deadline, stranding the row until
+   the timeout scanner sweeps it. Its in-transaction recheck in
+   `record_schedule_to_close_activity_timeout` had the identical gap. Both
+   now read a new `queue::db_clock_now` helper instead.
+2. `NOW()` is frozen at the enclosing transaction's start, not the current
+   time. `requeue_workflow_task_nd_blocked` runs inside a transaction that
+   already did other work (a row lock, a search-attrs write), so a slow
+   prior step could understate the backoff, or erase it outright. All three
+   requeue functions (and `db_clock_now`) now use `clock_timestamp()`
+   instead, which reads the real time at execution — the same distinction
+   `queue_pause::resume_shift_scheduled_at_query`'s own doc comment already
+   documents for this exact pitfall.
+
+New test `requeue_workflow_task_nd_blocked_uses_the_live_clock_inside_a_transaction`
+reproduces the transaction-frozen-clock path with `pg_sleep` standing in for
+real prior work. Confirmed red against `NOW()`, green against
+`clock_timestamp()`.
+
 No `WorkflowEvent` variant, no migration, no replay impact — the change is
-confined to how `scheduled_at` is computed before the write.
+confined to how `scheduled_at` is computed before the write, and to the two
+retry-vs-timeout gates that must now agree with it.

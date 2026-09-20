@@ -8,9 +8,12 @@
 //! **Postgres's** clock. A host-computed deadline can already be due by the
 //! time `claim_task` checks it, when the host clock trails Postgres's.
 //!
-//! The fix computes `scheduled_at` as `NOW() + make_interval(secs => ...)`
-//! inside the `UPDATE` statement itself. This stamps it on Postgres's own
-//! clock, the same clock `claim_task` later checks it against.
+//! The fix computes `scheduled_at` as `clock_timestamp() + make_interval(secs
+//! => ...)` inside the `UPDATE` statement itself. This stamps it on
+//! Postgres's own clock, the same clock `claim_task` later checks it
+//! against. `clock_timestamp()`, not `NOW()`: some callers run this inside a
+//! transaction that already did other work, and `NOW()` is frozen at that
+//! transaction's start.
 //!
 //! These tests compare the written `scheduled_at` against a query using the
 //! database's own `NOW()`, never the host clock. Each checks that the held
@@ -197,6 +200,43 @@ async fn requeue_workflow_task_nd_blocked_computes_scheduled_at_on_the_db_clock(
     queue::requeue_workflow_task_nd_blocked(&mut conn, task, delay, "non-determinism")
         .await
         .expect("requeue nd-blocked");
+
+    assert_scheduled_at_matches_delay_on_db_clock(&mut conn, task, delay).await;
+}
+
+/// Inside a transaction with elapsed prior work, `NOW()` is frozen at the
+/// transaction's start (issue #1389). `clock_timestamp()` is not.
+///
+/// `block_workflow_for_non_determinism` calls
+/// `requeue_workflow_task_nd_blocked` after a row lock and a prior write in
+/// the same transaction. This reproduces that shape, with `pg_sleep`
+/// standing in for that prior work. The backoff must still hold `delay`
+/// from the requeue's real execution time, not from the transaction's
+/// start.
+#[tokio::test]
+async fn requeue_workflow_task_nd_blocked_uses_the_live_clock_inside_a_transaction() {
+    use diesel_async::AsyncConnection as _;
+
+    let (mut conn, _c) = setup_db().await;
+    let q = unique_queue("nd-txn-skew");
+    let task = enqueue_workflow_task(&mut conn, &q).await;
+    assert_eq!(claim_one(&mut conn, &q).await, task);
+
+    let delay = Duration::seconds(2);
+    Box::pin(
+        conn.transaction::<(), autumn_harvest::error::HarvestError, _>(async |conn| {
+            // Stand-in for real prior work inside the same transaction (a row
+            // lock, a preceding write) taking a full second before the
+            // requeue itself runs.
+            diesel::sql_query("SELECT pg_sleep(1)")
+                .execute(conn)
+                .await
+                .expect("simulate prior transaction work");
+            queue::requeue_workflow_task_nd_blocked(conn, task, delay, "non-determinism").await
+        }),
+    )
+    .await
+    .expect("requeue nd-blocked");
 
     assert_scheduled_at_matches_delay_on_db_clock(&mut conn, task, delay).await;
 }

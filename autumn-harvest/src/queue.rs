@@ -41,9 +41,16 @@ const IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE: Duration =
 /// #1389).
 ///
 /// `requeue_for_retry` and its siblings compute their retry deadline as
-/// `NOW() + make_interval(secs => ...)`, inside the `UPDATE` statement
-/// itself. This stamps it on Postgres's own clock. `claim_task` later checks
-/// that same deadline against that same clock (`scheduled_at <= NOW()`).
+/// `clock_timestamp() + make_interval(secs => ...)`, inside the `UPDATE`
+/// statement itself. This stamps it on Postgres's own clock. `claim_task`
+/// later checks that same deadline against that same clock
+/// (`scheduled_at <= NOW()`).
+///
+/// `clock_timestamp()`, not `NOW()`: some callers run this `UPDATE` inside a
+/// transaction that already did other work (a row lock, a prior write).
+/// `NOW()` is frozen at that transaction's start, so it would understate the
+/// elapsed backoff by however long that prior work took.
+/// `clock_timestamp()` is volatile and reads the real time at execution.
 ///
 /// A host-computed deadline (`Utc::now() + delay`) can already be due by the
 /// time `claim_task` checks it, when the host clock trails Postgres's.
@@ -52,6 +59,35 @@ const IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE: Duration =
 #[allow(clippy::cast_precision_loss)] // millisecond delay never approaches 2^53
 fn delay_secs(delay: Duration) -> f64 {
     delay.num_milliseconds() as f64 / 1000.0
+}
+
+#[derive(diesel::QueryableByName)]
+struct ClockTimestampRow {
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    now: DateTime<Utc>,
+}
+
+/// Probe Postgres's own, live clock (issue #1389).
+///
+/// Uses `clock_timestamp()`, not `NOW()`, so a caller inside an open
+/// transaction still gets the real current time, not that transaction's
+/// frozen start time.
+///
+/// A caller deciding whether a retry still fits inside
+/// `schedule_to_close_at` needs this. [`requeue_for_retry`] and its
+/// siblings already compute their own deadline on this same clock. A
+/// host-clock decision here could otherwise disagree with the deadline
+/// they actually write.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn db_clock_now(conn: &mut AsyncPgConnection) -> HarvestResult<DateTime<Utc>> {
+    diesel::sql_query("SELECT clock_timestamp() AS now")
+        .get_result::<ClockTimestampRow>(conn)
+        .await
+        .map(|row| row.now)
+        .map_err(crate::error::database_error)
 }
 
 /// Compute the **DB-clock** portion of schedule-to-start latency in seconds: the
@@ -2878,9 +2914,11 @@ pub async fn requeue_for_retry(
     )
     .set((
         changeset,
-        dsl::scheduled_at.eq(sql::<Timestamptz>("NOW() + make_interval(secs => ")
-            .bind::<Double, _>(delay_secs(delay))
-            .sql(")")),
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
     ))
     .returning((
         dsl::queue_name,
@@ -2970,9 +3008,11 @@ pub async fn requeue_workflow_task_nd_blocked(
     )
     .set((
         changeset,
-        dsl::scheduled_at.eq(sql::<Timestamptz>("NOW() + make_interval(secs => ")
-            .bind::<Double, _>(delay_secs(delay))
-            .sql(")")),
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
         dsl::sticky_worker_id.eq(None::<String>),
         dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
         dsl::sticky_timeout.eq(None::<chrono::Duration>),
@@ -3026,9 +3066,11 @@ fn requeue_after_panic_query(changeset: PendingRequeueChangeset, delay: Duration
     )
     .set((
         changeset,
-        dsl::scheduled_at.eq(sql::<Timestamptz>("NOW() + make_interval(secs => ")
-            .bind::<Double, _>(delay_secs(delay))
-            .sql(")")),
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
         dsl::sticky_worker_id.eq(None::<String>),
         dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
         dsl::sticky_timeout.eq(None::<chrono::Duration>),
@@ -3086,9 +3128,11 @@ pub async fn requeue_workflow_task_after_panic(
     )
     .set((
         changeset,
-        dsl::scheduled_at.eq(sql::<Timestamptz>("NOW() + make_interval(secs => ")
-            .bind::<Double, _>(delay_secs(delay))
-            .sql(")")),
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
         dsl::sticky_worker_id.eq(None::<String>),
         dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
         dsl::sticky_timeout.eq(None::<chrono::Duration>),
@@ -10067,7 +10111,7 @@ mod tests {
         // `scheduled_at` is computed on Postgres's own clock (issue #1389),
         // not bound as a plain parameter.
         assert!(
-            sql.contains("\"scheduled_at\" = NOW() + make_interval(secs => $"),
+            sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => $"),
             "scheduled_at must be computed from Postgres's own clock: {sql}"
         );
         // The null-ing columns (worker_id/started_at/last_heartbeat_at +
