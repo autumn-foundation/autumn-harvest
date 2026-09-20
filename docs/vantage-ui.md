@@ -342,8 +342,10 @@ Use the workflow detail page at `/workflows/{exec_id}` to investigate a workflow
 
 Recurring Wayfinder sweeps over this dashboard, most recent first:
 
-- [`docs/ux-vantage-sweep-2026-09-20.md`](ux-vantage-sweep-2026-09-20.md) — negative
-  result. Re-verified the `Query<..>` broken-error-path class (#1333 through #1641)
-  stays closed, extended the same inventory to `Path<..>` extractors, and rejected
-  the one outlier found (`lift_gate_ui`) against the impact floor for lack of a
-  reachable failure mechanism.
+- [`docs/ux-vantage-sweep-2026-09-20.md`](ux-vantage-sweep-2026-09-20.md) — fixed
+  `refresh` on the Workers, DLQ, and Schedules pages (broken error paths 3→0):
+  `WorkerListParams`/`DeadLetterListParams`/`ScheduleListParams::refresh` were still
+  `Option<u64>`, missed when the DAG detail page's own `refresh` field was fixed
+  (#1630). Also extended the sweep to `Path<..>` extractors and rejected the one
+  outlier found (`lift_gate_ui`) against the impact floor for lack of a reachable
+  failure mechanism.

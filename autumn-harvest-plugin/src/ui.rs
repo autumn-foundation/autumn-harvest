@@ -397,9 +397,15 @@ pub(crate) struct WorkerListParams {
     /// Filter by build ID (exact match).
     #[serde(default)]
     build_id: Option<String>,
+    // `refresh` is `String`, not `u64` — same fix as `page`/`limit` above
+    // and as the DAG detail page's own `refresh` (#1630). A non-numeric
+    // value on a bookmarked `?refresh=30` URL, later mistyped, failed
+    // axum's query deserialization with a bare 400 before this handler
+    // ever ran. That discarded every other filter already on the URL.
+    // Reuses `parse_refresh_query_field`, the same parser DAG detail uses.
     /// Auto-refresh interval in seconds (emits a `<meta http-equiv="refresh">` tag).
     #[serde(default)]
-    refresh: Option<u64>,
+    refresh: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -452,8 +458,11 @@ pub(crate) struct DeadLetterListParams {
     failed_before: Option<String>,
     #[serde(default)]
     shard_id: Option<String>,
+    // `refresh` is `String`, not `u64` — same fix as `page`/`limit` above
+    // and as the DAG detail page's own `refresh` (#1630). Reuses
+    // `parse_refresh_query_field`, the same parser DAG detail uses.
     #[serde(default)]
-    refresh: Option<u64>,
+    refresh: Option<String>,
     #[serde(default)]
     flash: Option<String>,
     /// `summary` switches to the root-cause aggregation view (issue #385).
@@ -2497,6 +2506,11 @@ async fn list_dead_letters_ui(
         params.failed_before.as_deref(),
         params.shard_id.as_deref(),
     );
+    // Same fix, applied to `refresh` (Codex review on #1665: this field was
+    // missed by the page/limit sweep above, still typed `Option<u64>`
+    // directly on the extractor). Reuses `parse_refresh_query_field`, the
+    // DAG detail page's own parser (#1630).
+    let (refresh, refresh_error) = parse_refresh_query_field(params.refresh.as_deref());
 
     let pool = api_state.storage_pool().map_err(map_error)?;
 
@@ -2510,8 +2524,9 @@ async fn list_dead_letters_ui(
             limit,
             &limit_raw,
             limit_error.as_deref(),
-            params.refresh,
+            refresh,
             params.flash.as_deref(),
+            refresh_error.as_deref(),
         )
         .await;
     }
@@ -2590,10 +2605,11 @@ async fn list_dead_letters_ui(
         &limit_raw,
         has_next,
         total_for_pagination,
-        params.refresh,
+        refresh,
         params.flash.as_deref(),
         limit_error.as_deref(),
         page_error.as_deref(),
+        refresh_error.as_deref(),
     ))
 }
 
@@ -3000,6 +3016,12 @@ async fn list_workers_ui(
     let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
     let offset = page.saturating_mul(limit);
 
+    // Same fix, applied to `refresh` (Codex review on #1665: this field was
+    // missed by the page/limit/shard sweep above, still typed `Option<u64>`
+    // directly on the extractor). Reuses `parse_refresh_query_field`, the
+    // DAG detail page's own parser (#1630).
+    let (refresh, refresh_error) = parse_refresh_query_field(params.refresh.as_deref());
+
     let stale_threshold = api_state.worker_stale_threshold();
     let pool = api_state.storage_pool().map_err(map_error)?;
 
@@ -3095,10 +3117,11 @@ async fn list_workers_ui(
         &stale_raw,
         stale_error.as_deref(),
         build_id_filter,
-        params.refresh,
+        refresh,
         &limit_raw,
         limit_error.as_deref(),
         page_error.as_deref(),
+        refresh_error.as_deref(),
     ))
 }
 
@@ -3516,6 +3539,7 @@ fn render_dead_letters_page(
     flash: Option<&str>,
     limit_error: Option<&str>,
     page_error: Option<&str>,
+    refresh_error: Option<&str>,
 ) -> Markup {
     let body = html! {
         h2 { "Dead Letters" }
@@ -3523,7 +3547,7 @@ fn render_dead_letters_page(
             div.flash role="status" tabindex="-1" autofocus { (message) }
         }
         (render_dead_letter_view_toggle(filters, filter_raw, limit, limit_raw, refresh, None, false))
-        (render_dead_letter_filters(filters, filter_raw, limit, limit_raw, limit_error, refresh))
+        (render_dead_letter_filters(filters, filter_raw, limit, limit_raw, limit_error, refresh, refresh_error))
         (render_dead_letter_bulk_actions(filters, filter_raw, limit, limit_raw, refresh, total_matching))
 
         @if rows.is_empty() && shard_errors.is_empty() {
@@ -3584,6 +3608,7 @@ async fn render_dead_letters_summary_view(
     limit_error: Option<&str>,
     refresh: Option<u64>,
     flash: Option<&str>,
+    refresh_error: Option<&str>,
 ) -> Result<Markup, AutumnError> {
     let group_by = parse_dlq_summary_group_by(group_by_raw)?;
     let group_by_value = group_by
@@ -3615,7 +3640,7 @@ async fn render_dead_letters_summary_view(
             div.flash role="status" tabindex="-1" autofocus { (message) }
         }
         (render_dead_letter_view_toggle(filters, filter_raw, limit, limit_raw, refresh, Some(&group_by_value), true))
-        (render_dead_letter_filters(filters, filter_raw, limit, limit_raw, limit_error, refresh))
+        (render_dead_letter_filters(filters, filter_raw, limit, limit_raw, limit_error, refresh, refresh_error))
         (render_dlq_summary_group_by_form(filters, filter_raw, limit, limit_raw, refresh, &group_by))
 
         @for (shard_id, error) in &shard_errors {
@@ -4004,6 +4029,7 @@ fn render_dead_letter_filters(
     limit_raw: &str,
     limit_error: Option<&str>,
     refresh: Option<u64>,
+    refresh_error: Option<&str>,
 ) -> Markup {
     let workflow_name = filters.workflow_name.as_deref().unwrap_or("");
     let task_kind = filters.task_kind.map(DeadLetterTaskKind::as_label);
@@ -4083,6 +4109,9 @@ fn render_dead_letter_filters(
                     @if refresh.is_some_and(|secs| secs != 30 && secs != 60) {
                         option value=(refresh_value) selected { (refresh_value) "s" }
                     }
+                }
+                @if let Some(error) = refresh_error {
+                    span.field-error role="alert" { (error) }
                 }
             }
             button type="submit" { "Apply" }
@@ -4541,11 +4570,18 @@ fn render_workers_page(
     limit_raw: &str,
     limit_error: Option<&str>,
     page_error: Option<&str>,
+    // No form field backs `refresh` on this page, matching DAG detail's
+    // own `node`/`refresh` (#1630). A bad value is reported here as a
+    // page-level alert instead of next to a control.
+    refresh_error: Option<&str>,
 ) -> Markup {
     let total_workers: usize = grouped.iter().map(|(_, rows)| rows.len()).sum();
 
     let body = html! {
         h2 { "Workers" }
+        @if let Some(error) = refresh_error {
+            span.field-error role="alert" { (error) }
+        }
 
         // Fleet health banner
         (render_fleet_banner(stats, banner_state))
@@ -8332,8 +8368,11 @@ pub(crate) struct ScheduleListParams {
     health: Option<String>,
     #[serde(default)]
     shard_id: Option<String>,
+    // `refresh` is `String`, not `u64` — same fix as `page`/`limit` above
+    // and as the DAG detail page's own `refresh` (#1630). Reuses
+    // `parse_refresh_query_field`, the same parser DAG detail uses.
     #[serde(default)]
-    refresh: Option<u64>,
+    refresh: Option<String>,
     #[serde(default)]
     flash: Option<String>,
 }
@@ -8865,6 +8904,11 @@ async fn list_schedules_ui(
         parse_schedule_health_filter(params.health.as_deref());
     let (shard_id, shard_id_raw, shard_id_error) =
         parse_shard_id_filter("shard_id", params.shard_id.as_deref());
+    // Same fix, applied to `refresh` (Codex review on #1665: this field was
+    // missed by the page/limit sweep above, still typed `Option<u64>`
+    // directly on the extractor). Reuses `parse_refresh_query_field`, the
+    // DAG detail page's own parser (#1630).
+    let (refresh, refresh_error) = parse_refresh_query_field(params.refresh.as_deref());
     let target = params
         .target
         .as_deref()
@@ -8941,10 +8985,11 @@ async fn list_schedules_ui(
         total_filtered,
         &unhealthy_summary,
         &distribution,
-        params.refresh,
+        refresh,
         params.flash.as_deref(),
         limit_error.as_deref(),
         page_error.as_deref(),
+        refresh_error.as_deref(),
     ))
 }
 
@@ -9908,6 +9953,7 @@ fn render_schedules_page(
     flash: Option<&str>,
     limit_error: Option<&str>,
     page_error: Option<&str>,
+    refresh_error: Option<&str>,
 ) -> Markup {
     // The "show only unhealthy" link forces `health=Unhealthy`, so it clears
     // any stale health error the same way it clears the parsed override.
@@ -9934,7 +9980,7 @@ fn render_schedules_page(
             }
         }
 
-        (render_schedule_filters(filters, filter_raw, limit, limit_raw, limit_error, refresh))
+        (render_schedule_filters(filters, filter_raw, limit, limit_raw, limit_error, refresh, refresh_error))
         (render_schedule_bulk_actions(filters, filter_raw, limit, limit_raw, refresh, total_filtered, distribution))
 
         @if rows.is_empty() && shard_errors.is_empty() {
@@ -9983,6 +10029,7 @@ fn render_schedule_filters(
     limit_raw: &str,
     limit_error: Option<&str>,
     refresh: Option<u64>,
+    refresh_error: Option<&str>,
 ) -> Markup {
     let target_val = filters.target.as_deref().unwrap_or("");
     let refresh_value = refresh.map(|s| s.to_string()).unwrap_or_default();
@@ -10072,6 +10119,9 @@ fn render_schedule_filters(
                     @if refresh.is_some_and(|secs| secs != 30 && secs != 60) {
                         option value=(refresh_value) selected { (refresh_value) "s" }
                     }
+                }
+                @if let Some(error) = refresh_error {
+                    span.field-error role="alert" { (error) }
                 }
             }
             button type="submit" { "Apply" }
@@ -13391,6 +13441,7 @@ mod tests {
             "",
             None,
             None,
+            None,
         )
         .into_string();
         assert!(
@@ -13505,6 +13556,7 @@ mod tests {
             DEFAULT_DLQ_PAGE_SIZE,
             "not-a-number",
             Some("invalid limit 'not-a-number'"),
+            None,
             None,
         )
         .into_string();
@@ -14128,6 +14180,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .into_string();
         assert!(
@@ -14175,6 +14228,7 @@ mod tests {
             DEFAULT_SCHEDULE_PAGE_SIZE,
             "not-a-number",
             Some("invalid limit 'not-a-number'"),
+            None,
             None,
         )
         .into_string();
@@ -14903,6 +14957,7 @@ mod tests {
             false,
             0,
             Some(30),
+            None,
             None,
             None,
             None,
