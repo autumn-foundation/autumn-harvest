@@ -6876,6 +6876,286 @@ async fn a_force_terminated_staged_copy_still_carries_its_migration_origin() {
     );
 }
 
+/// Issue #1596 review, finding 1 (P1): an operator can force-terminate the
+/// staged copy in the supported `COMMITTED`-before-activation window, after
+/// `commit_cutover` has already sealed the source. `activate_target`'s
+/// `MIGRATING -> RUNNING` update then matches zero rows.
+///
+/// Before this fix, the parked workflow task was restored regardless. That
+/// recreates a `PENDING` task for a row that is actually `TERMINATED`.
+/// `claim_task_query` does not require the owning execution to be
+/// `RUNNING`, so the resurrected task could be claimed and dispatched
+/// against a terminated execution.
+#[tokio::test]
+async fn activation_does_not_resurrect_a_task_over_a_force_terminated_target() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "force-terminated-committed-window").await;
+    let (mut source, mut target) = (shards.source().await, shards.target().await);
+
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+    assert!(
+        commit_cutover(&mut source, exec_id, TARGET)
+            .await
+            .expect("cutover"),
+        "cutover must seal the source"
+    );
+
+    // Force-terminate the staged target row, exactly as an operator's
+    // unconditional `terminate_workflow_execution` does, before
+    // `activate_target` ever runs.
+    diesel::sql_query("UPDATE harvest_workflow_executions SET state = 'TERMINATED' WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut target)
+        .await
+        .expect("force-terminate the staged copy");
+
+    activate_target(&mut source, &mut target, exec_id)
+        .await
+        .expect("activation must still succeed as a no-op over a terminated target");
+
+    let mut target2 = shards.target().await;
+    assert_eq!(
+        state_of(&mut target2, exec_id).await.as_deref(),
+        Some("TERMINATED"),
+        "activation must never overwrite an operator's termination"
+    );
+    assert_eq!(
+        claimable_tasks(&mut target2, exec_id).await,
+        0,
+        "a task must never be restored for an execution activation finds already \
+         TERMINATED -- claim_task_query does not require the owning execution to \
+         be RUNNING, so a resurrected task would be claimable against a \
+         terminated run"
+    );
+}
+
+/// Issue #1596 review, finding 2 (P1): staging can vacate an unrelated
+/// same-key terminal row to free the target's active-uniqueness slot for
+/// the copy being staged. If that staged copy is then force-terminated
+/// before `activate_target` runs, the zero-rows-affected guard must still
+/// finalize the vacated row's marker. The migration concludes as `DONE`
+/// right after this transaction, whether or not activation was a no-op.
+/// `DONE` is terminal, so no future abort can restore that marker.
+///
+/// Before this fix, that marker was left dangling forever. Retention would
+/// permanently report the vacated row as `CONTINUED_AS_NEW` and refuse to
+/// ever delete it.
+#[tokio::test]
+async fn activation_finalizes_a_vacate_marker_over_a_force_terminated_target() {
+    let shards = setup_two_shards().await;
+
+    let mut target = shards.target().await;
+    let stale_id = Uuid::new_v4();
+    target
+        .batch_execute(&format!(
+            "INSERT INTO harvest_workflow_executions \
+               (id, workflow_name, workflow_id, run_id, shard_id, state, input, \
+                started_at, created_at, completed_at) \
+             VALUES \
+               ('{stale_id}', 'entity_flow', 'terminated-target-vacate', gen_random_uuid(), 1, \
+                'COMPLETED', '{{}}', now(), now(), now())"
+        ))
+        .await
+        .expect("seed the stale terminal prior on the target");
+
+    let exec_id = quiescent_fixture(&shards, "terminated-target-vacate").await;
+    let (mut source, mut target) = (shards.source().await, shards.target().await);
+
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("staging must vacate the stale prior and succeed");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+    assert!(
+        commit_cutover(&mut source, exec_id, TARGET)
+            .await
+            .expect("cutover"),
+        "cutover must seal the source"
+    );
+
+    diesel::sql_query("UPDATE harvest_workflow_executions SET state = 'TERMINATED' WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut target)
+        .await
+        .expect("force-terminate the staged copy");
+
+    activate_target(&mut source, &mut target, exec_id)
+        .await
+        .expect("activation must still succeed as a no-op over a terminated target");
+
+    let mut target2 = shards.target().await;
+    let marker: ScalarText = diesel::sql_query(
+        "SELECT staging_vacated_state AS value FROM harvest_workflow_executions WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(stale_id)
+    .get_result(&mut target2)
+    .await
+    .expect("query the stale row's marker");
+    assert_eq!(
+        marker.value, None,
+        "a force-terminated target must still finalize the vacate marker once the \
+         migration concludes as DONE -- otherwise retention reports this row as \
+         CONTINUED_AS_NEW forever and never deletes it"
+    );
+    let stale_state: ScalarText =
+        diesel::sql_query("SELECT state AS value FROM harvest_workflow_executions WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(stale_id)
+            .get_result(&mut target2)
+            .await
+            .expect("query the stale row's state");
+    assert_eq!(
+        stale_state.value.as_deref(),
+        Some("CONTINUED_AS_NEW"),
+        "finalizing the marker must not touch the vacated row's own state"
+    );
+
+    let mut source2 = shards.source().await;
+    let record = load_migration(&mut source2, exec_id)
+        .await
+        .expect("load")
+        .expect("row");
+    assert_eq!(record.phase, MigrationPhase::Done);
+}
+
+/// Issue #1596 review, finding 2 follow-up. The zero-rows-activated finalize
+/// must never clear a marker that belongs to a DIFFERENT, later migration.
+/// That other migration can race in after this one's target is terminated.
+///
+/// `staging_vacated_state` carries no attempt id or timestamp. The only safe
+/// signal left is uniqueness. When two rows under one business key both
+/// carry a marker, neither is touched. The ambiguity is left for an
+/// operator, rather than risk taking a live migration's own restore marker.
+#[tokio::test]
+async fn activation_leaves_an_ambiguous_vacate_marker_alone() {
+    const KEY: &str = "terminated-target-ambiguous-vacate";
+    let shards = setup_two_shards().await;
+
+    let mut target = shards.target().await;
+    let first_stale_id = Uuid::new_v4();
+    target
+        .batch_execute(&format!(
+            "INSERT INTO harvest_workflow_executions \
+               (id, workflow_name, workflow_id, run_id, shard_id, state, input, \
+                started_at, created_at, completed_at) \
+             VALUES \
+               ('{first_stale_id}', 'entity_flow', '{KEY}', gen_random_uuid(), 1, \
+                'COMPLETED', '{{}}', now(), now(), now())"
+        ))
+        .await
+        .expect("seed the first stale terminal prior on the target");
+
+    // Migration A vacates the first stale row and is then force-terminated
+    // before its own `activate_target` ever runs.
+    let exec_a = quiescent_fixture(&shards, KEY).await;
+    let (mut source_a, mut target_a) = (shards.source().await, shards.target().await);
+    begin_migration(&mut source_a, exec_a, SOURCE, TARGET)
+        .await
+        .expect("begin A");
+    stage_copy(&mut source_a, &mut target_a, exec_a, TARGET)
+        .await
+        .expect("stage A must vacate the first stale prior");
+    verify_target_copy(&mut source_a, &mut target_a, exec_a, &codecs())
+        .await
+        .expect("verify A");
+    assert!(
+        commit_cutover(&mut source_a, exec_a, TARGET)
+            .await
+            .expect("cutover A")
+    );
+    diesel::sql_query("UPDATE harvest_workflow_executions SET state = 'TERMINATED' WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_a.as_uuid())
+        .execute(&mut target_a)
+        .await
+        .expect("force-terminate A's staged copy");
+
+    // A's business key is free again. A fresh run starts directly on the
+    // target and lives out its whole life there before migration B arrives.
+    let mut target_fresh = shards.target().await;
+    let second_stale_id = insert_execution_with_id(
+        &mut target_fresh,
+        "entity_flow",
+        KEY,
+        ExecutionId::new_for_shard(TARGET),
+        TARGET,
+    )
+    .await;
+    diesel::sql_query("UPDATE harvest_workflow_executions SET state = 'COMPLETED' WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(second_stale_id.as_uuid())
+        .execute(&mut target_fresh)
+        .await
+        .expect("seed the second stale terminal prior on the target");
+
+    // Migration B, a DIFFERENT execution under the SAME business key, stages
+    // onto the target while A's marker is still unfinalized. It vacates the
+    // second stale row, so two markers now coexist under one business key.
+    let mut source_b = shards.source().await;
+    let exec_b = insert_execution(&mut source_b, "entity_flow", KEY).await;
+    append_history(
+        &mut source_b,
+        exec_b,
+        &[
+            started(json!({"seed": 1})),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("wake"),
+                duration_secs: 604_800,
+            },
+        ],
+    )
+    .await;
+    park_on_timer(&mut source_b, exec_b).await;
+    let mut target_b = shards.target().await;
+    begin_migration(&mut source_b, exec_b, SOURCE, TARGET)
+        .await
+        .expect("begin B");
+    stage_copy(&mut source_b, &mut target_b, exec_b, TARGET)
+        .await
+        .expect("stage B must vacate the second stale prior");
+
+    // A's delayed activation retry must not clear B's own marker.
+    activate_target(&mut source_a, &mut target_a, exec_a)
+        .await
+        .expect("A's activation must still succeed as a no-op");
+
+    let mut target2 = shards.target().await;
+    let first_marker: ScalarText = diesel::sql_query(
+        "SELECT staging_vacated_state AS value FROM harvest_workflow_executions WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(first_stale_id)
+    .get_result(&mut target2)
+    .await
+    .expect("query the first stale row's marker");
+    let second_marker: ScalarText = diesel::sql_query(
+        "SELECT staging_vacated_state AS value FROM harvest_workflow_executions WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(second_stale_id.as_uuid())
+    .get_result(&mut target2)
+    .await
+    .expect("query the second stale row's marker");
+
+    assert_eq!(
+        second_marker.value.as_deref(),
+        Some("COMPLETED"),
+        "B's own in-flight marker must never be cleared by A's unrelated activation retry"
+    );
+    assert_eq!(
+        first_marker.value.as_deref(),
+        Some("COMPLETED"),
+        "an ambiguous marker pair must be left alone rather than guess which one is A's"
+    );
+}
+
 /// `resolve_execution_shard_holding` must report the shard a hop's read
 /// actually used, not the id's raw encoded shard, whenever the two differ.
 ///

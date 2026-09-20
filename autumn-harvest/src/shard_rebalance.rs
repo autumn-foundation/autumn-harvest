@@ -2718,7 +2718,8 @@ mod db {
     /// crash: it is driven entirely off the durable `COMMITTED` record on the
     /// source, which by then is already sealed.
     ///
-    /// Three things happen in one target-shard transaction:
+    /// Three things happen in one target-shard transaction, ALL gated on the
+    /// `MIGRATING → RUNNING` update actually matching a row:
     ///
     /// 1. `MIGRATING → RUNNING`.
     /// 2. The parked workflow task row captured at stage time is restored.
@@ -2728,9 +2729,23 @@ mod db {
     ///    for a timer that may be days out. This is what closes the
     ///    "never lost" half of the wake contract on the post-cutover side.
     ///
+    /// An operator can force-terminate the staged copy during the supported
+    /// `COMMITTED`-before-activation window (issue #1596 review, findings 1
+    /// and 2). Step 1 can then legitimately match zero rows against an
+    /// already-`TERMINATED` row. Steps 2 and 3 must not run in that case.
+    /// Termination already tries to fail every open task for the execution.
+    /// Restoring a `PENDING` task afterward would undo that. `claim_task_query`
+    /// does not require the owning execution to be `RUNNING`. A resurrected
+    /// task could then be claimed and dispatched against a terminated run.
+    /// That branch instead finalizes any vacate marker this migration's own
+    /// staging left on an unrelated row. The migration still concludes as
+    /// `DONE`, and no future abort can restore that marker afterward.
+    ///
     /// # Errors
     ///
     /// [`HarvestError::Database`] on failure.
+    #[allow(clippy::too_many_lines)] // One target transaction, gated as a
+    // whole on `activated > 0`: splitting it would scatter that gate.
     pub async fn activate_target(
         source: &mut AsyncPgConnection,
         target: &mut AsyncPgConnection,
@@ -2829,37 +2844,106 @@ mod db {
                     .execute(&mut *conn)
                     .await
                     .map_err(database_error)?;
-                }
 
-                if let Some(task) = staged_task {
+                    // Gated on `activated > 0` (issue #1596 review, finding
+                    // 1). Termination is an operator override with no
+                    // state-precondition filter. It can seal this copy
+                    // `TERMINATED` before activation ever runs. The update
+                    // above then matches zero rows against an
+                    // already-terminated target. Restoring the parked task
+                    // unconditionally would recreate a `PENDING` row for
+                    // that execution. Termination already tried to fail
+                    // every open task of it. `claim_task_query` does not
+                    // require the owning execution to be `RUNNING`. A
+                    // resurrected task could later be claimed and
+                    // dispatched against a `TERMINATED` execution. An
+                    // idempotent retry of a genuinely successful activation
+                    // already has the task from the original transaction.
+                    // Gating here never loses legitimate work.
+                    if let Some(task) = staged_task {
+                        diesel::sql_query(
+                            "INSERT INTO harvest_task_queue \
+                             SELECT * FROM jsonb_populate_record( \
+                                 NULL::harvest_task_queue, $1::jsonb) \
+                             ON CONFLICT (id) DO NOTHING",
+                        )
+                        .bind::<Jsonb, _>(&task)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(database_error)?;
+                    }
+
+                    // A wake that arrived after the cutover is a staged
+                    // signal row with nothing scheduled to consume it.
+                    // Re-pend now.
                     diesel::sql_query(
-                        "INSERT INTO harvest_task_queue \
-                         SELECT * FROM jsonb_populate_record( \
-                             NULL::harvest_task_queue, $1::jsonb) \
-                         ON CONFLICT (id) DO NOTHING",
+                        "UPDATE harvest_task_queue t \
+                            SET state = 'PENDING', scheduled_at = NOW(), \
+                                wake_requested = FALSE \
+                          WHERE t.workflow_exec_id = $1 AND t.task_type = 'workflow' \
+                            AND t.state IN ('PENDING', 'RUNNING') \
+                            AND t.worker_id IS NULL AND t.started_at IS NULL \
+                            AND EXISTS (SELECT 1 FROM harvest_signals s \
+                                        WHERE s.workflow_exec_id = $1 AND NOT s.consumed)",
                     )
-                    .bind::<Jsonb, _>(&task)
+                    .bind::<SqlUuid, _>(exec_id.as_uuid())
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(database_error)?;
+                } else {
+                    // Activation is a no-op here for one of two reasons.
+                    // Either this is an idempotent retry of an
+                    // already-successful run, and the query below matches
+                    // nothing because this row's own marker was already
+                    // cleared above. Or an operator force-terminated the
+                    // staged copy in the `COMMITTED`-before-activation
+                    // window (issue #1596 review, finding 2).
+                    //
+                    // The migration still concludes as `DONE` right after
+                    // this transaction. `DONE` is a terminal phase, so no
+                    // future abort can walk it back. A vacate marker this
+                    // migration's own staging left on an unrelated row must
+                    // be finalized here, or it is stuck forever. Retention
+                    // would keep reporting that row as `CONTINUED_AS_NEW`.
+                    // It would refuse to ever delete it.
+                    //
+                    // Unlike the `activated > 0` clear above, this
+                    // migration's row stopped occupying the
+                    // active-uniqueness slot the moment it was
+                    // force-terminated. That is not the same transaction as
+                    // this clear. A fresh start can have reused the freed
+                    // slot, run to a terminal state, and been vacated by a
+                    // DIFFERENT, later migration before this runs.
+                    // `staging_vacated_state` carries no attempt id or
+                    // timestamp to tell the two apart. The `NOT EXISTS`
+                    // below only clears a marker that is the SOLE one under
+                    // this business key. A second, ambiguous marker is left
+                    // alone, rather than risk taking the newer migration's
+                    // own restore marker out from under it.
+                    diesel::sql_query(
+                        "UPDATE harvest_workflow_executions AS old \
+                            SET staging_vacated_state = NULL \
+                          WHERE old.staging_vacated_state IS NOT NULL AND old.id != $1 \
+                            AND EXISTS (SELECT 1 FROM harvest_workflow_executions t \
+                                         WHERE t.id = $1 AND t.state = 'TERMINATED') \
+                            AND old.workflow_name = \
+                                (SELECT workflow_name FROM harvest_workflow_executions \
+                                  WHERE id = $1) \
+                            AND old.workflow_id = \
+                                (SELECT workflow_id FROM harvest_workflow_executions \
+                                  WHERE id = $1) \
+                            AND NOT EXISTS ( \
+                                SELECT 1 FROM harvest_workflow_executions other \
+                                 WHERE other.staging_vacated_state IS NOT NULL \
+                                   AND other.id != $1 AND other.id != old.id \
+                                   AND other.workflow_name = old.workflow_name \
+                                   AND other.workflow_id = old.workflow_id)",
+                    )
+                    .bind::<SqlUuid, _>(exec_id.as_uuid())
                     .execute(&mut *conn)
                     .await
                     .map_err(database_error)?;
                 }
-
-                // A wake that arrived after the cutover is a staged signal row
-                // with nothing scheduled to consume it. Re-pend now.
-                diesel::sql_query(
-                    "UPDATE harvest_task_queue t \
-                        SET state = 'PENDING', scheduled_at = NOW(), \
-                            wake_requested = FALSE \
-                      WHERE t.workflow_exec_id = $1 AND t.task_type = 'workflow' \
-                        AND t.state IN ('PENDING', 'RUNNING') \
-                        AND t.worker_id IS NULL AND t.started_at IS NULL \
-                        AND EXISTS (SELECT 1 FROM harvest_signals s \
-                                    WHERE s.workflow_exec_id = $1 AND NOT s.consumed)",
-                )
-                .bind::<SqlUuid, _>(exec_id.as_uuid())
-                .execute(&mut *conn)
-                .await
-                .map_err(database_error)?;
                 Ok(())
             }
         }))
