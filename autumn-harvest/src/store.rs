@@ -462,6 +462,21 @@ fn compute_event_chunk_bounds(events: &[(ExecutionId, WorkflowEvent)]) -> Vec<(u
     chunk_bounds
 }
 
+/// The distinct shards `events` represents, sorted and deduplicated.
+///
+/// Issue #1589: [`append_new_execution_started_events_batch`] is a `pub`
+/// helper. It must not assume every event shares one shard just because
+/// its only current caller happens to guarantee that. Every distinct
+/// shard here gets its own DR fence check.
+#[cfg(feature = "db")]
+fn distinct_shards(events: &[(ExecutionId, WorkflowEvent)]) -> Vec<crate::types::ShardId> {
+    let mut shards: Vec<crate::types::ShardId> =
+        events.iter().map(|(exec_id, _)| exec_id.shard()).collect();
+    shards.sort_unstable();
+    shards.dedup();
+    shards
+}
+
 /// Append one `WorkflowStarted` event per execution, batched.
 ///
 /// One multi-row `INSERT` per chunk, instead of one `INSERT` per execution
@@ -473,11 +488,14 @@ fn compute_event_chunk_bounds(events: &[(ExecutionId, WorkflowEvent)]) -> Vec<(u
 /// here re-reads `MAX(event_id) FOR UPDATE` to serialize against a sibling.
 /// There is no sibling sharing an execution id to serialize against.
 ///
-/// `events` must share one shard -- true by construction for the only
-/// caller, since a local child always lands on its parent's shard (issue
-/// #956). The DR write-authority fence (issue #954) is asserted for that
-/// shared shard once per chunk, each in its own transaction paired with
-/// that chunk's `INSERT`s.
+/// `events` is not required to share one shard. The only current
+/// caller's local children always land on the parent's shard (issue
+/// #956), and so happen to. This is a `pub` helper another caller could
+/// reach with mixed shards. So the DR write-authority fence (issue
+/// #954) is asserted for every DISTINCT shard a chunk represents, not
+/// just its first event's. Each check runs inside that chunk's own
+/// transaction, paired with its `INSERT`s. A single-shard chunk pays
+/// for exactly one fence check, same as before.
 ///
 /// # Errors
 ///
@@ -498,8 +516,6 @@ pub async fn append_new_execution_started_events_batch(
         return Ok(());
     }
 
-    let shard = events[0].0.shard();
-
     // Chunk boundaries are decided up front from `events` itself (Codex
     // review, issue #1589), before any row is encoded or offloaded. Each
     // chunk then builds, encodes, offloads, and inserts its own small row
@@ -518,6 +534,8 @@ pub async fn append_new_execution_started_events_batch(
     // for the single-execution append path by uploading before the
     // fenced transaction opens. This mirrors it once per chunk.
     for (start, end) in compute_event_chunk_bounds(events) {
+        let chunk_shards = distinct_shards(&events[start..end]);
+
         let mut rows: Vec<NewHarvestEvent<'_>> = events[start..end]
             .iter()
             .map(|(exec_id, event)| {
@@ -548,7 +566,9 @@ pub async fn append_new_execution_started_events_batch(
 
         Box::pin(
             conn.transaction::<(), crate::error::HarvestError, _>(async |conn| {
-                crate::replication::assert_fence(conn, shard).await?;
+                for shard in &chunk_shards {
+                    crate::replication::assert_fence(conn, *shard).await?;
+                }
                 diesel::insert_into(harvest_events::table)
                     .values(&rows)
                     .execute(conn)
@@ -2639,6 +2659,32 @@ mod tests {
             events.len(),
             "every event must fall into a chunk"
         );
+    }
+
+    /// Codex review, issue #1589: a `pub` helper must not silently fence
+    /// only the first event's shard. `distinct_shards` must report every
+    /// shard a batch represents, deduplicated, so the caller can fence
+    /// each one.
+    #[cfg(feature = "db")]
+    #[test]
+    fn distinct_shards_reports_every_shard_deduplicated() {
+        let shard_a = crate::types::ShardId::new(0);
+        let shard_b = crate::types::ShardId::new(1);
+        let started = |shard: crate::types::ShardId| {
+            (
+                ExecutionId::new_for_shard(shard),
+                WorkflowEvent::WorkflowStarted {
+                    input: serde_json::json!({}),
+                    timestamp: Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
+                    scheduled_time: None,
+                },
+            )
+        };
+        let events = vec![started(shard_a), started(shard_b), started(shard_a)];
+
+        assert_eq!(distinct_shards(&events), vec![shard_a, shard_b]);
     }
 
     #[test]

@@ -10842,21 +10842,37 @@ struct LocalChildPlan<'a> {
     child_quota_key: Option<String>,
 }
 
+/// One plan's contribution to a chunk's summed payload: its own
+/// `child.input`, plus `shared_row_bytes`, plus its own resolved retry
+/// policy (Codex review, issue #1589).
+///
+/// `build_child_row` clones `plan.defaults.retry_policy` into every row
+/// (an owned `Value` is unavoidable there -- diesel needs one per row).
+/// The `Arc` cache in the fan-out loop only bounds how many independent
+/// copies exist BEFORE chunking. It says nothing about how much of that
+/// policy lands in a single chunk's `INSERT`. Without this term, a
+/// large same-type retry policy packed to the row-count ceiling could
+/// still build a chunk far over [`MAX_EXECUTION_CHUNK_PAYLOAD_BYTES`].
+/// This holds even though every child's own `input` is tiny.
+fn plan_row_bytes(plan: &LocalChildPlan<'_>, shared_row_bytes: usize) -> usize {
+    let retry_policy_bytes = plan
+        .defaults
+        .retry_policy
+        .as_deref()
+        .map_or(0, json_byte_len);
+    json_byte_len(&plan.child.input) + shared_row_bytes + retry_policy_bytes
+}
+
 /// Splits `plans` into `[start, end)` index ranges, each within both
 /// [`ROWS_PER_EXECUTION_INSERT_CHUNK`] rows and
 /// [`MAX_EXECUTION_CHUNK_PAYLOAD_BYTES`] of summed row payload. Whichever
 /// bound is reached first ends a chunk.
 ///
-/// Measured directly from each plan's own `child.input`, plus
-/// `shared_row_bytes` once per row (Codex review, issue #1589). This runs
-/// before any `NewWorkflowExecution`/event/enqueue row is built.
-/// `shared_row_bytes` is [`build_child_row`]'s per-row clone of the
-/// PARENT's own `context_headers` -- identical for every row in the
-/// batch, but still paid once per row. It belongs in the per-row budget
-/// the same way `child.input` does. The batched-insert loop then builds,
-/// inserts, and drops each chunk's own small row `Vec`s in turn. Peak
-/// memory therefore stays bounded by one chunk's payload, not the whole
-/// group's.
+/// Measured directly from each plan via [`plan_row_bytes`] (Codex review,
+/// issue #1589). This runs before any `NewWorkflowExecution`/event/enqueue
+/// row is built. The batched-insert loop then builds, inserts, and drops
+/// each chunk's own small row `Vec`s in turn. Peak memory therefore stays
+/// bounded by one chunk's payload, not the whole group's.
 ///
 /// Mirrors `queue.rs`'s `compute_chunk_bounds` shape. A non-empty `plans`
 /// always returns at least one range, and every plan falls into exactly
@@ -10869,9 +10885,9 @@ fn compute_local_child_chunk_bounds(
     let mut chunk_start = 0_usize;
     while chunk_start < plans.len() {
         let mut chunk_end = chunk_start + 1;
-        let mut payload_bytes = json_byte_len(&plans[chunk_start].child.input) + shared_row_bytes;
+        let mut payload_bytes = plan_row_bytes(&plans[chunk_start], shared_row_bytes);
         while chunk_end < plans.len() && chunk_end - chunk_start < ROWS_PER_EXECUTION_INSERT_CHUNK {
-            let next_bytes = json_byte_len(&plans[chunk_end].child.input) + shared_row_bytes;
+            let next_bytes = plan_row_bytes(&plans[chunk_end], shared_row_bytes);
             if payload_bytes + next_bytes > MAX_EXECUTION_CHUNK_PAYLOAD_BYTES {
                 break;
             }
@@ -30198,6 +30214,63 @@ mod tests {
                 "chunk [{start}, {end}) carries {chunk_payload} bytes of shared payload alone, \
                  over the {MAX_EXECUTION_CHUNK_PAYLOAD_BYTES}-byte budget by more than one \
                  row's allowance"
+            );
+        }
+    }
+
+    /// Issue #1589: `build_child_row` clones each plan's own resolved
+    /// retry policy into its row. A large same-type policy must
+    /// therefore shrink the chunk size the same way a large `child.input`
+    /// does. This holds even though the `Arc` cache means every plan
+    /// here points at the SAME underlying policy.
+    #[test]
+    fn execution_chunk_bounds_accounts_for_the_retry_policy() {
+        let commands: Vec<StartedChildWorkflowCommand> = (0..200)
+            .map(|_| StartedChildWorkflowCommand {
+                child_id: ExecutionId::new(),
+                workflow_name: "wf".to_string(),
+                input: serde_json::json!("tiny"),
+            })
+            .collect();
+        let near_max_bytes =
+            usize::try_from(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES).unwrap();
+        let large_policy = Arc::new(serde_json::json!("x".repeat(near_max_bytes)));
+        let plans: Vec<LocalChildPlan<'_>> = commands
+            .iter()
+            .map(|child| LocalChildPlan {
+                child,
+                defaults: ChildWorkflowDefaults {
+                    owner: None,
+                    runbook_url: None,
+                    severity: None,
+                    sla: None,
+                    sla_deadline_at: None,
+                    execution_timeout: None,
+                    deadline_at: None,
+                    chain_execution_timeout: None,
+                    chain_deadline_at: None,
+                    retry_policy: Some(Arc::clone(&large_policy)),
+                    quota: None,
+                },
+                child_workflow_id: child.child_id.to_string(),
+                child_quota_key: None,
+            })
+            .collect();
+
+        let bounds = compute_local_child_chunk_bounds(&plans, 0);
+        assert!(
+            bounds.len() > 10,
+            "a large retry policy shared by every plan must still split 200 plans into many \
+             small chunks, got {} chunk(s)",
+            bounds.len()
+        );
+        for &(start, end) in &bounds {
+            let chunk_payload = (end - start) * near_max_bytes;
+            assert!(
+                chunk_payload <= MAX_EXECUTION_CHUNK_PAYLOAD_BYTES + near_max_bytes,
+                "chunk [{start}, {end}) carries {chunk_payload} bytes of retry-policy payload \
+                 alone, over the {MAX_EXECUTION_CHUNK_PAYLOAD_BYTES}-byte budget by more than \
+                 one row's allowance"
             );
         }
     }
