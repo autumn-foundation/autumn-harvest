@@ -1913,3 +1913,10 @@ standalone note rather than part of the claim-path attribution table above:
   splitter every path/type decomposition in the MIR-level determinism
   analyzer goes through (issue #962), guarded with a first-byte check
   before its `starts_with` call (instructions -13.54%, PR #1597).
+* [`docs/performance-status-summary-stalled.md`](performance-status-summary-stalled.md)
+  — `status_summary::count_stalled_candidates`'s correlated `NOT EXISTS`
+  anti-join, 86.9% of a `GET /admin/status` request's buffers on a
+  3,000-active-execution fixture (issue #1643), rewritten as a
+  `MATERIALIZED` CTE anti-joined by equality (`Nested Loop Anti Join` →
+  `Hash Anti Join`; -97.8% buffers in the execution-heavy regime, a
+  smaller but real win in the other two measured regimes, PR #1656).
