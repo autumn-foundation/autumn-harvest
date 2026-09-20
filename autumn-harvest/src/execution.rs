@@ -1271,55 +1271,6 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         // closes.
         lock_execution_admission(conn, request.workflow_name, request.workflow_id).await?;
 
-        // Authoritative locked gate (issue #618, PR #1014). For every
-        // policy EXCEPT TerminateIfRunning (gated unlocked at POINT 1
-        // above), take the `FOR UPDATE` lock on any non-sealed prior
-        // FIRST — before the INSERT — so the create-vs-attach decision the
-        // gate keys on is made on ONE stable, locked state. This is the
-        // move that closes the seal-under-lock TOCTOU: a prior that seals
-        // (to CONTINUED_AS_NEW / TERMINATED) between an unlocked pre-read
-        // and the start is excluded by the `for_update()` filter, so the
-        // fresh replacement it would otherwise leak is caught here. The
-        // lock is reused by the INSERT / `..._by_key_for_update` load
-        // below. `reject_fresh_if_debounced` starts pass `gate = None`, so
-        // this never runs on the debounce path.
-        // Recompute the fast-path predicate from the (cloned) request:
-        // POINT 1 + the pre-check already applied the unlocked gate for the
-        // state-independent `terminate_via_pre_check` case, so skip it here.
-        // Every other policy (incl. conflict-driven Terminate with a
-        // non-`TerminateIfRunning` reuse, and `TerminateIfRunning` +
-        // `UseExisting`/`Fail`) takes the locked read and keys the gate on
-        // the create-vs-attach decision for the LOCKED prior state.
-        let terminate_via_pre_check = request.reuse_policy
-            == WorkflowIdReusePolicy::TerminateIfRunning
-            && effective_active_conflict_behavior(request.reuse_policy, request.conflict_policy)
-                == ActiveConflictBehavior::Terminate;
-        if let Some(mode) = gate
-            && !terminate_via_pre_check
-            && !reject_fresh_if_debounced
-        {
-            let prior = try_load_active_execution_for_update(
-                conn,
-                request.workflow_name,
-                request.workflow_id,
-            )
-            .await?;
-            if start_will_create_new_execution(
-                prior.as_ref().map(|e| e.state.as_str()),
-                request.reuse_policy,
-                request.conflict_policy,
-            ) && let Some((gate_id, reason, scope_kind)) = evaluate_start_gate(
-                mode,
-                request.workflow_name,
-                request.queue_name,
-                shard_id_value,
-                request.owner,
-            ) {
-                record_start_gate_block(metrics, scope_kind, &reason);
-                return Err(HarvestError::AdmissionBlocked { gate_id, reason });
-            }
-        }
-
         // `RejectDuplicate` must refuse against a reconciled `MIGRATED`
         // seal. `AllowDuplicateFailedOnly` must attach to one whose live
         // copy did NOT fail, not silently create past either (fresh
@@ -1347,6 +1298,21 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         // exact check then blocks until this transaction commits or
         // rolls back. It cannot reconcile the seal in the gap between
         // this read and the insert.
+        //
+        // This block runs BEFORE the admission-gate check below (issue
+        // #1596 review, comment_id 4055454416). `try_load_active_execution_
+        // for_update` deliberately excludes a reconciled seal, so the
+        // gate's own occupant read sees `None` and treats the request as a
+        // fresh create. Neither outcome below admits a new execution.
+        // A `RejectDuplicate` refusal and an `AllowDuplicateFailedOnly`
+        // attach both return an EXISTING row instead. Evaluating the gate
+        // first would misreport a refusal as `AdmissionBlocked`, not the
+        // promised `AlreadyExists`. It would also block an attach that
+        // creates nothing for the gate to legitimately guard. Resolve the
+        // seal first. Reach the gate only on a genuine fresh-create path:
+        // no seal, or a FAILED/CANCELLED seal that falls through to the
+        // INSERT below. That keeps the gate scoped to admissions it can
+        // actually block.
         if matches!(
             request.reuse_policy,
             WorkflowIdReusePolicy::RejectDuplicate
@@ -1359,7 +1325,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             // terminal but not yet sealed or migrated itself.
             // `try_load_active_execution_for_update` already answers
             // exactly that question. It is safe to call again here, even
-            // when the admission-gate block above already did. It is the
+            // when the admission-gate block below already did. It is the
             // same lock, on the same connection, in the same
             // transaction. When it finds an occupant, skip the seal
             // check entirely. Let the ordinary insert/conflict path
@@ -1418,6 +1384,63 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                     // replaces it exactly as `AllowDuplicateFailedOnly`
                     // already does for any other failed/cancelled prior.
                 }
+            }
+        }
+
+        // Authoritative locked gate (issue #618, PR #1014). For every
+        // policy EXCEPT TerminateIfRunning (gated unlocked at POINT 1
+        // above), take the `FOR UPDATE` lock on any non-sealed prior
+        // FIRST — before the INSERT — so the create-vs-attach decision the
+        // gate keys on is made on ONE stable, locked state. This is the
+        // move that closes the seal-under-lock TOCTOU: a prior that seals
+        // (to CONTINUED_AS_NEW / TERMINATED) between an unlocked pre-read
+        // and the start is excluded by the `for_update()` filter, so the
+        // fresh replacement it would otherwise leak is caught here. The
+        // lock is reused by the INSERT / `..._by_key_for_update` load
+        // below. `reject_fresh_if_debounced` starts pass `gate = None`, so
+        // this never runs on the debounce path.
+        //
+        // Runs AFTER the reconciled-seal block above (issue #1596 review,
+        // comment_id 4055454416). That block already returned for the two
+        // outcomes that admit no new execution. Reaching here means one of
+        // two things: no reconciled seal applies, or one did and was
+        // FAILED/CANCELLED. Either way, the INSERT below is a genuine
+        // fresh create the gate may legitimately block.
+        //
+        // Recompute the fast-path predicate from the (cloned) request:
+        // POINT 1 + the pre-check already applied the unlocked gate for the
+        // state-independent `terminate_via_pre_check` case, so skip it here.
+        // Every other policy (incl. conflict-driven Terminate with a
+        // non-`TerminateIfRunning` reuse, and `TerminateIfRunning` +
+        // `UseExisting`/`Fail`) takes the locked read and keys the gate on
+        // the create-vs-attach decision for the LOCKED prior state.
+        let terminate_via_pre_check = request.reuse_policy
+            == WorkflowIdReusePolicy::TerminateIfRunning
+            && effective_active_conflict_behavior(request.reuse_policy, request.conflict_policy)
+                == ActiveConflictBehavior::Terminate;
+        if let Some(mode) = gate
+            && !terminate_via_pre_check
+            && !reject_fresh_if_debounced
+        {
+            let prior = try_load_active_execution_for_update(
+                conn,
+                request.workflow_name,
+                request.workflow_id,
+            )
+            .await?;
+            if start_will_create_new_execution(
+                prior.as_ref().map(|e| e.state.as_str()),
+                request.reuse_policy,
+                request.conflict_policy,
+            ) && let Some((gate_id, reason, scope_kind)) = evaluate_start_gate(
+                mode,
+                request.workflow_name,
+                request.queue_name,
+                shard_id_value,
+                request.owner,
+            ) {
+                record_start_gate_block(metrics, scope_kind, &reason);
+                return Err(HarvestError::AdmissionBlocked { gate_id, reason });
             }
         }
 

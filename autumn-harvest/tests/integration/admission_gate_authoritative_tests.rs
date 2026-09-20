@@ -3637,6 +3637,141 @@ async fn gate_skips_allow_duplicate_attach_to_a_completed_prior() {
     assert_eq!(target_exec_count(&mut conn).await, 1);
 }
 
+/// Seed a RECONCILED seal: a `MIGRATED` row whose live copy has already been
+/// observed terminal (`migrated_run_terminal_at` set), exactly what
+/// `reconcile_migrated_seal_terminality` produces. `try_load_active_execution_
+/// for_update` deliberately excludes this row, so the admission gate's own
+/// occupant read sees no prior at all.
+async fn seed_reconciled_seal(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+    terminal_state: &str,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+         (id, workflow_name, workflow_id, shard_id, input, queue_name, state, \
+          completed_at, migrated_run_terminal_at, migrated_run_terminal_state) \
+         VALUES ($1, 'ag_target_wf', $2, 0, '{}'::jsonb, 'default', 'MIGRATED', \
+                 NOW(), NOW(), $3)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+    .bind::<Text, _>(workflow_id)
+    .bind::<Text, _>(terminal_state)
+    .execute(conn)
+    .await
+    .expect("seed reconciled seal");
+}
+
+/// Issue #1596 review, `comment_id` 4055454416 (P2): a `RejectDuplicate` start
+/// against a business key whose only prior is a RECONCILED seal must refuse
+/// with `AlreadyExists`, never `AdmissionBlocked`. Nothing is admitted here —
+/// the refusal itself is the whole outcome — so an armed gate must not be
+/// allowed to relabel it.
+///
+/// Before this fix, the admission-gate block ran first, saw no ACTIVE prior
+/// (a reconciled seal is deliberately excluded from that check), treated the
+/// request as a fresh create, and returned `AdmissionBlocked` under an armed
+/// gate instead of ever reaching the reconciled-seal check below it.
+#[tokio::test]
+async fn gate_does_not_relabel_a_reject_duplicate_refusal_over_a_reconciled_seal() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+
+    seed_reconciled_seal(&mut conn, "rd-reconciled-seal", "COMPLETED").await;
+    set_global_admission_gate_cache(Some(fleet_cache("reconciled-seal-incident")));
+
+    let outcome = autumn_harvest::start_or_load_workflow_execution_with_metrics(
+        &mut conn,
+        ag_target_params("rd-reconciled-seal", WorkflowIdReusePolicy::RejectDuplicate),
+        None,
+        Some(autumn_harvest::admission_gate::GateMode::Check),
+    )
+    .await;
+
+    set_global_admission_gate_cache(None);
+
+    match outcome {
+        Err(autumn_harvest::HarvestError::AlreadyExists { .. }) => {}
+        Err(autumn_harvest::HarvestError::AdmissionBlocked { .. }) => panic!(
+            "RejectDuplicate over a reconciled seal admits nothing -- the gate must not \
+             relabel the refusal as AdmissionBlocked"
+        ),
+        Ok(s) => panic!(
+            "RejectDuplicate over a reconciled seal must refuse, not start (created = {}, \
+             exec = {:?})",
+            s.created, s.exec_id
+        ),
+        Err(e) => panic!("unexpected start error: {e}"),
+    }
+    // Still exactly the one seeded seal — no fresh run created.
+    assert_eq!(target_exec_count(&mut conn).await, 1);
+}
+
+/// Issue #1596 review, `comment_id` 4055454416 (P2): an `AllowDuplicateFailedOnly`
+/// start against a reconciled seal whose live copy finished successfully
+/// (COMPLETED, not FAILED/CANCELLED) must ATTACH to it, never be blocked by an
+/// armed gate. An attach admits no new execution, so the gate has nothing to
+/// legitimately guard here.
+///
+/// Before this fix, the admission-gate block's own occupant read also missed
+/// the reconciled seal, treated the request as a fresh create, and returned
+/// `AdmissionBlocked` under an armed gate instead of ever reaching the
+/// attach below it.
+#[tokio::test]
+async fn gate_does_not_block_an_allow_duplicate_failed_only_attach_to_a_reconciled_seal() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+
+    seed_reconciled_seal(&mut conn, "adfo-reconciled-seal", "COMPLETED").await;
+    set_global_admission_gate_cache(Some(fleet_cache("reconciled-seal-attach-incident")));
+
+    let outcome = autumn_harvest::start_or_load_workflow_execution_with_metrics(
+        &mut conn,
+        ag_target_params(
+            "adfo-reconciled-seal",
+            WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+        ),
+        None,
+        Some(autumn_harvest::admission_gate::GateMode::Check),
+    )
+    .await;
+
+    set_global_admission_gate_cache(None);
+
+    match outcome {
+        Ok(s) => {
+            assert!(
+                !s.created,
+                "AllowDuplicateFailedOnly over a non-failed reconciled seal ATTACHES \
+                 (created == false), not a fresh create"
+            );
+            assert_eq!(
+                s.state, "COMPLETED",
+                "the attach must report the live copy's own terminal state, not MIGRATED"
+            );
+        }
+        Err(autumn_harvest::HarvestError::AdmissionBlocked { .. }) => panic!(
+            "an AllowDuplicateFailedOnly attach to a non-failed reconciled seal admits \
+             nothing -- the gate must be SKIPPED, not block it"
+        ),
+        Err(e) => panic!("unexpected start error: {e}"),
+    }
+    // Still exactly the one seeded seal — no fresh run created.
+    assert_eq!(target_exec_count(&mut conn).await, 1);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // F-round19: the immediate spawn() relay and the scanner (and multi-replica
 // scanners) must be MUTUALLY EXCLUSIVE on a source outbox row. Without a claim

@@ -1203,6 +1203,12 @@ diesel::table! {
         /// by code that knows this column exists", so a legacy or
         /// foreign-verified record fails the cutover guard closed.
         legal_hold_verified -> Bool,
+        /// The id of the unrelated same-key row this migration's `stage_copy`
+        /// vacated on the target, if any (issue #1596 review). Lets
+        /// `activate_target` finalize that row's `staging_vacated_state`
+        /// marker by id, rather than inferring ownership from business-key
+        /// uniqueness, which a retried call can get wrong.
+        vacated_execution_id -> Nullable<Uuid>,
     }
 }
 

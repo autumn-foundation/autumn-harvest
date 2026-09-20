@@ -1338,7 +1338,7 @@ mod db {
             row.and_then(|r| r.payload)
         };
 
-        Box::pin(target.transaction::<(), HarvestError, _>(async |conn| {
+        let vacated_execution_id = Box::pin(target.transaction::<Option<Uuid>, HarvestError, _>(async |conn| {
             // On a REVERSE migration (A -> B -> A) the target is a shard this
             // run has already lived on, so it holds A's `MIGRATED` seal — the
             // forwarding pointer every id that routes to A resolves through.
@@ -1394,7 +1394,7 @@ mod db {
             .await
             .optional_row()?;
 
-            if let Some(stale) = stale_target_row
+            let vacated_execution_id = if let Some(stale) = stale_target_row
                 && !matches!(
                     stale.state.as_str(),
                     "RUNNING" | "PAUSED" | "MIGRATING" | "MIGRATED"
@@ -1410,7 +1410,10 @@ mod db {
                 .execute(&mut *conn)
                 .await
                 .map_err(database_error)?;
-            }
+                Some(stale.id)
+            } else {
+                None
+            };
 
             // `migrated_from_shards` gets its new hop stamped HERE, at staging
             // time. It is not deferred to `activate_target`'s
@@ -1513,16 +1516,26 @@ mod db {
             .await
             .map_err(database_error)?;
 
-            Ok(())
+            Ok(vacated_execution_id)
         }))
         .await?;
 
+        // `vacated_execution_id` names precisely which row, if any, THIS
+        // staging vacated (issue #1596 review, comment_id 4055454415).
+        // `activate_target`'s force-terminated-target branch reads it back
+        // to finalize that row's marker by id. A business-key-only match
+        // cannot close the retry race this closes. A retried call could
+        // otherwise see a DIFFERENT migration's later vacate as the sole
+        // marker under the same business key. It could clear that marker
+        // by mistake.
         diesel::sql_query(
-            "UPDATE harvest_shard_migrations SET staged_task = $2, updated_at = NOW() \
+            "UPDATE harvest_shard_migrations \
+                SET staged_task = $2, vacated_execution_id = $3, updated_at = NOW() \
               WHERE execution_id = $1",
         )
         .bind::<SqlUuid, _>(exec_id.as_uuid())
         .bind::<Nullable<Jsonb>, _>(staged_task)
+        .bind::<Nullable<SqlUuid>, _>(vacated_execution_id)
         .execute(source)
         .await
         .map_err(database_error)?;
@@ -2738,8 +2751,10 @@ mod db {
     /// does not require the owning execution to be `RUNNING`. A resurrected
     /// task could then be claimed and dispatched against a terminated run.
     /// That branch instead finalizes any vacate marker this migration's own
-    /// staging left on an unrelated row. The migration still concludes as
-    /// `DONE`, and no future abort can restore that marker afterward.
+    /// staging left on an unrelated row, named precisely by the
+    /// `vacated_execution_id` `stage_copy` recorded. The migration still
+    /// concludes as `DONE`, and no future abort can restore that marker
+    /// afterward.
     ///
     /// # Errors
     ///
@@ -2752,8 +2767,13 @@ mod db {
         exec_id: ExecutionId,
     ) -> HarvestResult<()> {
         // `staged_task`, captured verbatim at stage time and restored here.
+        // `vacated_execution_id` names the row, if any, that THIS
+        // migration's own staging vacated. It is read here so the
+        // force-terminated-target branch below can finalize its marker by
+        // id (issue #1596 review, comment_id 4055454415).
         let staged: ActivationRow = diesel::sql_query(
-            "SELECT staged_task AS payload FROM harvest_shard_migrations \
+            "SELECT staged_task AS payload, vacated_execution_id \
+               FROM harvest_shard_migrations \
               WHERE execution_id = $1",
         )
         .bind::<SqlUuid, _>(exec_id.as_uuid())
@@ -2767,6 +2787,7 @@ mod db {
             ))
         })?;
         let staged_task: Option<Value> = staged.payload;
+        let vacated_execution_id: Option<Uuid> = staged.vacated_execution_id;
 
         Box::pin(target.transaction::<(), HarvestError, _>(async |conn| {
             let staged_task = staged_task.clone();
@@ -2890,56 +2911,40 @@ mod db {
                     .execute(&mut *conn)
                     .await
                     .map_err(database_error)?;
-                } else {
+                } else if let Some(vacated_id) = vacated_execution_id {
                     // Activation is a no-op here for one of two reasons.
                     // Either this is an idempotent retry of an
-                    // already-successful run, and the query below matches
-                    // nothing because this row's own marker was already
-                    // cleared above. Or an operator force-terminated the
-                    // staged copy in the `COMMITTED`-before-activation
-                    // window (issue #1596 review, finding 2).
+                    // already-successful run. Or an operator
+                    // force-terminated the staged copy in the
+                    // `COMMITTED`-before-activation window (issue #1596
+                    // review, finding 2).
                     //
                     // The migration still concludes as `DONE` right after
                     // this transaction. `DONE` is a terminal phase, so no
                     // future abort can walk it back. A vacate marker this
-                    // migration's own staging left on an unrelated row must
-                    // be finalized here, or it is stuck forever. Retention
+                    // migration's own staging left on `vacated_id` must be
+                    // finalized here, or it is stuck forever. Retention
                     // would keep reporting that row as `CONTINUED_AS_NEW`.
                     // It would refuse to ever delete it.
                     //
-                    // Unlike the `activated > 0` clear above, this
-                    // migration's row stopped occupying the
-                    // active-uniqueness slot the moment it was
-                    // force-terminated. That is not the same transaction as
-                    // this clear. A fresh start can have reused the freed
-                    // slot, run to a terminal state, and been vacated by a
-                    // DIFFERENT, later migration before this runs.
-                    // `staging_vacated_state` carries no attempt id or
-                    // timestamp to tell the two apart. The `NOT EXISTS`
-                    // below only clears a marker that is the SOLE one under
-                    // this business key. A second, ambiguous marker is left
-                    // alone, rather than risk taking the newer migration's
-                    // own restore marker out from under it.
+                    // Targeted BY ID, not by business-key uniqueness (issue
+                    // #1596 review, comment_id 4055454415). A business-key
+                    // match cannot tell this migration's own marker apart
+                    // from one a DIFFERENT, later migration leaves under
+                    // the same key. This call can also be a retry. The
+                    // first invocation can finalize the marker and then
+                    // fail before the source-side `DONE` write lands. A
+                    // second invocation then runs against state a
+                    // different migration has since changed.
+                    // `vacated_execution_id` was recorded in the SAME
+                    // transaction that vacated the row. It names that row
+                    // with no inference required.
                     diesel::sql_query(
-                        "UPDATE harvest_workflow_executions AS old \
+                        "UPDATE harvest_workflow_executions \
                             SET staging_vacated_state = NULL \
-                          WHERE old.staging_vacated_state IS NOT NULL AND old.id != $1 \
-                            AND EXISTS (SELECT 1 FROM harvest_workflow_executions t \
-                                         WHERE t.id = $1 AND t.state = 'TERMINATED') \
-                            AND old.workflow_name = \
-                                (SELECT workflow_name FROM harvest_workflow_executions \
-                                  WHERE id = $1) \
-                            AND old.workflow_id = \
-                                (SELECT workflow_id FROM harvest_workflow_executions \
-                                  WHERE id = $1) \
-                            AND NOT EXISTS ( \
-                                SELECT 1 FROM harvest_workflow_executions other \
-                                 WHERE other.staging_vacated_state IS NOT NULL \
-                                   AND other.id != $1 AND other.id != old.id \
-                                   AND other.workflow_name = old.workflow_name \
-                                   AND other.workflow_id = old.workflow_id)",
+                          WHERE id = $1 AND staging_vacated_state IS NOT NULL",
                     )
-                    .bind::<SqlUuid, _>(exec_id.as_uuid())
+                    .bind::<SqlUuid, _>(vacated_id)
                     .execute(&mut *conn)
                     .await
                     .map_err(database_error)?;
@@ -2953,9 +2958,17 @@ mod db {
         // payload. Once the target holds it there is no reason to keep a third
         // copy on the source in a table neither `erase.rs` nor the retention
         // janitor knows about, so the settling UPDATE clears it.
+        //
+        // `vacated_execution_id` is cleared here too. By this point the target
+        // transaction above already used it, if it was set, to finalize the
+        // vacated row's marker. Nothing reads it again once this record
+        // reaches `DONE`. A retry that reaches this point re-reads whatever
+        // was here before the clear. So clearing it now loses no retry that
+        // still needs it.
         diesel::sql_query(
             "UPDATE harvest_shard_migrations \
-                SET phase = 'DONE', staged_task = NULL, updated_at = NOW() \
+                SET phase = 'DONE', staged_task = NULL, vacated_execution_id = NULL, \
+                    updated_at = NOW() \
               WHERE execution_id = $1 AND phase = 'COMMITTED'",
         )
         .bind::<SqlUuid, _>(exec_id.as_uuid())
@@ -3003,7 +3016,7 @@ mod db {
         let claimed = diesel::sql_query(
             "UPDATE harvest_shard_migrations \
                 SET phase = 'ABORTED', abort_reason = $2, staged_task = NULL, \
-                    updated_at = NOW() \
+                    vacated_execution_id = NULL, updated_at = NOW() \
               WHERE execution_id = $1 \
                 AND phase IN ('PENDING', 'COPIED', 'VERIFIED')",
         )
@@ -4215,6 +4228,8 @@ mod db {
     struct ActivationRow {
         #[diesel(sql_type = Nullable<Jsonb>)]
         payload: Option<Value>,
+        #[diesel(sql_type = Nullable<SqlUuid>)]
+        vacated_execution_id: Option<Uuid>,
     }
 
     #[derive(diesel::QueryableByName)]
