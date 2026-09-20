@@ -2917,16 +2917,26 @@ mod probes {
         workflow_id: String,
     }
 
-    /// Which of the given business keys exist in `table_name`, in ONE
-    /// round trip.
+    /// Cap on business keys sent to [`matching_workflow_keys`] per query
+    /// (issue #1401, Codex follow-up). `harvest_completion_trigger_fires`
+    /// has no cleanup path, and the preceding scan admits up to
+    /// [`MAX_TRIGGER_FIRE_SCAN_PAGES`] pages. A shard whose fires are ALL
+    /// confirmed-delivered can put every one of them in a single batch.
+    /// Unbounded, a 255-byte-name fleet at that scale turns one `UNNEST`
+    /// call into a hundreds-of-megabytes request. This keeps the set-based
+    /// query, just chunked, trading a few extra round trips for a bounded
+    /// wire size per call.
+    const WORKFLOW_KEY_LOOKUP_CHUNK: usize = 1_000;
+
+    /// Which of the given business keys exist in `table_name`.
     ///
     /// `table_name` is never caller input. Both call sites below pass a
     /// fixed literal. String interpolation here carries no injection
     /// surface, matching every other dynamic-SQL helper in this file.
     ///
     /// `UNNEST($1::text[], $2::text[])` pairs `names[i]` with `ids[i]`
-    /// positionally. A whole shard's batch of completion-trigger fires is
-    /// checked as one query, not one query per fire. A completion-trigger
+    /// positionally, chunked at [`WORKFLOW_KEY_LOOKUP_CHUNK`] keys per
+    /// query rather than one round trip per fire. A completion-trigger
     /// fire has no target execution id to look up by -- it is minted only
     /// at start time. The business key is the only handle this tool has
     /// for either `harvest_workflow_executions` or
@@ -2937,20 +2947,23 @@ mod probes {
         names: &[String],
         ids: &[String],
     ) -> Result<std::collections::HashSet<(String, String)>, diesel::result::Error> {
-        let rows: Vec<WorkflowKeyRow> = diesel::sql_query(format!(
-            "SELECT DISTINCT e.workflow_name, e.workflow_id \
-             FROM {table_name} e \
-             JOIN UNNEST($1::text[], $2::text[]) AS t(workflow_name, workflow_id) \
-               ON e.workflow_name = t.workflow_name AND e.workflow_id = t.workflow_id"
-        ))
-        .bind::<diesel::sql_types::Array<Text>, _>(names)
-        .bind::<diesel::sql_types::Array<Text>, _>(ids)
-        .load(conn)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| (r.workflow_name, r.workflow_id))
-            .collect())
+        let mut matched = std::collections::HashSet::new();
+        let chunks = names.chunks(WORKFLOW_KEY_LOOKUP_CHUNK);
+        let id_chunks = ids.chunks(WORKFLOW_KEY_LOOKUP_CHUNK);
+        for (name_chunk, id_chunk) in chunks.zip(id_chunks) {
+            let rows: Vec<WorkflowKeyRow> = diesel::sql_query(format!(
+                "SELECT DISTINCT e.workflow_name, e.workflow_id \
+                 FROM {table_name} e \
+                 JOIN UNNEST($1::text[], $2::text[]) AS t(workflow_name, workflow_id) \
+                   ON e.workflow_name = t.workflow_name AND e.workflow_id = t.workflow_id"
+            ))
+            .bind::<diesel::sql_types::Array<Text>, _>(name_chunk)
+            .bind::<diesel::sql_types::Array<Text>, _>(id_chunk)
+            .load(conn)
+            .await?;
+            matched.extend(rows.into_iter().map(|r| (r.workflow_name, r.workflow_id)));
+        }
+        Ok(matched)
     }
 
     /// Look up each reference's target on its owning shard and bucket the

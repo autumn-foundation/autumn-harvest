@@ -89,6 +89,13 @@ bounds `undecodable_samples`: an exact count, plus a joined sample list
 capped at `MAX_FINDING_SAMPLES` (Codex follow-up). It previously joined
 every matching row into one unbounded string.
 
+`matching_workflow_keys` now chunks its `names`/`ids` arrays at
+`WORKFLOW_KEY_LOOKUP_CHUNK` (1,000) keys per query instead of sending a
+whole shard's batch in one `UNNEST` call (Codex follow-up). A shard whose
+confirmed-delivered fires all land in one batch could otherwise turn into
+a single hundreds-of-megabytes request. The lookup stays set-based, just
+spread across bounded queries.
+
 **No new `WorkflowEvent` variant, no engine-runtime behavior change beyond
 the two additive write-path fixes above.** Read-only in `backup_verify.rs`,
 reusing `execution::execution_exists_by_key` — the exact any-state
