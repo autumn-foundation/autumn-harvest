@@ -889,7 +889,7 @@ fn activity_precedence_for_facts(facts: &PendingActivityFacts, now: DateTime<Utc
     if facts.rate_limit_bucket_missing && facts.rate_limit_key.is_some() {
         return 8; // ActivityRateLimitBucketMissing
     }
-    // Issue #1193: mirrors `activity_circuit_currently_blocks`. A row whose
+    // Uses `activity_circuit_currently_blocks` (issue #1193). A row whose
     // breaker no longer blocks by the effective dispatch instant is not a
     // circuit-open verdict. It falls through to the not-due-yet ranks below.
     if activity_circuit_currently_blocks(facts, now) && facts.activity_name.is_some() {
