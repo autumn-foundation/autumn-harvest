@@ -3190,7 +3190,7 @@ async fn a_reset_terminated_predecessor_resolves_through_to_its_forks_completed_
 /// COMPLETED-fork test above. The fork's own row can also be
 /// retention-demoted to a summary before the predecessor ever reconciles,
 /// exactly as `a_summarised_failed_successor_records_its_own_outcome_not_
-/// the_predecessors` already covers for a CONTINUED_AS_NEW predecessor.
+/// the_predecessors` already covers for a `CONTINUED_AS_NEW` predecessor.
 /// The `occupied` check then sees nothing: no execution row, and a
 /// summary carries no active state. Before this fix, the predecessor's
 /// own `TERMINATED` was then reported as final, instead of chasing
