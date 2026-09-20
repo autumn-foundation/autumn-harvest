@@ -1878,17 +1878,15 @@ pub async fn fire_due_throttled_starts_with_codecs(
     match sharded_pool {
         Some(sp) if !shard_assignments.is_empty() => {
             for shard in shard_assignments {
-                let Some(pool) = sp.exact_pool_for(*shard).cloned() else {
+                let Some(mut shard_conn) = crate::shard::connect_to_shard(
+                    sp,
+                    *shard,
+                    "throttle",
+                    crate::shard::ShardConnectError::LogAndSkip,
+                )
+                .await?
+                else {
                     continue;
-                };
-                let mut shard_conn = match pool.get().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!(
-                            "[throttle] failed to get connection to shard {shard:?}: {e:?}"
-                        );
-                        continue;
-                    }
                 };
                 let fired = fire_due_on_conn(&mut shard_conn, metrics, codecs).await?;
                 fired_count += spawn_fired(fired, metrics, &mut shard_conn).await;

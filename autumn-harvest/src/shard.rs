@@ -28,6 +28,9 @@ use std::collections::BTreeMap;
 use std::hash::Hasher;
 
 #[cfg(feature = "db")]
+use diesel_async::AsyncPgConnection;
+
+#[cfg(feature = "db")]
 use crate::types::ExternalTarget;
 use crate::types::{ExecutionId, ShardId};
 #[cfg(feature = "db")]
@@ -1833,6 +1836,75 @@ impl ShardedDbPool {
     }
 }
 
+/// What a per-shard scanner does when it cannot reach one shard's database.
+///
+/// Existing scanners disagree on this. So [`connect_to_shard`] takes it as
+/// a parameter. It does not pick one behavior for every scanner
+/// (issue #1362).
+#[cfg(feature = "db")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ShardConnectError {
+    /// Log the error and move to the next shard. The scan continues.
+    LogAndSkip,
+    /// Return the error. The scan stops.
+    Abort,
+}
+
+/// A pooled connection to one shard, as returned by [`connect_to_shard`].
+#[cfg(feature = "db")]
+pub(crate) type ShardConn = deadpool::managed::Object<
+    diesel_async::pooled_connection::AsyncDieselConnectionManager<AsyncPgConnection>,
+>;
+
+/// Get `shard`'s own connection from `sharded_pool`.
+///
+/// Every per-shard admission scanner does this lookup the same way
+/// (issue #1362). Debounce, throttle, event-batch, and completion-delivery
+/// each scan due rows shard by shard. Each one starts a shard's turn with
+/// exactly this step.
+///
+/// A shard absent from the pool map is not configured on this process.
+/// `Ok(None)` skips it; this is not an error. A `pool.get()` failure has
+/// two possible outcomes. [`ShardConnectError::LogAndSkip`] logs it and
+/// treats it the same as a missing shard. [`ShardConnectError::Abort`]
+/// returns it to the caller instead. Existing scanners disagree on which
+/// outcome to use, so this takes the choice as a parameter.
+///
+/// The claim query, the row shape, and the fire logic stay in each
+/// caller's own loop. They run on the returned connection, but this
+/// function does not share them. They differ across scanners. Forcing one
+/// shape onto them would be the actual bug. Sharing only this lookup keeps
+/// each caller's loop order intact. An earlier shard may already have
+/// fired and committed before a later shard's connection fails. This
+/// preserves that order.
+///
+/// # Errors
+/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database)
+/// for a connect failure under [`ShardConnectError::Abort`].
+#[cfg(feature = "db")]
+pub(crate) async fn connect_to_shard(
+    sharded_pool: &ShardedDbPool,
+    shard: ShardId,
+    log_tag: &str,
+    on_connect_error: ShardConnectError,
+) -> crate::error::HarvestResult<Option<ShardConn>> {
+    let Some(pool) = sharded_pool.exact_pool_for(shard).cloned() else {
+        return Ok(None);
+    };
+    match pool.get().await {
+        Ok(conn) => Ok(Some(conn)),
+        Err(e) => match on_connect_error {
+            ShardConnectError::LogAndSkip => {
+                tracing::error!("[{log_tag}] failed to get connection to shard {shard:?}: {e:?}");
+                Ok(None)
+            }
+            ShardConnectError::Abort => {
+                Err(crate::error::HarvestError::Database(e.to_string()))
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3495,6 +3567,65 @@ mod tests {
              overridden earlier value must not stop these from \
              collapsing into one group"
         );
+    }
+
+    // `connect_to_shard` (issue #1362): the per-shard connection lookup
+    // shared by debounce, throttle, event_batch, and completion_callback.
+    // These tests cover the one branch no scanner's own test suite
+    // exercises today: a shard whose connection cannot be obtained.
+    // `test_pool()` builds a pool that never connects, so `.get()` fails
+    // fast with no live database.
+    mod connect_to_shard_tests {
+        use super::*;
+
+        fn unreachable_pools(shards: &[ShardId]) -> BTreeMap<ShardId, DbPool> {
+            shards.iter().map(|s| (*s, test_pool())).collect()
+        }
+
+        #[tokio::test]
+        async fn log_and_skip_returns_none_on_a_connect_failure() {
+            let shard = ShardId::new(0);
+            let sharded = ShardedDbPool::from_map(unreachable_pools(&[shard]), shard);
+
+            let result = connect_to_shard(&sharded, shard, "test", ShardConnectError::LogAndSkip)
+                .await
+                .expect("a connect failure must not fail under LogAndSkip");
+
+            assert!(
+                result.is_none(),
+                "an unreachable shard must be skipped, not connected"
+            );
+        }
+
+        #[tokio::test]
+        async fn abort_returns_an_error_on_a_connect_failure() {
+            let shard = ShardId::new(0);
+            let sharded = ShardedDbPool::from_map(unreachable_pools(&[shard]), shard);
+
+            let result = connect_to_shard(&sharded, shard, "test", ShardConnectError::Abort).await;
+
+            assert!(
+                result.is_err(),
+                "Abort must surface a connect failure as an error"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_shard_with_no_pool_entry_is_skipped_without_connecting() {
+            let configured = ShardId::new(0);
+            let unconfigured = ShardId::new(5);
+            let sharded = ShardedDbPool::from_map(unreachable_pools(&[configured]), configured);
+
+            let result =
+                connect_to_shard(&sharded, unconfigured, "test", ShardConnectError::Abort)
+                    .await
+                    .expect("an unconfigured shard is not a connect failure");
+
+            assert!(
+                result.is_none(),
+                "a shard with no pool entry must be skipped, never attempted"
+            );
+        }
     }
 }
 
