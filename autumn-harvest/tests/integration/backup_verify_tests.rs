@@ -2844,7 +2844,11 @@ async fn a_same_shard_completion_trigger_fire_is_not_probed() {
 
     seed_execution(&mut a, source, "parent_flow", "ct-same-1", "COMPLETED", 0).await;
     seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
-    seed_completion_trigger_fire(&mut a, source, trigger_id, fired_at, None).await;
+    // RECORDED same-shard (target_shard persisted as 0, matching source): a
+    // historical fact, not a re-derived pick. `route_trigger_fires` drops
+    // this outright rather than flagging it uncertain.
+    seed_completion_trigger_fire_with_target(&mut a, source, trigger_id, fired_at, 0, "child_flow")
+        .await;
     // No execution row anywhere for the target -- if this were adjudicated at
     // all it would report as lost or unproven.
 
@@ -2857,6 +2861,39 @@ async fn a_same_shard_completion_trigger_fire_is_not_probed() {
     assert!(
         !report.detected(FindingClass::CompletionTriggerFireUnproven),
         "a same-shard fire is atomic, never a restore-skew risk: {report:#?}"
+    );
+}
+
+/// A PRE-MIGRATION fire (no persisted `target_shard`) has its target shard
+/// re-derived from the router. A re-derived pick landing on its own source
+/// shard is NOT a historical fact -- a historical drain could have sent it
+/// cross-shard for real. It must surface as `CompletionTriggerFireUnproven`,
+/// never be silently dropped as if it were a recorded same-shard commit
+/// (issue #1401, Codex follow-up).
+#[tokio::test]
+async fn a_reconstructed_pre_migration_same_shard_pick_is_unproven() {
+    let (url_a, _ca) = setup().await;
+    let mut a = connect(&url_a).await;
+
+    let (source, trigger_id, _target_id) = find_fire_targeting("child_flow", 0);
+    let fired_at = Utc::now() - chrono::Duration::hours(1);
+
+    seed_execution(&mut a, source, "parent_flow", "ct-same-2", "COMPLETED", 0).await;
+    seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
+    // Pre-migration shape: `target_shard` is NULL, so this must be
+    // re-derived from the router rather than read as a recorded fact.
+    seed_completion_trigger_fire(&mut a, source, trigger_id, fired_at, None).await;
+
+    let report = verify_restore(&one_shard(&url_a), &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::CompletionTriggerFireLost),
+        "a same-shard pick, recorded or not, is never a proven loss: {report:#?}"
+    );
+    assert!(
+        report.detected(FindingClass::CompletionTriggerFireUnproven),
+        "a re-derived same-shard pick cannot rule out a lost cross-shard \
+         relay and must not be silently dropped: {report:#?}"
     );
 }
 

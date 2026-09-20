@@ -93,6 +93,7 @@ existence check the relay itself runs for its own idempotent retry.
 `an_absent_completion_trigger_target_past_the_fire_is_unproven`,
 `a_delivered_completion_trigger_fire_stays_silent`,
 `a_same_shard_completion_trigger_fire_is_not_probed`,
+`a_reconstructed_pre_migration_same_shard_pick_is_unproven`,
 `a_resolved_completion_trigger_fire_is_not_probed`,
 `a_fire_still_pending_relay_is_not_probed`,
 `an_absent_completion_trigger_target_with_a_summary_stays_silent`,
