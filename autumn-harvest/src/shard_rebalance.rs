@@ -1583,42 +1583,42 @@ mod db {
         // Both still owe the vacated-row restoration after this `if`. That
         // restoration depends only on the slot being free, not on how it
         // became free.
-        if let Some(row) = row {
-            if row.state == "MIGRATING" {
-                for sql in STAGED_CHILD_DELETES.iter().copied() {
-                    diesel::sql_query(sql)
-                        .bind::<SqlUuid, _>(exec_id.as_uuid())
-                        .execute(&mut *conn)
-                        .await
-                        .map_err(database_error)?;
-                }
-                // A carried pointer is the tell: the staged row stands where
-                // a seal stood, so restore the seal instead of removing the
-                // row.
-                let restored = diesel::sql_query(
-                    "UPDATE harvest_workflow_executions \
-                        SET state = 'MIGRATED', completed_at = COALESCE(completed_at, NOW()) \
-                      WHERE id = $1 AND state = 'MIGRATING' AND migrated_to_shard IS NOT NULL",
+        if let Some(row) = row
+            && row.state == "MIGRATING"
+        {
+            for sql in STAGED_CHILD_DELETES.iter().copied() {
+                diesel::sql_query(sql)
+                    .bind::<SqlUuid, _>(exec_id.as_uuid())
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(database_error)?;
+            }
+            // A carried pointer is the tell: the staged row stands where
+            // a seal stood, so restore the seal instead of removing the
+            // row.
+            let restored = diesel::sql_query(
+                "UPDATE harvest_workflow_executions \
+                    SET state = 'MIGRATED', completed_at = COALESCE(completed_at, NOW()) \
+                  WHERE id = $1 AND state = 'MIGRATING' AND migrated_to_shard IS NOT NULL",
+            )
+            .bind::<SqlUuid, _>(exec_id.as_uuid())
+            .execute(&mut *conn)
+            .await
+            .map_err(database_error)?;
+            if restored == 0 {
+                // No pointer was carried: this row is a first-time
+                // staged copy, not a restored seal. Deleting it is
+                // safe. The check above already confirmed the row is
+                // `MIGRATING`, so this cannot match a pre-existing
+                // `MIGRATED` seal (issue #1317).
+                diesel::sql_query(
+                    "DELETE FROM harvest_workflow_executions \
+                      WHERE id = $1 AND state = 'MIGRATING'",
                 )
                 .bind::<SqlUuid, _>(exec_id.as_uuid())
                 .execute(&mut *conn)
                 .await
                 .map_err(database_error)?;
-                if restored == 0 {
-                    // No pointer was carried: this row is a first-time
-                    // staged copy, not a restored seal. Deleting it is
-                    // safe. The check above already confirmed the row is
-                    // `MIGRATING`, so this cannot match a pre-existing
-                    // `MIGRATED` seal (issue #1317).
-                    diesel::sql_query(
-                        "DELETE FROM harvest_workflow_executions \
-                          WHERE id = $1 AND state = 'MIGRATING'",
-                    )
-                    .bind::<SqlUuid, _>(exec_id.as_uuid())
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(database_error)?;
-                }
             }
         }
 
