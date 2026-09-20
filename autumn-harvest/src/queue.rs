@@ -2896,6 +2896,81 @@ pub async fn requeue_for_retry(
     Ok(())
 }
 
+/// Reset a `RUNNING` workflow task to `PENDING` with a future `scheduled_at`.
+///
+/// This is the bounded backoff retry for a quota or shard-admission
+/// rejection (issue #956). It also clears a stale `mixed_signal_suspension`
+/// sentinel in the same update.
+///
+/// Mirrors [`requeue_for_retry`]. Two differences apply. First, the update
+/// is restricted to `task_type = 'workflow'` rows, since every caller holds
+/// a workflow task. Second, it clears `activity_name`.
+///
+/// Without the clear, an old sentinel can survive. An earlier, unrelated
+/// cycle may stamp it during a timer-and-signal race (issue #476/#600). A
+/// surviving sentinel still matches the wake-forward arm of
+/// `primary_repend_workflow_task_query`. Any unrelated wake then resets
+/// `scheduled_at` to now. This defeats the backoff (issue #1391).
+///
+/// `requeue_workflow_task_nd_blocked` clears the same sentinel for the
+/// similar ND-block backoff (issue #603).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::NotFound`] when the task is not a
+/// claimed (`RUNNING`) workflow task, and
+/// [`crate::error::HarvestError::Database`] on update failure.
+pub async fn requeue_workflow_task_for_quota_retry(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    delay: Duration,
+    previous_error: &str,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let next_run = Utc::now() + delay;
+    let changeset = PendingRequeueChangeset::new(next_run, previous_error.to_string());
+
+    let (queue_name, priority) = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::task_type.eq("workflow")),
+    )
+    .set((changeset, dsl::activity_name.eq(None::<String>)))
+    .returning((dsl::queue_name, dsl::priority))
+    .get_result::<(String, i32)>(conn)
+    .await
+    .optional()
+    .map_err(crate::error::database_error)?
+    .ok_or_else(|| {
+        crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not a running workflow task"
+        ))
+    })?;
+
+    // Dispatch hint (issue #1312), same rationale as `requeue_for_retry`.
+    record_pending_hint(
+        task_id,
+        &queue_name,
+        next_run,
+        priority,
+        crate::dispatch::DispatchKind::Workflow,
+    );
+
+    // Notify is best-effort, same rationale as `requeue_for_retry`.
+    if let Err(e) = crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await {
+        tracing::warn!(
+            task_id = %task_id,
+            queue = %queue_name,
+            error = %e,
+            "pg_notify failed after quota-retry requeue; task is PENDING and will be claimed on next poll"
+        );
+    }
+
+    Ok(())
+}
+
 /// Re-pend an ND-blocked workflow task with a future `scheduled_at` (issue
 /// #603).
 ///

@@ -79,6 +79,7 @@ use autumn_harvest::info::{ActivityHandlerFn, ActivityInfo, WorkflowHandlerFn};
 use autumn_harvest::models::{
     CompletionTriggerOutboxDb, NewCompletionTriggerOutboxDb, WorkflowExecution,
 };
+use autumn_harvest::queue;
 use autumn_harvest::quota::{MAX_QUOTA_KEY_BYTES, QuotaPolicy, QuotaResource};
 use autumn_harvest::schema::{harvest_completion_trigger_outbox, harvest_workflow_executions};
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool, install_global_router};
@@ -2342,6 +2343,117 @@ async fn mixed_batch_child_spawn_honors_target_quota_parks_parent_then_succeeds(
         2, // the (now-cancelled) blocker + the newly-created child
         "exactly one child should exist once quota capacity freed up"
     );
+}
+
+/// Issue #1391: an old `mixed_signal_suspension` sentinel must not survive
+/// the quota-retry backoff.
+///
+/// `queue::requeue_for_retry` never touched `activity_name`. A sentinel from
+/// an earlier, unrelated cycle then kept matching the wake-forward arm of
+/// `primary_repend_workflow_task_query`. Any unrelated wake during the
+/// backoff window reset `scheduled_at` to now. This defeated the exact
+/// backoff that
+/// [`mixed_batch_child_spawn_honors_target_quota_parks_parent_then_succeeds`]
+/// proves lands in the future.
+#[tokio::test]
+async fn quota_retry_backoff_survives_stale_mixed_signal_suspension_sentinel() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let parent_wf_name = leaked("quota_sentinel_parent");
+    let child_wf_name = leaked("quota_sentinel_child");
+
+    let child_quota_policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    let mut child_info = wf_info(child_wf_name, mixed_batch_quota_child);
+    child_info.quota = Some(child_quota_policy);
+
+    // Occupy the ONE `max_active_executions` slot for key "acme". See the
+    // detached-spawn test above for why this needs both the `MetadataGuard`
+    // install and the task-row deletion below.
+    let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy).await;
+    let blocker = start_root(
+        &mut conn,
+        child_wf_name,
+        &format!("blocker-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"tenant_id": "acme"}),
+    )
+    .await;
+    drop(blocker_guard);
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(blocker.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("delete blocker task row");
+
+    let parent = start_root(
+        &mut conn,
+        parent_wf_name,
+        &format!("parent-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"child_type": child_wf_name}),
+    )
+    .await;
+    let parent_pre_worker_scheduled_at = task_queue_state(&mut conn, parent).await.scheduled_at;
+
+    // Simulate a stale sentinel from an earlier, unrelated timer+signal race
+    // (issue #476/#600). This is the pre-existing-row shape issue #1391
+    // describes, not one this cycle stamps itself.
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET activity_name = 'mixed_signal_suspension' \
+         WHERE workflow_exec_id = $1 AND task_type = 'workflow'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(parent.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("stamp stale mixed_signal_suspension sentinel");
+
+    let reg = Arc::new(HandlerRegistry::new(
+        vec![
+            wf_info(parent_wf_name, mixed_batch_quota_parent),
+            child_info,
+        ],
+        vec![act_info(
+            "mixed_batch_quota_noop_activity",
+            mixed_batch_quota_noop_activity,
+        )],
+    ));
+    let worker = build_runtime_worker("w-1391-sentinel-quota", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+
+    // While the blocker still holds the quota slot, `persist_mixed_suspension_batch`
+    // rejects with `QuotaExceeded`. The whole transaction rolls back. This
+    // includes any sentinel clear its own success path would have done. So
+    // the pre-stamped sentinel above survives into the backoff requeue.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    let (retried_scheduled_at, observed_now) =
+        task_scheduled_at_after_a_retry_cycle(&mut conn, parent, parent_pre_worker_scheduled_at)
+            .await;
+    assert!(
+        retried_scheduled_at > observed_now,
+        "the backoff requeue must land in the future before the wake below \
+         can prove it survives"
+    );
+
+    // The regression check: an unrelated wake during the backoff window must
+    // be a no-op. Before the fix, the surviving sentinel matched
+    // `primary_repend_workflow_task_query`'s wake-forward arm and reset
+    // `scheduled_at` to now, defeating the backoff entirely.
+    queue::wake_workflow_task(&mut conn, parent)
+        .await
+        .expect("simulated unrelated wake");
+    let after_wake = task_queue_state(&mut conn, parent).await;
+    assert_eq!(
+        after_wake.scheduled_at, retried_scheduled_at,
+        "an unrelated wake must not pull a quota-backoff's scheduled_at \
+         forward via a stale mixed_signal_suspension sentinel"
+    );
+
+    // Free the quota slot and let the parent finish normally.
+    mark_terminal(&mut conn, blocker, "CANCELLED").await;
+
+    wait_for_execution_state(&url, parent, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
 }
 
 // ---------------------------------------------------------------------------

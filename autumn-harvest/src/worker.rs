@@ -16227,7 +16227,8 @@ async fn requeue_child_spawn_admission_error(
     );
     let backoff_chrono =
         chrono::Duration::from_std(backoff).unwrap_or_else(|_| chrono::Duration::seconds(5));
-    queue::requeue_for_retry(conn, task_id, backoff_chrono, &error.to_string()).await?;
+    queue::requeue_workflow_task_for_quota_retry(conn, task_id, backoff_chrono, &error.to_string())
+        .await?;
     Ok(())
 }
 
@@ -16277,7 +16278,8 @@ async fn recover_from_child_quota_exceeded(
     );
     let backoff_chrono =
         chrono::Duration::from_std(backoff).unwrap_or_else(|_| chrono::Duration::seconds(5));
-    queue::requeue_for_retry(conn, task_id, backoff_chrono, &error.to_string()).await?;
+    queue::requeue_workflow_task_for_quota_retry(conn, task_id, backoff_chrono, &error.to_string())
+        .await?;
     Ok(true)
 }
 
