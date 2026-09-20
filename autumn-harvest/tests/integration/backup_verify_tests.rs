@@ -19,7 +19,8 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use autumn_harvest::backup_verify::{
-    FindingClass, FindingSeverity, ShardTarget, VerifyOptions, VerifyStatus, verify_restore,
+    Finding, FindingClass, FindingSeverity, MAX_FINDING_SAMPLES, ShardTarget, VerifyOptions,
+    VerifyStatus, verify_restore,
 };
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::testing::WorkflowReplayer;
@@ -2894,6 +2895,62 @@ async fn a_reconstructed_pre_migration_same_shard_pick_is_unproven() {
         report.detected(FindingClass::CompletionTriggerFireUnproven),
         "a re-derived same-shard pick cannot rule out a lost cross-shard \
          relay and must not be silently dropped: {report:#?}"
+    );
+}
+
+/// A fire naming a trigger definition that no longer exists cannot resolve
+/// its target at all. Neither the fires row nor a joined trigger row
+/// carries a `target_workflow_name`. This is reported, not silently
+/// skipped. The report text stays bounded (issue #1401, Codex follow-up):
+/// the exact count is always right, only the joined sample list is capped
+/// at `MAX_FINDING_SAMPLES`.
+#[tokio::test]
+async fn missing_trigger_definitions_are_reported_with_a_bounded_sample() {
+    let (url_a, _ca) = setup().await;
+    let mut a = connect(&url_a).await;
+
+    let total = MAX_FINDING_SAMPLES + 2;
+    for i in 0..total {
+        let source = ExecutionId::new_for_shard(ShardId::new(0));
+        let trigger_id = Uuid::new_v4();
+        seed_execution(
+            &mut a,
+            source,
+            "parent_flow",
+            &format!("ct-missing-{i}"),
+            "COMPLETED",
+            0,
+        )
+        .await;
+        // No `seed_completion_trigger` row for this `trigger_id`: the join
+        // that would supply `trigger_target_workflow_name` finds nothing.
+        seed_completion_trigger_fire(&mut a, source, trigger_id, Utc::now(), None).await;
+    }
+
+    let report = verify_restore(&one_shard(&url_a), &opts(), &WorkflowReplayer::new()).await;
+
+    let probe_failed: Vec<&Finding> = report
+        .all_findings()
+        .filter(|f| f.class == FindingClass::ProbeFailed)
+        .collect();
+    let note = probe_failed
+        .iter()
+        .flat_map(|f| f.samples.iter())
+        .find(|s| s.contains("trigger definition that no longer exists"))
+        .unwrap_or_else(|| panic!("expected a missing-trigger-definition note: {report:#?}"));
+
+    assert!(
+        note.contains(&format!("{total} completion-trigger fire(s)")),
+        "the reported count must be exact even though the sample list is \
+         capped: {note}"
+    );
+    let sample_count = note
+        .split_once(": ")
+        .map_or(0, |(_, samples)| samples.split(", ").count());
+    assert!(
+        sample_count <= MAX_FINDING_SAMPLES,
+        "the joined sample list must stay bounded regardless of how many \
+         rows matched: {note}"
     );
 }
 

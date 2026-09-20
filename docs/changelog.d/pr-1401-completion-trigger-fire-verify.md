@@ -82,6 +82,13 @@ silently truncate" guarantee. `retention_summary_exists_by_key` checks
 the target execution id does not exist until start time) before the
 timestamp heuristic runs, so proven retention always wins.
 
+`collect_trigger_fires`'s missing-trigger-definition diagnostic (a fire
+whose `trigger_id` no longer joins to a `harvest_completion_triggers` row)
+now bounds its sample text the same way `fold_reference_events` already
+bounds `undecodable_samples`: an exact count, plus a joined sample list
+capped at `MAX_FINDING_SAMPLES` (Codex follow-up). It previously joined
+every matching row into one unbounded string.
+
 **No new `WorkflowEvent` variant, no engine-runtime behavior change beyond
 the two additive write-path fixes above.** Read-only in `backup_verify.rs`,
 reusing `execution::execution_exists_by_key` — the exact any-state
@@ -94,6 +101,7 @@ existence check the relay itself runs for its own idempotent retry.
 `a_delivered_completion_trigger_fire_stays_silent`,
 `a_same_shard_completion_trigger_fire_is_not_probed`,
 `a_reconstructed_pre_migration_same_shard_pick_is_unproven`,
+`missing_trigger_definitions_are_reported_with_a_bounded_sample`,
 `a_resolved_completion_trigger_fire_is_not_probed`,
 `a_fire_still_pending_relay_is_not_probed`,
 `an_absent_completion_trigger_target_with_a_summary_stays_silent`,

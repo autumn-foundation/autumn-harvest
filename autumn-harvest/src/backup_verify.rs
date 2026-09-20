@@ -2100,28 +2100,38 @@ mod probes {
     ) -> Result<CollectedTriggerFires, String> {
         let (rows, truncation) = scan_completion_trigger_fires(conn, limit).await?;
         let mut fires = Vec::with_capacity(rows.len());
-        let mut missing_trigger = Vec::new();
+        // Bounded like `undecodable_samples` in `fold_reference_events`: a
+        // static trigger removed while fires still reference it can affect
+        // every row the scan admits, up to `limit`. The count stays exact;
+        // only the joined sample text is capped.
+        let mut missing_trigger_samples = Vec::new();
+        let mut missing_trigger_count: u64 = 0;
         for row in rows {
-            match row
+            if let Some(target_workflow_name) = row
                 .fire_target_workflow_name
                 .or(row.trigger_target_workflow_name)
             {
-                Some(target_workflow_name) => fires.push(super::ResolvedFire {
+                fires.push(super::ResolvedFire {
                     source_exec_id: row.source_exec_id,
                     trigger_id: row.trigger_id,
                     fired_at: row.fired_at,
                     target_workflow_name,
                     target_shard: row.target_shard,
-                }),
-                None => missing_trigger.push(format!("{}/{}", row.source_exec_id, row.trigger_id)),
+                });
+            } else {
+                if missing_trigger_samples.len() < MAX_FINDING_SAMPLES {
+                    missing_trigger_samples
+                        .push(format!("{}/{}", row.source_exec_id, row.trigger_id));
+                }
+                missing_trigger_count += 1;
             }
         }
-        let undecodable = (!missing_trigger.is_empty()).then(|| {
+        let undecodable = (missing_trigger_count > 0).then(|| {
             format!(
-                "{} completion-trigger fire(s) name a trigger definition that no \
-                 longer exists, so their target could not be derived: {}",
-                missing_trigger.len(),
-                missing_trigger.join(", ")
+                "{missing_trigger_count} completion-trigger fire(s) name a trigger \
+                 definition that no longer exists, so their target could not be \
+                 derived: {}",
+                missing_trigger_samples.join(", ")
             )
         });
         Ok(CollectedTriggerFires {
