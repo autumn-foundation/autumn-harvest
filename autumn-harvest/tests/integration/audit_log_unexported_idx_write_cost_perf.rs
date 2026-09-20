@@ -3,33 +3,36 @@
 //! `harvest_audit_log_unexported_idx` on a deployment that never configures
 //! audit export.
 //!
-//! Issue #1272 (closed via PR #1518, documentation only) established that
+//! Issue #1272 (closed via PR #1518, documentation only) established a gap.
 //! `harvest_audit_log_unexported_idx` — `(occurred_at, id) WHERE export_seq
 //! IS NULL` — matches every row in `harvest_audit_log` when no audit-export
-//! sink is configured, because `export_seq` then stays `NULL` forever. The
-//! issue text is explicit that options (1) lazy index creation on opt-in and
-//! (4) a separate operator-applied migration are "the real fixes if the cost
-//! proves material on a large audit table — which wants a measurement, not a
-//! guess." `audit_export_tests.rs`'s own module doc repeats the same
-//! deferral: "The insert-path index cost is separate (issue #1272)."
+//! sink is configured. `export_seq` then stays `NULL` forever. The issue
+//! text is explicit about the real fixes: (1) lazy index creation on opt-in,
+//! and (4) a separate operator-applied migration. The issue calls both
+//! real fixes, but only "if the cost proves material on a large audit
+//! table". That, the issue says, "wants a measurement, not a guess."
+//!
+//! `audit_export_tests.rs`'s own module doc repeats the same deferral:
+//! "The insert-path index cost is separate (issue #1272)."
 //!
 //! This harness is that measurement. It seeds a production-shaped
-//! `harvest_audit_log` (500,000 pre-existing rows, realistic operation-name
-//! and actor cardinality, occurred_at spread across the 90-day default
-//! retention window, `export_seq` left `NULL` throughout — the exact steady
-//! state of an unconfigured deployment) in two otherwise-identical fresh
-//! databases: one with the shipped schema (index present), one with the
-//! index dropped (the "lazily created, only on opt-in" counterfactual). It
-//! then drives the REAL public entry point every mutating management-API
-//! handler calls — `audit::insert_audit` — for a batch of new rows in both,
-//! and reports the buffer/WAL delta `pg_stat_statements` attributes to the
+//! `harvest_audit_log` in two otherwise-identical fresh databases. One
+//! keeps the shipped schema, index present. The other drops the index --
+//! the "lazily created, only on opt-in" counterfactual. The fixture has
+//! 500,000 pre-existing rows, realistic operation-name and actor
+//! cardinality, and `occurred_at` spread across the 90-day default
+//! retention window. `export_seq` stays `NULL` throughout — the exact
+//! steady state of an unconfigured deployment. The harness then drives the
+//! REAL public entry point every mutating management-API handler calls,
+//! `audit::insert_audit`, for a batch of new rows in both databases. It
+//! reports the buffer/WAL delta `pg_stat_statements` attributes to the
 //! `INSERT INTO harvest_audit_log` statement itself, plus the index's own
-//! size and its `idx_scan` count observed across a representative read
-//! workload (`audit::list_audit`, the real `GET /audit` handler's own
-//! entry point).
+//! size and its `idx_scan` count. `idx_scan` is observed across a
+//! representative read workload: `audit::list_audit`, the real `GET /audit`
+//! handler's own entry point.
 //!
-//! Evidence is `pg_stat_statements` buffers, WAL bytes and `pg_relation_size`
-//! — never wall-clock alone, per this persona's charter.
+//! Evidence is `pg_stat_statements` buffers, WAL bytes and `pg_relation_size`.
+//! Wall-clock alone is never evidence, per this persona's charter.
 
 #![allow(clippy::too_many_lines)]
 
@@ -177,7 +180,21 @@ struct IdxScanRow {
     idx_scan: i64,
 }
 
+/// Reads `pg_stat_user_indexes` for `harvest_audit_log`, first forcing this
+/// backend's own counters to flush.
+///
+/// PG16's statistics collector batches updates. Querying
+/// `pg_stat_user_indexes` right after a scan, on the same backend, can
+/// still read the pre-scan counters. That would let a real index use hide
+/// behind a stale zero -- review finding on PR #1666. `SELECT
+/// pg_stat_force_next_flush()` makes the read authoritative. Issue #1511's
+/// own measurement used the identical mechanism for `pg_stat_database`
+/// counters, for the identical reason.
 async fn index_scan_counts(conn: &mut AsyncPgConnection) -> Vec<IdxScanRow> {
+    diesel::sql_query("SELECT pg_stat_force_next_flush()")
+        .execute(conn)
+        .await
+        .expect("force this backend's statistics to flush before reading them");
     diesel::sql_query(
         "SELECT indexrelname, idx_scan FROM pg_stat_user_indexes \
          WHERE relname = 'harvest_audit_log' ORDER BY indexrelname",
@@ -189,8 +206,8 @@ async fn index_scan_counts(conn: &mut AsyncPgConnection) -> Vec<IdxScanRow> {
 
 // ── Production-shaped fixture ───────────────────────────────────────────────
 
-/// Realistic operation-name cardinality and skew: `workflow.start` and
-/// `workflow.signal` dominate a real deployment's mutating traffic; the rest
+/// Realistic operation-name cardinality and skew. `workflow.start` and
+/// `workflow.signal` dominate a real deployment's mutating traffic. The rest
 /// of the management surface (schedules, DLQ, batch, audit-export admin) is
 /// the long tail. 14 distinct operations, weighted, not a uniform draw.
 const OPERATION_WEIGHTS: &[(&str, u32)] = &[
@@ -250,14 +267,24 @@ fn fixture_row(i: usize) -> (String, String, String, String, String, String) {
     )
 }
 
-/// Seeds `n` pre-existing audit rows through the REAL batched entry point
-/// (`audit::insert_audit_batch`), then backdates `occurred_at` with a single
-/// bulk `UPDATE` to spread them across the 90-day default retention window —
-/// `occurred_at` is DB-defaulted to `NOW()` at insert time and is not a
-/// `NewAuditRecord` field, so this is the only way to give the fixture
-/// realistic time-density without hand-writing `INSERT` statements that
-/// bypass the code path under test. The backdating `UPDATE` runs once,
-/// outside the measured window.
+/// Seeds `n` pre-existing audit rows through the REAL batched entry point,
+/// `audit::insert_audit_batch`. It then backdates `occurred_at` with a
+/// single bulk `UPDATE`, to spread the rows across the 90-day default
+/// retention window. `occurred_at` is DB-defaulted to `NOW()` at insert
+/// time and is not a `NewAuditRecord` field. Backdating afterward is the
+/// only way to give the fixture realistic time-density without
+/// hand-writing `INSERT` statements that bypass the code path under test.
+/// The backdating `UPDATE` runs once, outside the measured window.
+///
+/// `occurred_at` is a key column of `harvest_audit_log_unexported_idx`. So
+/// the backdating `UPDATE` leaves one dead index entry per row behind, a
+/// non-`HOT` update on an indexed column. Without an explicit `VACUUM`, the
+/// index-size and insert-cost measurements below would read a transient,
+/// bloated shape. That shape's exact bloat would depend on autovacuum's own
+/// timing rather than on the fixture -- review finding on PR #1666. A plain
+/// `VACUUM` reclaims the dead entries, never `VACUUM FULL`, which takes
+/// `ACCESS EXCLUSIVE`. It puts both fixtures in the same steady state
+/// before either is measured.
 async fn seed_fixture(conn: &mut AsyncPgConnection, n: usize) {
     const CHUNK: usize = 4999;
     let mut done = 0;
@@ -294,6 +321,10 @@ async fn seed_fixture(conn: &mut AsyncPgConnection, n: usize) {
     .execute(conn)
     .await
     .expect("backdate fixture rows across the retention window");
+    diesel::sql_query("VACUUM harvest_audit_log")
+        .execute(conn)
+        .await
+        .expect("reclaim dead index entries left by the backdating UPDATE");
 }
 
 const FIXTURE_ROWS: usize = 500_000;
@@ -341,6 +372,20 @@ async fn measure(admin: &str, label: &'static str, drop_unexported_idx: bool) ->
         .expect("stats connection");
     reset_stats_for_db(&mut stats_conn, &db_name).await;
 
+    // A checkpoint right before the measured window, in both scenarios.
+    // The first write to a page after a checkpoint carries a full-page
+    // image. Under this fixture's write load, that image can arrive from
+    // an autovacuum-triggered checkpoint firing unpredictably mid-window,
+    // rather than from the code under test. Forcing one here puts both
+    // scenarios' measured windows on the same footing. Never run
+    // `CHECKPOINT` on a shared production server outside a diagnostic
+    // session; this is a disposable per-scenario database. Otherwise the
+    // delta would be at the mercy of checkpoint timing.
+    diesel::sql_query("CHECKPOINT")
+        .execute(&mut stats_conn)
+        .await
+        .expect("checkpoint before the measured window");
+
     // The REAL public entry point every mutating management-API handler
     // calls once per request (`audit::insert_audit`'s own doc comment:
     // "Called after every covered management mutation").
@@ -381,9 +426,9 @@ async fn measure(admin: &str, label: &'static str, drop_unexported_idx: bool) ->
     let insert_buffers: i64 = insert_rows.iter().map(|r| r.total_buffers).sum();
 
     // Representative read workload: the real `GET /audit` entry point,
-    // `audit::list_audit`, with filters an operator actually uses
-    // (recency, actor, operation). None of these touch
-    // `harvest_audit_log_unexported_idx` -- it is not eligible for any of
+    // `audit::list_audit`, with filters an operator actually uses --
+    // recency, actor, operation. None of these touch
+    // `harvest_audit_log_unexported_idx`. It is not eligible for any of
     // them, exactly as it would not be for the real handler in production.
     let _ = audit::list_audit(&mut op_conn, &AuditFilters::default())
         .await
@@ -476,6 +521,24 @@ async fn zz_capture_audit_log_unexported_idx_write_cost_evidence() {
         "idx_scan(harvest_audit_log_unexported_idx) after seed+{MEASURED_INSERTS} inserts+3 \
          real list_audit reads: {}",
         before.unexported_idx_scans_after_reads
+    );
+
+    // Positive control (review finding on PR #1666). If the read path
+    // never registers on ANY index here, a zero on the target index is
+    // worthless. It would mean the flush/read mechanism itself is not
+    // seeing scans, not that this index specifically went unused.
+    // `list_audit`'s default call orders by `occurred_at DESC` with no
+    // filter. `harvest_audit_occurred_at_idx` exists to serve exactly that
+    // call. So it must show at least one real scan across the same three
+    // `list_audit` calls whose `harvest_audit_log_unexported_idx` count is
+    // asserted zero below.
+    assert!(
+        before.occurred_at_idx_scans_after_reads > 0,
+        "harvest_audit_occurred_at_idx must show at least one real scan from the same \
+         list_audit reads -- a zero here means the stats-flush/read mechanism itself is not \
+         visible, which would make the unexported-index zero below meaningless rather than a \
+         real finding (occurred_at_idx_scans_after_reads={})",
+        before.occurred_at_idx_scans_after_reads,
     );
 
     assert_eq!(
