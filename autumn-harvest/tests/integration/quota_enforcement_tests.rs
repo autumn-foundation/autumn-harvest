@@ -3779,33 +3779,69 @@ async fn quota_blocked_outbox_backoff_lands_on_the_database_clock() {
     )
     .await;
 
+    // Bracket the write with DB-clock reads taken just before and just
+    // after (Codex review on this PR). The actual `clock_timestamp()`
+    // write happens somewhere inside this call, at a point this test never
+    // observes directly. A single `db_clock_now()` sampled only afterward
+    // would be a fixed race instead. Any scheduling delay between the
+    // write and that later probe reads as a shrunken backoff, and fails
+    // the test even on correct code.
+    let before = queue::db_clock_now(&mut conn)
+        .await
+        .expect("probe database clock before");
     enforce_completion_triggers_outbox(&mut conn, &NoOpMetrics, &sharded_pool, &[ShardId::new(0)])
         .await
         .expect("outbox scan hits the quota-blocked target");
+    let after = queue::db_clock_now(&mut conn)
+        .await
+        .expect("probe database clock after");
 
     let deadline = outbox_next_attempt_at(&mut conn, outbox_id)
         .await
         .expect("a QuotaBlocked outcome must stamp next_attempt_at");
-    let db_now = queue::db_clock_now(&mut conn)
-        .await
-        .expect("probe database clock");
 
     // Mirrors `QUOTA_REDEFER_BACKOFF` (5 seconds). This tracks that
     // production constant the same way `CLAIM_BATCH_LIMIT` above does, so
     // a changed backoff value fails this test loudly.
-    let expected_backoff = chrono::Duration::seconds(5);
-    let held = deadline - db_now;
-    let drift = (held - expected_backoff).num_milliseconds().abs();
-    const TOLERANCE_MS: i64 = 750;
-    assert!(
-        drift <= TOLERANCE_MS,
-        "expected next_attempt_at ({deadline}) to land within \
-         {TOLERANCE_MS}ms of {expected_backoff} past the database's own \
-         NOW() ({db_now}), but held {held} -- drift {drift}ms"
+    assert_next_attempt_at_matches_backoff_on_db_clock(
+        deadline,
+        before,
+        after,
+        chrono::Duration::seconds(5),
     );
 
     mark_terminal(&mut conn, blocker, "CANCELLED").await;
     drop(guard);
+}
+
+/// Assert `deadline` lands within a tight tolerance of `expected_backoff`
+/// past the database's own clock (issue #1392 review).
+///
+/// `before` and `after` bracket the write. Both are read from the
+/// database's own clock, taken just before and just after the operation
+/// that performs the write. The write's own `clock_timestamp()` reading
+/// falls somewhere between the two. So `deadline` must land in
+/// `[before + expected_backoff, after + expected_backoff]`, widened by a
+/// small tolerance for cross-request rounding. This never depends on how
+/// long the bracketed operation itself takes. It does not race a slow or
+/// loaded test run the way a single post-hoc clock probe would.
+fn assert_next_attempt_at_matches_backoff_on_db_clock(
+    deadline: chrono::DateTime<chrono::Utc>,
+    before: chrono::DateTime<chrono::Utc>,
+    after: chrono::DateTime<chrono::Utc>,
+    expected_backoff: chrono::Duration,
+) {
+    const TOLERANCE_MS: i64 = 750;
+    let tolerance = chrono::Duration::milliseconds(TOLERANCE_MS);
+    let lower = before + expected_backoff - tolerance;
+    let upper = after + expected_backoff + tolerance;
+    assert!(
+        deadline >= lower && deadline <= upper,
+        "expected next_attempt_at ({deadline}) to land within \
+         {TOLERANCE_MS}ms of {expected_backoff} past the database's own \
+         clock, bracketed between before={before} and after={after} \
+         (window [{lower}, {upper}])"
+    );
 }
 
 /// Issue #1392: a scan that cannot even ATTEMPT a relay must also stamp
@@ -3854,6 +3890,13 @@ async fn outbox_relay_missing_pool_backoff_lands_on_the_database_clock() {
         .expect("insert outbox row")
         .id;
 
+    // Bracket the write with DB-clock reads taken just before and just
+    // after (Codex review on this PR). See
+    // `assert_next_attempt_at_matches_backoff_on_db_clock`'s doc comment
+    // for why a single post-hoc clock probe races a loaded test run.
+    let before = queue::db_clock_now(&mut conn)
+        .await
+        .expect("probe database clock before");
     enforce_completion_triggers_outbox(
         &mut conn,
         &NoOpMetrics,
@@ -3862,25 +3905,21 @@ async fn outbox_relay_missing_pool_backoff_lands_on_the_database_clock() {
     )
     .await
     .expect("outbox scan hits the missing-pool target");
+    let after = queue::db_clock_now(&mut conn)
+        .await
+        .expect("probe database clock after");
 
     let deadline = outbox_next_attempt_at(&mut conn, outbox_id)
         .await
         .expect("a missing-pool scan must stamp next_attempt_at");
-    let db_now = queue::db_clock_now(&mut conn)
-        .await
-        .expect("probe database clock");
 
     // Mirrors `OUTBOX_RELAY_FAILURE_BACKOFF` (5 seconds), the same value as
     // `QUOTA_REDEFER_BACKOFF` above but a separate production constant.
-    let expected_backoff = chrono::Duration::seconds(5);
-    let held = deadline - db_now;
-    let drift = (held - expected_backoff).num_milliseconds().abs();
-    const TOLERANCE_MS: i64 = 750;
-    assert!(
-        drift <= TOLERANCE_MS,
-        "expected next_attempt_at ({deadline}) to land within \
-         {TOLERANCE_MS}ms of {expected_backoff} past the database's own \
-         NOW() ({db_now}), but held {held} -- drift {drift}ms"
+    assert_next_attempt_at_matches_backoff_on_db_clock(
+        deadline,
+        before,
+        after,
+        chrono::Duration::seconds(5),
     );
 }
 
