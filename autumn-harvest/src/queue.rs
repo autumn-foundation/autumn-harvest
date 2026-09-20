@@ -3009,7 +3009,7 @@ pub async fn requeue_workflow_task_for_quota_retry(
     use crate::schema::harvest_task_queue::dsl;
 
     let next_run = Utc::now() + delay;
-    let changeset = PendingRequeueChangeset::new(next_run, previous_error.to_string());
+    let changeset = PendingRequeueChangeset::new(previous_error.to_string());
 
     let updated = diesel::update(
         dsl::harvest_task_queue
@@ -3019,6 +3019,7 @@ pub async fn requeue_workflow_task_for_quota_retry(
     )
     .set((
         changeset,
+        dsl::scheduled_at.eq(next_run),
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
     ))
@@ -3050,7 +3051,10 @@ pub async fn requeue_workflow_task_for_quota_retry(
 /// so a no-DB unit test can assert the generated SQL shape (issue #1391).
 /// Mirrors the `requeue_after_panic_query` shape-test precedent.
 #[cfg(test)]
-fn requeue_workflow_task_for_quota_retry_query(changeset: PendingRequeueChangeset) -> String {
+fn requeue_workflow_task_for_quota_retry_query(
+    changeset: PendingRequeueChangeset,
+    next_run: chrono::DateTime<Utc>,
+) -> String {
     use crate::schema::harvest_task_queue::dsl;
     use diesel::debug_query;
     use diesel::pg::Pg;
@@ -3063,6 +3067,7 @@ fn requeue_workflow_task_for_quota_retry_query(changeset: PendingRequeueChangese
     )
     .set((
         changeset,
+        dsl::scheduled_at.eq(next_run),
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
     ));
@@ -10247,11 +10252,10 @@ mod tests {
     /// reopen issue #1391 or its #603 sibling.
     #[test]
     fn requeue_workflow_task_for_quota_retry_query_clears_sentinel_and_wake() {
-        let changeset =
-            PendingRequeueChangeset::new(chrono::Utc::now(), "quota exceeded".to_string());
-        let sql = requeue_workflow_task_for_quota_retry_query(changeset);
+        let changeset = PendingRequeueChangeset::new("quota exceeded".to_string());
+        let sql = requeue_workflow_task_for_quota_retry_query(changeset, chrono::Utc::now());
 
-        for column in ["wake_requested", "activity_name"] {
+        for column in ["scheduled_at", "wake_requested", "activity_name"] {
             assert!(
                 sql.contains(&format!("\"{column}\" = $")),
                 "{column} must appear as a bound column in the SET clause: {sql}"
