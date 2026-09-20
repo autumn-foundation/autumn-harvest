@@ -115,6 +115,28 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
 }
 
+/// Best-effort `DROP DATABASE IF EXISTS` for every name given. A
+/// persistent `HARVEST_TEST_DATABASE_URL` server would otherwise
+/// accumulate this harness's large scenario databases across repeated
+/// runs -- review finding on PR #1666. One connection error, or one
+/// drop failure, does not stop the rest. Each name gets its own
+/// attempt. A failure is logged, not panicked: this cleanup step runs
+/// after the evidence has already been captured.
+async fn drop_databases(admin_url: &str, names: &[&str]) {
+    let Ok(mut admin) = AsyncPgConnection::establish(admin_url).await else {
+        eprintln!("cleanup: could not connect to admin database, leaving {names:?} in place");
+        return;
+    };
+    for name in names {
+        if let Err(e) = diesel::sql_query(format!("DROP DATABASE IF EXISTS \"{name}\""))
+            .execute(&mut admin)
+            .await
+        {
+            eprintln!("cleanup: failed to drop database {name}: {e}");
+        }
+    }
+}
+
 async fn ensure_pg_stat_statements(conn: &mut AsyncPgConnection) {
     let _ = diesel::sql_query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
         .execute(conn)
@@ -392,6 +414,7 @@ const MEASURED_INSERTS: usize = 3_000;
 
 struct Measurement {
     label: &'static str,
+    db_name: String,
     insert_calls: i64,
     insert_buffers: i64,
     insert_wal_bytes: i64,
@@ -594,6 +617,7 @@ async fn measure(
 
     Measurement {
         label,
+        db_name,
         insert_calls,
         insert_buffers,
         insert_wal_bytes: wal_after - wal_before,
@@ -661,6 +685,17 @@ async fn zz_capture_audit_log_unexported_idx_write_cost_evidence() {
          real list_audit reads: {}",
         before.unexported_idx_scans_after_reads
     );
+
+    // Best-effort cleanup, ahead of the assertions below (review finding
+    // on PR #1666). On the `HARVEST_TEST_DATABASE_URL` path this
+    // harness creates one 500,000-row base database plus two full
+    // clones. Every name carries a fresh UUID. So repeated runs
+    // against a persistent server would otherwise accumulate large
+    // databases forever. Placed before the assertions, so a positive-
+    // control or zero-scan failure still leaves the server clean. A
+    // hard crash inside `measure` itself, before reaching here, is the
+    // one case this does not cover.
+    drop_databases(&admin, &[&base_name, &before.db_name, &after.db_name]).await;
 
     // Positive control (review finding on PR #1666). If the read path
     // never registers on ANY index here, a zero on the target index is
