@@ -6447,6 +6447,19 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
             let mut deferred_checks = Vec::new();
             let mut cancel_metrics = Vec::new();
 
+            // Acquire the business-key admission lock FIRST, before any row
+            // lock this transaction takes (issue #1596 review, comment_id
+            // 4055601101). `resolve_effective_signal_with_start_policy`
+            // below takes `FOR UPDATE` on the incumbent row for
+            // `AllowDuplicate`/`AllowDuplicateFailedOnly`. A concurrent
+            // ordinary start (`start_or_load_workflow_execution_collect_
+            // with_codecs_and_quota_override`) takes this SAME advisory
+            // lock before its own row lock. Taking the row lock first here
+            // would let the two transactions form a row-lock/advisory-lock
+            // cycle, which Postgres resolves by aborting one as a
+            // deadlock. One lock order, taken first everywhere, closes it.
+            lock_execution_admission(conn, request.workflow_name, request.workflow_id).await?;
+
             // Cross-execution dedupe: scope by (workflow_name, workflow_id, key)
             // so escalation/reset paths on a new exec_id don't re-queue the signal.
             if let Some(key) = request.idempotency_key.as_deref()
@@ -7550,6 +7563,16 @@ fn admission_lock_namespace(workflow_name: &str, workflow_id: &str) -> String {
 /// lookup, and the fresh `INSERT`, against every other start racing the
 /// same key.
 ///
+/// Also taken first, for the same reason, at the top of the outer
+/// transactions in `signal_with_start_workflow_execution_with_metrics_and_
+/// codecs` and `update_with_start_workflow_execution_with_metrics_and_
+/// codecs` (issue #1596 review, `comment_id` 4055601101). Both resolve their
+/// effective reuse policy through a `FOR UPDATE` row lock on the incumbent
+/// row. Taking that row lock before this advisory lock would let a
+/// concurrent ordinary start -- which takes this lock first -- form a
+/// row-lock/advisory-lock cycle. One lock order, taken first on every
+/// admission path, closes it.
+///
 /// # Why the partial unique index does not already do this
 ///
 /// The active-uniqueness index only covers non-sealed rows. A reconciled
@@ -7909,6 +7932,13 @@ pub async fn update_with_start_workflow_execution_with_metrics_and_codecs(
             let mut deferred_starts = Vec::new();
             let mut deferred_checks = Vec::new();
             let mut cancel_metrics = Vec::new();
+
+            // Acquire the business-key admission lock FIRST, before any row
+            // lock this transaction takes (issue #1596 review, comment_id
+            // 4055601101). See the sibling comment in
+            // `signal_with_start_workflow_execution_with_metrics_and_codecs`
+            // for the deadlock this ordering closes.
+            lock_execution_admission(conn, request.workflow_name, request.workflow_id).await?;
 
             // Cross-execution idempotency dedupe scoped to (workflow_name, workflow_id).
             // When an idempotency key is provided we look up by the supplied update_id

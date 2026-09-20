@@ -1206,10 +1206,6 @@ mod db {
     struct StagedKeyRow {
         #[diesel(sql_type = Text)]
         state: String,
-        #[diesel(sql_type = Text)]
-        workflow_name: String,
-        #[diesel(sql_type = Text)]
-        workflow_id: String,
     }
 
     async fn read_json(
@@ -1338,7 +1334,7 @@ mod db {
             row.and_then(|r| r.payload)
         };
 
-        let vacated_execution_id = Box::pin(target.transaction::<Option<Uuid>, HarvestError, _>(async |conn| {
+        Box::pin(target.transaction::<(), HarvestError, _>(async |conn| {
             // On a REVERSE migration (A -> B -> A) the target is a shard this
             // run has already lived on, so it holds A's `MIGRATED` seal — the
             // forwarding pointer every id that routes to A resolves through.
@@ -1394,26 +1390,34 @@ mod db {
             .await
             .optional_row()?;
 
-            let vacated_execution_id = if let Some(stale) = stale_target_row
+            if let Some(stale) = stale_target_row
                 && !matches!(
                     stale.state.as_str(),
                     "RUNNING" | "PAUSED" | "MIGRATING" | "MIGRATED"
                 )
             {
+                // `staging_vacated_by` names the execution THIS staging is
+                // for, i.e. the row that will occupy the slot this vacate
+                // frees (issue #1596 review, comment_id 4055601106). Set in
+                // the SAME statement as the vacate itself, so the link is
+                // exactly as durable as the vacate: no cross-database
+                // write, no retry race. `activate_target` reads it back to
+                // finalize this row's marker with a direct match on the
+                // execution id, no inference or business-key ambiguity
+                // possible.
                 diesel::sql_query(
                     "UPDATE harvest_workflow_executions \
-                      SET state = 'CONTINUED_AS_NEW', staging_vacated_state = $2 \
+                      SET state = 'CONTINUED_AS_NEW', staging_vacated_state = $2, \
+                          staging_vacated_by = $3 \
                       WHERE id = $1",
                 )
                 .bind::<SqlUuid, _>(stale.id)
                 .bind::<Text, _>(&stale.state)
+                .bind::<SqlUuid, _>(exec_id.as_uuid())
                 .execute(&mut *conn)
                 .await
                 .map_err(database_error)?;
-                Some(stale.id)
-            } else {
-                None
-            };
+            }
 
             // `migrated_from_shards` gets its new hop stamped HERE, at staging
             // time. It is not deferred to `activate_target`'s
@@ -1516,26 +1520,16 @@ mod db {
             .await
             .map_err(database_error)?;
 
-            Ok(vacated_execution_id)
+            Ok(())
         }))
         .await?;
 
-        // `vacated_execution_id` names precisely which row, if any, THIS
-        // staging vacated (issue #1596 review, comment_id 4055454415).
-        // `activate_target`'s force-terminated-target branch reads it back
-        // to finalize that row's marker by id. A business-key-only match
-        // cannot close the retry race this closes. A retried call could
-        // otherwise see a DIFFERENT migration's later vacate as the sole
-        // marker under the same business key. It could clear that marker
-        // by mistake.
         diesel::sql_query(
-            "UPDATE harvest_shard_migrations \
-                SET staged_task = $2, vacated_execution_id = $3, updated_at = NOW() \
+            "UPDATE harvest_shard_migrations SET staged_task = $2, updated_at = NOW() \
               WHERE execution_id = $1",
         )
         .bind::<SqlUuid, _>(exec_id.as_uuid())
         .bind::<Nullable<Jsonb>, _>(staged_task)
-        .bind::<Nullable<SqlUuid>, _>(vacated_execution_id)
         .execute(source)
         .await
         .map_err(database_error)?;
@@ -1574,14 +1568,12 @@ mod db {
         // `MIGRATED` seal, untouched, is not a staged copy. `stage_copy` can
         // fail before its target transaction commits. Deleting the history
         // and the row below would then destroy a real, untouched seal.
-        let row: Option<StagedKeyRow> = diesel::sql_query(
-            "SELECT state, workflow_name, workflow_id FROM harvest_workflow_executions \
-              WHERE id = $1",
-        )
-        .bind::<SqlUuid, _>(exec_id.as_uuid())
-        .get_result(&mut *conn)
-        .await
-        .optional_row()?;
+        let row: Option<StagedKeyRow> =
+            diesel::sql_query("SELECT state FROM harvest_workflow_executions WHERE id = $1")
+                .bind::<SqlUuid, _>(exec_id.as_uuid())
+                .get_result(&mut *conn)
+                .await
+                .optional_row()?;
         let Some(row) = row else {
             return Ok(());
         };
@@ -1622,10 +1614,12 @@ mod db {
         }
 
         // Restore an unrelated same-key row `stage_copy` vacated to make
-        // room for this copy (issue #1317 review, P1). The vacate and this
-        // staged row's insert committed in the same transaction. So if the
-        // staged row existed, at most one other row can carry a pending
-        // marker for this business key, and it is this migration's.
+        // room for this copy (issue #1317 review, P1). Matched by
+        // `staging_vacated_by`, not by business key (issue #1596 review,
+        // comment_id 4055601106). `staging_vacated_by` names exactly the
+        // row this migration's own staging vacated, set in the same
+        // statement as the vacate itself. This match needs no
+        // continuous-occupancy argument to be safe.
         //
         // This runs LAST, after the staged row above is gone or sealed
         // back to `MIGRATED`. Both states already free this business
@@ -1635,12 +1629,10 @@ mod db {
         // whole scheme exists to respect.
         diesel::sql_query(
             "UPDATE harvest_workflow_executions \
-              SET state = staging_vacated_state, staging_vacated_state = NULL \
-              WHERE workflow_name = $1 AND workflow_id = $2 AND id != $3 \
-                AND staging_vacated_state IS NOT NULL",
+              SET state = staging_vacated_state, staging_vacated_state = NULL, \
+                  staging_vacated_by = NULL \
+              WHERE staging_vacated_by = $1 AND staging_vacated_state IS NOT NULL",
         )
-        .bind::<Text, _>(&row.workflow_name)
-        .bind::<Text, _>(&row.workflow_id)
         .bind::<SqlUuid, _>(exec_id.as_uuid())
         .execute(&mut *conn)
         .await
@@ -2731,30 +2723,35 @@ mod db {
     /// crash: it is driven entirely off the durable `COMMITTED` record on the
     /// source, which by then is already sealed.
     ///
-    /// Three things happen in one target-shard transaction, ALL gated on the
-    /// `MIGRATING → RUNNING` update actually matching a row:
+    /// Up to four things happen in one target-shard transaction:
     ///
     /// 1. `MIGRATING → RUNNING`.
-    /// 2. The parked workflow task row captured at stage time is restored.
-    /// 3. If any signal arrived between the cutover and now — forwarded to the
+    /// 2. Any vacate marker this migration's own staging left on an unrelated
+    ///    row is finalized (cleared), by that row's `staging_vacated_by` link.
+    ///    Unconditional: safe on every call, including one where step 1 is a
+    ///    no-op.
+    /// 3. The parked workflow task row captured at stage time is restored.
+    /// 4. If any signal arrived between the cutover and now — forwarded to the
     ///    target through the sealed source — the restored task is re-pended
     ///    `PENDING` at `NOW()` so the wake is delivered rather than left waiting
     ///    for a timer that may be days out. This is what closes the
     ///    "never lost" half of the wake contract on the post-cutover side.
     ///
-    /// An operator can force-terminate the staged copy during the supported
-    /// `COMMITTED`-before-activation window (issue #1596 review, findings 1
-    /// and 2). Step 1 can then legitimately match zero rows against an
-    /// already-`TERMINATED` row. Steps 2 and 3 must not run in that case.
-    /// Termination already tries to fail every open task for the execution.
-    /// Restoring a `PENDING` task afterward would undo that. `claim_task_query`
-    /// does not require the owning execution to be `RUNNING`. A resurrected
-    /// task could then be claimed and dispatched against a terminated run.
-    /// That branch instead finalizes any vacate marker this migration's own
-    /// staging left on an unrelated row, named precisely by the
-    /// `vacated_execution_id` `stage_copy` recorded. The migration still
-    /// concludes as `DONE`, and no future abort can restore that marker
-    /// afterward.
+    /// Steps 3 and 4 are gated on step 1 actually matching a row. An
+    /// operator can force-terminate the staged copy during the supported
+    /// `COMMITTED`-before-activation window (issue #1596 review, finding
+    /// 1). Step 1 can then legitimately match zero rows against an
+    /// already-`TERMINATED` row. Restoring a `PENDING` task in that case
+    /// would undo termination's own attempt to fail every open task for the
+    /// execution. `claim_task_query` does not require the owning execution
+    /// to be `RUNNING`, so a resurrected task could then be claimed and
+    /// dispatched against a terminated run.
+    ///
+    /// Step 2 has no such gate (issue #1596 review, finding 2, hardened by
+    /// `comment_id` 4055454415 and `comment_id` 4055601106). The migration
+    /// concludes as `DONE` right after this transaction regardless of step
+    /// 1's outcome. `DONE` is terminal, so no future abort can restore a
+    /// marker left unfinalized here.
     ///
     /// # Errors
     ///
@@ -2767,13 +2764,8 @@ mod db {
         exec_id: ExecutionId,
     ) -> HarvestResult<()> {
         // `staged_task`, captured verbatim at stage time and restored here.
-        // `vacated_execution_id` names the row, if any, that THIS
-        // migration's own staging vacated. It is read here so the
-        // force-terminated-target branch below can finalize its marker by
-        // id (issue #1596 review, comment_id 4055454415).
         let staged: ActivationRow = diesel::sql_query(
-            "SELECT staged_task AS payload, vacated_execution_id \
-               FROM harvest_shard_migrations \
+            "SELECT staged_task AS payload FROM harvest_shard_migrations \
               WHERE execution_id = $1",
         )
         .bind::<SqlUuid, _>(exec_id.as_uuid())
@@ -2787,7 +2779,6 @@ mod db {
             ))
         })?;
         let staged_task: Option<Value> = staged.payload;
-        let vacated_execution_id: Option<Uuid> = staged.vacated_execution_id;
 
         Box::pin(target.transaction::<(), HarvestError, _>(async |conn| {
             let staged_task = staged_task.clone();
@@ -2824,63 +2815,51 @@ mod db {
                 // Staging can have vacated an unrelated same-key row to free
                 // the target's active-uniqueness slot for this copy (issue
                 // #1317 review, P1). Activation is the point of no return
-                // for that seal. Drop its restore marker rather than carry
-                // it forever: nothing will ever abort this migration again
-                // to need it.
+                // for that seal either way, whether it succeeds or is a
+                // no-op over an already-`RUNNING` or force-terminated row.
+                // The migration concludes as `DONE` right after this
+                // transaction regardless. `DONE` is terminal, so no future
+                // abort can restore the marker. Drop it here rather than
+                // carry it forever.
                 //
-                // Gated on `activated > 0` (issue #1317 review, P1
-                // follow-up), not run unconditionally on every call. The
-                // durable `COMMITTED` record can retry this function long
-                // after the update above already matched and committed.
-                // A target-side crash between that commit and the
-                // source-side `DONE` write is exactly the case
-                // `activate_target`'s own idempotence exists to tolerate.
-                // By then a DIFFERENT same-key migration can have vacated
-                // its OWN unrelated terminal row on this same target. The
-                // clear below is keyed only by business identity, with no
-                // link to which migration attempt owns which vacate. An
-                // unconditional retry would clear that newer attempt's
-                // marker instead of this one's. If the newer migration
-                // later aborts, it would find no marker to restore from,
-                // leaving its vacated row stuck reporting
-                // `CONTINUED_AS_NEW` forever. `activated > 0` is true only
-                // in the exact call that just performed the transition
-                // above, in the same transaction as the clear. It scopes
-                // the clear to the marker this invocation actually owns,
-                // exactly once. A retry after that same transition has
-                // already committed skips it entirely.
-                if activated > 0 {
-                    diesel::sql_query(
-                        "UPDATE harvest_workflow_executions \
-                          SET staging_vacated_state = NULL \
-                          WHERE staging_vacated_state IS NOT NULL AND id != $1 \
-                            AND workflow_name = \
-                                (SELECT workflow_name FROM harvest_workflow_executions \
-                                  WHERE id = $1) \
-                            AND workflow_id = \
-                                (SELECT workflow_id FROM harvest_workflow_executions \
-                                  WHERE id = $1)",
-                    )
-                    .bind::<SqlUuid, _>(exec_id.as_uuid())
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(database_error)?;
+                // Matched by `staging_vacated_by` (issue #1596 review,
+                // comment_id 4055454415, hardened by comment_id
+                // 4055601106), not by business-key uniqueness. A
+                // business-key match cannot tell this migration's own
+                // marker apart from one a DIFFERENT migration leaves under
+                // the same key. This call can also be retried arbitrarily
+                // many times, including after a target-side crash between
+                // the `RUNNING` transition and the source-side `DONE`
+                // write. `staging_vacated_by` was set in the SAME statement
+                // `stage_copy` used to vacate the row. It names that row
+                // precisely, with no inference and no retry race, so this
+                // is safe to run unconditionally on every call.
+                diesel::sql_query(
+                    "UPDATE harvest_workflow_executions \
+                        SET staging_vacated_state = NULL, staging_vacated_by = NULL \
+                      WHERE staging_vacated_by = $1 AND staging_vacated_state IS NOT NULL",
+                )
+                .bind::<SqlUuid, _>(exec_id.as_uuid())
+                .execute(&mut *conn)
+                .await
+                .map_err(database_error)?;
 
-                    // Gated on `activated > 0` (issue #1596 review, finding
-                    // 1). Termination is an operator override with no
-                    // state-precondition filter. It can seal this copy
-                    // `TERMINATED` before activation ever runs. The update
-                    // above then matches zero rows against an
-                    // already-terminated target. Restoring the parked task
-                    // unconditionally would recreate a `PENDING` row for
-                    // that execution. Termination already tried to fail
-                    // every open task of it. `claim_task_query` does not
-                    // require the owning execution to be `RUNNING`. A
-                    // resurrected task could later be claimed and
-                    // dispatched against a `TERMINATED` execution. An
-                    // idempotent retry of a genuinely successful activation
-                    // already has the task from the original transaction.
-                    // Gating here never loses legitimate work.
+                // Gated on `activated > 0` (issue #1596 review, finding
+                // 1). Termination is an operator override with no
+                // state-precondition filter. It can seal this copy
+                // `TERMINATED` before activation ever runs. The update
+                // above then matches zero rows against an
+                // already-terminated target. Restoring the parked task
+                // unconditionally would recreate a `PENDING` row for
+                // that execution. Termination already tried to fail
+                // every open task of it. `claim_task_query` does not
+                // require the owning execution to be `RUNNING`. A
+                // resurrected task could later be claimed and
+                // dispatched against a `TERMINATED` execution. An
+                // idempotent retry of a genuinely successful activation
+                // already has the task from the original transaction.
+                // Gating here never loses legitimate work.
+                if activated > 0 {
                     if let Some(task) = staged_task {
                         diesel::sql_query(
                             "INSERT INTO harvest_task_queue \
@@ -2911,43 +2890,6 @@ mod db {
                     .execute(&mut *conn)
                     .await
                     .map_err(database_error)?;
-                } else if let Some(vacated_id) = vacated_execution_id {
-                    // Activation is a no-op here for one of two reasons.
-                    // Either this is an idempotent retry of an
-                    // already-successful run. Or an operator
-                    // force-terminated the staged copy in the
-                    // `COMMITTED`-before-activation window (issue #1596
-                    // review, finding 2).
-                    //
-                    // The migration still concludes as `DONE` right after
-                    // this transaction. `DONE` is a terminal phase, so no
-                    // future abort can walk it back. A vacate marker this
-                    // migration's own staging left on `vacated_id` must be
-                    // finalized here, or it is stuck forever. Retention
-                    // would keep reporting that row as `CONTINUED_AS_NEW`.
-                    // It would refuse to ever delete it.
-                    //
-                    // Targeted BY ID, not by business-key uniqueness (issue
-                    // #1596 review, comment_id 4055454415). A business-key
-                    // match cannot tell this migration's own marker apart
-                    // from one a DIFFERENT, later migration leaves under
-                    // the same key. This call can also be a retry. The
-                    // first invocation can finalize the marker and then
-                    // fail before the source-side `DONE` write lands. A
-                    // second invocation then runs against state a
-                    // different migration has since changed.
-                    // `vacated_execution_id` was recorded in the SAME
-                    // transaction that vacated the row. It names that row
-                    // with no inference required.
-                    diesel::sql_query(
-                        "UPDATE harvest_workflow_executions \
-                            SET staging_vacated_state = NULL \
-                          WHERE id = $1 AND staging_vacated_state IS NOT NULL",
-                    )
-                    .bind::<SqlUuid, _>(vacated_id)
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(database_error)?;
                 }
                 Ok(())
             }
@@ -2958,17 +2900,9 @@ mod db {
         // payload. Once the target holds it there is no reason to keep a third
         // copy on the source in a table neither `erase.rs` nor the retention
         // janitor knows about, so the settling UPDATE clears it.
-        //
-        // `vacated_execution_id` is cleared here too. By this point the target
-        // transaction above already used it, if it was set, to finalize the
-        // vacated row's marker. Nothing reads it again once this record
-        // reaches `DONE`. A retry that reaches this point re-reads whatever
-        // was here before the clear. So clearing it now loses no retry that
-        // still needs it.
         diesel::sql_query(
             "UPDATE harvest_shard_migrations \
-                SET phase = 'DONE', staged_task = NULL, vacated_execution_id = NULL, \
-                    updated_at = NOW() \
+                SET phase = 'DONE', staged_task = NULL, updated_at = NOW() \
               WHERE execution_id = $1 AND phase = 'COMMITTED'",
         )
         .bind::<SqlUuid, _>(exec_id.as_uuid())
@@ -3016,7 +2950,7 @@ mod db {
         let claimed = diesel::sql_query(
             "UPDATE harvest_shard_migrations \
                 SET phase = 'ABORTED', abort_reason = $2, staged_task = NULL, \
-                    vacated_execution_id = NULL, updated_at = NOW() \
+                    updated_at = NOW() \
               WHERE execution_id = $1 \
                 AND phase IN ('PENDING', 'COPIED', 'VERIFIED')",
         )
@@ -4228,8 +4162,6 @@ mod db {
     struct ActivationRow {
         #[diesel(sql_type = Nullable<Jsonb>)]
         payload: Option<Value>,
-        #[diesel(sql_type = Nullable<SqlUuid>)]
-        vacated_execution_id: Option<Uuid>,
     }
 
     #[derive(diesel::QueryableByName)]

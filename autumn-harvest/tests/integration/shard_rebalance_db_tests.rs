@@ -7029,128 +7029,126 @@ async fn activation_finalizes_a_vacate_marker_over_a_force_terminated_target() {
     assert_eq!(record.phase, MigrationPhase::Done);
 }
 
-/// Issue #1596 review, `comment_id` 4055454415 (P1). A business-key-only
-/// match cannot tell this migration's own marker apart from one a
-/// DIFFERENT, later migration leaves under the same key. The
-/// zero-rows-activated branch can also be RETRIED. The first invocation
-/// can finalize the marker and then fail before the source-side `DONE`
-/// write lands. That leaves the durable record `COMMITTED`, with its
-/// original `vacated_execution_id` intact. A different migration can then
-/// vacate a new row under the same business key before the retry runs.
-/// The retry must still target only the row THIS migration's own staging
-/// vacated, by id. It must never fall back to whichever row happens to
-/// carry a marker when it runs.
+#[derive(diesel::QueryableByName)]
+struct VacateMarkerRow {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    staging_vacated_state: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    staging_vacated_by: Option<Uuid>,
+}
+
+async fn vacate_marker_of(conn: &mut AsyncPgConnection, row_id: Uuid) -> VacateMarkerRow {
+    diesel::sql_query(
+        "SELECT staging_vacated_state, staging_vacated_by \
+           FROM harvest_workflow_executions WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(row_id)
+    .get_result(conn)
+    .await
+    .expect("query the row's vacate marker and link")
+}
+
+/// Issue #1596 review, `comment_id` 4055601106 (P1). An earlier fix
+/// (`comment_id` 4055454415) recorded which row `stage_copy` vacated in a
+/// SEPARATE, later, cross-database write. That write went to a
+/// `harvest_shard_migrations` column on the SOURCE shard.
+///
+/// If that write failed and `stage_copy` was retried, the retry found
+/// nothing left to vacate. The row was already `CONTINUED_AS_NEW` from
+/// the first attempt. So it silently overwrote the link with `NULL`,
+/// orphaning the marker forever.
+///
+/// The fix moves the link onto the vacated row itself
+/// (`staging_vacated_by`), set in the SAME statement as the vacate, on
+/// the SAME (target) database. This test drives exactly the retry the
+/// finding describes. `stage_copy` succeeds, its post-transaction
+/// bookkeeping is modelled as failing, then `stage_copy` runs again. It
+/// asserts the link survives, and still lets a later force-terminated
+/// activation finalize the marker.
 #[tokio::test]
-async fn activation_retry_after_a_partial_settle_does_not_clear_a_different_migrations_marker() {
-    const KEY: &str = "terminated-target-partial-settle-retry";
+async fn stage_copy_retry_preserves_the_vacate_link_after_a_bookkeeping_failure() {
     let shards = setup_two_shards().await;
 
     let mut target = shards.target().await;
-    let first_stale_id = Uuid::new_v4();
+    let stale_id = Uuid::new_v4();
     target
         .batch_execute(&format!(
             "INSERT INTO harvest_workflow_executions \
                (id, workflow_name, workflow_id, run_id, shard_id, state, input, \
                 started_at, created_at, completed_at) \
              VALUES \
-               ('{first_stale_id}', 'entity_flow', '{KEY}', gen_random_uuid(), 1, \
+               ('{stale_id}', 'entity_flow', 'retry-preserves-vacate-link', gen_random_uuid(), 1, \
                 'COMPLETED', '{{}}', now(), now(), now())"
         ))
         .await
-        .expect("seed the first stale terminal prior on the target");
+        .expect("seed the stale terminal prior on the target");
 
-    // Migration A vacates the first stale row and is then force-terminated
-    // before its own `activate_target` ever runs.
-    let exec_a = quiescent_fixture(&shards, KEY).await;
-    let (mut source_a, mut target_a) = (shards.source().await, shards.target().await);
-    begin_migration(&mut source_a, exec_a, SOURCE, TARGET)
+    let exec_id = quiescent_fixture(&shards, "retry-preserves-vacate-link").await;
+    let mut source = shards.source().await;
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
         .await
-        .expect("begin A");
-    stage_copy(&mut source_a, &mut target_a, exec_a, TARGET)
+        .expect("begin");
+    let mut target2 = shards.target().await;
+    stage_copy(&mut source, &mut target2, exec_id, TARGET)
         .await
-        .expect("stage A must vacate the first stale prior");
-    verify_target_copy(&mut source_a, &mut target_a, exec_a, &codecs())
+        .expect("stage (attempt 1) must vacate the stale prior");
+
+    // Roll the durable record back to PENDING. This models stage_copy's
+    // post-transaction bookkeeping failing after the target transaction
+    // above -- which performed the vacate and set the link -- already
+    // committed for real. It mirrors `a_repeated_stage_after_an_
+    // interrupted_resume_keeps_the_carried_seal`'s established
+    // crash-simulation pattern.
+    diesel::sql_query(
+        "UPDATE harvest_shard_migrations SET phase = 'PENDING' WHERE execution_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut source)
+    .await
+    .expect("simulate a crash before the phase advanced past PENDING");
+
+    // Retry: the stale row is already CONTINUED_AS_NEW, so this vacates
+    // nothing new. It must not disturb the link attempt 1 already set.
+    let mut target3 = shards.target().await;
+    stage_copy(&mut source, &mut target3, exec_id, TARGET)
         .await
-        .expect("verify A");
+        .expect("stage (attempt 2, the retry) must succeed as a no-op vacate");
+
+    let mut target4 = shards.target().await;
+    let marker = vacate_marker_of(&mut target4, stale_id).await;
+    assert_eq!(marker.staging_vacated_state.as_deref(), Some("COMPLETED"));
+    assert_eq!(
+        marker.staging_vacated_by,
+        Some(exec_id.as_uuid()),
+        "the retry must not lose the link attempt 1 already set on the vacated row"
+    );
+
+    // End to end: a force-terminated activation must still finalize this
+    // row's marker through the preserved link.
+    verify_target_copy(&mut source, &mut target4, exec_id, &codecs())
+        .await
+        .expect("verify");
     assert!(
-        commit_cutover(&mut source_a, exec_a, TARGET)
+        commit_cutover(&mut source, exec_id, TARGET)
             .await
-            .expect("cutover A")
+            .expect("cutover")
     );
     diesel::sql_query("UPDATE harvest_workflow_executions SET state = 'TERMINATED' WHERE id = $1")
-        .bind::<diesel::sql_types::Uuid, _>(exec_a.as_uuid())
-        .execute(&mut target_a)
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut target4)
         .await
-        .expect("force-terminate A's staged copy");
-
-    // First activation call: finalizes the marker A's own staging left on
-    // `first_stale_id`, exactly like `activation_finalizes_a_vacate_marker_
-    // over_a_force_terminated_target` above.
-    activate_target(&mut source_a, &mut target_a, exec_a)
+        .expect("force-terminate the staged copy");
+    activate_target(&mut source, &mut target4, exec_id)
         .await
-        .expect("A's first activation");
+        .expect("activation must still succeed as a no-op over a terminated target");
 
-    // Roll the durable record back to COMMITTED with its ORIGINAL
-    // vacated_execution_id. This models a crash between the target-side
-    // clear above, which already committed for real, and the source-side
-    // DONE write. That write would normally follow in the same call.
-    diesel::sql_query(
-        "UPDATE harvest_shard_migrations \
-            SET phase = 'COMMITTED', vacated_execution_id = $2 \
-          WHERE execution_id = $1",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(exec_a.as_uuid())
-    .bind::<diesel::sql_types::Uuid, _>(first_stale_id)
-    .execute(&mut source_a)
-    .await
-    .expect("simulate the source-side DONE write never landing");
-
-    // A DIFFERENT, later migration vacates a second, unrelated row under the
-    // SAME business key before A's retry runs. Modelled directly, rather
-    // than through a full second migration, since the row and its marker
-    // are all this scenario needs.
-    let mut target_b = shards.target().await;
-    let second_stale_id = Uuid::new_v4();
-    target_b
-        .batch_execute(&format!(
-            "INSERT INTO harvest_workflow_executions \
-               (id, workflow_name, workflow_id, run_id, shard_id, state, input, \
-                staging_vacated_state, started_at, created_at, completed_at) \
-             VALUES \
-               ('{second_stale_id}', 'entity_flow', '{KEY}', gen_random_uuid(), 1, \
-                'CONTINUED_AS_NEW', '{{}}', 'COMPLETED', now(), now(), now())"
-        ))
-        .await
-        .expect("seed a different migration's own in-flight vacate");
-
-    // A's retry must target only `first_stale_id` (already cleared, so this
-    // is a no-op), never `second_stale_id`.
-    activate_target(&mut source_a, &mut target_a, exec_a)
-        .await
-        .expect("A's retry must still succeed as a no-op");
-
-    let mut target2 = shards.target().await;
-    let second_marker: ScalarText = diesel::sql_query(
-        "SELECT staging_vacated_state AS value FROM harvest_workflow_executions WHERE id = $1",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(second_stale_id)
-    .get_result(&mut target2)
-    .await
-    .expect("query the second stale row's marker");
+    let mut target5 = shards.target().await;
+    let finalized = vacate_marker_of(&mut target5, stale_id).await;
     assert_eq!(
-        second_marker.value.as_deref(),
-        Some("COMPLETED"),
-        "a retry of A's activation must never clear a DIFFERENT migration's own \
-         in-flight vacate marker -- it must target only the row A's own staging \
-         vacated, by id, not whichever row happens to carry a marker"
+        finalized.staging_vacated_state, None,
+        "the preserved link must still let activation finalize the marker"
     );
-
-    let mut source2 = shards.source().await;
-    let record = load_migration(&mut source2, exec_a)
-        .await
-        .expect("load")
-        .expect("row");
-    assert_eq!(record.phase, MigrationPhase::Done);
+    assert_eq!(finalized.staging_vacated_by, None);
 }
 
 /// `resolve_execution_shard_holding` must report the shard a hop's read

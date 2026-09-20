@@ -3647,12 +3647,18 @@ async fn seed_reconciled_seal(
     workflow_id: &str,
     terminal_state: &str,
 ) {
+    // `harvest_we_migrated_forward_check` requires a `MIGRATED` row to carry
+    // a forwarding pointer: `migrated_to_shard` and `migrated_at` both set.
+    // The pointer's target need not be a configured shard for this test.
+    // Nothing here ever resolves through it. Only the row's own reconciled
+    // fields matter to the code path under test.
     diesel::sql_query(
         "INSERT INTO harvest_workflow_executions \
          (id, workflow_name, workflow_id, shard_id, input, queue_name, state, \
+          migrated_to_shard, migrated_at, \
           completed_at, migrated_run_terminal_at, migrated_run_terminal_state) \
          VALUES ($1, 'ag_target_wf', $2, 0, '{}'::jsonb, 'default', 'MIGRATED', \
-                 NOW(), NOW(), $3)",
+                 1, NOW(), NOW(), NOW(), $3)",
     )
     .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
     .bind::<Text, _>(workflow_id)
@@ -3662,16 +3668,17 @@ async fn seed_reconciled_seal(
     .expect("seed reconciled seal");
 }
 
-/// Issue #1596 review, `comment_id` 4055454416 (P2): a `RejectDuplicate` start
-/// against a business key whose only prior is a RECONCILED seal must refuse
-/// with `AlreadyExists`, never `AdmissionBlocked`. Nothing is admitted here —
-/// the refusal itself is the whole outcome — so an armed gate must not be
-/// allowed to relabel it.
+/// Issue #1596 review, `comment_id` 4055454416 (P2). A `RejectDuplicate`
+/// start against a business key whose only prior is a RECONCILED seal must
+/// refuse with `AlreadyExists`, never `AdmissionBlocked`. Nothing is
+/// admitted here — the refusal itself is the whole outcome — so an armed
+/// gate must not be allowed to relabel it.
 ///
-/// Before this fix, the admission-gate block ran first, saw no ACTIVE prior
-/// (a reconciled seal is deliberately excluded from that check), treated the
-/// request as a fresh create, and returned `AdmissionBlocked` under an armed
-/// gate instead of ever reaching the reconciled-seal check below it.
+/// Before this fix, the admission-gate block ran first. It saw no ACTIVE
+/// prior, since a reconciled seal is deliberately excluded from that
+/// check, and treated the request as a fresh create. It returned
+/// `AdmissionBlocked` under an armed gate, instead of ever reaching the
+/// reconciled-seal check below it.
 #[tokio::test]
 async fn gate_does_not_relabel_a_reject_duplicate_refusal_over_a_reconciled_seal() {
     let _guard = TEST_SERIAL
@@ -3713,16 +3720,17 @@ async fn gate_does_not_relabel_a_reject_duplicate_refusal_over_a_reconciled_seal
     assert_eq!(target_exec_count(&mut conn).await, 1);
 }
 
-/// Issue #1596 review, `comment_id` 4055454416 (P2): an `AllowDuplicateFailedOnly`
-/// start against a reconciled seal whose live copy finished successfully
-/// (COMPLETED, not FAILED/CANCELLED) must ATTACH to it, never be blocked by an
-/// armed gate. An attach admits no new execution, so the gate has nothing to
-/// legitimately guard here.
+/// Issue #1596 review, `comment_id` 4055454416 (P2). An
+/// `AllowDuplicateFailedOnly` start against a reconciled seal whose live
+/// copy finished successfully (COMPLETED, not FAILED/CANCELLED) must
+/// ATTACH to it. It must never be blocked by an armed gate. An attach
+/// admits no new execution, so the gate has nothing to legitimately guard
+/// here.
 ///
-/// Before this fix, the admission-gate block's own occupant read also missed
-/// the reconciled seal, treated the request as a fresh create, and returned
-/// `AdmissionBlocked` under an armed gate instead of ever reaching the
-/// attach below it.
+/// Before this fix, the admission-gate block's own occupant read also
+/// missed the reconciled seal. It treated the request as a fresh create,
+/// and returned `AdmissionBlocked` under an armed gate, instead of ever
+/// reaching the attach below it.
 #[tokio::test]
 async fn gate_does_not_block_an_allow_duplicate_failed_only_attach_to_a_reconciled_seal() {
     let _guard = TEST_SERIAL
@@ -4008,6 +4016,103 @@ fn update_with_start_fresh_params(workflow_id: &'static str) -> UpdateWithStartP
         workflow_retry_policy: None,
         max_workflow_attempts_ceiling: None,
         reject_fresh_if_debounced: false,
+    }
+}
+
+/// Issue #1596 review, `comment_id` 4055601101 (P2): `resolve_effective_
+/// signal_with_start_policy` takes `FOR UPDATE` on the incumbent row for
+/// `AllowDuplicate`/`AllowDuplicateFailedOnly`. A concurrent ordinary start
+/// takes the admission advisory lock FIRST, then waits on that same row.
+/// The two orders can form a row-lock/advisory-lock cycle, which Postgres
+/// resolves by aborting one side as a deadlock.
+///
+/// Reproduced by holding ONLY the advisory lock. That mimics a concurrent
+/// ordinary start that already has it and is still mid-transaction. A
+/// real `signal_with_start` call must then block on it IMMEDIATELY. It
+/// must not race ahead to take the row lock first. Before the fix, the
+/// advisory lock was acquired deep
+/// inside the nested start machinery, well after the row lock. A task
+/// racing ahead that far would not still be blocked here at all. Once
+/// the holder releases, the call must complete cleanly, with no deadlock
+/// error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn signal_with_start_acquires_the_admission_lock_before_any_row_lock() {
+    const WORKFLOW_ID: &str = "sws-lock-order";
+
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+
+    seed_prior_ag_target(&mut conn, WORKFLOW_ID, "RUNNING").await;
+
+    // The same advisory-lock namespace `admission_lock_namespace` derives
+    // for this business key. Its format is private to execution.rs, so it
+    // is reproduced bit for bit here, letting the holder contend on the
+    // identical lock.
+    let namespace = format!(
+        "exec_admission:v1:{}:ag_target_wf:{WORKFLOW_ID}",
+        "ag_target_wf".len()
+    );
+
+    let mut holder = pool.get().await.unwrap();
+    {
+        use diesel_async::SimpleAsyncConnection;
+        holder.batch_execute("BEGIN").await.unwrap();
+        diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind::<Text, _>(&namespace)
+            .execute(&mut holder)
+            .await
+            .unwrap();
+    }
+
+    let sws_pool = pool.clone();
+    let sws_task = tokio::spawn(async move {
+        let mut a_conn = sws_pool.get().await.unwrap();
+        signal_with_start_workflow_execution_with_metrics(
+            &mut a_conn,
+            signal_with_start_fresh_params(WORKFLOW_ID),
+            None,
+            None,
+        )
+        .await
+    });
+
+    // Give the spawned call time to reach (and block on) the admission lock.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !sws_task.is_finished(),
+        "signal_with_start must block on the admission lock before doing any \
+         other work -- if it raced ahead instead, the fix did not move the \
+         lock acquisition first"
+    );
+
+    // Holder releases the admission lock.
+    {
+        use diesel_async::SimpleAsyncConnection;
+        holder.batch_execute("COMMIT").await.unwrap();
+    }
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), sws_task)
+        .await
+        .expect("signal_with_start must complete once the admission lock frees, not hang")
+        .expect("join sws task");
+
+    match outcome {
+        Ok(started) => {
+            assert!(
+                !started.started_fresh,
+                "AllowDuplicate over a RUNNING prior attaches, not a fresh start"
+            );
+        }
+        Err(e) => panic!(
+            "signal_with_start must complete cleanly once unblocked, not error -- a \
+             deadlock error here means the lock order regressed: {e}"
+        ),
     }
 }
 
