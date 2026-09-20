@@ -1169,6 +1169,43 @@ async fn ui_dead_letters_invalid_page_redisplays_list_instead_of_aborting_page()
     );
 }
 
+/// Codex review on #1665: `refresh` was missed by the page/limit sweep
+/// (#1420/#1588) above, still typed `Option<u64>` directly on the
+/// extractor. Same fix, reusing `parse_refresh_query_field` (the DAG
+/// detail page's own parser, #1630).
+#[tokio::test]
+async fn ui_dead_letters_invalid_refresh_redisplays_page_instead_of_aborting() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(
+        &app,
+        "/dead-letters?refresh=not-a-number&workflow_name=invoice_workflow",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid refresh must not abort the whole DLQ page: {html}"
+    );
+    assert!(
+        html.contains("value=\"invoice_workflow\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the Refresh field: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+    assert!(
+        !html.contains("http-equiv=\"refresh\""),
+        "an invalid refresh must not set a meta refresh: {html}"
+    );
+}
+
 /// DLQ Summary toggle (issue #385): the aggregation view groups entries,
 /// reports counts merged across shards, and links back into the filtered list.
 #[tokio::test]
@@ -1542,6 +1579,41 @@ async fn ui_workers_invalid_page_redisplays_list_instead_of_aborting_page() {
     assert!(
         html.contains("Page 1"),
         "falls back to page 1 (zero-based page 0) instead of guessing: {html}"
+    );
+}
+
+/// Codex review on #1665: `refresh` was missed by the page/limit/shard
+/// sweep (#1378/#1560) above, still typed `Option<u64>` directly on the
+/// extractor. Same fix, reusing `parse_refresh_query_field` (the DAG
+/// detail page's own parser, #1630). No form field backs `refresh` on
+/// this page, matching DAG detail's own `node`/`refresh`. The error
+/// renders as a page-level alert instead of next to a control.
+#[tokio::test]
+async fn ui_workers_invalid_refresh_redisplays_page_instead_of_aborting() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/workers?refresh=not-a-number&build_id=abc123").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid refresh must not abort the whole Workers page: {html}"
+    );
+    assert!(
+        html.contains("value=\"abc123\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must be present: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+    assert!(
+        !html.contains("http-equiv=\"refresh\""),
+        "an invalid refresh must not set a meta refresh: {html}"
     );
 }
 
@@ -2211,6 +2283,39 @@ async fn ui_schedules_invalid_page_redisplays_list_instead_of_aborting_page() {
     assert!(
         html.contains("Page 1"),
         "falls back to page 1 (zero-based page 0) instead of guessing: {html}"
+    );
+}
+
+/// Codex review on #1665: `refresh` was missed by the page/limit sweep
+/// (#1588/#1619) above, still typed `Option<u64>` directly on the
+/// extractor. Same fix, reusing `parse_refresh_query_field` (the DAG
+/// detail page's own parser, #1630).
+#[tokio::test]
+async fn ui_schedules_invalid_refresh_redisplays_page_instead_of_aborting() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/schedules?refresh=not-a-number&target=billing").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid refresh must not abort the whole Schedules page: {html}"
+    );
+    assert!(
+        html.contains("value=\"billing\""),
+        "the other filter the operator already typed must not be discarded: {html}"
+    );
+    assert!(
+        html.contains("role=\"alert\""),
+        "an inline, screen-reader-announced error must sit next to the Refresh field: {html}"
+    );
+    assert!(
+        html.contains("not-a-number"),
+        "the error must name the bad value: {html}"
+    );
+    assert!(
+        !html.contains("http-equiv=\"refresh\""),
+        "an invalid refresh must not set a meta refresh: {html}"
     );
 }
 
