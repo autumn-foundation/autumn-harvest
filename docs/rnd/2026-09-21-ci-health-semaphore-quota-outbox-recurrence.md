@@ -322,9 +322,9 @@ Corrected: **6 of 11** `Test DB (linux, shard N)` legs failed.
 
 Run `35563198153` (2026-09-21T05:04:24Z) failed 6 of its 11 `Test DB (linux,
 shard N)` legs (shards 0, 3, 4, 5, 8, 10). Full-log inspection of shard 3
-(the worst-hit, `curl` of the signed log URL since the module exceeds any
-`tail_lines`) shows the large majority of its ~40 failing tests — spanning
-four otherwise-unrelated suites (`chain_timeout_tests`, `ctx_info_tests`,
+(`curl` of the signed log URL since the module exceeds any `tail_lines`)
+shows the large majority of its 36 failing tests — spanning four
+otherwise-unrelated suites (`chain_timeout_tests`, `ctx_info_tests`,
 `mixed_suspension_tests`, `dispatch_tests`) — panic at the identical
 location, `integration_e2e.rs:1383:6`, inside a shared test helper,
 `wait_for_execution_state_with_timeout`:
@@ -337,14 +337,18 @@ That helper polls the database every 50ms for a workflow to reach an
 expected state, and gives up after a fixed `tokio::time::timeout`. A handful
 of the shard's failures instead panic at an assertion inside their own test
 file (`chain_timeout_tests.rs:736`/`880`, `mixed_suspension_tests.rs:508`),
-not the shared helper — not checked further this session. Shard 3 was the
-worst-hit in this run but not the only one: **added after review**, this
-same run's own shard 10 independently shows ~60
-`integration_e2e`/`quota_enforcement_tests` failures, nearly all at the
-identical `integration_e2e.rs:1383:6` site — including the exact test item
-2 tracks,
+not the shared helper — not checked further this session. Shard 3 was not
+the only shard hit, and — **correction (post-review)** — not even the
+worst by raw failure count: an earlier draft called shard 3 "the
+worst-hit," but this same run's own shard 10 independently shows **70**
+failing tests (`grep -c '\.\.\. FAILED$'` on its full log, versus shard
+3's 36), nearly all at the identical `integration_e2e.rs:1383:6` site —
+including the exact test item 2 tracks,
 `quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded`
-(see item 2's own correction above).
+(see item 2's own correction above). Shard 3's failures span more
+*distinct* suites (4, vs. shard 10's 2), so "worst-hit" depends on which
+metric is meant; neither shard is uniquely worse on both axes, and this
+report does not pick one.
 
 **The manifest gap has drifted back onto a colliding value (confirmed) —
 but two further review rounds cut back how much this explains, and by how
@@ -421,21 +425,30 @@ This run's shape (many otherwise-independent tests failing at one shared
 wait-helper's timeout, across **two** shards — 3 and 10 — not shard 10
 alone) is still not fully root-caused: this session did not fetch the
 branch's diff, did not check whether a later commit fixed it, and does not
-have worker-level logging. But the shard-10 half of it now has a confirmed,
-documented structural cause (the collision above) that does not require a
-product regression to explain — a genuine reason to weight "shard 10's
-own long wall-clock made it exposed to transient contention" well above
-"this branch's diff broke dispatch," at least for shard 10's own failures
-in this run. Shard 3's simultaneous failure (a shard that does **not**
-carry either oversized suite) is not explained by the shard-10 collision
-at all, and points toward a broader, run-wide contention event in
-`35563198153` specifically — not investigated further this session.
-Recorded as **1 cascade occurrence (across 2 shards, only one of which has
-a confirmed structural cause), plus 1 shared-panic-site, shared-shard,
-non-cascade occurrence** on the now-confirmed shard-10 defect. The
-remaining open question is not "is shard 10 imbalanced" (settled) but
-"was this run's shard 3 failure the same phenomenon by a different
-mechanism, or an unrelated coincidence" — not resolved by this report.
+have worker-level logging.
+
+**Correction (post-review), a second round.** An earlier draft of this
+paragraph said the shard-10 manifest-gap collision gives "a genuine reason
+to weight 'shard 10's own long wall-clock made it exposed to transient
+contention' well above 'this branch's diff broke dispatch.'" That
+conclusion does not survive the sequential-execution finding elsewhere in
+this section (`.github/ci/run-suites.sh` runs a shard's suites one at a
+time — the two oversized suites never contend for resources
+simultaneously), which this paragraph had not yet incorporated when first
+written. **Corrected: the manifest-gap collision is a confirmed, real
+regression, worth fixing on total-CI-duration grounds, but it is not
+established as the cause of this run's failures and should not be weighted
+above the product-regression or branch-diff readings** — all three remain
+open, undismissed candidates for both shard 3's and shard 10's failures in
+this run. Recorded as **1 cascade occurrence spanning 2 shards** (70
+failures on shard 10, 36 on shard 3, per direct count — neither
+"worst-hit" on both metrics), plus, separately, 1 shared-panic-site,
+shared-shard, single-test occurrence (item 2's 3rd occurrence) on a
+different run. The open question remains exactly what it was before this
+round found the manifest-gap regression: whether either shard's failures
+trace to a branch-diff regression, a runner/DB-level contention event, or
+(for shard 10 specifically) something related to its confirmed but
+unproven-as-causal oversized-suite pairing.
 
 ### 5. `cross_region_dr_tests`: one occurrence, new signature, not root-caused
 
@@ -724,11 +737,12 @@ sed -n '3400,3466p' autumn-harvest/tests/integration/quota_enforcement_tests.rs
 #    pre-fix bug it guards against remains a live, undismissed candidate,
 #    alongside (not superseded by) item 4's shard-10 pattern.
 
-# Item 4's shared-helper check, shard 3 (worst-hit):
+# Item 4's shared-helper check, shard 3:
 # get_job_logs(job_id=106225838152, return_content=false) -> signed URL
 curl -sS -o shard3.log '<signed logs_url>'
 grep -n "panicked at\|FAILED\|error\[" shard3.log | head -60
-# -> the large majority of ~40 failures across 4 unrelated suites panic at
+grep -c '\.\.\. FAILED$' shard3.log   # -> 36
+# -> the large majority of 36 failures across 4 unrelated suites panic at
 #    integration_e2e.rs:1383:6 ("workflow should reach expected state
 #    within timeout: Elapsed(())"), inside wait_for_execution_state_with_timeout:
 sed -n '1370,1384p' autumn-harvest/tests/integration/integration_e2e.rs
@@ -738,8 +752,12 @@ sed -n '1370,1384p' autumn-harvest/tests/integration/integration_e2e.rs
 # get_job_logs(job_id=106225838228, return_content=false) -> signed URL
 curl -sS -o shard10_keenbardeen.log '<signed logs_url>'
 grep -n "quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded.*FAILED\|panicked at" shard10_keenbardeen.log | grep -A1 completion_trigger
-# -> same test, same integration_e2e.rs:1383:6 site, ~60 other tests in the
-#    same shard fail identically.
+grep -c '\.\.\. FAILED$' shard10_keenbardeen.log   # -> 70 -- MORE than shard 3
+# -> same test, same integration_e2e.rs:1383:6 site, 70 total failures in
+#    this shard, spanning only 2 suites (vs. shard 3's 4) -- neither shard
+#    is uniquely "worst" on both count and breadth. Post-review correction:
+#    an earlier draft called shard 3 "the worst-hit," which the raw count
+#    (36 vs. 70) contradicts.
 
 # The shard-10 sharding calculation (why both suites land there):
 awk '$1=="linux"{print NR": "c" "$0; c++}' .github/ci/integration-suites.txt \
