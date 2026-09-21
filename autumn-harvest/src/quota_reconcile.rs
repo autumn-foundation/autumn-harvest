@@ -310,6 +310,16 @@ struct CandidateRow {
 /// against a large REGISTERED one instead, not a strict win. See the
 /// migration's own comment for the full trade-off.
 ///
+/// Measured against production-shaped fixtures (issue #1226 follow-up,
+/// see `docs/performance-quota-reconcile-candidate-scan.md`). The
+/// residual filter costs at most a few thousand cache-hit buffers at
+/// moderate non-quota'd population sizes. Above roughly 100,000 such
+/// rows, the planner switches to a cheaper plan through the unrelated,
+/// pre-existing `idx_harvest_wfx_workflow_identity` index. The rejected
+/// `(workflow_name, id)` index was tested directly too. It gives no
+/// meaningful buffer reduction over that existing plan. No code change
+/// is warranted.
+///
 /// `AND ($2::uuid IS NULL OR id > $2) ORDER BY id LIMIT $3` is a keyset
 /// cursor, not a bare `LIMIT`. A row this sweep can never resolve --
 /// [`ReconcileOutcome::Unresolvable`] or [`ReconcileOutcome::OverCap`] --

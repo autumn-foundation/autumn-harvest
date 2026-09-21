@@ -1,0 +1,23 @@
+-- CANDIDATE_SQL @ target=1000 rows / noise=100000 rows across 50 non-quota'd workflow types, first tick (after_id=NULL, batch_size=200) --
+Limit  (cost=1991.09..1991.59 rows=200 width=58) (actual time=0.475..0.495 rows=200 loops=1)
+  Output: id, workflow_name, input
+  Buffers: shared hit=35
+  ->  Sort  (cost=1991.09..1993.38 rows=915 width=58) (actual time=0.473..0.481 rows=200 loops=1)
+        Output: id, workflow_name, input
+        Sort Key: harvest_workflow_executions.id
+        Sort Method: top-N heapsort  Memory: 71kB
+        Buffers: shared hit=35
+        ->  Bitmap Heap Scan on public.harvest_workflow_executions  (cost=52.17..1951.55 rows=915 width=58) (actual time=0.061..0.271 rows=1000 loops=1)
+              Output: id, workflow_name, input
+              Recheck Cond: (harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[]))
+              Filter: ((harvest_workflow_executions.quota_key IS NULL) AND (harvest_workflow_executions.state = ANY ('{RUNNING,PAUSED}'::text[])))
+              Heap Blocks: exact=23
+              Buffers: shared hit=35
+              ->  Bitmap Index Scan on idx_harvest_wfx_workflow_identity  (cost=0.00..51.94 rows=1003 width=0) (actual time=0.050..0.050 rows=1000 loops=1)
+                    Index Cond: (harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[]))
+                    Buffers: shared hit=12
+Query Identifier: -8385330453775558084
+Planning:
+  Buffers: shared hit=245 read=21
+Planning Time: 1.014 ms
+Execution Time: 0.527 ms

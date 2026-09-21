@@ -13,36 +13,40 @@
 //! `workflow_name = ANY($1)` is a residual filter evaluated row by row
 //! against each id-ordered candidate, not an index seek.
 //!
-//! The migration's own comment names this a "KNOWN SCALING TRADE-OFF": in a
-//! mixed deployment with a large non-quota'd population and few matching
-//! rows, one tick can touch many discarded rows before filling
-//! `batch_size`. It proposes and rejects a `(workflow_name, id)` index as
-//! an alternative, stating the trade-off "needs `EXPLAIN ANALYZE` against
-//! production-scale data" and is "tracked as a follow-up, not silently
-//! accepted." This file is that follow-up.
+//! The migration's own comment names this a "KNOWN SCALING TRADE-OFF".
+//! Picture a mixed deployment with a large non-quota'd population and few
+//! matching rows. One tick can then touch many discarded rows before
+//! filling `batch_size`. The comment proposes and rejects a
+//! `(workflow_name, id)` index as an alternative. It states the trade-off
+//! "needs `EXPLAIN ANALYZE` against production-scale data" and is
+//! "tracked as a follow-up, not silently accepted." This file is that
+//! follow-up.
 //!
 //! # Fixture
 //!
 //! Seeded, deterministic (no `random()`), production-shaped. One quota'd
-//! workflow type (`billing_saga`, policy key `tenant_id`) with a small,
-//! fixed pre-upgrade backfill population (1,000 `RUNNING`/`PAUSED` rows,
-//! `quota_key IS NULL`, matching the issue #1226 rollout-window scenario).
-//! Alongside it, a large population of 50 distinct NON-quota'd workflow
-//! types with no declared `QuotaPolicy`, also non-terminal and also
-//! `quota_key IS NULL` — this is the realistic case a busy shard produces:
-//! most workflow types never adopt quotas, but their non-terminal rows
-//! still sit under the same partial index forever, since nothing ever sets
-//! their `quota_key`. [`NOISE_SWEEP`] scales that population across three
-//! sizes (20,000 / 100,000 / 500,000) while the target population and
-//! `batch_size` (`QUOTA_RECONCILE_DEFAULT_BATCH` = 200) stay fixed, so any
+//! workflow type (`billing_saga`, policy key `tenant_id`) has a small,
+//! fixed pre-upgrade backfill population. That population is 1,000
+//! `RUNNING`/`PAUSED` rows with `quota_key IS NULL`, matching the issue
+//! #1226 rollout-window scenario.
+//!
+//! Alongside it sits a large population of 50 distinct NON-quota'd
+//! workflow types with no declared `QuotaPolicy`. Those rows are also
+//! non-terminal and also `quota_key IS NULL`. This is the realistic case
+//! a busy shard produces. Most workflow types never adopt quotas, but
+//! their non-terminal rows still sit under the same partial index
+//! forever, since nothing ever sets their `quota_key`. [`NOISE_SWEEP`]
+//! scales that population across three sizes: 20,000 / 100,000 /
+//! 500,000. The target population and `batch_size`
+//! (`QUOTA_RECONCILE_DEFAULT_BATCH` = 200) stay fixed throughout, so any
 //! change in rows touched per batch isolates the noise population's
 //! effect. A 10% terminal (`COMPLETED`) population is also seeded per
 //! noise size, outside the index's `state IN (...)` predicate, for a
 //! realistic terminal/non-terminal mix.
 //!
-//! Row ids are server-generated UUIDs, so target and noise rows are
-//! already uniformly interleaved in `id` order without any extra
-//! scattering step — exactly the ordering `ORDER BY id` scans.
+//! Row ids are server-generated UUIDs. Target and noise rows are
+//! therefore already interleaved uniformly in `id` order, with no extra
+//! scattering step needed — exactly the ordering `ORDER BY id` scans.
 //!
 //! Evidence-capture test below is ignored by default. Run via
 //! `autumn-harvest/scripts/quota_reconcile_candidate_scan_perf_repro.sh`.
@@ -225,11 +229,10 @@ async fn explain_candidate_scan(conn: &mut diesel_async::AsyncPgConnection) -> S
         .join("\n")
 }
 
-/// The alternative the migration's own comment proposes and rejects: a
-/// `(workflow_name, id)` partial index, tested here against the SAME
-/// unmodified `CANDIDATE_SQL` text to see whether the planner would even
-/// choose it. Dropped again immediately after the capture -- never left in
-/// the schema.
+/// The migration comment proposes and rejects a `(workflow_name, id)`
+/// partial index. Tested here against the SAME unmodified `CANDIDATE_SQL`
+/// text, to see whether the planner would even choose it. Dropped again
+/// immediately after the capture -- never left in the schema.
 async fn explain_with_alternative_index(conn: &mut diesel_async::AsyncPgConnection) -> String {
     diesel::sql_query(
         "CREATE INDEX idx_ledger_experiment_we_quota_reconcile_by_name_id \
@@ -359,9 +362,9 @@ async fn zz_capture_quota_reconcile_candidate_scan_evidence() {
             "pg_stat_statements is not usable on this server (needs \
              shared_preload_libraries = 'pg_stat_statements')",
         ),
-        (Ok(_), Some(Err(_))) => {
-            Some("pg_stat_statements_reset() failed -- the connected role likely lacks reset permission")
-        }
+        (Ok(_), Some(Err(_))) => Some(
+            "pg_stat_statements_reset() failed -- the connected role likely lacks reset permission",
+        ),
         _ => None,
     };
 
@@ -370,14 +373,10 @@ async fn zz_capture_quota_reconcile_candidate_scan_evidence() {
     if skip_reason.is_none() {
         let mut cursor = None;
         loop {
-            let (summary, next_cursor) = reconcile_quota_keys_from(
-                &mut conn,
-                QUOTA_RECONCILE_DEFAULT_BATCH,
-                cursor,
-                SHARD,
-            )
-            .await
-            .expect("reconcile_quota_keys_from");
+            let (summary, next_cursor) =
+                reconcile_quota_keys_from(&mut conn, QUOTA_RECONCILE_DEFAULT_BATCH, cursor, SHARD)
+                    .await
+                    .expect("reconcile_quota_keys_from");
             total_calls += 1;
             total_backfilled += summary.backfilled;
             if next_cursor.is_none() {
@@ -396,7 +395,9 @@ async fn zz_capture_quota_reconcile_candidate_scan_evidence() {
         eprintln!("SKIP: {reason} -- skipping the pg_stat_statements snapshot.");
         std::fs::write(
             out_dir.join("pg_stat_statements.txt"),
-            format!("-- SKIPPED: {reason}. See the EXPLAIN artifacts for the primary evidence. --\n"),
+            format!(
+                "-- SKIPPED: {reason}. See the EXPLAIN artifacts for the primary evidence. --\n"
+            ),
         )
         .expect("write pg_stat_statements skip notice");
     } else {

@@ -1,0 +1,22 @@
+-- SAME unmodified CANDIDATE_SQL, with the migration comment's rejected (workflow_name, id) partial index also present @ noise=500000 -- shows whether the planner would even choose it --
+Limit  (cost=3084.89..3085.39 rows=200 width=58) (actual time=0.375..0.392 rows=200 loops=1)
+  Output: id, workflow_name, input
+  Buffers: shared hit=23 read=9
+  ->  Sort  (cost=3084.89..3087.35 rows=983 width=58) (actual time=0.374..0.380 rows=200 loops=1)
+        Output: id, workflow_name, input
+        Sort Key: harvest_workflow_executions.id
+        Sort Method: top-N heapsort  Memory: 70kB
+        Buffers: shared hit=23 read=9
+        ->  Bitmap Heap Scan on public.harvest_workflow_executions  (cost=32.04..3042.41 rows=983 width=58) (actual time=0.070..0.197 rows=1000 loops=1)
+              Output: id, workflow_name, input
+              Recheck Cond: ((harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[])) AND (harvest_workflow_executions.quota_key IS NULL) AND (harvest_workflow_executions.state = ANY ('{RUNNING,PAUSED}'::text[])))
+              Heap Blocks: exact=23
+              Buffers: shared hit=23 read=9
+              ->  Bitmap Index Scan on idx_ledger_experiment_we_quota_reconcile_by_name_id  (cost=0.00..31.79 rows=983 width=0) (actual time=0.062..0.062 rows=1000 loops=1)
+                    Index Cond: (harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[]))
+                    Buffers: shared read=9
+Query Identifier: -8385330453775558084
+Planning:
+  Buffers: shared hit=79 read=1
+Planning Time: 0.545 ms
+Execution Time: 0.415 ms

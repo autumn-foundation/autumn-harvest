@@ -1,0 +1,4 @@
+noise=20000 target_active=1000 terminal=2000
+noise=100000 target_active=1000 terminal=10000
+noise=500000 target_active=1000 terminal=50000
+full pass @ largest fixture: ticks=6 backfilled=1000
