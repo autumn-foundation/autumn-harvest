@@ -2014,6 +2014,23 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                             workflow_type = %workflow_type,
                             "Oversized trigger input payload; skipping trigger execution."
                         );
+                        // Resolve the fires row inserted above, same as the
+                        // cross-shard outbox's own PayloadTooLarge arm
+                        // (Codex follow-up x15). This inline start runs on
+                        // `conn`, inside the source's own still-open
+                        // terminal transaction. A plain update on the same
+                        // connection is enough. No separate claim or
+                        // transaction is needed the way the outbox path
+                        // requires.
+                        diesel::update(
+                            fires_dsl::harvest_completion_trigger_fires
+                                .filter(fires_dsl::source_exec_id.eq(exec_id.as_uuid()))
+                                .filter(fires_dsl::trigger_id.eq(trigger_db.id)),
+                        )
+                        .set(fires_dsl::outcome.eq(Some("payload_too_large")))
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
                         if let Some(m) = metrics {
                             m.record_completion_trigger_fired(&trigger_name, "payload_too_large");
                         }

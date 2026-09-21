@@ -897,14 +897,15 @@ struct ResolvedFire {
     target_shard: Option<i32>,
 }
 
-/// A [`ResolvedFire`] whose target lands on a DIFFERENT shard than its
-/// source, pending cross-shard adjudication.
-///
-/// A same-shard fire commits atomically with its target start.
-/// `evaluate_triggers_for_execution`'s inline path inserts both the fires
-/// row and the target execution row in one transaction. A skewed restore
-/// cannot split it. [`route_trigger_fires`] filters same-shard fires out
-/// before this type is ever constructed.
+/// A [`ResolvedFire`] resolved to a concrete target shard, pending
+/// adjudication. `target_shard == source_shard` for a RECORDED same-shard
+/// fire (Codex follow-up x14/x15). The trigger fire and the target start
+/// commit atomically in that case. A restore containing the fire
+/// necessarily contains the target's initial creation too. That fact
+/// changes what adjudication means, not whether it happens.
+/// `resolve_trigger_fires` routes such a fire to
+/// `probes::adjudicate_same_shard_fires` instead of the cross-shard path,
+/// since ordinary absence carries no relay-loss signal for it.
 #[cfg(all(feature = "db", feature = "testing"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingTriggerFire {
@@ -3555,19 +3556,66 @@ mod probes {
         out
     }
 
-    /// One bounded chunk of [`adjudicate_trigger_fires`]'s work. `chunk` is
-    /// never larger than [`WORKFLOW_KEY_LOOKUP_CHUNK`], so every vector
-    /// built here is bounded the same way.
-    ///
-    /// `matching_workflow_executions` checks the whole chunk in one query
-    /// against `harvest_workflow_executions`. A genuine match is the same
-    /// ANY-STATE existence check `relay_gate_checked_start` itself runs
-    /// before starting the target, read-only against a restored snapshot.
-    /// A key matched by `MIGRATED` seals only is neither delivered nor
-    /// absent. It goes straight to `unproven`, skipping the
-    /// retention/timestamp checks below (Codex follow-up x13). Everything
-    /// genuinely absent is checked in one more query against
-    /// `harvest_execution_summaries`.
+    /// Adjudicate RECORDED same-shard fires (Codex follow-up x15).
+    /// `source_shard == target_shard`, so the trigger fire and the
+    /// target's initial creation share one transaction. A restore
+    /// containing the fire necessarily contains that creation too. There
+    /// is no cross-shard relay window to lose. Ordinary absence (no
+    /// `MIGRATED` seal) is never a relay loss the way it is for a
+    /// cross-shard fire. It is either a benign retention collection of a
+    /// completed run, or a target the engine legitimately never created
+    /// (an inline rejection such as `PayloadTooLarge`). Either way it is
+    /// silent here. Only a `MIGRATED`-seal-only match is reported, as
+    /// `completion_trigger_fire_unproven`: the live run may have
+    /// rebalanced to a shard this restore does not cover.
+    async fn adjudicate_same_shard_fires(
+        conn: &mut AsyncPgConnection,
+        owned: &[&super::PendingTriggerFire],
+        out: &mut TriggerFireBuckets,
+    ) {
+        for chunk in owned.chunks(WORKFLOW_KEY_LOOKUP_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let names: Vec<String> = chunk
+                .iter()
+                .map(|f| f.target_workflow_name.clone())
+                .collect();
+            let ids: Vec<String> = chunk.iter().map(|f| f.target_workflow_id.clone()).collect();
+
+            let migrated_seal_only = match match_live_targets(conn, &names, &ids).await {
+                Ok((_, migrated_seal_only)) => migrated_seal_only,
+                Err(e) => {
+                    for fire in chunk {
+                        out.push_lookup_error(format!(
+                            "{} same-shard existence check failed: {e}",
+                            fire.target_workflow_id
+                        ));
+                    }
+                    continue;
+                }
+            };
+
+            for fire in chunk {
+                let key = (
+                    fire.target_workflow_name.clone(),
+                    fire.target_workflow_id.clone(),
+                );
+                if migrated_seal_only.contains(&key) {
+                    out.push_unproven(format!(
+                        "{} (fired by {} on shard {}) matches a MIGRATED forwarding \
+                         seal only on shard {}; the live run may have rebalanced to a \
+                         shard this restore does not cover",
+                        fire.target_workflow_id,
+                        fire.source_exec_id,
+                        fire.source_shard,
+                        fire.target_shard
+                    ));
+                }
+            }
+        }
+    }
+
     /// Match `chunk`'s targets against `harvest_workflow_executions`, split
     /// into keys backed by a genuine row and keys backed by `MIGRATED`
     /// forwarding seals only. Split out of
@@ -3598,6 +3646,23 @@ mod probes {
         Ok((existing, migrated_seal_only))
     }
 
+    /// One bounded chunk of [`adjudicate_trigger_fires`]'s work, for
+    /// CROSS-shard fires only (`resolve_trigger_fires` routes same-shard
+    /// fires to [`adjudicate_same_shard_fires`] instead, Codex follow-up
+    /// x15). `chunk` is never larger than [`WORKFLOW_KEY_LOOKUP_CHUNK`], so
+    /// every vector built here is bounded the same way.
+    ///
+    /// [`match_live_targets`] checks the whole chunk in one query against
+    /// `harvest_workflow_executions`. A genuine match is the same
+    /// ANY-STATE existence check `relay_gate_checked_start` itself runs
+    /// before starting the target, read-only against a restored snapshot.
+    /// A key matched by `MIGRATED` seals only is neither delivered nor
+    /// absent. It goes straight to `unproven`, skipping the
+    /// retention/timestamp checks below (Codex follow-up x13). Everything
+    /// genuinely absent is checked in one more query against
+    /// `harvest_execution_summaries`. That retention/timestamp fallback is
+    /// calibrated for a CROSS-shard relay's delivery window -- it does not
+    /// apply to a same-shard fire, which never has one.
     async fn adjudicate_trigger_fire_chunk(
         conn: &mut AsyncPgConnection,
         chunk: &[&super::PendingTriggerFire],
@@ -3771,6 +3836,13 @@ mod probes {
             if owned.is_empty() {
                 continue;
             }
+            // Same-shard fires (Codex follow-up x15) get a narrower check.
+            // Ordinary absence is never a relay loss for them, so they
+            // must not reach the cross-shard retention/timestamp fallback
+            // below. See `adjudicate_same_shard_fires`.
+            let (owned_same_shard, owned_cross_shard): (Vec<_>, Vec<_>) = owned
+                .into_iter()
+                .partition(|f| f.source_shard == f.target_shard);
 
             // A SECOND, independent connection. `verify_shard` opened and
             // dropped its own long before we got here. A failure now must
@@ -3793,6 +3865,14 @@ mod probes {
                 }
             };
 
+            let mut buckets = adjudicate_trigger_fires(
+                &mut conn,
+                &owned_cross_shard,
+                &latest_by_shard,
+                max_skew_secs,
+            )
+            .await;
+            adjudicate_same_shard_fires(&mut conn, &owned_same_shard, &mut buckets).await;
             let TriggerFireBuckets {
                 lost,
                 lost_count,
@@ -3800,7 +3880,7 @@ mod probes {
                 unproven_count,
                 lookup_errors,
                 lookup_errors_count,
-            } = adjudicate_trigger_fires(&mut conn, &owned, &latest_by_shard, max_skew_secs).await;
+            } = buckets;
 
             for (class, count, samples) in [
                 (FindingClass::CompletionTriggerFireLost, lost_count, lost),
