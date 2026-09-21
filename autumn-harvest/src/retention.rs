@@ -3613,16 +3613,16 @@ mod legal_hold_db {
     /// [`crate::shard_rebalance::release_legal_hold_forwarded`] do exactly
     /// that.
     fn refuse_if_sealed(exec_id: ExecutionId, migrated_to_shard: Option<i32>) -> HarvestResult<()> {
-        match migrated_to_shard {
-            None => Ok(()),
-            Some(shard_id) => Err(HarvestError::ShardUnavailable {
-                shard_id,
-                reason: format!(
-                    "workflow execution {exec_id} sealed to shard {shard_id} mid shard-rebalance; \
-                     re-resolve it through its forwarding pointer and retry"
-                ),
-            }),
-        }
+        let Some(shard_id) = migrated_to_shard else {
+            return Ok(());
+        };
+        Err(HarvestError::ShardUnavailable {
+            shard_id,
+            reason: format!(
+                "workflow execution {exec_id} sealed to shard {shard_id} mid shard-rebalance; \
+                 re-resolve it through its forwarding pointer and retry"
+            ),
+        })
     }
 
     /// Place (or refresh) a per-execution legal hold (issue #747). Shard-local:
