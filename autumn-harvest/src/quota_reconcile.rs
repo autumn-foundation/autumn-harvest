@@ -320,13 +320,17 @@ struct CandidateRow {
 /// this in practice. It is a full index, so it pays for that terminal
 /// history too.
 ///
-/// This is not a one-time rollout cost. Only rows this sweep backfills
-/// ever leave the candidate index. A non-quota'd row never does, since
-/// nothing ever sets its `quota_key`. Once every target row is
-/// backfilled, every future tick still walks the full non-quota'd
-/// population. It looks for a match that no longer exists, then returns
-/// zero rows. Measured directly: 504,201 buffers, 267ms, every tick,
-/// forever, at 500,000 non-quota'd rows -- worse than any single tick
+/// This is not a one-time rollout cost, for a sustained workload. A
+/// non-quota'd row leaves the candidate index too, once its execution
+/// goes terminal -- the predicate is `state IN ('RUNNING', 'PAUSED')`,
+/// not `quota_key IS NULL` alone. This fixture never advances that
+/// population. It measures a live production system's steady state
+/// instead: new non-quota'd starts continuously replace completions,
+/// holding the active non-quota'd population roughly constant. Under
+/// that condition, not literally "the same rows forever", the candidate
+/// scan cost recurs every tick, since nothing shrinks the population it
+/// walks. Measured directly: 504,201 buffers, immediately after the
+/// target backlog is fully backfilled -- worse than any single tick
 /// measured during the backfill itself.
 ///
 /// The rejected `(workflow_name, id)` index was built and tested

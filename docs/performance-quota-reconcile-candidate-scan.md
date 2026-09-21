@@ -185,34 +185,43 @@ first-tick call at this same 500,000-noise size, the number that actually
 clears the impact floor's 5%-of-workload-buffers bar for a single-shard,
 single-heartbeat-interval sweep.
 
-**Steady state is not zero. It is worse than the backfill itself.** Only
-the 1,000 target rows ever leave the candidate index -- their `quota_key`
-gets set, so they stop matching `quota_key IS NULL`. The 500,000 non-quota'd
-noise rows never do, since nothing ever sets their `quota_key` (see the
-module doc's "KNOWN SCALING TRADE-OFF" section). Once the target backlog is
-fully backfilled, `CANDIDATE_SQL` has zero rows left it can match, but it
-does not know that in advance: it still walks the id-ordered candidate
-index from the last cursor position (which wraps to the start once a batch
-comes back short) looking for a `billing_saga` row that no longer exists,
-scanning every one of the 500,000 noise rows before giving up and
-returning zero rows. Measured directly, immediately after the backfill
-pass completes, against the identical fixture:
+**Steady state is not zero. It is worse than the backfill itself, for a
+sustained workload.** Only the 1,000 target rows ever leave the candidate
+index because *this sweep* backfilled them -- their `quota_key` gets set,
+so they stop matching `quota_key IS NULL`. A non-quota'd row leaves the
+index too, but only when its own execution goes terminal (the index
+predicate is `state IN ('RUNNING', 'PAUSED')`, not `quota_key IS NULL`
+alone) -- nothing about *this sweep* ever touches it. The fixture never
+advances that population, which is deliberate: it models a live
+production system's steady state, where new non-quota'd starts
+continuously replace completions and the active non-quota'd population
+stays roughly constant, not a workload that drains to zero and stays
+there. Once the target backlog is fully backfilled, `CANDIDATE_SQL` has
+zero rows left it can match, but it does not know that in advance: it
+still walks the id-ordered candidate index from the last cursor position
+(which wraps to the start once a batch comes back short) looking for a
+`billing_saga` row that no longer exists, scanning every one of the
+500,000 noise rows before giving up and returning zero rows. Measured
+directly, immediately after the backfill pass completes, against the
+identical fixture:
 
 | calls | buffers | rows removed by filter | rows returned | exec time |
 |---:|---:|---:|---:|---:|
 | 1 | 504,201 (hit/read split varies, total reproduced identically twice) | 500,000 | 0 | 267-314ms |
 
-That is not a one-time rollout expense. It is the **permanent** cost of
-*every* heartbeat tick, forever, for as long as this deployment has both a
-quota'd workflow type and a non-quota'd population sharing the table --
-worse than any single tick measured during the backfill itself, and with
-no natural end.
+That is not a one-time rollout expense. Under a sustained workload -- the
+active non-quota'd population never draining to zero and staying there --
+it is the **permanent** cost of *every* heartbeat tick, for as long as
+this deployment has both a quota'd workflow type and a non-quota'd
+population sharing the table, worse than any single tick measured during
+the backfill itself.
 
 ## 💡 Verdict
 
 The scaling risk the migration comment names is real, confirmed at
-production-shaped scale, worse than a rollout-window cost (it never ends),
-and the specific reason the proposed index does not help in practice is
+production-shaped scale, worse than a rollout-window cost under a
+sustained non-quota'd workload (it does not end on its own), and the
+specific reason the proposed index does not help in practice is
 now precisely diagnosed: a planner cardinality misestimate under
 `= ANY($1)` against a partial index whose predicate correlates with the
 leading column, not an inherent inability to use the index at all. The
@@ -258,10 +267,11 @@ Neither is this pass's "smallest change that moves the counter":
 Per this agent's process, a change like either is an "ask before": the
 author decides. This PR stops at diagnosis, with the mechanism nailed
 down precisely enough that whoever picks up the fix does not need to
-re-run this investigation. Given the permanent, forever-recurring steady-
-state cost measured above, this diagnosis is worth prioritizing sooner
-rather than later in any deployment that mixes quota'd and non-quota'd
-workflow types at this population scale.
+re-run this investigation. Given the steady-state cost measured above
+recurs for as long as the non-quota'd workload stays active, this
+diagnosis is worth prioritizing sooner rather than later in any
+deployment that mixes quota'd and non-quota'd workflow types at this
+population scale.
 
 ## 🔬 Reproduce
 
