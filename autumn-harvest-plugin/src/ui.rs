@@ -6004,7 +6004,7 @@ fn render_workflow_detail(
                 @if total_events > DETAIL_EVENT_PAGE_SIZE {
                     div.pagination style="margin-bottom:12px" {
                         @if has_prev_page {
-                            a href=(workflow_detail_href(event_page - 1, selected_log_level)) {
+                            a href=(workflow_detail_href(&exec_id_str, event_page - 1, selected_log_level)) {
                                 (PreEscaped("&larr;")) " Previous"
                             }
                         } @else {
@@ -6012,13 +6012,13 @@ fn render_workflow_detail(
                         }
                         span { " Events " (page_start + 1) "–" (page_end) " of " (total_events) " " }
                         @if has_next_page {
-                            a href=(workflow_detail_href(event_page + 1, selected_log_level)) {
+                            a href=(workflow_detail_href(&exec_id_str, event_page + 1, selected_log_level)) {
                                 "Next " (PreEscaped("&rarr;"))
                             }
                         } @else {
                             span.disabled { "Next " (PreEscaped("&rarr;")) }
                         }
-                        a href=(workflow_detail_href(last_page, selected_log_level)) { "Jump to latest" }
+                        a href=(workflow_detail_href(&exec_id_str, last_page, selected_log_level)) { "Jump to latest" }
                     }
                 }
                 table {
@@ -6058,7 +6058,7 @@ fn render_workflow_detail(
                 @if total_events > DETAIL_EVENT_PAGE_SIZE {
                     div.pagination style="margin-top:12px" {
                         @if has_prev_page {
-                            a href=(workflow_detail_href(event_page - 1, selected_log_level)) {
+                            a href=(workflow_detail_href(&exec_id_str, event_page - 1, selected_log_level)) {
                                 (PreEscaped("&larr;")) " Previous"
                             }
                         } @else {
@@ -6066,14 +6066,22 @@ fn render_workflow_detail(
                         }
                         span { "Page " (event_page + 1) }
                         @if has_next_page {
-                            a href=(workflow_detail_href(event_page + 1, selected_log_level)) {
+                            a href=(workflow_detail_href(&exec_id_str, event_page + 1, selected_log_level)) {
                                 "Next " (PreEscaped("&rarr;"))
                             }
                         } @else {
                             span.disabled { "Next " (PreEscaped("&rarr;")) }
                         }
-                        a href=(workflow_detail_href(last_page, selected_log_level)) { "Jump to latest" }
-                        form method="get" style="display:inline-flex;gap:6px;align-items:center;margin-left:8px" {
+                        a href=(workflow_detail_href(&exec_id_str, last_page, selected_log_level)) { "Jump to latest" }
+                        // `action=(exec_id_str)`, not the default omitted
+                        // action (issue #1687 review, Codex finding). A GET
+                        // form with no `action` submits to the document's
+                        // base url with its query replaced. On this page's
+                        // `<base href="..">` fallback (see `layout`'s doc
+                        // comment) that base url is `/workflows/`, not
+                        // `/workflows/{id}`. It drops the execution id the
+                        // same way a bare `workflow_detail_href` link would.
+                        form method="get" action=(exec_id_str) style="display:inline-flex;gap:6px;align-items:center;margin-left:8px" {
                             label style="font-size:12px;color:#94a3b8;display:inline-flex;align-items:center;gap:6px" {
                                 "Jump to event:"
                                 input type="number" name="jump_event" min="1" max=(total_events) placeholder="N"
@@ -6198,8 +6206,19 @@ fn render_heartbeat_checkpoint_cell(item: &TaskQueueItem, state: CheckpointCellS
 /// `jump_event` is deliberately NOT preserved: it is a one-shot "take me to
 /// event N" action that `event_page` already resolves to a concrete page, so
 /// carrying it would re-trigger the jump on every subsequent click.
-fn workflow_detail_href(event_page: i64, log_level: Option<&str>) -> String {
-    let mut url = format!("?event_page={event_page}");
+///
+/// Prefixed with `exec_id_str`, not a bare `?query` (issue #1687 review,
+/// Codex finding). A relative reference with an empty path inherits the
+/// browser's *entire* current base path, not just its directory. See
+/// `layout`'s doc comment for this page's `<base href="..">` fallback, on
+/// a direct-rendered rejected action. A bare `?event_page=1` there would
+/// resolve to `/workflows/?event_page=1`, dropping the execution id
+/// entirely. A path-relative reference merges against only the base's
+/// directory component instead, which `<base href="..">` already
+/// restores to the correct one. Prefixing here fixes it under both the
+/// base-tag case and the ordinary `GET` page load.
+fn workflow_detail_href(exec_id_str: &str, event_page: i64, log_level: Option<&str>) -> String {
+    let mut url = format!("{exec_id_str}?event_page={event_page}");
     if let Some(level) = log_level {
         url.push_str("&log_level=");
         url.push_str(level);
@@ -6275,12 +6294,12 @@ fn render_workflow_logs_panel(
             h3 { "Logs" }
             div.log-filters style="margin-bottom:12px" {
                 @let all_class = if selected.is_none() { "active" } else { "" };
-                a class=(all_class) href=(workflow_detail_href(event_page, None)) { "All" }
+                a class=(all_class) href=(workflow_detail_href(exec_id_str, event_page, None)) { "All" }
                 @for level in [WorkflowLogLevel::Info, WorkflowLogLevel::Warn, WorkflowLogLevel::Error] {
                     @let wire = level.as_str();
                     @let class = if selected == Some(wire) { "active" } else { "" };
                     " "
-                    a class=(class) href=(workflow_detail_href(event_page, Some(wire))) { (wire) }
+                    a class=(class) href=(workflow_detail_href(exec_id_str, event_page, Some(wire))) { (wire) }
                 }
             }
             @if truncated {
@@ -17273,6 +17292,55 @@ mod tests {
         );
     }
 
+    /// RED before this fix (issue #1687 review, second Codex finding).
+    /// Take a relative reference with an empty path: a bare
+    /// `?event_page=1` link, or a GET `<form>` with no `action`. It
+    /// inherits the browser's *entire* current base path, not just its
+    /// directory. That differs
+    /// from a path-relative reference like `{id}/signal`, which merges
+    /// against only the base's directory. `<base href="..">` restores the
+    /// right directory for path-relative references. But a query-only one
+    /// under that base would still resolve to `/workflows/?event_page=1`,
+    /// dropping the execution id. GREEN: every pagination link and the
+    /// jump-to-event form's `action` are prefixed with the execution id
+    /// explicitly. They no longer depend on that distinction at all.
+    #[test]
+    fn render_workflow_detail_pagination_and_jump_form_are_execution_specific() {
+        let execution = stub_execution();
+        let exec_id_str = execution.id.to_string();
+        let blocked = stub_blocked_on();
+        let page_events: Vec<HarvestEvent> = Vec::new();
+        let html = render_workflow_detail(
+            &execution,
+            150, // past DETAIL_EVENT_PAGE_SIZE so pagination and the jump form render
+            &page_events,
+            &[],
+            &[],
+            false,
+            &[],
+            1, // event_page, so both Previous and Next render
+            &blocked,
+            None,
+            None,
+            None,
+            None,
+            &WorkflowLogsPanelData::default(),
+            &WorkflowActionEcho::default(),
+            true, // rendered_at_action_url — the case the base-tag fix affects
+        )
+        .into_string();
+
+        assert!(
+            html.contains(&format!("href=\"{exec_id_str}?event_page=")),
+            "pagination links must carry the execution id, not a bare '?event_page=': {html}"
+        );
+        assert!(
+            html.contains(&format!(r#"form method="get" action="{exec_id_str}""#)),
+            "the jump-to-event form must have an explicit execution-id action, \
+             not rely on the browser's default form-submission target: {html}"
+        );
+    }
+
     #[test]
     fn logs_panel_shows_the_truncation_banner_from_the_caller_probe() {
         // The marker sits at `seq = i64::MAX` and sorts LAST, while the panel
@@ -17336,10 +17404,13 @@ mod tests {
 
     #[test]
     fn workflow_detail_href_preserves_both_dimensions() {
-        assert_eq!(workflow_detail_href(0, None), "?event_page=0");
         assert_eq!(
-            workflow_detail_href(2, Some("error")),
-            "?event_page=2&log_level=error"
+            workflow_detail_href("abc-123", 0, None),
+            "abc-123?event_page=0"
+        );
+        assert_eq!(
+            workflow_detail_href("abc-123", 2, Some("error")),
+            "abc-123?event_page=2&log_level=error"
         );
     }
 

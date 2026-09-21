@@ -58,7 +58,12 @@ Shows a single workflow execution in full detail.
   push the URL past a typical request-line limit. Because the response is
   served from one path segment below the canonical `/workflows/{exec_id}`
   page, it carries a `<base href="..">` element so every relative link and
-  form action on the page keeps resolving correctly.
+  form action on the page keeps resolving correctly. A `<base>` element
+  only fixes *path*-relative references, not a bare `?query` reference
+  (which inherits the browser's whole current base path, not just its
+  directory) — so the event-timeline pagination links and the "Jump to
+  event" form's action are execution-id-prefixed explicitly, rather than
+  relying on that distinction.
 - **Export history** — GET link to `…/workflows/{exec_id}/history/export` for the full JSON event log.
 
 **Event timeline collapsible payload** — each event row in the history table has a `<details>` element. Click "view payload" to expand and see the full JSON event data.
