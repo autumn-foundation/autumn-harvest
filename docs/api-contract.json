@@ -1568,6 +1568,10 @@
           "description": "Duplicate workflow_id with id_reuse_policy=reject_duplicate."
         },
         {
+          "status": 413,
+          "description": "The serialized workflow input exceeds max_workflow_input_bytes, or the signal payload exceeds max_signal_payload_bytes."
+        },
+        {
           "status": 429,
           "description": "The workflow's declared per-tenant resource quota (issue #946, QuotaPolicy) is exhausted for the resolved key on a FRESH admission only (attaching to an existing run and delivering the signal to it never re-checks the quota). Body is {\"error\": \"quota exceeded\", \"workflow_name\", \"key\", \"resource\", \"limit\", \"current\"}, mirroring the plain start route's arm exactly. Never returned for a workflow with no declared QuotaPolicy."
         },
@@ -1747,6 +1751,10 @@
         {
           "status": 409,
           "description": "Duplicate workflow_id with id_reuse_policy=reject_duplicate, or execution is PAUSED."
+        },
+        {
+          "status": 413,
+          "description": "The serialized workflow input exceeds max_workflow_input_bytes."
         },
         {
           "status": 422,
@@ -3589,9 +3597,15 @@
       "idempotency": "Idempotent by filter: already-replayed or already-pending entries are skipped.",
       "params": [],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": false,
         "fields": [
+          {
+            "name": "dead_letter_id",
+            "type": "string",
+            "required": false,
+            "description": "Target exactly one dead letter by id."
+          },
           {
             "name": "activity_name",
             "required": false,
@@ -3611,6 +3625,12 @@
             "name": "min_attempts",
             "required": false,
             "description": "Only replay entries with at least this many attempts (SQL-expressible). Mirrors the aggregate endpoint's min_attempts filter."
+          },
+          {
+            "name": "task_type",
+            "type": "string",
+            "required": false,
+            "description": "Restrict the cohort to one task type. Alias: task_kind."
           },
           {
             "name": "failed_after",
@@ -3636,6 +3656,12 @@
             "name": "failure_signature",
             "required": false,
             "description": "Filter by derived failure signature (compute-on-read, exact match)."
+          },
+          {
+            "name": "shard_id",
+            "type": "integer",
+            "required": false,
+            "description": "Scope the operation to one shard."
           },
           {
             "name": "limit",
@@ -3680,9 +3706,15 @@
       "idempotency": "Idempotent by filter: already-discarded entries are skipped.",
       "params": [],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": false,
         "fields": [
+          {
+            "name": "dead_letter_id",
+            "type": "string",
+            "required": false,
+            "description": "Target exactly one dead letter by id."
+          },
           {
             "name": "activity_name",
             "required": false,
@@ -3702,6 +3734,12 @@
             "name": "min_attempts",
             "required": false,
             "description": "Only discard entries with at least this many attempts (SQL-expressible). Mirrors the aggregate endpoint's min_attempts filter."
+          },
+          {
+            "name": "task_type",
+            "type": "string",
+            "required": false,
+            "description": "Restrict the cohort to one task type. Alias: task_kind."
           },
           {
             "name": "failed_after",
@@ -3727,6 +3765,12 @@
             "name": "failure_signature",
             "required": false,
             "description": "Filter by derived failure signature (compute-on-read, exact match)."
+          },
+          {
+            "name": "shard_id",
+            "type": "integer",
+            "required": false,
+            "description": "Scope the operation to one shard."
           },
           {
             "name": "limit",
@@ -3821,7 +3865,7 @@
       "idempotency": "Idempotent: redriving an already-redriven entry (or one whose execution has progressed) is a no-op reported as skipped, never a duplicate enqueue.",
       "params": [],
       "request_body": {
-        "required": false,
+        "required": true,
         "free_form": false,
         "fields": [
           {
@@ -3853,6 +3897,12 @@
             "name": "dead_letter_ids",
             "required": false,
             "description": "Explicit set of dead-letter UUIDs to redrive."
+          },
+          {
+            "name": "shard_id",
+            "type": "integer",
+            "required": false,
+            "description": "Scope the operation to one shard."
           },
           {
             "name": "max",
