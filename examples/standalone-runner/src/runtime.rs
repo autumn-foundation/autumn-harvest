@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use autumn_harvest::prelude::*;
+use autumn_harvest_plugin::metrics_scrape::HarvestMetricsRecorder;
 use autumn_harvest_plugin::prelude::*;
 
 use crate::domain::RUNNER_QUEUE;
@@ -34,9 +37,16 @@ pub fn standalone_runtime_config(database_url: String) -> HarvestRuntimeConfig {
     }
 }
 
-pub fn standalone_builder() -> HarvestBuilder {
+/// `metrics` is the same `HarvestMetricsRecorder` instance `server.rs` wires
+/// into the `/metrics` route (issue #1611). The plugin path's
+/// `HarvestPlugin::with_metrics_scrape()` does this same
+/// `HarvestBuilder::telemetry(..)` call for the caller; a standalone
+/// embedder has no plugin to do it, so it is one explicit argument here
+/// instead.
+pub fn standalone_builder(metrics: HarvestMetricsRecorder) -> HarvestBuilder {
     HarvestBuilder::default()
         .workflows(workflows::workflows())
         .activities(activities::activities())
         .worker(WorkerConfig::default().with_queues([RUNNER_QUEUE]))
+        .telemetry(TelemetryConfig::builder().metrics(Arc::new(metrics)).build())
 }
