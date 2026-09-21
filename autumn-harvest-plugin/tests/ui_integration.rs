@@ -5493,10 +5493,21 @@ async fn detail_page_reset_action_redirects_with_flash() {
     insert_workflow_events(&database_url, exec_id, &events, 1).await;
 
     let app = build_single_shard_ui_app(&database_url);
+    // `reset_to_event_id=1`: the form's field is 1-based (matching the
+    // timeline "#" column). "1" targets 0-based event id 0, this
+    // execution's `WorkflowStarted` -- the earliest valid reset point.
+    // "0" (this test's value before issue #1687's review) converts to the
+    // 0-based id -1. `validate_reset_point` rejects that as outside the
+    // history range. Both outcomes redirected identically before this PR,
+    // since every branch shared one `Redirect`. This test was passing
+    // while silently exercising the *failure* path. A rejected submission
+    // now renders the page directly instead of redirecting (issue #1687
+    // review, Codex finding). A genuine success fixture is required to
+    // observe the redirect this test asserts on.
     let (status, headers, body) = post_form(
         &app,
         &format!("/workflows/{exec_id}/reset"),
-        "reset_to_event_id=0&reason=rollback",
+        "reset_to_event_id=1&reason=rollback",
     )
     .await;
     assert!(
