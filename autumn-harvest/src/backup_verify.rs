@@ -1081,6 +1081,12 @@ fn absence_is_decisive_loss(
     target_latest_event_at: Option<DateTime<Utc>>,
     max_skew_secs: i64,
 ) -> bool {
+    // `VerifyOptions::max_skew_secs` is a public, unvalidated field (Codex
+    // follow-up x20). A negative value would flip this comparison's
+    // direction. A target shard AHEAD of `fired_at` would then read as
+    // decisive loss instead of proof of life. Floor it at zero: a
+    // negative tolerance means "no tolerance", not "invert the check".
+    let max_skew_secs = max_skew_secs.max(0);
     matches!(
         target_latest_event_at,
         Some(latest) if fired_at - latest > chrono::Duration::seconds(max_skew_secs)
@@ -4086,15 +4092,18 @@ mod probes {
         }
 
         let skew = compute_skew(shards.iter().map(|s| s.latest_event_at));
+        // Floored at zero, same as `absence_is_decisive_loss`'s own copy
+        // of this tolerance (Codex follow-up x20). A negative
+        // `max_skew_secs` must not flag every nonzero skew.
+        let max_skew_secs = options.max_skew_secs.max(0);
         if let Some(secs) = skew
-            && secs > options.max_skew_secs
+            && secs > max_skew_secs
         {
             cross_shard.push(
                 Finding::new(FindingClass::RestorePointSkew, None, 1, Vec::new()).with_detail(
                     format!(
                         "newest-event timestamps differ by {secs}s across shards \
-                             (threshold {}s)",
-                        options.max_skew_secs
+                             (threshold {max_skew_secs}s)"
                     ),
                 ),
             );
@@ -4388,6 +4397,31 @@ mod tests {
                 max_skew_secs,
             ),
             "a gap exceeding the skew tolerance is still proof of loss"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
+    fn absence_is_decisive_loss_floors_a_negative_skew_tolerance_at_zero() {
+        // `VerifyOptions::max_skew_secs` is a public, unvalidated field
+        // (Codex follow-up x20). A negative value must not flip the
+        // comparison and report a target shard AHEAD of `fired_at` as
+        // decisive loss.
+        let fired_at = Utc::now();
+
+        assert!(
+            !absence_is_decisive_loss(
+                fired_at,
+                Some(fired_at + chrono::Duration::seconds(30)),
+                -60
+            ),
+            "a target shard ahead of fired_at is proof of life, not loss, \
+             regardless of a negative configured tolerance"
+        );
+        assert!(
+            absence_is_decisive_loss(fired_at, Some(fired_at - chrono::Duration::seconds(1)), -60),
+            "a negative tolerance floors to zero, so any positive gap is still \
+             decisive loss"
         );
     }
 
