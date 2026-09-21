@@ -24038,14 +24038,19 @@ async fn set_legal_hold_handler(
     // mask the write's outcome from the caller (issue #1405 review). On
     // success the write already reports the shard it landed on, so this
     // reuses that instead of re-walking the forwarding pointer from
-    // scratch. On refusal or a genuine error nothing committed, so falling
-    // back to the usual resolution is fine.
+    // scratch. `ShardUnavailable` means the write itself could not resolve
+    // a working shard (Codex review). Retrying that same resolution here
+    // would cost the caller a second pool-checkout wait on an
+    // already-unavailable shard. This skips the audit write in that one
+    // case. Every other error is cheap to retry a checkout for and still
+    // worth auditing (e.g. `NotFound`).
     let audit_conn = match &result {
         Ok((_, shard)) => {
             ::autumn_harvest::shard_rebalance::conn_for_shard(pool.sharded_pool(), *shard)
                 .await
                 .ok()
         }
+        Err(HarvestError::ShardUnavailable { .. }) => None,
         Err(_) => db_conn_for_execution(&api_state, exec_id).await.ok(),
     };
     if let Some(mut conn) = audit_conn {
@@ -24115,6 +24120,7 @@ async fn release_legal_hold_handler(
                 .await
                 .ok()
         }
+        Err(HarvestError::ShardUnavailable { .. }) => None,
         Err(_) => db_conn_for_execution(&api_state, exec_id).await.ok(),
     };
     if let Some(mut conn) = audit_conn {
