@@ -67,6 +67,7 @@ use autumn_harvest::store::admit_update_event_with_codecs;
 use autumn_harvest::types::{
     ExecutionId as HarvestExecutionId, Priority, ShardId, UpdateId, WorkflowIdReusePolicy,
 };
+use autumn_harvest::worker::DispatchDeadline;
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
 use autumn_harvest::{
     StepKind, StepOutcome, Timeline, TimelineRollup, TimelineStep, derive_timeline,
@@ -9419,8 +9420,11 @@ async fn execute_schedule_trigger_ui(
     // use. `raw_sla`/`raw_execution_timeout` above still separately feed the
     // `sla` clamp -- `resolve_dispatch_deadline` returns an unclamped `sla`
     // too, so it is discarded here.
-    let (execution_timeout, _, max_execution_timeout_ceiling) =
-        runtime.registry().resolve_dispatch_deadline(workflow_name);
+    let DispatchDeadline {
+        execution_timeout,
+        max_execution_timeout_ceiling,
+        ..
+    } = runtime.registry().resolve_dispatch_deadline(workflow_name);
     // Schedule-level retry_policy takes precedence over the workflow-type default,
     // mirroring the automated tick, backfill, and API trigger-now paths.
     let ui_trigger_retry_policy = row

@@ -27,7 +27,7 @@ use crate::policy::{OverlapPolicy, Schedule, WorkflowSchedule, compute_jitter_of
 use crate::schema::{harvest_schedules, harvest_workflow_executions};
 use crate::shard::{ShardRouter, ShardedDbPool};
 use crate::types::{ExecutionId, Priority, ShardId, WorkflowIdReusePolicy};
-use crate::worker::{DbPool, HandlerRegistry};
+use crate::worker::{DbPool, DispatchDeadline, HandlerRegistry};
 
 const DEFAULT_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -1484,12 +1484,15 @@ pub async fn trigger_unified_dag(
     let schedule_ref = schedule.as_ref().map(|s| s.id.to_string());
 
     // Issue #1412: resolve the DAG's declared execution_timeout/sla/ceiling
-    // from its shadow WorkflowInfo -- the SAME lookup `tick_one_workflow_schedule`'s
-    // main dispatch path performs -- so a manual/MCP trigger gets the same
-    // deadline enforcement as a scheduled tick or a manual HTTP
-    // `/workflows/{name}/start`.
-    let (execution_timeout, sla, max_execution_timeout_ceiling) =
-        registry.resolve_dispatch_deadline(dag_name);
+    // from its shadow WorkflowInfo. `tick_one_workflow_schedule`'s main
+    // dispatch path performs the SAME lookup. A manual/MCP trigger then
+    // gets the same deadline enforcement as a scheduled tick or a manual
+    // HTTP `/workflows/{name}/start`.
+    let DispatchDeadline {
+        execution_timeout,
+        sla,
+        max_execution_timeout_ceiling,
+    } = registry.resolve_dispatch_deadline(dag_name);
 
     start_or_load_workflow_execution_with_codecs(
         &mut db,
@@ -4435,11 +4438,15 @@ async fn tick_one_workflow_schedule(
             }
         };
         // Issue #1412: one shared lookup resolves the declared execution_timeout,
-        // sla, and fleet-wide ceiling for this fire -- a DAG's own shadow
-        // `WorkflowInfo` (registered under its name by `DagInfo::as_workflow_info()`)
-        // carries these fields identically to a `#[workflow]`, so it covers both kinds.
-        let (execution_timeout, sla, max_execution_timeout_ceiling) =
-            registry.resolve_dispatch_deadline(wf_name);
+        // sla, and fleet-wide ceiling for this fire. A DAG's own shadow
+        // `WorkflowInfo` carries these fields identically to a `#[workflow]`.
+        // `DagInfo::as_workflow_info()` registers that shadow entry under the
+        // DAG's own name, so this one lookup covers both kinds.
+        let DispatchDeadline {
+            execution_timeout,
+            sla,
+            max_execution_timeout_ceiling,
+        } = registry.resolve_dispatch_deadline(wf_name);
         tracing::info!(
             workflow_name = %wf_name, workflow_id = %workflow_id,
             scheduled_for = %scheduled_for, "harvest: dispatching scheduled workflow run"
@@ -4516,8 +4523,8 @@ async fn tick_one_workflow_schedule(
                     severity: severity.map(str::to_string),
                     // Fleet-wide execution_timeout ceiling (issue #1412): a throttled
                     // scheduled fire must be capped by the same operator-configured
-                    // ceiling a manual/HTTP start applies -- parity with the chain-cap
-                    // ceiling right below.
+                    // ceiling a manual/HTTP start applies. This is parity with the
+                    // chain-cap ceiling right below.
                     max_execution_timeout_ceiling_secs: max_execution_timeout_ceiling
                         .map(|d| d.num_seconds()),
                     // Chain-scoped lifetime cap (issue #617): workflow-type default
@@ -6281,13 +6288,16 @@ async fn drain_buffered_schedule_runs(
                 }
             };
             // Issue #1412: one shared lookup resolves the declared execution_timeout,
-            // sla, and fleet-wide ceiling, so a buffered/overlap-drained fire gets
+            // sla, and fleet-wide ceiling. A buffered/overlap-drained fire then gets
             // the same deadline enforcement as a normal tick dispatch or a manual
-            // trigger -- a DAG's own shadow `WorkflowInfo` (registered under its
-            // name by `DagInfo::as_workflow_info()`) carries these fields
-            // identically to a `#[workflow]`, so it covers both kinds.
-            let (execution_timeout, sla, max_execution_timeout_ceiling) =
-                registry.resolve_dispatch_deadline(wf_name);
+            // trigger. A DAG's own shadow `WorkflowInfo` carries these fields
+            // identically to a `#[workflow]`. `DagInfo::as_workflow_info()` registers
+            // that shadow entry under the DAG's own name, so this covers both kinds.
+            let DispatchDeadline {
+                execution_timeout,
+                sla,
+                max_execution_timeout_ceiling,
+            } = registry.resolve_dispatch_deadline(wf_name);
 
             tracing::info!(
                 workflow_name = %wf_name,

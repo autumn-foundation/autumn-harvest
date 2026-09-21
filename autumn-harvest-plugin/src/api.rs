@@ -117,7 +117,7 @@ use autumn_harvest::types::{
     ExecutionId, ExternalActivityToken, Priority, ShardId, UpdateId, WorkflowIdConflictPolicy,
     WorkflowIdReusePolicy,
 };
-use autumn_harvest::worker::{DbPool, HandlerRegistry};
+use autumn_harvest::worker::{DbPool, DispatchDeadline, HandlerRegistry};
 use autumn_harvest::workers::{
     DrainPreviewItem, DrainResponse, FleetHealth, PinnedExecutionRow, WorkerFilters, WorkerRow,
     get_worker, list_pinned_executions, list_workers, parse_worker_filters, preview_item_from_row,
@@ -30633,8 +30633,11 @@ pub(crate) async fn schedule_backfill_inner(
                 // above still separately feeds the `sla` clamp on the raw
                 // `std::time::Duration` form -- `resolve_dispatch_deadline` returns
                 // an unclamped `sla` too, so it is discarded here.
-                let (workflow_execution_timeout, _, workflow_max_execution_timeout_ceiling) =
-                    runtime.registry.resolve_dispatch_deadline(&wf_name);
+                let DispatchDeadline {
+                    execution_timeout: workflow_execution_timeout,
+                    max_execution_timeout_ceiling: workflow_max_execution_timeout_ceiling,
+                    ..
+                } = runtime.registry.resolve_dispatch_deadline(&wf_name);
 
                 // issue #377: check admission gates before firing a backfill run.
                 // Workflow backfill writes to pool.default_pool() and creates
@@ -31195,8 +31198,11 @@ pub(crate) async fn schedule_backfill_inner(
                 // `chain_execution_timeout` stays `None` for a DAG start (issue #617).
                 // DAGs carry no chain-scoped lifetime cap. This matches
                 // `DagInfo::as_workflow_info()`'s own `chain_execution_timeout: None`.
-                let (dag_execution_timeout, dag_sla, dag_max_execution_timeout_ceiling) =
-                    runtime.registry.resolve_dispatch_deadline(&dag_name);
+                let DispatchDeadline {
+                    execution_timeout: dag_execution_timeout,
+                    sla: dag_sla,
+                    max_execution_timeout_ceiling: dag_max_execution_timeout_ceiling,
+                } = runtime.registry.resolve_dispatch_deadline(&dag_name);
 
                 // issue #377: enforce admission gates for DAG backfills, mirroring
                 // the workflow backfill branch gate check.

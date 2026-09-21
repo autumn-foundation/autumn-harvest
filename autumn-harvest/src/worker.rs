@@ -1228,17 +1228,10 @@ impl HandlerRegistry {
     /// does not change from before this extraction. This function
     /// centralizes the lookup only, not the downstream policy.
     ///
-    /// `(None, None, None)` when `name` is not registered and the registry
-    /// declares no fleet-wide ceiling.
+    /// Every field is `None` when `name` is not registered and the
+    /// registry declares no fleet-wide ceiling.
     #[must_use]
-    pub fn resolve_dispatch_deadline(
-        &self,
-        name: &str,
-    ) -> (
-        Option<chrono::Duration>,
-        Option<chrono::Duration>,
-        Option<chrono::Duration>,
-    ) {
+    pub fn resolve_dispatch_deadline(&self, name: &str) -> DispatchDeadline {
         let info = self.workflows.get(name);
         let execution_timeout = info
             .and_then(|info| info.execution_timeout)
@@ -1246,11 +1239,27 @@ impl HandlerRegistry {
         let sla = info
             .and_then(|info| info.sla)
             .and_then(|d| chrono::Duration::from_std(d).ok());
-        let ceiling = self
+        let max_execution_timeout_ceiling = self
             .max_workflow_execution_timeout
             .and_then(|d| chrono::Duration::from_std(d).ok());
-        (execution_timeout, sla, ceiling)
+        DispatchDeadline {
+            execution_timeout,
+            sla,
+            max_execution_timeout_ceiling,
+        }
     }
+}
+
+/// Return type of [`HandlerRegistry::resolve_dispatch_deadline`] (issue #1412).
+///
+/// A named struct, not a same-typed tuple. A caller cannot silently
+/// transpose `execution_timeout`/`sla`/the ceiling at a new call site — a
+/// mismatched field name fails to compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchDeadline {
+    pub execution_timeout: Option<chrono::Duration>,
+    pub sla: Option<chrono::Duration>,
+    pub max_execution_timeout_ceiling: Option<chrono::Duration>,
 }
 
 #[cfg(test)]
@@ -1295,7 +1304,11 @@ mod resolve_dispatch_deadline_tests {
         let registry = HandlerRegistry::new(vec![], vec![]);
         assert_eq!(
             registry.resolve_dispatch_deadline("no_such_workflow"),
-            (None, None, None)
+            DispatchDeadline {
+                execution_timeout: None,
+                sla: None,
+                max_execution_timeout_ceiling: None,
+            }
         );
     }
 
@@ -1311,11 +1324,11 @@ mod resolve_dispatch_deadline_tests {
         );
         assert_eq!(
             registry.resolve_dispatch_deadline("wf"),
-            (
-                Some(chrono::Duration::seconds(60)),
-                Some(chrono::Duration::seconds(30)),
-                None
-            )
+            DispatchDeadline {
+                execution_timeout: Some(chrono::Duration::seconds(60)),
+                sla: Some(chrono::Duration::seconds(30)),
+                max_execution_timeout_ceiling: None,
+            }
         );
     }
 
@@ -1324,7 +1337,11 @@ mod resolve_dispatch_deadline_tests {
         let registry = HandlerRegistry::new(vec![deadline_info_fixture("wf", None, None)], vec![]);
         assert_eq!(
             registry.resolve_dispatch_deadline("wf"),
-            (None, None, None)
+            DispatchDeadline {
+                execution_timeout: None,
+                sla: None,
+                max_execution_timeout_ceiling: None,
+            }
         );
     }
 
@@ -1334,7 +1351,11 @@ mod resolve_dispatch_deadline_tests {
             .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600)));
         assert_eq!(
             registry.resolve_dispatch_deadline("no_such_workflow"),
-            (None, None, Some(chrono::Duration::seconds(3600)))
+            DispatchDeadline {
+                execution_timeout: None,
+                sla: None,
+                max_execution_timeout_ceiling: Some(chrono::Duration::seconds(3600)),
+            }
         );
     }
 
@@ -1354,11 +1375,51 @@ mod resolve_dispatch_deadline_tests {
         .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600)));
         assert_eq!(
             registry.resolve_dispatch_deadline("wf"),
-            (
-                Some(chrono::Duration::seconds(7200)),
-                None,
-                Some(chrono::Duration::seconds(3600))
-            )
+            DispatchDeadline {
+                execution_timeout: Some(chrono::Duration::seconds(7200)),
+                sla: None,
+                max_execution_timeout_ceiling: Some(chrono::Duration::seconds(3600)),
+            }
+        );
+    }
+
+    /// A DAG's shadow `WorkflowInfo` resolves through the exact same code
+    /// path as a plain `#[workflow]` (issue #1412). `DagInfo::as_workflow_info`
+    /// propagates `execution_timeout`/`sla` verbatim onto that shadow entry,
+    /// and `HandlerRegistry::new` indexes it into `self.workflows` under the
+    /// DAG's own name like any other `WorkflowInfo`.
+    #[test]
+    fn dag_shadow_workflow_info_resolves_like_a_plain_workflow() {
+        let dag = crate::info::DagInfo {
+            name: "my_dag",
+            module: "tests",
+            schedule: None,
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: |_| {},
+            workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+            jitter: std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+            execution_timeout: Some(std::time::Duration::from_secs(120)),
+            sla: Some(std::time::Duration::from_secs(90)),
+        };
+        let shadow_workflow_info = dag
+            .as_workflow_info()
+            .expect("workflow_handler is Some, so as_workflow_info must be Some");
+        let registry = HandlerRegistry::new(vec![shadow_workflow_info], vec![]);
+        assert_eq!(
+            registry.resolve_dispatch_deadline("my_dag"),
+            DispatchDeadline {
+                execution_timeout: Some(chrono::Duration::seconds(120)),
+                sla: Some(chrono::Duration::seconds(90)),
+                max_execution_timeout_ceiling: None,
+            }
         );
     }
 }
