@@ -1797,6 +1797,13 @@ enum AuditCommand {
         /// Upper bound (exclusive), RFC 3339.
         #[arg(long)]
         before: Option<String>,
+        /// Row id tiebreaker for `--before` (issue #1408).
+        ///
+        /// Pass the prior page's last row id, alongside `--before`, to page
+        /// past rows tied on that timestamp. Has no effect without
+        /// `--before`.
+        #[arg(long)]
+        before_id: Option<String>,
         /// Maximum number of records to return [1–500].
         #[arg(long, value_parser = clap::value_parser!(i64).range(1..=500))]
         limit: Option<i64>,
@@ -11700,6 +11707,7 @@ fn audit_request(command: &AuditCommand) -> ApiRequest {
             status,
             since,
             before,
+            before_id,
             limit,
         } => {
             let mut params: Vec<(&'static str, String)> = Vec::new();
@@ -11723,6 +11731,9 @@ fn audit_request(command: &AuditCommand) -> ApiRequest {
             }
             if let Some(v) = before {
                 params.push(("before", v.clone()));
+            }
+            if let Some(v) = before_id {
+                params.push(("before_id", v.clone()));
             }
             if let Some(v) = limit {
                 params.push(("limit", v.to_string()));
