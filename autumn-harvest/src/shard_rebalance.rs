@@ -635,9 +635,10 @@ pub use db::{
     conn_for_shard, forward_of_held_row, list_migration_candidates, load_migration,
     migrate_execution, migrate_quiescent_executions, migrate_quiescent_executions_after,
     observe_quiescence, reconcile_migrated_seal_terminality, reconcile_migrated_seals,
-    reconcile_migrated_seals_after, residence_chain, resolve_execution_shard,
-    resolve_execution_shard_holding, resolve_target_shard, resolve_target_shard_holding,
-    resume_incomplete_migrations, shard_of_held_row, stage_copy, verify_target_copy,
+    reconcile_migrated_seals_after, release_legal_hold_forwarded, residence_chain,
+    resolve_execution_shard, resolve_execution_shard_holding, resolve_target_shard,
+    resolve_target_shard_holding, resume_incomplete_migrations, set_legal_hold_forwarded,
+    shard_of_held_row, stage_copy, verify_target_copy,
 };
 
 // This is `pub(crate)`, not part of the `pub use` block above (issue #1596
@@ -661,6 +662,7 @@ mod db {
 
     use crate::error::{HarvestError, HarvestResult, database_error};
     use crate::payload_codec::PayloadCodecs;
+    use crate::retention::{self, LegalHoldOutcome};
     use crate::shard::ShardedDbPool;
     use crate::types::{ExecutionId, ShardId};
 
@@ -4553,6 +4555,96 @@ mod db {
             current = next;
         }
         resolve_forward_chain(checkout_shard, |_| Some(current)).map(|_| (conn, current))
+    }
+
+    /// [`crate::retention::set_legal_hold`], retried across a mid-flight seal
+    /// (issue #1405).
+    ///
+    /// The core write refuses a row a concurrent cutover sealed under its
+    /// lock. This re-resolves `exec_id` and retries, bounded like every
+    /// other forwarding walk in this module ([`MAX_FORWARD_HOPS`]). A chain
+    /// that keeps moving still fails closed instead of looping forever.
+    ///
+    /// Re-resolves through [`conn_for_execution_forwarded_with_shard`] on
+    /// every attempt, rather than checking out the shard the refusal names
+    /// directly (issue #1405 review). That shard can alias the connection
+    /// this call already dropped a moment earlier. A pre-split staging
+    /// deployment is the same case that function's own hop loop guards
+    /// against. A raw checkout on a size-one aliased pool would then wait
+    /// forever for the connection this call itself just released. Re-
+    /// resolving already carries that guard; duplicating it here would not
+    /// be simpler or safer.
+    ///
+    /// Also returns the shard the write landed on (issue #1405 follow-up
+    /// review). A caller that must attribute a follow-up action -- an audit
+    /// log, say -- to a shard does not pay for a second resolution.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`crate::retention::set_legal_hold`], or
+    /// [`HarvestError::ShardUnavailable`] when the row is still sealed after
+    /// [`MAX_FORWARD_HOPS`] hops.
+    pub async fn set_legal_hold_forwarded(
+        pool: &ShardedDbPool,
+        exec_id: ExecutionId,
+        reason: &str,
+        hold_until: Option<DateTime<Utc>>,
+        actor: &str,
+        now: DateTime<Utc>,
+    ) -> HarvestResult<(LegalHoldOutcome, ShardId)> {
+        let mut last_shard = exec_id.shard();
+        for _ in 0..MAX_FORWARD_HOPS {
+            let (mut conn, shard) = conn_for_execution_forwarded_with_shard(pool, exec_id).await?;
+            last_shard = shard;
+            match retention::set_legal_hold(&mut conn, exec_id, reason, hold_until, actor, now)
+                .await
+            {
+                Err(HarvestError::ShardUnavailable { .. }) => {}
+                Ok(outcome) => return Ok((outcome, shard)),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(HarvestError::ShardUnavailable {
+            shard_id: last_shard.as_i32(),
+            reason: format!(
+                "legal hold on {exec_id} did not settle within {MAX_FORWARD_HOPS} shard hops"
+            ),
+        })
+    }
+
+    /// [`crate::retention::release_legal_hold`], retried across a mid-flight
+    /// seal (issue #1405).
+    ///
+    /// See [`set_legal_hold_forwarded`] for the shape of the race this
+    /// closes and why each attempt re-resolves from scratch. The landing
+    /// shard is returned alongside the outcome for the same reason.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`crate::retention::release_legal_hold`], or
+    /// [`HarvestError::ShardUnavailable`] when the row is still sealed after
+    /// [`MAX_FORWARD_HOPS`] hops.
+    pub async fn release_legal_hold_forwarded(
+        pool: &ShardedDbPool,
+        exec_id: ExecutionId,
+        now: DateTime<Utc>,
+    ) -> HarvestResult<(LegalHoldOutcome, ShardId)> {
+        let mut last_shard = exec_id.shard();
+        for _ in 0..MAX_FORWARD_HOPS {
+            let (mut conn, shard) = conn_for_execution_forwarded_with_shard(pool, exec_id).await?;
+            last_shard = shard;
+            match retention::release_legal_hold(&mut conn, exec_id, now).await {
+                Err(HarvestError::ShardUnavailable { .. }) => {}
+                Ok(outcome) => return Ok((outcome, shard)),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(HarvestError::ShardUnavailable {
+            shard_id: last_shard.as_i32(),
+            reason: format!(
+                "legal hold release on {exec_id} did not settle within {MAX_FORWARD_HOPS} shard hops"
+            ),
+        })
     }
 
     #[derive(diesel::QueryableByName)]
