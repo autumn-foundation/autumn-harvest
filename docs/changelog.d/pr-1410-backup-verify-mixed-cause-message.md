@@ -28,5 +28,14 @@ covering a summary with `unreadable: 2` and `skipped_no_handler: 3`. It
 asserts the message names both counts, does not claim every history was
 unreadable, and does not claim handlers will not fix any of it. Written
 first against the unfixed branch and confirmed failing (TDD red phase)
-before the fix landed. The existing all-unreadable and all-skipped tests
-were re-run unchanged to confirm no regression.
+before the fix landed. A second test,
+`text_output_reports_partial_coverage_even_when_skipped_is_also_present`,
+confirms the PARTIALLY VERIFIED branch still wins when something replayed
+alongside both an unreadable and a skipped count. The existing
+all-unreadable and all-skipped tests were re-run unchanged to confirm no
+regression.
+
+**Review.** Checked from three angles (branch-logic correctness, operator
+wording, test coverage) after the fix landed. Correctness and coverage
+came back clean; wording review caught one inconsistency against the
+sibling branch's phrasing, fixed in the same change.

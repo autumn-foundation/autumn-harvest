@@ -471,6 +471,28 @@ fn text_output_names_both_causes_when_unreadable_and_skipped_combine() {
     );
 }
 
+/// Three causes at once: some replayed, some unreadable, some skipped. The
+/// PARTIALLY VERIFIED branch must still win, since it checks only whether
+/// anything replayed at all -- `skipped_no_handler` does not change that.
+#[test]
+fn text_output_reports_partial_coverage_even_when_skipped_is_also_present() {
+    let mut s = shard(Vec::new());
+    s.replay = ReplaySummary {
+        sampled: 6,
+        clean: 2,
+        divergent: 0,
+        failed: 0,
+        skipped_no_handler: 3,
+        unreadable: 1,
+    };
+    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let text = format_backup_verify_text(&r);
+    assert!(
+        text.contains("PARTIALLY VERIFIED") && !text.contains("NOT VERIFIED"),
+        "something replayed, so this is partial coverage, not zero: {text}"
+    );
+}
+
 #[test]
 fn text_output_reports_partial_coverage_when_some_unreadable_but_others_replayed() {
     let mut s = shard(Vec::new());

@@ -4751,8 +4751,8 @@ pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
             out,
             "  replay: NOT VERIFIED — {} sampled, {} unreadable, {} skipped (no handler), \
              0 replayed. {} history/histories failed to read; see the history_unreadable \
-             finding above. {} had no registered handler. Registering handlers may fix \
-             part of this, not all of it.",
+             finding above for the cause. {} had no registered handler. Registering \
+             handlers may fix part of this, not all of it.",
             replay.sampled,
             replay.unreadable,
             replay.skipped_no_handler,
