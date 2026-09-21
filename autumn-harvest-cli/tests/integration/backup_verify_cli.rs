@@ -437,6 +437,40 @@ fn text_output_does_not_blame_handlers_when_every_history_is_unreadable() {
     );
 }
 
+/// Issue #1410. A fleet-wide summary can merge an all-unreadable shard with
+/// an all-skipped shard. Neither single-cause branch may fire: the message
+/// must name both counts and must not blame, or clear, handlers outright.
+#[test]
+fn text_output_names_both_causes_when_unreadable_and_skipped_combine() {
+    let mut s = shard(Vec::new());
+    s.replay = ReplaySummary {
+        sampled: 5,
+        clean: 0,
+        divergent: 0,
+        failed: 0,
+        skipped_no_handler: 3,
+        unreadable: 2,
+    };
+    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let text = format_backup_verify_text(&r);
+    assert!(
+        text.contains("NOT VERIFIED") && !text.contains("PARTIALLY VERIFIED"),
+        "nothing replayed here, so this is zero coverage, not partial: {text}"
+    );
+    assert!(
+        !text.contains("Every sampled history failed to read"),
+        "some samples were skipped, not unreadable, so this claim is false: {text}"
+    );
+    assert!(
+        !text.contains("Registering workflow handlers will not fix this"),
+        "handlers would fix the skipped subset, so this overclaims: {text}"
+    );
+    assert!(
+        text.contains("2 unreadable") && text.contains("3 skipped"),
+        "both counts must be named so an operator can tell the causes apart: {text}"
+    );
+}
+
 #[test]
 fn text_output_reports_partial_coverage_when_some_unreadable_but_others_replayed() {
     let mut s = shard(Vec::new());
