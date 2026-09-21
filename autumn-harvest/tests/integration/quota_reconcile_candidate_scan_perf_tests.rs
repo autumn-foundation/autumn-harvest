@@ -519,19 +519,23 @@ async fn zz_capture_quota_reconcile_candidate_scan_evidence() {
             "every target row must be backfilled by the end of one full pass"
         );
 
-        // Steady-state cost: only the target rows ever leave the candidate
-        // index. The 500,000 non-quota'd noise rows never do, since nothing
-        // ever sets their quota_key. Once every target row is backfilled,
-        // this exact call is what every FUTURE heartbeat tick costs. It
-        // recurs forever, not a one-time rollout expense (issue #1226
+        // Steady-state cost, for a sustained workload: only the target rows
+        // ever leave the candidate index because THIS sweep backfilled
+        // them. A non-quota'd row leaves too, but only once its own
+        // execution goes terminal. Nothing here advances that population.
+        // This models a live system where new starts keep replacing
+        // completions, not a workload draining to zero (issue #1226
         // follow-up review).
         let post_backfill_plan = explain_candidate_scan(&mut conn).await;
         std::fs::write(
             out_dir.join("post-backfill-steady-state-explain.txt"),
             format!(
                 "-- CANDIDATE_SQL immediately after a full backfill pass completes \
-                 @ noise={} (largest fixture) -- every future heartbeat tick's \
-                 permanent cost, not a one-time rollout expense --\n{post_backfill_plan}\n",
+                 @ noise={} (largest fixture) -- every future heartbeat tick's cost \
+                 under a sustained non-quota'd workload (new starts continuously \
+                 replacing completions), not a one-time rollout expense; a \
+                 non-quota'd row DOES leave the candidate index once its own \
+                 execution goes terminal --\n{post_backfill_plan}\n",
                 NOISE_SWEEP[NOISE_SWEEP.len() - 1]
             ),
         )
