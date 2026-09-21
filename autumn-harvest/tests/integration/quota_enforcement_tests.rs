@@ -3741,7 +3741,20 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     // WHOLE persist transaction -- including the source's own
     // `WorkflowCompleted` append -- leaving it stuck RUNNING forever with no
     // error ever recorded.
-    wait_for_execution_state(&url, source, "COMPLETED").await;
+    //
+    // A wider bound than the usual 10s default (CI flake observed on PR
+    // #1673). This decision cycle resolves the trigger's target quota,
+    // persists the blocked outbox row, and completes the source. All of
+    // that happens before this point. That can push the 10s default past
+    // its budget under a resource-constrained runner, the same way
+    // `wait_for_execution_state_with_timeout`'s own doc comment describes.
+    wait_for_execution_state_with_timeout(
+        &url,
+        source,
+        "COMPLETED",
+        std::time::Duration::from_secs(30),
+    )
+    .await;
 
     #[derive(diesel::QueryableByName)]
     struct OutboxCount {

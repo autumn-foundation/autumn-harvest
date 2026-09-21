@@ -1602,6 +1602,9 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                             source_exec_id: exec_id.as_uuid(),
                             trigger_id: trigger_db.id,
                             outcome: Some("condition_unmet".to_string()),
+                            // A resolved-skip never picks a target (issue #1401).
+                            target_shard: None,
+                            target_workflow_name: None,
                         })
                         .on_conflict_do_nothing()
                         .execute(conn)
@@ -1808,6 +1811,12 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                                 source_exec_id: exec_id.as_uuid(),
                                 trigger_id: trigger_db.id,
                                 outcome: Some("admission_blocked".to_string()),
+                                // The target was resolved before the gate
+                                // blocked it (issue #1401).
+                                target_shard: Some(target_shard.as_i32()),
+                                target_workflow_name: Some(
+                                    trigger_db.target_workflow_name.clone(),
+                                ),
                             })
                             .on_conflict_do_nothing()
                             .execute(conn)
@@ -1846,6 +1855,15 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                     // NULL outcome = fired (issue #810 reserves the column
                     // for resolved-skip reasons).
                     outcome: None,
+                    // Captured at relay time so a restore-verification pass
+                    // can read the historical target directly, instead of
+                    // reconstructing it from current, mutable state.
+                    // `target_shard` from a topology that may have changed
+                    // since. `target_workflow_name` from a trigger row
+                    // `sync_completion_triggers` can update in place (issue
+                    // #1401).
+                    target_shard: Some(target_shard.as_i32()),
+                    target_workflow_name: Some(trigger_db.target_workflow_name.clone()),
                 })
                 .on_conflict_do_nothing()
                 .execute(conn)
@@ -1996,6 +2014,23 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                             workflow_type = %workflow_type,
                             "Oversized trigger input payload; skipping trigger execution."
                         );
+                        // Resolve the fires row inserted above, same as the
+                        // cross-shard outbox's own PayloadTooLarge arm
+                        // (Codex follow-up x15). This inline start runs on
+                        // `conn`, inside the source's own still-open
+                        // terminal transaction. A plain update on the same
+                        // connection is enough. No separate claim or
+                        // transaction is needed the way the outbox path
+                        // requires.
+                        diesel::update(
+                            fires_dsl::harvest_completion_trigger_fires
+                                .filter(fires_dsl::source_exec_id.eq(exec_id.as_uuid()))
+                                .filter(fires_dsl::trigger_id.eq(trigger_db.id)),
+                        )
+                        .set(fires_dsl::outcome.eq(Some("payload_too_large")))
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
                         if let Some(m) = metrics {
                             m.record_completion_trigger_fired(&trigger_name, "payload_too_large");
                         }
@@ -2607,8 +2642,25 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                 cap_bytes,
                 ..
             }) => {
+                use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
+                use diesel_async::AsyncConnection as _;
+
                 // Permanent error: payload will never fit regardless of retries.
-                // Delete the outbox row so it does not retry forever.
+                // Delete the outbox row so it does not retry forever, and
+                // resolve the fires row the same way `admission_blocked`
+                // does. Without this, the fires row stays `outcome IS NULL`
+                // forever. A restore-verification pass then reads this
+                // permanent, correctly-handled rejection as a delivered
+                // relay whose target is missing (issue #1401).
+                //
+                // Both writes commit or roll back TOGETHER (issue #1401,
+                // Codex follow-up). Two separate autocommitted statements
+                // left a crash window between them. The outbox row gone
+                // but the fires row still `outcome IS NULL` is EXACTLY the
+                // shape a restore-verification pass reads as a lost
+                // delivery. A rolled-back transaction leaves the outbox row
+                // in place, so the next scanner tick retries this same
+                // rejection from scratch.
                 tracing::error!(
                     target_workflow = %task.target_workflow_name,
                     kind = %kind,
@@ -2616,10 +2668,118 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                     cap_bytes,
                     "[completion_trigger outbox] permanent error: oversized input payload; deleting outbox row"
                 );
-                let _ = diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
-                    .filter(outbox_dsl::id.eq(task.id))
-                    .execute(conn)
+
+                // Claim (delete) the outbox row FIRST, and check delivery
+                // LAST (issue #1401, Codex follow-up x8). Checking first
+                // left a window. Another attempt could deliver the target
+                // and roll back only its OWN outbox delete, in between our
+                // check and our delete. Our check would never see that.
+                // Deleting first closes the window. Once our delete
+                // commits, no other attempt can touch this row again. An
+                // existence check run immediately after is therefore the
+                // last possible look, and cannot miss a delivery that beat
+                // us to the target.
+                //
+                // The claim, the check, and the fires update all run
+                // inside ONE open transaction (issue #1401, Codex follow-up
+                // x9), not as separate steps. A failure at any step rolls
+                // back the delete too. The outbox row is restored for the
+                // next scan tick to retry, instead of being permanently
+                // lost while `fires.outcome` stays NULL.
+                let resolved: Result<bool, crate::error::HarvestError> =
+                    Box::pin(conn.transaction(async |tx| {
+                        let deleted = diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
+                            .filter(outbox_dsl::id.eq(task.id))
+                            .execute(tx)
+                            .await
+                            .map_err(crate::error::database_error)?;
+                        // Zero rows deleted means another attempt already
+                        // claimed and resolved this row (issue #1401, Codex
+                        // follow-up). Nothing left for us to do.
+                        if deleted == 0 {
+                            return Ok(false);
+                        }
+
+                        let already_delivered = crate::execution::execution_exists_by_key(
+                            &mut target_conn,
+                            &task.target_workflow_name,
+                            &task.target_workflow_id,
+                        )
+                        .await?
+                            // A LIVE check alone is not proof of non-delivery
+                            // (issue #1401, Codex follow-up x10): retention
+                            // can remove the row within seconds of
+                            // completion. A summary, when the deployment
+                            // captures one, outlives that window.
+                            || crate::execution::execution_summary_exists_by_key(
+                                &mut target_conn,
+                                &task.target_workflow_name,
+                                &task.target_workflow_id,
+                            )
+                            .await?;
+                        if already_delivered {
+                            tracing::debug!(
+                                source_exec_id = %task.source_exec_id,
+                                trigger_id = %task.trigger_id,
+                                "[completion_trigger outbox] target already exists or is \
+                                 retained (any state); treating the stale outbox row as \
+                                 delivered, not rejected"
+                            );
+                            return Ok(false);
+                        }
+
+                        // Neither check proved delivery here (Codex follow-up).
+                        // Per `execution_summary_exists_by_key`'s own doc
+                        // comment, that is still not proof of NON-delivery
+                        // when summaries are disabled or expired.
+                        // `payload_too_large` is the deliberate choice
+                        // anyway. Leaving `outcome` unset instead would make
+                        // this fire a candidate lost relay for every future
+                        // `backup_verify` run. That is the exact false
+                        // positive issue #1401 exists to prevent. This
+                        // trades a rare, silent miss (a genuinely delivered
+                        // target, retained without a summary) for a loud,
+                        // common false alarm. See
+                        // `docs/runbooks/backup-restore.md` §4.2(d) for the
+                        // same residual, documented once.
+                        diesel::update(
+                            fires_dsl::harvest_completion_trigger_fires
+                                .filter(fires_dsl::source_exec_id.eq(task.source_exec_id))
+                                .filter(fires_dsl::trigger_id.eq(task.trigger_id)),
+                        )
+                        .set(fires_dsl::outcome.eq(Some("payload_too_large")))
+                        .execute(tx)
+                        .await
+                        .map_err(crate::error::database_error)?;
+                        Ok(true)
+                    }))
                     .await;
+                match resolved {
+                    Ok(false) => {
+                        tracing::warn!(
+                            source_exec_id = %task.source_exec_id,
+                            trigger_id = %task.trigger_id,
+                            "[completion_trigger outbox] outbox row already claimed or \
+                             already delivered; leaving its fire outcome untouched"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            source_exec_id = %task.source_exec_id,
+                            trigger_id = %task.trigger_id,
+                            error = ?e,
+                            "[completion_trigger outbox] failed to resolve the \
+                             permanently-rejected fire; backing off this outbox row"
+                        );
+                        // The whole transaction rolled back on any Err, so
+                        // the outbox row is untouched here (issue #1401,
+                        // Codex follow-up). Without this backoff it would
+                        // retry at full poll cadence forever, mirroring the
+                        // generic error arm below.
+                        stamp_outbox_relay_backoff(conn, task.id).await;
+                    }
+                    Ok(true) => {}
+                }
                 processed_count += 1;
             }
             Err(e) => {
