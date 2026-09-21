@@ -1028,6 +1028,15 @@ fn route_trigger_fires(
 /// contain the delivery, PROVIDED that newest-event timestamp itself is
 /// trustworthy.
 ///
+/// `fired_at` and `target_latest_event_at` come from TWO DIFFERENT
+/// Postgres hosts' clocks in a multi-shard deployment (issue #1401, Codex
+/// follow-up). A raw `<` comparison would treat any clock skew between
+/// them as proof of loss. `max_skew_secs` is the same operator-configured
+/// tolerance [`FindingClass::RestorePointSkew`] already uses to flag
+/// excessive cross-shard skew. A gap smaller than that tolerance is never
+/// trusted as proof here either. The gap must exceed the skew bound the
+/// deployment already vouches for.
+///
 /// Otherwise, absence stays ambiguous: the target shard has progressed past
 /// `fired_at`, or carries no event to compare at all. It may be ordinary
 /// retention -- the run completed and was collected. The caller already
@@ -1058,8 +1067,12 @@ fn route_trigger_fires(
 fn absence_is_decisive_loss(
     fired_at: DateTime<Utc>,
     target_latest_event_at: Option<DateTime<Utc>>,
+    max_skew_secs: i64,
 ) -> bool {
-    matches!(target_latest_event_at, Some(latest) if latest < fired_at)
+    matches!(
+        target_latest_event_at,
+        Some(latest) if fired_at - latest > chrono::Duration::seconds(max_skew_secs)
+    )
 }
 
 // ── Production-DSN guard ────────────────────────────────────────────────────
@@ -3433,10 +3446,12 @@ mod probes {
         conn: &mut AsyncPgConnection,
         owned: &[&super::PendingTriggerFire],
         latest_by_shard: &std::collections::BTreeMap<i32, Option<DateTime<Utc>>>,
+        max_skew_secs: i64,
     ) -> TriggerFireBuckets {
         let mut out = TriggerFireBuckets::default();
         for chunk in owned.chunks(WORKFLOW_KEY_LOOKUP_CHUNK) {
-            adjudicate_trigger_fire_chunk(conn, chunk, latest_by_shard, &mut out).await;
+            adjudicate_trigger_fire_chunk(conn, chunk, latest_by_shard, max_skew_secs, &mut out)
+                .await;
         }
         out
     }
@@ -3454,6 +3469,7 @@ mod probes {
         conn: &mut AsyncPgConnection,
         chunk: &[&super::PendingTriggerFire],
         latest_by_shard: &std::collections::BTreeMap<i32, Option<DateTime<Utc>>>,
+        max_skew_secs: i64,
         out: &mut TriggerFireBuckets,
     ) {
         if chunk.is_empty() {
@@ -3542,7 +3558,7 @@ mod probes {
                 fire.fired_at,
                 fire.target_shard
             );
-            if super::absence_is_decisive_loss(fire.fired_at, target_latest) {
+            if super::absence_is_decisive_loss(fire.fired_at, target_latest, max_skew_secs) {
                 out.push_lost(sample);
             } else {
                 out.push_unproven(sample);
@@ -3557,6 +3573,7 @@ mod probes {
         pending: &[super::PendingTriggerFire],
         targets: &[ShardTarget],
         shards: &[ShardVerifyReport],
+        max_skew_secs: i64,
     ) -> Vec<Finding> {
         use std::collections::BTreeSet;
 
@@ -3632,7 +3649,7 @@ mod probes {
                 unproven_count,
                 lookup_errors,
                 lookup_errors_count,
-            } = adjudicate_trigger_fires(&mut conn, &owned, &latest_by_shard).await;
+            } = adjudicate_trigger_fires(&mut conn, &owned, &latest_by_shard, max_skew_secs).await;
 
             for (class, count, samples) in [
                 (FindingClass::CompletionTriggerFireLost, lost_count, lost),
@@ -3690,7 +3707,8 @@ mod probes {
                 uncertain,
                 uncertain_count,
             } = super::route_trigger_fires(fires, &router);
-            let mut trigger_findings = resolve_trigger_fires(&pending, targets, &shards).await;
+            let mut trigger_findings =
+                resolve_trigger_fires(&pending, targets, &shards, options.max_skew_secs).await;
             cross_shard.append(&mut trigger_findings);
             if uncertain_count > 0 {
                 cross_shard.push(Finding::new(
@@ -3979,21 +3997,46 @@ mod tests {
         let fired_at = Utc::now();
 
         assert!(
-            !absence_is_decisive_loss(fired_at, None),
+            !absence_is_decisive_loss(fired_at, None, 0),
             "no timestamp signal at all must not be treated as proof of loss"
         );
         assert!(
-            absence_is_decisive_loss(fired_at, Some(fired_at - chrono::Duration::seconds(1))),
+            absence_is_decisive_loss(fired_at, Some(fired_at - chrono::Duration::seconds(1)), 0),
             "a target restore point strictly before the fire proves the loss"
         );
         assert!(
-            !absence_is_decisive_loss(fired_at, Some(fired_at)),
+            !absence_is_decisive_loss(fired_at, Some(fired_at), 0),
             "a restore point exactly at the fire is not proof of loss"
         );
         assert!(
-            !absence_is_decisive_loss(fired_at, Some(fired_at + chrono::Duration::seconds(1))),
+            !absence_is_decisive_loss(fired_at, Some(fired_at + chrono::Duration::seconds(1)), 0),
             "a target shard that progressed past the fire may simply have \
              retained and collected the run"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
+    fn absence_is_decisive_loss_requires_the_gap_to_exceed_the_skew_tolerance() {
+        let fired_at = Utc::now();
+        let max_skew_secs = 60;
+
+        assert!(
+            !absence_is_decisive_loss(
+                fired_at,
+                Some(fired_at - chrono::Duration::seconds(max_skew_secs)),
+                max_skew_secs,
+            ),
+            "a gap no larger than the configured cross-shard clock-skew \
+             tolerance is not proof of loss (issue #1401, Codex follow-up)"
+        );
+        assert!(
+            absence_is_decisive_loss(
+                fired_at,
+                Some(fired_at - chrono::Duration::seconds(max_skew_secs + 1)),
+                max_skew_secs,
+            ),
+            "a gap exceeding the skew tolerance is still proof of loss"
         );
     }
 

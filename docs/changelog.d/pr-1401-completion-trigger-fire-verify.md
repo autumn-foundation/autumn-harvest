@@ -11,7 +11,8 @@ never received, with no scanner and, until now, no drill check to catch it.
 
 - `completion_trigger_fire_lost` (`incoherent`, exit 1): the target execution
   is absent AND the target shard's restore point (its newest event) predates
-  the fire's `fired_at`. The relay can only start the target at or after
+  the fire's `fired_at` by more than the cross-shard clock-skew tolerance
+  (`max_skew_secs`). The relay can only start the target at or after
   `fired_at`, so this is proof, not inference.
 - `completion_trigger_fire_unproven` (`undetermined`, exit 2): the target is
   absent, no `harvest_execution_summaries` row proves retention, and the
@@ -53,6 +54,17 @@ bounded-count treatment (Codex follow-up x4). No new test: this one is
 only reachable through the full `verify_restore` path, and the fix is
 the same push-bounded/count-separately shape already pinned by three
 other tests on this PR.
+
+`absence_is_decisive_loss` compared `fired_at` (the SOURCE shard's clock)
+against `latest_event_at` (the TARGET shard's clock) with a raw `<`,
+treating ordinary cross-shard clock skew as proof of loss (Codex follow-up
+x5). It now requires the gap to exceed `max_skew_secs` — the same
+operator-configured tolerance `restore_point_skew` already uses for
+exactly this kind of cross-host timestamp comparison — before trusting it
+as proof; a smaller gap stays `completion_trigger_fire_unproven`. Threaded
+`max_skew_secs` through `resolve_trigger_fires`/`adjudicate_trigger_fires`/
+`adjudicate_trigger_fire_chunk` from `VerifyOptions`. Added
+`absence_is_decisive_loss_requires_the_gap_to_exceed_the_skew_tolerance`.
 
 **Confirmed delivered, precisely.** `outcome IS NULL` alone is set at
 trigger-evaluation time, before any relay attempt — not proof of delivery.

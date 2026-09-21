@@ -119,7 +119,7 @@ resume, not because anything is wrong.
 | `replay_divergence` | A sampled history no longer replays against the deployed workflow code. Not caused by the restore; caused by a code/history mismatch. Fix by rolling *back* the workflow code, then resume (see `nondeterminism-block.md`). |
 | `external_effect_rolled_back` | The caller recorded a signal/cancel/await as **delivered**, but the target's shard shows no trace of the effect — the cross-shard analogue of `child_terminal_rolled_back`. Adjudicated per effect: a delivered *cancel* requires the target to be terminal; a resolved *await* requires the target's continue-as-new **chain head** to be terminal (a `CONTINUED_AS_NEW` target alone is not proof — see §4.2(c)); a delivered *signal* is matched **exactly by its `idempotency_key`** when the caller supplied one, else by channel name. The *signal* lookup walks the target's **successor chain** (`continued_from_exec_id` / `retry_of_exec_id`), because both continue-as-new and workflow-level retry reassign `harvest_signals` rows to the successor; the *await* check walks the continue-as-new chain via each predecessor's own `WorkflowContinuedAsNew` event, matching the engine's `read_external_await_outcome`. Adjudicated whether or not the **caller** is itself terminal — the assertion does not expire when the caller completes. Repair by restoring the target shard to a point at or after the caller's, per §6. Nothing retries this: the caller has already recorded the terminal and will never re-request. |
 | `replay_workflow_failed` | A sampled **non-terminal** history replays to a workflow *error* under the deployed code. Because the sample is drawn only from runs with no recorded terminal failure, this means the deployed handler now errors where the live run had not. Same remedy as `replay_divergence`: roll the workflow code *back*, then resume. |
-| `completion_trigger_fire_lost` | The source shard confirms a cross-shard completion-trigger relay delivered (`harvest_completion_trigger_fires.outcome IS NULL`, its outbox row gone), but the target execution is absent AND the target shard's restore point predates the fire. The target shard's snapshot cannot possibly hold the delivery — see §4.2(d). |
+| `completion_trigger_fire_lost` | The source shard confirms a cross-shard completion-trigger relay delivered (`harvest_completion_trigger_fires.outcome IS NULL`, its outbox row gone), but the target execution is absent AND the target shard's restore point predates the fire by more than the cross-shard clock-skew tolerance. The target shard's snapshot cannot possibly hold the delivery — see §4.2(d). |
 
 A report containing any of these exits **1**. Do not start workers.
 
@@ -323,11 +323,16 @@ ack, it refuses; with the ack, it still only reads.
   business key FIRST — proven retention stays silent regardless of
   timestamps. Without a summary, an absent target with no timestamp
   evidence either way is `completion_trigger_fire_unproven` (`undetermined`,
-  exit 2); an absent target whose shard's restore point predates the fire is
+  exit 2); an absent target whose shard's restore point predates the fire by
+  more than `VerifyOptions::max_skew_secs` (default 60s, the same
+  cross-shard clock-skew tolerance `restore_point_skew` uses — see §6.3) is
   `completion_trigger_fire_lost` (`incoherent`, exit 1) — the restore point
-  proves the target snapshot cannot hold the delivery. A RECORDED same-shard
-  fire is never checked: it commits atomically with the target start and
-  cannot be split by a skewed restore.
+  proves the target snapshot cannot hold the delivery. `fired_at` and the
+  restore point come from two different Postgres hosts' clocks, so a gap no
+  larger than that tolerance stays `undetermined` instead (Codex follow-up
+  x5), never treated as proof. A RECORDED same-shard fire is never checked:
+  it commits atomically with the target start and cannot be split by a
+  skewed restore.
 
   **Residual limitation** (Codex follow-up x2). A target that ran,
   completed, and was retention-collected can itself have been its shard's
@@ -550,7 +555,10 @@ workflow as a reason to restore again.
 **per fire**, not just fleet-wide: a target shard's newest event compared
 against the fire's own `fired_at`. This resolves the common case decisively —
 without needing a `harvest_execution_summaries` row — leaving only a genuinely
-indeterminate absence as `completion_trigger_fire_unproven`.
+indeterminate absence as `completion_trigger_fire_unproven`. The per-fire
+comparison requires the gap to exceed the SAME skew tolerance
+(`max_skew_secs`) this section's fleet-wide check uses, since the two
+timestamps come from different shards' Postgres clocks (Codex follow-up x5).
 
 ---
 
