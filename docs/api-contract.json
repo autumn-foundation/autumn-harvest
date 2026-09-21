@@ -2836,7 +2836,7 @@
         },
         {
           "status": 503,
-          "description": "The reset succeeded but the audit record for it could not be written. The new execution exists; retry is not needed."
+          "description": "The reset succeeded but the audit record for it could not be written. The new execution exists. Retry is not needed."
         }
       ]
     },
@@ -7618,7 +7618,7 @@
         },
         {
           "status": 503,
-          "description": "The schedule row names neither a workflow nor a DAG, an inconsistent state."
+          "description": "The schedule row names neither a workflow nor a DAG. This is an inconsistent state."
         }
       ]
     },

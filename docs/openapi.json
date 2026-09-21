@@ -3947,7 +3947,7 @@
             "description": "Database error or partial shard failure."
           },
           "503": {
-            "description": "The schedule row names neither a workflow nor a DAG, an inconsistent state."
+            "description": "The schedule row names neither a workflow nor a DAG. This is an inconsistent state."
           }
         },
         "summary": "Backfill missed scheduled runs for a workflow or DAG schedule over an explicit time window.",
@@ -11173,7 +11173,7 @@
             "description": "Database error."
           },
           "503": {
-            "description": "The reset succeeded but the audit record for it could not be written. The new execution exists; retry is not needed."
+            "description": "The reset succeeded but the audit record for it could not be written. The new execution exists. Retry is not needed."
           }
         },
         "summary": "Fork a workflow execution at a specific event boundary, replaying from that point with a new execution ID.",
