@@ -2084,6 +2084,24 @@ const fn records_abandoned_dispatches(outcome: &WorkflowOutcome) -> bool {
     matches!(outcome, WorkflowOutcome::Failed { .. })
 }
 
+/// Whether a `ContinuedAsNew` outcome is exempt from the history hard cap
+/// (issue #1409, Codex P2 on PR #1679).
+///
+/// A genuine continuation escapes onto a fresh successor row, so the
+/// predecessor's own cap is moot -- but only when it carries no
+/// abandoned-dispatch-eligible command. A redirect to `WorkflowFailed` can
+/// append issue #952's synthetic pair onto this SAME row, so the exemption
+/// does not extend there. `resolved_abandoned_dispatch_event_count` is the
+/// caller's pre-dedup upper bound (see [`terminal_history_event_count`]'s
+/// doc): nonzero here means the batch has at least one such command.
+const fn continue_as_new_exempt_from_history_cap(
+    outcome: &WorkflowOutcome,
+    resolved_abandoned_dispatch_event_count: u64,
+) -> bool {
+    matches!(outcome, WorkflowOutcome::ContinuedAsNew { .. })
+        && resolved_abandoned_dispatch_event_count == 0
+}
+
 /// The events recording one dispatch a failing cycle abandoned (issue #952), or
 /// an empty vec when this command is not an abandoned dispatch.
 ///
@@ -18835,8 +18853,14 @@ fn terminal_history_event_count(
     // the abandoned-dispatch records. Issue #1265: pass the hard-cap
     // preflight's resolved value here, from
     // `abandoned_dispatch_event_count_resolved`. Do not recompute a
-    // pre-dedup count. A re-parked dispatch the dedup already zeroed must
-    // not inflate this gauge.
+    // pre-dedup count for a `Failed` outcome. A re-parked dispatch the
+    // dedup already zeroed must not inflate this gauge.
+    //
+    // Issue #1409: a `ContinuedAsNew` outcome is the one exception. Its
+    // caller passes the cheap pre-dedup upper bound instead
+    // (`abandoned_dispatch_event_count`). Whether it will actually redirect
+    // and append these records is only knowable under the execution row
+    // lock this pre-transaction preflight does not hold.
     resolved_abandoned_dispatch_event_count: u64,
 ) -> u64 {
     u64::try_from(next_event_id)
@@ -21059,8 +21083,9 @@ async fn process_workflow_task(
     };
     // Issue #1265: captured here so the `history_size` gauge below can reuse
     // the SAME dedup-resolved count instead of recomputing a pre-dedup one.
-    // It stays 0 for every non-`Failed` outcome (mirrors
-    // `records_abandoned_dispatches`): none of those resolve this count.
+    // It stays 0 for every outcome that cannot append the abandoned-dispatch
+    // pair: `Completed`, `Suspended`, and a `ContinuedAsNew` carrying no
+    // abandoned-dispatch-eligible command at all.
     let mut resolved_abandoned_dispatch_event_count: u64 = 0;
     let pending_durable_event_count = match &outcome {
         WorkflowOutcome::Suspended { commands } => {
@@ -21078,8 +21103,29 @@ async fn process_workflow_task(
                 }
             }
         }
-        WorkflowOutcome::ContinuedAsNew { .. } => pending_update_result_event_count(&pending_cmds)
-            .saturating_add(pre_suspension_event_count(&pending_cmds)),
+        WorkflowOutcome::ContinuedAsNew { .. } => {
+            // Issue #1409 (Codex P2 on this PR): a continue-as-new can
+            // internally redirect to a real `WorkflowFailed`. That appends
+            // this cycle's abandoned-dispatch pair (issue #952) onto the
+            // SAME (predecessor) row this preflight is sizing. A genuine
+            // continuation instead escapes onto a fresh successor row --
+            // exactly why this outcome is otherwise exempt from the hard
+            // cap below.
+            //
+            // Whether it will actually redirect is only known under the
+            // execution row lock inside the persist transaction
+            // (`resolve_continue_as_new_verdict`). This pre-transaction
+            // preflight must not pay for that twice. So it counts the
+            // cheap, DB-free upper bound instead. That is the same
+            // over-counts-are-safe reasoning `abandoned_dispatch_event_count`'s
+            // own doc already establishes for the identical preflight-sizing
+            // purpose.
+            let abandoned = abandoned_dispatch_event_count(&pending_cmds);
+            resolved_abandoned_dispatch_event_count = abandoned;
+            pending_update_result_event_count(&pending_cmds)
+                .saturating_add(pre_suspension_event_count(&pending_cmds))
+                .saturating_add(abandoned)
+        }
         WorkflowOutcome::Completed { .. } => pending_update_result_event_count(&pending_cmds)
             .saturating_add(pre_suspension_event_count(&pending_cmds))
             .saturating_add(terminal_parent_close_cascade_events),
@@ -21120,7 +21166,10 @@ async fn process_workflow_task(
 
     if let Some(cap) = registry.history_policy().event_hard_cap()
         && current_history_event_count >= cap
-        && !matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. })
+        && !continue_as_new_exempt_from_history_cap(
+            &outcome,
+            resolved_abandoned_dispatch_event_count,
+        )
     {
         let deferred = fail_workflow_for_history_cap(
             conn,
@@ -40117,6 +40166,41 @@ mod tests {
         assert!(!records_abandoned_dispatches(&WorkflowOutcome::Suspended {
             commands: Vec::new(),
         }));
+    }
+
+    /// Issue #1409 (Codex P2 on PR #1679): a `ContinuedAsNew` that carries no
+    /// abandoned-dispatch-eligible command stays exempt from the history hard
+    /// cap. It truly does escape onto a fresh successor row. One that DOES
+    /// carry such a command loses the exemption, since a redirect to
+    /// `WorkflowFailed` can append issue #952's pair onto the SAME row.
+    /// Every other outcome is never exempt, regardless of the count.
+    #[test]
+    fn only_an_abandoned_dispatch_free_continuation_is_exempt_from_the_history_cap() {
+        let continued = WorkflowOutcome::ContinuedAsNew {
+            input: Value::Null,
+            new_workflow_type: None,
+        };
+        assert!(continue_as_new_exempt_from_history_cap(&continued, 0));
+        assert!(!continue_as_new_exempt_from_history_cap(&continued, 2));
+
+        let failed = WorkflowOutcome::Failed {
+            error: "boom".to_string(),
+            non_deterministic_details: None,
+            handler_panic: false,
+            unhandled_signals: std::collections::BTreeMap::new(),
+        };
+        assert!(!continue_as_new_exempt_from_history_cap(&failed, 0));
+
+        let completed = WorkflowOutcome::Completed {
+            output: Value::Null,
+            unhandled_signals: std::collections::BTreeMap::new(),
+        };
+        assert!(!continue_as_new_exempt_from_history_cap(&completed, 0));
+
+        let suspended = WorkflowOutcome::Suspended {
+            commands: Vec::new(),
+        };
+        assert!(!continue_as_new_exempt_from_history_cap(&suspended, 0));
     }
 
     /// The dedup asks the question the MATCHER asked — "is this dispatch already
