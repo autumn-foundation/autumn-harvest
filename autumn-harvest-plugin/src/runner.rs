@@ -1110,28 +1110,28 @@ impl HarvestRunner {
         // uncovered.
         let (dispatch_guard, dispatch_installed, dispatch_multi_shard, dispatch_shard) =
             if dispatch_shards.len() > 1 {
-            let installed_shards =
-                install_dispatch_channels_for_shards(config, &dispatch_shards).await?;
-            let installed = !installed_shards.is_empty();
-            (
-                DispatchInstallGuard::new_shards(installed_shards),
-                installed,
-                installed,
-                None,
-            )
-        } else {
-            let dispatch_shard = match dispatch_shards.as_slice() {
-                [only] => Some(*only),
-                _ => None,
+                let installed_shards =
+                    install_dispatch_channels_for_shards(config, &dispatch_shards).await?;
+                let installed = !installed_shards.is_empty();
+                (
+                    DispatchInstallGuard::new_shards(installed_shards),
+                    installed,
+                    installed,
+                    None,
+                )
+            } else {
+                let dispatch_shard = match dispatch_shards.as_slice() {
+                    [only] => Some(*only),
+                    _ => None,
+                };
+                let installed = install_dispatch_channel(config, dispatch_shard).await?;
+                (
+                    DispatchInstallGuard::new(installed),
+                    installed,
+                    false,
+                    dispatch_shard,
+                )
             };
-            let installed = install_dispatch_channel(config, dispatch_shard).await?;
-            (
-                DispatchInstallGuard::new(installed),
-                installed,
-                false,
-                dispatch_shard,
-            )
-        };
 
         let worker = if config.worker_enabled {
             let worker = Worker::new(
@@ -2586,9 +2586,8 @@ mod tests {
         // it.
         block_on(async {
             let cancel = tokio_util::sync::CancellationToken::new();
-            let telemetry = std::sync::Arc::new(
-                autumn_harvest::telemetry::TelemetryConfig::builder().build(),
-            );
+            let telemetry =
+                std::sync::Arc::new(autumn_harvest::telemetry::TelemetryConfig::builder().build());
             let handle = autumn_harvest::worker::spawn_dispatch_metrics_sampler(
                 cancel.clone(),
                 telemetry,

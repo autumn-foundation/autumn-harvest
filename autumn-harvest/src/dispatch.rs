@@ -1550,7 +1550,9 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(250)).await;
         channel.maintain(&queues()).await.expect("maintain");
-        let delayed = read_one(&channel).await.expect("the long delay is ready now");
+        let delayed = read_one(&channel)
+            .await
+            .expect("the long delay is ready now");
         assert_eq!(delayed.task_id, by_id[1]);
         assert_eq!(delayed.redeliveries, 1);
     }
