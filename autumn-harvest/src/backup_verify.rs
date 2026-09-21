@@ -944,15 +944,24 @@ struct PendingTriggerFire {
 /// documents. It is a residual limitation for pre-migration data only.
 ///
 /// A RECORDED same-shard fire (`fire.target_shard == Some(source_shard)`)
-/// is dropped outright: it is a historical fact, not a guess, so the
-/// atomic-commit argument above genuinely applies. A RE-DERIVED pick that
-/// happens to equal `source_shard` is different (issue #1401, Codex
-/// follow-up). The same historical-drain blind spot can point the fallback
-/// at the wrong CROSS-shard target. It can just as easily land the pick on
-/// `source_shard` by coincidence, which would silently drop a fire that
-/// was actually lost. Such a fire goes to `uncertain` instead of being
-/// silently skipped or adjudicated against a shard pick this function
-/// cannot vouch for.
+/// is still adjudicated, not dropped outright (Codex follow-up x14). The
+/// atomic-commit fact only proves the target was CREATED there. A shard
+/// rebalance after the fire can move the live row elsewhere. It leaves a
+/// `MIGRATED` seal under the same business key on `source_shard` -- the
+/// same forwarding-seal shape `probes::matching_workflow_executions`
+/// already guards against for cross-shard fires. Routing it through
+/// `pending` like any other fire, with `target_shard` equal to
+/// `source_shard`, gets it that same protection for free.
+///
+/// A RE-DERIVED pick that happens to equal `source_shard` is different
+/// (issue #1401, Codex follow-up). The same historical-drain blind spot
+/// can point the fallback at the wrong CROSS-shard target. It can just as
+/// easily land the pick on `source_shard` by coincidence. That would
+/// silently drop a fire that was actually lost. Unlike the RECORDED case,
+/// this pick is not a historical fact, so adjudicating it against
+/// `source_shard` would not even be checking the right place. Such a fire
+/// goes to `uncertain` instead of being silently skipped or adjudicated
+/// against a shard pick this function cannot vouch for.
 #[cfg(all(feature = "db", feature = "testing"))]
 struct RoutedTriggerFires {
     pending: Vec<PendingTriggerFire>,
@@ -988,20 +997,22 @@ fn route_trigger_fires(
                 true,
             ),
         };
-        if target_shard == source_shard {
-            if reconstructed {
-                if uncertain.len() < MAX_FINDING_SAMPLES {
-                    uncertain.push(format!(
-                        "{target_workflow_id} (fired by {} on shard {source_shard}; \
-                         pre-migration fire, re-derived shard pick cannot be trusted to \
-                         rule out a cross-shard relay)",
-                        fire.source_exec_id
-                    ));
-                }
-                uncertain_count += 1;
+        if target_shard == source_shard && reconstructed {
+            if uncertain.len() < MAX_FINDING_SAMPLES {
+                uncertain.push(format!(
+                    "{target_workflow_id} (fired by {} on shard {source_shard}; \
+                     pre-migration fire, re-derived shard pick cannot be trusted to \
+                     rule out a cross-shard relay)",
+                    fire.source_exec_id
+                ));
             }
+            uncertain_count += 1;
             continue;
         }
+        // A RECORDED same-shard fire (`target_shard == source_shard`,
+        // `!reconstructed`) falls through to here instead of being dropped
+        // (Codex follow-up x14). It still needs the MIGRATED-seal check
+        // below, in case the target has since rebalanced away.
         pending.push(PendingTriggerFire {
             source_shard,
             source_exec_id: fire.source_exec_id,
@@ -3618,13 +3629,18 @@ mod probes {
         };
 
         for fire in chunk {
-            let key = (fire.target_workflow_name.clone(), fire.target_workflow_id.clone());
+            let key = (
+                fire.target_workflow_name.clone(),
+                fire.target_workflow_id.clone(),
+            );
             if migrated_seal_only.contains(&key) {
                 out.push_unproven(format!(
                     "{} (fired by {} on shard {}) matches a MIGRATED forwarding seal only \
                      on shard {}; the live run may have rebalanced to a shard this \
                      restore does not cover",
-                    fire.target_workflow_id, fire.source_exec_id, fire.source_shard,
+                    fire.target_workflow_id,
+                    fire.source_exec_id,
+                    fire.source_shard,
                     fire.target_shard
                 ));
             }
@@ -4003,7 +4019,7 @@ mod tests {
 
     #[test]
     #[cfg(all(feature = "db", feature = "testing"))]
-    fn route_trigger_fires_drops_a_recorded_same_shard_fire() {
+    fn route_trigger_fires_still_adjudicates_a_recorded_same_shard_fire() {
         let router = two_shard_router();
         let mut fire = resolved_fire("child_flow");
         let target_workflow_id = format!(
@@ -4014,16 +4030,22 @@ mod tests {
             .pick_for_new_workflow("child_flow", &target_workflow_id)
             .as_i32();
         // A RECORDED same-shard fire is a historical fact, not a guess.
+        // The target can still have rebalanced away since (Codex follow-up
+        // x14), so it must reach `pending` for adjudication rather than
+        // being dropped outright.
         fire.target_shard = Some(same_shard);
 
         let routing = route_trigger_fires(vec![(same_shard, fire)], &router);
 
-        assert!(
-            routing.pending.is_empty(),
-            "a same-shard fire is atomic with its target start and must not \
-             be adjudicated: {:?}",
+        assert_eq!(
+            routing.pending.len(),
+            1,
+            "a RECORDED same-shard fire must still be adjudicated, in case \
+             the target rebalanced away after the atomic commit: {:?}",
             routing.pending
         );
+        assert_eq!(routing.pending[0].target_shard, same_shard);
+        assert_eq!(routing.pending[0].source_shard, same_shard);
         assert!(
             routing.uncertain.is_empty(),
             "a RECORDED same-shard fire is a historical fact, not a guess, \

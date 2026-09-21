@@ -2831,37 +2831,102 @@ async fn an_absent_completion_trigger_target_with_a_summary_stays_silent() {
     );
 }
 
-/// Scope guard: a same-shard fire is committed atomically with the target
-/// start (`evaluate_triggers_for_execution`'s inline path), so it is immune
-/// to cross-shard restore skew by construction. The probe must not adjudicate
-/// it at all, even when the target is absent everywhere.
+/// A same-shard fire is committed atomically with the target start
+/// (`evaluate_triggers_for_execution`'s inline path), so its target row is
+/// guaranteed to have been created there. It is still adjudicated like any
+/// other fire (Codex follow-up x14). A later shard rebalance can move the
+/// target away, so the atomic-commit fact alone does not prove the target
+/// SURVIVED to this restore. A genuinely-present, non-migrated target
+/// reports nothing.
 #[tokio::test]
-async fn a_same_shard_completion_trigger_fire_is_not_probed() {
+async fn a_same_shard_completion_trigger_fire_with_a_live_target_is_clean() {
     let (url_a, _ca) = setup().await;
     let mut a = connect(&url_a).await;
 
-    let (source, trigger_id, _target_id) = find_fire_targeting("child_flow", 0);
+    let (source, trigger_id, target_id) = find_fire_targeting("child_flow", 0);
     let fired_at = Utc::now() - chrono::Duration::hours(1);
 
     seed_execution(&mut a, source, "parent_flow", "ct-same-1", "COMPLETED", 0).await;
     seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
     // RECORDED same-shard (target_shard persisted as 0, matching source): a
-    // historical fact, not a re-derived pick. `route_trigger_fires` drops
-    // this outright rather than flagging it uncertain.
+    // historical fact, not a re-derived pick.
     seed_completion_trigger_fire_with_target(&mut a, source, trigger_id, fired_at, 0, "child_flow")
         .await;
-    // No execution row anywhere for the target -- if this were adjudicated at
-    // all it would report as lost or unproven.
+    seed_execution(
+        &mut a,
+        ExecutionId::new_for_shard(ShardId::new(0)),
+        "child_flow",
+        &target_id,
+        "COMPLETED",
+        0,
+    )
+    .await;
 
     let report = verify_restore(&one_shard(&url_a), &opts(), &WorkflowReplayer::new()).await;
 
     assert!(
         !report.detected(FindingClass::CompletionTriggerFireLost),
-        "a same-shard fire is atomic, never a restore-skew risk: {report:#?}"
+        "a same-shard fire whose target genuinely survived must report \
+         nothing: {report:#?}"
     );
     assert!(
         !report.detected(FindingClass::CompletionTriggerFireUnproven),
-        "a same-shard fire is atomic, never a restore-skew risk: {report:#?}"
+        "a same-shard fire whose target genuinely survived must report \
+         nothing: {report:#?}"
+    );
+}
+
+/// The exact gap Codex follow-up x14 found. A same-shard fire's target was
+/// created atomically, then later rebalanced away by a shard-migration.
+/// That leaves a `MIGRATED` forwarding seal under the same business key on
+/// the SAME shard the fire recorded. The seal must not be read as proof
+/// the target survived this restore.
+#[tokio::test]
+async fn a_same_shard_fire_whose_target_migrated_away_is_unproven() {
+    let (url_a, _ca) = setup().await;
+    let mut a = connect(&url_a).await;
+
+    let (source, trigger_id, target_id) = find_fire_targeting("child_flow", 0);
+    let fired_at = Utc::now() - chrono::Duration::hours(1);
+
+    seed_execution(
+        &mut a,
+        source,
+        "parent_flow",
+        "ct-same-migrated-1",
+        "COMPLETED",
+        0,
+    )
+    .await;
+    seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
+    seed_completion_trigger_fire_with_target(&mut a, source, trigger_id, fired_at, 0, "child_flow")
+        .await;
+    // The seal left behind on shard 0 by a later rebalance to shard 1. Only
+    // shard 0 is supplied to `verify_restore` below, mirroring an operator
+    // who does not (or cannot) also restore the shard the target moved to.
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+         (id, workflow_name, workflow_id, state, input, started_at, shard_id, \
+          migrated_to_shard, migrated_at) \
+         VALUES (gen_random_uuid(), $1, $2, 'MIGRATED', '{}'::jsonb, NOW(), 0, 1, NOW())",
+    )
+    .bind::<diesel::sql_types::Text, _>("child_flow")
+    .bind::<diesel::sql_types::Text, _>(&target_id)
+    .execute(&mut a)
+    .await
+    .expect("seed migrated seal");
+
+    let report = verify_restore(&one_shard(&url_a), &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::CompletionTriggerFireLost),
+        "a MIGRATED seal is not proof of loss either -- the live copy may \
+         be fine on a shard this restore does not cover: {report:#?}"
+    );
+    assert!(
+        report.detected(FindingClass::CompletionTriggerFireUnproven),
+        "a MIGRATED seal is not proof of delivery, so this must not report \
+         clean: {report:#?}"
     );
 }
 
