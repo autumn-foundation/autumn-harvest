@@ -6226,8 +6226,8 @@ async fn a_declined_cutover_reports_legal_hold_drift_not_a_wake() {
 // once, before that lock is requested (`db_conn_for_execution`, at the top of
 // the API handler). A concurrent cutover can seal the row in the window
 // between that resolution and the lock grant. The lock still succeeds -- a
-// sealed row is an ordinary row to `SELECT ... FOR UPDATE` -- so the write
-// used to land on the forwarding tombstone while the API reported success.
+// sealed row is an ordinary row to `SELECT ... FOR UPDATE`. The write used to
+// land on the forwarding tombstone while the API reported success.
 
 #[tokio::test]
 async fn set_legal_hold_refuses_a_row_sealed_after_it_resolved_but_before_its_lock_was_granted() {
@@ -6245,8 +6245,8 @@ async fn set_legal_hold_refuses_a_row_sealed_after_it_resolved_but_before_its_lo
         .await
         .expect("verify");
 
-    // Lock the row so a concurrent cutover queues behind it, released only
-    // after the caller's connection below has resolved -- reproducing the
+    // Lock the row so a concurrent cutover queues behind it. Release it only
+    // after the caller's connection below has resolved -- this reproduces the
     // exact ordering the bug needs: resolve, THEN seal, THEN lock.
     let mut holder = shards.source().await;
     let (lock_held_tx, lock_held_rx) = tokio::sync::oneshot::channel();

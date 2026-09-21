@@ -4563,8 +4563,8 @@ mod db {
     /// The core write refuses a row a concurrent cutover sealed under its
     /// lock, naming the shard it forwards to. This follows that pointer and
     /// retries there, bounded like every other forwarding walk in this
-    /// module ([`MAX_FORWARD_HOPS`]) — so a chain that keeps moving still
-    /// fails closed instead of looping forever.
+    /// module ([`MAX_FORWARD_HOPS`]). A chain that keeps moving still fails
+    /// closed instead of looping forever.
     ///
     /// # Errors
     ///

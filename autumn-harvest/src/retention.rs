@@ -3597,11 +3597,11 @@ mod legal_hold_db {
     /// row — set `migrated_to_shard` — in the window between that resolution
     /// and the lock grant. The lock still succeeds; a sealed row is a normal
     /// row to `SELECT ... FOR UPDATE`. Without this check the hold write lands
-    /// on the forwarding tombstone, the API reports success, and the live copy
-    /// on the target shard never sees it.
+    /// on the forwarding tombstone. The API reports success. The live copy on
+    /// the target shard never sees it.
     ///
-    /// Matched on the pointer, not on `state = 'MIGRATED'` (same reasoning as
-    /// [`crate::shard_rebalance::forward_of_held_row`]): the pointer is what
+    /// Matched on the pointer, not on `state = 'MIGRATED'`. Same reasoning as
+    /// [`crate::shard_rebalance::forward_of_held_row`]: the pointer is what
     /// makes the row a tombstone, regardless of what a later forced state
     /// write does to `state` itself.
     ///

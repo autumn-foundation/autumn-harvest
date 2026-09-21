@@ -24033,9 +24033,9 @@ async fn set_legal_hold_handler(
         shard_id: None,
         source: &source,
     };
-    // Best-effort, on its own connection: the write above already committed
-    // (or refused) on its own shard, so an audit-log failure here must not
-    // mask that outcome from the caller.
+    // Best-effort, on its own connection. The write above already committed
+    // (or refused) on its own shard. An audit-log failure here must not mask
+    // that outcome from the caller.
     if let Ok(mut conn) = db_conn_for_execution(&api_state, exec_id).await {
         let _ = audit::insert_audit(&mut conn, &ar).await;
     }
@@ -24095,7 +24095,7 @@ async fn release_legal_hold_handler(
         shard_id: None,
         source: &source,
     };
-    // Best-effort, on its own connection: see the same-shaped comment in
+    // Best-effort, on its own connection. See the same-shaped comment in
     // set_legal_hold_handler.
     if let Ok(mut conn) = db_conn_for_execution(&api_state, exec_id).await {
         let _ = audit::insert_audit(&mut conn, &ar).await;
