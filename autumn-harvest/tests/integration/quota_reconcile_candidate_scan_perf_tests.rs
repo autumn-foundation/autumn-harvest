@@ -49,9 +49,24 @@
 //! noise size, outside the index's `state IN (...)` predicate, for a
 //! realistic terminal/non-terminal mix.
 //!
-//! Row ids are server-generated UUIDs. Target and noise rows are
-//! therefore already interleaved uniformly in `id` order, with no extra
-//! scattering step needed — exactly the ordering `ORDER BY id` scans.
+//! Row ids are deterministic: `md5()` of a row-unique, namespace-prefixed
+//! seed string, cast to `uuid`, not `gen_random_uuid()` (issue #1226
+//! follow-up review). `md5` output spreads uniformly over the id space.
+//! Target and noise rows therefore still interleave uniformly in `id`
+//! order, the property `ORDER BY id` scans rely on. Every run now
+//! reproduces the exact same interleaving, and therefore the exact same
+//! buffer counts.
+//!
+//! # Why the alternative index looks unhelpful under `= ANY($1)`
+//!
+//! [`explain_with_alternative_index`] captures three plans for the same
+//! query against the same fixture. This separates "the index cannot
+//! help" from "the unforced planner does not pick it". First, the
+//! unmodified query. Second, the same query with `enable_indexscan`
+//! forced off, so the planner must consider the alternative index.
+//! Third, the same predicate rewritten to a literal
+//! `workflow_name = $1`. See `docs/performance-quota-reconcile-candidate-scan.md`
+//! for the reading.
 //!
 //! Evidence-capture test below is ignored by default. Run via
 //! `autumn-harvest/scripts/quota_reconcile_candidate_scan_perf_repro.sh`.
@@ -169,10 +184,18 @@ async fn seed_fixture(conn: &mut diesel_async::AsyncPgConnection, noise_count: i
         .await
         .expect("truncate quota_reconcile fixture table");
 
+    // Ids are deterministic, not gen_random_uuid(): md5() of a row-unique,
+    // namespace-prefixed seed string, cast to uuid. Postgres's uuid input
+    // parser accepts a bare 32-hex-digit string. md5 output spreads
+    // uniformly over the id space. Target and noise rows therefore still
+    // interleave uniformly in `id` order, the property this file's
+    // module doc relies on. The exact interleaving, and therefore
+    // every buffer count this file reports, now reproduces byte-for-byte
+    // across runs (Codex Review finding, PR #1691).
     diesel::sql_query(format!(
         "INSERT INTO harvest_workflow_executions \
            (id, workflow_name, workflow_id, shard_id, state, input, quota_key) \
-         SELECT gen_random_uuid(), '{TARGET_WORKFLOW}', 'target-' || i, 0, \
+         SELECT md5('qr-target-' || i)::uuid, '{TARGET_WORKFLOW}', 'target-' || i, 0, \
                 CASE WHEN i % 5 = 0 THEN 'PAUSED' ELSE 'RUNNING' END, \
                 jsonb_build_object('tenant_id', 'tenant_' || (i % 500)), \
                 NULL \
@@ -185,7 +208,8 @@ async fn seed_fixture(conn: &mut diesel_async::AsyncPgConnection, noise_count: i
     diesel::sql_query(format!(
         "INSERT INTO harvest_workflow_executions \
            (id, workflow_name, workflow_id, shard_id, state, input, quota_key) \
-         SELECT gen_random_uuid(), '{TARGET_WORKFLOW}', 'target-terminal-' || i, 0, \
+         SELECT md5('qr-target-terminal-' || i)::uuid, '{TARGET_WORKFLOW}', \
+                'target-terminal-' || i, 0, \
                 'COMPLETED', jsonb_build_object('tenant_id', 'tenant_' || (i % 500)), \
                 'tenant_' || (i % 500) \
          FROM generate_series(1, {TARGET_TERMINAL}) AS i"
@@ -197,7 +221,7 @@ async fn seed_fixture(conn: &mut diesel_async::AsyncPgConnection, noise_count: i
     diesel::sql_query(format!(
         "INSERT INTO harvest_workflow_executions \
            (id, workflow_name, workflow_id, shard_id, state, input, quota_key) \
-         SELECT gen_random_uuid(), 'noise_wf_' || (i % {NOISE_WORKFLOW_TYPES}), \
+         SELECT md5('qr-noise-' || i)::uuid, 'noise_wf_' || (i % {NOISE_WORKFLOW_TYPES}), \
                 'noise-' || i, 0, \
                 CASE WHEN i % 5 = 0 THEN 'PAUSED' ELSE 'RUNNING' END, \
                 jsonb_build_object('tenant_id', 'tenant_' || (i % 500)), \
@@ -212,7 +236,8 @@ async fn seed_fixture(conn: &mut diesel_async::AsyncPgConnection, noise_count: i
     diesel::sql_query(format!(
         "INSERT INTO harvest_workflow_executions \
            (id, workflow_name, workflow_id, shard_id, state, input, quota_key) \
-         SELECT gen_random_uuid(), 'noise_wf_' || (i % {NOISE_WORKFLOW_TYPES}), \
+         SELECT md5('qr-noise-terminal-' || i)::uuid, \
+                'noise_wf_' || (i % {NOISE_WORKFLOW_TYPES}), \
                 'terminal-' || i, 0, 'COMPLETED', \
                 jsonb_build_object('tenant_id', 'tenant_' || (i % 500)), \
                 NULL \
@@ -252,11 +277,65 @@ async fn explain_candidate_scan(conn: &mut diesel_async::AsyncPgConnection) -> S
         .join("\n")
 }
 
+async fn explain_literal_equality(conn: &mut diesel_async::AsyncPgConnection) -> String {
+    let sql = "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) \
+        SELECT id, workflow_name, input FROM harvest_workflow_executions \
+        WHERE quota_key IS NULL AND state IN ('RUNNING', 'PAUSED') \
+          AND workflow_name = $1 \
+          AND ($2::uuid IS NULL OR id > $2) \
+        ORDER BY id \
+        LIMIT $3";
+    let rows: Vec<ExplainRow> = diesel::sql_query(sql)
+        .bind::<Text, _>(TARGET_WORKFLOW.to_string())
+        .bind::<Nullable<diesel::sql_types::Uuid>, _>(None::<uuid::Uuid>)
+        .bind::<BigInt, _>(QUOTA_RECONCILE_DEFAULT_BATCH)
+        .load(conn)
+        .await
+        .expect("EXPLAIN literal-equality variant");
+    rows.into_iter()
+        .map(|r| r.query_plan)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn explain_forced_bitmap(conn: &mut diesel_async::AsyncPgConnection) -> String {
+    diesel::sql_query("BEGIN")
+        .execute(conn)
+        .await
+        .expect("begin forced-plan transaction");
+    diesel::sql_query("SET LOCAL enable_indexscan = off")
+        .execute(conn)
+        .await
+        .expect("disable plain index scan for this transaction");
+    let plan_text = explain_candidate_scan(conn).await;
+    diesel::sql_query("ROLLBACK")
+        .execute(conn)
+        .await
+        .expect("rollback forced-plan transaction");
+    plan_text
+}
+
 /// The migration comment proposes and rejects a `(workflow_name, id)`
-/// partial index. Tested here against the SAME unmodified `CANDIDATE_SQL`
-/// text, to see whether the planner would even choose it. Dropped again
-/// immediately after the capture -- never left in the schema.
-async fn explain_with_alternative_index(conn: &mut diesel_async::AsyncPgConnection) -> String {
+/// partial index. Tested here three ways against the SAME 500,000-noise
+/// fixture (issue #1226 follow-up), to isolate why the planner rejects
+/// it under the unmodified `CANDIDATE_SQL`:
+///
+/// 1. Unmodified `CANDIDATE_SQL` (`= ANY($1)`), nothing forced -- what
+///    production actually runs.
+/// 2. The same query, with `enable_indexscan` disabled for one
+///    transaction, forcing the planner to consider the composite index
+///    via a Bitmap Index Scan. This isolates whether the index CAN
+///    deliver a cheap plan once selected, regardless of whether the
+///    unforced planner picks it.
+/// 3. The predicate rewritten to a literal `workflow_name = $1` instead
+///    of `= ANY($1)` -- isolates whether the array form specifically is
+///    what the unforced planner avoids.
+///
+/// The alternative index is dropped again immediately after the capture
+/// -- never left in the schema.
+async fn explain_with_alternative_index(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> (String, String, String) {
     diesel::sql_query(
         "CREATE INDEX idx_ledger_experiment_we_quota_reconcile_by_name_id \
          ON harvest_workflow_executions (workflow_name, id) \
@@ -270,14 +349,16 @@ async fn explain_with_alternative_index(conn: &mut diesel_async::AsyncPgConnecti
         .await
         .expect("analyze after alternative index");
 
-    let plan_text = explain_candidate_scan(conn).await;
+    let unforced = explain_candidate_scan(conn).await;
+    let forced_bitmap = explain_forced_bitmap(conn).await;
+    let literal_equality = explain_literal_equality(conn).await;
 
     diesel::sql_query("DROP INDEX idx_ledger_experiment_we_quota_reconcile_by_name_id")
         .execute(conn)
         .await
         .expect("drop alternative experiment index");
 
-    plan_text
+    (unforced, forced_bitmap, literal_equality)
 }
 
 #[derive(QueryableByName)]
@@ -337,17 +418,39 @@ async fn zz_capture_quota_reconcile_candidate_scan_evidence() {
         eprintln!("wrote {file_name}");
 
         if noise_count == NOISE_SWEEP[NOISE_SWEEP.len() - 1] {
-            let alt_plan_text = explain_with_alternative_index(&mut conn).await;
+            let (unforced, forced_bitmap, literal_equality) =
+                explain_with_alternative_index(&mut conn).await;
             std::fs::write(
                 out_dir.join("alternative-index-explain.txt"),
                 format!(
                     "-- SAME unmodified CANDIDATE_SQL, with the migration comment's \
                      rejected (workflow_name, id) partial index also present \
-                     @ noise={noise_count} -- shows whether the planner would even \
-                     choose it --\n{alt_plan_text}\n"
+                     @ noise={noise_count} -- the unforced planner does NOT choose it \
+                     --\n{unforced}\n"
                 ),
             )
             .expect("write alternative-index artifact");
+            std::fs::write(
+                out_dir.join("alternative-index-forced-bitmap-explain.txt"),
+                format!(
+                    "-- SAME unmodified CANDIDATE_SQL, alternative index present, \
+                     enable_indexscan=off for one transaction to force the planner \
+                     to consider the alternative index @ noise={noise_count} -- \
+                     isolates whether the index CAN deliver a cheap plan once \
+                     selected --\n{forced_bitmap}\n"
+                ),
+            )
+            .expect("write alternative-index-forced-bitmap artifact");
+            std::fs::write(
+                out_dir.join("alternative-index-literal-equality-explain.txt"),
+                format!(
+                    "-- Same predicate, alternative index present, workflow_name = $1 \
+                     (literal equality) instead of = ANY($1) @ noise={noise_count} -- \
+                     isolates whether the array form specifically is what the \
+                     unforced planner avoids --\n{literal_equality}\n"
+                ),
+            )
+            .expect("write alternative-index-literal-equality artifact");
         }
 
         summary_lines.push(format!(

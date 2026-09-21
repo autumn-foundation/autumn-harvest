@@ -313,26 +313,29 @@ struct CandidateRow {
 /// Measured against production-shaped fixtures (issue #1226 follow-up,
 /// see `docs/performance-quota-reconcile-candidate-scan.md`). The
 /// residual filter cost is real. It grows with the non-quota'd
-/// population: about 3,800 buffers at 20,000 such rows. It reaches about
-/// 98,000 buffers, and a 148ms single-batch execution time, at 500,000.
+/// population: about 3,900 buffers at 20,000 such rows. It reaches about
+/// 95,000 buffers, and a ~150ms single-batch execution time, at 500,000.
 /// That is once the quota'd workflow type also carries its own realistic
 /// terminal history. `idx_harvest_wfx_workflow_identity` does not rescue
 /// this in practice. It is a full index, so it pays for that terminal
 /// history too.
 ///
 /// The rejected `(workflow_name, id)` index was built and tested
-/// directly. It does not help either, for a distinct, specific reason.
-/// Postgres does not use a leading-column index for ordered access under
-/// `= ANY($1)`, only under a plain `=`. The same index against the same
-/// fixture drops the cost from about 98,000 buffers to about 200 under a
-/// literal `workflow_name = $1` rewrite.
+/// directly. The unforced planner does not pick it either. The reason is
+/// a cost misestimate, not a hard limitation. Forcing the planner onto
+/// it (`enable_indexscan = off`) drops the cost from about 95,000
+/// buffers to 46. A literal `workflow_name = $1` rewrite drops it to
+/// 189, with no forcing needed. The index would help enormously; the
+/// default planner just never reaches for it under `= ANY($1)` against
+/// this correlated data.
 ///
-/// A structural fix exists in principle: one bounded, ordered scan per
-/// registered quota'd workflow name, merged by `id`. Changing this
-/// function's shape from one static query to a dynamic per-name form is
-/// not a mechanical rewrite, though. It touches the keyset cursor's
-/// anti-starvation guarantee this module's doc comment describes at
-/// length, and needs a human decision. No fix ships in this pass.
+/// Two fix directions exist, both evidenced, neither shipped. One
+/// rewrites `CANDIDATE_SQL` as one bounded, ordered scan per registered
+/// quota'd workflow name, merged by `id`. That touches the keyset
+/// cursor's anti-starvation guarantee below, so it needs a human
+/// decision. The other fixes the underlying statistics -- attempted
+/// once, unsuccessfully, and not pursued further. No fix ships in this
+/// pass.
 ///
 /// `AND ($2::uuid IS NULL OR id > $2) ORDER BY id LIMIT $3` is a keyset
 /// cursor, not a bare `LIMIT`. A row this sweep can never resolve --

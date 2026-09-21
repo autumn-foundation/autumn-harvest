@@ -1,14 +1,14 @@
--- SAME unmodified CANDIDATE_SQL, with the migration comment's rejected (workflow_name, id) partial index also present @ noise=500000 -- shows whether the planner would even choose it --
-Limit  (cost=0.42..354.38 rows=200 width=58) (actual time=0.850..76.530 rows=200 loops=1)
+-- SAME unmodified CANDIDATE_SQL, with the migration comment's rejected (workflow_name, id) partial index also present @ noise=500000 -- the unforced planner does NOT choose it --
+Limit  (cost=0.42..355.21 rows=200 width=58) (actual time=1.380..58.100 rows=200 loops=1)
   Output: id, workflow_name, input
-  Buffers: shared hit=106069 read=44
-  ->  Index Scan using idx_harvest_we_quota_reconcile_candidates on public.harvest_workflow_executions  (cost=0.42..70449.48 rows=39807 width=58) (actual time=0.848..76.458 rows=200 loops=1)
+  Buffers: shared hit=95048 read=43
+  ->  Index Scan using idx_harvest_we_quota_reconcile_candidates on public.harvest_workflow_executions  (cost=0.42..70559.37 rows=39775 width=58) (actual time=1.379..58.047 rows=200 loops=1)
         Output: id, workflow_name, input
         Filter: (harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[]))
-        Rows Removed by Filter: 105440
-        Buffers: shared hit=106069 read=44
-Query Identifier: -4931473042796240993
+        Rows Removed by Filter: 94467
+        Buffers: shared hit=95048 read=43
+Query Identifier: 7887508310203047271
 Planning:
-  Buffers: shared hit=66 read=28
-Planning Time: 0.807 ms
-Execution Time: 76.578 ms
+  Buffers: shared hit=62 read=28
+Planning Time: 0.728 ms
+Execution Time: 58.147 ms
