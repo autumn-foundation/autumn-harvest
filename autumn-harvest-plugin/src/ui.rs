@@ -1451,7 +1451,11 @@ fn resolve_workflow_detail_event_page(
         parse_page_query_field(event_page_raw);
     let (jump_event, jump_event_error) = parse_jump_event_query_field(jump_event_raw);
     let event_page = jump_event.map_or(event_page_from_query, |jump| {
-        let jump_zero = (jump - 1).max(0);
+        // `saturating_sub`, not `-`: `jump` is unclamped user input, and
+        // `i64::MIN - 1` overflows. Saturating leaves `i64::MIN` itself,
+        // which `.max(0)` still clamps to 0 like any other very-negative
+        // jump_event (Snag repro, boundary tour on `jump_event`).
+        let jump_zero = jump.saturating_sub(1).max(0);
         jump_zero / page_size
     });
     let event_page_error = if jump_event.is_some() {
@@ -11977,6 +11981,27 @@ fn layout_schedules(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GREEN -- the fix under test (Snag repro, boundary tour on
+    /// `jump_event`). The fix in #1627 handles a non-numeric `jump_event`.
+    /// It also handles a small negative one (`-5`, see
+    /// `resolve_workflow_detail_event_page_clamps_a_negative_jump_event_to_zero`).
+    /// But `resolve_workflow_detail_event_page`'s prior `(jump - 1).max(0)`
+    /// still overflowed on `i64::MIN`. `i64::MIN - 1` cannot be
+    /// represented. A debug build panicked on that instead of degrading,
+    /// the default for `cargo test` and `cargo dev`. A GET to
+    /// `/ui/workflows/{exec_id}?jump_event=-9223372036854775808` reached
+    /// this exact call in `workflow_detail_ui`, with no other validation
+    /// in front of it. `saturating_sub` degrades it like any other
+    /// very-negative value instead: page 0, no error.
+    #[test]
+    fn resolve_workflow_detail_event_page_does_not_overflow_on_i64_min_jump_event() {
+        let (page, page_error, jump_error) =
+            resolve_workflow_detail_event_page(None, Some("-9223372036854775808"), 100);
+        assert_eq!(page, 0);
+        assert_eq!(page_error, None);
+        assert_eq!(jump_error, None);
+    }
 
     /// GREEN: a valid bound parses, and the raw display echoes the
     /// caller-supplied text (not a re-formatted RFC 3339 string) with no error.
