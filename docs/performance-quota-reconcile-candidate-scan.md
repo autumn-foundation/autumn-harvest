@@ -23,8 +23,22 @@ before merge — read the review thread for the full exchange):
 3. That correction's own three-way comparison table mixed a cold
    first-tick timing (from the plan-table capture above) with warm,
    back-to-back timings (from the three-variant capture). The buffer
-   counts were already apples-to-apples; the timings were not. Both are
-   now reported from the same back-to-back capture batch.
+   counts were already apples-to-apples; the timings were not.
+4. The attempted fix for (3) was itself incomplete: the three variants
+   in that capture still run sequentially on one connection, so later
+   variants reuse pages earlier ones already pulled into cache -- the
+   timing comparison stayed uncontrolled no matter which numbers were
+   quoted. The exec-time comparison is dropped entirely; buffers alone
+   carry the claim (see "Root cause," below, for why that is sufficient
+   under this agent's own evidence rules). The plan table's own
+   first-tick timings were also out of sync with the committed
+   artifacts (stale numbers from an earlier run) and are now refreshed
+   to match exactly.
+5. The "why no fix ships" section wrongly argued that a per-registered-
+   name rewrite would generate unbounded distinct SQL text, defeating
+   the prepared-statement cache. It would not: one static parameterized
+   query, executed once per name, keeps one query shape regardless of
+   registry size -- corrected below.
 
 Also fixed: the fixture originally used `gen_random_uuid()`, so exact
 buffer counts jittered a few percent run to run. Row ids are now
@@ -61,9 +75,11 @@ Seeded, deterministic, production-shaped:
 
 | noise rows | plan chosen | buffers | rows removed by filter | exec time |
 |---:|---|---:|---:|---:|
-| 20,000 | Index Scan on `idx_harvest_we_quota_reconcile_candidates`, residual filter | 3,870 (all hit) | 3,657 | 1.8ms |
-| 100,000 | same | 18,970 (all hit) | 18,682 | 12.0ms |
-| 500,000 | same | ~95,100 (hit+read) | 94,467 | ~142-152ms |
+| 20,000 | Index Scan on `idx_harvest_we_quota_reconcile_candidates`, residual filter | 3,870 (all hit) | 3,657 | 2.0ms |
+| 100,000 | same | 18,970 (all hit) | 18,682 | 9.5ms |
+| 500,000 | same | 95,091 (hit+read) | 94,467 | 137.0ms |
+
+Figures match the committed `noise-*.explain.txt` files exactly.
 
 Unlike the first (incorrect) pass, `idx_harvest_wfx_workflow_identity`
 is **never** picked here at any size. That index is not partial by
@@ -96,25 +112,32 @@ followed by a sort, and the row estimate for the alternative plan
 (`quota_key IS NULL AND state IN (...)`) being correlated in a way
 ordinary column statistics do not capture. That is worth testing
 directly rather than reasoning about, so three variants were captured
-back-to-back against the identical fixture, connection, and cache
-state — the buffer counts above are stable across cache states by
-construction, but a timing comparison needs same-batch numbers to mean
-anything, so these are deliberately NOT the cold first-tick timing from
-the plan table above:
+against the identical fixture:
 
-| variant | mechanism | buffers | exec time |
-|---|---|---:|---:|
-| unmodified `CANDIDATE_SQL` (`= ANY($1)`), nothing forced | what production runs | 95,091 | 58.1ms |
-| same query, `enable_indexscan = off` for one transaction | forces the planner onto the alternative index via Bitmap Index Scan + Sort | 46 | 8.3ms |
-| same predicate rewritten to literal `workflow_name = $1` | plain equality lets Postgres serve `ORDER BY id` directly from the index, no sort | 189 | 0.14ms |
+| variant | mechanism | buffers |
+|---|---|---:|
+| unmodified `CANDIDATE_SQL` (`= ANY($1)`), nothing forced | what production runs | 95,091 |
+| same query, `enable_indexscan = off` for one transaction | forces the planner onto the alternative index via Bitmap Index Scan + Sort | 46 |
+| same predicate rewritten to literal `workflow_name = $1` | plain equality lets Postgres serve `ORDER BY id` directly from the index, no sort | 189 |
+
+Buffers only. `explain_with_alternative_index` runs these three
+variants sequentially on one connection, so each later variant can
+reuse pages the earlier ones already pulled into shared_buffers. That
+makes any timing comparison between them uncontrolled -- a real finding
+from review, not addressed by reordering or repeating the capture,
+since the effect is inherent to running multiple variants on one warm
+connection. Buffers do not have this problem: `EXPLAIN (..., BUFFERS)`
+counts the pages this specific execution actually touched regardless of
+whether the OS or Postgres already had them cached, which is exactly
+why this agent's own evidence rules treat the buffer total as the
+admissible, cache-independent gate and `actual time=` as inadmissible
+alone. No exec-time claim is made for this comparison.
 
 Forcing the plan (row 2) proves the index itself is not the problem:
-once selected, it is **~2,000x cheaper in buffers, ~7x faster** than
-what the unforced planner picks (buffers are the gate here, not the
-timing — see this agent's own evidence rules on why `actual time=` is
-inadmissible alone). The literal-equality form (row 3) is cheaper
-still on both counts, since a plain `=` lets Postgres recognize the
-index already returns `id`-ordered output and skip the sort entirely.
+once selected, it is **~2,000x cheaper in buffers** than what the
+unforced planner picks. The literal-equality form (row 3) is cheaper
+still, since a plain `=` lets Postgres recognize the index already
+returns `id`-ordered output and skip the sort entirely.
 
 So the verdict is narrower and more actionable than either earlier
 draft claimed: the composite index **would help enormously**. What
@@ -152,12 +175,9 @@ does not help in practice is now precisely diagnosed: a planner
 cardinality misestimate under `= ANY($1)` against a partial index whose
 predicate correlates with the leading column, not an inherent inability
 to use the index at all. The buffer gap between the plan Postgres picks
-and the plan it could pick is 500x-2,000x, measured back-to-back on the
-identical fixture and cache state (the admissible, cache-independent
-gate). The execution-time gap on that same back-to-back capture is a
-more modest ~7x — smaller than buffers alone would suggest, and cited
-here only as corroboration, per this agent's own rule that timing is
-inadmissible on its own.
+and the plan it could pick is 500x-2,000x, measured against the
+identical fixture (the admissible, cache-independent gate; see "Root
+cause" above for why no exec-time claim is made alongside it).
 
 ## 🔧 Why no fix ships in this PR
 
@@ -176,16 +196,18 @@ Two directions exist, both evidenced above, neither attempted here:
 
 Neither is this pass's "smallest change that moves the counter":
 
-- Route 1 changes `CANDIDATE_SQL` from one static, cacheable query to a
-  dynamically-built one scaling with the registered quota'd workflow
-  count — exactly the "unbounded distinct statement texts defeating the
-  prepared-statement cache" pattern this agent's own process calls out
-  to avoid, unless the fan-out is capped and reasoned about explicitly.
-  More importantly, it touches the keyset cursor's anti-starvation
-  guarantee this module's doc comment describes at length: merging N
-  per-name cursors while preserving "every tick moves strictly past
-  whatever it just examined" is a real design question, not a
-  mechanical rewrite.
+- Route 1 does not need dynamically generated SQL text. The same static
+  parameterized query (`workflow_name = $1`, exactly what
+  `explain_literal_equality` already demonstrates) can execute once per
+  registered name; only the number of *executions* scales with the
+  registry, and the prepared-statement cache still sees one query
+  shape, not an unbounded one. Two real costs remain, though: one round
+  trip per registered name per tick instead of one round trip total,
+  and merging N per-name result streams by `id` while preserving the
+  keyset cursor's anti-starvation guarantee this module's doc comment
+  describes at length -- "every tick moves strictly past whatever it
+  just examined" now has to hold across N cursors, not one. That merge
+  design is the real design question, not a mechanical rewrite.
 - Route 2 is architecturally smaller in principle but was not reduced
   to a working, verified statistics change in this pass — reporting
   "try `CREATE STATISTICS`" without a measured before/after would
