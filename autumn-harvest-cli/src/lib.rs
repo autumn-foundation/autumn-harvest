@@ -4734,7 +4734,7 @@ pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
             replay.unreadable,
             replay.unreadable
         );
-    } else if replay.unreadable > 0 {
+    } else if replay.unreadable > 0 && replay.skipped_no_handler == 0 {
         // Every sample that reached this check was unreadable, and none
         // replayed at all. This is distinct from the branch below, where
         // nothing replayed because no handler was registered. Handlers may
@@ -4748,6 +4748,23 @@ pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
              history failed to read; see the history_unreadable finding above for the cause. \
              Registering workflow handlers will not fix this.",
             replay.sampled, replay.unreadable
+        );
+    } else if replay.unreadable > 0 {
+        // Nothing replayed, for two separate reasons at once: some samples
+        // were unreadable, others had no registered handler. A fleet-wide
+        // merge across shards can produce this mix (issue #1410). Name both
+        // counts. Registering handlers fixes only the second group.
+        let _ = writeln!(
+            out,
+            "  replay: NOT VERIFIED — {} sampled, {} unreadable, {} skipped (no handler), \
+             0 replayed. {} history/histories failed to read; see the history_unreadable \
+             finding above for the cause. {} had no registered handler. Registering \
+             handlers may fix part of this, not all of it.",
+            replay.sampled,
+            replay.unreadable,
+            replay.skipped_no_handler,
+            replay.unreadable,
+            replay.skipped_no_handler
         );
     } else {
         let _ = writeln!(
