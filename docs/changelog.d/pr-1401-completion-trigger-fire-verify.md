@@ -47,6 +47,13 @@ way as `TriggerFireBuckets`'s (Codex follow-up x3): capped at
 `MAX_FINDING_SAMPLES`, with a separate exact `uncertain_count`. Added
 `route_trigger_fires_bounds_uncertain_samples_but_keeps_an_exact_count`.
 
+`resolve_trigger_fires`'s `UninspectedShardReference` diagnostic for a
+`pending` fire whose target shard was not supplied gets the same
+bounded-count treatment (Codex follow-up x4). No new test: this one is
+only reachable through the full `verify_restore` path, and the fix is
+the same push-bounded/count-separately shape already pinned by three
+other tests on this PR.
+
 **Confirmed delivered, precisely.** `outcome IS NULL` alone is set at
 trigger-evaluation time, before any relay attempt — not proof of delivery.
 The scan additionally requires the matching `harvest_completion_trigger_outbox`

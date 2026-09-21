@@ -3563,21 +3563,29 @@ mod probes {
         let mut findings = Vec::new();
         let known: BTreeSet<i32> = targets.iter().map(|t| t.shard_id).collect();
 
-        let uninspected: Vec<String> = pending
-            .iter()
-            .filter(|p| !known.contains(&p.target_shard))
-            .map(|p| {
-                format!(
+        // Bounded like `TriggerFireBuckets`'s sample lists (issue #1401,
+        // Codex follow-up x4): an exact count, with the joined sample text
+        // capped at `MAX_FINDING_SAMPLES`. `pending` can hold up to the
+        // scan's one-million-fire ceiling per source shard.
+        let mut uninspected = Vec::new();
+        let mut uninspected_count: u64 = 0;
+        for p in pending {
+            if known.contains(&p.target_shard) {
+                continue;
+            }
+            if uninspected.len() < MAX_FINDING_SAMPLES {
+                uninspected.push(format!(
                     "{} (fired by {} on shard {}) -> shard {}",
                     p.target_workflow_id, p.source_exec_id, p.source_shard, p.target_shard
-                )
-            })
-            .collect();
-        if !uninspected.is_empty() {
+                ));
+            }
+            uninspected_count += 1;
+        }
+        if uninspected_count > 0 {
             findings.push(Finding::new(
                 FindingClass::UninspectedShardReference,
                 None,
-                uninspected.len() as u64,
+                uninspected_count,
                 uninspected,
             ));
         }
