@@ -42,6 +42,11 @@ inline path inserts the fires row and starts the target in one transaction,
 so it is atomic and immune by construction (scope: cross-shard only, per the
 issue).
 
+`route_trigger_fires`'s `uncertain` sample list (below) is bounded the same
+way as `TriggerFireBuckets`'s (Codex follow-up x3): capped at
+`MAX_FINDING_SAMPLES`, with a separate exact `uncertain_count`. Added
+`route_trigger_fires_bounds_uncertain_samples_but_keeps_an_exact_count`.
+
 **Confirmed delivered, precisely.** `outcome IS NULL` alone is set at
 trigger-evaluation time, before any relay attempt — not proof of delivery.
 The scan additionally requires the matching `harvest_completion_trigger_outbox`

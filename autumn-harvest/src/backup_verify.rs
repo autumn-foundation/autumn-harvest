@@ -959,7 +959,11 @@ struct RoutedTriggerFires {
     /// A pre-migration fire whose re-derived shard landed on its own
     /// source shard -- a same-shard conclusion this function cannot
     /// trust. Sample identifiers, for a [`FindingClass::CompletionTriggerFireUnproven`].
+    /// Bounded at [`MAX_FINDING_SAMPLES`] as it accumulates; `uncertain_count`
+    /// stays exact regardless (issue #1401, Codex follow-up x3), mirroring
+    /// `TriggerFireBuckets`'s bounded sample lists.
     uncertain: Vec<String>,
+    uncertain_count: u64,
 }
 
 #[cfg(all(feature = "db", feature = "testing"))]
@@ -969,6 +973,7 @@ fn route_trigger_fires(
 ) -> RoutedTriggerFires {
     let mut pending = Vec::new();
     let mut uncertain = Vec::new();
+    let mut uncertain_count: u64 = 0;
     for (source_shard, fire) in fires {
         let target_workflow_id = format!(
             "completion-trigger-{}-{}",
@@ -985,12 +990,15 @@ fn route_trigger_fires(
         };
         if target_shard == source_shard {
             if reconstructed {
-                uncertain.push(format!(
-                    "{target_workflow_id} (fired by {} on shard {source_shard}; pre-migration \
-                     fire, re-derived shard pick cannot be trusted to rule out a cross-shard \
-                     relay)",
-                    fire.source_exec_id
-                ));
+                if uncertain.len() < MAX_FINDING_SAMPLES {
+                    uncertain.push(format!(
+                        "{target_workflow_id} (fired by {} on shard {source_shard}; \
+                         pre-migration fire, re-derived shard pick cannot be trusted to \
+                         rule out a cross-shard relay)",
+                        fire.source_exec_id
+                    ));
+                }
+                uncertain_count += 1;
             }
             continue;
         }
@@ -1004,7 +1012,11 @@ fn route_trigger_fires(
             fired_at: fire.fired_at,
         });
     }
-    RoutedTriggerFires { pending, uncertain }
+    RoutedTriggerFires {
+        pending,
+        uncertain,
+        uncertain_count,
+    }
 }
 
 /// Is an absent completion-trigger target a PROVEN loss, given the target
@@ -3665,15 +3677,18 @@ mod probes {
                 router_shards,
                 ShardId::new(options.default_shard),
             );
-            let super::RoutedTriggerFires { pending, uncertain } =
-                super::route_trigger_fires(fires, &router);
+            let super::RoutedTriggerFires {
+                pending,
+                uncertain,
+                uncertain_count,
+            } = super::route_trigger_fires(fires, &router);
             let mut trigger_findings = resolve_trigger_fires(&pending, targets, &shards).await;
             cross_shard.append(&mut trigger_findings);
-            if !uncertain.is_empty() {
+            if uncertain_count > 0 {
                 cross_shard.push(Finding::new(
                     FindingClass::CompletionTriggerFireUnproven,
                     None,
-                    uncertain.len() as u64,
+                    uncertain_count,
                     uncertain,
                 ));
             }
@@ -3884,6 +3899,39 @@ mod tests {
             1,
             "a re-derived same-shard pick cannot rule out a lost cross-shard \
              relay, so it must be flagged uncertain instead of dropped"
+        );
+        assert_eq!(routing.uncertain_count, 1);
+    }
+
+    #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
+    fn route_trigger_fires_bounds_uncertain_samples_but_keeps_an_exact_count() {
+        let router = two_shard_router();
+        let total = MAX_FINDING_SAMPLES + 2;
+        let mut fires = Vec::with_capacity(total);
+        while fires.len() < total {
+            let fire = resolved_fire("child_flow");
+            let target_workflow_id = format!(
+                "completion-trigger-{}-{}",
+                fire.trigger_id, fire.source_exec_id
+            );
+            let same_shard = router
+                .pick_for_new_workflow("child_flow", &target_workflow_id)
+                .as_i32();
+            fires.push((same_shard, fire));
+        }
+
+        let routing = route_trigger_fires(fires, &router);
+
+        assert!(routing.pending.is_empty());
+        assert_eq!(
+            routing.uncertain.len(),
+            MAX_FINDING_SAMPLES,
+            "the sample list must stay bounded regardless of how many fires matched"
+        );
+        assert_eq!(
+            routing.uncertain_count, total as u64,
+            "the count must stay exact even though the sample list is capped"
         );
     }
 
