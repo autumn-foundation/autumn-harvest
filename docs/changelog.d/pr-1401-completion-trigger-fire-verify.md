@@ -19,16 +19,23 @@ never received, with no scanner and, until now, no drill check to catch it.
   evidentiary gap `retention_unproven` names, resolved here from the fire's
   own `fired_at` as a fallback rather than requiring a summary.
 
-**Residual limitation, summary-free retention only** (Codex follow-up). A
-target that completed and was retention-collected can itself have been its
-shard's newest event. With no other shard traffic since, deleting it pulls
-the visible restore point back to before `fired_at`, misreading a coherent
-restore as `completion_trigger_fire_lost`. `harvest_execution_summaries`
-closes this when enabled, since it is checked before the timestamp
-heuristic runs. Closing it with summaries disabled needs a genuine durable
-restore-point marker — exactly the durable-marker work issue #1401 chose
-not to require. Documented in `docs/runbooks/backup-restore.md` §4.2(d)
-and in `absence_is_decisive_loss`'s doc comment.
+**Residual limitation** (Codex follow-up x2). A target that completed and
+was retention-collected can itself have been its shard's newest event.
+With no other shard traffic since, deleting it pulls the visible restore
+point back to before `fired_at`, misreading a coherent restore as
+`completion_trigger_fire_lost`. `harvest_execution_summaries` closes this
+when checked — but only within the summary's own `--summary-age` horizon.
+`harvest_completion_trigger_fires` has no cleanup path, so an old fire
+outlives its target's summary once that summary is GC'd
+(`retention::gc_execution_summaries`). This is not just a "summaries
+disabled" gap: it recurs for aged fires under any finite summary horizon.
+Closing it unconditionally needs a genuine durable restore-point marker —
+exactly the durable-marker work issue #1401 chose not to require.
+Documented in `docs/runbooks/backup-restore.md` §4.2(d) and in
+`absence_is_decisive_loss`'s doc comment. Tying fires-table retention to
+the summary horizon is tracked as a possible follow-up rather than
+built here — it is a new engine-retention capability, not a
+`backup_verify` change.
 
 A same-shard fire is never adjudicated: `evaluate_triggers_for_execution`'s
 inline path inserts the fires row and starts the target in one transaction,

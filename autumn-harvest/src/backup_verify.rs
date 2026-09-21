@@ -1025,16 +1025,22 @@ fn route_trigger_fires(
 /// This is the same evidentiary gap [`FindingClass::RetentionUnproven`]
 /// names for a recorded child terminal or delivered effect.
 ///
-/// Residual limitation, summary-free retention only (issue #1401, Codex
-/// follow-up). A target that ran, completed, and was retention-collected
-/// with no other traffic on its shard afterward can itself have been the
-/// shard's newest event. Its deletion then pulls the visible newest-event
-/// timestamp back to before `fired_at`. This proxy then misreads a
-/// coherent restore as decisive loss. `harvest_execution_summaries`
-/// (checked by the caller first) closes this when enabled. Closing it
+/// Residual limitation (issue #1401, Codex follow-up x2). A target that
+/// ran, completed, and was retention-collected with no other traffic on
+/// its shard afterward can itself have been the shard's newest event. Its
+/// deletion then pulls the visible newest-event timestamp back to before
+/// `fired_at`. This proxy then misreads a coherent restore as decisive
+/// loss.
+///
+/// `harvest_execution_summaries` (checked by the caller first) closes
+/// this -- but only within its OWN retention horizon.
+/// `retention::gc_execution_summaries` hard-deletes a non-migration-target
+/// summary once it ages past `summary_age`, while
+/// `harvest_completion_trigger_fires` has no cleanup path at all. So this
+/// gap is not just "summaries disabled": it recurs for every fire once it
+/// outlives its target's summary, even with summaries enabled. Closing it
 /// unconditionally needs a real durable restore-point marker, the exact
-/// durable-marker
-/// work issue #1401 explicitly chose not to require.
+/// durable-marker work issue #1401 explicitly chose not to require.
 #[cfg(all(feature = "db", feature = "testing"))]
 #[must_use]
 fn absence_is_decisive_loss(
@@ -2917,53 +2923,52 @@ mod probes {
         workflow_id: String,
     }
 
-    /// Cap on business keys sent to [`matching_workflow_keys`] per query
-    /// (issue #1401, Codex follow-up). `harvest_completion_trigger_fires`
+    /// Cap on fires [`adjudicate_trigger_fires`] adjudicates per round trip
+    /// (issue #1401, Codex follow-up x2). `harvest_completion_trigger_fires`
     /// has no cleanup path, and the preceding scan admits up to
     /// [`MAX_TRIGGER_FIRE_SCAN_PAGES`] pages. A shard whose fires are ALL
     /// confirmed-delivered can put every one of them in a single batch.
     /// Unbounded, a 255-byte-name fleet at that scale turns one `UNNEST`
-    /// call into a hundreds-of-megabytes request. This keeps the set-based
-    /// query, just chunked, trading a few extra round trips for a bounded
-    /// wire size per call.
+    /// call into a hundreds-of-megabytes request. It would also hold every
+    /// name, id, and matched key in memory at once. Chunking the CALLER's
+    /// batch, not just the query, bounds both.
     const WORKFLOW_KEY_LOOKUP_CHUNK: usize = 1_000;
 
-    /// Which of the given business keys exist in `table_name`.
+    /// Which of the given business keys exist in `table_name`, in ONE
+    /// round trip.
     ///
     /// `table_name` is never caller input. Both call sites below pass a
     /// fixed literal. String interpolation here carries no injection
     /// surface, matching every other dynamic-SQL helper in this file.
     ///
     /// `UNNEST($1::text[], $2::text[])` pairs `names[i]` with `ids[i]`
-    /// positionally, chunked at [`WORKFLOW_KEY_LOOKUP_CHUNK`] keys per
-    /// query rather than one round trip per fire. A completion-trigger
-    /// fire has no target execution id to look up by -- it is minted only
-    /// at start time. The business key is the only handle this tool has
-    /// for either `harvest_workflow_executions` or
-    /// `harvest_execution_summaries`. Both are keyed here the same way.
+    /// positionally. The caller is responsible for keeping `names`/`ids`
+    /// within [`WORKFLOW_KEY_LOOKUP_CHUNK`] -- this function does not
+    /// chunk internally. A completion-trigger fire has no target execution
+    /// id to look up by -- it is minted only at start time. The business
+    /// key is the only handle this tool has for either
+    /// `harvest_workflow_executions` or `harvest_execution_summaries`.
+    /// Both are keyed here the same way.
     async fn matching_workflow_keys(
         conn: &mut AsyncPgConnection,
         table_name: &str,
         names: &[String],
         ids: &[String],
     ) -> Result<std::collections::HashSet<(String, String)>, diesel::result::Error> {
-        let mut matched = std::collections::HashSet::new();
-        let chunks = names.chunks(WORKFLOW_KEY_LOOKUP_CHUNK);
-        let id_chunks = ids.chunks(WORKFLOW_KEY_LOOKUP_CHUNK);
-        for (name_chunk, id_chunk) in chunks.zip(id_chunks) {
-            let rows: Vec<WorkflowKeyRow> = diesel::sql_query(format!(
-                "SELECT DISTINCT e.workflow_name, e.workflow_id \
-                 FROM {table_name} e \
-                 JOIN UNNEST($1::text[], $2::text[]) AS t(workflow_name, workflow_id) \
-                   ON e.workflow_name = t.workflow_name AND e.workflow_id = t.workflow_id"
-            ))
-            .bind::<diesel::sql_types::Array<Text>, _>(name_chunk)
-            .bind::<diesel::sql_types::Array<Text>, _>(id_chunk)
-            .load(conn)
-            .await?;
-            matched.extend(rows.into_iter().map(|r| (r.workflow_name, r.workflow_id)));
-        }
-        Ok(matched)
+        let rows: Vec<WorkflowKeyRow> = diesel::sql_query(format!(
+            "SELECT DISTINCT e.workflow_name, e.workflow_id \
+             FROM {table_name} e \
+             JOIN UNNEST($1::text[], $2::text[]) AS t(workflow_name, workflow_id) \
+               ON e.workflow_name = t.workflow_name AND e.workflow_id = t.workflow_id"
+        ))
+        .bind::<diesel::sql_types::Array<Text>, _>(names)
+        .bind::<diesel::sql_types::Array<Text>, _>(ids)
+        .load(conn)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.workflow_name, r.workflow_id))
+            .collect())
     }
 
     /// Look up each reference's target on its owning shard and bucket the
@@ -3359,11 +3364,42 @@ mod probes {
     }
 
     /// Verdict buckets for one target shard's pending completion-trigger fires.
+    ///
+    /// Each sample list is bounded at [`MAX_FINDING_SAMPLES`] as it
+    /// accumulates; the paired count stays exact regardless (issue #1401,
+    /// Codex follow-up), mirroring `fold_reference_events`'s
+    /// `undecodable_samples`/`undecodable_count` split.
     #[derive(Default)]
     struct TriggerFireBuckets {
         lost: Vec<String>,
+        lost_count: u64,
         unproven: Vec<String>,
+        unproven_count: u64,
         lookup_errors: Vec<String>,
+        lookup_errors_count: u64,
+    }
+
+    impl TriggerFireBuckets {
+        fn push_lost(&mut self, sample: String) {
+            if self.lost.len() < MAX_FINDING_SAMPLES {
+                self.lost.push(sample);
+            }
+            self.lost_count += 1;
+        }
+
+        fn push_unproven(&mut self, sample: String) {
+            if self.unproven.len() < MAX_FINDING_SAMPLES {
+                self.unproven.push(sample);
+            }
+            self.unproven_count += 1;
+        }
+
+        fn push_lookup_error(&mut self, sample: String) {
+            if self.lookup_errors.len() < MAX_FINDING_SAMPLES {
+                self.lookup_errors.push(sample);
+            }
+            self.lookup_errors_count += 1;
+        }
     }
 
     /// Check every fire's target for existence and bucket the verdict.
@@ -3371,57 +3407,75 @@ mod probes {
     /// handling and the per-fire verdict logic stay separately readable,
     /// mirroring `adjudicate_refs`.
     ///
-    /// Batched, not per-fire (issue #1401, Codex follow-up).
-    /// `harvest_completion_trigger_fires` has no cleanup path. A busy
-    /// fleet's confirmed-delivered fire count can reach into the hundreds
-    /// of thousands. One query per fire, plus a second for every absent
-    /// target, would make a routine restore drill issue up to two round
-    /// trips per row.
-    ///
-    /// `matching_workflow_keys` checks the whole `owned` batch in one
-    /// query against `harvest_workflow_executions`. This is the same
-    /// ANY-STATE existence check `relay_gate_checked_start` itself runs
-    /// before starting the target, read-only against a restored snapshot.
-    /// It checks the absent remainder in one more query against
-    /// `harvest_execution_summaries`.
+    /// Chunked at [`WORKFLOW_KEY_LOOKUP_CHUNK`] fires per round trip, not
+    /// per-fire and not as one whole-shard batch (issue #1401, Codex
+    /// follow-up x2). `harvest_completion_trigger_fires` has no cleanup
+    /// path, and a busy fleet's confirmed-delivered fire count can reach
+    /// into the hundreds of thousands. One query per fire, plus a second
+    /// for every absent target, would make a routine restore drill issue
+    /// up to two round trips per row. A single whole-shard batch, at the
+    /// opposite extreme, would hold every fire's name and id in memory at
+    /// once alongside the full match set. Chunking discards each chunk's
+    /// temporary keys before starting the next.
     async fn adjudicate_trigger_fires(
         conn: &mut AsyncPgConnection,
         owned: &[&super::PendingTriggerFire],
         latest_by_shard: &std::collections::BTreeMap<i32, Option<DateTime<Utc>>>,
     ) -> TriggerFireBuckets {
         let mut out = TriggerFireBuckets::default();
-        if owned.is_empty() {
-            return out;
+        for chunk in owned.chunks(WORKFLOW_KEY_LOOKUP_CHUNK) {
+            adjudicate_trigger_fire_chunk(conn, chunk, latest_by_shard, &mut out).await;
+        }
+        out
+    }
+
+    /// One bounded chunk of [`adjudicate_trigger_fires`]'s work. `chunk` is
+    /// never larger than [`WORKFLOW_KEY_LOOKUP_CHUNK`], so every vector
+    /// built here is bounded the same way.
+    ///
+    /// `matching_workflow_keys` checks the whole chunk in one query against
+    /// `harvest_workflow_executions`. This is the same ANY-STATE existence
+    /// check `relay_gate_checked_start` itself runs before starting the
+    /// target, read-only against a restored snapshot. It checks the absent
+    /// remainder in one more query against `harvest_execution_summaries`.
+    async fn adjudicate_trigger_fire_chunk(
+        conn: &mut AsyncPgConnection,
+        chunk: &[&super::PendingTriggerFire],
+        latest_by_shard: &std::collections::BTreeMap<i32, Option<DateTime<Utc>>>,
+        out: &mut TriggerFireBuckets,
+    ) {
+        if chunk.is_empty() {
+            return;
         }
 
-        let names: Vec<String> = owned
+        let names: Vec<String> = chunk
             .iter()
             .map(|f| f.target_workflow_name.clone())
             .collect();
-        let ids: Vec<String> = owned.iter().map(|f| f.target_workflow_id.clone()).collect();
+        let ids: Vec<String> = chunk.iter().map(|f| f.target_workflow_id.clone()).collect();
 
         let existing =
             match matching_workflow_keys(conn, "harvest_workflow_executions", &names, &ids).await {
                 Ok(keys) => keys,
                 Err(e) => {
-                    for fire in owned {
-                        out.lookup_errors.push(format!(
+                    for fire in chunk {
+                        out.push_lookup_error(format!(
                             "{} existence check failed: {e}",
                             fire.target_workflow_id
                         ));
                     }
-                    return out;
+                    return;
                 }
             };
 
-        let absent: Vec<&&super::PendingTriggerFire> = owned
+        let absent: Vec<&&super::PendingTriggerFire> = chunk
             .iter()
             .filter(|f| {
                 !existing.contains(&(f.target_workflow_name.clone(), f.target_workflow_id.clone()))
             })
             .collect();
         if absent.is_empty() {
-            return out;
+            return;
         }
 
         let absent_names: Vec<String> = absent
@@ -3451,12 +3505,12 @@ mod probes {
             Ok(keys) => keys,
             Err(e) => {
                 for fire in absent {
-                    out.lookup_errors.push(format!(
+                    out.push_lookup_error(format!(
                         "{} retention-summary lookup failed: {e}",
                         fire.target_workflow_id
                     ));
                 }
-                return out;
+                return;
             }
         };
 
@@ -3477,12 +3531,11 @@ mod probes {
                 fire.target_shard
             );
             if super::absence_is_decisive_loss(fire.fired_at, target_latest) {
-                out.lost.push(sample);
+                out.push_lost(sample);
             } else {
-                out.unproven.push(sample);
+                out.push_unproven(sample);
             }
         }
-        out
     }
 
     /// Cross-shard adjudication for [`super::PendingTriggerFire`]s (issue
@@ -3554,22 +3607,28 @@ mod probes {
 
             let TriggerFireBuckets {
                 lost,
+                lost_count,
                 unproven,
+                unproven_count,
                 lookup_errors,
+                lookup_errors_count,
             } = adjudicate_trigger_fires(&mut conn, &owned, &latest_by_shard).await;
 
-            for (class, samples) in [
-                (FindingClass::CompletionTriggerFireLost, lost),
-                (FindingClass::CompletionTriggerFireUnproven, unproven),
-                (FindingClass::ProbeFailed, lookup_errors),
+            for (class, count, samples) in [
+                (FindingClass::CompletionTriggerFireLost, lost_count, lost),
+                (
+                    FindingClass::CompletionTriggerFireUnproven,
+                    unproven_count,
+                    unproven,
+                ),
+                (
+                    FindingClass::ProbeFailed,
+                    lookup_errors_count,
+                    lookup_errors,
+                ),
             ] {
-                if !samples.is_empty() {
-                    findings.push(Finding::new(
-                        class,
-                        Some(target.shard_id),
-                        samples.len() as u64,
-                        samples,
-                    ));
+                if count > 0 {
+                    findings.push(Finding::new(class, Some(target.shard_id), count, samples));
                 }
             }
         }
