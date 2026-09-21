@@ -1433,6 +1433,9 @@ pub struct AuditFilters {
     /// `id` from the prior page along with `before` to page past a tie
     /// without loss. A caller that sends `before` alone keeps the legacy,
     /// single-column cursor, which can skip rows tied on `occurred_at`.
+    ///
+    /// Has no effect without `before`: `list_audit` applies no cursor filter
+    /// at all when `before` is absent, even if this field is set.
     pub before_id: Option<Uuid>,
     /// Maximum number of records to return. Clamped to [1, 500].
     pub limit: i64,

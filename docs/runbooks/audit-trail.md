@@ -144,10 +144,19 @@ curl -s "https://app.example.com/api/harvest/admin/audit?actor=alice%40co&status
 | Outcome | `--status` | `status` | `succeeded` or `failed` |
 | Lower time bound (inclusive) | `--since` | `since` | RFC 3339 |
 | Upper time bound (exclusive) | `--before` | `before` | RFC 3339 |
+| `before` tiebreaker | `--before-id` | `before_id` | Row id. See below. |
 | Page size | `--limit` | `limit` | 1–500, default 50 |
 
-Results are always ordered `occurred_at DESC`. The CLI prints a table by
-default; pass `--output json` for machine-readable output.
+Results are always ordered `(occurred_at, id) DESC`. The CLI prints a table
+by default; pass `--output json` for machine-readable output.
+
+### Paging past tied timestamps
+
+A batch action (e.g. bulk pause/resume) can write many rows with one exact
+`occurred_at`. To page past a tie without loss, pass `--before-id` (or
+`before_id`) alongside `--before`: use the prior page's last row id. Without
+`--before-id`, a request paging on `--before` alone can skip a row tied at
+the page boundary (issue #1408).
 
 ---
 

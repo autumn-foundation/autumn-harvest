@@ -164,17 +164,23 @@ async fn audit_list_before_only_cursor_can_drop_a_tied_row() {
     .expect("second page");
 
     // The legacy single-column cursor excludes every row tied with `last`'s
-    // timestamp, including the unseen third row. This pins the known gap the
-    // `before_id` cursor below closes.
-    let seen: std::collections::HashSet<_> = first_page
-        .iter()
-        .chain(second_page.iter())
-        .map(|r| r.id)
-        .collect();
-    assert_ne!(
+    // timestamp. All three rows share one timestamp here, so the second page
+    // is empty and the unseen third row is gone for good. This pins the
+    // known gap the `before_id` cursor below closes.
+    assert!(
+        second_page.is_empty(),
+        "before-only cursor is expected to drop every row tied at the page boundary"
+    );
+    let seen: std::collections::HashSet<_> = first_page.iter().map(|r| r.id).collect();
+    assert_eq!(
         seen.len(),
+        2,
+        "only the first page's two rows were ever seen"
+    );
+    assert_eq!(
         ids.len(),
-        "before-only cursor is expected to drop a row tied at the page boundary"
+        3,
+        "one of the three inserted rows was never returned"
     );
 }
 
@@ -219,6 +225,28 @@ async fn audit_list_before_id_cursor_walks_every_tied_row_once() {
         seen, expected,
         "the before_id cursor must walk every tied row exactly once"
     );
+}
+
+#[tokio::test]
+async fn audit_list_before_id_alone_is_a_no_op() {
+    let (mut conn, _c) = make_conn().await;
+    let ids = insert_three_tied_rows(&mut conn).await;
+
+    // `before_id` with no `before` applies no cursor filter at all (see the
+    // doc comment on `AuditFilters::before_id`). This pins that choice so it
+    // stays deliberate rather than a silent surprise.
+    let rows = audit::list_audit(
+        &mut conn,
+        &AuditFilters {
+            before_id: Some(ids[0]),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list with before_id alone");
+
+    assert_eq!(rows.len(), 3, "before_id alone must not filter any row out");
 }
 
 #[tokio::test]
