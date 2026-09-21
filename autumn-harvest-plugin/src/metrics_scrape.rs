@@ -5,7 +5,10 @@
 //! record samples into it) and `autumn_web::actuator::MetricsSource` (so
 //! autumn-web's already-shared `/actuator/prometheus` endpoint can render
 //! those samples alongside the app's own `autumn_http_*` families and any
-//! other plugin's metrics).
+//! other plugin's metrics). [`HarvestMetricsRecorder::render_prometheus`]
+//! (issue #1611) renders the same aggregated state directly, for a
+//! standalone embedder with no `autumn_web::actuator` endpoint to feed —
+//! see `examples/standalone-runner`.
 //!
 //! This deliberately does **not** touch the global `metrics`-crate registry
 //! (unlike the `metrics-rs` adapter/escape hatch documented in
@@ -195,6 +198,90 @@ impl HarvestMetricsRecorder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Render the current aggregated state as Prometheus text exposition
+    /// format (issue #1611).
+    ///
+    /// `MetricsSource::collect` below is the only place that walks `Inner`
+    /// into `MetricFamily` values. This method renders exactly that output.
+    /// A standalone embedder with no `autumn_web::actuator` endpoint to
+    /// mount sees the same series the plugin path's `/actuator/prometheus`
+    /// serves. Serving it needs one route:
+    ///
+    /// ```rust
+    /// use autumn_harvest_plugin::metrics_scrape::HarvestMetricsRecorder;
+    ///
+    /// let recorder = HarvestMetricsRecorder::new();
+    /// let text = recorder.render_prometheus();
+    /// assert!(text.is_empty()); // nothing recorded yet
+    /// ```
+    ///
+    /// mounted on a bare Axum router as
+    /// `.route("/metrics", get(move || { let r = recorder.clone(); async move { r.render_prometheus() } }))`.
+    #[must_use]
+    pub fn render_prometheus(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = String::new();
+        for family in MetricsSource::collect(self) {
+            let kind = match family.kind {
+                MetricKind::Counter => "counter",
+                MetricKind::Gauge => "gauge",
+            };
+            let _ = writeln!(
+                out,
+                "# HELP {} {}",
+                family.name,
+                escape_help_text(&family.help)
+            );
+            let _ = writeln!(out, "# TYPE {} {kind}", family.name);
+            for sample in &family.samples {
+                let value = format_sample_value(sample.value);
+                if sample.labels.is_empty() {
+                    let _ = writeln!(out, "{} {value}", family.name);
+                } else {
+                    let labels = sample
+                        .labels
+                        .iter()
+                        .map(|(k, v)| format!("{k}=\"{}\"", escape_label_value(v)))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let _ = writeln!(out, "{}{{{labels}}} {value}", family.name);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Prometheus text format escaping for a `# HELP` line: backslash and
+/// newline only (a HELP string is not quoted, so `"` needs no escaping).
+fn escape_help_text(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\n', "\\n")
+}
+
+/// Prometheus text format escaping for a quoted label value: backslash,
+/// double-quote, and newline.
+fn escape_label_value(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+/// Format a sample value per Prometheus text format. `f64::to_string()`
+/// renders infinities and NaN in a shape the exposition format rejects.
+/// The plugin path's own `/actuator/prometheus` renderer special-cases
+/// them the same way, so this stays consistent with it.
+fn format_sample_value(v: f64) -> String {
+    if v == f64::INFINITY {
+        "+Inf".to_owned()
+    } else if v == f64::NEG_INFINITY {
+        "-Inf".to_owned()
+    } else if v.is_nan() {
+        "NaN".to_owned()
+    } else {
+        v.to_string()
     }
 }
 
@@ -1024,5 +1111,75 @@ mod tests {
             sample_value(f, &[("workflow", "onboarding"), ("queue", "default")]),
             1.0
         );
+    }
+
+    #[test]
+    fn render_prometheus_is_empty_before_any_recording() {
+        let recorder = HarvestMetricsRecorder::new();
+        assert_eq!(recorder.render_prometheus(), "");
+    }
+
+    #[test]
+    fn render_prometheus_emits_help_type_and_a_labeled_counter_line() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_workflow_started("onboarding", "default");
+        recorder.record_workflow_started("onboarding", "default");
+
+        let text = recorder.render_prometheus();
+        assert!(text.contains(
+            "# HELP harvest_workflow_started_total Total number of workflow executions started"
+        ));
+        assert!(text.contains("# TYPE harvest_workflow_started_total counter\n"));
+        assert!(text.contains(
+            "harvest_workflow_started_total{workflow=\"onboarding\",queue=\"default\"} 2\n"
+        ));
+    }
+
+    #[test]
+    fn render_prometheus_emits_an_unlabeled_counter_line() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_timer_started(30.0);
+
+        let text = recorder.render_prometheus();
+        assert!(text.contains("# TYPE harvest_timer_started_total counter\n"));
+        assert!(text.contains("harvest_timer_started_total 1\n"));
+    }
+
+    #[test]
+    fn render_prometheus_decomposes_a_histogram_into_count_and_sum_families() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_activity_completed("send_email", "default", 1.5, ActivityStatus::Completed);
+        recorder.record_activity_completed("send_email", "default", 2.5, ActivityStatus::Completed);
+
+        let text = recorder.render_prometheus();
+        assert!(text.contains("# TYPE harvest_activity_duration_count counter\n"));
+        assert!(text.contains(
+            "harvest_activity_duration_count{activity=\"send_email\",queue=\"default\",status=\"completed\"} 2\n"
+        ));
+        assert!(text.contains("# TYPE harvest_activity_duration_sum counter\n"));
+        assert!(text.contains(
+            "harvest_activity_duration_sum{activity=\"send_email\",queue=\"default\",status=\"completed\"} 4\n"
+        ));
+    }
+
+    #[test]
+    fn render_prometheus_escapes_a_backslash_in_a_label_value() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_workflow_started("a\\b", "q");
+        assert!(recorder.render_prometheus().contains("workflow=\"a\\\\b\""));
+    }
+
+    #[test]
+    fn render_prometheus_escapes_a_double_quote_in_a_label_value() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_workflow_started("a\"b", "q");
+        assert!(recorder.render_prometheus().contains("workflow=\"a\\\"b\""));
+    }
+
+    #[test]
+    fn render_prometheus_escapes_a_newline_in_a_label_value() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_workflow_started("a\nb", "q");
+        assert!(recorder.render_prometheus().contains("workflow=\"a\\nb\""));
     }
 }

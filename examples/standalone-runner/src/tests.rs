@@ -1,5 +1,7 @@
+use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::{WorkflowEvent, WorkflowSimulator};
 use autumn_harvest_plugin::HarvestApiState;
+use autumn_harvest_plugin::metrics_scrape::HarvestMetricsRecorder;
 use autumn_harvest_plugin::prelude::HarvestMode;
 use autumn_web::reexports::axum;
 use axum::body::Body;
@@ -24,7 +26,7 @@ fn runtime_config_uses_external_runner_mode_without_outbox() {
 
 #[test]
 fn builder_registers_runner_owned_workflows_and_activities() {
-    let built = standalone_builder()
+    let built = standalone_builder(HarvestMetricsRecorder::new())
         .try_build()
         .expect("standalone runner registrations should build");
 
@@ -94,7 +96,7 @@ async fn standalone_order_uses_version_gate_saga_and_child_workflow() {
 /// with nothing installed matches a router that has never received traffic.
 /// That is exactly the state these three routes must tolerate.
 fn router_under_test() -> axum::Router {
-    build_router(HarvestApiState::new())
+    build_router(HarvestApiState::new(), HarvestMetricsRecorder::new())
 }
 
 async fn get_status(app: axum::Router, uri: &str) -> StatusCode {
@@ -149,7 +151,7 @@ async fn preflight_without_a_credential_is_rejected() {
 async fn preflight_succeeds_once_dev_profile_is_declared() {
     let api_state = HarvestApiState::new();
     declare_deployment_profile(&api_state, Some("dev"));
-    let app = build_router(api_state);
+    let app = build_router(api_state, HarvestMetricsRecorder::new());
 
     assert_eq!(
         get_status(app.clone(), "/api/harvest/admin/preflight").await,
@@ -159,4 +161,42 @@ async fn preflight_succeeds_once_dev_profile_is_declared() {
         get_status(app, "/api/harvest/admin/preflight").await,
         StatusCode::OK
     );
+}
+
+/// Closes issue #1611. A standalone mount has no `autumn_web::actuator`
+/// endpoint to feed, so `/metrics` is the only place its recorded samples
+/// are ever readable. Before this route, an embedder who enabled the
+/// recorder had every sample discarded, with no way to render them out.
+#[tokio::test]
+async fn metrics_route_renders_a_recorded_sample_as_prometheus_text() {
+    let metrics = HarvestMetricsRecorder::new();
+    metrics.record_workflow_started("standalone_order", RUNNER_QUEUE);
+    let app = build_router(HarvestApiState::new(), metrics);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should serve the request");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .expect("content-type header should be set"),
+        "text/plain; version=0.0.4"
+    );
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should read");
+    let text = String::from_utf8(body.to_vec()).expect("response body should be UTF-8");
+    assert!(text.contains("# TYPE harvest_workflow_started_total counter\n"));
+    assert!(text.contains(&format!(
+        "harvest_workflow_started_total{{workflow=\"standalone_order\",queue=\"{RUNNER_QUEUE}\"}} 1\n"
+    )));
 }
