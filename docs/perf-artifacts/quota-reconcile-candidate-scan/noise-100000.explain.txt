@@ -1,14 +1,14 @@
 -- CANDIDATE_SQL @ target=1000 rows / noise=100000 rows across 50 non-quota'd workflow types, first tick (after_id=NULL, batch_size=200) --
-Limit  (cost=0.42..159.18 rows=200 width=59) (actual time=0.141..11.723 rows=200 loops=1)
+Limit  (cost=0.42..159.69 rows=200 width=59) (actual time=0.123..13.544 rows=200 loops=1)
   Output: id, workflow_name, input
-  Buffers: shared hit=20141
-  ->  Index Scan using idx_harvest_we_quota_reconcile_candidates on public.harvest_workflow_executions  (cost=0.42..17538.87 rows=22094 width=59) (actual time=0.140..11.700 rows=200 loops=1)
+  Buffers: shared hit=22177
+  ->  Index Scan using idx_harvest_we_quota_reconcile_candidates on public.harvest_workflow_executions  (cost=0.42..17523.05 rows=22003 width=59) (actual time=0.122..13.516 rows=200 loops=1)
         Output: id, workflow_name, input
         Filter: (harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[]))
-        Rows Removed by Filter: 19839
-        Buffers: shared hit=20141
-Query Identifier: 2386123318688224501
+        Rows Removed by Filter: 21873
+        Buffers: shared hit=22177
+Query Identifier: -4931473042796240993
 Planning:
-  Buffers: shared hit=248 read=20
-Planning Time: 1.052 ms
-Execution Time: 11.751 ms
+  Buffers: shared hit=250 read=20
+Planning Time: 1.128 ms
+Execution Time: 13.574 ms
