@@ -2114,10 +2114,15 @@ mod probes {
         // fetched outside the nominal budget, disambiguates: empty means
         // the scan was actually complete, not truncated.
         let final_page = fetch_trigger_fire_page(conn, page, cursor).await?;
-        if final_page.is_empty() {
+        // A SHORT page here (issue #1401, Codex follow-up x7), not just an
+        // EMPTY one, also proves exhaustion. 1..page rows one page past the
+        // nominal ceiling is still the true last page. This matches the
+        // check inside the loop above.
+        let final_page_exhausted = i64::try_from(final_page.len()).unwrap_or(i64::MAX) < page;
+        rows.extend(final_page);
+        if final_page_exhausted {
             return Ok((rows, None));
         }
-        rows.extend(final_page);
 
         let truncation = format!(
             "completion-trigger fire scan hit its page ceiling after {} rows \

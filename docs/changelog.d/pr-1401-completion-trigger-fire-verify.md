@@ -80,6 +80,25 @@ dedicated test: reproducing the exact boundary needs
 fix is a straightforward extra confirming fetch, verified by inspection
 plus the full existing suite.
 
+That extra confirming page had its own off-by-one (Codex follow-up x7): it
+checked only whether the page was EMPTY, not whether it was merely SHORT
+(1..page rows). A qualifying count landing 1 through `probe_limit` rows
+past the nominal ceiling is still fully scanned, but the code
+unconditionally reported truncation for it anyway. Now checks
+`len < page`, matching the loop's own exhaustion check.
+
+**Payload-rejection resolution, closed the last race** (Codex follow-up
+x8). The existence recheck still ran BEFORE claiming (deleting) the
+outbox row, leaving a window: another attempt could deliver the target
+and roll back only its own outbox delete in between our check and our
+delete, and our check would never see that delivery. Reordered to claim
+first, check last — once our delete commits, no other attempt can touch
+the row again, so the existence check immediately after is the last
+possible look. Also applies `stamp_outbox_relay_backoff` on any failure in
+this path, matching the generic error arm; previously a failure here left
+the outbox row's backoff untouched, so it retried at full poll cadence
+regardless of the failure.
+
 **Confirmed delivered, precisely.** `outcome IS NULL` alone is set at
 trigger-evaluation time, before any relay attempt — not proof of delivery.
 The scan additionally requires the matching `harvest_completion_trigger_outbox`

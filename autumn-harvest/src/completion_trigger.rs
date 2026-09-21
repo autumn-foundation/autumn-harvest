@@ -2652,70 +2652,60 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                     "[completion_trigger outbox] permanent error: oversized input payload; deleting outbox row"
                 );
 
-                // Re-check the target's any-state existence FIRST, on the
-                // TARGET shard (issue #1401, Codex follow-up x2). This
-                // mirrors the existence check `relay_gate_checked_start`
-                // itself already runs before claiming a delivery.
-                //
-                // The outbox row still existing is not proof this rejection
-                // is the whole story. An earlier attempt could have started
-                // the target successfully. That attempt could then have
-                // failed at ITS OWN outbox-delete step. The row would then
-                // wait for a later, differently-configured attempt, which
-                // could reject it as oversized.
-                let already_delivered = crate::execution::execution_exists_by_key(
-                    &mut target_conn,
-                    &task.target_workflow_name,
-                    &task.target_workflow_id,
-                )
-                .await;
-                let resolved: Result<bool, crate::error::HarvestError> = match already_delivered {
-                    Ok(true) => {
-                        tracing::debug!(
-                            source_exec_id = %task.source_exec_id,
-                            trigger_id = %task.trigger_id,
-                            "[completion_trigger outbox] target already exists (any \
-                             state); treating the stale outbox row as delivered, not \
-                             rejected"
-                        );
+                // Claim (delete) the outbox row FIRST, and check delivery
+                // LAST (issue #1401, Codex follow-up x8). Checking first
+                // left a window. Another attempt could deliver the target
+                // and roll back only its OWN outbox delete, in between our
+                // check and our delete. Our check would never see that.
+                // Deleting first closes the window. Once our delete
+                // commits, no other attempt can touch this row again. An
+                // existence check run immediately after is therefore the
+                // last possible look, and cannot miss a delivery that beat
+                // us to the target.
+                let claimed: Result<usize, crate::error::HarvestError> =
+                    Box::pin(conn.transaction(async |tx| {
                         diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
                             .filter(outbox_dsl::id.eq(task.id))
-                            .execute(conn)
+                            .execute(tx)
                             .await
                             .map_err(crate::error::database_error)
-                            .map(|_| false)
-                    }
-                    Ok(false) => {
-                        Box::pin(conn.transaction(async |tx| {
-                            let deleted =
-                                diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
-                                    .filter(outbox_dsl::id.eq(task.id))
-                                    .execute(tx)
-                                    .await
-                                    .map_err(crate::error::database_error)?;
-                            // Zero rows deleted means another attempt already
-                            // claimed and resolved this row (issue #1401, Codex
-                            // follow-up). A rolling deployment is one example:
-                            // a differently-configured worker could deliver it
-                            // successfully in between this attempt's own
-                            // rolled-back claim and this transaction. Marking
-                            // the fire `payload_too_large` here would overwrite
-                            // that success with a wrong, permanent rejection.
-                            if deleted == 0 {
-                                return Ok(false);
+                    }))
+                    .await;
+                let resolved: Result<bool, crate::error::HarvestError> = match claimed {
+                    // Zero rows deleted means another attempt already
+                    // claimed and resolved this row (issue #1401, Codex
+                    // follow-up). Nothing left for us to do.
+                    Ok(0) => Ok(false),
+                    Ok(_) => {
+                        match crate::execution::execution_exists_by_key(
+                            &mut target_conn,
+                            &task.target_workflow_name,
+                            &task.target_workflow_id,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                tracing::debug!(
+                                    source_exec_id = %task.source_exec_id,
+                                    trigger_id = %task.trigger_id,
+                                    "[completion_trigger outbox] target already exists \
+                                     (any state); treating the stale outbox row as \
+                                     delivered, not rejected"
+                                );
+                                Ok(false)
                             }
-                            diesel::update(
+                            Ok(false) => diesel::update(
                                 fires_dsl::harvest_completion_trigger_fires
                                     .filter(fires_dsl::source_exec_id.eq(task.source_exec_id))
                                     .filter(fires_dsl::trigger_id.eq(task.trigger_id)),
                             )
                             .set(fires_dsl::outcome.eq(Some("payload_too_large")))
-                            .execute(tx)
+                            .execute(conn)
                             .await
-                            .map_err(crate::error::database_error)?;
-                            Ok(true)
-                        }))
-                        .await
+                            .map_err(crate::error::database_error)
+                            .map(|_| true),
+                            Err(e) => Err(e),
+                        }
                     }
                     Err(e) => Err(e),
                 };
@@ -2734,9 +2724,17 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                             trigger_id = %task.trigger_id,
                             error = ?e,
                             "[completion_trigger outbox] failed to resolve the \
-                             permanently-rejected fire; the outbox row is untouched \
-                             and the next scan retries it"
+                             permanently-rejected fire; backing off this outbox row"
                         );
+                        // A back off applies whether or not the claim itself
+                        // succeeded (issue #1401, Codex follow-up). If the
+                        // claim failed, the row is untouched. It would
+                        // otherwise retry at full poll cadence forever. If
+                        // the claim succeeded and only the existence check
+                        // or fires update failed, the row is already gone,
+                        // so this call is a harmless no-op. It mirrors the
+                        // generic error arm below.
+                        stamp_outbox_relay_backoff(conn, task.id).await;
                     }
                     Ok(true) => {}
                 }
