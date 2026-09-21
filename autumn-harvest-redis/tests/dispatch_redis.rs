@@ -535,7 +535,10 @@ async fn maintain_recovers_unacked_leases_across_several_queues_in_one_pass() {
 
     tokio::time::sleep(Duration::from_millis(400)).await;
     let counts = fixture.dispatch.maintain(&queues).await.expect("maintain");
-    assert_eq!(counts.recovered, 2, "both queues' idle entries must recover");
+    assert_eq!(
+        counts.recovered, 2,
+        "both queues' idle entries must recover"
+    );
     assert_eq!(fixture.pending_count("crashed-a").await, 0);
     assert_eq!(fixture.pending_count("crashed-b").await, 0);
 
@@ -694,7 +697,11 @@ async fn a_capped_read_favors_the_higher_priority_candidates() {
     );
 
     let rest = read(&fixture, &queues, 10).await;
-    assert_eq!(rest.len(), 1, "the one surplus low-priority reference is requeued");
+    assert_eq!(
+        rest.len(),
+        1,
+        "the one surplus low-priority reference is requeued"
+    );
     assert!(rest[0].task_id == low_1.task_id || rest[0].task_id == low_2.task_id);
 }
 

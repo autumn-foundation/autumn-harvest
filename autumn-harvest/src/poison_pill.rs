@@ -705,71 +705,75 @@ mod scanner {
                 Vec<DeferredTriggerStart>,
                 Vec<(ExecutionId, String)>,
                 Vec<crate::execution::StartCancelledRun>,
-            ), HarvestError, _>(async |conn| {
-                let Some(worker_id) = worker else {
-                    return Ok((false, None, Vec::new(), Vec::new(), Vec::new()));
-                };
-                // Lock the row and re-verify it is still the same orphan.
-                // This cannot fold the worker-liveness check into the same
-                // statement. See `requeue_orphan_stmt`'s doc comment: a
-                // wait on this row's lock would leave the liveness check
-                // reading a stale pre-wait snapshot of `harvest_workers`.
-                // `worker_still_dead` below is deliberately a separate,
-                // later statement instead. It runs only once this lock is
-                // already ours, so it is guaranteed a fresh snapshot.
-                let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
-                    .find(task_id)
-                    .for_update()
-                    .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(crate::error::database_error)?;
-                match current {
-                    Some((state, Some(wid), strikes))
-                        if state == "RUNNING" && wid == worker_id && strikes == prior_strikes => {}
-                    _ => return Ok((false, None, Vec::new(), Vec::new(), Vec::new())),
-                }
-                if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
-                    return Ok((false, None, Vec::new(), Vec::new(), Vec::new()));
-                }
-
-                dead_letter(conn, &entry).await?;
-
-                diesel::update(dsl::harvest_task_queue.find(task_id))
-                    .set((
-                        dsl::state.eq("FAILED"),
-                        dsl::worker_id.eq(None::<String>),
-                        dsl::crash_strikes.eq(new_strikes),
-                        dsl::error.eq(Some(error.clone())),
-                        dsl::completed_at.eq(Some(Utc::now())),
-                    ))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-
-                let (failed_workflow, deferred, closed_children, pending_cancel_metrics) =
-                    match workflow_exec_id {
-                        Some(exec_uuid) => {
-                            fail_owning_workflow(
-                                conn,
-                                execution_id_from_uuid(exec_uuid),
-                                &error,
-                                Some(metrics),
-                                codecs,
-                            )
-                            .await?
-                        }
-                        None => (None, Vec::new(), Vec::new(), Vec::new()),
+            ), HarvestError, _>(
+                async |conn| {
+                    let Some(worker_id) = worker else {
+                        return Ok((false, None, Vec::new(), Vec::new(), Vec::new()));
                     };
-                Ok((
-                    true,
-                    failed_workflow,
-                    deferred,
-                    closed_children,
-                    pending_cancel_metrics,
-                ))
-            })))
+                    // Lock the row and re-verify it is still the same orphan.
+                    // This cannot fold the worker-liveness check into the same
+                    // statement. See `requeue_orphan_stmt`'s doc comment: a
+                    // wait on this row's lock would leave the liveness check
+                    // reading a stale pre-wait snapshot of `harvest_workers`.
+                    // `worker_still_dead` below is deliberately a separate,
+                    // later statement instead. It runs only once this lock is
+                    // already ours, so it is guaranteed a fresh snapshot.
+                    let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
+                        .find(task_id)
+                        .for_update()
+                        .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
+                        .first(conn)
+                        .await
+                        .optional()
+                        .map_err(crate::error::database_error)?;
+                    match current {
+                        Some((state, Some(wid), strikes))
+                            if state == "RUNNING"
+                                && wid == worker_id
+                                && strikes == prior_strikes => {}
+                        _ => return Ok((false, None, Vec::new(), Vec::new(), Vec::new())),
+                    }
+                    if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
+                        return Ok((false, None, Vec::new(), Vec::new(), Vec::new()));
+                    }
+
+                    dead_letter(conn, &entry).await?;
+
+                    diesel::update(dsl::harvest_task_queue.find(task_id))
+                        .set((
+                            dsl::state.eq("FAILED"),
+                            dsl::worker_id.eq(None::<String>),
+                            dsl::crash_strikes.eq(new_strikes),
+                            dsl::error.eq(Some(error.clone())),
+                            dsl::completed_at.eq(Some(Utc::now())),
+                        ))
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
+
+                    let (failed_workflow, deferred, closed_children, pending_cancel_metrics) =
+                        match workflow_exec_id {
+                            Some(exec_uuid) => {
+                                fail_owning_workflow(
+                                    conn,
+                                    execution_id_from_uuid(exec_uuid),
+                                    &error,
+                                    Some(metrics),
+                                    codecs,
+                                )
+                                .await?
+                            }
+                            None => (None, Vec::new(), Vec::new(), Vec::new()),
+                        };
+                    Ok((
+                        true,
+                        failed_workflow,
+                        deferred,
+                        closed_children,
+                        pending_cancel_metrics,
+                    ))
+                },
+            )))
             .await?;
 
         if acted {

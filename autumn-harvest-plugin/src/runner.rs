@@ -1110,7 +1110,11 @@ impl HarvestRunner {
                 _ => None,
             };
             let installed = install_dispatch_channel(config, dispatch_shard).await?;
-            (DispatchInstallGuard::new(installed), installed, dispatch_shard)
+            (
+                DispatchInstallGuard::new(installed),
+                installed,
+                dispatch_shard,
+            )
         };
 
         let worker = if config.worker_enabled {

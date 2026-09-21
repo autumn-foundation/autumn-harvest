@@ -1004,10 +1004,8 @@ impl RedisDispatch {
         self.ensure_groups(queues, false).await?;
         let mut conn = self.conn.clone();
         let visibility_ms = self.visibility_ms();
-        let pendings: Vec<StreamPendingCountReply> = self
-            .pending_pipeline(queues)
-            .query_async(&mut conn)
-            .await?;
+        let pendings: Vec<StreamPendingCountReply> =
+            self.pending_pipeline(queues).query_async(&mut conn).await?;
 
         let mut total = 0;
         for (queue, pending) in queues.iter().zip(pendings.iter()) {

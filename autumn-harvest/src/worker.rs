@@ -9015,8 +9015,8 @@ async fn process_mutex_releases_from_commands(
     // names a row no reader outside this transaction can see yet. The
     // buffering scope holds it until the commit, matching every other
     // transaction owner that calls `wake_workflow_task`.
-    let held_secs = crate::dispatch::buffered_settled(Box::pin(conn.transaction::<Vec<f64>, HarvestError, _>(
-        async |conn| {
+    let held_secs = crate::dispatch::buffered_settled(Box::pin(
+        conn.transaction::<Vec<f64>, HarvestError, _>(async |conn| {
             let releases = releases.clone();
             let mut held = Vec::new();
             for (key, lock_seq) in releases {
@@ -9031,8 +9031,8 @@ async fn process_mutex_releases_from_commands(
                 }
             }
             Ok(held)
-        },
-    )))
+        }),
+    ))
     .await?;
 
     for secs in held_secs {
@@ -26754,8 +26754,10 @@ impl Worker {
         // with no channel installed. Persisted across iterations, unlike
         // `shard_dispatch` itself: the reconcile cursor and the degraded-mode
         // cooldown must survive from one iteration to the next.
-        let mut dispatch_states: Vec<DispatchLoopState> =
-            shard_targets.iter().map(|_| DispatchLoopState::new()).collect();
+        let mut dispatch_states: Vec<DispatchLoopState> = shard_targets
+            .iter()
+            .map(|_| DispatchLoopState::new())
+            .collect();
 
         while !self.shutdown.is_cancelled() {
             let mut any_claimed = false;

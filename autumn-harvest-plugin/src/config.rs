@@ -1135,7 +1135,10 @@ orphaned_workflows = "explode"
         assert_eq!(config.redis.visibility_timeout_ms, 60_000);
         assert_eq!(config.redis.poll_interval_ms, 20);
         assert_eq!(config.redis.reconcile_interval_ms, 1_000);
-        assert_eq!(config.redis.reconcile_batch, DEFAULT_DISPATCH_RECONCILE_BATCH);
+        assert_eq!(
+            config.redis.reconcile_batch,
+            DEFAULT_DISPATCH_RECONCILE_BATCH
+        );
     }
 
     #[test]

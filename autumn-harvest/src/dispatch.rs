@@ -279,14 +279,19 @@ pub fn installed() -> Option<InstalledDispatch> {
 /// own pool connection. This costs a reconcile interval of latency on the
 /// first dispatch of a row, never a lost or duplicated one. That is the
 /// same durability floor every other dispatch path relies on.
-static INSTALLED_BY_SHARD: RwLock<Option<std::collections::HashMap<crate::types::ShardId, InstalledDispatch>>> =
-    RwLock::new(None);
+static INSTALLED_BY_SHARD: RwLock<
+    Option<std::collections::HashMap<crate::types::ShardId, InstalledDispatch>>,
+> = RwLock::new(None);
 
 /// Install a channel for one shard of a multi-shard runtime.
 ///
 /// A later call for the same shard replaces the earlier one. Does not touch
 /// [`install`]'s single-shard slot.
-pub fn install_for_shard(shard: crate::types::ShardId, channel: Arc<dyn TaskDispatch>, settings: DispatchSettings) {
+pub fn install_for_shard(
+    shard: crate::types::ShardId,
+    channel: Arc<dyn TaskDispatch>,
+    settings: DispatchSettings,
+) {
     if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
         slot.get_or_insert_with(std::collections::HashMap::new)
             .insert(shard, InstalledDispatch { channel, settings });
@@ -1463,7 +1468,10 @@ mod tests {
         let channel = MemoryDispatch::new();
         let a = hint("q", Utc::now());
         let b = hint("q", Utc::now());
-        channel.publish(&[a.clone(), b.clone()]).await.expect("publish");
+        channel
+            .publish(&[a.clone(), b.clone()])
+            .await
+            .expect("publish");
 
         // One `next` call already returns both ready entries (`max` is 8).
         // Two separate `read_one` calls would silently drop the second,
@@ -1475,10 +1483,7 @@ mod tests {
         assert_eq!(leases.len(), 2, "both entries are ready in one read");
         assert_eq!(channel.outstanding_leases(), 2);
 
-        channel
-            .ack_many(&leases)
-            .await
-            .expect("ack_many");
+        channel.ack_many(&leases).await.expect("ack_many");
         let mut acked = channel.acked_ids();
         acked.sort();
         let mut expected = vec![a.task_id, b.task_id];
@@ -1494,7 +1499,10 @@ mod tests {
         let channel = MemoryDispatch::new();
         let a = hint("q", Utc::now());
         let b = hint("q", Utc::now());
-        channel.publish(&[a.clone(), b.clone()]).await.expect("publish");
+        channel
+            .publish(&[a.clone(), b.clone()])
+            .await
+            .expect("publish");
 
         // One `next` call already returns both ready entries; see the note
         // in `ack_many_drops_every_lease_in_the_batch` above.
