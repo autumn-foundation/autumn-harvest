@@ -270,37 +270,47 @@ expected state, and gives up after a fixed `tokio::time::timeout`. A handful
 of the shard's failures instead panic at an assertion inside their own test
 file (`chain_timeout_tests.rs:736`/`880`, `mixed_suspension_tests.rs:508`),
 not the shared helper — not checked further this session. Shard 3 was the
-worst-hit but not the only shard 10 hit either: **added after review**, this
-same run's shard 10 independently shows ~60 `integration_e2e`/
-`quota_enforcement_tests` failures, nearly all at the identical
-`integration_e2e.rs:1383:6` site — including the exact test item 2 tracks,
+worst-hit but not the only one: **added after review**, this same run's own
+shard 10 independently shows ~60 `integration_e2e`/`quota_enforcement_tests`
+failures, nearly all at the identical `integration_e2e.rs:1383:6` site —
+including the exact test item 2 tracks,
 `quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded`
 (see item 2's own correction above). `.github/ci/integration-suites.txt`'s
 row-ordinal sharding puts both `integration_e2e` (row 32) and
 `quota_enforcement_tests` (row 43) on shard 10 by construction (`32 % 11 =
 43 % 11 = 10`), so shard 10 carries the two largest serial suites in the
-manifest — a candidate reason shard 10 specifically is where this pattern
-keeps surfacing, on two different branches (`claude/keen-bardeen-amm1ft`
-here, `claude/kind-hopper-wbrak0` in item 2's 3rd occurrence).
+manifest — a candidate reason it's where this panic site keeps surfacing.
 
-This shape (one shared wait-helper's timeout firing across many
-otherwise-independent tests in a shard, concentrated on shard 10) is
-consistent with either a systemic problem in that run's environment
-(worker never processes tasks, DB contention, shard 10's own wall-clock
-being long enough to make it disproportionately exposed to any transient
-slowdown) or a genuine regression in a branch's own diff that broke
-workflow dispatch broadly enough that nothing reaches its expected state in
-time. **Not root-caused, and not rendered as a test-vs-product verdict** —
-this session did not fetch either branch's diff, did not check whether a
-later commit fixed either occurrence, and does not have the worker-level
-logging that would distinguish "a branch's own code broke dispatch" from
-"shard 10's environment was starved" from "shard 10's own suite is long
-enough that transient CI contention hits it more often than other shards."
-Now recorded as **2 occurrences across 2 branches**, not 1 — still short of
-a measured rate, but no longer a single-occurrence note: this shape is
-recurring, and the shard-10 mechanism above is a concrete, checkable
-hypothesis for why, worth timing-decomposition work (per this role's own
-Tier-1 evidence toolkit) rather than another log-reading pass.
+**Correction (post-review):** an earlier draft of this section, and of item
+2's summary, called item 2's 3rd occurrence (`35576291757`) a **2nd
+occurrence of this cascade**. That overclaims what was checked. Re-grepped
+`35576291757`'s full shard-10 log for every `... FAILED` and `FAILED
+SUITES:` line, not just the one test item 2 tracks: it shows **exactly one**
+test failure in that entire shard, not a cascade. So this run shares the
+same panic *site* and the same *shard* as `35563198153`'s cascade, but not
+its shape — one isolated test timing out is a materially weaker data point
+than dozens failing together, and does not by itself confirm shard 10 is
+systemically slow rather than this one test being unusually
+timing-sensitive on its own. Both remain live candidates.
+
+This shape (`35563198153`'s many-tests-in-one-shard cascade, one shared
+wait-helper's timeout firing across otherwise-independent tests) is
+consistent with either a systemic problem in that run's environment (worker
+never processes tasks, DB contention) or a genuine regression in that
+branch's own diff that broke workflow dispatch broadly enough that nothing
+reaches its expected state in time. **Not root-caused, and not rendered as
+a test-vs-product verdict** — this session did not fetch the branch's diff,
+did not check whether a later commit fixed it, and does not have the
+worker-level logging that would distinguish those possibilities from
+"shard 10's own suite is long enough that transient CI contention hits it
+more often than other shards" — the last of which item 2's isolated 3rd
+occurrence is also consistent with, without requiring the cascade
+explanation. Recorded as **1 cascade occurrence, plus 1 shared-panic-site,
+shared-shard, non-cascade occurrence** — not "2 occurrences of the
+cascade." Still short of a measured rate. The shard-10 co-location is a
+concrete, checkable hypothesis worth timing-decomposition work (per this
+role's own Tier-1 evidence toolkit), not yet confirmed as the mechanism for
+either.
 
 ### 5. `cross_region_dr_tests`: one occurrence, new signature, not root-caused
 
@@ -347,27 +357,34 @@ rerun campaign at
 `quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded`,
 and separately consider a timing decomposition of the `test-db-linux`
 shard-10 leg specifically** (it carries both `integration_e2e` and
-`quota_enforcement_tests` by the sharding formula, making it this suite's
-single longest-running, most contention-exposed shard) — both ahead of any
-other candidate in this series' backlog.
+`quota_enforcement_tests` by the sharding formula — a plausible reason it is
+disproportionately exposed to timing pressure, but, per the correction
+below, its actual wall-clock time relative to the other 10 shards remains
+unmeasured, not confirmed as longest) — both ahead of any other candidate in
+this series' backlog.
 
 **Item 3** is closed, per the correction above: the 09-18 report's diagnosis
 holds on this 5th occurrence too — real, own-branch dead code, correctly
 caught by two independent gates, not a suite defect. No further action, and
 not carried forward to the next report.
 
-**Item 4** is explicitly not rendered as a test-vs-product verdict, but is
-no longer an isolated note either: it is now 2 occurrences (its own run,
-`claude/keen-bardeen-amm1ft`, and item 2's 3rd occurrence, on
-`claude/kind-hopper-wbrak0`), both concentrated on shard 10, both sharing
-the identical panic site. The evidence gathered this session (2 runs, 2
-branches, no diff read on either, no later-commit check, no worker-level
-logging) is still insufficient to say whether this is a real dispatch-path
-regression, DB/runner contention, or simply shard 10's own long wall-clock
-making it the shard most exposed to any transient slowdown — but "insufficient
-to render a verdict" is now paired with "a concrete, checkable next
-experiment" (the timing decomposition above), which is a stronger position
-than a single occurrence's shrug.
+**Item 4** is explicitly not rendered as a test-vs-product verdict.
+**Correction (post-review):** an earlier draft of this paragraph called item
+2's 3rd occurrence a 2nd occurrence of this cascade — wrong, per the
+correction in item 4's own symptom section above: `35576291757` shows
+exactly one test failing, not the dozens `35563198153` showed. What is
+confirmed is narrower: the same panic *site* and the same *shard*, not the
+same *shape*. The evidence gathered this session (1 cascade occurrence, 1
+single-test occurrence sharing its site and shard, no diff read on either
+branch, no later-commit check, no worker-level logging) is still
+insufficient to say whether this is a real dispatch-path regression,
+DB/runner contention, or simply shard 10's own wall-clock making it more
+exposed to any transient slowdown than other shards — that last
+possibility remains a hypothesis, not a measurement (see the Treatment
+section's new item). "Insufficient to render a verdict" is now at least
+paired with a concrete, checkable next experiment, which is a stronger
+position than a single occurrence's shrug, but the cascade itself is still
+n=1.
 
 **Item 5** has no mechanism recovered; a single, unclustered occurrence.
 
@@ -434,17 +451,22 @@ Carried forward, unchanged from prior reports in this series:
   section this session already had in hand) confirms the identical
   dead-code mechanism the 09-18 report closed. Root-caused, not a flake, no
   rate needed.
-- **Item 4: correction (post-review).** Denominator fixed: 6/11 shards, not
-  6/30 (`test-db-linux`'s own matrix is 11 shards; 30 was this run's total
-  job count across every job type). ~40 failing tests in the worst shard
-  (shard 3), large majority sharing one panic site
+- **Item 4: corrected twice (post-review).** First, denominator fixed: 6/11
+  shards, not 6/30 (`test-db-linux`'s own matrix is 11 shards; 30 was this
+  run's total job count across every job type). ~40 failing tests in the
+  worst shard (shard 3), large majority sharing one panic site
   (`integration_e2e.rs:1383:6`, `wait_for_execution_state_with_timeout`).
-  Now 2 occurrences across 2 branches (this run, and item 2's 3rd
-  occurrence), both on shard 10 specifically — confirmed by direct
-  calculation that shard 10 uniquely carries both `integration_e2e` and
-  `quota_enforcement_tests` under the sharding formula (`32 % 11 = 43 % 11
-  = 10`). Not a rate; a shard-10-specific timing decomposition is the
-  concrete next step, not yet run by any session.
+  Second, an earlier draft called item 2's 3rd occurrence a 2nd cascade
+  occurrence — wrong; re-checking that run's full log shows exactly 1 test
+  failed, not a cascade. Corrected: 1 cascade occurrence (this run), plus 1
+  single-test occurrence sharing the same panic site and same shard (item
+  2's 3rd occurrence) — not 2 occurrences of the cascade. Both land on
+  shard 10, confirmed by direct calculation that shard 10 uniquely carries
+  both `integration_e2e` and `quota_enforcement_tests` under the sharding
+  formula (`32 % 11 = 43 % 11 = 10`); shard 10's actual wall-clock time
+  relative to the other 10 shards is unmeasured, not confirmed as longest.
+  Not a rate; a shard-10-specific timing decomposition is the concrete next
+  step, not yet run by any session.
 - **Item 5:** 1 occurrence, unclassified.
 - **Ledger:** no quarantine ledger exists in this repository to update.
 
