@@ -54,8 +54,14 @@ reset event-number field also moved from `type="number"` to
 browser's number-input value-sanitization algorithm blanks a rejected
 non-numeric value from the visible control even though the raw HTML
 attribute still carries it, undermining the very echo this change exists
-to provide. No other page, form, or endpoint touched; the success-path
-flash is unchanged.
+to provide. A fifth finding: `render_workflow_detail_page`'s payload
+decoding (issue #608) audited every decoded read under the hard-coded
+`"GET /ui/workflows/{id}"`, wrongly attributing a rejected-action POST's
+decoded reads to a route that never made the request. Fixed by threading
+the caller's own `route_or_command` through to
+`decode_and_audit_workflow_detail`, so each of the three POST handlers'
+renders audit under their own `POST /workflows/{id}/…` route. No other
+page, form, or endpoint touched; the success-path flash is unchanged.
 
 **Measurement.** Deterministic, re-run in the PR:
 `cargo test -p autumn-harvest-plugin --lib ui::tests` — new tests:
@@ -69,7 +75,11 @@ flash is unchanged.
 ordinary `GET`), and
 `render_workflow_detail_pagination_and_jump_form_are_execution_specific`
 (pagination hrefs and the jump form's action carry the execution id even
-under the direct-render `<base>` fallback). No new `WorkflowEvent`
-variant, no migration, no behavioral instrumentation — a Tier 1
-error-path defect (entered data lost on a documented incident-response
-flow), which clears the impact floor on its own.
+under the direct-render `<base>` fallback). Docker-backed (testcontainers),
+compile-checked in this sandbox:
+`rejected_signal_render_attributes_decode_audit_to_the_post_route` in
+`ui_integration.rs` (a rejected signal's decode audit row names
+`POST /workflows/{id}/signal`, never the `GET` fallback). No new
+`WorkflowEvent` variant, no migration, no behavioral instrumentation — a
+Tier 1 error-path defect (entered data lost on a documented
+incident-response flow), which clears the impact floor on its own.

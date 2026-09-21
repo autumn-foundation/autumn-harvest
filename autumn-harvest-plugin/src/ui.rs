@@ -1515,6 +1515,7 @@ async fn workflow_detail_ui(
         params.flash.as_deref(),
         WorkflowActionEcho::default(),
         false,
+        "GET /ui/workflows/{id}",
         &headers,
         maybe_session,
     )
@@ -1542,6 +1543,15 @@ async fn render_workflow_detail_page(
     flash: Option<&str>,
     action_echo: WorkflowActionEcho,
     rendered_at_action_url: bool,
+    // The caller's own route, for the payload-decode audit trail (issue
+    // #1687 review, Codex finding). Before this parameter existed, every
+    // caller's decoded-payload reads were attributed to the hard-coded
+    // `"GET /ui/workflows/{id}"`. That was wrong for the three POST
+    // handlers rendering this page directly on a rejected submission.
+    // A sensitive-read audit trail must name the request that actually
+    // triggered the read, not a different route that happens to share
+    // the same renderer.
+    route_or_command: &'static str,
     headers: &axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> Result<Markup, AutumnError> {
@@ -1671,6 +1681,7 @@ async fn render_workflow_detail_page(
         &mut execution,
         &mut page_events,
         &mut blocked_on,
+        route_or_command,
     )
     .await;
 
@@ -1851,6 +1862,7 @@ async fn decode_and_audit_workflow_detail(
     execution: &mut WorkflowExecution,
     timeline_events: &mut [HarvestEvent],
     blocked_on: &mut BlockedOnData,
+    route_or_command: &'static str,
 ) {
     let Some(codecs) = read_path_decoder(api_state, session).await else {
         return;
@@ -1864,7 +1876,7 @@ async fn decode_and_audit_workflow_detail(
         headers,
         TARGET_WORKFLOW,
         Some(&target),
-        "GET /ui/workflows/{id}",
+        route_or_command,
         Some(exec_id.shard()),
         outcome,
         Some(SOURCE_UI),
@@ -2344,6 +2356,7 @@ async fn signal_workflow_ui(
         Some(&error),
         echo,
         true,
+        "POST /workflows/{id}/signal",
         &headers,
         maybe_session,
     )
@@ -2482,6 +2495,7 @@ async fn reset_workflow_ui(
         Some(&error),
         echo,
         true,
+        "POST /workflows/{id}/reset",
         &headers,
         maybe_session,
     )
@@ -2546,6 +2560,7 @@ async fn trigger_update_ui(
                     Some(&err_msg),
                     echo,
                     true,
+                    "POST /workflows/{id}/trigger-update",
                     &headers,
                     maybe_session,
                 )
@@ -2639,6 +2654,7 @@ async fn trigger_update_ui(
         Some(&error),
         echo,
         true,
+        "POST /workflows/{id}/trigger-update",
         &headers,
         maybe_session,
     )

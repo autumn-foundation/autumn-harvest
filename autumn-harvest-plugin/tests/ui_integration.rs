@@ -6208,6 +6208,25 @@ async fn decode_audit_sources(database_url: &str) -> Vec<String> {
         .expect("failed to load decode audit sources")
 }
 
+/// The `route_or_command` column of every `payload.decode_read` audit row
+/// (issue #1687 review, Codex finding). `render_workflow_detail_page` is
+/// shared by the `GET` route and the three rejected-action POST handlers.
+/// Each caller's decoded reads must be attributed to ITS OWN route, not a
+/// hard-coded `GET /ui/workflows/{id}` regardless of which request
+/// actually triggered the read.
+async fn decode_audit_routes(database_url: &str) -> Vec<String> {
+    use autumn_harvest::schema::harvest_audit_log;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for audit routes");
+    harvest_audit_log::table
+        .filter(harvest_audit_log::operation.eq(autumn_harvest::audit::OP_PAYLOAD_DECODE_READ))
+        .select(harvest_audit_log::route_or_command)
+        .load(&mut conn)
+        .await
+        .expect("failed to load decode audit routes")
+}
+
 /// Issue #608 (DLQ UI): the dead-letter page renders the decoded task input
 /// and error instead of ciphertext, and the plaintext page render is audited.
 #[tokio::test]
@@ -6456,6 +6475,95 @@ async fn workflow_detail_ui_renders_decoded_input() {
     assert_eq!(
         stored_input, input_envelope,
         "stored input must remain ciphertext after the decoded render"
+    );
+}
+
+/// GREEN (issue #1687 review, Codex finding). `render_workflow_detail_page`
+/// is shared by the `GET` route and the three rejected-action POST
+/// handlers. A payload decoded while rendering a rejected signal directly
+/// must attribute its `payload.decode_read` audit row to the POST route
+/// that actually triggered the read. It must not use the hard-coded `GET
+/// /ui/workflows/{id}` the shared renderer used to assume.
+#[tokio::test]
+async fn rejected_signal_render_attributes_decode_audit_to_the_post_route() {
+    let (database_url, _container) = setup_test_database_url().await;
+
+    let input_envelope = envelope_608(&json!({"user": "pii-signal-reject"}));
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for workflow insert");
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "encrypted_workflow",
+            workflow_id: "reject-decode-1",
+            exec_id,
+            input: input_envelope.clone(),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
+        },
+        None,
+    )
+    .await
+    .expect("workflow insert should succeed");
+    reset_event_field(&mut conn, exec_id, 0, "input", input_envelope.clone()).await;
+
+    let app = build_decode_enabled_api_with_ui_app(&database_url);
+    let (status, _headers, body) = post_form(
+        &app,
+        &format!("/ui/workflows/{exec_id}/signal"),
+        "signal_name=approve&payload=%7Bnot+json",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the rejected signal must render the detail page directly: {body}"
+    );
+
+    let routes = decode_audit_routes(&database_url).await;
+    assert!(
+        routes.iter().any(|r| r == "POST /workflows/{id}/signal"),
+        "the decode audit row must attribute the POST route that triggered the render: {routes:?}"
+    );
+    assert!(
+        !routes.iter().any(|r| r == "GET /ui/workflows/{id}"),
+        "no GET-route audit row should be written for this POST-triggered render: {routes:?}"
     );
 }
 
