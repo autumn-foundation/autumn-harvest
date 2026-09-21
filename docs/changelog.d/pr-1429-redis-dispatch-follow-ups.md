@@ -86,23 +86,52 @@ instead of N workers each duplicating a fixed-size scan.
 Every change is confined to the dispatch channel, its configuration surface,
 and its metrics; the Postgres claim path and event log are untouched.
 
-**Tests.** Full `autumn-harvest` (1275), `autumn-harvest-redis` (45), and
-`autumn-harvest-plugin` (1318) unit suites pass. Targeted integration coverage
-against real local Postgres and Redis instances: `dispatch_tests.rs`,
+**Review.** Four agents reviewed this diff from independent angles
+(concurrency/crash-safety, Redis Cluster/Lua correctness,
+config/metrics/operability, test-coverage/doc-consistency). Confirmed
+findings, all fixed: `HarvestRunner::stop` uninstalled only the
+single-shard dispatch slot, leaking a multi-shard install's per-shard
+channels; a shard connect failure mid-install left earlier shards'
+channels installed with no guard to unwind them; `ack_many_inner` batched
+leases from any queue into one `MULTI`/`EXEC` pipeline, undercutting this
+PR's own per-queue Cluster hash-tag scheme; `requeue_batch` aborted its
+whole call on the first queue's script error, silently skipping sibling
+queues in a multi-queue `release_many` batch; `harvest_dispatch_dropped_hints`
+was missing from the alert-pack's stable-metric catalog, which would have
+failed a CI guard test; the dropped-hints sampler never ran in an API-only
+process (no `Worker`), even though that topology's own background
+publisher can still drop hints.
+
+**Tests.** Full `autumn-harvest` (3696), `autumn-harvest-redis` (45), and
+`autumn-harvest-plugin` (1320) unit suites pass. `dispatch_tests.rs`,
 `poison_pill_tests.rs`, `sharded_runtime_tests.rs`, `mutex_tests.rs`,
-`codec_rotation_db_tests.rs`, and the `timeout`-scoped suites, plus
-`autumn-harvest-redis`'s `dispatch_redis.rs` and `worker_dispatch_e2e.rs`
-integration suites (including a new
-`maintain_recovers_unacked_leases_across_several_queues_in_one_pass` case).
+`codec_rotation_db_tests.rs`, and the `timeout`-scoped integration suites
+against real local Postgres continue to pass unchanged — this PR did not
+modify them. New integration coverage in `autumn-harvest-redis`'s
+`dispatch_redis.rs`/`worker_dispatch_e2e.rs` against real local Redis,
+including `maintain_recovers_unacked_leases_across_several_queues_in_one_pass`.
 New unit coverage: `per_shard_dispatch_requires_full_coverage`,
 `a_fully_covered_multi_shard_runtime_is_accepted`,
 `per_shard_channels_are_independent_of_each_other_and_of_the_global_slot`,
 `ack_many_drops_every_lease_in_the_batch`,
-`release_many_gives_every_lease_back_with_its_own_delay`,
-`dispatch_keys_for_one_queue_share_one_hash_tag`,
+`release_many_gives_every_lease_back_with_its_own_delay` (per-lease delay
+independence, not a shared delay), `dispatch_keys_for_one_queue_share_one_hash_tag`,
 `dispatch_keys_for_different_queues_carry_different_tags`,
 `dispatch_view_reports_installed_state_and_tuning`,
-`dispatch_view_never_leaks_a_connection_url`, and
-`dispatch_dropped_hints_is_an_unlabeled_last_write_wins_gauge`.
+`dispatch_view_never_leaks_a_connection_url`,
+`dispatch_dropped_hints_is_an_unlabeled_last_write_wins_gauge`,
+`stop_uninstalls_the_per_shard_channels_a_multi_shard_runner_installed`, and
+`stop_cancels_and_joins_the_api_only_dispatch_metrics_sampler`.
 `docs/audits/comment-hygiene.py --base origin/trunk-dev` reports zero Tier B
-regressions.
+regressions. `cargo clippy` (including `--all-features`/pedantic+nursery on
+`autumn-harvest`, and the `redis`-feature variants of the other two crates)
+is clean.
+
+**Known gaps, not fixed here.** The multi-shard dispatch path (item 3) has
+no end-to-end test proving a multi-shard worker claims through the
+*correct* shard's channel — only construction-time coverage gating is
+covered. `DispatchConfigView.key_prefix` reports the base prefix, not any
+of the per-shard prefixes actually in use, for a multi-shard-in-one-process
+runner. `harvest_dispatch_dropped_hints` ships as a Gauge rather than a
+Counter, despite being a monotonic value; `increase()` still reads it
+correctly today, but a "current value" dashboard panel would not.
