@@ -6,7 +6,7 @@ comment raises, with a root cause more specific than the migration
 guessed. No code, index, or query change ships in this PR — see
 "Why no fix ships" below.
 
-**Correction history** (both from `Codex Review` on
+**Correction history** (all from `Codex Review` on
 [PR #1691](https://github.com/autumn-foundation/autumn-harvest/pull/1691),
 before merge — read the review thread for the full exchange):
 
@@ -20,6 +20,11 @@ before merge — read the review thread for the full exchange):
    index CAN deliver a cheap plan, confirmed by forcing the planner to
    use it. The real mechanism is a cost-estimation problem, not a hard
    limitation — see "Root cause," below, which replaces that claim.
+3. That correction's own three-way comparison table mixed a cold
+   first-tick timing (from the plan-table capture above) with warm,
+   back-to-back timings (from the three-variant capture). The buffer
+   counts were already apples-to-apples; the timings were not. Both are
+   now reported from the same back-to-back capture batch.
 
 Also fixed: the fixture originally used `gen_random_uuid()`, so exact
 buffer counts jittered a few percent run to run. Row ids are now
@@ -83,27 +88,33 @@ fixture, with `CANDIDATE_SQL` unmodified: the unforced planner does
 (`alternative-index-explain.txt`).
 
 The first correction to this document stopped there and concluded the
-index was structurally unusable under `= ANY($1)`. Round 2 of review
-pushed back, correctly: a `ScalarArrayOpExpr` CAN still be an index
-condition followed by a sort, and the row estimate for the alternative
-plan (`rows=38,875`) is wildly off from the actual matching rows
-(1,000) — a 38x overestimate, caused by `workflow_name` and the partial
-predicate (`quota_key IS NULL AND state IN (...)`) being correlated in
-a way ordinary column statistics do not capture. That is worth testing
+index was structurally unusable under `= ANY($1)`. Review pushed back,
+correctly: a `ScalarArrayOpExpr` CAN still be an index condition
+followed by a sort, and the row estimate for the alternative plan
+(`rows=38,875`) is wildly off from the actual matching rows (1,000) — a
+38x overestimate, caused by `workflow_name` and the partial predicate
+(`quota_key IS NULL AND state IN (...)`) being correlated in a way
+ordinary column statistics do not capture. That is worth testing
 directly rather than reasoning about, so three variants were captured
-against the identical fixture and connection:
+back-to-back against the identical fixture, connection, and cache
+state — the buffer counts above are stable across cache states by
+construction, but a timing comparison needs same-batch numbers to mean
+anything, so these are deliberately NOT the cold first-tick timing from
+the plan table above:
 
 | variant | mechanism | buffers | exec time |
 |---|---|---:|---:|
-| unmodified `CANDIDATE_SQL` (`= ANY($1)`), nothing forced | what production runs | ~95,100 | ~142-152ms |
-| same query, `enable_indexscan = off` for one transaction | forces the planner onto the alternative index via Bitmap Index Scan + Sort | 46 | 6.5ms |
-| same predicate rewritten to literal `workflow_name = $1` | plain equality lets Postgres serve `ORDER BY id` directly from the index, no sort | 189 | 0.11ms |
+| unmodified `CANDIDATE_SQL` (`= ANY($1)`), nothing forced | what production runs | 95,091 | 58.1ms |
+| same query, `enable_indexscan = off` for one transaction | forces the planner onto the alternative index via Bitmap Index Scan + Sort | 46 | 8.3ms |
+| same predicate rewritten to literal `workflow_name = $1` | plain equality lets Postgres serve `ORDER BY id` directly from the index, no sort | 189 | 0.14ms |
 
 Forcing the plan (row 2) proves the index itself is not the problem:
-once selected, it is **~2,000x cheaper** than what the unforced planner
-picks. The literal-equality form (row 3) is cheaper still, since a
-plain `=` lets Postgres recognize the index already returns `id`-ordered
-output and skip the sort entirely.
+once selected, it is **~2,000x cheaper in buffers, ~7x faster** than
+what the unforced planner picks (buffers are the gate here, not the
+timing — see this agent's own evidence rules on why `actual time=` is
+inadmissible alone). The literal-equality form (row 3) is cheaper
+still on both counts, since a plain `=` lets Postgres recognize the
+index already returns `id`-ordered output and skip the sort entirely.
 
 So the verdict is narrower and more actionable than either earlier
 draft claimed: the composite index **would help enormously**. What
@@ -140,8 +151,13 @@ production-shaped scale, and the specific reason the proposed index
 does not help in practice is now precisely diagnosed: a planner
 cardinality misestimate under `= ANY($1)` against a partial index whose
 predicate correlates with the leading column, not an inherent inability
-to use the index at all. The gap between the plan Postgres picks and
-the plan it could pick is roughly 500x-2,000x depending on measure.
+to use the index at all. The buffer gap between the plan Postgres picks
+and the plan it could pick is 500x-2,000x, measured back-to-back on the
+identical fixture and cache state (the admissible, cache-independent
+gate). The execution-time gap on that same back-to-back capture is a
+more modest ~7x — smaller than buffers alone would suggest, and cited
+here only as corroboration, per this agent's own rule that timing is
+inadmissible on its own.
 
 ## 🔧 Why no fix ships in this PR
 
