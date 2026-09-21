@@ -114,6 +114,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          quota_enforcement_tests
 linux        autumn-harvest         integration                      -                          quota_history_bytes_perf_tests
 linux        autumn-harvest         integration                      -                          quota_lock_ordering_tests
+linux        autumn-harvest         integration                      -                          quota_reconcile_candidate_scan_perf_tests
 linux        autumn-harvest         integration                      -                          quota_reconcile_tests
 linux        autumn-harvest         integration                      -                          quota_supersede_ordering_tests
 linux        autumn-harvest         integration                      -                          rate_limit_bucket_gc_tests

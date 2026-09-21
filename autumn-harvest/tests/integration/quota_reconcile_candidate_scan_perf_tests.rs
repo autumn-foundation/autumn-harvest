@@ -584,3 +584,37 @@ async fn zz_capture_quota_reconcile_candidate_scan_evidence() {
 
     eprintln!("== capture complete: artifacts in {} ==", out_dir.display());
 }
+
+/// Locks in the fixture constants this file's module doc publishes. A
+/// future edit that silently changes them then fails a fast, no-database
+/// test. Otherwise only a slow manual comparison against a committed
+/// artifact would catch it. No live Postgres required.
+///
+/// This file's evidence-capture test above is `#[ignore]`d by design (a
+/// one-shot tool, not a repeatable CI assertion). This test exists so the
+/// module still has an un-ignored case for CI to execute, mirroring
+/// `quota_history_bytes_perf_tests::event_count_ranges_match_documentation`.
+#[test]
+fn fixture_constants_match_documentation() {
+    assert_eq!(
+        TARGET_ACTIVE, 1_000,
+        "target active-execution count drifted"
+    );
+    assert_eq!(
+        TARGET_TERMINAL, 50_000,
+        "target terminal-history count drifted"
+    );
+    assert_eq!(
+        NOISE_WORKFLOW_TYPES, 50,
+        "noise workflow-type count drifted"
+    );
+    assert_eq!(
+        NOISE_SWEEP,
+        [20_000, 100_000, 500_000],
+        "noise sweep sizes drifted"
+    );
+    assert_eq!(
+        QUOTA_RECONCILE_DEFAULT_BATCH, 200,
+        "quota_reconcile's own default batch size drifted"
+    );
+}
