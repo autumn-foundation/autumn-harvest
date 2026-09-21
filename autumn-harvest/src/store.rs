@@ -497,6 +497,18 @@ fn distinct_shards(events: &[(ExecutionId, WorkflowEvent)]) -> Vec<crate::types:
 /// transaction, paired with its `INSERT`s. A single-shard chunk pays
 /// for exactly one fence check, same as before.
 ///
+/// **Atomicity is per chunk, not across the whole call** (Codex review).
+/// Each chunk commits in its own transaction, opened after that chunk's
+/// offload upload. It is never one transaction wrapping every chunk,
+/// which would hold the DR fence lock across every chunk's upload. A
+/// caller that needs the whole batch to succeed or fail together, across
+/// chunk boundaries, must wrap this call in its own enclosing
+/// transaction. A failure then rolls back every chunk's savepoint too,
+/// not just the one that failed. The only current caller already does
+/// this. `events` here is always well under one chunk in practice.
+/// Even when it is not, `persist_all_started_child_workflows` calls this
+/// from inside its own outer transaction.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on `INSERT` failure, a
