@@ -24272,7 +24272,16 @@ fn spawn_queue_pause_sampler(
 /// the `db` feature. A dropped hint costs latency, not correctness. The row
 /// stays `PENDING` and the reconcile sweep republishes it. This is a health
 /// signal, not a durability one.
-fn spawn_dispatch_metrics_sampler(
+///
+/// `pub`, not worker-private: the dispatch background publisher installs
+/// unconditionally at startup (issue #1312), including in an API-only
+/// process with `worker_enabled = false`. Such a process still needs this
+/// sampler. A caller with no [`Worker`] at all (`autumn-harvest-plugin`'s
+/// `HarvestRunner`) spawns it directly rather than through
+/// [`Worker::spawn_monitoring_tasks`], which only runs once a `Worker`
+/// exists.
+#[must_use]
+pub fn spawn_dispatch_metrics_sampler(
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     interval: Duration,

@@ -122,6 +122,8 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     // The adjacent bridge fix issue #1307 made: `record_external_cancel_sent`
     // had no `MetricsRsRecorder` implementation and silently no-opped.
     "harvest_workflow_external_cancel_sent_total",
+    // Issue #1429 — the dispatch background publisher's dropped-hint count.
+    "harvest_dispatch_dropped_hints",
 ];
 
 #[test]

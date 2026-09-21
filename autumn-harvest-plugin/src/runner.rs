@@ -19,6 +19,7 @@ use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::{
     DEFAULT_WORKER_POLL_INTERVAL, DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig,
+    spawn_dispatch_metrics_sampler,
 };
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
@@ -859,12 +860,24 @@ pub struct HarvestRunner {
     retention: Option<RetentionRuntime>,
     batch: Option<BatchRuntime>,
     codec_refresh: Option<CodecRefreshRuntime>,
-    /// True when this runner installed the process-global dispatch channel.
+    /// True when this runner installed a process-global dispatch channel.
     ///
-    /// The slot is process wide and outlives one runner, so `stop` must give it
-    /// back (issue #1312). A runner that installed nothing leaves the slot
-    /// alone, because another owner in the same process may hold it.
+    /// The slot(s) are process wide and outlive one runner, so `stop` must
+    /// give them back (issue #1312). A runner that installed nothing leaves
+    /// them alone, because another owner in the same process may hold them.
     dispatch_installed: bool,
+    /// True when `dispatch_installed` names the per-shard slots (issue
+    /// #1429) rather than the single-shard slot.
+    ///
+    /// `stop` reads this to call `uninstall_all_shards` instead of
+    /// `uninstall`. The two slots are distinct process-wide statics.
+    /// Calling the wrong one leaves the other installed for a runtime that
+    /// has already stopped (issue #1429 review).
+    dispatch_multi_shard: bool,
+    /// The dropped-hints metrics sampler this runner owns. `Some` only for
+    /// an API-only process — no `Worker`, which spawns its own copy instead
+    /// (issue #1429 review). `stop` cancels and joins it.
+    dispatch_metrics_sampler: Option<(CancellationToken, JoinHandle<()>)>,
 }
 
 /// Background batch-operations executor handle (issue #102).
@@ -1095,12 +1108,14 @@ impl HarvestRunner {
         // partial install here — cut short by a shard connect failure —
         // therefore fails startup, rather than leaving some shards silently
         // uncovered.
-        let (dispatch_guard, dispatch_installed, dispatch_shard) = if dispatch_shards.len() > 1 {
+        let (dispatch_guard, dispatch_installed, dispatch_multi_shard, dispatch_shard) =
+            if dispatch_shards.len() > 1 {
             let installed_shards =
                 install_dispatch_channels_for_shards(config, &dispatch_shards).await?;
             let installed = !installed_shards.is_empty();
             (
                 DispatchInstallGuard::new_shards(installed_shards),
+                installed,
                 installed,
                 None,
             )
@@ -1113,6 +1128,7 @@ impl HarvestRunner {
             (
                 DispatchInstallGuard::new(installed),
                 installed,
+                false,
                 dispatch_shard,
             )
         };
@@ -1156,6 +1172,26 @@ impl HarvestRunner {
             dispatch_installed,
             dispatch_shard,
         ));
+
+        // A `Worker` already spawns its own copy of this sampler in
+        // `spawn_monitoring_tasks`. An API-only process (`worker_enabled =
+        // false`) owns no `Worker`, so nothing would otherwise sample
+        // `harvest_dispatch_dropped_hints` here. The dispatch background
+        // publisher this metric describes is installed unconditionally,
+        // above. That happens specifically because an API-only process
+        // still publishes references for the fleet (issue #1429 review).
+        // Only spawn when there is no `Worker` to double up with.
+        let dispatch_metrics_sampler = if worker.is_none() {
+            let cancel = CancellationToken::new();
+            let handle = spawn_dispatch_metrics_sampler(
+                cancel.clone(),
+                Arc::clone(registry.telemetry()),
+                DEFAULT_WORKER_POLL_INTERVAL,
+            );
+            Some((cancel, handle))
+        } else {
+            None
+        };
 
         let worker_id = worker
             .as_ref()
@@ -1253,6 +1289,8 @@ impl HarvestRunner {
             batch,
             codec_refresh,
             dispatch_installed,
+            dispatch_multi_shard,
+            dispatch_metrics_sampler,
         })
     }
 
@@ -1270,9 +1308,11 @@ impl HarvestRunner {
 
     /// Stop any locally owned worker and scheduler tasks.
     ///
-    /// A runner that installed the dispatch channel also uninstalls it. The
-    /// slot is process wide, so a channel left behind would still carry
-    /// references for a runtime that has stopped (issue #1312).
+    /// A runner that installed a dispatch channel also uninstalls it. The
+    /// slot(s) are process wide, so a channel left behind would still carry
+    /// references for a runtime that has stopped (issue #1312). It could
+    /// also make a later runtime's own per-shard coverage check misread
+    /// stale state (issue #1429 review).
     pub async fn stop(self) {
         let Self {
             api_runtime: _,
@@ -1284,10 +1324,26 @@ impl HarvestRunner {
             batch,
             codec_refresh,
             dispatch_installed,
+            dispatch_multi_shard,
+            dispatch_metrics_sampler,
         } = self;
 
         if dispatch_installed {
-            autumn_harvest::dispatch::uninstall();
+            if dispatch_multi_shard {
+                autumn_harvest::dispatch::uninstall_all_shards();
+            } else {
+                autumn_harvest::dispatch::uninstall();
+            }
+        }
+
+        if let Some((cancel, handle)) = dispatch_metrics_sampler {
+            cancel.cancel();
+            if let Err(error) = handle.await {
+                tracing::warn!(
+                    error = %error,
+                    "dispatch metrics sampler task failed during shutdown"
+                );
+            }
         }
 
         if let Some(worker) = worker {
@@ -1715,7 +1771,7 @@ async fn install_dispatch_channels_for_shards(
     let mut installed_shards = Vec::with_capacity(shards.len());
     for &shard in shards {
         let key_prefix = effective_dispatch_prefix(&config.redis.key_prefix, Some(shard));
-        let channel = autumn_harvest_redis::RedisDispatch::connect(
+        let channel = match autumn_harvest_redis::RedisDispatch::connect(
             url,
             autumn_harvest_redis::RedisDispatchConfig {
                 key_prefix: key_prefix.clone(),
@@ -1725,13 +1781,24 @@ async fn install_dispatch_channels_for_shards(
             },
         )
         .await
-        .map_err(|error| {
-            AutumnError::service_unavailable_msg(format!(
-                "failed to connect the Redis dispatch channel for shard {} at {endpoint}: \
-                 {error}",
-                shard.as_i32()
-            ))
-        })?;
+        {
+            Ok(channel) => channel,
+            Err(error) => {
+                // A shard earlier in this loop already installed (issue
+                // #1429 review). This function's own `Err` return skips the
+                // caller's `DispatchInstallGuard`, which only ever wraps the
+                // `Vec` this call returns. So on this path it never exists
+                // to unwind those shards. Uninstall every per-shard slot
+                // here instead, matching the guard's own "clear everything,
+                // not just this call's list" cleanup shape.
+                autumn_harvest::dispatch::uninstall_all_shards();
+                return Err(AutumnError::service_unavailable_msg(format!(
+                    "failed to connect the Redis dispatch channel for shard {} at {endpoint}: \
+                     {error}",
+                    shard.as_i32()
+                )));
+            }
+        };
 
         autumn_harvest::dispatch::install_for_shard(
             shard,
@@ -2490,7 +2557,50 @@ mod tests {
             batch: None,
             codec_refresh: None,
             dispatch_installed: installed,
+            dispatch_multi_shard: false,
+            dispatch_metrics_sampler: None,
         }
+    }
+
+    /// Like [`runner_owning_dispatch`], but the install it owns is the
+    /// per-shard slots rather than the single-shard slot.
+    fn runner_owning_multi_shard_dispatch() -> super::HarvestRunner {
+        super::HarvestRunner {
+            dispatch_multi_shard: true,
+            ..runner_owning_dispatch(true)
+        }
+    }
+
+    /// `stop` cancels and joins an API-only process's dispatch metrics
+    /// sampler (issue #1429 review). A `Worker`-less runner previously
+    /// spawned no sampler for `harvest_dispatch_dropped_hints` at all.
+    ///
+    /// A hung join would make this test itself hang, so a passing test is
+    /// the proof. The sampler task actually observes its cancellation and
+    /// returns, rather than `stop` leaking a detached task forever.
+    #[test]
+    fn stop_cancels_and_joins_the_api_only_dispatch_metrics_sampler() {
+        // `tokio::spawn` (inside `spawn_dispatch_metrics_sampler`) needs a
+        // live runtime. The spawn and the `stop` it feeds must therefore
+        // share one `block_on` call, rather than spawning before entering
+        // it.
+        block_on(async {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let telemetry = std::sync::Arc::new(
+                autumn_harvest::telemetry::TelemetryConfig::builder().build(),
+            );
+            let handle = autumn_harvest::worker::spawn_dispatch_metrics_sampler(
+                cancel.clone(),
+                telemetry,
+                std::time::Duration::from_secs(3600),
+            );
+            let runner = super::HarvestRunner {
+                dispatch_metrics_sampler: Some((cancel, handle)),
+                ..runner_owning_dispatch(false)
+            };
+
+            runner.stop().await;
+        });
     }
 
     /// Run `future` on a private current-thread runtime.
@@ -2578,6 +2688,41 @@ mod tests {
             "stop must not uninstall a channel this runner never installed"
         );
         autumn_harvest::dispatch::uninstall();
+    }
+
+    /// A runner that installed per-shard channels (issue #1429) uninstalls
+    /// them via `uninstall_all_shards`, not the single-shard slot, when it
+    /// stops. `stop` previously called only `dispatch::uninstall` (issue
+    /// #1429 review), leaving per-shard state live for whatever runtime
+    /// started next in this process.
+    #[test]
+    fn stop_uninstalls_the_per_shard_channels_a_multi_shard_runner_installed() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install_for_shard(
+            ShardId::new(0),
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        autumn_harvest::dispatch::install_for_shard(
+            ShardId::new(1),
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        block_on(runner_owning_multi_shard_dispatch().stop());
+
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(ShardId::new(0)).is_none(),
+            "stop must uninstall shard 0's channel"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(ShardId::new(1)).is_none(),
+            "stop must uninstall shard 1's channel"
+        );
     }
 
     /// A restart with Redis off must clear per-shard channels too (issue

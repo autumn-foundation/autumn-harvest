@@ -83,8 +83,9 @@
 //!   the `CROSSSLOT` failure. A cluster-aware client is a separate follow-up.
 //! - **No TLS.** A `rediss://` URL is rejected at `connect` with a message
 //!   that says so. The `redis` client's TLS stack depends on an unmaintained
-//!   crate that the dependency ledger refuses; issue #1429 tracks TLS. A
-//!   plain `redis://` URL sends the password in cleartext.
+//!   crate that the dependency ledger refuses. This is not one of issue
+//!   #1429's ten items; it needs its own follow-up issue. A plain
+//!   `redis://` URL sends the password in cleartext.
 //! - **One channel per shard, not one channel that spans shards.** A single
 //!   [`RedisDispatch`] instance still addresses one key family and expects
 //!   every reference it carries to belong to one database. A multi-shard

@@ -269,6 +269,10 @@ impl std::fmt::Debug for RedisDispatch {
     }
 }
 
+/// One queue's share of a [`RedisDispatch::requeue_batch`] call: each
+/// entry's handle, reference and due time, borrowed from the caller's slice.
+type QueueBatch<'a> = Vec<(&'a String, &'a DispatchRef, DateTime<Utc>)>;
+
 impl RedisDispatch {
     /// Build a channel from two open connection managers.
     ///
@@ -589,8 +593,7 @@ impl RedisDispatch {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut by_queue: HashMap<&str, Vec<(&String, &DispatchRef, DateTime<Utc>)>> =
-            HashMap::new();
+        let mut by_queue: HashMap<&str, QueueBatch<'_>> = HashMap::new();
         for (handle, reference, due) in entries {
             by_queue
                 .entry(reference.queue_name.as_str())
@@ -599,6 +602,19 @@ impl RedisDispatch {
         }
         let now_ms = Utc::now().timestamp_millis();
         let ttl = self.dedupe_ttl_secs();
+        // One queue's script invocation failing must not abort the rest of
+        // this batch (issue #1429 review). A caller
+        // that batches leases spanning several queues (`release_many_inner`,
+        // the surplus/PEL-recovery paths) would otherwise risk every other
+        // queue's requeue. One transient error on the first queue a
+        // `HashMap` happens to iterate would silently skip it. That is a
+        // real increase in blast radius over the pre-batch
+        // one-lease-at-a-time behavior. The cost stays latency-only: a
+        // requeue this call drops still sits behind its old visibility
+        // timeout. The reconcile sweep is the durability floor regardless.
+        // Every queue is attempted; the first error, if any, is returned
+        // after the loop.
+        let mut first_error = None;
         for (queue, batch) in by_queue {
             let mut invocation = self.requeue_script.prepare_invoke();
             invocation
@@ -621,9 +637,11 @@ impl RedisDispatch {
                     .arg(serde_json::to_string(reference)?);
             }
             let mut conn = self.conn.clone();
-            let _: i64 = invocation.invoke_async(&mut conn).await?;
+            if let Err(error) = invocation.invoke_async::<i64>(&mut conn).await {
+                first_error.get_or_insert_with(|| RedisAdapterError::from(error));
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn publish_inner(&self, hints: &[DispatchHint]) -> RedisAdapterResult<()> {
@@ -836,30 +854,46 @@ impl RedisDispatch {
             .await
     }
 
-    /// Drop several leases in one round trip (issue #1429).
+    /// Drop several leases at once, one round trip per distinct queue in the
+    /// batch (issue #1429).
     ///
     /// Same shape as [`Self::ack_inner`], batched into one atomic pipeline
-    /// covering every lease regardless of which queue it came from. `XACK`,
-    /// `XDEL` and the marker delete do not need `EVALSHA`'s single-queue key
-    /// grouping. Nothing here needs to split by queue.
+    /// per queue. `XACK`/`XDEL`/the marker delete for one queue all share
+    /// that queue's hash tag. A stream, delayed set and marker from a
+    /// DIFFERENT queue carry a different tag by design (issue #1429's own
+    /// per-queue hash-tag split). One `MULTI`/`EXEC` spanning two queues'
+    /// keys would therefore fail `CROSSSLOT` on a real Cluster the moment
+    /// this crate's client becomes Cluster-aware. That is exactly the
+    /// failure the hash tags exist to remove. Grouping by queue first,
+    /// mirroring [`Self::release_many_inner`]/[`Self::requeue_batch`], keeps
+    /// every pipeline's keys inside one queue's tag.
     async fn ack_many_inner(&self, leases: &[DispatchLease]) -> RedisAdapterResult<()> {
         if leases.is_empty() {
             return Ok(());
         }
-        let mut pipe = redis::pipe();
-        pipe.atomic();
+        let mut by_queue: HashMap<&str, Vec<&DispatchLease>> = HashMap::new();
         for lease in leases {
-            let key = self.stream_key(&lease.queue_name);
-            let entry_id = handle_entry_id(&lease.handle);
-            pipe.xack(&key, &self.config.consumer_group, &[entry_id])
-                .ignore()
-                .xdel(&key, &[entry_id])
-                .ignore()
-                .del(self.marker_key(&lease.queue_name, lease.task_id))
-                .ignore();
+            by_queue
+                .entry(lease.queue_name.as_str())
+                .or_default()
+                .push(lease);
         }
         let mut conn = self.conn.clone();
-        pipe.query_async::<()>(&mut conn).await?;
+        for (queue, batch) in by_queue {
+            let key = self.stream_key(queue);
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            for lease in batch {
+                let entry_id = handle_entry_id(&lease.handle);
+                pipe.xack(&key, &self.config.consumer_group, &[entry_id])
+                    .ignore()
+                    .xdel(&key, &[entry_id])
+                    .ignore()
+                    .del(self.marker_key(queue, lease.task_id))
+                    .ignore();
+            }
+            pipe.query_async::<()>(&mut conn).await?;
+        }
         Ok(())
     }
 

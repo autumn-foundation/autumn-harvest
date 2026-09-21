@@ -1168,6 +1168,10 @@ async fn commit_workflow_execution_timeout(
     .await
 }
 
+// The `dispatch::buffered_settled` wrap (issue #1429) added two lines over
+// the 100-line cap. The transaction below is one atomic unit; splitting it
+// would only move lines around, not shrink the function.
+#[allow(clippy::too_many_lines)]
 async fn enforce_activity_timeout(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -1175,7 +1179,6 @@ async fn enforce_activity_timeout(
     reason: &TimeoutReason,
     circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
     metrics: &(dyn MetricsRecorder + Send + Sync),
-
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let Some(activity_name) = task.activity_name.as_deref() else {

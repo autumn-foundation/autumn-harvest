@@ -1495,7 +1495,10 @@ mod tests {
     #[tokio::test]
     async fn release_many_gives_every_lease_back_with_its_own_delay() {
         // Issue #1429. Each lease in the batch carries its own delay, so a
-        // batch may mix an immediate return with a backed-off one.
+        // batch may mix an immediate return with a backed-off one. A shared
+        // delay for the whole batch would pass this assertion too, so the
+        // two leases here get different delays. Only the short one is ready
+        // right away; the long one is still not ready by then.
         let channel = MemoryDispatch::new();
         let a = hint("q", Utc::now());
         let b = hint("q", Utc::now());
@@ -1506,19 +1509,23 @@ mod tests {
 
         // One `next` call already returns both ready entries; see the note
         // in `ack_many_drops_every_lease_in_the_batch` above.
-        let leases = channel
+        let mut leases = channel
             .next(&queues(), "c", 8, Duration::from_millis(0))
             .await
             .expect("read");
         assert_eq!(leases.len(), 2, "both entries are ready in one read");
+        leases.sort_by_key(|lease| lease.task_id);
+        let mut by_id = [a.task_id, b.task_id];
+        by_id.sort_unstable();
+        let (short, long) = (leases.remove(0), leases.remove(0));
+        assert_eq!(short.task_id, by_id[0]);
+        assert_eq!(long.task_id, by_id[1]);
 
         channel
-            .release_many(
-                &leases
-                    .into_iter()
-                    .map(|lease| (lease, Duration::from_millis(0)))
-                    .collect::<Vec<_>>(),
-            )
+            .release_many(&[
+                (short, Duration::from_millis(0)),
+                (long, Duration::from_millis(200)),
+            ])
             .await
             .expect("release_many");
         let mut released = channel.released_ids();
@@ -1527,8 +1534,25 @@ mod tests {
         expected.sort();
         assert_eq!(released, expected);
 
-        let redelivered = read_one(&channel).await.expect("redelivered");
-        assert_eq!(redelivered.redeliveries, 1);
+        let immediate = read_one(&channel).await.expect("the short delay is ready");
+        assert_eq!(
+            immediate.task_id, by_id[0],
+            "only the lease released with no delay is ready yet"
+        );
+        assert!(
+            channel
+                .next(&queues(), "c", 8, Duration::from_millis(0))
+                .await
+                .expect("read")
+                .is_empty(),
+            "the lease released with a 200ms delay must not be ready yet"
+        );
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        channel.maintain(&queues()).await.expect("maintain");
+        let delayed = read_one(&channel).await.expect("the long delay is ready now");
+        assert_eq!(delayed.task_id, by_id[1]);
+        assert_eq!(delayed.redeliveries, 1);
     }
 
     #[tokio::test]
