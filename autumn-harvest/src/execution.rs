@@ -6017,12 +6017,12 @@ pub async fn execution_exists_by_key(
 /// workflow_id)` execution completed and was later retention-collected?
 ///
 /// Retention can remove a `harvest_workflow_executions` row shortly after
-/// completion (`--summary-age` as low as one second), so
+/// completion (`--summary-age` as low as one second). So
 /// [`execution_exists_by_key`] returning `false` is not proof an execution
-/// never ran -- only that it is not LIVE right now. Summaries are opt-in,
-/// so this can also return `false` for a genuinely retained execution when
-/// summaries are disabled; callers must not treat that as proof of absence
-/// either.
+/// never ran. It only proves the execution is not LIVE right now.
+/// Summaries are opt-in. This can also return `false` for a genuinely
+/// retained execution when summaries are disabled. Callers must not treat
+/// that as proof of absence either.
 pub async fn execution_summary_exists_by_key(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
