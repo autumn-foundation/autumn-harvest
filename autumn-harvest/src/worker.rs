@@ -16680,6 +16680,10 @@ async fn prepare_workflow_task_with_cache(
 /// changes the spawn-time logical identity its parent recorded) or orphaning
 /// the parent's `ChildWorkflow*` waiter, neither of which has a sound default
 /// in Phase 1. Callers from a child workflow get an explicit failure instead.
+// Issue #1409: write-only now. `resolve_continue_as_new_verdict` makes the
+// decision (a child execution's `parent_id` is enough, no DB read needed);
+// this runs only from the write step, once the verdict already says
+// `ChildUnsupported`.
 async fn reject_child_continue_as_new(
     conn: &mut AsyncPgConnection,
     persistence: &WorkflowTaskPersistence<'_>,
@@ -16687,9 +16691,9 @@ async fn reject_child_continue_as_new(
     // Issue #1243: configured codecs, so this write encodes under the
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
-) -> HarvestResult<bool> {
+) -> HarvestResult<()> {
     let Some(parent_exec_id) = execution.parent_id.map(execution_id_from_uuid) else {
-        return Ok(false);
+        return Ok(());
     };
 
     let error = "continue_as_new is not supported in child workflows in this release";
@@ -16732,14 +16736,11 @@ async fn reject_child_continue_as_new(
         .await?;
     }
 
-    Ok(true)
+    Ok(())
 }
 
 /// Outcome of validating a continue-as-new's target workflow type (issue #803).
 enum ContinueAsNewTypeCheck<'a> {
-    /// The target type is blank or unregistered on this worker: the execution
-    /// has already been failed terminally and the caller must bail.
-    Rejected,
     /// `new_workflow_type` was `None` — a same-type continuation, the legacy
     /// path. Every lifecycle column is carried forward verbatim.
     SameType,
@@ -16748,15 +16749,15 @@ enum ContinueAsNewTypeCheck<'a> {
     CrossType(&'a crate::info::WorkflowInfo),
 }
 
-/// Validate a cross-type continue-as-new target before anything is persisted
-/// (issue #803 AC5).
+/// Validate a cross-type continue-as-new target — a pure decision, no write
+/// (issue #1409: [`resolve_continue_as_new_verdict`] is the only caller, and
+/// makes the terminal-failure write itself, once, after the abandoned-dispatch
+/// decision that depends on this verdict has already been made).
 ///
 /// Continuing into a type no worker can dispatch would seal the predecessor
 /// and leave a successor stuck `RUNNING` forever with nothing to claim it, so
-/// the check runs **before** the seal transaction opens and fails the
-/// predecessor terminally instead — the same shape as
-/// [`reject_child_continue_as_new`], and the same fail-closed posture the
-/// child-spawn paths already take for an unregistered child type.
+/// this runs **before** the seal transaction opens — the same fail-closed
+/// posture the child-spawn paths already take for an unregistered child type.
 ///
 /// Consequence worth knowing: the target must be registered on the worker that
 /// runs the *transition*, so a new phase handler has to reach the whole fleet
@@ -16771,11 +16772,10 @@ enum ContinueAsNewTypeCheck<'a> {
 async fn check_continue_as_new_type<'a>(
     conn: &mut AsyncPgConnection,
     registry: &'a HandlerRegistry,
-    persistence: &WorkflowTaskPersistence<'_>,
     execution: &WorkflowExecution,
     new_workflow_type: Option<&str>,
     slot: &mut SuccessorSlot,
-) -> HarvestResult<ContinueAsNewTypeCheck<'a>> {
+) -> HarvestResult<Result<ContinueAsNewTypeCheck<'a>, String>> {
     let error = match classify_continue_as_new_target(registry, new_workflow_type) {
         Ok(ContinueAsNewTypeCheck::CrossType(info)) => {
             // Routing first: the slot resolution below can only see the
@@ -16819,40 +16819,193 @@ async fn check_continue_as_new_type<'a>(
                 {
                     Ok(resolved) => {
                         *slot = resolved;
-                        return Ok(ContinueAsNewTypeCheck::CrossType(info));
+                        return Ok(Ok(ContinueAsNewTypeCheck::CrossType(info)));
                     }
                     Err(error) => error,
                 }
             }
         }
-        Ok(resolved) => return Ok(resolved),
+        Ok(resolved) => return Ok(Ok(resolved)),
         Err(error) => error,
     };
 
-    // Root-only by construction: `reject_child_continue_as_new` runs first, so
-    // a child execution never reaches here. Retry is deliberately not offered
-    // (`None` for the execution) — a re-run would resolve the same missing
-    // registration and fail identically, matching the child-guard precedent.
-    persist_workflow_failure(
+    Ok(Err(error))
+}
+
+/// Whether a continue-as-new proceeds, or redirects to a terminal failure
+/// (issue #1409).
+///
+/// Carries no borrowed data on purpose. The write step re-derives
+/// `target_info` with a plain, deterministic `registry.workflows.get(..)`
+/// lookup on the unchanged `new_workflow_type` — not a re-validation (the
+/// registry and the name are both fixed for the rest of this decision cycle),
+/// just a cheap, infallible re-read that avoids threading a lifetime through
+/// [`persist_workflow_outcome`] for a value it never inspects itself.
+enum ContinueAsNewVerdict {
+    /// Redirect to a terminal failure instead of continuing.
+    Redirect(ContinueAsNewRedirect),
+    /// Proceed with the continuation. Carries the successor quota key
+    /// already resolved (and bound-checked) so the write step never
+    /// re-resolves it.
+    Continue { successor_quota_key: Option<String> },
+}
+
+/// The redirect reason a [`ContinueAsNewVerdict::Redirect`] carries (issue
+/// #1409). `ChildUnsupported` picks its own failure write (child vs.
+/// detached-child); the other three checks (target/input-cap/quota-key-cap)
+/// all fail the ROOT write identically, so they share one variant.
+enum ContinueAsNewRedirect {
+    /// `execution` is a child; `continue_as_new` is unsupported there.
+    ChildUnsupported,
+    /// The target/quota-key/input-cap checks rejected the transition. The
+    /// message is already rendered for [`persist_workflow_failure`].
+    RootFailure { error: String },
+}
+
+/// Decide whether this cycle's continue-as-new proceeds or redirects to a
+/// terminal failure (issue #1409).
+///
+/// Resolved ONCE, under the execution row lock the enclosing transaction
+/// already holds, **before** [`persist_terminal_outcome_commands`] decides
+/// whether to record this cycle's abandoned dispatches (issue #952) — so a
+/// continue-as-new that will redirect gets the SAME abandoned-dispatch
+/// treatment as any other failing cycle. The verdict is threaded to
+/// [`persist_workflow_continue_as_new_with_verdict`], which performs the
+/// write this decides but never re-validates: [`check_continue_as_new_type`]'s
+/// cross-shard occupancy read talks to another shard's live state, so a
+/// second call could answer differently and desync the synthetic-dispatch
+/// decision from the actual write.
+async fn resolve_continue_as_new_verdict(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    execution: &WorkflowExecution,
+    input: &serde_json::Value,
+    new_workflow_type: Option<&str>,
+) -> HarvestResult<ContinueAsNewVerdict> {
+    if execution.parent_id.is_some() {
+        return Ok(ContinueAsNewVerdict::Redirect(
+            ContinueAsNewRedirect::ChildUnsupported,
+        ));
+    }
+
+    let mut successor_slot = SuccessorSlot::Free;
+    let target_info = match check_continue_as_new_type(
         conn,
-        persistence.task.id,
-        persistence.exec_id,
-        persistence.next_event_id,
-        persistence.worker_id,
-        persistence.task.crash_strikes,
-        &error,
-        None,
-        None,
-        None,
-        None,
-        None,
-        crate::types::Priority::default(),
-        registry.payload_codecs(),
-        // `metrics: None` above -- nothing can ever be collected here.
-        &mut Vec::new(),
+        registry,
+        execution,
+        new_workflow_type,
+        &mut successor_slot,
     )
-    .await?;
-    Ok(ContinueAsNewTypeCheck::Rejected)
+    .await?
+    {
+        Err(error) => {
+            return Ok(ContinueAsNewVerdict::Redirect(
+                ContinueAsNewRedirect::RootFailure { error },
+            ));
+        }
+        Ok(ContinueAsNewTypeCheck::SameType) => None,
+        Ok(ContinueAsNewTypeCheck::CrossType(info)) => Some(info),
+    };
+
+    // Cross-type input cap (issue #1161). A same-type continuation needs no
+    // check here: `WorkflowContext`'s own in-process check already enforced
+    // the correct cap before the command was pushed. A cross-type target's
+    // cap can only be resolved HERE, where the registry is reachable.
+    if let Some(info) = target_info {
+        let cap = resolve_cross_type_max_input_bytes(info, registry.max_workflow_input_bytes);
+        let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
+        let offload_applies = registry
+            .payload_offloader()
+            .is_some_and(|o| observed > o.threshold());
+        if cap > 0 && observed > cap && !offload_applies {
+            let successor_workflow_name =
+                new_workflow_type.unwrap_or(execution.workflow_name.as_str());
+            let error = HarvestError::PayloadTooLarge {
+                kind: crate::error::PayloadKind::WorkflowInput,
+                observed_bytes: observed,
+                cap_bytes: cap,
+                workflow_type: successor_workflow_name.to_string(),
+                activity_name: None,
+            }
+            .to_string();
+            return Ok(ContinueAsNewVerdict::Redirect(
+                ContinueAsNewRedirect::RootFailure { error },
+            ));
+        }
+    }
+
+    // Per-tenant quota key (issue #946): same-type carries the predecessor's
+    // already-bound-checked key forward verbatim; cross-type re-resolves
+    // against the TARGET type's own declared policy and the fresh input —
+    // see `persist_workflow_continue_as_new_with_verdict`'s identical
+    // resolution for why (mirrors `resolve_workflow_concurrency`).
+    let successor_quota_key: Option<String> = new_workflow_type.map_or_else(
+        || execution.quota_key.clone(),
+        |target| {
+            registry
+                .workflows
+                .get(target)
+                .and_then(|info| info.quota)
+                .and_then(|policy| crate::quota::resolve_quota_key(policy.key_expr, input))
+        },
+    );
+    if let Some(key) = successor_quota_key.as_deref()
+        && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
+    {
+        let successor_workflow_name = new_workflow_type.unwrap_or(execution.workflow_name.as_str());
+        let error = HarvestError::PayloadTooLarge {
+            kind: crate::error::PayloadKind::QuotaKey,
+            observed_bytes,
+            cap_bytes: crate::quota::MAX_QUOTA_KEY_BYTES,
+            workflow_type: successor_workflow_name.to_string(),
+            activity_name: None,
+        }
+        .to_string();
+        return Ok(ContinueAsNewVerdict::Redirect(
+            ContinueAsNewRedirect::RootFailure { error },
+        ));
+    }
+
+    Ok(ContinueAsNewVerdict::Continue {
+        successor_quota_key,
+    })
+}
+
+/// [`resolve_continue_as_new_verdict`], but for a whole [`WorkflowOutcome`]:
+/// `Some` only for `ContinuedAsNew`, `None` for every other outcome.
+///
+/// Six internal paths inside continue-as-new persistence (an unsupported
+/// child, a blank/unregistered/DAG/occupied-slot target, an over-cap input,
+/// an over-cap quota key) redirect a `ContinuedAsNew` outcome to a real
+/// `WorkflowFailed` — and issue #952's abandoned-dispatch rule is keyed on
+/// the outcome that actually gets persisted, not the one the executor
+/// reported. `persist_terminal_outcome_commands` calls this before deciding
+/// whether to record this cycle's abandoned dispatches, and threads the
+/// result to `persist_workflow_outcome` so the eventual write never
+/// re-validates (see `resolve_continue_as_new_verdict`'s doc for why a
+/// second validation could disagree with this one).
+async fn resolve_continue_as_new_verdict_for_outcome(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    execution: &WorkflowExecution,
+    outcome: &WorkflowOutcome,
+) -> HarvestResult<Option<ContinueAsNewVerdict>> {
+    let WorkflowOutcome::ContinuedAsNew {
+        input,
+        new_workflow_type,
+    } = outcome
+    else {
+        return Ok(None);
+    };
+    resolve_continue_as_new_verdict(
+        conn,
+        registry,
+        execution,
+        input,
+        new_workflow_type.as_deref(),
+    )
+    .await
+    .map(Some)
 }
 
 /// State of the `(workflow_name, workflow_id)` uniqueness slot the successor
@@ -17493,87 +17646,38 @@ fn resolve_cross_type_max_input_bytes(
         .map_or(global_floor, |per_type| per_type.max(global_floor))
 }
 
-/// Returns `Ok(true)` when this cycle's continue-as-new attempt was
-/// internally redirected to a terminal failure instead of continuing. A
-/// blank/unregistered/DAG target, a live occupant of the successor slot, an
-/// oversized quota key, or an over-cap input (#1161) all redirect this way.
-/// `Ok(false)` means the successor was actually created. The caller
-/// (`persist_workflow_outcome`) uses this to correct the metrics and
-/// schedule-failure-counter accounting it already pre-computed for a plain
-/// `ContinuedAsNew` outcome. That accounting is wrong once this redirect
-/// fires (Codex P2 on PR #1399).
+/// The write step behind [`persist_workflow_continue_as_new`], driven by an
+/// already-resolved `verdict` (issue #1409). Performs the write the verdict
+/// decided; never re-validates. See [`resolve_continue_as_new_verdict`] for
+/// why re-validating here would be unsound, not just wasteful.
+///
+/// Returns `Ok(true)` when `verdict` redirected this cycle to a terminal
+/// failure instead of continuing. `Ok(false)` means the successor was
+/// actually created. The caller (`persist_workflow_outcome`) uses this to
+/// correct the metrics and schedule-failure-counter accounting it already
+/// pre-computed for a plain `ContinuedAsNew` outcome. That accounting is
+/// wrong once this redirect fires (Codex P2 on PR #1399).
 #[allow(clippy::too_many_lines)]
-#[doc(hidden)]
-pub async fn persist_workflow_continue_as_new(
+async fn persist_workflow_continue_as_new_with_verdict(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     persistence: WorkflowTaskPersistence<'_>,
     execution: &WorkflowExecution,
     input: serde_json::Value,
     new_workflow_type: Option<String>,
+    verdict: ContinueAsNewVerdict,
 ) -> HarvestResult<bool> {
     use crate::schema::{harvest_events, harvest_signals, harvest_workflow_executions};
 
     let offloader = registry.payload_offloader();
 
-    if reject_child_continue_as_new(conn, &persistence, execution, registry.payload_codecs())
-        .await?
-    {
-        return Ok(true);
-    }
-
-    // Issue #803: validate a cross-type target before anything is written, so
-    // an unregistered type can never seal the predecessor and strand an
-    // undispatchable successor.
-    // Same-type: the predecessor's own seal frees the slot, so nothing to do.
-    // Cross-type: `check_continue_as_new_type` resolves the target slot into
-    // this and rejects a live occupant before anything is persisted.
-    let mut successor_slot = SuccessorSlot::Free;
-    let target_info = match check_continue_as_new_type(
-        conn,
-        registry,
-        &persistence,
-        execution,
-        new_workflow_type.as_deref(),
-        &mut successor_slot,
-    )
-    .await?
-    {
-        ContinueAsNewTypeCheck::Rejected => {
+    let successor_quota_key = match verdict {
+        ContinueAsNewVerdict::Redirect(ContinueAsNewRedirect::ChildUnsupported) => {
+            reject_child_continue_as_new(conn, &persistence, execution, registry.payload_codecs())
+                .await?;
             return Ok(true);
         }
-        ContinueAsNewTypeCheck::SameType => None,
-        ContinueAsNewTypeCheck::CrossType(info) => Some(info),
-    };
-
-    // Cross-type input cap (issue #1161). A same-type continuation needs no
-    // check here: `WorkflowContext`'s own in-process check already enforced
-    // the correct cap before the command was pushed. A cross-type target's
-    // cap can only be resolved HERE, where the registry is reachable. The
-    // in-process context cannot see another type's `max_input_bytes`.
-    // Reject before any write, exactly like the quota-key check further
-    // below (see its comment for why a bare `Err` here is wrong). Checked
-    // BEFORE the `input.clone()` calls further down, so a rejected input
-    // never pays for two full clones it will never need (Codex-style review
-    // finding).
-    if let Some(info) = target_info {
-        let cap = resolve_cross_type_max_input_bytes(info, registry.max_workflow_input_bytes);
-        let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-        let offload_applies = registry
-            .payload_offloader()
-            .is_some_and(|o| observed > o.threshold());
-        if cap > 0 && observed > cap && !offload_applies {
-            let successor_workflow_name = new_workflow_type
-                .as_deref()
-                .unwrap_or(execution.workflow_name.as_str());
-            let error = HarvestError::PayloadTooLarge {
-                kind: crate::error::PayloadKind::WorkflowInput,
-                observed_bytes: observed,
-                cap_bytes: cap,
-                workflow_type: successor_workflow_name.to_string(),
-                activity_name: None,
-            }
-            .to_string();
+        ContinueAsNewVerdict::Redirect(ContinueAsNewRedirect::RootFailure { error }) => {
             persist_workflow_failure(
                 conn,
                 persistence.task.id,
@@ -17594,7 +17698,15 @@ pub async fn persist_workflow_continue_as_new(
             .await?;
             return Ok(true);
         }
-    }
+        ContinueAsNewVerdict::Continue {
+            successor_quota_key,
+        } => successor_quota_key,
+    };
+    // A plain, deterministic lookup on the already-verdicted target name —
+    // see `ContinueAsNewVerdict`'s doc for why this is not a re-validation.
+    let target_info = new_workflow_type
+        .as_deref()
+        .and_then(|t| registry.workflows.get(t));
 
     // Carry the predecessor's `last_completion_result` forward by its *stored*
     // representation (issue #524 / #488). If it was offloaded, copy the
@@ -17693,90 +17805,18 @@ pub async fn persist_workflow_continue_as_new(
         .as_deref()
         .unwrap_or(execution.workflow_name.as_str());
 
-    // Per-tenant quota key (issue #946). Continue-as-new is in-flight
-    // continuation of an already-admitted run, not a fresh admission, so --
-    // like the concurrency key just above -- this does NOT re-run
-    // enforcement (`quota::check_quota` is never called here). But unlike a
-    // plain bookkeeping value, `quota_key` backs an AGGREGATE accounting
-    // query (`quota::load_quota_usage`) that the tenant's NEXT genuinely-new
-    // admission reads: stamping `None` here would make the predecessor's
-    // active-execution slot (and its history bytes) silently invisible to
-    // that accounting the instant it continues-as-new, letting a looping
-    // entity workflow leak unbounded quota headroom on every hop. Same-type:
-    // carry the predecessor's already-resolved key forward verbatim (mirrors
-    // `execution.quota_key`, exactly like the concurrency key propagation
-    // below). Cross-type (#803): re-resolve against the TARGET type's own
-    // declared policy and the new input, reading `registry` directly --
-    // mirroring `resolve_workflow_concurrency` immediately below -- rather
-    // than the process-global `GLOBAL_WORKFLOW_METADATA` mirror, which is
-    // populated only by `HandlerRegistry::with_state_and_telemetry` and
-    // would silently resolve `None` for a `Worker` built from the raw
-    // `HandlerRegistry::new(..)` constructor even when `registry` itself
-    // has the target's `WorkflowInfo.quota` set correctly.
-    let successor_quota_key: Option<String> = new_workflow_type.as_deref().map_or_else(
-        || execution.quota_key.clone(),
-        |target| {
-            registry
-                .workflows
-                .get(target)
-                .and_then(|info| info.quota)
-                .and_then(|policy| crate::quota::resolve_quota_key(policy.key_expr, &input))
-        },
-    );
-    // Issue #946 (Codex round-3 review): a cross-type continuation
-    // re-resolves the quota key against the TARGET type's own declared
-    // policy and the fresh input -- unlike the same-type carry-forward
-    // above, which reuses a key that was already bound-checked at whatever
-    // earlier point it was first resolved. Reject rather than silently
-    // persisting an oversized key: the aggregate `quota::load_quota_usage`
-    // accounting keys on this column, and every OTHER path that stamps
-    // `quota_key` (fresh starts, the fan-out/child-timeout-race/detached
-    // child spawns) enforces this same bound before the row is written.
-    //
-    // Codex round-3 follow-up: this MUST fail the predecessor terminally
-    // in-place rather than returning `Err` out of this function. This whole
-    // call chain runs on ONE Diesel transaction
-    // (`process_workflow_task`'s `conn.transaction(async |conn| { .. })`),
-    // so a bare `Err` propagating via `?` rolls back everything written on
-    // `conn` so far this cycle and leaves the predecessor stuck `RUNNING`
-    // forever with no error ever recorded. `check_continue_as_new_type`'s
-    // own rejection arm (blank target, unregistered type, DAG target,
-    // occupied successor slot, cross-shard mismatch, unrepresentable
-    // deadline) already writes the terminal failure in-place and returns
-    // `Ok(..)` -- mirror that pattern rather than inventing a second
-    // failure-signalling convention inside this same function.
-    if let Some(key) = successor_quota_key.as_deref()
-        && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
-    {
-        let error = HarvestError::PayloadTooLarge {
-            kind: crate::error::PayloadKind::QuotaKey,
-            observed_bytes,
-            cap_bytes: crate::quota::MAX_QUOTA_KEY_BYTES,
-            workflow_type: successor_workflow_name.to_string(),
-            activity_name: None,
-        }
-        .to_string();
-        persist_workflow_failure(
-            conn,
-            task_id,
-            exec_id,
-            next_event_id,
-            worker_id,
-            persistence.task.crash_strikes,
-            &error,
-            None,
-            None,
-            None,
-            None,
-            None,
-            crate::types::Priority::default(),
-            registry.payload_codecs(),
-            // `metrics: None` above -- nothing can ever be collected here.
-            &mut Vec::new(),
-        )
-        .await?;
-        return Ok(true);
-    }
+    // Per-tenant quota key (issue #946): already resolved and bound-checked
+    // by `resolve_continue_as_new_verdict` (issue #1409) -- same-type carries
+    // the predecessor's key forward verbatim, cross-type re-resolves against
+    // the TARGET type's own declared policy and the fresh input. Continue-as-new
+    // is in-flight continuation of an already-admitted run, not a fresh
+    // admission, so this never re-runs `quota::check_quota` either way. But
+    // unlike a plain bookkeeping value, `quota_key` backs an AGGREGATE
+    // accounting query (`quota::load_quota_usage`) that the tenant's NEXT
+    // genuinely-new admission reads: stamping `None` here would make the
+    // predecessor's active-execution slot (and its history bytes) silently
+    // invisible to that accounting the instant it continues-as-new, letting a
+    // looping entity workflow leak unbounded quota headroom on every hop.
 
     let new_row = NewWorkflowExecution {
         id: new_exec_id.as_uuid(),
@@ -17994,6 +18034,43 @@ pub async fn persist_workflow_continue_as_new(
     .await
 }
 
+/// Resolve this cycle's continue-as-new verdict, then perform the write it
+/// decides (issue #1409). Test-support entry point: kept `#[doc(hidden)]`
+/// rather than semver-stable, since it exists so integration tests can drive
+/// the seal transaction directly (see e.g. `terminal_write_ownership_tests`'s
+/// claim-ownership guard). `persist_terminal_outcome_commands` does NOT call
+/// this — it resolves the verdict itself, earlier, so the abandoned-dispatch
+/// decision that depends on it runs first; see
+/// [`resolve_continue_as_new_verdict`]'s doc for why.
+#[doc(hidden)]
+pub async fn persist_workflow_continue_as_new(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    persistence: WorkflowTaskPersistence<'_>,
+    execution: &WorkflowExecution,
+    input: serde_json::Value,
+    new_workflow_type: Option<String>,
+) -> HarvestResult<bool> {
+    let verdict = resolve_continue_as_new_verdict(
+        conn,
+        registry,
+        execution,
+        &input,
+        new_workflow_type.as_deref(),
+    )
+    .await?;
+    persist_workflow_continue_as_new_with_verdict(
+        conn,
+        registry,
+        persistence,
+        execution,
+        input,
+        new_workflow_type,
+        verdict,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn persist_workflow_outcome(
     conn: &mut AsyncPgConnection,
@@ -18031,6 +18108,12 @@ async fn persist_workflow_outcome(
     // `effective_placement_router`. Threaded to `handle_suspended_workflow`'s
     // `Suspended` arm, the only one that can still create a cross-shard child.
     resolved_router: Option<&crate::shard::ShardRouter>,
+    // Issue #1409: the `ContinuedAsNew` arm's verdict, pre-resolved by
+    // `persist_terminal_outcome_commands` BEFORE it decided whether to
+    // record this cycle's abandoned dispatches — `None` when no caller
+    // needed that early decision, in which case the arm resolves it itself.
+    // Every other outcome arm ignores this.
+    continue_as_new_verdict: Option<ContinueAsNewVerdict>,
 ) -> HarvestResult<(bool, Vec<(ExecutionId, Option<String>)>)> {
     let parent_exec_id = execution.parent_id.map(execution_id_from_uuid);
     // A detached child has parent_close_policy set (non-null). Detached children
@@ -18213,13 +18296,31 @@ async fn persist_workflow_outcome(
             // terminal — the PREDECESSOR — so this stays its own name even for
             // a cross-type continuation (issue #803).
             let workflow_name = execution.workflow_name.clone();
-            let result = persist_workflow_continue_as_new(
+            // Issue #1409: use the pre-resolved verdict when the caller
+            // already needed one (so the abandoned-dispatch decision and this
+            // write agree); resolve fresh otherwise -- this arm's own only
+            // caller, `persist_terminal_outcome_commands`.
+            let verdict = match continue_as_new_verdict {
+                Some(verdict) => verdict,
+                None => {
+                    resolve_continue_as_new_verdict(
+                        conn,
+                        registry,
+                        execution,
+                        &input,
+                        new_workflow_type.as_deref(),
+                    )
+                    .await?
+                }
+            };
+            let result = persist_workflow_continue_as_new_with_verdict(
                 conn,
                 registry,
                 persistence,
                 execution,
                 input,
                 new_workflow_type,
+                verdict,
             )
             .await;
             fail_execution_on_error(conn, task, worker_id, result, registry.payload_codecs())
@@ -18510,7 +18611,7 @@ async fn run_deferred_schedule_counter(
 /// `FOR UPDATE` pause guard — in a single transaction (issue #383). Schedule
 /// counters are deferred to the caller via [`run_deferred_schedule_counter`]
 /// and run only after that outer transaction commits.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn persist_terminal_outcome_commands(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -18582,13 +18683,26 @@ async fn persist_terminal_outcome_commands(
     // (FINDING 1).
     let (mut timer_events, _armed) =
         plan_timer_lifecycle(conn, persistence.exec_id, pending_cmds).await?;
+
+    // Issue #1409: resolve a `ContinuedAsNew` outcome's verdict NOW, before
+    // deciding whether to record this cycle's abandoned dispatches below —
+    // see `resolve_continue_as_new_verdict_for_outcome`'s doc.
+    let continue_as_new_verdict =
+        resolve_continue_as_new_verdict_for_outcome(conn, registry, execution, &outcome).await?;
+    let will_redirect_to_failure = matches!(
+        continue_as_new_verdict,
+        Some(ContinueAsNewVerdict::Redirect(_))
+    );
+
     // Issue #952: a FAILING cycle also records the awaited work it dispatched
     // and then abandoned by returning `Err` before it could suspend — otherwise
     // the persisted history silently drops `StartChildWorkflow` /
-    // `ScheduleActivity` and lies about what the code did. Scoped to `Failed`:
-    // see `AbandonedDispatchPlan::disabled` for why a completed cycle keeps its
-    // pre-#952 behaviour exactly.
-    let abandoned_dispatches = if records_abandoned_dispatches(&outcome) {
+    // `ScheduleActivity` and lies about what the code did. Scoped to `Failed`
+    // (or, issue #1409, a `ContinuedAsNew` redirected to one above): see
+    // `AbandonedDispatchPlan::disabled` for why a genuinely completed or
+    // continued cycle keeps its pre-#952 behaviour exactly.
+    let abandoned_dispatches = if records_abandoned_dispatches(&outcome) || will_redirect_to_failure
+    {
         AbandonedDispatchPlan::resolve(conn, pending_cmds, recorded_dispatches.clone()).await?
     } else {
         AbandonedDispatchPlan::disabled()
@@ -18679,6 +18793,7 @@ async fn persist_terminal_outcome_commands(
         pending_cancel_metrics,
         continue_as_new_redirected_to_failure,
         resolved_router,
+        continue_as_new_verdict,
     )
     .await?;
     Ok((retry_scheduled, deferred_checks, race_deferred_triggers))
@@ -21317,6 +21432,10 @@ async fn process_workflow_task(
                         &mut pending_cancel_metrics,
                         &mut continue_as_new_redirected_to_failure,
                         resolved_router.as_ref(),
+                        // This path never computes an abandoned-dispatch
+                        // decision ahead of time (`is_terminal_with_commands`
+                        // is false here), so the arm resolves its own verdict.
+                        None,
                     )
                     .await?;
                     (retry_scheduled, deferred_checks, Vec::new())

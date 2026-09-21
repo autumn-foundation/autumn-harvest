@@ -40,14 +40,14 @@ use autumn_harvest::execution::{
     SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams,
     signal_with_start_workflow_execution, start_or_load_workflow_execution,
 };
-use autumn_harvest::info::WorkflowHandlerFn;
+use autumn_harvest::info::{ActivityHandlerFn, ActivityInfo, WorkflowHandlerFn};
 use autumn_harvest::models::WorkflowExecution;
 use autumn_harvest::schema::{harvest_schedules, harvest_signals, harvest_workflow_executions};
 use autumn_harvest::types::{
     ExecutionId, Priority, StartSource, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
 };
 use autumn_harvest::worker::{HandlerRegistry, NO_CAPABLE_WORKER_PREFIX};
-use autumn_harvest::{WorkflowContext, WorkflowInfo};
+use autumn_harvest::{ActivityContext, WorkflowContext, WorkflowInfo};
 use chrono::{Duration as ChronoDuration, Utc};
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
@@ -173,6 +173,31 @@ fn wf(name: &'static str, handler: WorkflowHandlerFn) -> WorkflowInfo {
 
 fn registry(infos: Vec<WorkflowInfo>) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(infos, vec![]))
+}
+
+fn act_info(name: &'static str, handler: ActivityHandlerFn) -> ActivityInfo {
+    ActivityInfo {
+        name,
+        module: "cross_type_continue_as_new_tests",
+        default_retry_policy: None,
+        default_start_to_close: None,
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_schedule_to_close: None,
+        default_queue: Some("default"),
+        max_concurrent: None,
+        concurrency_key: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        rate_limit_key_expr: None,
+        circuit_breaker: None,
+        is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        requires: None,
+        handler,
+    }
 }
 
 /// Start a root execution of `workflow_name`/`workflow_id` through the real
@@ -662,6 +687,136 @@ async fn a_tightened_target_cap_rejects_an_oversized_transition() {
     assert_eq!(
         rows, 1,
         "no successor may be created when the target's cap rejects the input"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1409 — a continue-as-new redirected to a terminal failure must
+// still record the cycle's abandoned dispatches (issue #952's synthetic
+// terminal pair), the same as any other failing cycle. Before the fix, the
+// abandoned-dispatch decision was made against the ORIGINAL `ContinuedAsNew`
+// outcome, before the worker discovered the redirect, so the pair was
+// silently dropped (a `tracing::warn!` only).
+// ---------------------------------------------------------------------------
+
+const ABANDONED_ACTIVITY_NAME: &str = "issue_1409_abandoned_activity";
+
+/// Never actually runs -- the dispatch is abandoned in the same cycle it is
+/// pushed. Still must be a REGISTERED activity: the fleet capability-miss
+/// guard (issue #804) inspects every command in a decision cycle's batch,
+/// abandoned or not, before the cycle is allowed to run at all.
+fn abandoned_activity_noop(
+    _ctx: &ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>> {
+    Box::pin(async move { Ok(serde_json::json!({"noop": true})) })
+}
+
+/// Phase 1 variant that also dispatches an activity in the SAME decision
+/// cycle as the transition. Neither branch resolves in a live cycle: the
+/// activity parks on its result channel, and `continue_as_new_as_type`
+/// parks forever by design. The executor reads this as "no more progress
+/// possible" and extracts `ContinuedAsNew` from the pushed commands, leaving
+/// the activity dispatch abandoned in the same batch.
+fn phase_one_forwarding_with_abandoned_activity<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target = input
+            .get("next_type")
+            .and_then(serde_json::Value::as_str)
+            .expect("phase_one_forwarding_with_abandoned_activity input must carry next_type")
+            .to_string();
+        let payload = input
+            .get("payload")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let dispatch =
+            ctx.execute_activity_raw(ABANDONED_ACTIVITY_NAME, serde_json::json!({}), "default");
+        let transition = ctx.continue_as_new_as_type(&target, payload);
+        let _ = futures::join!(dispatch, transition);
+        unreachable!("neither branch resolves within a live decision cycle");
+    })
+}
+
+/// A cross-type transition redirected to a terminal failure by the target's
+/// tightened `max_input_bytes` cap must still record the abandoned activity
+/// dispatch from the SAME cycle.
+#[tokio::test]
+async fn a_cap_redirected_transition_still_records_its_abandoned_dispatch() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let phase1 = leaked("trial_subscription");
+    let phase2 = leaked("paid_subscription");
+    let workflow_id = format!("sub-{}", Uuid::new_v4().simple());
+    let big_payload = serde_json::json!({"blob": "x".repeat(300)});
+
+    let predecessor = start_root(
+        &mut conn,
+        phase1,
+        &workflow_id,
+        serde_json::json!({"next_type": phase2, "payload": big_payload}),
+    )
+    .await;
+
+    // Same shape as `a_tightened_target_cap_rejects_an_oversized_transition`:
+    // phase 2 declares no override, so it falls back to the small
+    // fleet-wide floor set below.
+    let mut source = wf(phase1, phase_one_forwarding_with_abandoned_activity);
+    source.max_input_bytes = Some(10_000);
+    let target = wf(phase2, phase_two);
+    let reg = Arc::new(
+        HandlerRegistry::new(
+            vec![source, target],
+            vec![act_info(ABANDONED_ACTIVITY_NAME, abandoned_activity_noop)],
+        )
+        .with_payload_caps(10_000, 100, 10_000, 10_000),
+    );
+
+    let worker = build_runtime_worker("w-1409-cap-abandoned", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+    let failed = wait_for_execution_state(&url, predecessor, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    let error = failed
+        .error
+        .expect("a terminal failure must carry an error");
+    assert!(
+        error.contains(phase2),
+        "the operator message must name the target type, got: {error}"
+    );
+
+    let history = load_history_from_url(&url, predecessor).await;
+    assert!(
+        !history
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowContinuedAsNew { .. })),
+        "a cap-rejected transition may not record a continue-as-new"
+    );
+    assert!(
+        history.events.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityScheduled { name, .. } if name == ABANDONED_ACTIVITY_NAME
+        )),
+        "issue #1409: a continue-as-new redirected to a terminal failure must still record \
+         the cycle's abandoned activity dispatch, matching issue #952's rule for any other \
+         failing cycle; got {:?}",
+        history.events
+    );
+    assert!(
+        history.events.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityFailed {
+                non_retryable: true,
+                ..
+            }
+        )),
+        "the abandoned dispatch must carry its synthetic terminal half of the pair; got {:?}",
+        history.events
     );
 }
 

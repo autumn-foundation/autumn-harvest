@@ -3294,6 +3294,143 @@ async fn continue_as_new_cross_type_oversized_quota_key_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #1409 — a continue-as-new redirected to a terminal failure by the
+// quota-key cap must still record the cycle's abandoned dispatches (issue
+// #952's synthetic terminal pair), the same as any other failing cycle.
+// ---------------------------------------------------------------------------
+
+const ISSUE_1409_ABANDONED_ACTIVITY_NAME: &str = "issue_1409_quota_abandoned_activity";
+
+/// Never actually runs -- the dispatch is abandoned in the same cycle it is
+/// pushed. Still must be a REGISTERED activity: the fleet capability-miss
+/// guard (issue #804) inspects every command in a decision cycle's batch,
+/// abandoned or not, before the cycle is allowed to run at all.
+fn issue_1409_noop_activity(
+    _ctx: &ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>> {
+    Box::pin(async move { Ok(serde_json::json!({"noop": true})) })
+}
+
+/// [`oversized_key_phase_one`] plus an activity dispatched in the SAME
+/// decision cycle as the transition, abandoned when the cycle exits via
+/// continue-as-new.
+fn oversized_key_phase_one_with_abandoned_activity<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target = input["next_type"]
+            .as_str()
+            .expect("input.next_type must be present")
+            .to_string();
+        let oversized_tenant_id = input["oversized_tenant_id"]
+            .as_str()
+            .expect("input.oversized_tenant_id must be present")
+            .to_string();
+        let target: &'static str = Box::leak(target.into_boxed_str());
+        let dispatch = ctx.execute_activity_raw(
+            ISSUE_1409_ABANDONED_ACTIVITY_NAME,
+            serde_json::json!({}),
+            "default",
+        );
+        let transition = ctx.continue_as_new_as_type(
+            target,
+            serde_json::json!({ "tenant_id": oversized_tenant_id }),
+        );
+        let _ = futures::join!(dispatch, transition);
+        unreachable!("neither branch resolves within a live decision cycle");
+    })
+}
+
+/// A cross-type transition redirected to a terminal failure by the
+/// oversized-quota-key bound must still record the abandoned activity
+/// dispatch from the SAME cycle -- mirrors
+/// `continue_as_new_cross_type_oversized_quota_key_is_rejected` above, plus
+/// the abandoned dispatch.
+#[tokio::test]
+async fn continue_as_new_cross_type_oversized_quota_key_still_records_its_abandoned_dispatch() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let phase1 = leaked("quota_can_oversized_abandoned_from");
+    let phase2 = leaked("quota_can_oversized_abandoned_to");
+    let workflow_id = format!("sub-{}", Uuid::new_v4().simple());
+
+    let oversized_tenant_id = "x".repeat(usize::try_from(MAX_QUOTA_KEY_BYTES).expect("small") + 1);
+
+    let predecessor = start_root(
+        &mut conn,
+        phase1,
+        &workflow_id,
+        serde_json::json!({
+            "next_type": phase2,
+            "oversized_tenant_id": oversized_tenant_id,
+        }),
+    )
+    .await;
+
+    // A generous resource cap on the TARGET type -- the rejection below must
+    // be attributable to the KEY LENGTH bound, not any active-executions
+    // count.
+    let mut target = wf_info(phase2, phase_two);
+    target.quota = Some(QuotaPolicy::new("tenant_id").with_max_active_executions(1000));
+
+    let reg = Arc::new(HandlerRegistry::new(
+        vec![
+            wf_info(phase1, oversized_key_phase_one_with_abandoned_activity),
+            target,
+        ],
+        vec![act_info(
+            ISSUE_1409_ABANDONED_ACTIVITY_NAME,
+            issue_1409_noop_activity,
+        )],
+    ));
+    let worker = build_runtime_worker("w-1409-quota-abandoned", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+    let failed = wait_for_execution_state(&url, predecessor, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    let error = failed
+        .error
+        .expect("a terminal failure must carry an error");
+    assert!(
+        error.contains(phase2) && error.contains("QuotaKey"),
+        "the failure must name the target type and the QuotaKey payload kind, got {error}"
+    );
+
+    let history = load_history_from_url(&url, predecessor).await;
+    assert!(
+        !history
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowContinuedAsNew { .. })),
+        "a rejected cross-type transition must record no WorkflowContinuedAsNew"
+    );
+    assert!(
+        history.events.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityScheduled { name, .. } if name == ISSUE_1409_ABANDONED_ACTIVITY_NAME
+        )),
+        "issue #1409: a continue-as-new redirected to a terminal failure by the quota-key cap \
+         must still record the cycle's abandoned activity dispatch; got {:?}",
+        history.events
+    );
+    assert!(
+        history.events.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityFailed {
+                non_retryable: true,
+                ..
+            }
+        )),
+        "the abandoned dispatch must carry its synthetic terminal half of the pair; got {:?}",
+        history.events
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Issue #946, Codex round-3 review — a SAME-SHARD completion trigger whose
 // TARGET's per-tenant quota is exhausted at fire time must defer the start
 // to the durable outbox for retry, NOT propagate `Err` out of
