@@ -24005,7 +24005,8 @@ async fn set_legal_hold_handler(
 
     // Issue #1405: `set_legal_hold` refuses a row a concurrent cutover sealed
     // out from under it, rather than writing the hold onto the sealed
-    // tombstone. The `_forwarded` sibling follows the pointer and retries.
+    // tombstone. The `_forwarded` sibling follows the pointer and retries,
+    // and reports the shard it landed on.
     let result = ::autumn_harvest::shard_rebalance::set_legal_hold_forwarded(
         pool.sharded_pool(),
         exec_id,
@@ -24033,15 +24034,27 @@ async fn set_legal_hold_handler(
         shard_id: None,
         source: &source,
     };
-    // Best-effort, on its own connection. The write above already committed
-    // (or refused) on its own shard. An audit-log failure here must not mask
-    // that outcome from the caller.
-    if let Ok(mut conn) = db_conn_for_execution(&api_state, exec_id).await {
+    // Best-effort, on its own connection: an audit-log failure here must not
+    // mask the write's outcome from the caller (issue #1405 review). On
+    // success the write already reports the shard it landed on, so this
+    // reuses that instead of re-walking the forwarding pointer from
+    // scratch. On refusal or a genuine error nothing committed, so falling
+    // back to the usual resolution is fine.
+    let audit_conn = match &result {
+        Ok((_, shard)) => ::autumn_harvest::shard_rebalance::conn_for_shard(
+            pool.sharded_pool(),
+            *shard,
+        )
+        .await
+        .ok(),
+        Err(_) => db_conn_for_execution(&api_state, exec_id).await.ok(),
+    };
+    if let Some(mut conn) = audit_conn {
         let _ = audit::insert_audit(&mut conn, &ar).await;
     }
 
     match result {
-        Ok(outcome) => Ok((axum::http::StatusCode::OK, Json(outcome))),
+        Ok((outcome, _)) => Ok((axum::http::StatusCode::OK, Json(outcome))),
         Err(e) => Err(conflict_from(e)),
     }
 }
@@ -24097,12 +24110,21 @@ async fn release_legal_hold_handler(
     };
     // Best-effort, on its own connection. See the same-shaped comment in
     // set_legal_hold_handler.
-    if let Ok(mut conn) = db_conn_for_execution(&api_state, exec_id).await {
+    let audit_conn = match &result {
+        Ok((_, shard)) => ::autumn_harvest::shard_rebalance::conn_for_shard(
+            pool.sharded_pool(),
+            *shard,
+        )
+        .await
+        .ok(),
+        Err(_) => db_conn_for_execution(&api_state, exec_id).await.ok(),
+    };
+    if let Some(mut conn) = audit_conn {
         let _ = audit::insert_audit(&mut conn, &ar).await;
     }
 
     match result {
-        Ok(outcome) => Ok((axum::http::StatusCode::OK, Json(outcome))),
+        Ok((outcome, _)) => Ok((axum::http::StatusCode::OK, Json(outcome))),
         Err(e) => Err(conflict_from(e)),
     }
 }

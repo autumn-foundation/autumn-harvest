@@ -4565,15 +4565,19 @@ mod db {
     /// other forwarding walk in this module ([`MAX_FORWARD_HOPS`]). A chain
     /// that keeps moving still fails closed instead of looping forever.
     ///
-    /// Re-resolves through [`conn_for_execution_forwarded`] on every attempt,
-    /// rather than checking out the shard the refusal names directly (issue
-    /// #1405 review). That shard can alias the connection this call already
-    /// dropped a moment earlier. A pre-split staging deployment is the same
-    /// case [`conn_for_execution_forwarded_with_shard`]'s own hop loop
-    /// guards against. A raw checkout on a size-one aliased pool would then
-    /// wait forever for the connection this call itself just released.
-    /// `conn_for_execution_forwarded` already carries that guard; a fresh
-    /// call is simpler and safer than duplicating it here.
+    /// Re-resolves through [`conn_for_execution_forwarded_with_shard`] on
+    /// every attempt, rather than checking out the shard the refusal names
+    /// directly (issue #1405 review). That shard can alias the connection
+    /// this call already dropped a moment earlier. A pre-split staging
+    /// deployment is the same case that function's own hop loop guards
+    /// against. A raw checkout on a size-one aliased pool would then wait
+    /// forever for the connection this call itself just released. Re-
+    /// resolving already carries that guard; duplicating it here would not
+    /// be simpler or safer.
+    ///
+    /// Also returns the shard the write landed on (issue #1405 follow-up
+    /// review), so a caller that must attribute a follow-up action -- an
+    /// audit log, say -- to a shard does not pay for a second resolution.
     ///
     /// # Errors
     ///
@@ -4587,18 +4591,21 @@ mod db {
         hold_until: Option<DateTime<Utc>>,
         actor: &str,
         now: DateTime<Utc>,
-    ) -> HarvestResult<LegalHoldOutcome> {
+    ) -> HarvestResult<(LegalHoldOutcome, ShardId)> {
+        let mut last_shard = exec_id.shard();
         for _ in 0..MAX_FORWARD_HOPS {
-            let mut conn = conn_for_execution_forwarded(pool, exec_id).await?;
+            let (mut conn, shard) = conn_for_execution_forwarded_with_shard(pool, exec_id).await?;
+            last_shard = shard;
             match retention::set_legal_hold(&mut conn, exec_id, reason, hold_until, actor, now)
                 .await
             {
                 Err(HarvestError::ShardUnavailable { .. }) => {}
-                other => return other,
+                Ok(outcome) => return Ok((outcome, shard)),
+                Err(e) => return Err(e),
             }
         }
         Err(HarvestError::ShardUnavailable {
-            shard_id: exec_id.shard().as_i32(),
+            shard_id: last_shard.as_i32(),
             reason: format!(
                 "legal hold on {exec_id} did not settle within {MAX_FORWARD_HOPS} shard hops"
             ),
@@ -4609,7 +4616,8 @@ mod db {
     /// seal (issue #1405).
     ///
     /// See [`set_legal_hold_forwarded`] for the shape of the race this
-    /// closes and why each attempt re-resolves from scratch.
+    /// closes, why each attempt re-resolves from scratch, and why the
+    /// landing shard is returned alongside the outcome.
     ///
     /// # Errors
     ///
@@ -4620,16 +4628,19 @@ mod db {
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
         now: DateTime<Utc>,
-    ) -> HarvestResult<LegalHoldOutcome> {
+    ) -> HarvestResult<(LegalHoldOutcome, ShardId)> {
+        let mut last_shard = exec_id.shard();
         for _ in 0..MAX_FORWARD_HOPS {
-            let mut conn = conn_for_execution_forwarded(pool, exec_id).await?;
+            let (mut conn, shard) = conn_for_execution_forwarded_with_shard(pool, exec_id).await?;
+            last_shard = shard;
             match retention::release_legal_hold(&mut conn, exec_id, now).await {
                 Err(HarvestError::ShardUnavailable { .. }) => {}
-                other => return other,
+                Ok(outcome) => return Ok((outcome, shard)),
+                Err(e) => return Err(e),
             }
         }
         Err(HarvestError::ShardUnavailable {
-            shard_id: exec_id.shard().as_i32(),
+            shard_id: last_shard.as_i32(),
             reason: format!(
                 "legal hold release on {exec_id} did not settle within {MAX_FORWARD_HOPS} shard hops"
             ),
