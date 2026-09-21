@@ -73,13 +73,23 @@ Seeded, deterministic, production-shaped:
 
 ## 🧭 Plan — first tick at each noise size
 
-| noise rows | plan chosen | buffers | rows removed by filter | exec time |
-|---:|---|---:|---:|---:|
-| 20,000 | Index Scan on `idx_harvest_we_quota_reconcile_candidates`, residual filter | 3,870 (all hit) | 3,657 | 1.6ms |
-| 100,000 | same | 18,970 (all hit) | 18,682 | 9.8ms |
-| 500,000 | same | 95,091 (hit+read) | 94,467 | 141.3ms |
+| noise rows | plan chosen | buffers | rows removed by filter |
+|---:|---|---:|---:|
+| 20,000 | Index Scan on `idx_harvest_we_quota_reconcile_candidates`, residual filter | 3,870 (all hit) | 3,657 |
+| 100,000 | same | 18,970 (all hit) | 18,682 |
+| 500,000 | same | 95,091 (hit+read) | 94,467 |
 
-Figures match the committed `noise-*.explain.txt` files exactly.
+Buffers and rows-removed match the committed `noise-*.explain.txt` files
+exactly and reproduce bit-for-bit run to run (fixture ids are
+deterministic). Execution time is deliberately not tabulated here: every
+re-run of this capture (this file was captured six times over the course
+of this investigation, for reasons unrelated to this table) regenerates
+`noise-*.explain.txt` with a fresh, slightly different `Execution Time:`,
+and a table claiming exact millisecond figures needs updating on every
+such re-run to stay honest -- read the committed `noise-*.explain.txt`
+files directly for the timing that produced them, or the "Root cause"
+section below, whose measurements are all buffer-only for the same
+reason.
 
 Unlike the first (incorrect) pass, `idx_harvest_wfx_workflow_identity`
 is **never** picked here at any size. That index is not partial by
