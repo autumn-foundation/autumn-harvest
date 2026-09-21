@@ -25719,6 +25719,37 @@ async fn dispatch_call<T>(
     })
 }
 
+/// Per-shard block duration for a dispatch-channel read during multi-shard
+/// round-robin scanning (Codex review, issue #1429).
+///
+/// `run_poll_loop_multi` visits shard channels sequentially in one `for`
+/// loop. A read that blocks for the full configured `poll_interval` (the
+/// single-shard contract, C4) therefore serializes every idle shard's turn
+/// behind it. With `n` shards and work on only one, that shard could wait up
+/// to `(n - 1) * poll_interval` between reads. That holds even while a free
+/// permit and work were both available the whole time.
+const MULTI_SHARD_DISPATCH_READ_BLOCK: Duration = Duration::from_millis(10);
+
+/// The block duration a dispatch-channel read uses for one iteration.
+///
+/// `false` (single shard) returns `poll_interval` unchanged: there is no
+/// peer shard to starve, so the long-poll read stays byte-for-byte the
+/// pre-#1429 behaviour (contract C4). `true` caps the block at
+/// [`MULTI_SHARD_DISPATCH_READ_BLOCK`], so an idle shard's read returns
+/// quickly and the round-robin keeps moving instead of parking behind it.
+/// `run_poll_loop_multi`'s own "all idle" NOTIFY-listener wait already
+/// supplies the poll_interval-scale sleep once no shard has work. So
+/// shortening this block adds no extra round trips when every shard is
+/// genuinely idle.
+#[must_use]
+const fn dispatch_read_block(multi_shard: bool, poll_interval: Duration) -> Duration {
+    if multi_shard && poll_interval.as_nanos() > MULTI_SHARD_DISPATCH_READ_BLOCK.as_nanos() {
+        MULTI_SHARD_DISPATCH_READ_BLOCK
+    } else {
+        poll_interval
+    }
+}
+
 /// How many references one read asks for (issue #1312).
 ///
 /// The two pools have separate permits, and a workflow reference cannot start
@@ -26795,6 +26826,7 @@ impl Worker {
                         Some(shard_targets[idx].0),
                         installed,
                         &mut dispatch_states[idx],
+                        true,
                     )
                     .await
                 } else {
@@ -27958,14 +27990,21 @@ impl Worker {
     /// On a channel error it enters degraded mode. The worker then drains
     /// through [`Self::drain_postgres`] until the cooldown elapses. Availability
     /// equals the Postgres path while the channel is unreachable.
+    ///
+    /// `multi_shard` follows [`dispatch_read_block`]. `true` bounds the
+    /// channel read below so a caller round-robining several shards does not
+    /// park behind one idle shard's full `poll_interval` (Codex review,
+    /// issue #1429).
     async fn run_dispatch_iteration(
         &self,
         pool: &DbPool,
         shard: Option<crate::types::ShardId>,
         installed: &crate::dispatch::InstalledDispatch,
         state: &mut DispatchLoopState,
+        multi_shard: bool,
     ) -> bool {
         let settings = &installed.settings;
+        let block_for = dispatch_read_block(multi_shard, settings.poll_interval);
 
         // Degraded mode (issue #1312). The channel failed recently, so this
         // iteration does not touch it. A channel call that fails costs the poll
@@ -28022,18 +28061,19 @@ impl Worker {
             return false;
         };
 
-        // The read blocks for `poll_interval` by contract, so its cap is that
-        // wait plus the call timeout (contract C4). The shutdown arm gives a
+        // The read blocks for `block_for` (contract C4 for a single shard;
+        // capped by `dispatch_read_block` when round-robining several). Its
+        // cap is that wait plus the call timeout. The shutdown arm gives a
         // stopping worker its exit without waiting out the read.
         let read = tokio::select! {
             () = self.shutdown.cancelled() => return false,
             result = tokio::time::timeout(
-                settings.poll_interval + DISPATCH_CALL_TIMEOUT,
+                block_for + DISPATCH_CALL_TIMEOUT,
                 installed.channel.next(
                     &self.config.queues,
                     &self.config.worker_id,
                     want,
-                    settings.poll_interval,
+                    block_for,
                 ),
             ) => result,
         };
@@ -28050,7 +28090,7 @@ impl Worker {
             Err(_) => {
                 let error = HarvestError::Dispatch(format!(
                     "dispatch read did not answer within {:?}",
-                    settings.poll_interval + DISPATCH_CALL_TIMEOUT
+                    block_for + DISPATCH_CALL_TIMEOUT
                 ));
                 self.enter_degraded(state, &error, "dispatch read timed out", settings);
                 return self.drain_postgres(pool, shard).await;
@@ -28478,7 +28518,7 @@ impl Worker {
             if let Some(installed) = per_shard_installed.or_else(crate::dispatch::installed) {
                 if dispatch_allowed {
                     if self
-                        .run_dispatch_iteration(pool, shard, &installed, &mut dispatch_state)
+                        .run_dispatch_iteration(pool, shard, &installed, &mut dispatch_state, false)
                         .await
                         && let Some(shard) = shard
                     {
