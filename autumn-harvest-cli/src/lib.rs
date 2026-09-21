@@ -3417,8 +3417,8 @@ enum EventsCommand {
     Tail {
         /// Workflow execution ID to watch.
         execution_id: String,
-        /// Resume from this event_id (issue #1405), sent as the
-        /// Last-Event-ID header. NOT the shard-local harvest_events.id --
+        /// Resume from this `event_id` (issue #1405), sent as the
+        /// Last-Event-ID header. NOT the shard-local `harvest_events.id` --
         /// this is the per-execution sequence number the server's `id:`
         /// SSE field carries. Events after it are replayed before entering
         /// live-tail mode.
