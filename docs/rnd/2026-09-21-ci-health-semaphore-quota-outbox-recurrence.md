@@ -1,9 +1,10 @@
 # 🚦 Semaphore CI health — `quota_enforcement_tests`' unexplained outbox-retry
-# timeout recurs a 3rd time, and its 3rd occurrence shares a panic site with
-# a separate shard-10 wait-timeout cascade, tying two candidates this
-# report's first draft treated as unrelated; `corpus::seeded_corpus_is_
-# clean_under_the_syntactic_layer`'s 5th occurrence confirms the 09-18
-# report's diagnosis still holds (own-diff dead code, not a flake)
+# timeout recurs a 2nd confirmed time, and a 3rd, unrelated failure of the
+# same test at an earlier step shares its panic site with a separate
+# shard-10 wait-timeout cascade, tying two candidates this report's first
+# draft treated as unrelated; `corpus::seeded_corpus_is_clean_under_the_
+# syntactic_layer`'s 5th occurrence confirms the 09-18 report's diagnosis
+# still holds (own-diff dead code, not a flake)
 
 **Status:** health report — no PR opened against `ci.yml` or any test. Continues
 the series from `docs/rnd/2026-09-20-ci-health-semaphore-migration-count-message-fix.md`.
@@ -95,7 +96,7 @@ verification)", #1669) is the HEAD-most commit in this session's own branch
 history. Not actioned further here — it is a deterministic own-branch compile
 error, caught correctly by `Lint`/`MSRV` every time, already resolved.
 
-**Data-quality note (2 of 19):** `35549811155` and `35523524313` both report
+**Data-quality note (2 of 20):** `35549811155` and `35523524313` both report
 overall conclusion `failure` while `get_job_logs(run_id=..., failed_only=true)`
 returns zero failed jobs across all 30. Not root-caused this session — a
 plausible mechanism is a job that failed on an earlier attempt within the
@@ -150,46 +151,66 @@ in `cargo test`'s stdout, only in this test binary's own assertions. That
 gap is unchanged; this session did not obtain worker-level logging either.
 
 Two occurrences with an identical, specific panic text is a meaningfully
-stronger signal than the single occurrence the 09-16 report logged.
+stronger signal than the single occurrence the 09-16 report logged, and
+**this is now confirmed as this test's own mechanism, at 2/2 occurrences**
+(the count is not diluted by the 3rd occurrence below, which is a different
+failure — see the correction).
 
-**Added after review (Codex's census correction, above, surfaced this): a
-3rd occurrence, with a different signature that reframes the finding.** Run
-`35576291757` (`Test DB (linux, shard 10)`, `claude/kind-hopper-wbrak0`,
-2026-09-21T08:07:53Z, `run_attempt: 2`) failed the same test again, but this
-time the panic is **not** the specific "target row" assertion — it is the
-generic shared-helper timeout:
+**Added after review (Codex's census correction, above, surfaced this), then
+corrected again by a second review round.** Run `35576291757` (`Test DB
+(linux, shard 10)`, `claude/kind-hopper-wbrak0`, 2026-09-21T08:07:53Z,
+`run_attempt: 2`) failed the same test a 3rd time, at a different panic
+site:
 
 ```
 thread 'quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded' panicked at autumn-harvest/tests/integration/integration_e2e.rs:1383:6:
 workflow should reach expected state within timeout: Elapsed(())
 ```
 
-This is the identical panic site and text as item 4's mass cascade
-(`wait_for_execution_state_with_timeout`). Checked whether that is
-coincidence: `.github/ci/integration-suites.txt`'s row-ordinal sharding
-(`row_ordinal % 11`) puts **both** `integration_e2e` (row 32, `32 % 11 =
-10`) and `quota_enforcement_tests` (row 43, `43 % 11 = 10`) on shard 10 —
-confirmed by direct calculation, not assumed. Shard 10 is not an arbitrary
-one-in-eleven sample; it is specifically the shard carrying the two largest
-serial suites in the manifest. Item 4's own shard-10 leg (same run,
-`35563198153`) independently confirms this: its full log shows this exact
-test — `completion_trigger_defers_to_outbox_when_target_quota_exceeded` —
-also panicking at `integration_e2e.rs:1383:6`, alongside roughly 60 other
-`integration_e2e`/`quota_enforcement_tests` tests in the same shard, nearly
-all at the identical site.
+**Correction (post-review):** an earlier draft of this section called this
+a 3rd occurrence *of the outbox-retry timeout*, with two readings offered
+for why the signature differed. A Codex review correctly pointed out that
+this conflates two entirely different waits inside the same test function.
+Reading the source
+(`quota_enforcement_tests.rs:3400-3466`): the test starts a source
+workflow, waits for it to reach `COMPLETED` at **line 3416** —
+`wait_for_execution_state(&url, source, "COMPLETED").await`, a thin
+10-second wrapper around the shared
+`wait_for_execution_state_with_timeout` helper (confirmed at
+`integration_e2e.rs:1348-1360`) — asserts the outbox row count, asserts the
+target row count, **then** frees the quota slot (`mark_terminal`, line
+~3453) and only **then** enters the outbox-retry-specific polling loop
+(lines ~3455-3466) that produces the "target row was never created" panic.
+`35576291757`'s panic is at `integration_e2e.rs:1383:6`, the shared
+helper's own `.expect(...)` — reached only from line 3416's call, **before**
+the quota slot is freed and before the outbox-retry loop is ever entered.
+**This is not a 3rd occurrence of the outbox-retry timeout at all.** It is
+a separate failure of the same test, at an earlier, unrelated step: the
+*source* workflow itself did not reach `COMPLETED` within 10 seconds,
+which has nothing to do with the target's quota, the outbox, or the retry
+sweep.
 
-**This changes the finding.** What looked like one recurring, specific
-mechanism (a background outbox-retry sweep race) is now 2 occurrences of
-that specific signature plus a 3rd, differently-signatured occurrence that
-directly ties this test to item 4's shard-10-wide cascade. The two
-signatures may be genuinely independent (a real outbox-retry race *and* a
-separate shard-10 contention problem, both hitting the same test because it
-happens to poll twice — once via its own bespoke wait loop, once via the
-shared helper), or the "target row" signature could itself be an earlier,
-partial stage of the same contention problem (the background sweep merely
-delayed, not absent) — this session cannot distinguish the two without
-worker-level tracing, which remains unavailable. Both readings are recorded,
-neither claimed as confirmed.
+That correction changes what this occurrence is evidence *for*. A generic
+"a workflow didn't reach its expected state in time" timeout, at the exact
+panic site item 4's mass cascade also hits, is not a 3rd data point for the
+specific outbox-retry race — it is a data point connecting *this test's
+own occasional flakiness* to item 4's broader shard-10 pattern instead.
+Checked whether the shard-10 co-location is coincidence:
+`.github/ci/integration-suites.txt`'s row-ordinal sharding (`row_ordinal %
+11`) puts **both** `integration_e2e` (row 32, `32 % 11 = 10`) and
+`quota_enforcement_tests` (row 43, `43 % 11 = 10`) on shard 10 — confirmed
+by direct calculation, not assumed. Item 4's own shard-10 leg (same run,
+`35563198153`) independently confirms the connection: its full log shows
+this exact test also panicking at `integration_e2e.rs:1383:6` (the same
+generic site, not the outbox-specific one), alongside roughly 60 other
+`integration_e2e`/`quota_enforcement_tests` tests in the same shard.
+
+**Restated precisely:** this test has 2 confirmed occurrences of a
+specific outbox-retry mechanism (its own candidate for a product-vs-test
+verdict, unchanged by this correction) and, separately, 1 occurrence of a
+generic dispatch/wait timeout that connects it to item 4's shard-10
+pattern rather than to the outbox-retry mechanism. Both are recorded as
+open, neither conflated with the other.
 
 Three occurrences (2 of one signature, 1 of another, on the identical test)
 is still far short of this role's own ≥20-rerun bar for a measured rate, and
@@ -437,14 +458,22 @@ Carried forward, unchanged from prior reports in this series:
   item 3's correction. 2/20 a census/tooling gap (conclusion/job mismatch).
   4/20 unresolved, with no rendered test-vs-product verdict: items 2 (2 of
   its 3 occurrences fall in this window), 4, and 5.
-- **Item 2:** 3 confirmed occurrences of
-  `quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded`
-  across the whole series — 2 carry byte-identical panic text (`"target row
-  was never created by the outbox retry; last count was 1"`), 6 days apart,
-  2 different branches; the 3rd (found only after the census correction)
-  panics at a different, shared-helper site that is byte-identical to item
-  4's cascade. Not a rate (n=3, no rerun protocol run). No revert check
-  applies — no fix was made or attempted this session.
+- **Item 2: correction (post-review).** An earlier draft counted all 3
+  occurrences of this test as evidence for one mechanism. Reading the test
+  source (`quota_enforcement_tests.rs:3400-3466`) shows the 3rd occurrence's
+  panic site (`integration_e2e.rs:1383:6`, reached from line 3416's
+  `wait_for_execution_state` call) fires **before** the quota slot is freed
+  and **before** the outbox-retry loop is ever entered — it is not the
+  mechanism the first two occurrences exercise. Corrected: **2/2 confirmed
+  occurrences** of the specific outbox-retry mechanism carry byte-identical
+  panic text (`"target row was never created by the outbox retry; last
+  count was 1"`), 6 days apart, 2 different branches — a real recurring
+  signal, own rerun-campaign candidate. **Separately, 1 occurrence** of a
+  generic wait-timeout at an earlier, unrelated step of the same test,
+  byte-identical to item 4's cascade site — evidence for item 4's pattern,
+  not for the outbox-retry mechanism. Neither is a rate (n=2 and n=1,
+  no rerun protocol run). No revert check applies — no fix was made or
+  attempted this session.
 - **Item 3: correction (post-review).** 5th confirmed occurrence (not a 4th,
   per the correction above), on a 3rd distinct branch — direct log
   inspection (re-grepped after review for the `--- rustc diagnostics ---`
@@ -522,14 +551,28 @@ grep -n "quota_enforcement_tests::completion_trigger_defers_to_outbox_when_targe
 #    the 09-16 report's run 35034838493 (there at line 3329, six days of
 #    unrelated edits explain the line-number drift).
 
-# Item 2's 3rd occurrence, different signature, found only after the
-# census correction recovered run 35576291757:
+# Item 2's 3rd occurrence, found only after the census correction
+# recovered run 35576291757:
 # get_job_logs(job_id=106285217766, return_content=false) -> signed URL
 curl -sS -o shard10_kindhopper.log '<signed logs_url>'
 grep -n "panicked at" shard10_kindhopper.log | grep completion_trigger
 # -> panics at integration_e2e.rs:1383:6 ("workflow should reach expected
 #    state within timeout: Elapsed(())") -- NOT the target-row assertion of
 #    the first two occurrences.
+
+# Post-review correction: confirming this is NOT the outbox-retry mechanism.
+# wait_for_execution_state (the call reached from) is a thin 10s wrapper
+# around the shared helper that panics at integration_e2e.rs:1383:
+sed -n '1348,1360p' autumn-harvest/tests/integration/integration_e2e.rs
+# The ONLY call to wait_for_execution_state (not _with_timeout) in this
+# test is at line 3416, waiting for the SOURCE workflow to reach COMPLETED
+# -- before the quota slot is freed (mark_terminal, ~3453) and before the
+# outbox-retry polling loop (~3455-3466) that produces the "target row"
+# panic:
+sed -n '3400,3466p' autumn-harvest/tests/integration/quota_enforcement_tests.rs
+# -> confirms the 3rd occurrence is a separate, earlier, unrelated wait --
+#    a data point for item 4's pattern, not a 3rd occurrence of the
+#    outbox-retry mechanism the first two occurrences share.
 
 # Item 4's shared-helper check, shard 3 (worst-hit):
 # get_job_logs(job_id=106225838152, return_content=false) -> signed URL
