@@ -98,7 +98,7 @@ still present and unchanged; the corrected method adds exactly one more
 | `35553863066` | `claude/laughing-maxwell-9t78rp` | `quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded` — see item 2, a 2nd confirmed occurrence |
 | `35576291757` | `claude/kind-hopper-wbrak0` (run_attempt 2) | same test as item 2, but a 3rd, differently-signatured occurrence found only after the census correction above — see item 2 |
 | `35557880574` | `claude/kind-hopper-wbrak0` | comment-hygiene Tier B (`execution.rs`, own diff) |
-| `35563198153` | `claude/keen-bardeen-amm1ft` | 6 shards fail; nearly all failures panic at the same shared polling helper — see item 4 |
+| `35563198153` | `claude/keen-bardeen-amm1ft` | 6 shards fail; of the 2 shards (3, 10) whose full logs were inspected, nearly all failures panic at the same shared polling helper — shards 0, 4, 5, 8 not inspected, see item 4 |
 | `35566461177` | `claude/kind-hopper-wbrak0` | `cargo fmt` diff (own diff) |
 | `35523524313` | `claude/kind-clarke-ef1yn2` | run conclusion `failure`, but 0 failed jobs of 30 — same data-quality note as `35549811155` |
 
@@ -167,10 +167,15 @@ in `cargo test`'s stdout, only in this test binary's own assertions. That
 gap is unchanged; this session did not obtain worker-level logging either.
 
 Two occurrences with an identical, specific panic text is a meaningfully
-stronger signal than the single occurrence the 09-16 report logged, and
-**this is now confirmed as this test's own mechanism, at 2/2 occurrences**
-(the count is not diluted by the 3rd occurrence below, which is a different
-failure — see the correction).
+stronger signal than the single occurrence the 09-16 report logged.
+**Correction (post-review):** an earlier draft called this "confirmed as
+this test's own mechanism" — overstated. What is confirmed at 2/2 is the
+recurring *signature* (the same assertion, the same panic text); the
+underlying *mechanism* (whether the background sweep ran and no-op'd, ran
+and failed, or never ran at all) is exactly as unestablished as the
+paragraph above already says — this correction doesn't change that, only
+removes the contradictory claim. (The count is not diluted by the 3rd
+occurrence below, which is a different failure — see the correction.)
 
 **Added after review (Codex's census correction, above, surfaced this), then
 corrected again by a second review round.** Run `35576291757` (`Test DB
@@ -556,20 +561,30 @@ Carried forward, in priority order:
    campaign is comparatively less urgent, at 0/1 confirmed exposure and no
    fresh occurrences since) — still not run by any session; no Docker
    available in this session's sandbox.
-2. **Fix the `test-db-linux` shard-10 sharding-manifest gap (issue #1267's
-   collision, reintroduced)** — a confirmed, real CI-cost regression, worth
-   fixing on its own merits, but demoted from "top priority" now that the
-   claimed connection to this report's flakes is unconfirmed (see item 4's
-   correction). The fix shape is still essentially known: reorder or pad
-   `.github/ci/integration-suites.txt` (or bump `SEMAPHORE_SHARD_COUNT`,
-   keeping the matrix list length in sync) so `integration_e2e` (row 32)
-   and `quota_enforcement_tests` (row 43) no longer land on the same shard,
-   then time the affected shards before and after — and, separately, do a
-   full manifest-wide accounting (this session only checked two suites
-   plus one more) before assuming shard 10 is the single worst-imbalanced
-   shard. A durable fix should add a harness (a guard script in
-   `docs/audits/`, this repo's own convention) so the invariant cannot
-   silently drift again as the manifest keeps growing alphabetically.
+2. **Investigate, then fix, the `test-db-linux` shard balance (issue
+   #1267's `integration_e2e`/`quota_enforcement_tests` collision is
+   confirmed reintroduced, but is not confirmed to be the worst imbalance
+   today)** — a real CI-cost regression, worth fixing, but demoted from
+   "top priority" now that its connection to this report's flakes is
+   unconfirmed (see item 4's correction). **Correction (post-review):** an
+   earlier draft of this item prescribed the fix mechanism (reorder or pad
+   the manifest, or bump the shard count) ahead of the accounting that
+   should decide it — wrong order. Reordering or padding
+   `.github/ci/integration-suites.txt` shifts the row ordinal of every
+   suite after the insertion point, and bumping `SEMAPHORE_SHARD_COUNT`
+   remaps every row; either can silently create a new collision elsewhere
+   while fixing this one, and this session has not done the full
+   per-shard test-weight accounting (across all 11 shards, all manifest
+   rows — this session only checked two suites plus one more) that would
+   catch that. **Corrected order: simulate current per-shard weight across
+   the full manifest first** (the same method `ci.yml`'s own comment says
+   issue #1267's fix used — `#[tokio::test]` count per row, summed per
+   shard), *then* pick whichever of reorder/pad/shard-count-bump minimizes
+   the max-min spread without introducing a new collision, *then* time the
+   affected shards before and after. A durable fix should also add a
+   harness (a guard script in `docs/audits/`, this repo's own convention)
+   so the invariant cannot silently drift again as the manifest keeps
+   growing alphabetically.
 3. **Whether shard-10 overload (or anything else) actually explains item
    2's 3rd occurrence or item 4's cascade** — genuinely open after this
    round's corrections. Sequential shard execution rules out concurrent
