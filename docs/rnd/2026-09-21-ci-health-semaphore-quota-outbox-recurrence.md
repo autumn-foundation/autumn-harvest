@@ -1,15 +1,17 @@
-# 🚦 Semaphore CI health — `test-db-linux` shard 10's overload is a
-# confirmed regression of a previously-fixed, previously-measured sharding
-# defect (issue #1267's `integration_e2e`/`quota_enforcement_tests`
-# collision, silently reintroduced by alphabetical manifest growth), found
-# while chasing `quota_enforcement_tests`' own 2nd confirmed outbox-retry
-# timeout; `corpus::seeded_corpus_is_clean_under_the_syntactic_layer`'s 5th
+# 🚦 Semaphore CI health — `quota_enforcement_tests`' outbox-retry timeout
+# recurs a 2nd confirmed time; chasing its 3rd, differently-signatured
+# failure surfaced a real but narrower finding: `test-db-linux` shard 10's
+# `integration_e2e`/`quota_enforcement_tests` collision is a confirmed
+# regression of a previously-fixed, previously-measured sharding defect
+# (issue #1267), worth fixing on its own, but NOT established as the cause
+# of either flake — sequential shard execution rules that mechanism out;
+# `corpus::seeded_corpus_is_clean_under_the_syntactic_layer`'s 5th
 # occurrence confirms the 09-18 report's diagnosis still holds
 
 **Status:** health report — no PR opened against `ci.yml` or any test. Continues
 the series from `docs/rnd/2026-09-20-ci-health-semaphore-migration-count-message-fix.md`.
 
-**Corrected across five review rounds** (Codex on this PR): the initial
+**Corrected across seven review rounds** (Codex on this PR): the initial
 draft of item 3 reopened
 `corpus::seeded_corpus_is_clean_under_the_syntactic_layer` as "still
 undiagnosed" and miscounted it as a 4th occurrence on a fifth branch,
@@ -22,19 +24,25 @@ rebuilding it via the documented method recovered one more failure
 (`35576291757`). Fourth, a review round caught that this recovered failure
 was wrongly analyzed as both a 3rd occurrence of item 2's specific
 outbox-retry mechanism and a 2nd occurrence of item 4's mass cascade;
-neither held up against the source and the full log. **Fifth, and most
-consequential: a review round caught that the walk-back on the fourth
-point had itself overcorrected** (calling the 3rd occurrence's wait
-"unrelated" to quota when it is the test's own primary quota-deferral
-assertion) and, separately, that the shard-10 co-location this report had
-been treating as an unmeasured hypothesis is actually a **confirmed
-regression of a previously-fixed, previously-measured CI-health defect**
-(`ci.yml`'s own comment documents issue #1267's fix for this exact
-collision, including a historical baseline — ~35 min vs 18-28 min per
-shard — that this report had not read closely enough on the first four
-passes). All five corrected below, inline at the point each applies; the
-report's headline finding and recommended priority changed with each
-round.
+neither held up against the source and the full log. Fifth, a review round
+caught that the walk-back on the fourth point had itself overcorrected
+(calling the 3rd occurrence's wait "unrelated" to quota when it is the
+test's own primary quota-deferral assertion) and separately surfaced that
+the shard-10 co-location is a genuine, previously-fixed, previously-
+measured regression (issue #1267) — this session's biggest finding, but
+the report's fifth draft then overstated it as a *confirmed explanation*
+for the flakes. **Sixth and seventh, two more rounds cut that overstatement
+back down**: the sizing claim ("the manifest's two largest suites") used
+an incomplete test-count grep and was never checked against the rest of
+the manifest (a third suite turns out to be individually larger); and,
+more substantively, `.github/ci/run-suites.sh` runs a shard's suites
+**sequentially**, not concurrently, which rules out the "resource
+contention between the two suites" mechanism the fifth round's framing
+assumed. The manifest-gap regression is real and worth fixing regardless;
+that it explains either observed flake is not established. All seven
+corrected below, inline at the point each applies — this report's
+confidence in its own headline finding rose sharply, then came back down
+to something narrower and better supported.
 
 ## 🎯 Verdict path
 
@@ -207,32 +215,37 @@ permanently stuck non-`COMPLETED`, and `wait_for_execution_state` timing
 out at 10s waiting for a state that will never arrive. That remains a live,
 undismissed candidate.
 
-**What is now also confirmed, and changes which candidate is more likely:**
+**What is confirmed, and what a later review round cut back down:**
 `.github/ci/integration-suites.txt`'s row-ordinal sharding (`row_ordinal %
-11`) puts **both** `integration_e2e` (row 32, `32 % 11 = 10`) and
-`quota_enforcement_tests` (row 43, `43 % 11 = 10`) on shard 10. This is not
-merely a coincidence this session noticed — `ci.yml`'s own comment at the
-`test-db-linux` matrix (lines 988-997) documents that these exact two
-suites colliding on one shard is a **previously fixed, previously
-measured** problem: *"11, not 10 (issue #1267 review). `row_ordinal % 10`
-put `integration_e2e` and `quota_enforcement_tests` on one shard... That
-shard ran ~35 min against 18-28 min for every other shard... 11 shares no
-factor with the 10-row gap, so it cannot reproduce the collision."* At the
-time of that fix, the two suites' manifest positions were exactly 10 rows
-apart; today they are exactly 11 rows apart — because the manifest is
-alphabetically generated and grows as new integration test files are added
-between "integration_e2e" and "quota_enforcement_tests" alphabetically, the
-gap silently drifted from 10 to 11, landing on the one specific multiple
-the chosen shard count cannot tolerate. **This is a confirmed regression of
-a previously-fixed, previously-measured CI-health defect (issue #1267), not
-an unmeasured hypothesis** — and it directly explains both this occurrence
-and item 4's cascade without requiring either to be a genuine product bug.
-It does not, however, rule the product-bug reading out: a shard running 35
-minutes of other tests' contention is exactly the kind of environment where
-a marginal, genuinely-racy quota-deferral bug would also be more likely to
-surface. This session cannot distinguish "purely shard-10 overload" from "a
-real product race made more likely by shard-10 overload" without the same
-missing worker-tracing evidence noted throughout this report.
+11`) puts **both** `integration_e2e` (row 32) and `quota_enforcement_tests`
+(row 43) on shard 10 — confirmed, and `ci.yml`'s own comment (lines
+988-997) confirms this exact pair colliding was already found and fixed
+once under issue #1267, with a total-job-duration baseline already on
+record (~35 min vs 18-28 min per shard). The manifest gap drifted from 10
+rows (what the fix accounted for) to 11 (the one value it can't tolerate)
+as the alphabetically-generated manifest grew. **That drift is real.**
+
+**Correction (post-review):** an earlier draft of this paragraph said the
+drift "directly explains both this occurrence and item 4's cascade," and
+described shard 10 as running "35 minutes of other tests' contention." A
+further review round caught two problems this session had not checked:
+first, `#[tokio::test]`-only counting undercounted both suites (118 and 44
+tests, not 68 and 43) and, checked against the wider manifest for the
+first time, a third suite (`event_partitioning_tests.rs`, 148 tests, a
+different shard) is individually larger than either — so "the manifest's
+two largest suites" is `ci.yml`'s claim from the time of its own fix, not
+something this session re-verified against today's manifest. Second, and
+more importantly: `.github/ci/run-suites.sh` runs a shard's suites
+**sequentially**, one `cargo test` invocation at a time, confirmed by
+reading the script directly — the two suites never execute concurrently,
+so "contention" between them during either one's run is not an established
+mechanism. The confirmed total-duration imbalance is worth fixing on its
+own merits; it does not by itself explain why an individual 10-second poll
+times out. **Downgraded accordingly:** shard-10 overload is a real,
+confirmed regression worth fixing, but is no longer claimed as an
+established explanation for this occurrence or item 4's cascade — both
+remain open, alongside the product-bug reading this paragraph already
+flagged as undismissed.
 
 **Restated precisely:** this test has 2 confirmed occurrences of a specific
 outbox-retry-loop panic (unchanged candidate for its own product-vs-test
@@ -329,31 +342,63 @@ identical `integration_e2e.rs:1383:6` site — including the exact test item
 `quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded`
 (see item 2's own correction above).
 
-**Elevated from hypothesis to confirmed regression (post-review, second
-round).** `.github/ci/integration-suites.txt`'s row-ordinal sharding puts
+**The manifest gap has drifted back onto a colliding value (confirmed) —
+but two further review rounds cut back how much this explains, and by how
+much.** `.github/ci/integration-suites.txt`'s row-ordinal sharding puts
 both `integration_e2e` (row 32) and `quota_enforcement_tests` (row 43) on
-shard 10 (`32 % 11 = 43 % 11 = 10`). This is not this session's own
-discovery of a coincidence — `ci.yml`'s own comment at the `test-db-linux`
-matrix definition (lines 988-997) documents that this exact collision was
-already found, measured, and fixed once: *"11, not 10 (issue #1267
-review). `row_ordinal % 10` put `integration_e2e` and
+shard 10 (`32 % 11 = 43 % 11 = 10`). `ci.yml`'s own comment at the
+`test-db-linux` matrix definition (lines 988-997) documents that this exact
+pair colliding on one shard was already found and fixed once: *"11, not
+10 (issue #1267 review). `row_ordinal % 10` put `integration_e2e` and
 `quota_enforcement_tests` on one shard. These are the manifest's two
 largest, most wall-clock-timeout-shaped suites... That shard ran ~35 min
 against 18-28 min for every other shard... 11 shares no factor with the
-10-row gap, so it cannot reproduce the collision."* Both files' own
-`#[tokio::test]` counts confirm the sizing claim directly (68 in
-`integration_e2e.rs`, 43 in `quota_enforcement_tests.rs`, 111 combined —
-far above any other single suite in the manifest). At the time of that fix
-the two suites' manifest rows were 10 apart; today, per direct count, they
-are 11 apart — because the manifest is generated in alphabetical order and
-grows as new integration test files land between "integration_e2e" and
-"quota_enforcement_tests" alphabetically, the gap silently drifted onto the
-one multiple the chosen shard count cannot tolerate. **This is a confirmed
-regression of a previously-fixed, previously-measured CI-health defect
-(issue #1267), not an unmeasured hypothesis** — and the invariant that
-prevented it has no guard: nothing in this repository currently checks
-that these two suites (or any other pair) stay off the same shard as the
-manifest continues to grow.
+10-row gap, so it cannot reproduce the collision."* At the time of that fix
+the two suites' rows were 10 apart; today they are 11 apart — the manifest
+is alphabetically generated and grows as new files land between the two
+names, so the gap silently drifted onto the one multiple the chosen shard
+count can't tolerate. **That drift is confirmed**, independent of anything
+below.
+
+**Correction (post-review, two more findings).** First, the sizing claim
+above was checked against an incomplete grep. `#[tokio::test]` (the bare
+spelling only) undercounted every test using an argument, e.g.
+`#[tokio::test(flavor = "multi_thread")]`. Recounted with `^#\[tokio::test`
+(matching every variant): `integration_e2e.rs` has **118**,
+`quota_enforcement_tests.rs` has **44** — and, checked against the rest of
+the manifest for the first time this round, `event_partitioning_tests.rs`
+alone has **148**, more than either of shard 10's suites individually
+(it lands on shard 7 — row 28, `28 % 11 = 7` — not shard 10). **This
+session has not done a full per-shard accounting across all 11 shards**,
+so "shard 10 carries the manifest's two largest suites" is `ci.yml`'s own
+historical claim from the time of the 2026 fix, not something this session
+has re-verified as still true today; it may no longer be the single worst
+shard.
+
+Second, and more substantively: `.github/ci/run-suites.sh`'s `do_run`
+processes a shard's matching manifest rows in a single `while read` loop,
+one `cargo test` invocation per row, **sequentially** — confirmed by
+reading the script directly (no backgrounding, no parallel job dispatch
+within a shard). `integration_e2e` and `quota_enforcement_tests` therefore
+**never run at the same wall-clock instant** on shard 10; one completes
+before the other starts. The historical "~35 min vs 18-28 min" figure is
+real and is a genuine, confirmed **total-job-duration imbalance** — worth
+fixing for CI cost and wall-clock reasons on its own — but it is not, by
+itself, an established mechanism for why an *individual test's* fixed
+10-second poll would time out, since the two suites don't contend for the
+database or CPU simultaneously. Any link between the imbalance and the
+specific timeout panics observed (item 2's 3rd occurrence, item 4's
+cascade) would have to run through a different, unverified mechanism —
+resource leakage accumulating across a long sequence of `cargo test`
+invocations, GitHub Actions runner-level effects on an outsized job, or
+simple coincidence with broader CI-fleet contention during a long job —
+none of which this session measured. **Restated at the confidence this
+evidence actually supports:** the shard-10 total-duration imbalance is a
+real, confirmed regression of a previously-fixed defect, worth fixing
+regardless of the flakes; the specific claim that it *causes* the observed
+per-test timeouts is downgraded back to an unconfirmed hypothesis, and the
+claim that shard 10 is uniquely the worst-imbalanced shard is unverified
+pending a full manifest accounting.
 
 **Correction (post-review):** an earlier draft of this section, and of item
 2's summary, called item 2's 3rd occurrence (`35576291757`) a **2nd
@@ -417,112 +462,115 @@ are unresolved: item 2 (`35553863066`, `35576291757` — 2 of item 2's 3
 occurrences; the 1st, `35034838493`, predates this window), item 4
 (`35563198153`), and item 5 (`35535358141`).
 
-**Item 2, corrected twice more (post-review).** The outbox-retry-specific
+**Item 2, corrected across multiple rounds.** The outbox-retry-specific
 signature (2/2 occurrences, byte-identical panic text) still cannot be
 given a test-vs-product verdict — this role's own hard gate (requirement 3)
 blocks a fix PR until the nondeterminism is shown to live in the test
 rather than the product, and this session did not obtain the
 worker/tracing evidence that would decide it. The 3rd occurrence is a
-**different** panic (not the outbox-retry assertion — see the correction
-in item 2's own section) at a wait that is nonetheless the test's own
-primary quota-deferral assertion, not an unrelated setup step. **This is
-the report's headline recommendation, now sharper than the first two
-drafts stated it:** whoever next has Docker available in-session should
-(a) point the ≥20x rerun campaign at
-`quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded`'s
-outbox-retry-loop panic specifically, and (b) **fix the confirmed
-`test-db-linux` shard-10 sharding-manifest regression** (item 4's
-correction — this is no longer a hypothesis: `ci.yml`'s own comment
-documents this exact collision was found, measured at ~35 min vs 18-28 min
-per shard, and fixed once already under issue #1267; the manifest has
-since drifted back into the one gap value (11) the chosen shard count
-cannot tolerate). (b) is the higher-confidence, lower-cost fix of the two:
-it needs no rerun campaign to justify, only a one-line manifest reorder (or
-a shard-count bump) and a before/after timing comparison on the
-`test-db-linux` shard legs — squarely within this role's own Tier-1 timing-
-decomposition toolkit, and a strong "Harness PR" candidate per this role's
-charter (a check that keeps this invariant from silently drifting again as
-the manifest keeps growing alphabetically, since nothing currently guards
-it). Neither was executed this session — this report documents the finding
-precisely enough that either can be picked up without re-deriving it.
+**different** panic (not the outbox-retry assertion) at a wait that is
+nonetheless the test's own primary quota-deferral assertion, not an
+unrelated setup step — a genuine, undismissed product-bug candidate for
+that occurrence specifically. **The report's recommendation, downgraded
+back from an earlier round's overreach:** whoever next has Docker
+available in-session should point the ≥20x rerun campaign at the
+outbox-retry-loop panic specifically — that recommendation stands
+unchanged by any of this round's corrections. **Separately**, the
+`test-db-linux` shard-10 sharding-manifest gap has drifted back onto a
+colliding value, which is real and worth fixing on total-CI-duration
+grounds alone, but is **not** established as the cause of either this
+occurrence or item 4's cascade (see the correction above and in item 4
+below) — so it is recorded as a second, independent finding worth acting
+on, not folded into this recommendation as if it explained the flakes.
 
 **Item 3** is closed, per the correction above: the 09-18 report's diagnosis
 holds on this 5th occurrence too — real, own-branch dead code, correctly
 caught by two independent gates, not a suite defect. No further action, and
 not carried forward to the next report.
 
-**Item 4, corrected twice more (post-review).** An earlier draft called
-item 2's 3rd occurrence a 2nd occurrence of this cascade — wrong: it is 1
-test failing, not the dozens shard 3 showed in the same run. What changed
-since is stronger, not weaker: shard 10's disproportionate exposure is now
-a **confirmed regression of a previously-fixed, previously-measured defect
-(issue #1267)**, not a hypothesis needing a fresh timing decomposition to
-establish. What remains genuinely unresolved is narrower and more
-specific: shard 3 (which carries neither oversized suite) failed
-simultaneously in the same run, which the shard-10 collision does not
-explain at all — a real, open question about whether `35563198153` had a
-second, independent cause, or a broader run-wide contention event affecting
-multiple shards at once. That question, not "is shard 10 imbalanced,"
-is what would need worker-level logging or a fresh occurrence to resolve.
+**Item 4, corrected across multiple rounds.** An earlier round called item
+2's 3rd occurrence a 2nd occurrence of this cascade — wrong: it is 1 test
+failing, not the dozens shard 3 showed in the same run. A later round then
+established that shard 10's row-gap drift is real and confirmed, but
+walked back the claim that it *explains* the cascade: `run-suites.sh` runs
+a shard's suites sequentially, so `integration_e2e` and
+`quota_enforcement_tests` never contend for resources at the same instant,
+and the historical 35-minute figure is a total-duration measurement, not
+evidence of concurrent slowdown. **What remains true and actionable:** the
+manifest-gap regression is confirmed and worth fixing regardless of
+whether it explains any specific flake. **What remains genuinely
+unresolved:** why the individual 10-second polls in this run's shards
+timed out at all — shard 3 (which carries neither oversized suite) failed
+simultaneously in the same run, which the shard-10 finding does not
+explain, pointing toward either a broader run-wide contention event or
+something this session has not identified. Neither the shard-10 fix nor
+worker-level logging has been obtained by any session yet.
 
 **Item 5** has no mechanism recovered; a single, unclustered occurrence.
 
 ## 🔧 Treatment
 
-None shipped this session. **Item 4's correction found something that
-clears — or nearly clears — this role's own impact floor: not a fresh
-flake fix, but a confirmed, named, previously-measured configuration
-regression** (a "cache made correct" / structural-defect analog to that
-category, since `ci.yml`'s own comment already supplies the before
-measurement: ~35 min vs 18-28 min per shard, issue #1267). What's missing
-to actually ship it is not more diagnosis — the mechanism, the fix shape,
-and the historical baseline are all already documented in `ci.yml`'s own
-comment and confirmed by this report's direct row-count check — but a
-fresh **after** measurement from the same harness, which this session did
-not obtain (no live GitHub Actions dispatch available to trigger and time
-a fixed run). Per the hard gate's own rule ("if you cannot produce the
-after-measurement... the correct outcome is a report, not a PR"), this
-stays a report, but it is now the most actionable item this series has
-produced: a named 2-line diagnosis, ready for a same-day fix PR the moment
-a session can run the before/after shard-timing comparison. No flaky test
+None shipped this session, and after two further review rounds, less of
+this report clears the impact floor than an earlier draft claimed. The
+`test-db-linux` shard-10 manifest-gap drift **is** a confirmed regression
+of a previously-fixed, previously-measured defect (issue #1267's
+before-baseline, ~35 min vs 18-28 min per shard, is real and already on
+record in `ci.yml`'s own comment) and is worth fixing on CI-cost grounds
+alone — that part of an earlier draft's escalation holds. What does not
+hold, per this round's corrections: that fixing it would resolve the
+flakes this report chased it down while investigating (item 2's 3rd
+occurrence, item 4's cascade), since sequential shard execution rules out
+the concurrent-contention mechanism an earlier draft assumed, and the
+"two largest suites" sizing claim was never re-verified against the full,
+current manifest. Treat the shard-10 finding as two separable
+recommendations, not one: (1) a real, low-risk CI-cost fix, ready to pick
+up without further diagnosis; (2) a *candidate*, not a confirmed
+explanation, for the flakes — still worth investigating, but not a
+substitute for the rerun campaign below. No flaky test
 was made deterministic this session, no timing win was itself measured,
 no quarantine ledger entries retired (none exist), no suite passing under
 shuffled order to report.
 
 Carried forward, in priority order:
 
-1. **Fix the `test-db-linux` shard-10 sharding-manifest regression
-   (issue #1267's collision, reintroduced)** — now this report's top
-   priority, ahead of the rerun campaign below. The fix shape is
-   essentially known: reorder or pad `.github/ci/integration-suites.txt`
-   (or bump `SEMAPHORE_SHARD_COUNT`, keeping the matrix list length in
-   sync) so `integration_e2e` (row 32) and `quota_enforcement_tests` (row
-   43) no longer land on the same shard under `row_ordinal % count`, then
-   time the affected shards before and after. A durable fix should also
-   add a harness (a guard script in `docs/audits/`, this repo's own
-   convention, checking the two suites' row gap against the shard count on
-   every PR) so the invariant cannot silently drift again as the manifest
-   keeps growing alphabetically — this repeated regression is itself
-   evidence the point-in-time fix from issue #1267 was not self-maintaining.
-2. **The rerun campaign for `quota_enforcement_tests`'s outbox-retry-loop
-   panic specifically** (2/2 byte-identical occurrences; the 09-16 report's
-   activity-timeout `#1558` campaign is comparatively less urgent, at 0/1
-   confirmed exposure and no fresh occurrences since) — still not run by
-   any session; no Docker available in this session's sandbox.
-3. **Cache-usage API access** — still unavailable, checked again today.
-4. **Branch-protection confirmation** — still unavailable, checked again
+1. **The rerun campaign for `quota_enforcement_tests`'s outbox-retry-loop
+   panic specifically** (2/2 byte-identical occurrences, unaffected by any
+   correction this round; the 09-16 report's activity-timeout `#1558`
+   campaign is comparatively less urgent, at 0/1 confirmed exposure and no
+   fresh occurrences since) — still not run by any session; no Docker
+   available in this session's sandbox.
+2. **Fix the `test-db-linux` shard-10 sharding-manifest gap (issue #1267's
+   collision, reintroduced)** — a confirmed, real CI-cost regression, worth
+   fixing on its own merits, but demoted from "top priority" now that the
+   claimed connection to this report's flakes is unconfirmed (see item 4's
+   correction). The fix shape is still essentially known: reorder or pad
+   `.github/ci/integration-suites.txt` (or bump `SEMAPHORE_SHARD_COUNT`,
+   keeping the matrix list length in sync) so `integration_e2e` (row 32)
+   and `quota_enforcement_tests` (row 43) no longer land on the same shard,
+   then time the affected shards before and after — and, separately, do a
+   full manifest-wide accounting (this session only checked two suites
+   plus one more) before assuming shard 10 is the single worst-imbalanced
+   shard. A durable fix should add a harness (a guard script in
+   `docs/audits/`, this repo's own convention) so the invariant cannot
+   silently drift again as the manifest keeps growing alphabetically.
+3. **Whether shard-10 overload (or anything else) actually explains item
+   2's 3rd occurrence or item 4's cascade** — genuinely open after this
+   round's corrections. Sequential shard execution rules out concurrent
+   contention as the mechanism; no alternative mechanism has been measured.
+4. **Cache-usage API access** — still unavailable, checked again today.
+5. **Branch-protection confirmation** — still unavailable, checked again
    today.
-5. **The `list_workflow_runs` conclusion vs. `list_workflow_jobs` gap**
+6. **The `list_workflow_runs` conclusion vs. `list_workflow_jobs` gap**
    (item 1's data-quality note) — 2 of 20 runs this window report `failure`
    overall with 0 job-level failures found; not previously logged in this
    series in exactly this form (distinct from the cancelled-run-hides-a-
    failure direction the 09-06/09-11 reports found — this is the reverse:
    an explicit `failure` conclusion the jobs API cannot account for).
-6. **Shard 3's simultaneous failure in `35563198153`** — not explained by
+7. **Shard 3's simultaneous failure in `35563198153`** — not explained by
    the shard-10 collision (shard 3 carries neither oversized suite); a
    genuinely open question about a possible broader, run-wide contention
-   event, separate from item 4's now-confirmed structural cause.
-7. **The remaining cancelled-run population** — the 45 cancelled runs in
+   event.
+8. **The remaining cancelled-run population** — the 45 cancelled runs in
    this window were not job-logged at all this session (time budget went to
    the 20 explicit failures instead, all 20 of which were checked, an
    improvement over prior reports' partial samples).
@@ -553,36 +601,44 @@ Carried forward, in priority order:
   confirmed occurrences** of the specific outbox-retry-loop panic carry
   byte-identical text (`"target row was never created by the outbox retry;
   last count was 1"`), 6 days apart, 2 different branches — a real
-  recurring signal, own rerun-campaign candidate, unaffected by either
-  correction. **Separately, 1 occurrence** of a panic at the test's earlier
-  quota-relevant wait, byte-identical to item 4's cascade site — now best
-  explained by item 4's confirmed shard-10 regression, though a genuine
-  product-side race remains undismissed for that specific occurrence.
-  Neither is a rate (n=2 and n=1, no rerun protocol run). No revert check
-  applies — no fix was made or attempted this session.
+  recurring signal, own rerun-campaign candidate, unaffected by any
+  correction this round. **Separately, 1 occurrence** of a panic at the
+  test's earlier quota-relevant wait, byte-identical to item 4's cascade
+  site — a confirmed shard-10 manifest-gap regression exists (see item 4)
+  but is not established as this occurrence's mechanism (sequential shard
+  execution rules out concurrent contention); a genuine product-side race
+  remains equally undismissed. Neither is a rate (n=2 and n=1, no rerun
+  protocol run). No revert check applies — no fix was made or attempted
+  this session.
 - **Item 3: correction (post-review).** 5th confirmed occurrence (not a 4th,
   per the correction above), on a 3rd distinct branch — direct log
   inspection (re-grepped after review for the `--- rustc diagnostics ---`
   section this session already had in hand) confirms the identical
   dead-code mechanism the 09-18 report closed. Root-caused, not a flake, no
   rate needed.
-- **Item 4: corrected three times (post-review).** First, denominator
-  fixed: 6/11 shards, not 6/30. Second, an earlier draft called item 2's
-  3rd occurrence a 2nd cascade occurrence — wrong; exactly 1 test failed in
-  that run, not a cascade. Third, and most substantively: shard 10's
-  disproportionate exposure is **no longer an unmeasured hypothesis**.
-  `ci.yml:988-997`'s own comment documents that `integration_e2e` and
-  `quota_enforcement_tests` colliding on one shard was already found and
-  fixed once (issue #1267), with a historical baseline already in hand:
-  *that* shard ran ~35 min against 18-28 min for every other shard. Direct
-  recount confirms the two suites are 11 manifest rows apart today (11 % 11
-  = 0), not the 10 the original fix accounted for — a silent regression via
-  alphabetical manifest growth, not a new discovery of a coincidence.
-  `#[tokio::test]` counts confirm the sizing (68 + 43 = 111 tests, the
-  manifest's two largest suites, combined on one shard). This is a
-  confirmed, previously-measured configuration defect; only a fresh
-  after-measurement (post-fix shard timing) is still missing, which this
-  session had no means to run (no live GitHub Actions dispatch).
+- **Item 4: corrected five times (post-review).** First, denominator fixed:
+  6/11 shards, not 6/30. Second, an earlier draft called item 2's 3rd
+  occurrence a 2nd cascade occurrence — wrong; exactly 1 test failed in
+  that run, not a cascade. Third, `ci.yml:988-997`'s own comment confirmed
+  `integration_e2e` and `quota_enforcement_tests` colliding on shard 10 was
+  already found, measured (~35 min vs 18-28 min per shard), and fixed once
+  (issue #1267); direct recount confirms the manifest gap drifted from the
+  10 rows the fix accounted for to 11 today (`43 - 32 = 11`) — **this drift
+  is confirmed**, not assumed. Fourth and fifth, two more corrections cut
+  back what that drift explains: the `#[tokio::test]`-only count
+  undercounted both suites (118 and 44 tests, not 68 and 43), and a third
+  suite checked for the first time this round
+  (`event_partitioning_tests.rs`, 148 tests, a different shard) is
+  individually larger than either — so "the manifest's two largest
+  suites" is unverified against today's full manifest, not confirmed.
+  More substantively, `run-suites.sh` runs a shard's suites sequentially
+  (confirmed by reading the script), so the two suites never contend for
+  resources at the same instant — the historical 35-minute figure is a
+  real, confirmed **total-duration** regression, worth fixing regardless,
+  but not an established mechanism for the individual per-test timeouts
+  observed. Both the fix and a full manifest-wide accounting remain
+  undone by any session; no after-measurement obtained either way (no
+  live GitHub Actions dispatch this session).
 - **Item 5:** 1 occurrence, unclassified.
 - **Ledger:** no quarantine ledger exists in this repository to update.
 
@@ -695,9 +751,27 @@ grep -n "11, not 10" -A 12 .github/workflows/ci.yml
 #    manifest growth between the two suites, not a new problem.
 grep -c "#\[tokio::test\]" autumn-harvest/tests/integration/integration_e2e.rs \
   autumn-harvest/tests/integration/quota_enforcement_tests.rs
-# -> 68 and 43 -- confirms ci.yml's own sizing claim ("the manifest's two
-#    largest, most wall-clock-timeout-shaped suites"), 111 combined on one
-#    shard.
+# -> 68 and 43 -- WRONG, bare-spelling-only, undercounts. Post-review,
+#    two more corrections:
+grep -c "^#\[tokio::test" autumn-harvest/tests/integration/integration_e2e.rs \
+  autumn-harvest/tests/integration/quota_enforcement_tests.rs \
+  autumn-harvest/tests/integration/event_partitioning_tests.rs
+# -> 118, 44, and 148 -- the full attribute count (matching e.g.
+#    #[tokio::test(flavor = "multi_thread")] too). event_partitioning_tests
+#    is individually LARGER than either shard-10 suite, and lands on a
+#    DIFFERENT shard (row 28, 28 % 11 = 7) -- "the manifest's two largest
+#    suites" is ci.yml's claim from its own 2026 fix, not re-verified
+#    against today's manifest by this session.
+
+# Post-review, further correction: does shard 10 even run its suites
+# concurrently? No -- confirmed by reading the runner directly:
+sed -n '75,90p' .github/ci/run-suites.sh
+# -> do_run's `while read ... do run_cargo ...; done` loop is a single
+#    sequential shell loop, one `cargo test` invocation per manifest row,
+#    to completion before the next starts. integration_e2e and
+#    quota_enforcement_tests on shard 10 never run at the same wall-clock
+#    instant -- the 35-min figure is total job duration, not evidence of
+#    concurrent contention between the two suites.
 
 # Item 3's re-grep (post-review correction): the run's log was already
 # fetched for the census; re-checking it for the 09-18 fix's diagnostic
