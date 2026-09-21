@@ -3417,10 +3417,13 @@ enum EventsCommand {
     Tail {
         /// Workflow execution ID to watch.
         execution_id: String,
-        /// Resume from this event row ID (Last-Event-ID header).
-        /// Events with id > this value are replayed before entering live-tail mode.
+        /// Resume from this event_id (issue #1405), sent as the
+        /// Last-Event-ID header. NOT the shard-local harvest_events.id --
+        /// this is the per-execution sequence number the server's `id:`
+        /// SSE field carries. Events after it are replayed before entering
+        /// live-tail mode.
         #[arg(long)]
-        last_event_id: Option<i64>,
+        last_event_id: Option<i32>,
     },
 }
 
@@ -7685,7 +7688,7 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
 async fn run_events_tail(
     cli: &Cli,
     execution_id: &str,
-    last_event_id: Option<i64>,
+    last_event_id: Option<i32>,
 ) -> Result<(), CliError> {
     let path = format!("/executions/{}", path_segment(execution_id));
     let url = format!(

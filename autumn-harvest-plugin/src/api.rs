@@ -43597,15 +43597,22 @@ async fn stream_execution_events(
         // read-path payload decoding is active (issue #608).
 
         // Helper: flush a slice of DB rows into the SSE channel.
-        // Returns the last `row.id` seen and the first terminal state name found,
-        // or breaks early if the channel is full / dropped.
+        // Returns the last `row.id`/`row.event_id` actually SENT and the
+        // first terminal state name found, or breaks early if the channel
+        // is full / dropped. `cur_last_seen_event_id` tracks in step with
+        // `cur_last_seen`. Both update only after a row is sent. A
+        // caller-side `rows.last()` read (Codex review) would report a row
+        // this call never sent, when `try_send` fails partway through.
+        // That would hand a reconnecting client a cursor past events it
+        // never received.
         // Using a macro-style closure here because closures can't easily `break 'notify`.
-        // We use a boolean return: (last_id, terminal_state, should_break).
+        // We use a boolean return: (last_id, last_event_id, terminal_state, should_break).
         let send_rows =
             |rows: &[autumn_harvest::models::HarvestEvent],
              mut cur_last_seen: i64,
+             mut cur_last_seen_event_id: Option<i32>,
              tx: &mut futures::channel::mpsc::Sender<Result<Event, std::convert::Infallible>>|
-             -> (i64, Option<&'static str>, bool) {
+             -> (i64, Option<i32>, Option<&'static str>, bool) {
                 let mut found_terminal: Option<&'static str> = None;
                 for row in rows {
                     let sse_event = Event::default()
@@ -43616,16 +43623,17 @@ async fn stream_execution_events(
                         .event(row.event_type.as_str())
                         .data(sse_frame_data(&row.event_data, decoder.as_ref()));
                     if tx.try_send(Ok(sse_event)).is_err() {
-                        return (cur_last_seen, None, true);
+                        return (cur_last_seen, cur_last_seen_event_id, None, true);
                     }
                     cur_last_seen = row.id;
+                    cur_last_seen_event_id = Some(row.event_id);
                     if is_terminal_event_type(&row.event_type) {
                         found_terminal = Some(terminal_event_type_to_state(&row.event_type));
                     } else if row.event_type == "WorkflowRedriven" {
                         found_terminal = None;
                     }
                 }
-                (cur_last_seen, found_terminal, false)
+                (cur_last_seen, cur_last_seen_event_id, found_terminal, false)
             };
 
         // ── 1. Send backfill events (events already committed before this request) ──
@@ -43803,12 +43811,10 @@ async fn stream_execution_events(
                             Err(_) => continue,
                         };
 
-                        let (new_id, terminal_state, should_break) =
-                            send_rows(&new_rows, last_seen_id, &mut tx);
+                        let (new_id, new_event_id, terminal_state, should_break) =
+                            send_rows(&new_rows, last_seen_id, last_seen_event_id, &mut tx);
                         last_seen_id = new_id;
-                        if let Some(row) = new_rows.last() {
-                            last_seen_event_id = Some(row.event_id);
-                        }
+                        last_seen_event_id = new_event_id;
 
                         if should_break {
                             let err_data = serde_json::json!({
@@ -43855,12 +43861,10 @@ async fn stream_execution_events(
                         else {
                             continue 'notify;
                         };
-                        let (new_id, terminal_state, should_break) =
-                            send_rows(&missed, last_seen_id, &mut tx);
+                        let (new_id, new_event_id, terminal_state, should_break) =
+                            send_rows(&missed, last_seen_id, last_seen_event_id, &mut tx);
                         last_seen_id = new_id;
-                        if let Some(row) = missed.last() {
-                            last_seen_event_id = Some(row.event_id);
-                        }
+                        last_seen_event_id = new_event_id;
                         if should_break {
                             let err_data = serde_json::json!({
                                 "error": "slow_consumer",
@@ -43914,12 +43918,10 @@ async fn stream_execution_events(
                         else {
                             continue 'notify;
                         };
-                        let (new_id, terminal_state, should_break) =
-                            send_rows(&missed, last_seen_id, &mut tx);
+                        let (new_id, new_event_id, terminal_state, should_break) =
+                            send_rows(&missed, last_seen_id, last_seen_event_id, &mut tx);
                         last_seen_id = new_id;
-                        if let Some(row) = missed.last() {
-                            last_seen_event_id = Some(row.event_id);
-                        }
+                        last_seen_event_id = new_event_id;
                         if should_break {
                             let err_data = serde_json::json!({
                                 "error": "slow_consumer",

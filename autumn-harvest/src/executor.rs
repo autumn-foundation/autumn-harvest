@@ -1721,9 +1721,10 @@ pub async fn run_workflow_with_state_advancing_clock(
     // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
     // the timeout scanner rather than a stale start+timeout recompute.
     .with_deadline(span_meta.and_then(|m| m.deadline_at))
-    // Issue #1405: thread the row's current shard so a `ParentShard` child
-    // places on where this run actually lives, not the origin bits `exec_id`
-    // encodes -- lets a WorkflowTestEnv run exercise a rebalanced parent.
+    // Issue #1405: thread the row's current shard. A `ParentShard` child
+    // then places on where this run actually lives, not the origin bits
+    // `exec_id` encodes. Lets a WorkflowTestEnv run exercise a rebalanced
+    // parent.
     .with_current_shard_id(
         span_meta
             .and_then(|m| i32::try_from(m.shard_id).ok())
@@ -1837,9 +1838,9 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
     // the timeout scanner rather than a stale start+timeout recompute.
     .with_deadline(span_meta.and_then(|m| m.deadline_at))
-    // Issue #1405: thread the row's current shard (span_meta.shard_id is
-    // read live from the execution row, see worker.rs) so a `ParentShard`
-    // child places where this run actually lives, not the origin bits
+    // Issue #1405: thread the row's current shard (`span_meta.shard_id` is
+    // read live from the execution row, see worker.rs). A `ParentShard`
+    // child then places where this run actually lives, not the origin bits
     // `exec_id` encodes.
     .with_current_shard_id(
         span_meta

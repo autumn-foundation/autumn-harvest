@@ -474,6 +474,7 @@ async fn workflow_list_shows_an_orphaned_staged_migration_and_also_finds_it_expl
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn sse_stream_resume_after_migration_uses_the_translated_event_id_cursor() {
     // Issue #1405: the SSE resume cursor must be `event_id`. A shard
     // migration copies it byte-for-byte. The cursor must not be

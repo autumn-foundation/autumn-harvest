@@ -2642,10 +2642,10 @@ pub struct WorkflowContext {
     /// and by embedders that run several topologies in one process, so
     /// placement never depends on mutating a process global.
     shard_router: Option<crate::shard::ShardRouter>,
-    /// The shard the parent row lives on RIGHT NOW (issue #1405), read live
-    /// from the execution row's `shard_id` column at context construction --
-    /// the same pattern as `deadline_at`. `self.exec_id.shard()` names where
-    /// this run was MINTED, not where a rebalanced run lives today.
+    /// The shard the parent row lives on RIGHT NOW (issue #1405). Read live
+    /// from the execution row's `shard_id` column at context construction,
+    /// the same pattern as `deadline_at`. `self.exec_id.shard()` names
+    /// where this run was MINTED, not where a rebalanced run lives today.
     ///
     /// Used only to place a `ParentShard` child (the default) on the row's
     /// true current shard. `None` -- the replayer / test-env paths that carry
@@ -7418,12 +7418,13 @@ impl WorkflowContext {
     /// never touches the router, so a deployment that never opts in is
     /// byte-for-byte unchanged.
     ///
-    /// `parent_shard` is the row's CURRENT shard (issue #1405), not the origin
-    /// bits `self.exec_id` encodes -- a rebalanced parent's child must land
-    /// where the parent actually lives, since that is also the shard the
-    /// worker's persist step already holds a connection to. Falls back to
-    /// `self.exec_id.shard()` only when no live shard was threaded in (the
-    /// replayer / test-env paths), the pre-#1405 behaviour.
+    /// `parent_shard` is the row's CURRENT shard (issue #1405), not the
+    /// origin bits `self.exec_id` encodes. A rebalanced parent's child must
+    /// land where the parent actually lives. Otherwise `worker.rs` classifies
+    /// it as cross-shard against the parent's live residence and silently
+    /// relays it onto the stale origin shard instead. Falls back to
+    /// `self.exec_id.shard()` only when no live shard was threaded in, the
+    /// replayer / test-env paths' pre-#1405 behaviour.
     ///
     /// Only ever called on a **fresh dispatch**. A replay reuses the `child_id`
     /// recorded in `ChildWorkflowStarted`, so placement is decided exactly once
@@ -12776,10 +12777,10 @@ impl WorkflowContext {
         // unlike the workflow body and query handlers — never sees them.
         let execution_timeout = self.execution_timeout;
         let deadline_at = self.deadline_at;
-        // Issue #1405: inherit the parent's current shard, mirroring deadline_at
-        // above, so a child spawned from inside an update handler also places
-        // on the row's true residence rather than falling back to the origin
-        // bits `new_for_handler` would otherwise leave unset.
+        // Issue #1405: inherit the parent's current shard, mirroring
+        // deadline_at above. A child spawned from an update handler then
+        // also places on the row's true residence. It does not fall back
+        // to the origin bits `new_for_handler` would otherwise leave unset.
         let current_shard_id = self.current_shard_id;
         // Carryover is frozen in WorkflowStarted, so a handler on a scheduled workflow
         // must observe the same last_completion_result/last_error as the workflow body
@@ -21190,18 +21191,18 @@ mod tests {
         );
     }
 
-    /// Issue #1405: a parent minted on ORIGIN shard 7 that has since been
-    /// rebalanced to shard 12 must place a `ParentShard` child on 12, its
-    /// CURRENT residence -- not on 7, the id's stale origin bits.
+    /// Issue #1405: a parent minted on ORIGIN shard 7 has since been
+    /// rebalanced to shard 12. It must place a `ParentShard` child on 12,
+    /// its CURRENT residence, not on 7, the id's stale origin bits.
     ///
     /// A child placed on 7 does not fail closed. `worker.rs`'s
     /// `child_target_shard` classifies placement by comparing the id's
-    /// encoded bits against the parent's LIVE shard; a mismatch reads as a
-    /// genuine cross-shard placement and relays the child onto shard 7 through
-    /// the ordinary cross-shard-child path. Shard 7 is a normal, healthy shard
-    /// -- it is simply not where this parent lives any more -- so the relay
-    /// succeeds and silently creates the row there. The failure is silent
-    /// misplacement, not an unresolvable id.
+    /// encoded bits against the parent's LIVE shard. A mismatch reads as a
+    /// genuine cross-shard placement. It relays the child onto shard 7
+    /// through the ordinary cross-shard-child path. Shard 7 is a normal,
+    /// healthy shard, simply not where this parent lives any more, so the
+    /// relay succeeds. It silently creates the row there. The failure is
+    /// silent misplacement, not an unresolvable id.
     #[tokio::test]
     async fn awaited_child_workflow_inherits_the_parents_current_shard_not_its_origin() {
         let origin_shard = ShardId::new(7);
