@@ -111,6 +111,21 @@ at any step rolls the delete back too, restoring the outbox row for the
 next scan tick to retry. The backoff call is no longer a conditional
 no-op — every failure in this path now leaves a real row to back off.
 
+**Payload-rejection resolution, retention-aware** (Codex follow-up x10).
+The existence check was LIVE-TABLE-only: retention can remove a
+`harvest_workflow_executions` row within `--summary-age` seconds of
+completion, as low as one second. A target genuinely delivered by an
+earlier, differently-configured attempt and retention-collected before
+this attempt's check ran would read as absent, and this path would mark
+it `payload_too_large` — a wrong, permanent rejection of a real delivery.
+Added `execution::execution_summary_exists_by_key` (new, not
+testing-gated, since this runs in the live engine) checking
+`harvest_execution_summaries` by business key, and the resolution now
+treats a live row OR a summary as proof of delivery. Summaries are
+opt-in, so this narrows the gap rather than closing it outright when
+they are disabled — the same residual limitation `backup_verify`'s own
+retention checks already carry and document.
+
 **Confirmed delivered, precisely.** `outcome IS NULL` alone is set at
 trigger-evaluation time, before any relay attempt — not proof of delivery.
 The scan additionally requires the matching `harvest_completion_trigger_outbox`

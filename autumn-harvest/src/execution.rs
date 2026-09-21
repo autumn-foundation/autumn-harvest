@@ -21,7 +21,7 @@ use crate::event::WorkflowEvent;
 use crate::info::WorkflowInfo;
 use crate::models::{NewHarvestSignal, NewWorkflowExecution, WorkflowExecution};
 use crate::queue::{self, EnqueueParams, TaskType};
-use crate::schema::{harvest_signals, harvest_workflow_executions};
+use crate::schema::{harvest_execution_summaries, harvest_signals, harvest_workflow_executions};
 use crate::shard::ShardedDbPool;
 use crate::store;
 use crate::telemetry::TraceContextCarrier;
@@ -6007,6 +6007,31 @@ pub async fn execution_exists_by_key(
         harvest_workflow_executions::table
             .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
             .filter(harvest_workflow_executions::workflow_id.eq(workflow_id)),
+    ))
+    .get_result::<bool>(conn)
+    .await
+    .map_err(database_error)
+}
+
+/// Does a `harvest_execution_summaries` row prove a `(workflow_name,
+/// workflow_id)` execution completed and was later retention-collected?
+///
+/// Retention can remove a `harvest_workflow_executions` row shortly after
+/// completion (`--summary-age` as low as one second), so
+/// [`execution_exists_by_key`] returning `false` is not proof an execution
+/// never ran -- only that it is not LIVE right now. Summaries are opt-in,
+/// so this can also return `false` for a genuinely retained execution when
+/// summaries are disabled; callers must not treat that as proof of absence
+/// either.
+pub async fn execution_summary_exists_by_key(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> HarvestResult<bool> {
+    diesel::select(diesel::dsl::exists(
+        harvest_execution_summaries::table
+            .filter(harvest_execution_summaries::workflow_name.eq(workflow_name))
+            .filter(harvest_execution_summaries::workflow_id.eq(workflow_id)),
     ))
     .get_result::<bool>(conn)
     .await

@@ -2688,14 +2688,25 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                             &task.target_workflow_name,
                             &task.target_workflow_id,
                         )
-                        .await?;
+                        .await?
+                            // A LIVE check alone is not proof of non-delivery
+                            // (issue #1401, Codex follow-up x10): retention
+                            // can remove the row within seconds of
+                            // completion. A summary, when the deployment
+                            // captures one, outlives that window.
+                            || crate::execution::execution_summary_exists_by_key(
+                                &mut target_conn,
+                                &task.target_workflow_name,
+                                &task.target_workflow_id,
+                            )
+                            .await?;
                         if already_delivered {
                             tracing::debug!(
                                 source_exec_id = %task.source_exec_id,
                                 trigger_id = %task.trigger_id,
-                                "[completion_trigger outbox] target already exists (any \
-                                 state); treating the stale outbox row as delivered, \
-                                 not rejected"
+                                "[completion_trigger outbox] target already exists or is \
+                                 retained (any state); treating the stale outbox row as \
+                                 delivered, not rejected"
                             );
                             return Ok(false);
                         }
