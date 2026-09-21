@@ -4606,8 +4606,10 @@ mod db {
     }
 
     /// [`crate::retention::release_legal_hold`], retried across a mid-flight
-    /// seal (issue #1405). See [`set_legal_hold_forwarded`] for the shape of
-    /// the race this closes and why each attempt re-resolves from scratch.
+    /// seal (issue #1405).
+    ///
+    /// See [`set_legal_hold_forwarded`] for the shape of the race this
+    /// closes and why each attempt re-resolves from scratch.
     ///
     /// # Errors
     ///
