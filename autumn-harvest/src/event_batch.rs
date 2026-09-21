@@ -183,12 +183,12 @@ pub async fn admit_batched_start_with_codecs(
             buffered_payloads = harvest_event_batches.buffered_payloads || EXCLUDED.buffered_payloads,
             fire_at           = LEAST(harvest_event_batches.fire_at, EXCLUDED.fire_at),
             updated_at        = NOW(),
-            -- workflow_id is first-admission-wins, matching every other
-            -- field left out of this list. One exception (issue #1430): a
-            -- row admitted before the #1353 empty-id guard shipped can hold
-            -- a stored empty id. Such a row can never start. Heal it to this
+            -- workflow_id is first-request-wins, matching every other field
+            -- left out of this list. One exception (issue #1430): a row
+            -- admitted before the #1353 empty-id check shipped can hold a
+            -- stored empty id. Such a row can never start. Heal it to this
             -- request's valid id instead of merging this payload into a row
-            -- the fire-time poison-row cleanup can only ever discard.
+            -- fire_claimed_batch_row's delete-and-audit path can only drop.
             workflow_id = CASE
                 WHEN harvest_event_batches.workflow_id = '' THEN EXCLUDED.workflow_id
                 ELSE harvest_event_batches.workflow_id
