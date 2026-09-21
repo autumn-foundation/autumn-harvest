@@ -692,19 +692,20 @@ async fn a_tightened_target_cap_rejects_an_oversized_transition() {
 
 // ---------------------------------------------------------------------------
 // Issue #1409 — a continue-as-new redirected to a terminal failure must
-// still record the cycle's abandoned dispatches (issue #952's synthetic
-// terminal pair), the same as any other failing cycle. Before the fix, the
-// abandoned-dispatch decision was made against the ORIGINAL `ContinuedAsNew`
-// outcome, before the worker discovered the redirect, so the pair was
-// silently dropped (a `tracing::warn!` only).
+// still record the cycle's abandoned dispatches. That is the same
+// treatment as any other failing cycle (issue #952's synthetic terminal
+// pair). Before the fix, the abandoned-dispatch decision was made against
+// the ORIGINAL `ContinuedAsNew` outcome, before the worker discovered the
+// redirect. So the pair was silently dropped (a `tracing::warn!` only).
 // ---------------------------------------------------------------------------
 
 const ABANDONED_ACTIVITY_NAME: &str = "issue_1409_abandoned_activity";
 
 /// Never actually runs -- the dispatch is abandoned in the same cycle it is
 /// pushed. Still must be a REGISTERED activity: the fleet capability-miss
-/// guard (issue #804) inspects every command in a decision cycle's batch,
-/// abandoned or not, before the cycle is allowed to run at all.
+/// guard (issue #804) inspects every command in a decision cycle's batch.
+/// It checks abandoned dispatches too, before the cycle is allowed to run
+/// at all.
 fn abandoned_activity_noop(
     _ctx: &ActivityContext,
     _input: serde_json::Value,

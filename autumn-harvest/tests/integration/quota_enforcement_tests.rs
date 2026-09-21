@@ -3295,16 +3295,18 @@ async fn continue_as_new_cross_type_oversized_quota_key_is_rejected() {
 
 // ---------------------------------------------------------------------------
 // Issue #1409 — a continue-as-new redirected to a terminal failure by the
-// quota-key cap must still record the cycle's abandoned dispatches (issue
-// #952's synthetic terminal pair), the same as any other failing cycle.
+// quota-key cap must still record the cycle's abandoned dispatches. That
+// is the same treatment as any other failing cycle (issue #952's synthetic
+// terminal pair).
 // ---------------------------------------------------------------------------
 
 const ISSUE_1409_ABANDONED_ACTIVITY_NAME: &str = "issue_1409_quota_abandoned_activity";
 
 /// Never actually runs -- the dispatch is abandoned in the same cycle it is
 /// pushed. Still must be a REGISTERED activity: the fleet capability-miss
-/// guard (issue #804) inspects every command in a decision cycle's batch,
-/// abandoned or not, before the cycle is allowed to run at all.
+/// guard (issue #804) inspects every command in a decision cycle's batch.
+/// It checks abandoned dispatches too, before the cycle is allowed to run
+/// at all.
 fn issue_1409_noop_activity(
     _ctx: &ActivityContext,
     _input: serde_json::Value,
@@ -3345,7 +3347,7 @@ fn oversized_key_phase_one_with_abandoned_activity<'a>(
 
 /// A cross-type transition redirected to a terminal failure by the
 /// oversized-quota-key bound must still record the abandoned activity
-/// dispatch from the SAME cycle -- mirrors
+/// dispatch from the SAME cycle. Mirrors
 /// `continue_as_new_cross_type_oversized_quota_key_is_rejected` above, plus
 /// the abandoned dispatch.
 #[tokio::test]
