@@ -2123,21 +2123,21 @@ mod probes {
 
         // The budget ran out with the last page full (issue #1401, Codex
         // follow-up x6). A qualifying-row count that is an exact multiple
-        // of `page` is indistinguishable from genuine truncation, from
-        // inside the loop above. `len < page` never fires when every page,
-        // including the true last one, comes back full. One more page,
-        // fetched outside the nominal budget, disambiguates: empty means
-        // the scan was actually complete, not truncated.
-        let final_page = fetch_trigger_fire_page(conn, page, cursor).await?;
-        // A SHORT page here (issue #1401, Codex follow-up x7), not just an
-        // EMPTY one, also proves exhaustion. 1..page rows one page past the
-        // nominal ceiling is still the true last page. This matches the
-        // check inside the loop above.
-        let final_page_exhausted = i64::try_from(final_page.len()).unwrap_or(i64::MAX) < page;
-        rows.extend(final_page);
-        if final_page_exhausted {
+        // of `page` looks the same as genuine truncation. `len < page`
+        // never fires when every page, including the true last one, comes
+        // back full.
+        //
+        // A same-sized confirming PAGE just moves that boundary one page
+        // later (issue #1401, Codex follow-up x12). Any fixed-size fetch
+        // has a count where a full result is genuinely the end. An
+        // EXISTENCE probe does not: fetch at most one row past the cursor.
+        // Empty proves nothing remains, for any qualifying-row count. One
+        // row proves the opposite, just as certainly.
+        let confirmation = fetch_trigger_fire_page(conn, 1, cursor).await?;
+        if confirmation.is_empty() {
             return Ok((rows, None));
         }
+        rows.extend(confirmation);
 
         let truncation = format!(
             "completion-trigger fire scan hit its page ceiling after {} rows \
