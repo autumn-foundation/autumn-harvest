@@ -1465,12 +1465,18 @@ mod tests {
         let b = hint("q", Utc::now());
         channel.publish(&[a.clone(), b.clone()]).await.expect("publish");
 
-        let first = read_one(&channel).await.expect("first lease");
-        let second = read_one(&channel).await.expect("second lease");
+        // One `next` call already returns both ready entries (`max` is 8);
+        // two separate `read_one` calls would silently drop the second, since
+        // it never returns more than one lease per call.
+        let leases = channel
+            .next(&queues(), "c", 8, Duration::from_millis(0))
+            .await
+            .expect("read");
+        assert_eq!(leases.len(), 2, "both entries are ready in one read");
         assert_eq!(channel.outstanding_leases(), 2);
 
         channel
-            .ack_many(&[first, second])
+            .ack_many(&leases)
             .await
             .expect("ack_many");
         let mut acked = channel.acked_ids();
@@ -1490,14 +1496,21 @@ mod tests {
         let b = hint("q", Utc::now());
         channel.publish(&[a.clone(), b.clone()]).await.expect("publish");
 
-        let first = read_one(&channel).await.expect("first lease");
-        let second = read_one(&channel).await.expect("second lease");
+        // One `next` call already returns both ready entries; see the note
+        // in `ack_many_drops_every_lease_in_the_batch` above.
+        let leases = channel
+            .next(&queues(), "c", 8, Duration::from_millis(0))
+            .await
+            .expect("read");
+        assert_eq!(leases.len(), 2, "both entries are ready in one read");
 
         channel
-            .release_many(&[
-                (first, Duration::from_millis(0)),
-                (second, Duration::from_millis(0)),
-            ])
+            .release_many(
+                &leases
+                    .into_iter()
+                    .map(|lease| (lease, Duration::from_millis(0)))
+                    .collect::<Vec<_>>(),
+            )
             .await
             .expect("release_many");
         let mut released = channel.released_ids();
