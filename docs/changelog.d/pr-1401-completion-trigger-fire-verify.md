@@ -52,6 +52,18 @@ way an admission-gate block already did
 (`enforce_completion_triggers_outbox_with_codecs`, `payload_too_large`), so
 it is likewise excluded rather than misread as a lost delivery.
 
+That resolution now also checks its own outbox delete affected a row
+before marking the fire (Codex follow-up). A rolled-back claim followed
+by a concurrent, successful delivery of the SAME row — plausible during a
+rolling deployment with a differently configured payload cap — left the
+delete matching zero rows while the update ran unconditionally, silently
+overwriting a genuine successful delivery with a permanent, wrong
+`payload_too_large` outcome. No dedicated race test: no existing harness
+exercises this function's write path at all, and reproducing the race
+deterministically would need new concurrency-test infrastructure
+disproportionate to a one-line guard. Verified by inspection and the full
+existing suite.
+
 **Migration `20260920215812`.** `harvest_completion_trigger_fires` gains two
 nullable columns, `target_shard` and `target_workflow_name`, populated by
 `completion_trigger.rs` at relay time. Reading the historical values a fire

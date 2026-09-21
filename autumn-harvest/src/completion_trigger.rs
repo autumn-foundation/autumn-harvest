@@ -2602,32 +2602,56 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                     cap_bytes,
                     "[completion_trigger outbox] permanent error: oversized input payload; deleting outbox row"
                 );
-                let resolved = Box::pin(conn.transaction(async |tx| {
-                    diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
-                        .filter(outbox_dsl::id.eq(task.id))
+                let resolved: Result<bool, crate::error::HarvestError> =
+                    Box::pin(conn.transaction(async |tx| {
+                        let deleted = diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
+                            .filter(outbox_dsl::id.eq(task.id))
+                            .execute(tx)
+                            .await
+                            .map_err(crate::error::database_error)?;
+                        // Zero rows deleted means another attempt already
+                        // claimed and resolved this row (issue #1401, Codex
+                        // follow-up). A rolling deployment is one example:
+                        // a differently-configured worker could deliver it
+                        // successfully in between this attempt's own
+                        // rolled-back claim and this transaction. Marking
+                        // the fire `payload_too_large` here would overwrite
+                        // that success with a wrong, permanent rejection.
+                        if deleted == 0 {
+                            return Ok(false);
+                        }
+                        diesel::update(
+                            fires_dsl::harvest_completion_trigger_fires
+                                .filter(fires_dsl::source_exec_id.eq(task.source_exec_id))
+                                .filter(fires_dsl::trigger_id.eq(task.trigger_id)),
+                        )
+                        .set(fires_dsl::outcome.eq(Some("payload_too_large")))
                         .execute(tx)
                         .await
                         .map_err(crate::error::database_error)?;
-                    diesel::update(
-                        fires_dsl::harvest_completion_trigger_fires
-                            .filter(fires_dsl::source_exec_id.eq(task.source_exec_id))
-                            .filter(fires_dsl::trigger_id.eq(task.trigger_id)),
-                    )
-                    .set(fires_dsl::outcome.eq(Some("payload_too_large")))
-                    .execute(tx)
-                    .await
-                    .map_err(crate::error::database_error)
-                }))
-                .await;
-                if let Err(e) = resolved {
-                    tracing::error!(
-                        source_exec_id = %task.source_exec_id,
-                        trigger_id = %task.trigger_id,
-                        error = ?e,
-                        "[completion_trigger outbox] failed to resolve the \
-                         permanently-rejected fire; the outbox row is untouched \
-                         and the next scan retries it"
-                    );
+                        Ok(true)
+                    }))
+                    .await;
+                match resolved {
+                    Ok(false) => {
+                        tracing::warn!(
+                            source_exec_id = %task.source_exec_id,
+                            trigger_id = %task.trigger_id,
+                            "[completion_trigger outbox] outbox row already claimed by \
+                             another attempt; leaving its fire outcome untouched"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            source_exec_id = %task.source_exec_id,
+                            trigger_id = %task.trigger_id,
+                            error = ?e,
+                            "[completion_trigger outbox] failed to resolve the \
+                             permanently-rejected fire; the outbox row is untouched \
+                             and the next scan retries it"
+                        );
+                    }
+                    Ok(true) => {}
                 }
                 processed_count += 1;
             }
