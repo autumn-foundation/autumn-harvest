@@ -247,13 +247,17 @@ established explanation for this occurrence or item 4's cascade — both
 remain open, alongside the product-bug reading this paragraph already
 flagged as undismissed.
 
-**Restated precisely:** this test has 2 confirmed occurrences of a specific
+**Restated precisely (corrected again below — do not read this in
+isolation):** this test has 2 confirmed occurrences of a specific
 outbox-retry-loop panic (unchanged candidate for its own product-vs-test
 verdict) and, separately, 1 occurrence of a panic at an earlier,
-quota-relevant wait, that shares its panic site with item 4's cascade and
-is now best explained by a confirmed, previously-measured shard-10
-overload regression — though a product-side race remains a live,
-undismissed possibility for that occurrence specifically.
+quota-relevant wait that shares its panic site with item 4's cascade. That
+occurrence remains unclassified: a confirmed shard-10 manifest-gap
+regression exists, but — per the correction later in this section —
+sequential shard execution rules out the concurrent-contention mechanism
+that would make it "the best explanation," so it is not ranked above the
+equally live, equally undismissed product-side-race possibility for that
+specific occurrence.
 
 Three occurrences (2 of one signature, 1 of another, on the identical test)
 is still far short of this role's own ≥20-rerun bar for a measured rate, and
@@ -713,9 +717,12 @@ sed -n '1348,1360p' autumn-harvest/tests/integration/integration_e2e.rs
 # outbox-retry polling loop (~3455-3466) that produces the "target row"
 # panic:
 sed -n '3400,3466p' autumn-harvest/tests/integration/quota_enforcement_tests.rs
-# -> confirms the 3rd occurrence is a separate, earlier, unrelated wait --
-#    a data point for item 4's pattern, not a 3rd occurrence of the
-#    outbox-retry mechanism the first two occurrences share.
+# -> confirms the 3rd occurrence is a different panic site than the first
+#    two (not the outbox-retry-loop assertion) -- but NOT "unrelated" to
+#    quota: the doc comment at lines 3410-3415 names this wait the test's
+#    own primary quota-deferral assertion, so a regression of the exact
+#    pre-fix bug it guards against remains a live, undismissed candidate,
+#    alongside (not superseded by) item 4's shard-10 pattern.
 
 # Item 4's shared-helper check, shard 3 (worst-hit):
 # get_job_logs(job_id=106225838152, return_content=false) -> signed URL
