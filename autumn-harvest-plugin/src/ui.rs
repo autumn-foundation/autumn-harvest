@@ -294,48 +294,27 @@ pub(crate) struct WorkflowDetailParams {
     /// `info` | `warn` | `error`. Absent or unrecognised means "all levels".
     #[serde(default)]
     log_level: Option<String>,
-
-    // Echoed back by a failed Send signal / Reset to event N / Trigger
-    // update submission (issue #1687). The operator's entered values
-    // survive the redirect that renders their validation error this way.
-    // Before this, every failure branch of those three action forms
-    // redirected to `?flash={error}` alone. The collapsed `<details>`
-    // closed back to empty. A mistyped JSON payload or event number had to
-    // be retyped from memory. See `WorkflowActionEcho`.
-    #[serde(default)]
-    signal_error: Option<String>,
-    #[serde(default)]
-    signal_name: Option<String>,
-    #[serde(default)]
-    signal_payload: Option<String>,
-    #[serde(default)]
-    reset_error: Option<String>,
-    #[serde(default)]
-    reset_event: Option<String>,
-    #[serde(default)]
-    reset_reason: Option<String>,
-    #[serde(default)]
-    update_error: Option<String>,
-    #[serde(default)]
-    update_name: Option<String>,
-    #[serde(default)]
-    update_payload: Option<String>,
 }
 
 /// Entered values and the validation error for the Send signal / Reset to
-/// event N / Trigger update forms. Echoed back from `WorkflowDetailParams`
-/// after a failed submission (issue #1687).
+/// event N / Trigger update forms. Passed in memory from a failed POST
+/// handler to [`render_workflow_detail_page`] (issue #1687).
 ///
 /// Each of the three action forms on the workflow detail page is a
-/// `<details>`-collapsed form that POSTs and redirects back to this same
-/// page. Before this type existed, every failure branch of those handlers
-/// redirected to `?flash={error}` alone. The redirect re-rendered the form
-/// collapsed and empty. The operator's signal name, JSON payload, reset
-/// event number/reason, or update name/payload were gone. Only a generic
-/// top-of-page flash said something had failed. `render_workflow_detail`
-/// uses these fields to keep the relevant `<details>` open. It pre-fills
-/// the inputs with what was submitted, and shows the error inline next to
-/// the field that caused it.
+/// `<details>`-collapsed form that POSTs back to this same page. Before
+/// this type existed, every failure branch of those handlers redirected to
+/// `?flash={error}` alone. The redirect re-rendered the form collapsed and
+/// empty. The operator's signal name, JSON payload, reset event
+/// number/reason, or update name/payload were gone. Only a generic
+/// top-of-page flash said something had failed.
+///
+/// A rejected submission never becomes a redirect at all now. See
+/// [`render_workflow_detail_page`]'s own doc comment for why a payload in
+/// the URL is itself a problem, not just a lost-data one. Instead the POST
+/// handler renders this page directly. It passes the rejected values here.
+/// `render_workflow_detail` uses them to keep the relevant `<details>`
+/// open, and to pre-fill the inputs with what was submitted. It shows the
+/// error inline next to the field that caused it.
 #[derive(Debug, Default)]
 struct WorkflowActionEcho {
     signal_error: Option<String>,
@@ -347,22 +326,6 @@ struct WorkflowActionEcho {
     update_error: Option<String>,
     update_name: Option<String>,
     update_payload: Option<String>,
-}
-
-impl WorkflowActionEcho {
-    fn from_params(params: &WorkflowDetailParams) -> Self {
-        Self {
-            signal_error: params.signal_error.clone(),
-            signal_name: params.signal_name.clone(),
-            signal_payload: params.signal_payload.clone(),
-            reset_error: params.reset_error.clone(),
-            reset_event: params.reset_event.clone(),
-            reset_reason: params.reset_reason.clone(),
-            update_error: params.update_error.clone(),
-            update_name: params.update_name.clone(),
-            update_payload: params.update_payload.clone(),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1543,20 +1506,54 @@ async fn workflow_detail_ui(
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> Result<Markup, AutumnError> {
-    let exec_id = parse_execution_id(&id)?;
+    render_workflow_detail_page(
+        &api_state,
+        &id,
+        params.event_page.as_deref(),
+        params.jump_event.as_deref(),
+        params.log_level.as_deref(),
+        params.flash.as_deref(),
+        WorkflowActionEcho::default(),
+        &headers,
+        maybe_session,
+    )
+    .await
+}
+
+/// Loads and renders the workflow detail page.
+///
+/// Shared by the `GET` route and by the three action-form handlers. Those
+/// are Send signal, Reset to event N, and Trigger update, on a rejected
+/// submission (issue #1687 review). A rejected submission renders this
+/// page directly. It does not redirect with the entered values in the
+/// query string. Putting a signal or update payload in a redirect URL
+/// would put it in browser history, in proxy/server access logs, and in
+/// the same-origin referrer. A payload near the engine's own size cap
+/// could also push the URL past a typical request-line limit.
+/// `action_echo` carries the rejected values and error in memory instead.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn render_workflow_detail_page(
+    api_state: &HarvestApiState,
+    id: &str,
+    event_page_raw: Option<&str>,
+    jump_event_raw: Option<&str>,
+    log_level_raw: Option<&str>,
+    flash: Option<&str>,
+    action_echo: WorkflowActionEcho,
+    headers: &axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
+) -> Result<Markup, AutumnError> {
+    let exec_id = parse_execution_id(id)?;
     let exec_uuid = exec_id.as_uuid();
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let mut conn = db_conn_for_execution(api_state, exec_id).await?;
     let execution = load_execution(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
 
     // Resolve event_page before any DB queries so we can use OFFSET/LIMIT directly.
     let page_size = DETAIL_EVENT_PAGE_SIZE;
-    let (event_page, event_page_error, jump_event_error) = resolve_workflow_detail_event_page(
-        params.event_page.as_deref(),
-        params.jump_event.as_deref(),
-        page_size,
-    );
+    let (event_page, event_page_error, jump_event_error) =
+        resolve_workflow_detail_event_page(event_page_raw, jump_event_raw, page_size);
 
     // Total event count — used for pagination controls.
     let total_events: i64 = harvest_events::table
@@ -1645,7 +1642,7 @@ async fn workflow_detail_ui(
         heartbeat_details_cap,
     )
     .await?;
-    resolve_blocked_on_heartbeat_caps(&api_state, &mut blocked_on);
+    resolve_blocked_on_heartbeat_caps(api_state, &mut blocked_on);
 
     // Resolve the continue-as-new threshold from the runtime registry if available.
     // This is a lightweight read of an in-memory value — no extra DB query.
@@ -1664,9 +1661,9 @@ async fn workflow_detail_ui(
     let mut page_events = page_events;
     let session = extension_session(maybe_session);
     decode_and_audit_workflow_detail(
-        &api_state,
+        api_state,
         &mut conn,
-        &headers,
+        headers,
         session.clone(),
         exec_id,
         &mut execution,
@@ -1692,9 +1689,8 @@ async fn workflow_detail_ui(
     // Loaded on the page's own connection before it is dropped. Best-effort: a
     // failure hides the panel rather than failing the page (logs are
     // observational, AC7), with a warn so a persistent failure is diagnosable.
-    let logs_admin = crate::api::has_harvest_admin_access(&api_state, session.clone()).await;
-    let log_level_filter =
-        autumn_harvest::WorkflowLogLevel::from_wire(params.log_level.as_deref().unwrap_or(""));
+    let logs_admin = crate::api::has_harvest_admin_access(api_state, session.clone()).await;
+    let log_level_filter = autumn_harvest::WorkflowLogLevel::from_wire(log_level_raw.unwrap_or(""));
     let mut log_read_failed = false;
     let mut log_truncated = false;
     let log_lines: Vec<autumn_harvest::models::HarvestWorkflowLog> = if logs_admin {
@@ -1761,9 +1757,9 @@ async fn workflow_detail_ui(
 
     drop(conn);
     if !is_terminal_workflow_state(&execution.state)
-        && crate::api::has_harvest_admin_access(&api_state, session).await
+        && crate::api::has_harvest_admin_access(api_state, session).await
     {
-        blocked_on.awaitables = match crate::api::build_awaitables_report(&api_state, exec_id).await
+        blocked_on.awaitables = match crate::api::build_awaitables_report(api_state, exec_id).await
         {
             Ok(report) => Some(report),
             Err(err) => {
@@ -1787,7 +1783,7 @@ async fn workflow_detail_ui(
         &children,
         event_page,
         &blocked_on,
-        params.flash.as_deref(),
+        flash,
         event_page_error.as_deref(),
         jump_event_error.as_deref(),
         continue_as_new_threshold,
@@ -1798,7 +1794,7 @@ async fn workflow_detail_ui(
             truncated: log_truncated,
             read_failed: log_read_failed,
         },
-        &WorkflowActionEcho::from_params(&params),
+        &action_echo,
     ))
 }
 
@@ -2251,6 +2247,7 @@ async fn signal_workflow_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
+    maybe_session: Option<Extension<Session>>,
     Form(form): Form<WorkflowSignalForm>,
 ) -> Result<axum::response::Response, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
@@ -2314,19 +2311,40 @@ async fn signal_workflow_ui(
     )
     .await;
 
-    // On failure, echo the entered signal name and payload back through the
-    // redirect (issue #1687). The re-rendered, re-opened form is not blank
-    // this way — the operator does not retype a JSON payload after a typo.
-    let redirect_url = match &error_summary {
-        None => format!("../../workflows/{id}?flash={flash}"),
-        Some(error) => format!(
-            "../../workflows/{id}?flash={flash}&signal_error={}&signal_name={}&signal_payload={}",
-            url_encode(error),
-            url_encode(&form.signal_name),
-            url_encode(payload_str),
-        ),
+    // On failure, render this page directly with the entered signal name
+    // and payload pre-filled (issue #1687 review). It does not redirect
+    // with them in the query string. A signal payload can carry credentials
+    // or other workflow data. A redirect would put it in browser history,
+    // in proxy/server access logs, and in the same-origin referrer. A
+    // large payload could also push the URL past a typical request-line
+    // limit. `conn` is dropped first: the render acquires its own
+    // connection, and holding two at once can deadlock a pool-size-one
+    // shard.
+    let Some(error) = error_summary else {
+        drop(conn);
+        let redirect_url = format!("../../workflows/{id}?flash={flash}");
+        return Ok(axum::response::Redirect::to(&redirect_url).into_response());
     };
-    Ok(axum::response::Redirect::to(&redirect_url).into_response())
+    drop(conn);
+    let echo = WorkflowActionEcho {
+        signal_error: Some(error.clone()),
+        signal_name: Some(form.signal_name.clone()),
+        signal_payload: Some(payload_str.to_string()),
+        ..Default::default()
+    };
+    let markup = render_workflow_detail_page(
+        &api_state,
+        &id,
+        None,
+        None,
+        None,
+        Some(&error),
+        echo,
+        &headers,
+        maybe_session,
+    )
+    .await?;
+    Ok(markup.into_response())
 }
 
 /// Parse the "Reset to event N" field (1-based, matching the timeline "#"
@@ -2364,6 +2382,7 @@ async fn reset_workflow_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
+    maybe_session: Option<Extension<Session>>,
     Form(form): Form<WorkflowResetForm>,
 ) -> Result<axum::response::Response, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
@@ -2435,24 +2454,42 @@ async fn reset_workflow_ui(
     )
     .await;
 
-    // On failure, echo the entered event number and reason back through the
-    // redirect (issue #1687) — same reasoning as `signal_workflow_ui`.
-    let redirect_url = match &error_summary {
-        None => format!("../../workflows/{id}?flash={flash}"),
-        Some(error) => format!(
-            "../../workflows/{id}?flash={flash}&reset_error={}&reset_event={}&reset_reason={}",
-            url_encode(error),
-            url_encode(&form.reset_to_event_id),
-            url_encode(form.reason.as_deref().unwrap_or("")),
-        ),
+    // On failure, render this page directly with the entered event number
+    // and reason pre-filled (issue #1687 review) — same reasoning as
+    // `signal_workflow_ui`.
+    let Some(error) = error_summary else {
+        drop(conn);
+        let redirect_url = format!("../../workflows/{id}?flash={flash}");
+        return Ok(axum::response::Redirect::to(&redirect_url).into_response());
     };
-    Ok(axum::response::Redirect::to(&redirect_url).into_response())
+    drop(conn);
+    let echo = WorkflowActionEcho {
+        reset_error: Some(error.clone()),
+        reset_event: Some(form.reset_to_event_id.clone()),
+        reset_reason: Some(form.reason.clone().unwrap_or_default()),
+        ..Default::default()
+    };
+    let markup = render_workflow_detail_page(
+        &api_state,
+        &id,
+        None,
+        None,
+        None,
+        Some(&error),
+        echo,
+        &headers,
+        maybe_session,
+    )
+    .await?;
+    Ok(markup.into_response())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn trigger_update_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
+    maybe_session: Option<Extension<Session>>,
     Form(form): Form<WorkflowTriggerUpdateForm>,
 ) -> Result<axum::response::Response, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
@@ -2485,16 +2522,29 @@ async fn trigger_update_ui(
                     },
                 )
                 .await;
-                let flash = url_encode(&err_msg);
-                // Echo the entered update name and payload back (issue
-                // #1687) — same reasoning as `signal_workflow_ui`.
-                let redirect_url = format!(
-                    "../../workflows/{id}?flash={flash}&update_error={}&update_name={}&update_payload={}",
-                    url_encode(&err_msg),
-                    url_encode(&form.update_name),
-                    url_encode(payload_str),
-                );
-                return Ok(axum::response::Redirect::to(&redirect_url).into_response());
+                // Render this page directly with the entered update name
+                // and payload pre-filled (issue #1687 review) — same
+                // reasoning as `signal_workflow_ui`.
+                drop(conn);
+                let echo = WorkflowActionEcho {
+                    update_error: Some(err_msg.clone()),
+                    update_name: Some(form.update_name.clone()),
+                    update_payload: Some(payload_str.to_string()),
+                    ..Default::default()
+                };
+                let markup = render_workflow_detail_page(
+                    &api_state,
+                    &id,
+                    None,
+                    None,
+                    None,
+                    Some(&err_msg),
+                    echo,
+                    &headers,
+                    maybe_session,
+                )
+                .await?;
+                return Ok(markup.into_response());
             }
         }
     };
@@ -2562,16 +2612,31 @@ async fn trigger_update_ui(
     )
     .await;
 
-    let redirect_url = match &error_summary {
-        None => format!("../../workflows/{id}?flash={flash}"),
-        Some(error) => format!(
-            "../../workflows/{id}?flash={flash}&update_error={}&update_name={}&update_payload={}",
-            url_encode(error),
-            url_encode(&form.update_name),
-            url_encode(payload_str),
-        ),
+    let Some(error) = error_summary else {
+        drop(conn);
+        let redirect_url = format!("../../workflows/{id}?flash={flash}");
+        return Ok(axum::response::Redirect::to(&redirect_url).into_response());
     };
-    Ok(axum::response::Redirect::to(&redirect_url).into_response())
+    drop(conn);
+    let echo = WorkflowActionEcho {
+        update_error: Some(error.clone()),
+        update_name: Some(form.update_name.clone()),
+        update_payload: Some(payload_str.to_string()),
+        ..Default::default()
+    };
+    let markup = render_workflow_detail_page(
+        &api_state,
+        &id,
+        None,
+        None,
+        None,
+        Some(&error),
+        echo,
+        &headers,
+        maybe_session,
+    )
+    .await?;
+    Ok(markup.into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -5673,7 +5738,20 @@ fn render_workflow_detail(
                 form method="post" action={ (exec_id_str) "/reset" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Event # (1-based, as shown in timeline)"
-                        input type="number" name="reset_to_event_id" min="1" required placeholder="1"
+                        // `type="text"` with `inputmode`/`pattern`, not
+                        // `type="number"` (Codex review, issue #1687). A
+                        // browser's number-input value-sanitization
+                        // algorithm blanks a non-numeric value from the
+                        // visible control. This happens even though the raw
+                        // HTML attribute still carries it. On the exact
+                        // rejected-input case this field exists to
+                        // redisplay, `type="number"` would show an empty
+                        // box. The DOM attribute, and this file's own
+                        // tests, would say otherwise. `inputmode="numeric"`
+                        // still gives mobile browsers a numeric keypad.
+                        // `pattern` is a hint; the server-side parser
+                        // remains the authority, not a replacement for it.
+                        input type="text" inputmode="numeric" pattern="[0-9]*" name="reset_to_event_id" required placeholder="1"
                             value=(action_echo.reset_event.as_deref().unwrap_or(""))
                             style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
@@ -17036,7 +17114,9 @@ mod tests {
             "the signal form's error must render inline: {html}"
         );
         assert!(
-            html.contains(r#"name="signal_name" required placeholder="e.g. approve" value="approve""#),
+            html.contains(
+                r#"name="signal_name" required placeholder="e.g. approve" value="approve""#
+            ),
             "the signal name the operator typed must be redisplayed, not blanked: {html}"
         );
         assert!(
@@ -17049,7 +17129,7 @@ mod tests {
             "the reset form's error must render inline: {html}"
         );
         assert!(
-            html.contains(r#"name="reset_to_event_id" min="1" required placeholder="1" value="zz""#),
+            html.contains(r#"name="reset_to_event_id" required placeholder="1" value="zz""#),
             "the reset event number the operator typed must be redisplayed, not blanked: {html}"
         );
         assert!(

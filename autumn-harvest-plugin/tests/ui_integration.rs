@@ -5521,48 +5521,47 @@ async fn detail_page_reset_action_redirects_with_flash() {
 /// GREEN — `reset_to_event_id` used to be typed `i64` directly on
 /// `WorkflowResetForm`. A non-numeric value failed axum's own `Form`
 /// deserialization before `reset_workflow_ui` ever ran. That was a bare
-/// framework 400, not the styled flash-redirect every other action on this
-/// page produces. Reset is the runbook's destructive recovery action, not
+/// framework 400, not the styled error the page renders for every other
+/// rejected action. Reset is the runbook's destructive recovery action, not
 /// a filter, so the fix rejects the value with a clear message. It does
 /// not guess an event number the operator never typed.
+///
+/// A rejected submission renders the detail page directly (200), not a
+/// redirect (issue #1687 review). This is updated from this test's
+/// original redirect-based assertion — see
+/// `detail_page_reset_action_with_invalid_event_number_preserves_entered_reason`
+/// for the entered-data-preservation half of that fix.
 #[tokio::test]
-async fn detail_page_reset_action_with_invalid_event_number_redirects_with_flash_instead_of_aborting()
- {
+async fn detail_page_reset_action_with_invalid_event_number_renders_error_instead_of_aborting() {
     let (database_url, _container) = setup_test_database_url().await;
     let exec_id =
         insert_workflow_on_url(&database_url, ShardId::new(0), "reset_wf3", "reset-3").await;
 
     let app = build_single_shard_ui_app(&database_url);
-    let (status, headers, body) = post_form(
+    let (status, _headers, html) = post_form(
         &app,
         &format!("/workflows/{exec_id}/reset"),
         "reset_to_event_id=not-a-number&reason=oops",
     )
     .await;
-    assert!(
-        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
-        "an invalid event number must redirect with a flash error, not abort the request (got {status}): {body}"
-    );
-    let location = headers
-        .get("location")
-        .expect("redirect must have Location header")
-        .to_str()
-        .unwrap();
-    assert!(
-        location.contains(&exec_id.to_string()) || location.contains("workflows"),
-        "redirect must go back to the detail page: {location}"
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an invalid event number must render the detail page with an error, not abort the request: {html}"
     );
     assert!(
-        location.contains("flash"),
-        "redirect must carry a flash message naming the bad value: {location}"
+        html.contains("invalid event number") && html.contains("expected a whole number"),
+        "the rendered page must name the bad value: {html}"
     );
 }
 
 /// GREEN (issue #1687) — a rejected reset submission used to redirect with
 /// only a generic flash. The collapsed "Reset to event N" panel re-rendered
-/// empty, so the operator's event number and reason were gone. The redirect
-/// now also carries the entered values. The re-rendered page shows the
-/// panel open and pre-filled with exactly what was submitted.
+/// empty, so the operator's event number and reason were gone. A rejected
+/// submission now renders the detail page directly (200, not a redirect;
+/// issue #1687 review). A redirect would put the submitted values in the
+/// URL, and hence in browser history and server logs. The panel now
+/// re-opens, pre-filled with exactly what was submitted.
 #[tokio::test]
 async fn detail_page_reset_action_with_invalid_event_number_preserves_entered_reason() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -5570,23 +5569,19 @@ async fn detail_page_reset_action_with_invalid_event_number_preserves_entered_re
         insert_workflow_on_url(&database_url, ShardId::new(0), "reset_wf4", "reset-4").await;
 
     let app = build_single_shard_ui_app(&database_url);
-    let (_status, headers, _body) = post_form(
+    let (status, _headers, html) = post_form(
         &app,
         &format!("/workflows/{exec_id}/reset"),
         "reset_to_event_id=not-a-number&reason=rollback+after+incident",
     )
     .await;
-    let location = headers
-        .get("location")
-        .expect("redirect must have Location header")
-        .to_str()
-        .unwrap();
-    let query = location.split_once('?').map_or("", |(_, q)| q);
-
-    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}?{query}")).await;
-    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a rejected reset must render the detail page directly, not redirect: {html}"
+    );
     assert!(
-        html.contains(r#"name="reset_to_event_id" min="1" required placeholder="1" value="not-a-number""#),
+        html.contains(r#"name="reset_to_event_id" required placeholder="1" value="not-a-number""#),
         "the entered event number must be redisplayed, not blanked: {html}"
     );
     assert!(
@@ -5607,21 +5602,17 @@ async fn detail_page_signal_action_with_invalid_payload_preserves_entered_values
         insert_workflow_on_url(&database_url, ShardId::new(0), "signal_wf3", "signal-3").await;
 
     let app = build_single_shard_ui_app(&database_url);
-    let (_status, headers, _body) = post_form(
+    let (status, _headers, html) = post_form(
         &app,
         &format!("/workflows/{exec_id}/signal"),
         "signal_name=approve&payload=%7Bnot+json",
     )
     .await;
-    let location = headers
-        .get("location")
-        .expect("redirect must have Location header")
-        .to_str()
-        .unwrap();
-    let query = location.split_once('?').map_or("", |(_, q)| q);
-
-    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}?{query}")).await;
-    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a rejected signal must render the detail page directly, not redirect: {html}"
+    );
     assert!(
         html.contains(r#"name="signal_name" required placeholder="e.g. approve" value="approve""#),
         "the entered signal name must be redisplayed, not blanked: {html}"
