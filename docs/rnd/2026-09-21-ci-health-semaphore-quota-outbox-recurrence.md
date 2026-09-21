@@ -1,32 +1,40 @@
-# 🚦 Semaphore CI health — `quota_enforcement_tests`' unexplained outbox-retry
-# timeout recurs a 2nd confirmed time, and a 3rd, unrelated failure of the
-# same test at an earlier step shares its panic site with a separate
-# shard-10 wait-timeout cascade, tying two candidates this report's first
-# draft treated as unrelated; `corpus::seeded_corpus_is_clean_under_the_
-# syntactic_layer`'s 5th occurrence confirms the 09-18 report's diagnosis
-# still holds (own-diff dead code, not a flake)
+# 🚦 Semaphore CI health — `test-db-linux` shard 10's overload is a
+# confirmed regression of a previously-fixed, previously-measured sharding
+# defect (issue #1267's `integration_e2e`/`quota_enforcement_tests`
+# collision, silently reintroduced by alphabetical manifest growth), found
+# while chasing `quota_enforcement_tests`' own 2nd confirmed outbox-retry
+# timeout; `corpus::seeded_corpus_is_clean_under_the_syntactic_layer`'s 5th
+# occurrence confirms the 09-18 report's diagnosis still holds
 
 **Status:** health report — no PR opened against `ci.yml` or any test. Continues
 the series from `docs/rnd/2026-09-20-ci-health-semaphore-migration-count-message-fix.md`.
 
-**Corrected three times after review** (Codex on this PR, two rounds): the
-initial draft of item 3 reopened
+**Corrected across five review rounds** (Codex on this PR): the initial
+draft of item 3 reopened
 `corpus::seeded_corpus_is_clean_under_the_syntactic_layer` as "still
 undiagnosed" and miscounted it as a 4th occurrence on a fifth branch,
 without checking today's occurrence against the 09-18 report's own
-diagnostic-clarity fix — which was live in the log this session already had
-and, once grepped, shows the exact same deterministic dead-code mechanism
-that report closed as "not a flake." Second, the census math in the
-Diagnosis and Measurement sections omitted `35553863066` (item 2's quota
-recurrence) from its 15/2/2 breakdown entirely. Third, a follow-up review
-caught that the census itself was built from the combined `{event, status}`
-filter the 09-17 report confirmed is non-deterministic, without the
-validation or workaround that finding requires — rebuilding it via the
-documented method recovered one more failure (`35576291757`), which turned
-out to be a 3rd occurrence of item 2's test with a *different* signature
-that ties it directly to item 4's cascade. All three corrected below,
-inline at the point each applies; item 2 and item 4 are now materially
-different findings than the first draft reported.
+diagnostic-clarity fix. Second, the census math omitted `35553863066`
+(item 2's quota recurrence) from its 15/2/2 breakdown entirely. Third, a
+follow-up review caught that the census itself was built from the combined
+`{event, status}` filter the 09-17 report confirmed is non-deterministic —
+rebuilding it via the documented method recovered one more failure
+(`35576291757`). Fourth, a review round caught that this recovered failure
+was wrongly analyzed as both a 3rd occurrence of item 2's specific
+outbox-retry mechanism and a 2nd occurrence of item 4's mass cascade;
+neither held up against the source and the full log. **Fifth, and most
+consequential: a review round caught that the walk-back on the fourth
+point had itself overcorrected** (calling the 3rd occurrence's wait
+"unrelated" to quota when it is the test's own primary quota-deferral
+assertion) and, separately, that the shard-10 co-location this report had
+been treating as an unmeasured hypothesis is actually a **confirmed
+regression of a previously-fixed, previously-measured CI-health defect**
+(`ci.yml`'s own comment documents issue #1267's fix for this exact
+collision, including a historical baseline — ~35 min vs 18-28 min per
+shard — that this report had not read closely enough on the first four
+passes). All five corrected below, inline at the point each applies; the
+report's headline finding and recommended priority changed with each
+round.
 
 ## 🎯 Verdict path
 
@@ -167,50 +175,72 @@ thread 'quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target
 workflow should reach expected state within timeout: Elapsed(())
 ```
 
-**Correction (post-review):** an earlier draft of this section called this
-a 3rd occurrence *of the outbox-retry timeout*, with two readings offered
-for why the signature differed. A Codex review correctly pointed out that
-this conflates two entirely different waits inside the same test function.
-Reading the source
-(`quota_enforcement_tests.rs:3400-3466`): the test starts a source
-workflow, waits for it to reach `COMPLETED` at **line 3416** —
-`wait_for_execution_state(&url, source, "COMPLETED").await`, a thin
-10-second wrapper around the shared
+**Correction (post-review), two rounds.** An earlier draft of this section
+called this a 3rd occurrence *of the outbox-retry timeout*. A Codex review
+correctly pointed out that this conflates two different waits inside the
+same test function. Reading the source (`quota_enforcement_tests.rs:3400-
+3466`): the test starts a source workflow, waits for it to reach
+`COMPLETED` at **line 3416** — `wait_for_execution_state(&url, source,
+"COMPLETED").await`, a thin 10-second wrapper around the shared
 `wait_for_execution_state_with_timeout` helper (confirmed at
 `integration_e2e.rs:1348-1360`) — asserts the outbox row count, asserts the
 target row count, **then** frees the quota slot (`mark_terminal`, line
 ~3453) and only **then** enters the outbox-retry-specific polling loop
 (lines ~3455-3466) that produces the "target row was never created" panic.
-`35576291757`'s panic is at `integration_e2e.rs:1383:6`, the shared
-helper's own `.expect(...)` — reached only from line 3416's call, **before**
-the quota slot is freed and before the outbox-retry loop is ever entered.
-**This is not a 3rd occurrence of the outbox-retry timeout at all.** It is
-a separate failure of the same test, at an earlier, unrelated step: the
-*source* workflow itself did not reach `COMPLETED` within 10 seconds,
-which has nothing to do with the target's quota, the outbox, or the retry
-sweep.
+`35576291757`'s panic is at `integration_e2e.rs:1383:6`, reached only from
+line 3416's call, before the quota slot is freed. **This is not a 3rd
+occurrence of the outbox-retry-specific panic.**
 
-That correction changes what this occurrence is evidence *for*. A generic
-"a workflow didn't reach its expected state in time" timeout, at the exact
-panic site item 4's mass cascade also hits, is not a 3rd data point for the
-specific outbox-retry race — it is a data point connecting *this test's
-own occasional flakiness* to item 4's broader shard-10 pattern instead.
-Checked whether the shard-10 co-location is coincidence:
+**A second review round then caught that the walk-back overreached.** The
+first correction's draft called line 3416's wait "unrelated" to quota and
+the outbox. Wrong: reading the test's own doc comment immediately above it
+(`quota_enforcement_tests.rs:3410-3415`) — *"The money assertion: the
+source reaches COMPLETED even though its trigger's target is at quota cap.
+Pre-fix, `Err(QuotaExceeded)` propagating out of
+`evaluate_triggers_for_execution` rolled back the WHOLE persist
+transaction — including the source's own `WorkflowCompleted` append —
+leaving it stuck RUNNING forever with no error ever recorded"* — line
+3416 **is** this test's primary quota-deferral assertion, not an
+incidental setup step. A regression of that exact pre-fix bug would present
+exactly as observed: the source's terminal commit rolled back, the row
+permanently stuck non-`COMPLETED`, and `wait_for_execution_state` timing
+out at 10s waiting for a state that will never arrive. That remains a live,
+undismissed candidate.
+
+**What is now also confirmed, and changes which candidate is more likely:**
 `.github/ci/integration-suites.txt`'s row-ordinal sharding (`row_ordinal %
 11`) puts **both** `integration_e2e` (row 32, `32 % 11 = 10`) and
-`quota_enforcement_tests` (row 43, `43 % 11 = 10`) on shard 10 — confirmed
-by direct calculation, not assumed. Item 4's own shard-10 leg (same run,
-`35563198153`) independently confirms the connection: its full log shows
-this exact test also panicking at `integration_e2e.rs:1383:6` (the same
-generic site, not the outbox-specific one), alongside roughly 60 other
-`integration_e2e`/`quota_enforcement_tests` tests in the same shard.
+`quota_enforcement_tests` (row 43, `43 % 11 = 10`) on shard 10. This is not
+merely a coincidence this session noticed — `ci.yml`'s own comment at the
+`test-db-linux` matrix (lines 988-997) documents that these exact two
+suites colliding on one shard is a **previously fixed, previously
+measured** problem: *"11, not 10 (issue #1267 review). `row_ordinal % 10`
+put `integration_e2e` and `quota_enforcement_tests` on one shard... That
+shard ran ~35 min against 18-28 min for every other shard... 11 shares no
+factor with the 10-row gap, so it cannot reproduce the collision."* At the
+time of that fix, the two suites' manifest positions were exactly 10 rows
+apart; today they are exactly 11 rows apart — because the manifest is
+alphabetically generated and grows as new integration test files are added
+between "integration_e2e" and "quota_enforcement_tests" alphabetically, the
+gap silently drifted from 10 to 11, landing on the one specific multiple
+the chosen shard count cannot tolerate. **This is a confirmed regression of
+a previously-fixed, previously-measured CI-health defect (issue #1267), not
+an unmeasured hypothesis** — and it directly explains both this occurrence
+and item 4's cascade without requiring either to be a genuine product bug.
+It does not, however, rule the product-bug reading out: a shard running 35
+minutes of other tests' contention is exactly the kind of environment where
+a marginal, genuinely-racy quota-deferral bug would also be more likely to
+surface. This session cannot distinguish "purely shard-10 overload" from "a
+real product race made more likely by shard-10 overload" without the same
+missing worker-tracing evidence noted throughout this report.
 
-**Restated precisely:** this test has 2 confirmed occurrences of a
-specific outbox-retry mechanism (its own candidate for a product-vs-test
-verdict, unchanged by this correction) and, separately, 1 occurrence of a
-generic dispatch/wait timeout that connects it to item 4's shard-10
-pattern rather than to the outbox-retry mechanism. Both are recorded as
-open, neither conflated with the other.
+**Restated precisely:** this test has 2 confirmed occurrences of a specific
+outbox-retry-loop panic (unchanged candidate for its own product-vs-test
+verdict) and, separately, 1 occurrence of a panic at an earlier,
+quota-relevant wait, that shares its panic site with item 4's cascade and
+is now best explained by a confirmed, previously-measured shard-10
+overload regression — though a product-side race remains a live,
+undismissed possibility for that occurrence specifically.
 
 Three occurrences (2 of one signature, 1 of another, on the identical test)
 is still far short of this role's own ≥20-rerun bar for a measured rate, and
@@ -264,7 +294,7 @@ this branch's own diff, caught independently and correctly by two gates
 rebuild), not a suite-level flake and not requiring any further diagnosis.
 **No action needed; not carried forward.**
 
-### 4. `claude/keen-bardeen-amm1ft`: one run, 6 of 11 `test-db-linux` shards fail, most panics at one shared polling helper — connects to item 2, still not root-caused
+### 4. `claude/keen-bardeen-amm1ft`: one run, 6 of 11 `test-db-linux` shards fail — shard 10's share is a confirmed sharding-manifest regression (issue #1267), shard 3's is not explained
 
 **Correction (post-review):** the first draft said "6 of 30 shards." Wrong
 denominator — `test-db-linux`'s own matrix (`ci.yml:1002`,
@@ -291,16 +321,39 @@ expected state, and gives up after a fixed `tokio::time::timeout`. A handful
 of the shard's failures instead panic at an assertion inside their own test
 file (`chain_timeout_tests.rs:736`/`880`, `mixed_suspension_tests.rs:508`),
 not the shared helper — not checked further this session. Shard 3 was the
-worst-hit but not the only one: **added after review**, this same run's own
-shard 10 independently shows ~60 `integration_e2e`/`quota_enforcement_tests`
-failures, nearly all at the identical `integration_e2e.rs:1383:6` site —
-including the exact test item 2 tracks,
+worst-hit in this run but not the only one: **added after review**, this
+same run's own shard 10 independently shows ~60
+`integration_e2e`/`quota_enforcement_tests` failures, nearly all at the
+identical `integration_e2e.rs:1383:6` site — including the exact test item
+2 tracks,
 `quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded`
-(see item 2's own correction above). `.github/ci/integration-suites.txt`'s
-row-ordinal sharding puts both `integration_e2e` (row 32) and
-`quota_enforcement_tests` (row 43) on shard 10 by construction (`32 % 11 =
-43 % 11 = 10`), so shard 10 carries the two largest serial suites in the
-manifest — a candidate reason it's where this panic site keeps surfacing.
+(see item 2's own correction above).
+
+**Elevated from hypothesis to confirmed regression (post-review, second
+round).** `.github/ci/integration-suites.txt`'s row-ordinal sharding puts
+both `integration_e2e` (row 32) and `quota_enforcement_tests` (row 43) on
+shard 10 (`32 % 11 = 43 % 11 = 10`). This is not this session's own
+discovery of a coincidence — `ci.yml`'s own comment at the `test-db-linux`
+matrix definition (lines 988-997) documents that this exact collision was
+already found, measured, and fixed once: *"11, not 10 (issue #1267
+review). `row_ordinal % 10` put `integration_e2e` and
+`quota_enforcement_tests` on one shard. These are the manifest's two
+largest, most wall-clock-timeout-shaped suites... That shard ran ~35 min
+against 18-28 min for every other shard... 11 shares no factor with the
+10-row gap, so it cannot reproduce the collision."* Both files' own
+`#[tokio::test]` counts confirm the sizing claim directly (68 in
+`integration_e2e.rs`, 43 in `quota_enforcement_tests.rs`, 111 combined —
+far above any other single suite in the manifest). At the time of that fix
+the two suites' manifest rows were 10 apart; today, per direct count, they
+are 11 apart — because the manifest is generated in alphabetical order and
+grows as new integration test files land between "integration_e2e" and
+"quota_enforcement_tests" alphabetically, the gap silently drifted onto the
+one multiple the chosen shard count cannot tolerate. **This is a confirmed
+regression of a previously-fixed, previously-measured CI-health defect
+(issue #1267), not an unmeasured hypothesis** — and the invariant that
+prevented it has no guard: nothing in this repository currently checks
+that these two suites (or any other pair) stay off the same shard as the
+manifest continues to grow.
 
 **Correction (post-review):** an earlier draft of this section, and of item
 2's summary, called item 2's 3rd occurrence (`35576291757`) a **2nd
@@ -310,28 +363,30 @@ SUITES:` line, not just the one test item 2 tracks: it shows **exactly one**
 test failure in that entire shard, not a cascade. So this run shares the
 same panic *site* and the same *shard* as `35563198153`'s cascade, but not
 its shape — one isolated test timing out is a materially weaker data point
-than dozens failing together, and does not by itself confirm shard 10 is
-systemically slow rather than this one test being unusually
-timing-sensitive on its own. Both remain live candidates.
+than dozens failing together on its own. It no longer needs to stand alone,
+though: per the correction above, shard 10 is now confirmed (not merely
+hypothesized) to be a structurally overloaded shard, independent of
+anything either branch's own diff did.
 
-This shape (`35563198153`'s many-tests-in-one-shard cascade, one shared
-wait-helper's timeout firing across otherwise-independent tests) is
-consistent with either a systemic problem in that run's environment (worker
-never processes tasks, DB contention) or a genuine regression in that
-branch's own diff that broke workflow dispatch broadly enough that nothing
-reaches its expected state in time. **Not root-caused, and not rendered as
-a test-vs-product verdict** — this session did not fetch the branch's diff,
-did not check whether a later commit fixed it, and does not have the
-worker-level logging that would distinguish those possibilities from
-"shard 10's own suite is long enough that transient CI contention hits it
-more often than other shards" — the last of which item 2's isolated 3rd
-occurrence is also consistent with, without requiring the cascade
-explanation. Recorded as **1 cascade occurrence, plus 1 shared-panic-site,
-shared-shard, non-cascade occurrence** — not "2 occurrences of the
-cascade." Still short of a measured rate. The shard-10 co-location is a
-concrete, checkable hypothesis worth timing-decomposition work (per this
-role's own Tier-1 evidence toolkit), not yet confirmed as the mechanism for
-either.
+This run's shape (many otherwise-independent tests failing at one shared
+wait-helper's timeout, across **two** shards — 3 and 10 — not shard 10
+alone) is still not fully root-caused: this session did not fetch the
+branch's diff, did not check whether a later commit fixed it, and does not
+have worker-level logging. But the shard-10 half of it now has a confirmed,
+documented structural cause (the collision above) that does not require a
+product regression to explain — a genuine reason to weight "shard 10's
+own long wall-clock made it exposed to transient contention" well above
+"this branch's diff broke dispatch," at least for shard 10's own failures
+in this run. Shard 3's simultaneous failure (a shard that does **not**
+carry either oversized suite) is not explained by the shard-10 collision
+at all, and points toward a broader, run-wide contention event in
+`35563198153` specifically — not investigated further this session.
+Recorded as **1 cascade occurrence (across 2 shards, only one of which has
+a confirmed structural cause), plus 1 shared-panic-site, shared-shard,
+non-cascade occurrence** on the now-confirmed shard-10 defect. The
+remaining open question is not "is shard 10 imbalanced" (settled) but
+"was this run's shard 3 failure the same phenomenon by a different
+mechanism, or an unrelated coincidence" — not resolved by this report.
 
 ### 5. `cross_region_dr_tests`: one occurrence, new signature, not root-caused
 
@@ -362,85 +417,112 @@ are unresolved: item 2 (`35553863066`, `35576291757` — 2 of item 2's 3
 occurrences; the 1st, `35034838493`, predates this window), item 4
 (`35563198153`), and item 5 (`35535358141`).
 
-**Item 2** cannot yet be given a test-vs-product verdict — this role's own
-hard gate (requirement 3) blocks a fix PR until the nondeterminism is shown
-to live in the test rather than the product it exercises, and this session
-did not obtain the worker/tracing evidence that would decide it. What
-changed today is the evidentiary weight, twice over: 1 occurrence was
-"recorded, not actioned"; then 2 occurrences with byte-identical panic text
-six days apart became the series' strongest single-candidate signal since
-the closed activity-timeout item; then a 3rd occurrence, found only after
-correcting the census method, turned out to share its panic site with item
-4's shard-10 cascade — connecting two candidates this report's first draft
-treated as unrelated. This is the report's headline recommendation:
-**whoever next has Docker available in-session should point the ≥20x
-rerun campaign at
-`quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded`,
-and separately consider a timing decomposition of the `test-db-linux`
-shard-10 leg specifically** (it carries both `integration_e2e` and
-`quota_enforcement_tests` by the sharding formula — a plausible reason it is
-disproportionately exposed to timing pressure, but, per the correction
-below, its actual wall-clock time relative to the other 10 shards remains
-unmeasured, not confirmed as longest) — both ahead of any other candidate in
-this series' backlog.
+**Item 2, corrected twice more (post-review).** The outbox-retry-specific
+signature (2/2 occurrences, byte-identical panic text) still cannot be
+given a test-vs-product verdict — this role's own hard gate (requirement 3)
+blocks a fix PR until the nondeterminism is shown to live in the test
+rather than the product, and this session did not obtain the
+worker/tracing evidence that would decide it. The 3rd occurrence is a
+**different** panic (not the outbox-retry assertion — see the correction
+in item 2's own section) at a wait that is nonetheless the test's own
+primary quota-deferral assertion, not an unrelated setup step. **This is
+the report's headline recommendation, now sharper than the first two
+drafts stated it:** whoever next has Docker available in-session should
+(a) point the ≥20x rerun campaign at
+`quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded`'s
+outbox-retry-loop panic specifically, and (b) **fix the confirmed
+`test-db-linux` shard-10 sharding-manifest regression** (item 4's
+correction — this is no longer a hypothesis: `ci.yml`'s own comment
+documents this exact collision was found, measured at ~35 min vs 18-28 min
+per shard, and fixed once already under issue #1267; the manifest has
+since drifted back into the one gap value (11) the chosen shard count
+cannot tolerate). (b) is the higher-confidence, lower-cost fix of the two:
+it needs no rerun campaign to justify, only a one-line manifest reorder (or
+a shard-count bump) and a before/after timing comparison on the
+`test-db-linux` shard legs — squarely within this role's own Tier-1 timing-
+decomposition toolkit, and a strong "Harness PR" candidate per this role's
+charter (a check that keeps this invariant from silently drifting again as
+the manifest keeps growing alphabetically, since nothing currently guards
+it). Neither was executed this session — this report documents the finding
+precisely enough that either can be picked up without re-deriving it.
 
 **Item 3** is closed, per the correction above: the 09-18 report's diagnosis
 holds on this 5th occurrence too — real, own-branch dead code, correctly
 caught by two independent gates, not a suite defect. No further action, and
 not carried forward to the next report.
 
-**Item 4** is explicitly not rendered as a test-vs-product verdict.
-**Correction (post-review):** an earlier draft of this paragraph called item
-2's 3rd occurrence a 2nd occurrence of this cascade — wrong, per the
-correction in item 4's own symptom section above: `35576291757` shows
-exactly one test failing, not the dozens `35563198153` showed. What is
-confirmed is narrower: the same panic *site* and the same *shard*, not the
-same *shape*. The evidence gathered this session (1 cascade occurrence, 1
-single-test occurrence sharing its site and shard, no diff read on either
-branch, no later-commit check, no worker-level logging) is still
-insufficient to say whether this is a real dispatch-path regression,
-DB/runner contention, or simply shard 10's own wall-clock making it more
-exposed to any transient slowdown than other shards — that last
-possibility remains a hypothesis, not a measurement (see the Treatment
-section's new item). "Insufficient to render a verdict" is now at least
-paired with a concrete, checkable next experiment, which is a stronger
-position than a single occurrence's shrug, but the cascade itself is still
-n=1.
+**Item 4, corrected twice more (post-review).** An earlier draft called
+item 2's 3rd occurrence a 2nd occurrence of this cascade — wrong: it is 1
+test failing, not the dozens shard 3 showed in the same run. What changed
+since is stronger, not weaker: shard 10's disproportionate exposure is now
+a **confirmed regression of a previously-fixed, previously-measured defect
+(issue #1267)**, not a hypothesis needing a fresh timing decomposition to
+establish. What remains genuinely unresolved is narrower and more
+specific: shard 3 (which carries neither oversized suite) failed
+simultaneously in the same run, which the shard-10 collision does not
+explain at all — a real, open question about whether `35563198153` had a
+second, independent cause, or a broader run-wide contention event affecting
+multiple shards at once. That question, not "is shard 10 imbalanced,"
+is what would need worker-level logging or a fresh occurrence to resolve.
 
 **Item 5** has no mechanism recovered; a single, unclustered occurrence.
 
 ## 🔧 Treatment
 
-None shipped. Nothing found clears the impact floor this round: no flaky
-test made deterministic (0/N verified), no product bug rendered with a
-mechanism, no timing win measured, no quarantine ledger entries to retire
-(still no quarantine ledger in this repository — checked again), no suite
-passing under shuffled order to report (not run this session). Per the hard
-gate, a report is the correct outcome, not a PR against `ci.yml` or any test.
+None shipped this session. **Item 4's correction found something that
+clears — or nearly clears — this role's own impact floor: not a fresh
+flake fix, but a confirmed, named, previously-measured configuration
+regression** (a "cache made correct" / structural-defect analog to that
+category, since `ci.yml`'s own comment already supplies the before
+measurement: ~35 min vs 18-28 min per shard, issue #1267). What's missing
+to actually ship it is not more diagnosis — the mechanism, the fix shape,
+and the historical baseline are all already documented in `ci.yml`'s own
+comment and confirmed by this report's direct row-count check — but a
+fresh **after** measurement from the same harness, which this session did
+not obtain (no live GitHub Actions dispatch available to trigger and time
+a fixed run). Per the hard gate's own rule ("if you cannot produce the
+after-measurement... the correct outcome is a report, not a PR"), this
+stays a report, but it is now the most actionable item this series has
+produced: a named 2-line diagnosis, ready for a same-day fix PR the moment
+a session can run the before/after shard-timing comparison. No flaky test
+was made deterministic this session, no timing win was itself measured,
+no quarantine ledger entries retired (none exist), no suite passing under
+shuffled order to report.
 
-Carried forward, unchanged from prior reports in this series:
+Carried forward, in priority order:
 
-1. **Cache-usage API access** — still unavailable, checked again today.
-2. **Branch-protection confirmation** — still unavailable, checked again
+1. **Fix the `test-db-linux` shard-10 sharding-manifest regression
+   (issue #1267's collision, reintroduced)** — now this report's top
+   priority, ahead of the rerun campaign below. The fix shape is
+   essentially known: reorder or pad `.github/ci/integration-suites.txt`
+   (or bump `SEMAPHORE_SHARD_COUNT`, keeping the matrix list length in
+   sync) so `integration_e2e` (row 32) and `quota_enforcement_tests` (row
+   43) no longer land on the same shard under `row_ordinal % count`, then
+   time the affected shards before and after. A durable fix should also
+   add a harness (a guard script in `docs/audits/`, this repo's own
+   convention, checking the two suites' row gap against the shard count on
+   every PR) so the invariant cannot silently drift again as the manifest
+   keeps growing alphabetically — this repeated regression is itself
+   evidence the point-in-time fix from issue #1267 was not self-maintaining.
+2. **The rerun campaign for `quota_enforcement_tests`'s outbox-retry-loop
+   panic specifically** (2/2 byte-identical occurrences; the 09-16 report's
+   activity-timeout `#1558` campaign is comparatively less urgent, at 0/1
+   confirmed exposure and no fresh occurrences since) — still not run by
+   any session; no Docker available in this session's sandbox.
+3. **Cache-usage API access** — still unavailable, checked again today.
+4. **Branch-protection confirmation** — still unavailable, checked again
    today.
-3. **The rerun campaign for `quota_enforcement_tests`** (this report's new
-   top priority; the 09-16 report's activity-timeout `#1558` campaign is
-   comparatively less urgent now, at 0/1 confirmed exposure and no fresh
-   occurrences since) — still not run by any session; no Docker available
-   in this session's sandbox.
-4. **The `list_workflow_runs` conclusion vs. `list_workflow_jobs` gap**
+5. **The `list_workflow_runs` conclusion vs. `list_workflow_jobs` gap**
    (item 1's data-quality note) — 2 of 20 runs this window report `failure`
    overall with 0 job-level failures found; not previously logged in this
    series in exactly this form (distinct from the cancelled-run-hides-a-
    failure direction the 09-06/09-11 reports found — this is the reverse:
    an explicit `failure` conclusion the jobs API cannot account for).
-5. **A timing decomposition of `test-db-linux` shard 10** — new this report
-   (item 4's correction): shard 10 carries both `integration_e2e` and
-   `quota_enforcement_tests` by the sharding formula, and is now implicated
-   in both item 2's 3rd occurrence and item 4's cascade. Whether its own
-   wall-clock time is disproportionate versus the other 10 shards has not
-   been measured by any session.
-6. **The remaining cancelled-run population** — the 45 cancelled runs in
+6. **Shard 3's simultaneous failure in `35563198153`** — not explained by
+   the shard-10 collision (shard 3 carries neither oversized suite); a
+   genuinely open question about a possible broader, run-wide contention
+   event, separate from item 4's now-confirmed structural cause.
+7. **The remaining cancelled-run population** — the 45 cancelled runs in
    this window were not job-logged at all this session (time budget went to
    the 20 explicit failures instead, all 20 of which were checked, an
    improvement over prior reports' partial samples).
@@ -458,44 +540,49 @@ Carried forward, unchanged from prior reports in this series:
   item 3's correction. 2/20 a census/tooling gap (conclusion/job mismatch).
   4/20 unresolved, with no rendered test-vs-product verdict: items 2 (2 of
   its 3 occurrences fall in this window), 4, and 5.
-- **Item 2: correction (post-review).** An earlier draft counted all 3
-  occurrences of this test as evidence for one mechanism. Reading the test
-  source (`quota_enforcement_tests.rs:3400-3466`) shows the 3rd occurrence's
-  panic site (`integration_e2e.rs:1383:6`, reached from line 3416's
-  `wait_for_execution_state` call) fires **before** the quota slot is freed
-  and **before** the outbox-retry loop is ever entered — it is not the
-  mechanism the first two occurrences exercise. Corrected: **2/2 confirmed
-  occurrences** of the specific outbox-retry mechanism carry byte-identical
-  panic text (`"target row was never created by the outbox retry; last
-  count was 1"`), 6 days apart, 2 different branches — a real recurring
-  signal, own rerun-campaign candidate. **Separately, 1 occurrence** of a
-  generic wait-timeout at an earlier, unrelated step of the same test,
-  byte-identical to item 4's cascade site — evidence for item 4's pattern,
-  not for the outbox-retry mechanism. Neither is a rate (n=2 and n=1,
-  no rerun protocol run). No revert check applies — no fix was made or
-  attempted this session.
+- **Item 2: corrected twice more (post-review).** An earlier draft counted
+  all 3 occurrences of this test as evidence for one mechanism. Reading the
+  test source (`quota_enforcement_tests.rs:3400-3466`) shows the 3rd
+  occurrence's panic site (`integration_e2e.rs:1383:6`, reached from line
+  3416's `wait_for_execution_state` call) fires **before** the quota slot is
+  freed and **before** the outbox-retry loop is ever entered — not the
+  mechanism the first two occurrences exercise. A second correction then
+  caught that the walk-back overreached in calling that wait "unrelated" to
+  quota: its own doc comment (`quota_enforcement_tests.rs:3410-3415`) names
+  it the test's primary quota-deferral assertion. Corrected: **2/2
+  confirmed occurrences** of the specific outbox-retry-loop panic carry
+  byte-identical text (`"target row was never created by the outbox retry;
+  last count was 1"`), 6 days apart, 2 different branches — a real
+  recurring signal, own rerun-campaign candidate, unaffected by either
+  correction. **Separately, 1 occurrence** of a panic at the test's earlier
+  quota-relevant wait, byte-identical to item 4's cascade site — now best
+  explained by item 4's confirmed shard-10 regression, though a genuine
+  product-side race remains undismissed for that specific occurrence.
+  Neither is a rate (n=2 and n=1, no rerun protocol run). No revert check
+  applies — no fix was made or attempted this session.
 - **Item 3: correction (post-review).** 5th confirmed occurrence (not a 4th,
   per the correction above), on a 3rd distinct branch — direct log
   inspection (re-grepped after review for the `--- rustc diagnostics ---`
   section this session already had in hand) confirms the identical
   dead-code mechanism the 09-18 report closed. Root-caused, not a flake, no
   rate needed.
-- **Item 4: corrected twice (post-review).** First, denominator fixed: 6/11
-  shards, not 6/30 (`test-db-linux`'s own matrix is 11 shards; 30 was this
-  run's total job count across every job type). ~40 failing tests in the
-  worst shard (shard 3), large majority sharing one panic site
-  (`integration_e2e.rs:1383:6`, `wait_for_execution_state_with_timeout`).
-  Second, an earlier draft called item 2's 3rd occurrence a 2nd cascade
-  occurrence — wrong; re-checking that run's full log shows exactly 1 test
-  failed, not a cascade. Corrected: 1 cascade occurrence (this run), plus 1
-  single-test occurrence sharing the same panic site and same shard (item
-  2's 3rd occurrence) — not 2 occurrences of the cascade. Both land on
-  shard 10, confirmed by direct calculation that shard 10 uniquely carries
-  both `integration_e2e` and `quota_enforcement_tests` under the sharding
-  formula (`32 % 11 = 43 % 11 = 10`); shard 10's actual wall-clock time
-  relative to the other 10 shards is unmeasured, not confirmed as longest.
-  Not a rate; a shard-10-specific timing decomposition is the concrete next
-  step, not yet run by any session.
+- **Item 4: corrected three times (post-review).** First, denominator
+  fixed: 6/11 shards, not 6/30. Second, an earlier draft called item 2's
+  3rd occurrence a 2nd cascade occurrence — wrong; exactly 1 test failed in
+  that run, not a cascade. Third, and most substantively: shard 10's
+  disproportionate exposure is **no longer an unmeasured hypothesis**.
+  `ci.yml:988-997`'s own comment documents that `integration_e2e` and
+  `quota_enforcement_tests` colliding on one shard was already found and
+  fixed once (issue #1267), with a historical baseline already in hand:
+  *that* shard ran ~35 min against 18-28 min for every other shard. Direct
+  recount confirms the two suites are 11 manifest rows apart today (11 % 11
+  = 0), not the 10 the original fix accounted for — a silent regression via
+  alphabetical manifest growth, not a new discovery of a coincidence.
+  `#[tokio::test]` counts confirm the sizing (68 + 43 = 111 tests, the
+  manifest's two largest suites, combined on one shard). This is a
+  confirmed, previously-measured configuration defect; only a fresh
+  after-measurement (post-fix shard timing) is still missing, which this
+  session had no means to run (no live GitHub Actions dispatch).
 - **Item 5:** 1 occurrence, unclassified.
 - **Ledger:** no quarantine ledger exists in this repository to update.
 
@@ -595,6 +682,22 @@ grep -n "quota_enforcement_tests::completion_trigger_defers_to_outbox_when_targe
 awk '$1=="linux"{print NR": "c" "$0; c++}' .github/ci/integration-suites.txt \
   | grep -n "quota_enforcement_tests\|integration_e2e\b"
 python3 -c "print(32 % 11, 43 % 11)"   # -> 10 10
+
+# Post-review, 5th correction: this collision is not a fresh discovery --
+# ci.yml documents it was already found, measured, and fixed once:
+grep -n "11, not 10" -A 12 .github/workflows/ci.yml
+# -> "row_ordinal % 10 put integration_e2e and quota_enforcement_tests on
+#    one shard... That shard ran ~35 min against 18-28 min for every other
+#    shard... 11 shares no factor with the 10-row gap, so it cannot
+#    reproduce the collision." The fix assumed a 10-row gap; direct count
+#    today shows an 11-row gap (43 - 32 = 11), the one value 11-way
+#    sharding cannot tolerate -- a silent regression via alphabetical
+#    manifest growth between the two suites, not a new problem.
+grep -c "#\[tokio::test\]" autumn-harvest/tests/integration/integration_e2e.rs \
+  autumn-harvest/tests/integration/quota_enforcement_tests.rs
+# -> 68 and 43 -- confirms ci.yml's own sizing claim ("the manifest's two
+#    largest, most wall-clock-timeout-shaped suites"), 111 combined on one
+#    shard.
 
 # Item 3's re-grep (post-review correction): the run's log was already
 # fetched for the census; re-checking it for the 09-18 fix's diagnostic
