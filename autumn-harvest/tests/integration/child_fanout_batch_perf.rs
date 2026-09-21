@@ -64,6 +64,20 @@ async fn setup_server() -> (String, DbGuard) {
     }
     let container = Postgres::default()
         .with_tag("16")
+        // Preload `pg_stat_statements` so the evidence-capture tests below
+        // work on the pure-Docker fallback path (issue #1589 CI failure).
+        // The extension's C hooks only exist once preloaded at postmaster
+        // start. `CREATE EXTENSION` alone (`ensure_pg_stat_statements`
+        // below) cannot retroactively enable them. Mirrors
+        // `claim_bench_support.rs`'s identical fix. `.with_cmd(...)` fully
+        // replaces `Image::cmd()`, so the image's own `fsync=off` default
+        // is repeated here explicitly to avoid re-enabling fsync.
+        .with_cmd([
+            "-c",
+            "shared_preload_libraries=pg_stat_statements",
+            "-c",
+            "fsync=off",
+        ])
         .start()
         .await
         .expect("postgres container should start");
