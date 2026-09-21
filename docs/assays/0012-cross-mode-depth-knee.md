@@ -148,14 +148,11 @@ cargo build --release
 
 redis-server --daemonize yes --port 6379 --save "" --appendonly no
 
-ASSAY10_DATABASE_URL="postgres://postgres:<pw>@127.0.0.1:5432/assay10" \
-ASSAY10_ADMIN_URL="postgres://postgres:<pw>@127.0.0.1:5432/postgres" \
-ASSAY10_ARMS="postgres,redis_pg" \
-ASSAY10_WORKFLOWS=500 \
-ASSAY10_REPS=3 \
-./target/release/cross_mode_throughput_assay
+export ASSAY10_DATABASE_URL="postgres://postgres:<pw>@127.0.0.1:5432/assay10"
+export ASSAY10_ADMIN_URL="postgres://postgres:<pw>@127.0.0.1:5432/postgres"
+export ASSAY10_ARMS="postgres,redis_pg"
+export ASSAY10_REPS=3
 
-ASSAY10_WORKFLOWS=1000 \
-ASSAY10_REPS=3 \
-./target/release/cross_mode_throughput_assay
+ASSAY10_WORKFLOWS=500 ./target/release/cross_mode_throughput_assay
+ASSAY10_WORKFLOWS=1000 ./target/release/cross_mode_throughput_assay
 ```
