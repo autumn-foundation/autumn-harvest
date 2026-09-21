@@ -2711,6 +2711,20 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                             return Ok(false);
                         }
 
+                        // Neither check proved delivery here (Codex follow-up).
+                        // Per `execution_summary_exists_by_key`'s own doc
+                        // comment, that is still not proof of NON-delivery
+                        // when summaries are disabled or expired.
+                        // `payload_too_large` is the deliberate choice
+                        // anyway. Leaving `outcome` unset instead would make
+                        // this fire a candidate lost relay for every future
+                        // `backup_verify` run. That is the exact false
+                        // positive issue #1401 exists to prevent. This
+                        // trades a rare, silent miss (a genuinely delivered
+                        // target, retained without a summary) for a loud,
+                        // common false alarm. See
+                        // `docs/runbooks/backup-restore.md` §4.2(d) for the
+                        // same residual, documented once.
                         diesel::update(
                             fires_dsl::harvest_completion_trigger_fires
                                 .filter(fires_dsl::source_exec_id.eq(task.source_exec_id))
