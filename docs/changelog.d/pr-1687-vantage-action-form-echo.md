@@ -27,23 +27,38 @@ payload or an event number copied from the timeline, on one typo, lands
 back on a page that looks unchanged except for a banner, and must recall
 and retype everything from scratch across all three collapsed panels.
 
-**Change.** `WorkflowActionEcho` — on a failure, each handler's redirect
-now also carries the entered values (`signal_name`/`signal_payload`,
-`reset_event`/`reset_reason`, `update_name`/`update_payload`) alongside
-the error. `WorkflowDetailParams` reads them back; `render_workflow_detail`
-keeps the relevant `<details>` open, pre-fills its inputs with exactly
-what was submitted, and renders the error inline next to the field,
-instead of a generic top banner. One variable moved (data preservation +
-error adjacency for these three forms); no other page, form, or endpoint
-touched, and the success-path flash is unchanged.
+**Change.** `WorkflowActionEcho` carries the entered values
+(`signal_name`/`signal_payload`, `reset_event`/`reset_reason`,
+`update_name`/`update_payload`) and the error in memory. On a failure,
+the shared `render_workflow_detail_page` (extracted from the `GET` route,
+now also called by the three POST handlers) renders the detail page
+directly as the POST's own response, instead of redirecting — a review
+round (Codex) flagged the redirect design's first draft for putting a
+signal/update payload in the URL, hence in browser history and
+server/proxy logs. `render_workflow_detail` keeps the relevant `<details>`
+open, pre-fills its inputs with exactly what was submitted, and renders
+the error inline next to the field. Serving that markup from one path
+segment below the canonical `/workflows/{id}` page (`/workflows/{id}/signal`
+etc.) left every relative link and form action resolving wrong — a second
+review-round finding — fixed with a `<base href="..">` element emitted
+only on that direct-render path. The reset event-number field also moved
+from `type="number"` to `type="text" inputmode="numeric" pattern="[0-9]*"`
+(third finding): a browser's number-input value-sanitization algorithm
+blanks a rejected non-numeric value from the visible control even though
+the raw HTML attribute still carries it, undermining the very echo this
+change exists to provide. No other page, form, or endpoint touched; the
+success-path flash is unchanged.
 
 **Measurement.** Deterministic, re-run in the PR:
-`cargo test -p autumn-harvest-plugin --lib ui::tests` — two new tests:
+`cargo test -p autumn-harvest-plugin --lib ui::tests` — new tests:
 `render_workflow_detail_echoes_entered_values_on_action_form_errors`
 (all three panels open, pre-filled, and show their inline error when
-`WorkflowActionEcho` carries one) and
+`WorkflowActionEcho` carries one),
 `render_workflow_detail_leaves_action_forms_collapsed_with_no_error`
-(unchanged behavior — no panel forced open absent an error). No new
-`WorkflowEvent` variant, no migration, no behavioral instrumentation — a
-Tier 1 error-path defect (entered data lost on a documented incident-
-response flow), which clears the impact floor on its own.
+(unchanged behavior — no panel forced open absent an error), and
+`render_workflow_detail_emits_a_base_tag_only_when_rendered_at_an_action_url`
+(the `<base>` element appears only on the direct-render path, never on an
+ordinary `GET`). No new `WorkflowEvent` variant, no migration, no
+behavioral instrumentation — a Tier 1 error-path defect (entered data
+lost on a documented incident-response flow), which clears the impact
+floor on its own.

@@ -42,16 +42,23 @@ Shows a single workflow execution in full detail.
 
 - **Cancel** — POST to `/workflows/{exec_id}/cancel` with a confirmation dialog. Redirects to the detail page with a flash message.
 - **Terminate** — Disabled button (not yet available).
-- **Send signal** — Expandable form (collapsed by default). POST to `/workflows/{exec_id}/signal` with `signal_name` and an optional JSON `payload`. Redirects with flash.
-- **Reset to event N** — Expandable form. POST to `/workflows/{exec_id}/reset` with `reset_to_event_id` (1-based event number, as shown in the timeline "#" column) and optional `reason`. Creates a new fork execution. Redirects with flash.
-- **Trigger update** — Expandable form. POST to `/workflows/{exec_id}/trigger-update` with `update_name` and optional JSON `payload`. Redirects with flash.
+- **Send signal** — Expandable form (collapsed by default). POST to `/workflows/{exec_id}/signal` with `signal_name` and an optional JSON `payload`. Redirects with flash on success.
+- **Reset to event N** — Expandable form. POST to `/workflows/{exec_id}/reset` with `reset_to_event_id` (1-based event number, as shown in the timeline "#" column) and optional `reason`. Creates a new fork execution. Redirects with flash on success.
+- **Trigger update** — Expandable form. POST to `/workflows/{exec_id}/trigger-update` with `update_name` and optional JSON `payload`. Redirects with flash on success.
 
   On a rejected submission (malformed JSON payload, non-numeric event
-  number, or the engine call itself failing), all three forms redirect
-  back **open**, with the operator's entered values pre-filled and the
-  error shown inline next to the field that caused it (issue #1687) —
-  the same `<details>`-preserving pattern the backfill launcher's dry-run
-  preview already uses. A typo does not cost the whole entry.
+  number, or the engine call itself failing), all three forms instead
+  render the detail page directly as the POST's own response — no
+  redirect — with the rejected form **open**, the operator's entered
+  values pre-filled, and the error shown inline next to the field that
+  caused it (issue #1687). A typo does not cost the whole entry. This is
+  deliberately not a redirect: putting a signal or update payload in a
+  redirect's query string would put it in browser history, proxy/server
+  access logs, and the same-origin referrer, and a large payload could
+  push the URL past a typical request-line limit. Because the response is
+  served from one path segment below the canonical `/workflows/{exec_id}`
+  page, it carries a `<base href="..">` element so every relative link and
+  form action on the page keeps resolving correctly.
 - **Export history** — GET link to `…/workflows/{exec_id}/history/export` for the full JSON event log.
 
 **Event timeline collapsible payload** — each event row in the history table has a `<details>` element. Click "view payload" to expand and see the full JSON event data.

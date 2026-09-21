@@ -1514,6 +1514,7 @@ async fn workflow_detail_ui(
         params.log_level.as_deref(),
         params.flash.as_deref(),
         WorkflowActionEcho::default(),
+        false,
         &headers,
         maybe_session,
     )
@@ -1540,6 +1541,7 @@ async fn render_workflow_detail_page(
     log_level_raw: Option<&str>,
     flash: Option<&str>,
     action_echo: WorkflowActionEcho,
+    rendered_at_action_url: bool,
     headers: &axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> Result<Markup, AutumnError> {
@@ -1795,6 +1797,7 @@ async fn render_workflow_detail_page(
             read_failed: log_read_failed,
         },
         &action_echo,
+        rendered_at_action_url,
     ))
 }
 
@@ -2340,6 +2343,7 @@ async fn signal_workflow_ui(
         None,
         Some(&error),
         echo,
+        true,
         &headers,
         maybe_session,
     )
@@ -2477,6 +2481,7 @@ async fn reset_workflow_ui(
         None,
         Some(&error),
         echo,
+        true,
         &headers,
         maybe_session,
     )
@@ -2540,6 +2545,7 @@ async fn trigger_update_ui(
                     None,
                     Some(&err_msg),
                     echo,
+                    true,
                     &headers,
                     maybe_session,
                 )
@@ -2632,6 +2638,7 @@ async fn trigger_update_ui(
         None,
         Some(&error),
         echo,
+        true,
         &headers,
         maybe_session,
     )
@@ -5201,7 +5208,7 @@ fn render_workflow_list(
         (render_pagination(page, limit, limit_raw, has_next, state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_before_raw, exec_id_search, page_error))
     };
 
-    layout("Workflows · Vantage", &body, "")
+    layout("Workflows · Vantage", &body, "", None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5608,6 +5615,7 @@ fn render_workflow_detail(
     continue_as_new_threshold: Option<u64>,
     logs: &WorkflowLogsPanelData<'_>,
     action_echo: &WorkflowActionEcho,
+    rendered_at_action_url: bool,
 ) -> Markup {
     let exec_id_str = execution.id.to_string();
     let title = format!("{} · Vantage", execution.workflow_name);
@@ -6079,7 +6087,10 @@ fn render_workflow_detail(
         }
     };
 
-    layout(&title, &body, "../")
+    // See `layout`'s own doc comment for why this is a real `<base>`
+    // element and not just a string prefix (issue #1687 review).
+    let html_base = rendered_at_action_url.then_some("..");
+    layout(&title, &body, "../", html_base)
 }
 
 /// Per-row checkpoint rendering decision for the pending-activities table, after
@@ -6593,13 +6604,36 @@ fn js_escape(s: &str) -> String {
         .replace('\u{2029}', "\\u2029")
 }
 
-fn layout(title: &str, body: &Markup, base_href: &str) -> Markup {
+/// `base_href` is a plain string prepended to the header nav's own links
+/// (`"../"`, `"../../"`, or `""` -- how many directories up the canonical
+/// page sits). `html_base` is a real `<base href>` element. It is `None`
+/// on every ordinary `GET` page load.
+///
+/// The two are unrelated. `base_href` never resolves in the browser on its
+/// own. Every nav link that uses it is itself parsed relative to the
+/// document's OWN url. `html_base` exists for exactly one caller (issue
+/// #1687 review). `render_workflow_detail_page` renders the workflow
+/// detail page directly, as a rejected POST's response body. That happens
+/// from a URL one path segment below the canonical detail page, such as
+/// `/workflows/{id}/signal`. The page's body has many relative links and
+/// form actions -- `{id}/signal`, `../workflows`,
+/// `../../workflows/{id}/history/export`, pagination hrefs, all of it.
+/// Each one is written assuming the document's own url IS the canonical
+/// detail page. Serving that body unchanged from one level deeper
+/// resolves every one of those wrong (issue #1687 review, Codex finding).
+/// `<base href="..">` there re-establishes the same directory context the
+/// canonical url would give. It fixes all of them at once, rather than
+/// rewriting each link to be mount-depth-aware.
+fn layout(title: &str, body: &Markup, base_href: &str, html_base: Option<&str>) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width,initial-scale=1";
+                @if let Some(base) = html_base {
+                    base href=(base);
+                }
                 title { (title) }
                 style { (PreEscaped(STYLE)) }
             }
@@ -7588,7 +7622,7 @@ async fn workflow_timeline_ui(
     );
     let title = format!("Timeline · {} · Vantage", execution.workflow_name);
     let body = render_timeline_body(&timeline, &execution, now);
-    Ok(layout(&title, &body, "../../"))
+    Ok(layout(&title, &body, "../../", None))
 }
 
 /// Build the timeline page body (back link + heading + Gantt). Extracted from
@@ -13197,7 +13231,7 @@ mod tests {
     #[test]
     fn layout_escapes_title_but_keeps_body_markup() {
         let body = html! { p { "hello" } };
-        let html = layout("<evil>", &body, "").into_string();
+        let html = layout("<evil>", &body, "", None).into_string();
         assert!(html.contains("<title>&lt;evil&gt;</title>"));
         assert!(html.contains("<p>hello</p>"));
         assert!(html.contains("🔭 Vantage"));
@@ -14021,7 +14055,7 @@ mod tests {
     #[test]
     fn layout_includes_workers_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout("Test", &body, "").into_string();
+        let html = layout("Test", &body, "", None).into_string();
         assert!(
             html.contains("workers"),
             "layout must include a Workers nav link"
@@ -14466,7 +14500,7 @@ mod tests {
     #[test]
     fn layout_includes_schedules_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout("Test", &body, "").into_string();
+        let html = layout("Test", &body, "", None).into_string();
         assert!(
             html.contains("schedules"),
             "layout must include schedules nav link"
@@ -15020,6 +15054,7 @@ mod tests {
             Some(10_000),
             &WorkflowLogsPanelData::default(),
             &WorkflowActionEcho::default(),
+            false,
         )
         .into_string();
 
@@ -15057,6 +15092,7 @@ mod tests {
             None,
             &WorkflowLogsPanelData::default(),
             &WorkflowActionEcho::default(),
+            false,
         )
         .into_string();
 
@@ -15090,6 +15126,7 @@ mod tests {
             Some(500),
             &WorkflowLogsPanelData::default(),
             &WorkflowActionEcho::default(),
+            false,
         )
         .into_string();
 
@@ -15120,7 +15157,7 @@ mod tests {
     #[test]
     fn layout_includes_build_routing_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout("Test", &body, "").into_string();
+        let html = layout("Test", &body, "", None).into_string();
         assert!(
             html.contains("build-routing"),
             "base layout must include a Build Routing nav link"
@@ -16842,6 +16879,7 @@ mod tests {
             None,
             logs,
             &WorkflowActionEcho::default(),
+            false,
         )
         .into_string()
     }
@@ -16966,6 +17004,7 @@ mod tests {
                 ..Default::default()
             },
             &WorkflowActionEcho::default(),
+            false,
         )
         .into_string();
         // maud escapes `&` inside an attribute value, which is the correct
@@ -17007,6 +17046,7 @@ mod tests {
                 ..Default::default()
             },
             &WorkflowActionEcho::default(),
+            false,
         )
         .into_string();
 
@@ -17054,6 +17094,7 @@ mod tests {
             None,
             &WorkflowLogsPanelData::default(),
             &WorkflowActionEcho::default(),
+            false,
         )
         .into_string();
         assert!(
@@ -17106,6 +17147,7 @@ mod tests {
             None,
             &WorkflowLogsPanelData::default(),
             &echo,
+            false,
         )
         .into_string();
 
@@ -17170,12 +17212,64 @@ mod tests {
             None,
             &WorkflowLogsPanelData::default(),
             &WorkflowActionEcho::default(),
+            false,
         )
         .into_string();
 
         assert!(
             !html.contains("<details style=\"display:inline-block\" open"),
             "no action form should be forced open absent an error: {html}"
+        );
+    }
+
+    /// RED before this fix (issue #1687 review, Codex finding). Serving the
+    /// detail page's markup directly as a rejected POST's response body
+    /// left every relative link and form action wrong. The body assumed
+    /// the document's own url was the canonical `/workflows/{id}` page.
+    /// The browser stays at `/workflows/{id}/signal` (or `/reset`,
+    /// `/trigger-update`) on a direct render. So `{id}/signal` would
+    /// resolve to the nonexistent `/workflows/{id}/{id}/signal`. Every
+    /// other relative link and pagination href would be wrong the same
+    /// way. GREEN: `rendered_at_action_url: true` emits a real `<base
+    /// href="..">` element. It re-establishes the same directory context
+    /// the canonical url gives, so every existing relative link resolves
+    /// correctly without being rewritten.
+    #[test]
+    fn render_workflow_detail_emits_a_base_tag_only_when_rendered_at_an_action_url() {
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let render = |rendered_at_action_url: bool| {
+            render_workflow_detail(
+                &execution,
+                0,
+                &[],
+                &[],
+                &[],
+                false,
+                &[],
+                0,
+                &blocked,
+                None,
+                None,
+                None,
+                None,
+                &WorkflowLogsPanelData::default(),
+                &WorkflowActionEcho::default(),
+                rendered_at_action_url,
+            )
+            .into_string()
+        };
+
+        let from_get = render(false);
+        assert!(
+            !from_get.contains("<base "),
+            "an ordinary GET page load must not carry a <base> element: {from_get}"
+        );
+
+        let from_post = render(true);
+        assert!(
+            from_post.contains(r#"<base href="..">"#),
+            "a page rendered directly from a rejected action POST must carry <base href=\"..\">: {from_post}"
         );
     }
 
