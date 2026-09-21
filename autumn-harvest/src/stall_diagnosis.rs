@@ -1417,7 +1417,7 @@ fn wake_source_repended_this_row(task: &WorkflowTaskFacts) -> bool {
 ///    survives that drift, so it is what proves the row is still this
 ///    timer's even once `scheduled_at` no longer says so. Still deferred
 ///    to `wake_source_repended_this_row`, same as the tolerance match
-///    below: a genuinely different wake reason always repends through a
+///    below. A genuinely different wake reason always repends through a
 ///    path that clears this marker in production. But nothing stops a
 ///    future write-path bug from forgetting to clear it. This guard is
 ///    what keeps that failure mode safe. A missed clear costs a false

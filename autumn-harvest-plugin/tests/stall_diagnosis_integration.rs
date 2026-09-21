@@ -2103,7 +2103,7 @@ async fn queue_pause_resume_does_not_misattribute_an_unrelated_timer_to_a_signal
     seed_live_worker(&pool, "w-live", "resume-safety-q").await;
 
     // Pause and resume the queue the row happens to sit on. That is
-    // unrelated to why the row is PENDING, but it still credits held time
+    // unrelated to why the row is PENDING. It still credits held time
     // onto scheduled_at, drifting it further from the unrelated timer's
     // fires_at than it already was.
     {
