@@ -3742,6 +3742,187 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
     drop(guard);
 }
 
+/// Issue #1392: a `QuotaBlocked` outcome must stamp `next_attempt_at` from
+/// Postgres's own clock, not the scanning replica's host clock.
+///
+/// A host-computed deadline can already be due by the time a peer replica
+/// checks it, when that replica's clock runs ahead. This test compares the
+/// written deadline against the database's own `NOW()`, never this test
+/// process's `chrono::Utc::now()`. It then catches a regression back to the
+/// host clock, regardless of which replica's clock the regression favors.
+#[tokio::test]
+async fn quota_blocked_outbox_backoff_lands_on_the_database_clock() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    install_global_router(ShardRouter::single());
+    let sharded_pool = Some(ShardedDbPool::single(build_test_pool(&url)));
+
+    let blocked_wf = leaked("outbox_backoff_clock");
+    let quota_policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    let guard = MetadataGuard::install_one(blocked_wf, quota_policy).await;
+
+    // Occupy the one slot so the outbox relay's admission attempt below
+    // hits `QuotaExceeded`.
+    let blocker = start_root(
+        &mut conn,
+        blocked_wf,
+        &format!("blocker-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"tenant_id": "acme"}),
+    )
+    .await;
+
+    let outbox_id = insert_outbox_row(
+        &mut conn,
+        blocked_wf,
+        serde_json::json!({"tenant_id": "acme"}),
+    )
+    .await;
+
+    // Bracket the write with DB-clock reads taken just before and just
+    // after (Codex review on this PR). The actual `clock_timestamp()`
+    // write happens somewhere inside this call, at a point this test never
+    // observes directly. A single `db_clock_now()` sampled only afterward
+    // would be a fixed race instead. Any scheduling delay between the
+    // write and that later probe reads as a shrunken backoff, and fails
+    // the test even on correct code.
+    let before = queue::db_clock_now(&mut conn)
+        .await
+        .expect("probe database clock before");
+    enforce_completion_triggers_outbox(&mut conn, &NoOpMetrics, &sharded_pool, &[ShardId::new(0)])
+        .await
+        .expect("outbox scan hits the quota-blocked target");
+    let after = queue::db_clock_now(&mut conn)
+        .await
+        .expect("probe database clock after");
+
+    let deadline = outbox_next_attempt_at(&mut conn, outbox_id)
+        .await
+        .expect("a QuotaBlocked outcome must stamp next_attempt_at");
+
+    // Mirrors `QUOTA_REDEFER_BACKOFF` (5 seconds). This tracks that
+    // production constant the same way `CLAIM_BATCH_LIMIT` above does, so
+    // a changed backoff value fails this test loudly.
+    assert_next_attempt_at_matches_backoff_on_db_clock(
+        deadline,
+        before,
+        after,
+        chrono::Duration::seconds(5),
+    );
+
+    mark_terminal(&mut conn, blocker, "CANCELLED").await;
+    drop(guard);
+}
+
+/// Assert `deadline` lands within a tight tolerance of `expected_backoff`
+/// past the database's own clock (issue #1392 review).
+///
+/// `before` and `after` bracket the write. Both are read from the
+/// database's own clock, taken just before and just after the operation
+/// that performs the write. The write's own `clock_timestamp()` reading
+/// falls somewhere between the two. So `deadline` must land in
+/// `[before + expected_backoff, after + expected_backoff]`, widened by a
+/// small tolerance for cross-request rounding. This never depends on how
+/// long the bracketed operation itself takes. It does not race a slow or
+/// loaded test run the way a single post-hoc clock probe would.
+fn assert_next_attempt_at_matches_backoff_on_db_clock(
+    deadline: chrono::DateTime<chrono::Utc>,
+    before: chrono::DateTime<chrono::Utc>,
+    after: chrono::DateTime<chrono::Utc>,
+    expected_backoff: chrono::Duration,
+) {
+    const TOLERANCE_MS: i64 = 750;
+    let tolerance = chrono::Duration::milliseconds(TOLERANCE_MS);
+    let lower = before + expected_backoff - tolerance;
+    let upper = after + expected_backoff + tolerance;
+    assert!(
+        deadline >= lower && deadline <= upper,
+        "expected next_attempt_at ({deadline}) to land within \
+         {TOLERANCE_MS}ms of {expected_backoff} past the database's own \
+         clock, bracketed between before={before} and after={after} \
+         (window [{lower}, {upper}])"
+    );
+}
+
+/// Issue #1392: a scan that cannot even ATTEMPT a relay must also stamp
+/// `next_attempt_at` from Postgres's own clock, via
+/// `stamp_outbox_relay_backoff`. Here, the target shard has no configured
+/// pool.
+///
+/// Distinct from `quota_blocked_outbox_backoff_lands_on_the_database_clock`
+/// above: that test drives `relay_gate_checked_start`'s `QuotaExceeded` arm.
+/// This one drives the separate missing-pool arm in
+/// `enforce_completion_triggers_outbox_with_codecs` itself.
+#[tokio::test]
+async fn outbox_relay_missing_pool_backoff_lands_on_the_database_clock() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    install_global_router(ShardRouter::single());
+
+    // Shard 7 is never registered with a pool. The per-row lookup inside
+    // the scanner then finds no target pool, and takes the missing-pool
+    // backoff path instead of attempting a relay.
+    let unreachable_shard = ShardId::new(7);
+    let mut pools = std::collections::BTreeMap::new();
+    pools.insert(ShardId::new(0), build_test_pool(&url));
+    let sharded_pool = Some(ShardedDbPool::from_map(pools, ShardId::new(0)));
+
+    let outbox_id = diesel::insert_into(harvest_completion_trigger_outbox::table)
+        .values(&NewCompletionTriggerOutboxDb {
+            source_exec_id: Uuid::new_v4(),
+            trigger_id: Uuid::new_v4(),
+            target_shard: unreachable_shard.as_i32(),
+            target_workflow_name: leaked("outbox_missing_pool").to_string(),
+            target_workflow_id: format!("target-{}", Uuid::new_v4().simple()),
+            target_input: serde_json::json!({}),
+            // A named queue skips the default-shard queue-name lookup this
+            // scan would otherwise attempt, keeping the test focused on the
+            // missing-pool backoff path alone.
+            queue_name: Some("outbox-missing-pool-queue".to_string()),
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: serde_json::to_value(Priority::default()).unwrap(),
+            max_workflow_input_bytes: 1_000_000,
+        })
+        .get_result::<CompletionTriggerOutboxDb>(&mut conn)
+        .await
+        .expect("insert outbox row")
+        .id;
+
+    // Bracket the write with DB-clock reads taken just before and just
+    // after (Codex review on this PR). See
+    // `assert_next_attempt_at_matches_backoff_on_db_clock`'s doc comment
+    // for why a single post-hoc clock probe races a loaded test run.
+    let before = queue::db_clock_now(&mut conn)
+        .await
+        .expect("probe database clock before");
+    enforce_completion_triggers_outbox(
+        &mut conn,
+        &NoOpMetrics,
+        &sharded_pool,
+        &[unreachable_shard],
+    )
+    .await
+    .expect("outbox scan hits the missing-pool target");
+    let after = queue::db_clock_now(&mut conn)
+        .await
+        .expect("probe database clock after");
+
+    let deadline = outbox_next_attempt_at(&mut conn, outbox_id)
+        .await
+        .expect("a missing-pool scan must stamp next_attempt_at");
+
+    // Mirrors `OUTBOX_RELAY_FAILURE_BACKOFF` (5 seconds), the same value as
+    // `QUOTA_REDEFER_BACKOFF` above but a separate production constant.
+    assert_next_attempt_at_matches_backoff_on_db_clock(
+        deadline,
+        before,
+        after,
+        chrono::Duration::seconds(5),
+    );
+}
+
 /// Issue #1227 Finding 4, Codex round-1 P1 (PR #1386): ordering the claim
 /// batch by `created_at` ALONE (the initial fix above) is not enough. Once
 /// `WorkerRuntimeConfig::poll_interval` is at or above `QUOTA_REDEFER_BACKOFF`

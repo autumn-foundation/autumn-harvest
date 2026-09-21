@@ -10272,6 +10272,12 @@ mod tests {
                 "{column} must appear as a bound column in the SET clause: {sql}"
             );
         }
+        // `scheduled_at` is computed on Postgres's own clock (issue #1389),
+        // not bound as a plain parameter.
+        assert!(
+            sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => $"),
+            "scheduled_at must be computed from Postgres's own clock: {sql}"
+        );
         // activity_name binds `None` (SQL NULL); wake_requested binds `false`.
         assert!(
             sql.contains("None"),

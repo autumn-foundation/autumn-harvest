@@ -813,6 +813,15 @@ pub async fn resolve_cross_shard_target_queue(
 #[cfg(feature = "db")]
 const QUOTA_REDEFER_BACKOFF: chrono::Duration = chrono::Duration::seconds(5);
 
+/// Convert a whole-second backoff constant to `make_interval`'s fractional-
+/// seconds argument (issue #1392). Mirrors `queue::delay_secs`, which does
+/// the same conversion for the task queue's own DB-clock backoff writes.
+#[cfg(feature = "db")]
+#[allow(clippy::cast_precision_loss)] // whole-second constants never approach 2^53
+const fn backoff_secs(delay: chrono::Duration) -> f64 {
+    delay.num_seconds() as f64
+}
+
 /// Cap on the number of outbox rows `enforce_completion_triggers_outbox`
 /// claims per scan.
 #[cfg(feature = "db")]
@@ -828,6 +837,12 @@ const OUTBOX_CLAIM_BATCH_LIMIT: i64 = 50;
 /// batch.
 #[cfg(feature = "db")]
 const OUTBOX_RETRY_RESERVED_SLOTS: i64 = 10;
+
+/// Retry-tier claim eligibility, on Postgres's own clock (issue #1392).
+/// Shared with a unit test pinning the SQL text, so it can never silently
+/// drift back to a host-sampled comparison.
+#[cfg(feature = "db")]
+const OUTBOX_RETRY_ELIGIBLE_PREDICATE: &str = "next_attempt_at <= NOW()";
 
 /// Outcome of a claimed cross-shard completion-trigger relay attempt, decided
 /// under the source-row `FOR UPDATE SKIP LOCKED` claim (issue #618, F-round19).
@@ -876,6 +891,15 @@ enum RelayOutcome {
         current: u64,
     },
 }
+
+/// Claims a source outbox row only when its backoff has elapsed, on
+/// Postgres's own clock (issue #1392). Shared between
+/// [`relay_gate_checked_start`] and its unit tests. A test then pins the
+/// exact query a peer replica's write is checked against.
+#[cfg(feature = "db")]
+const RELAY_CLAIM_QUERY: &str = "SELECT id FROM harvest_completion_trigger_outbox \
+     WHERE id = $1 AND (next_attempt_at IS NULL OR next_attempt_at <= NOW()) \
+     FOR UPDATE SKIP LOCKED";
 
 /// Run the cross-shard completion-trigger relay's start/block decision through the
 /// existence-aware [`crate::execution::gate_checked_start_or_load`] primitive under
@@ -963,16 +987,15 @@ async fn relay_gate_checked_start(
     // re-check, A's `id`-only claim would still succeed once B's transaction
     // commits and releases the row, driving an extra admission attempt on a
     // row whose backoff a peer just (re)armed, one bypass per stale reader.
-    let now = chrono::Utc::now();
+    //
+    // Compares against Postgres's own `NOW()`, not a host-sampled
+    // `chrono::Utc::now()` (issue #1392). Every replica's clock can drift
+    // from every other's. Every replica reads and writes this one deadline
+    // against the same DB clock instead, so that drift cannot leak in.
     let outcome = Box::pin(source_conn
         .transaction::<RelayOutcome, crate::error::HarvestError, _>(async |source_tx| {
-            let claimed: Option<ClaimedId> = diesel::sql_query(
-                "SELECT id FROM harvest_completion_trigger_outbox \
-                 WHERE id = $1 AND (next_attempt_at IS NULL OR next_attempt_at <= $2) \
-                 FOR UPDATE SKIP LOCKED",
-            )
+            let claimed: Option<ClaimedId> = diesel::sql_query(RELAY_CLAIM_QUERY)
             .bind::<diesel::sql_types::Uuid, _>(outbox_id)
-            .bind::<diesel::sql_types::Timestamptz, _>(now)
             .get_result::<ClaimedId>(source_tx)
             .await
             .optional()
@@ -1066,12 +1089,27 @@ async fn relay_gate_checked_start(
                     current,
                     ..
                 }) => {
-                    let next_attempt_at = chrono::Utc::now() + QUOTA_REDEFER_BACKOFF;
+                    // Stamped on Postgres's own `clock_timestamp()`, not the
+                    // host clock (issue #1392). `source_tx` already did
+                    // prior work this transaction: the claim above, plus
+                    // the cross-shard start attempt that raised this error.
+                    // `NOW()` is frozen at the transaction's start, so it
+                    // would understate the backoff. `clock_timestamp()`
+                    // reads the real time at execution.
+                    use diesel::dsl::sql;
+                    use diesel::sql_types::{Double, Timestamptz};
+                    use diesel::NullableExpressionMethods;
+
                     diesel::update(
                         outbox_dsl::harvest_completion_trigger_outbox
                             .filter(outbox_dsl::id.eq(outbox_id)),
                     )
-                    .set(outbox_dsl::next_attempt_at.eq(Some(next_attempt_at)))
+                    .set(outbox_dsl::next_attempt_at.eq(sql::<Timestamptz>(
+                        "clock_timestamp() + make_interval(secs => ",
+                    )
+                    .bind::<Double, _>(backoff_secs(QUOTA_REDEFER_BACKOFF))
+                    .sql(")")
+                    .nullable()))
                     .execute(source_tx)
                     .await
                     .map_err(crate::error::database_error)?;
@@ -2178,6 +2216,17 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
 #[cfg(feature = "db")]
 const OUTBOX_RELAY_FAILURE_BACKOFF: chrono::Duration = chrono::Duration::seconds(5);
 
+/// [`stamp_outbox_relay_backoff`]'s write, shared with its unit tests (issue
+/// #1392) so the pinned SQL text can never drift from what actually runs.
+#[cfg(feature = "db")]
+const OUTBOX_RELAY_BACKOFF_STAMP_QUERY: &str = "UPDATE harvest_completion_trigger_outbox \
+     SET next_attempt_at = clock_timestamp() + make_interval(secs => $2) \
+     WHERE id IN ( \
+         SELECT id FROM harvest_completion_trigger_outbox \
+         WHERE id = $1 \
+         FOR UPDATE SKIP LOCKED \
+     )";
+
 /// Stamp `next_attempt_at` on an outbox row this scan could not even attempt
 /// to relay. Without this, a row whose target shard is durably unreachable
 /// (pool never configured, or persistently refusing connections) would sit
@@ -2208,20 +2257,15 @@ const OUTBOX_RELAY_FAILURE_BACKOFF: chrono::Duration = chrono::Duration::seconds
 async fn stamp_outbox_relay_backoff(conn: &mut diesel_async::AsyncPgConnection, task_id: Uuid) {
     use diesel_async::RunQueryDsl;
 
-    let next_attempt_at = chrono::Utc::now() + OUTBOX_RELAY_FAILURE_BACKOFF;
-    let result = diesel::sql_query(
-        "UPDATE harvest_completion_trigger_outbox \
-         SET next_attempt_at = $2 \
-         WHERE id IN ( \
-             SELECT id FROM harvest_completion_trigger_outbox \
-             WHERE id = $1 \
-             FOR UPDATE SKIP LOCKED \
-         )",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(task_id)
-    .bind::<diesel::sql_types::Timestamptz, _>(next_attempt_at)
-    .execute(conn)
-    .await;
+    // Stamped on Postgres's own `clock_timestamp()`, not the host clock
+    // (issue #1392). Every scanner replica later checks this deadline
+    // against that same DB clock. Writing it there too removes
+    // cross-replica host skew by construction.
+    let result = diesel::sql_query(OUTBOX_RELAY_BACKOFF_STAMP_QUERY)
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Double, _>(backoff_secs(OUTBOX_RELAY_FAILURE_BACKOFF))
+        .execute(conn)
+        .await;
 
     if let Err(e) = result {
         tracing::warn!(
@@ -2320,7 +2364,6 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
     // third query of more fresh rows, so a reservation the retry backlog
     // never needed doesn't silently cap every scan at 40 of the configured
     // 50 (round-3 P2 on PR #1386).
-    let now = chrono::Utc::now();
     let mut pending_tasks = outbox_dsl::harvest_completion_trigger_outbox
         .filter(outbox_dsl::target_shard.eq_any(&shards))
         .filter(outbox_dsl::next_attempt_at.is_null())
@@ -2333,9 +2376,15 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
 
     let retry_limit = OUTBOX_CLAIM_BATCH_LIMIT
         - i64::try_from(pending_tasks.len()).unwrap_or(OUTBOX_CLAIM_BATCH_LIMIT);
+    // Compares against Postgres's own `NOW()`, not a host-sampled
+    // `chrono::Utc::now()` (issue #1392). Eligibility then agrees with the
+    // clock the backoff was stamped on, regardless of this replica's own
+    // clock drift.
     let retry_rows = outbox_dsl::harvest_completion_trigger_outbox
         .filter(outbox_dsl::target_shard.eq_any(&shards))
-        .filter(outbox_dsl::next_attempt_at.le(now))
+        .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
+            OUTBOX_RETRY_ELIGIBLE_PREDICATE,
+        ))
         .order((
             outbox_dsl::next_attempt_at.asc(),
             outbox_dsl::created_at.asc(),
@@ -2591,6 +2640,32 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
     }
 
     Ok(processed_count)
+}
+
+/// Build the `next_attempt_at` `SET` clause used by the `QuotaBlocked` arm of
+/// [`relay_gate_checked_start`], so a no-DB unit test can assert the
+/// generated SQL shape (issue #1392). Mirrors the
+/// `queue::requeue_after_panic_query` shape-test precedent.
+#[cfg(all(test, feature = "db"))]
+fn quota_blocked_backoff_query() -> String {
+    use crate::schema::harvest_completion_trigger_outbox::dsl as outbox_dsl;
+    use diesel::dsl::sql;
+    use diesel::pg::Pg;
+    use diesel::sql_types::{Double, Timestamptz};
+    use diesel::{ExpressionMethods, NullableExpressionMethods, QueryDsl, debug_query};
+
+    let query = diesel::update(
+        outbox_dsl::harvest_completion_trigger_outbox.filter(outbox_dsl::id.eq(Uuid::nil())),
+    )
+    .set(
+        outbox_dsl::next_attempt_at.eq(sql::<Timestamptz>(
+            "clock_timestamp() + make_interval(secs => ",
+        )
+        .bind::<Double, _>(backoff_secs(QUOTA_REDEFER_BACKOFF))
+        .sql(")")
+        .nullable()),
+    );
+    debug_query::<Pg, _>(&query).to_string()
 }
 
 #[cfg(test)]
@@ -3523,5 +3598,67 @@ mod tests {
         // unchanged for legacy consumers).
         let val = serde_json::to_value(CompletionTrigger::new("a", "b")).unwrap();
         assert!(val.get("condition").is_none());
+    }
+
+    // ── issue #1392: outbox backoff deadlines must use the DB clock ────────
+    //
+    // Every scanner replica has its own host clock, and those clocks can
+    // drift from each other. A backoff stamped on one replica's host clock
+    // can already look due to a faster replica. A 5-second cadence then
+    // collapses into repeated immediate retries.
+    //
+    // These tests pin the generated SQL text. Every eligibility check
+    // compares against Postgres's own `NOW()`. Every backoff write is
+    // computed by Postgres's own `clock_timestamp()`, never a host-sampled
+    // `chrono::Utc::now()`.
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn relay_claim_query_checks_backoff_against_the_db_clock() {
+        assert!(
+            RELAY_CLAIM_QUERY.contains("next_attempt_at <= NOW()"),
+            "the claim re-check must compare next_attempt_at against Postgres's \
+             own NOW(), not a host-sampled parameter: {RELAY_CLAIM_QUERY}"
+        );
+        assert_eq!(
+            RELAY_CLAIM_QUERY.matches('$').count(),
+            1,
+            "the query must bind only outbox_id ($1) -- no second, \
+             host-computed timestamp parameter: {RELAY_CLAIM_QUERY}"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn outbox_retry_tier_filters_on_the_db_clock() {
+        assert_eq!(
+            OUTBOX_RETRY_ELIGIBLE_PREDICATE, "next_attempt_at <= NOW()",
+            "the retry-tier batch filter must compare against Postgres's own \
+             NOW(), not a host-sampled chrono::Utc::now()"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn stamp_outbox_relay_backoff_writes_on_the_db_clock() {
+        assert!(
+            OUTBOX_RELAY_BACKOFF_STAMP_QUERY
+                .contains("next_attempt_at = clock_timestamp() + make_interval(secs => $2)"),
+            "the relay-failure backoff must be computed by Postgres's own \
+             clock_timestamp(), not a host-computed timestamp parameter: \
+             {OUTBOX_RELAY_BACKOFF_STAMP_QUERY}"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn quota_blocked_backoff_writes_on_the_db_clock() {
+        let sql = quota_blocked_backoff_query();
+        assert!(
+            sql.contains("\"next_attempt_at\" = clock_timestamp() + make_interval(secs => $"),
+            "a QuotaExceeded outcome must stamp next_attempt_at from \
+             Postgres's own clock_timestamp(), not a host-computed \
+             chrono::Utc::now(): {sql}"
+        );
     }
 }
