@@ -476,5 +476,17 @@ harness = false
 name = "history_export_profile"
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `worker::any_activity_wait_already_resolved` -- the post-park re-check
+# every mixed suspension batch (issue #950 `join!`/`race()` fan-out) and the
+# cancel-race-loser check ahead of it run to ask "did anything in this
+# just-parked activity-wait set already resolve?". The function itself is
+# pure and unconditional (no DB access), but `worker` is a `db`-gated module.
+# See `benches/activity_wait_resolution_profile.rs`.
+[[bench]]
+name = "activity_wait_resolution_profile"
+required-features = ["db"]
+harness = false
+
 [lints]
 workspace = true

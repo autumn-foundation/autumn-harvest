@@ -10264,7 +10264,7 @@ mod tests {
     #[test]
     fn requeue_workflow_task_for_quota_retry_query_clears_sentinel_and_wake() {
         let changeset = PendingRequeueChangeset::new("quota exceeded".to_string());
-        let sql = requeue_workflow_task_for_quota_retry_query(changeset, Duration::seconds(30));
+        let sql = requeue_workflow_task_for_quota_retry_query(changeset, Duration::seconds(5));
 
         for column in ["wake_requested", "activity_name"] {
             assert!(
@@ -10272,6 +10272,12 @@ mod tests {
                 "{column} must appear as a bound column in the SET clause: {sql}"
             );
         }
+        // `scheduled_at` is computed on Postgres's own clock (issue #1389),
+        // not bound as a plain parameter.
+        assert!(
+            sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => $"),
+            "scheduled_at must be computed from Postgres's own clock: {sql}"
+        );
         // activity_name binds `None` (SQL NULL); wake_requested binds `false`.
         assert!(
             sql.contains("None"),
@@ -10290,6 +10296,12 @@ mod tests {
         // Restricted to claimed (RUNNING) workflow rows.
         assert!(sql.contains("\"task_type\""), "{sql}");
         assert!(sql.contains("\"state\""), "{sql}");
+        // `scheduled_at` is computed on Postgres's own clock (issue #1389),
+        // not the host clock, mirroring the panic-retry sibling pin above.
+        assert!(
+            sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => $"),
+            "scheduled_at must be computed from Postgres's own clock: {sql}"
+        );
     }
 
     #[test]
