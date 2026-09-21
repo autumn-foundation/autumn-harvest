@@ -66,6 +66,20 @@ as proof; a smaller gap stays `completion_trigger_fire_unproven`. Threaded
 `adjudicate_trigger_fire_chunk` from `VerifyOptions`. Added
 `absence_is_decisive_loss_requires_the_gap_to_exceed_the_skew_tolerance`.
 
+`scan_completion_trigger_fires` reported a false truncation when the
+qualifying fire count landed exactly on a page-size multiple at the
+`MAX_TRIGGER_FIRE_SCAN_PAGES` ceiling (Codex follow-up x6): every page
+came back full, including the true last one, so `len < page` never fired
+and the loop's fixed iteration budget ran out with no page left to
+confirm exhaustion. A completely scanned shard would then read as
+truncated, forcing `ProbeFailed`/exit 2 on a healthy restore. Fixed by
+fetching one more page, outside the nominal budget, before declaring
+truncation — an empty result confirms the scan was actually complete. No
+dedicated test: reproducing the exact boundary needs
+`MAX_TRIGGER_FIRE_SCAN_PAGES` (1,000) full pages of seeded fires, and the
+fix is a straightforward extra confirming fetch, verified by inspection
+plus the full existing suite.
+
 **Confirmed delivered, precisely.** `outcome IS NULL` alone is set at
 trigger-evaluation time, before any relay attempt — not proof of delivery.
 The scan additionally requires the matching `harvest_completion_trigger_outbox`

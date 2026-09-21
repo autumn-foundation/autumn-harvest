@@ -2044,6 +2044,48 @@ mod probes {
     /// Each row stands alone. Unlike the event scan, no group spans more
     /// than one row, so plain keyset pagination on the primary key
     /// `(source_exec_id, trigger_id)` cannot split anything.
+    /// One page of [`scan_completion_trigger_fires`], keyset-paginated on
+    /// the fires table's own primary key `(source_exec_id, trigger_id)`.
+    async fn fetch_trigger_fire_page(
+        conn: &mut AsyncPgConnection,
+        page: i64,
+        cursor: Option<(Uuid, Uuid)>,
+    ) -> Result<Vec<TriggerFireRow>, String> {
+        let after = match cursor {
+            Some(_) => "AND (f.source_exec_id, f.trigger_id) > ($1, $2) ",
+            None => "",
+        };
+        let sql = format!(
+            "SELECT f.source_exec_id, f.trigger_id, f.fired_at, \
+                 f.target_shard, \
+                 f.target_workflow_name AS fire_target_workflow_name, \
+                 t.target_workflow_name AS trigger_target_workflow_name \
+             FROM harvest_completion_trigger_fires f \
+             LEFT JOIN harvest_completion_triggers t ON t.id = f.trigger_id \
+             WHERE f.outcome IS NULL \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM harvest_completion_trigger_outbox o \
+                 WHERE o.source_exec_id = f.source_exec_id \
+                   AND o.trigger_id = f.trigger_id \
+               ) \
+             {after}\
+             ORDER BY f.source_exec_id, f.trigger_id \
+             LIMIT {page}"
+        );
+        let query = diesel::sql_query(sql);
+        match cursor {
+            Some((exec, trig)) => {
+                query
+                    .bind::<diesel::sql_types::Uuid, _>(exec)
+                    .bind::<diesel::sql_types::Uuid, _>(trig)
+                    .load(conn)
+                    .await
+            }
+            None => query.load(conn).await,
+        }
+        .map_err(|e| format!("completion-trigger fire scan failed: {e}"))
+    }
+
     async fn scan_completion_trigger_fires(
         conn: &mut AsyncPgConnection,
         limit: i64,
@@ -2053,40 +2095,7 @@ mod probes {
         let mut cursor: Option<(Uuid, Uuid)> = None;
 
         for _ in 0..MAX_TRIGGER_FIRE_SCAN_PAGES {
-            let after = match cursor {
-                Some(_) => "AND (f.source_exec_id, f.trigger_id) > ($1, $2) ",
-                None => "",
-            };
-            let sql = format!(
-                "SELECT f.source_exec_id, f.trigger_id, f.fired_at, \
-                     f.target_shard, \
-                     f.target_workflow_name AS fire_target_workflow_name, \
-                     t.target_workflow_name AS trigger_target_workflow_name \
-                 FROM harvest_completion_trigger_fires f \
-                 LEFT JOIN harvest_completion_triggers t ON t.id = f.trigger_id \
-                 WHERE f.outcome IS NULL \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM harvest_completion_trigger_outbox o \
-                     WHERE o.source_exec_id = f.source_exec_id \
-                       AND o.trigger_id = f.trigger_id \
-                   ) \
-                 {after}\
-                 ORDER BY f.source_exec_id, f.trigger_id \
-                 LIMIT {page}"
-            );
-            let query = diesel::sql_query(sql);
-            let loaded: Vec<TriggerFireRow> = match cursor {
-                Some((exec, trig)) => {
-                    query
-                        .bind::<diesel::sql_types::Uuid, _>(exec)
-                        .bind::<diesel::sql_types::Uuid, _>(trig)
-                        .load(conn)
-                        .await
-                }
-                None => query.load(conn).await,
-            }
-            .map_err(|e| format!("completion-trigger fire scan failed: {e}"))?;
-
+            let loaded = fetch_trigger_fire_page(conn, page, cursor).await?;
             let exhausted = i64::try_from(loaded.len()).unwrap_or(i64::MAX) < page;
             if let Some(last) = loaded.last() {
                 cursor = Some((last.source_exec_id, last.trigger_id));
@@ -2096,6 +2105,19 @@ mod probes {
                 return Ok((rows, None));
             }
         }
+
+        // The budget ran out with the last page full (issue #1401, Codex
+        // follow-up x6). A qualifying-row count that is an exact multiple
+        // of `page` is indistinguishable from genuine truncation, from
+        // inside the loop above. `len < page` never fires when every page,
+        // including the true last one, comes back full. One more page,
+        // fetched outside the nominal budget, disambiguates: empty means
+        // the scan was actually complete, not truncated.
+        let final_page = fetch_trigger_fire_page(conn, page, cursor).await?;
+        if final_page.is_empty() {
+            return Ok((rows, None));
+        }
+        rows.extend(final_page);
 
         let truncation = format!(
             "completion-trigger fire scan hit its page ceiling after {} rows \
