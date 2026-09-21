@@ -21201,13 +21201,37 @@ async fn process_workflow_task(
             // dropping the dispatch exactly as it always did before this
             // whole issue. See that function's doc for the narrower,
             // honest gap this still leaves.
+            //
+            // Resolved against the same dedup persistence applies (issue
+            // #952, mirrors the `Failed` arm below). A re-park of an
+            // already-started child or already-recorded dispatch must not
+            // trip the cap, or inflate the metric, on events that will
+            // never be written.
             let abandoned = if continue_as_new_certainly_redirects(
                 registry,
                 &prepared.execution,
                 input,
                 new_workflow_type.as_deref(),
             ) {
-                abandoned_dispatch_event_count(&pending_cmds)
+                match abandoned_dispatch_event_count_resolved(
+                    conn,
+                    &pending_cmds,
+                    RecordedDispatchIds::from_history(&history_events),
+                )
+                .await
+                {
+                    Ok(count) => count,
+                    Err(error) => {
+                        return fail_execution_on_error(
+                            conn,
+                            task,
+                            worker_id,
+                            Err::<(), _>(error),
+                            registry.payload_codecs(),
+                        )
+                        .await;
+                    }
+                }
             } else {
                 0
             };
