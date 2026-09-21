@@ -1569,10 +1569,17 @@ impl DispatchInstallGuard {
 
 impl Drop for DispatchInstallGuard {
     fn drop(&mut self) {
-        match self.kind {
+        match &self.kind {
             DispatchInstallKind::None => {}
             DispatchInstallKind::Single => autumn_harvest::dispatch::uninstall(),
-            DispatchInstallKind::Shards(_) => autumn_harvest::dispatch::uninstall_all_shards(),
+            DispatchInstallKind::Shards(shards) => {
+                tracing::warn!(
+                    shards = ?shards.iter().map(|shard| shard.as_i32()).collect::<Vec<_>>(),
+                    "unwinding an uncommitted multi-shard dispatch install: a later startup \
+                     step failed after these shards' channels connected"
+                );
+                autumn_harvest::dispatch::uninstall_all_shards();
+            }
         }
     }
 }
