@@ -2262,6 +2262,18 @@ impl WorkflowHandle {
         // #772 round 6: thread the deadline budget (see `hydrate_ctx_for_query`).
         .with_execution_timeout(execution.execution_timeout)
         .with_deadline(execution.deadline_at)
+        // #1405: thread the row's current shard (mirrors the deadline
+        // budget). A `ParentShard` child spawned from a query handler then
+        // places on the row's true residence, not the origin bits `target`
+        // encodes.
+        //
+        // `execution.shard_id` above and `history` below resolve residence
+        // separately (line 2246). A migration landing between the two reads
+        // could make this value stale by the time `history` is read.
+        // Currently inert: a query replay emits no commands and appends no
+        // events, so no fresh child mint is ever reachable from here. It
+        // would become live risk if this path is ever extended to persist.
+        .with_current_shard_id(Some(crate::types::ShardId::new(execution.shard_id)))
         // #698: thread the spawning-parent id (mirrors the deadline budget) so a
         // query handler running against a loaded execution reads the correct
         // `ctx.info().parent_execution_id` for a child workflow.
