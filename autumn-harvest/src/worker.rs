@@ -16993,6 +16993,84 @@ async fn resolve_continue_as_new_verdict(
     })
 }
 
+/// Best-effort, DB-free prediction of whether a `ContinuedAsNew` outcome
+/// will redirect to a terminal failure (issue #1409).
+///
+/// Used ONLY to decide the history hard-cap preflight's accounting, in
+/// `process_workflow_task`. This runs before the persist transaction that
+/// alone can resolve the real verdict
+/// ([`resolve_continue_as_new_verdict`], under the execution row lock). It
+/// mirrors that function's checks, but only the ones needing no DB read at
+/// all. Those are: an unsupported child, a blank/DAG/unregistered target,
+/// an unrepresentable declared deadline, an over-cap cross-type input, and
+/// an over-cap quota key.
+///
+/// **Deliberately incomplete.** Two of `resolve_continue_as_new_verdict`'s
+/// checks need a DB read: a live cross-shard occupant, a live
+/// successor-slot occupant. Neither is evaluated here. Re-running them a
+/// second time, unlocked, before the transaction even opens, would be the
+/// exact TOCTOU this design avoids. A redirect from one of those two checks
+/// alone, on a cycle otherwise indistinguishable from a healthy
+/// continuation, makes this function return `false`.
+///
+/// That residual gap in the hard-cap safety net is deliberate. A redirected
+/// cycle near the cap could still slip past it for one of those two
+/// reasons. Closing it would mean flagging every dispatch-then-continue
+/// cycle as a possible redirect. That false-positive-DLQs a healthy
+/// continuation that was always going to succeed. This function trades a
+/// narrow, honest gap in the safety net for ruling that worse failure mode
+/// out.
+fn continue_as_new_certainly_redirects(
+    registry: &HandlerRegistry,
+    execution: &WorkflowExecution,
+    input: &serde_json::Value,
+    new_workflow_type: Option<&str>,
+) -> bool {
+    if execution.parent_id.is_some() {
+        return true;
+    }
+    let target_info = match classify_continue_as_new_target(registry, new_workflow_type) {
+        Err(_) => return true,
+        Ok(ContinueAsNewTypeCheck::SameType) => return false,
+        Ok(ContinueAsNewTypeCheck::CrossType(info)) => info,
+    };
+    let effective_timeout = target_info
+        .execution_timeout
+        .and_then(|d| chrono::Duration::from_std(d).ok())
+        .map(|t| {
+            registry
+                .max_workflow_execution_timeout
+                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .map_or(t, |ceiling| t.min(ceiling))
+        });
+    if classify_successor_deadline_representable(
+        target_info.name,
+        effective_timeout,
+        chrono::Utc::now(),
+    )
+    .is_err()
+    {
+        return true;
+    }
+    let cap = resolve_cross_type_max_input_bytes(target_info, registry.max_workflow_input_bytes);
+    let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
+    let offload_applies = registry
+        .payload_offloader()
+        .is_some_and(|o| observed > o.threshold());
+    if cap > 0 && observed > cap && !offload_applies {
+        return true;
+    }
+    let quota_key = target_info
+        .quota
+        .and_then(|policy| crate::quota::resolve_quota_key(policy.key_expr, input));
+    if let Some(key) = quota_key.as_deref()
+        && crate::quota::quota_key_over_cap(key).is_some()
+    {
+        return true;
+    }
+    false
+}
+
 /// [`resolve_continue_as_new_verdict`], but for a whole [`WorkflowOutcome`]:
 /// `Some` only for `ContinuedAsNew`, `None` for every other outcome.
 ///
@@ -21103,24 +21181,36 @@ async fn process_workflow_task(
                 }
             }
         }
-        WorkflowOutcome::ContinuedAsNew { .. } => {
-            // Issue #1409 (Codex P2 on this PR): a continue-as-new can
-            // internally redirect to a real `WorkflowFailed`. That appends
-            // this cycle's abandoned-dispatch pair (issue #952) onto the
-            // SAME (predecessor) row this preflight is sizing. A genuine
+        WorkflowOutcome::ContinuedAsNew {
+            input,
+            new_workflow_type,
+        } => {
+            // Issue #1409: a continue-as-new can internally redirect to a
+            // real `WorkflowFailed`. That appends this cycle's
+            // abandoned-dispatch pair (issue #952) onto the SAME
+            // (predecessor) row this preflight is sizing. A genuine
             // continuation instead escapes onto a fresh successor row --
             // exactly why this outcome is otherwise exempt from the hard
             // cap below.
             //
-            // Whether it will actually redirect is only known under the
-            // execution row lock inside the persist transaction
-            // (`resolve_continue_as_new_verdict`). This pre-transaction
-            // preflight must not pay for that twice. So it counts the
-            // cheap, DB-free upper bound instead. That is the same
-            // over-counts-are-safe reasoning `abandoned_dispatch_event_count`'s
-            // own doc already establishes for the identical preflight-sizing
-            // purpose.
-            let abandoned = abandoned_dispatch_event_count(&pending_cmds);
+            // Only count it when `continue_as_new_certainly_redirects` says
+            // so. Counting it whenever the batch merely CARRIES an
+            // abandoned-dispatch-eligible command false-positive-DLQs the
+            // common healthy case. That case is a race/join dispatch
+            // alongside a continuation that actually succeeds, silently
+            // dropping the dispatch exactly as it always did before this
+            // whole issue. See that function's doc for the narrower,
+            // honest gap this still leaves.
+            let abandoned = if continue_as_new_certainly_redirects(
+                registry,
+                &prepared.execution,
+                input,
+                new_workflow_type.as_deref(),
+            ) {
+                abandoned_dispatch_event_count(&pending_cmds)
+            } else {
+                0
+            };
             resolved_abandoned_dispatch_event_count = abandoned;
             pending_update_result_event_count(&pending_cmds)
                 .saturating_add(pre_suspension_event_count(&pending_cmds))
@@ -40201,6 +40291,105 @@ mod tests {
             commands: Vec::new(),
         };
         assert!(!continue_as_new_exempt_from_history_cap(&suspended, 0));
+    }
+
+    /// Issue #1409: the history hard-cap preflight must not
+    /// false-positive-DLQ a healthy continuation just because it also
+    /// dispatched-then-abandoned something in the same cycle. Pin the exact
+    /// cheap checks this prediction covers. Also pin the two DB-dependent
+    /// ones it deliberately leaves as `false` -- a documented residual gap,
+    /// not a bug.
+    #[test]
+    fn continue_as_new_certainly_redirects_covers_only_the_db_free_checks() {
+        let root = can803_predecessor();
+        let mut child = root.clone();
+        child.parent_id = Some(uuid::Uuid::new_v4());
+
+        let target = can803_wf_info("paid_subscription");
+        let registry = HandlerRegistry::new(vec![target], vec![]);
+        let small_input = serde_json::json!({});
+
+        // A same-type continuation can never redirect for a reason this
+        // function can see -- `check_continue_as_new_type` is not even
+        // consulted for `new_workflow_type: None`.
+        assert!(!continue_as_new_certainly_redirects(
+            &registry,
+            &root,
+            &small_input,
+            None
+        ));
+
+        // A child execution redirects unconditionally (issue #1409's
+        // `ChildUnsupported`), same-type or cross-type alike.
+        assert!(continue_as_new_certainly_redirects(
+            &registry,
+            &child,
+            &small_input,
+            None
+        ));
+        assert!(continue_as_new_certainly_redirects(
+            &registry,
+            &child,
+            &small_input,
+            Some("paid_subscription")
+        ));
+
+        // An unregistered cross-type target redirects -- pure registry
+        // lookup, no DB read.
+        assert!(continue_as_new_certainly_redirects(
+            &registry,
+            &root,
+            &small_input,
+            Some("no_such_type")
+        ));
+
+        // A registered cross-type target with a small input and no quota
+        // policy cannot be shown to redirect by any DB-free check.
+        assert!(!continue_as_new_certainly_redirects(
+            &registry,
+            &root,
+            &small_input,
+            Some("paid_subscription")
+        ));
+
+        // An over-cap cross-type input redirects -- pure size check against
+        // the target's effective cap. `max_input_bytes: None` falls back to
+        // the registry's own floor, lowered here well under the payload
+        // below (the default floor is 2 MiB).
+        let tight_target = can803_wf_info("tight_cap");
+        let tight_registry = HandlerRegistry::new(vec![tight_target], vec![])
+            .with_payload_caps(10_000, 8, 10_000, 10_000);
+        let big_input = serde_json::json!({"blob": "x".repeat(300)});
+        assert!(continue_as_new_certainly_redirects(
+            &tight_registry,
+            &root,
+            &big_input,
+            Some("tight_cap")
+        ));
+
+        // An over-cap quota key redirects -- pure resolve + length check.
+        let mut quota_target = can803_wf_info("quota_target");
+        quota_target.quota = Some(crate::quota::QuotaPolicy::new("tenant_id"));
+        let quota_registry = HandlerRegistry::new(vec![quota_target], vec![]);
+        let oversized_key_input = serde_json::json!({
+            "tenant_id": "x".repeat(
+                usize::try_from(crate::quota::MAX_QUOTA_KEY_BYTES).expect("small") + 1
+            )
+        });
+        assert!(continue_as_new_certainly_redirects(
+            &quota_registry,
+            &root,
+            &oversized_key_input,
+            Some("quota_target")
+        ));
+        // A quota key within bound is not, by itself, a reason to redirect.
+        let in_bound_key_input = serde_json::json!({"tenant_id": "acme"});
+        assert!(!continue_as_new_certainly_redirects(
+            &quota_registry,
+            &root,
+            &in_bound_key_input,
+            Some("quota_target")
+        ));
     }
 
     /// The dedup asks the question the MATCHER asked — "is this dispatch already
