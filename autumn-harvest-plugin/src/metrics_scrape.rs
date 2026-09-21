@@ -1145,17 +1145,17 @@ mod tests {
     #[test]
     fn render_prometheus_decomposes_a_histogram_into_count_and_sum_families() {
         let recorder = HarvestMetricsRecorder::new();
-        recorder.record_activity_completed("send_email", "default", 1.5, ActivityStatus::Success);
-        recorder.record_activity_completed("send_email", "default", 2.5, ActivityStatus::Success);
+        recorder.record_activity_completed("send_email", "default", 1.5, ActivityStatus::Completed);
+        recorder.record_activity_completed("send_email", "default", 2.5, ActivityStatus::Completed);
 
         let text = recorder.render_prometheus();
         assert!(text.contains("# TYPE harvest_activity_duration_count counter\n"));
         assert!(text.contains(
-            "harvest_activity_duration_count{activity=\"send_email\",queue=\"default\",status=\"success\"} 2\n"
+            "harvest_activity_duration_count{activity=\"send_email\",queue=\"default\",status=\"completed\"} 2\n"
         ));
         assert!(text.contains("# TYPE harvest_activity_duration_sum counter\n"));
         assert!(text.contains(
-            "harvest_activity_duration_sum{activity=\"send_email\",queue=\"default\",status=\"success\"} 4\n"
+            "harvest_activity_duration_sum{activity=\"send_email\",queue=\"default\",status=\"completed\"} 4\n"
         ));
     }
 
