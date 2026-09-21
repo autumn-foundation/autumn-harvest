@@ -4561,10 +4561,19 @@ mod db {
     /// (issue #1405).
     ///
     /// The core write refuses a row a concurrent cutover sealed under its
-    /// lock, naming the shard it forwards to. This follows that pointer and
-    /// retries there, bounded like every other forwarding walk in this
-    /// module ([`MAX_FORWARD_HOPS`]). A chain that keeps moving still fails
-    /// closed instead of looping forever.
+    /// lock. This re-resolves `exec_id` and retries, bounded like every
+    /// other forwarding walk in this module ([`MAX_FORWARD_HOPS`]). A chain
+    /// that keeps moving still fails closed instead of looping forever.
+    ///
+    /// Re-resolves through [`conn_for_execution_forwarded`] on every attempt,
+    /// rather than checking out the shard the refusal names directly (issue
+    /// #1405 review). That shard can alias the connection this call already
+    /// dropped a moment earlier — a pre-split staging deployment, the same
+    /// case [`conn_for_execution_forwarded_with_shard`]'s own hop loop
+    /// guards against. A raw checkout on a size-one aliased pool would then
+    /// wait forever for the connection this call itself just released.
+    /// `conn_for_execution_forwarded` already carries that guard; a fresh
+    /// call is simpler and safer than duplicating it here.
     ///
     /// # Errors
     ///
@@ -4579,14 +4588,12 @@ mod db {
         actor: &str,
         now: DateTime<Utc>,
     ) -> HarvestResult<LegalHoldOutcome> {
-        let mut conn = conn_for_execution_forwarded(pool, exec_id).await?;
         for _ in 0..MAX_FORWARD_HOPS {
+            let mut conn = conn_for_execution_forwarded(pool, exec_id).await?;
             match retention::set_legal_hold(&mut conn, exec_id, reason, hold_until, actor, now)
                 .await
             {
-                Err(HarvestError::ShardUnavailable { shard_id, .. }) => {
-                    conn = checkout(pool, ShardId::new(shard_id)).await?;
-                }
+                Err(HarvestError::ShardUnavailable { .. }) => {}
                 other => return other,
             }
         }
@@ -4600,7 +4607,7 @@ mod db {
 
     /// [`crate::retention::release_legal_hold`], retried across a mid-flight
     /// seal (issue #1405). See [`set_legal_hold_forwarded`] for the shape of
-    /// the race this closes.
+    /// the race this closes and why each attempt re-resolves from scratch.
     ///
     /// # Errors
     ///
@@ -4612,12 +4619,10 @@ mod db {
         exec_id: ExecutionId,
         now: DateTime<Utc>,
     ) -> HarvestResult<LegalHoldOutcome> {
-        let mut conn = conn_for_execution_forwarded(pool, exec_id).await?;
         for _ in 0..MAX_FORWARD_HOPS {
+            let mut conn = conn_for_execution_forwarded(pool, exec_id).await?;
             match retention::release_legal_hold(&mut conn, exec_id, now).await {
-                Err(HarvestError::ShardUnavailable { shard_id, .. }) => {
-                    conn = checkout(pool, ShardId::new(shard_id)).await?;
-                }
+                Err(HarvestError::ShardUnavailable { .. }) => {}
                 other => return other,
             }
         }
