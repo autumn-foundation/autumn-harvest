@@ -1,14 +1,14 @@
 -- SAME unmodified CANDIDATE_SQL, with the migration comment's rejected (workflow_name, id) partial index also present @ noise=500000 -- the unforced planner does NOT choose it --
-Limit  (cost=0.42..355.21 rows=200 width=58) (actual time=1.380..58.100 rows=200 loops=1)
+Limit  (cost=0.42..363.53 rows=200 width=58) (actual time=1.514..55.667 rows=200 loops=1)
   Output: id, workflow_name, input
-  Buffers: shared hit=95048 read=43
-  ->  Index Scan using idx_harvest_we_quota_reconcile_candidates on public.harvest_workflow_executions  (cost=0.42..70559.37 rows=39775 width=58) (actual time=1.379..58.047 rows=200 loops=1)
+  Buffers: shared hit=95063 read=28
+  ->  Index Scan using idx_harvest_we_quota_reconcile_candidates on public.harvest_workflow_executions  (cost=0.42..70622.67 rows=38899 width=58) (actual time=1.512..55.625 rows=200 loops=1)
         Output: id, workflow_name, input
         Filter: (harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[]))
         Rows Removed by Filter: 94467
-        Buffers: shared hit=95048 read=43
-Query Identifier: 7887508310203047271
+        Buffers: shared hit=95063 read=28
+Query Identifier: -2658917363363864142
 Planning:
-  Buffers: shared hit=62 read=28
-Planning Time: 0.728 ms
-Execution Time: 58.147 ms
+  Buffers: shared hit=68 read=26
+Planning Time: 0.703 ms
+Execution Time: 55.699 ms

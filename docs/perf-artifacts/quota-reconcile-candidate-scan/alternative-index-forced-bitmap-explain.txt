@@ -1,36 +1,36 @@
 -- SAME unmodified CANDIDATE_SQL, alternative index present, enable_indexscan=off for one transaction to force the planner to consider the alternative index @ noise=500000 -- isolates whether the index CAN deliver a cheap plan once selected --
-Limit  (cost=16770.85..16794.19 rows=200 width=58) (actual time=5.246..8.309 rows=200 loops=1)
+Limit  (cost=16715.27..16738.61 rows=200 width=58) (actual time=6.439..8.516 rows=200 loops=1)
   Output: id, workflow_name, input
-  Buffers: shared hit=34 read=12
-  ->  Gather Merge  (cost=16770.85..20638.16 rows=33146 width=58) (actual time=5.245..8.295 rows=200 loops=1)
+  Buffers: shared hit=36 read=10
+  ->  Gather Merge  (cost=16715.27..20497.40 rows=32416 width=58) (actual time=6.437..8.501 rows=200 loops=1)
         Output: id, workflow_name, input
         Workers Planned: 2
         Workers Launched: 2
-        Buffers: shared hit=34 read=12
-        ->  Sort  (cost=15770.83..15812.26 rows=16573 width=58) (actual time=0.234..0.238 rows=67 loops=3)
+        Buffers: shared hit=36 read=10
+        ->  Sort  (cost=15715.25..15755.77 rows=16208 width=58) (actual time=0.204..0.215 rows=67 loops=3)
               Output: id, workflow_name, input
               Sort Key: harvest_workflow_executions.id
               Sort Method: top-N heapsort  Memory: 70kB
-              Buffers: shared hit=34 read=12
-              Worker 0:  actual time=0.093..0.093 rows=0 loops=1
+              Buffers: shared hit=36 read=10
+              Worker 0:  actual time=0.062..0.062 rows=0 loops=1
+                Sort Method: quicksort  Memory: 25kB
+                Buffers: shared hit=6 read=1
+              Worker 1:  actual time=0.059..0.060 rows=0 loops=1
                 Sort Method: quicksort  Memory: 25kB
                 Buffers: shared hit=7
-              Worker 1:  actual time=0.070..0.071 rows=0 loops=1
-                Sort Method: quicksort  Memory: 25kB
-                Buffers: shared hit=4 read=3
-              ->  Parallel Bitmap Heap Scan on public.harvest_workflow_executions  (cost=1280.68..15054.56 rows=16573 width=58) (actual time=0.089..0.135 rows=333 loops=3)
+              ->  Parallel Bitmap Heap Scan on public.harvest_workflow_executions  (cost=1245.89..15014.75 rows=16208 width=58) (actual time=0.084..0.118 rows=333 loops=3)
                     Output: id, workflow_name, input
                     Recheck Cond: ((harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[])) AND (harvest_workflow_executions.quota_key IS NULL) AND (harvest_workflow_executions.state = ANY ('{RUNNING,PAUSED}'::text[])))
                     Heap Blocks: exact=23
                     Buffers: shared hit=23 read=9
-                    Worker 0:  actual time=0.029..0.030 rows=0 loops=1
+                    Worker 0:  actual time=0.020..0.020 rows=0 loops=1
                     Worker 1:  actual time=0.023..0.023 rows=0 loops=1
-                    ->  Bitmap Index Scan on idx_ledger_experiment_we_quota_reconcile_by_name_id  (cost=0.00..1270.73 rows=39775 width=0) (actual time=0.201..0.201 rows=1000 loops=1)
+                    ->  Bitmap Index Scan on idx_ledger_experiment_we_quota_reconcile_by_name_id  (cost=0.00..1236.16 rows=38899 width=0) (actual time=0.198..0.198 rows=1000 loops=1)
                           Index Cond: (harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[]))
                           Buffers: shared read=9
 Settings: enable_indexscan = 'off'
-Query Identifier: 7887508310203047271
+Query Identifier: -2658917363363864142
 Planning:
   Buffers: shared hit=20
-Planning Time: 0.316 ms
-Execution Time: 8.345 ms
+Planning Time: 0.307 ms
+Execution Time: 8.549 ms

@@ -1,13 +1,13 @@
 -- Same predicate, alternative index present, workflow_name = $1 (literal equality) instead of = ANY($1) @ noise=500000 -- isolates whether the array form specifically is what the unforced planner avoids --
-Limit  (cost=0.42..271.25 rows=200 width=58) (actual time=0.021..0.120 rows=200 loops=1)
+Limit  (cost=0.42..277.41 rows=200 width=58) (actual time=0.019..0.110 rows=200 loops=1)
   Output: id, workflow_name, input
   Buffers: shared hit=189
-  ->  Index Scan using idx_ledger_experiment_we_quota_reconcile_by_name_id on public.harvest_workflow_executions  (cost=0.42..53861.85 rows=39775 width=58) (actual time=0.020..0.106 rows=200 loops=1)
+  ->  Index Scan using idx_ledger_experiment_we_quota_reconcile_by_name_id on public.harvest_workflow_executions  (cost=0.42..53873.96 rows=38899 width=58) (actual time=0.018..0.097 rows=200 loops=1)
         Output: id, workflow_name, input
         Index Cond: (harvest_workflow_executions.workflow_name = 'billing_saga'::text)
         Buffers: shared hit=189
-Query Identifier: -1625900491650347006
+Query Identifier: 5362672362261877017
 Planning:
   Buffers: shared hit=20
-Planning Time: 0.323 ms
-Execution Time: 0.137 ms
+Planning Time: 0.287 ms
+Execution Time: 0.126 ms

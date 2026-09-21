@@ -453,9 +453,12 @@ async fn zz_capture_quota_reconcile_candidate_scan_evidence() {
             .expect("write alternative-index-literal-equality artifact");
         }
 
+        let noise_terminal = noise_count / 10;
         summary_lines.push(format!(
-            "noise={noise_count} target_active={TARGET_ACTIVE} terminal={}",
-            noise_count / 10
+            "noise={noise_count} target_active={TARGET_ACTIVE} \
+             target_terminal={TARGET_TERMINAL} noise_terminal={noise_terminal} \
+             total_terminal={}",
+            TARGET_TERMINAL + noise_terminal
         ));
     }
 

@@ -12,9 +12,19 @@
 #
 # `HARVEST_TEST_DATABASE_URL`, when set, is treated as an ADMIN URL, exactly
 # as `claim_bench_support.rs` treats it elsewhere in this crate: the harness
-# creates, migrates, seeds, measures, and drops a fresh uniquely-named
-# database per run. When unset, `claim_bench_support::db::setup_bench_db`
-# falls back to a testcontainer automatically.
+# creates, migrates, seeds, and measures against a fresh uniquely-named
+# database per run. It does NOT drop that database when the run ends --
+# `setup_bench_db` documents this: an idle lease connection is held open
+# instead, so the database stays visible to `pg_stat_activity` and defends
+# itself against a concurrent run's stale-database sweep. A FUTURE run's own
+# `setup_bench_db` call sweeps and drops databases stale from a prior run,
+# not this run's own teardown. On a one-off local run against a real Postgres
+# server (not the testcontainer fallback), this leaves a roughly 600,000-row
+# `harvest_claim_bench_*` database behind until the next run of this or any
+# other suite against the same server; `DROP DATABASE` it by hand if that
+# matters. When unset, `claim_bench_support::db::setup_bench_db` falls back
+# to a testcontainer automatically, which the daemon reclaims entirely on
+# its own.
 #
 # Writes into `docs/perf-artifacts/quota-reconcile-candidate-scan/`:
 #   noise-{20000,100000,500000}.explain.txt

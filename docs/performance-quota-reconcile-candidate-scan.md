@@ -166,10 +166,17 @@ reproduced twice with identical totals:
 |---:|---:|---:|---:|
 | 6 | ~489,500-489,600 | ~13,500-13,600 | **503,105** (both runs) |
 
-Half a million buffers for one pass, on a fixture whose non-quota'd
-population (500,000 rows) is well within plausible production scale.
-This clears the impact floor's 5%-of-workload-buffers bar for even a
-single-shard, single-heartbeat-interval reconcile sweep.
+This is six calls, not one. `spawn_quota_key_reconciler_for_shard` makes
+exactly one `reconcile_quota_keys_from` call per `worker_heartbeat_interval`
+tick, so 503,105 is the total cost of a full pass over the candidate set --
+six heartbeat intervals here, not a single one. A single interval's cost is
+the "Plan" table above: 95,091 buffers for one first-tick call at this same
+500,000-noise size, the number that actually clears the impact floor's
+5%-of-workload-buffers bar for a single-shard, single-heartbeat-interval
+sweep. Half a million buffers for the full pass is the aggregate a
+deployment pays once, on first adopting quotas for a type with this large a
+pre-existing backfill population; steady-state cost after that pass
+completes is zero, since every row has left the candidate set.
 
 ## 💡 Verdict
 
