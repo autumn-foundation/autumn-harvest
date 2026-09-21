@@ -25732,9 +25732,10 @@ const MULTI_SHARD_DISPATCH_READ_BLOCK: Duration = Duration::from_millis(10);
 
 /// The block duration a dispatch-channel read uses for one iteration.
 ///
-/// `false` (single shard) returns `poll_interval` unchanged: there is no
-/// peer shard to starve, so the long-poll read stays byte-for-byte the
-/// pre-#1429 behaviour (contract C4). `true` caps the block at
+/// `shard_count` is the number of shards the caller's round-robin visits
+/// this scan. `1` (single shard) returns `poll_interval` unchanged: there is
+/// no peer shard to starve, so the long-poll read stays byte-for-byte the
+/// pre-#1429 behaviour (contract C4). More than one caps the block at
 /// [`MULTI_SHARD_DISPATCH_READ_BLOCK`], so an idle shard's read returns
 /// quickly and the round-robin keeps moving instead of parking behind it.
 /// `run_poll_loop_multi`'s own "all idle" NOTIFY-listener wait already
@@ -25742,8 +25743,8 @@ const MULTI_SHARD_DISPATCH_READ_BLOCK: Duration = Duration::from_millis(10);
 /// shortening this block adds no extra round trips when every shard is
 /// genuinely idle.
 #[must_use]
-const fn dispatch_read_block(multi_shard: bool, poll_interval: Duration) -> Duration {
-    if multi_shard && poll_interval.as_nanos() > MULTI_SHARD_DISPATCH_READ_BLOCK.as_nanos() {
+const fn dispatch_read_block(shard_count: usize, poll_interval: Duration) -> Duration {
+    if shard_count > 1 && poll_interval.as_nanos() > MULTI_SHARD_DISPATCH_READ_BLOCK.as_nanos() {
         MULTI_SHARD_DISPATCH_READ_BLOCK
     } else {
         poll_interval
@@ -25756,17 +25757,35 @@ const fn dispatch_read_block(multi_shard: bool, poll_interval: Duration) -> Dura
 /// on an activity permit. `None` means both pools are full: a read now would
 /// hold references that nothing can start, so the caller sleeps instead.
 ///
-/// The sum of the two is the bound. A read never asks for more than the worker
-/// can start, and it never floors to one when no permit is free.
-const fn dispatch_read_size(free_workflow: usize, free_activity: usize) -> Option<usize> {
+/// The sum of the two is the bound, capped at [`DISPATCH_READ_MAX`]. A read
+/// never asks for more than the worker can start, and it never floors to one
+/// when no permit is free.
+///
+/// `shard_count` bounds it further to a fair share of what is free (Codex
+/// review, issue #1429). `run_poll_loop_multi`'s round-robin calls this once
+/// per shard per scan. An uncapped read let the first shard visited claim
+/// the worker's entire free-permit budget in one call, starving every
+/// sibling shard until those tasks finished. `1` (single shard) divides by
+/// one and changes nothing, so the pre-#1429 behaviour is unchanged there.
+const fn dispatch_read_size(
+    free_workflow: usize,
+    free_activity: usize,
+    shard_count: usize,
+) -> Option<usize> {
     let free = free_workflow.saturating_add(free_activity);
     if free == 0 {
         return None;
     }
-    if free < DISPATCH_READ_MAX {
+    let share = free.div_ceil(if shard_count == 0 { 1 } else { shard_count });
+    let bound = if DISPATCH_READ_MAX < share {
+        DISPATCH_READ_MAX
+    } else {
+        share
+    };
+    if free < bound {
         Some(free)
     } else {
-        Some(DISPATCH_READ_MAX)
+        Some(bound)
     }
 }
 
@@ -26820,36 +26839,33 @@ impl Worker {
                 // reads and claims through it, exactly like the single-pool
                 // loop's dispatch branch. A shard with none polls Postgres,
                 // unchanged.
-                let dispatched = if let Some(installed) = &shard_dispatch[idx] {
+                let dispatched: u32 = if let Some(installed) = &shard_dispatch[idx] {
                     self.run_dispatch_iteration(
                         &shard_targets[idx].1,
                         Some(shard_targets[idx].0),
                         installed,
                         &mut dispatch_states[idx],
-                        true,
+                        n,
                     )
                     .await
                 } else {
-                    self.poll_once(
-                        &shard_targets[idx].1,
-                        shard_acquire_bound(true, self.config.poll_interval),
-                        Some(shard_targets[idx].0),
+                    u32::from(
+                        self.poll_once(
+                            &shard_targets[idx].1,
+                            shard_acquire_bound(true, self.config.poll_interval),
+                            Some(shard_targets[idx].0),
+                        )
+                        .await,
                     )
-                    .await
                 };
-                if dispatched {
+                if dispatched > 0 {
                     any_claimed = true;
-                    // Per-shard dispatch counter (issue #961, AC5). Emitted
-                    // here rather than inside `poll_once`/`dispatch_task`
-                    // because a task row carries no `shard_id` column — "which
-                    // shard" *is* "which pool", and only the poll loop knows
-                    // which pool it just claimed from. `poll_once` returns
-                    // `true` exactly when it dispatched, so this counts
-                    // dispatches, not poll attempts.
-                    self.registry
-                        .telemetry()
-                        .metrics
-                        .record_shard_dispatched(shard_metric_label(shard_targets[idx].0));
+                    // Per-shard dispatch counter (issue #961, AC5), once per
+                    // dispatched task (issue #1429, Codex review) rather than
+                    // once per poll call. A batched dispatch-channel read may
+                    // claim several leases in one `run_dispatch_iteration`
+                    // call, and `poll_once` always dispatches at most one.
+                    self.record_shard_dispatched_many(shard_targets[idx].0, dispatched);
                     // Advance start past the shard that just claimed so the
                     // next hot iteration tries the next shard first.
                     start_idx = (idx + 1) % n;
@@ -27985,26 +28001,31 @@ impl Worker {
     /// outcome table in [`reference_outcome`]. Maintenance and the reconcile
     /// sweep run on their own intervals from here.
     ///
-    /// Returns `true` when at least one task was dispatched.
+    /// Returns how many tasks were dispatched (Codex review, issue #1429).
+    /// A batched read can claim more than one lease in a single call. A
+    /// caller that counts dispatches needs the real total, not a bool.
     ///
     /// On a channel error it enters degraded mode. The worker then drains
     /// through [`Self::drain_postgres`] until the cooldown elapses. Availability
     /// equals the Postgres path while the channel is unreachable.
     ///
-    /// `multi_shard` follows [`dispatch_read_block`]. `true` bounds the
-    /// channel read below so a caller round-robining several shards does not
-    /// park behind one idle shard's full `poll_interval` (Codex review,
-    /// issue #1429).
+    /// `shard_count` follows [`dispatch_read_block`] and [`dispatch_read_size`]
+    /// (Codex review, issue #1429). More than one bounds the channel read's
+    /// block duration and its size. That keeps a caller round-robining
+    /// several shards from parking behind one idle shard's full
+    /// `poll_interval`. It also stops one busy shard from claiming every
+    /// sibling's fair share of free permits. `1` (single shard) leaves both
+    /// unbounded, byte-for-byte the pre-#1429 behaviour.
     async fn run_dispatch_iteration(
         &self,
         pool: &DbPool,
         shard: Option<crate::types::ShardId>,
         installed: &crate::dispatch::InstalledDispatch,
         state: &mut DispatchLoopState,
-        multi_shard: bool,
-    ) -> bool {
+        shard_count: usize,
+    ) -> u32 {
         let settings = &installed.settings;
-        let block_for = dispatch_read_block(multi_shard, settings.poll_interval);
+        let block_for = dispatch_read_block(shard_count, settings.poll_interval);
 
         // Degraded mode (issue #1312). The channel failed recently, so this
         // iteration does not touch it. A channel call that fails costs the poll
@@ -28012,7 +28033,7 @@ impl Worker {
         // below the Postgres rate. The cooldown expires on its own, and the
         // next iteration probes the channel again.
         if state.degraded.is_degraded() {
-            return self.drain_postgres(pool, shard, multi_shard).await;
+            return self.drain_postgres(pool, shard, shard_count).await;
         }
 
         // A maintenance success does not clear the degraded window. Only a
@@ -28026,21 +28047,24 @@ impl Worker {
             .await
         {
             self.enter_degraded(state, &error, "dispatch maintenance failed", settings);
-            return self.drain_postgres(pool, shard, multi_shard).await;
+            return self.drain_postgres(pool, shard, shard_count).await;
         }
 
         if DispatchLoopState::due(&mut state.reconciled, settings.reconcile_interval)
             && !self.run_dispatch_reconcile(pool, installed, state).await
         {
-            return self.drain_postgres(pool, shard, multi_shard).await;
+            return self.drain_postgres(pool, shard, shard_count).await;
         }
 
-        // One read sized to the free permits of each pool, so the worker never
-        // holds more references than it can start. The semaphores gate
-        // execution, not claiming, so this is a bound and not a guarantee.
+        // One read sized to a fair share of the free permits of each pool
+        // (issue #1429). So the worker never holds more references than it
+        // can start, and one shard cannot claim every sibling's share in a
+        // multi-shard round-robin. The semaphores gate execution, not
+        // claiming, so this is a bound and not a guarantee.
         let Some(want) = dispatch_read_size(
             self.workflow_semaphore.available_permits(),
             self.activity_semaphore.available_permits(),
+            shard_count,
         ) else {
             // Both pools are full. A reference read now would sit in this
             // worker's hands until a permit frees, which keeps it from a peer
@@ -28058,7 +28082,7 @@ impl Worker {
                 Ok(permit) = self.workflow_semaphore.acquire() => { drop(permit); }
                 Ok(permit) = self.activity_semaphore.acquire() => { drop(permit); }
             }
-            return false;
+            return 0;
         };
 
         // The read blocks for `block_for` (contract C4 for a single shard;
@@ -28066,7 +28090,7 @@ impl Worker {
         // cap is that wait plus the call timeout. The shutdown arm gives a
         // stopping worker its exit without waiting out the read.
         let read = tokio::select! {
-            () = self.shutdown.cancelled() => return false,
+            () = self.shutdown.cancelled() => return 0,
             result = tokio::time::timeout(
                 block_for + DISPATCH_CALL_TIMEOUT,
                 installed.channel.next(
@@ -28085,7 +28109,7 @@ impl Worker {
             }
             Ok(Err(error)) => {
                 self.enter_degraded(state, &error, "dispatch read failed", settings);
-                return self.drain_postgres(pool, shard, multi_shard).await;
+                return self.drain_postgres(pool, shard, shard_count).await;
             }
             Err(_) => {
                 let error = HarvestError::Dispatch(format!(
@@ -28093,11 +28117,28 @@ impl Worker {
                     block_for + DISPATCH_CALL_TIMEOUT
                 ));
                 self.enter_degraded(state, &error, "dispatch read timed out", settings);
-                return self.drain_postgres(pool, shard, multi_shard).await;
+                return self.drain_postgres(pool, shard, shard_count).await;
             }
         };
 
-        let mut dispatched = false;
+        self.dispatch_leases(pool, shard, installed, state, leases)
+            .await
+    }
+
+    /// Claim and dispatch each lease from one dispatch-channel read.
+    ///
+    /// Returns how many were actually dispatched (issue #1429; extracted
+    /// from [`Self::run_dispatch_iteration`] to keep that function's line
+    /// count under clippy's `too_many_lines` threshold).
+    async fn dispatch_leases(
+        &self,
+        pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
+        installed: &crate::dispatch::InstalledDispatch,
+        state: &mut DispatchLoopState,
+        leases: Vec<crate::dispatch::DispatchLease>,
+    ) -> u32 {
+        let mut dispatched = 0u32;
         // Leases this iteration gives straight back with no claim attempt
         // (shutdown, or no free permit for the pool a reference needs). None
         // of these was ever claimed, so batching their disposal costs only a
@@ -28135,9 +28176,12 @@ impl Worker {
                 }
                 None => None,
             };
-            dispatched |= self
+            if self
                 .consume_reference(pool, shard, installed, state, lease, reservation)
-                .await;
+                .await
+            {
+                dispatched += 1;
+            }
         }
         if !to_release.is_empty() {
             let _ = dispatch_call(installed.channel.release_many(&to_release), "release").await;
@@ -28162,19 +28206,20 @@ impl Worker {
     /// call. A channel call that fails can cost the poll interval plus the call
     /// timeout. One claim per call is a throughput collapse, not a fallback.
     ///
-    /// `multi_shard` follows [`dispatch_read_block`] (Codex review, issue
+    /// `shard_count` follows [`dispatch_read_block`] (Codex review, issue
     /// #1429). The closing wait is capped the same way the channel read is.
     /// So one shard's degraded-mode fallback does not park a multi-shard
     /// round-robin behind it for a full `poll_interval`.
     ///
-    /// Returns `true` when at least one task was dispatched.
+    /// Returns how many tasks were dispatched (`poll_once` claims at most one
+    /// per call, so this is the number of loop iterations that claimed).
     async fn drain_postgres(
         &self,
         pool: &DbPool,
         shard: Option<crate::types::ShardId>,
-        multi_shard: bool,
-    ) -> bool {
-        let mut dispatched = false;
+        shard_count: usize,
+    ) -> u32 {
+        let mut dispatched = 0u32;
         while !self.shutdown.is_cancelled() {
             if !self
                 .poll_once(
@@ -28186,14 +28231,33 @@ impl Worker {
             {
                 break;
             }
-            dispatched = true;
+            dispatched += 1;
         }
-        let wait = dispatch_read_block(multi_shard, self.config.poll_interval);
+        let wait = dispatch_read_block(shard_count, self.config.poll_interval);
         tokio::select! {
             () = self.shutdown.cancelled() => {}
             () = tokio::time::sleep(wait) => {}
         }
         dispatched
+    }
+
+    /// Emit [`Metrics::record_shard_dispatched`] once per dispatched task
+    /// (Codex review, issue #1429).
+    ///
+    /// A batched dispatch-channel read can claim several leases in one
+    /// `run_dispatch_iteration` call. Emitting the counter once per call
+    /// regardless of the batch size under-reported by up to
+    /// `DISPATCH_READ_MAX`. So the per-shard dispatch-rate dashboard no
+    /// longer matched the counter's documented meaning. A no-op for `count
+    /// == 0`.
+    fn record_shard_dispatched_many(&self, shard: crate::types::ShardId, count: u32) {
+        let label = shard_metric_label(shard);
+        for _ in 0..count {
+            self.registry
+                .telemetry()
+                .metrics
+                .record_shard_dispatched(label);
+        }
     }
 
     /// Log a channel error and open the degraded-mode cooldown it earns.
@@ -28528,15 +28592,13 @@ impl Worker {
             let dispatch_allowed = per_shard_installed.is_some() || dispatch_allowed;
             if let Some(installed) = per_shard_installed.or_else(crate::dispatch::installed) {
                 if dispatch_allowed {
-                    if self
-                        .run_dispatch_iteration(pool, shard, &installed, &mut dispatch_state, false)
-                        .await
+                    let dispatched = self
+                        .run_dispatch_iteration(pool, shard, &installed, &mut dispatch_state, 1)
+                        .await;
+                    if dispatched > 0
                         && let Some(shard) = shard
                     {
-                        self.registry
-                            .telemetry()
-                            .metrics
-                            .record_shard_dispatched(shard_metric_label(shard));
+                        self.record_shard_dispatched_many(shard, dispatched);
                     }
                     continue;
                 }
@@ -41634,14 +41696,42 @@ mod tests {
 
     #[test]
     fn a_read_is_sized_to_the_free_permits_of_both_pools() {
-        assert_eq!(dispatch_read_size(0, 0), None, "no permit means no read");
-        assert_eq!(dispatch_read_size(1, 0), Some(1));
-        assert_eq!(dispatch_read_size(0, 1), Some(1));
-        assert_eq!(dispatch_read_size(2, 3), Some(5));
+        assert_eq!(dispatch_read_size(0, 0, 1), None, "no permit means no read");
+        assert_eq!(dispatch_read_size(1, 0, 1), Some(1));
+        assert_eq!(dispatch_read_size(0, 1, 1), Some(1));
+        assert_eq!(dispatch_read_size(2, 3, 1), Some(5));
         assert_eq!(
-            dispatch_read_size(1_000, 1_000),
+            dispatch_read_size(1_000, 1_000, 1),
             Some(DISPATCH_READ_MAX),
             "a read never asks for more than the cap"
+        );
+    }
+
+    #[test]
+    fn a_read_is_capped_to_a_fair_share_across_shards() {
+        // Codex review, issue #1429. An uncapped read let the first shard
+        // visited in a multi-shard round-robin claim every free permit,
+        // starving its siblings until those tasks finished.
+        assert_eq!(
+            dispatch_read_size(100, 100, 4),
+            Some(50),
+            "200 free permits split four ways is a share of 50, well under the cap"
+        );
+        assert_eq!(
+            dispatch_read_size(2, 1, 4),
+            Some(1),
+            "a fair share always rounds up, so a shard sees at least one row \
+             it is entitled to rather than none"
+        );
+        assert_eq!(
+            dispatch_read_size(0, 0, 4),
+            None,
+            "no free permit means no read regardless of shard count"
+        );
+        assert_eq!(
+            dispatch_read_size(1_000, 1_000, 4),
+            Some(DISPATCH_READ_MAX),
+            "the fair share still yields to the absolute cap"
         );
     }
 
