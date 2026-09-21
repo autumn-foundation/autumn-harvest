@@ -3024,6 +3024,13 @@ mod probes {
         workflow_id: String,
         #[diesel(sql_type = diesel::sql_types::Bool)]
         all_migrated: bool,
+        /// The seal's forwarding shard, when `all_migrated`. A completion-
+        /// trigger target's business key is a one-time id (Codex follow-up
+        /// x16). In practice at most one row exists per key. `MAX` is a
+        /// deterministic pick if that assumption is ever violated. `NULL`
+        /// when `all_migrated` is false -- the caller never needs it then.
+        #[diesel(sql_type = Nullable<Integer>)]
+        migrated_to_shard: Option<i32>,
     }
 
     /// Like [`matching_workflow_keys`] against `harvest_workflow_executions`,
@@ -3047,7 +3054,8 @@ mod probes {
     ) -> Result<Vec<WorkflowExecutionMatchRow>, diesel::result::Error> {
         diesel::sql_query(
             "SELECT e.workflow_name, e.workflow_id, \
-                 bool_and(e.state = 'MIGRATED') AS all_migrated \
+                 bool_and(e.state = 'MIGRATED') AS all_migrated, \
+                 MAX(e.migrated_to_shard) AS migrated_to_shard \
              FROM harvest_workflow_executions e \
              JOIN UNNEST($1::text[], $2::text[]) AS t(workflow_name, workflow_id) \
                ON e.workflow_name = t.workflow_name AND e.workflow_id = t.workflow_id \
@@ -3545,13 +3553,21 @@ mod probes {
     async fn adjudicate_trigger_fires(
         conn: &mut AsyncPgConnection,
         owned: &[&super::PendingTriggerFire],
+        targets: &[ShardTarget],
         latest_by_shard: &std::collections::BTreeMap<i32, Option<DateTime<Utc>>>,
         max_skew_secs: i64,
     ) -> TriggerFireBuckets {
         let mut out = TriggerFireBuckets::default();
         for chunk in owned.chunks(WORKFLOW_KEY_LOOKUP_CHUNK) {
-            adjudicate_trigger_fire_chunk(conn, chunk, latest_by_shard, max_skew_secs, &mut out)
-                .await;
+            adjudicate_trigger_fire_chunk(
+                conn,
+                chunk,
+                targets,
+                latest_by_shard,
+                max_skew_secs,
+                &mut out,
+            )
+            .await;
         }
         out
     }
@@ -3565,12 +3581,14 @@ mod probes {
     /// cross-shard fire. It is either a benign retention collection of a
     /// completed run, or a target the engine legitimately never created
     /// (an inline rejection such as `PayloadTooLarge`). Either way it is
-    /// silent here. Only a `MIGRATED`-seal-only match is reported, as
-    /// `completion_trigger_fire_unproven`: the live run may have
-    /// rebalanced to a shard this restore does not cover.
+    /// silent here. A `MIGRATED`-seal-only match tries to confirm on its
+    /// forwarding shard first (Codex follow-up x16). Only an unconfirmed
+    /// seal is reported, as `completion_trigger_fire_unproven`: the live
+    /// run may have rebalanced to a shard this restore does not cover.
     async fn adjudicate_same_shard_fires(
         conn: &mut AsyncPgConnection,
         owned: &[&super::PendingTriggerFire],
+        targets: &[ShardTarget],
         out: &mut TriggerFireBuckets,
     ) {
         for chunk in owned.chunks(WORKFLOW_KEY_LOOKUP_CHUNK) {
@@ -3595,13 +3613,14 @@ mod probes {
                     continue;
                 }
             };
+            let confirmed = confirm_migrated_seals(targets, &migrated_seal_only).await;
 
             for fire in chunk {
                 let key = (
                     fire.target_workflow_name.clone(),
                     fire.target_workflow_id.clone(),
                 );
-                if migrated_seal_only.contains(&key) {
+                if migrated_seal_only.contains_key(&key) && !confirmed.contains(&key) {
                     out.push_unproven(format!(
                         "{} (fired by {} on shard {}) matches a MIGRATED forwarding \
                          seal only on shard {}; the live run may have rebalanced to a \
@@ -3616,9 +3635,10 @@ mod probes {
         }
     }
 
-    /// Match `chunk`'s targets against `harvest_workflow_executions`, split
-    /// into keys backed by a genuine row and keys backed by `MIGRATED`
-    /// forwarding seals only. Split out of
+    /// Match `chunk`'s targets against `harvest_workflow_executions`.
+    /// Split into keys backed by a genuine row and keys backed by
+    /// `MIGRATED` forwarding seals only (mapped to the seal's
+    /// `migrated_to_shard`). Split out of
     /// [`adjudicate_trigger_fire_chunk`] to keep that function under the
     /// line-count lint.
     async fn match_live_targets(
@@ -3628,22 +3648,64 @@ mod probes {
     ) -> Result<
         (
             std::collections::HashSet<(String, String)>,
-            std::collections::HashSet<(String, String)>,
+            std::collections::HashMap<(String, String), Option<i32>>,
         ),
         diesel::result::Error,
     > {
         let matches = matching_workflow_executions(conn, names, ids).await?;
         let mut existing = std::collections::HashSet::new();
-        let mut migrated_seal_only = std::collections::HashSet::new();
+        let mut migrated_seal_only = std::collections::HashMap::new();
         for row in matches {
             let key = (row.workflow_name, row.workflow_id);
             if row.all_migrated {
-                migrated_seal_only.insert(key);
+                migrated_seal_only.insert(key, row.migrated_to_shard);
             } else {
                 existing.insert(key);
             }
         }
         Ok((existing, migrated_seal_only))
+    }
+
+    /// Try to confirm each `MIGRATED`-seal-only key on the shard its seal
+    /// points to, one round trip per distinct destination shard (Codex
+    /// follow-up x16). A destination outside the supplied `--shard` list,
+    /// or unreachable, is left unconfirmed. The caller keeps reporting it
+    /// `unproven`, same as today. This is a SINGLE hop. A seal found on
+    /// the destination that is itself another seal still counts as
+    /// confirmed here. That mirrors the single-hop `migrated_to_shard`
+    /// convention already used elsewhere in the engine. A chained
+    /// migration is a residual limitation, not a regression this
+    /// introduces.
+    async fn confirm_migrated_seals(
+        targets: &[ShardTarget],
+        seals: &std::collections::HashMap<(String, String), Option<i32>>,
+    ) -> std::collections::HashSet<(String, String)> {
+        let mut by_shard: std::collections::BTreeMap<i32, Vec<(String, String)>> =
+            std::collections::BTreeMap::new();
+        for (key, dest) in seals {
+            if let Some(dest_shard) = dest {
+                by_shard.entry(*dest_shard).or_default().push(key.clone());
+            }
+        }
+
+        let mut confirmed = std::collections::HashSet::new();
+        for (dest_shard, keys) in by_shard {
+            let Some(target) = targets.iter().find(|t| t.shard_id == dest_shard) else {
+                continue;
+            };
+            let Ok(mut dest_conn) = connect_read_only(&target.dsn).await else {
+                continue;
+            };
+            let names: Vec<String> = keys.iter().map(|(n, _)| n.clone()).collect();
+            let ids: Vec<String> = keys.iter().map(|(_, i)| i.clone()).collect();
+            if let Ok(found) =
+                matching_workflow_keys(&mut dest_conn, "harvest_workflow_executions", &names, &ids)
+                    .await
+            {
+                confirmed.extend(found);
+            }
+        }
+        confirmed
     }
 
     /// One bounded chunk of [`adjudicate_trigger_fires`]'s work, for
@@ -3657,15 +3719,17 @@ mod probes {
     /// ANY-STATE existence check `relay_gate_checked_start` itself runs
     /// before starting the target, read-only against a restored snapshot.
     /// A key matched by `MIGRATED` seals only is neither delivered nor
-    /// absent. It goes straight to `unproven`, skipping the
-    /// retention/timestamp checks below (Codex follow-up x13). Everything
-    /// genuinely absent is checked in one more query against
-    /// `harvest_execution_summaries`. That retention/timestamp fallback is
-    /// calibrated for a CROSS-shard relay's delivery window -- it does not
-    /// apply to a same-shard fire, which never has one.
+    /// absent. It tries to confirm on the seal's forwarding shard first
+    /// (Codex follow-up x16). An unconfirmed one goes straight to
+    /// `unproven`, skipping the retention/timestamp checks below (Codex
+    /// follow-up x13). Everything genuinely absent is checked in one more
+    /// query against `harvest_execution_summaries`. That retention/timestamp
+    /// fallback is calibrated for a CROSS-shard relay's delivery window --
+    /// it does not apply to a same-shard fire, which never has one.
     async fn adjudicate_trigger_fire_chunk(
         conn: &mut AsyncPgConnection,
         chunk: &[&super::PendingTriggerFire],
+        targets: &[ShardTarget],
         latest_by_shard: &std::collections::BTreeMap<i32, Option<DateTime<Utc>>>,
         max_skew_secs: i64,
         out: &mut TriggerFireBuckets,
@@ -3692,13 +3756,14 @@ mod probes {
                 return;
             }
         };
+        let confirmed = confirm_migrated_seals(targets, &migrated_seal_only).await;
 
         for fire in chunk {
             let key = (
                 fire.target_workflow_name.clone(),
                 fire.target_workflow_id.clone(),
             );
-            if migrated_seal_only.contains(&key) {
+            if migrated_seal_only.contains_key(&key) && !confirmed.contains(&key) {
                 out.push_unproven(format!(
                     "{} (fired by {} on shard {}) matches a MIGRATED forwarding seal only \
                      on shard {}; the live run may have rebalanced to a shard this \
@@ -3715,7 +3780,7 @@ mod probes {
             .iter()
             .filter(|f| {
                 let key = (f.target_workflow_name.clone(), f.target_workflow_id.clone());
-                !existing.contains(&key) && !migrated_seal_only.contains(&key)
+                !existing.contains(&key) && !migrated_seal_only.contains_key(&key)
             })
             .collect();
         if absent.is_empty() {
@@ -3868,11 +3933,12 @@ mod probes {
             let mut buckets = adjudicate_trigger_fires(
                 &mut conn,
                 &owned_cross_shard,
+                targets,
                 &latest_by_shard,
                 max_skew_secs,
             )
             .await;
-            adjudicate_same_shard_fires(&mut conn, &owned_same_shard, &mut buckets).await;
+            adjudicate_same_shard_fires(&mut conn, &owned_same_shard, targets, &mut buckets).await;
             let TriggerFireBuckets {
                 lost,
                 lost_count,
