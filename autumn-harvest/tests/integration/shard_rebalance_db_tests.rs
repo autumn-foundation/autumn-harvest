@@ -6253,10 +6253,12 @@ async fn set_legal_hold_refuses_a_row_sealed_after_it_resolved_but_before_its_lo
     let (release_lock_tx, release_lock_rx) = tokio::sync::oneshot::channel();
     let holder_task = tokio::spawn(async move {
         Box::pin(holder.transaction::<(), HarvestError, _>(async |conn| {
-            diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
-                .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-                .execute(&mut *conn)
-                .await?;
+            diesel::sql_query(
+                "SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .execute(&mut *conn)
+            .await?;
             let _ = lock_held_tx.send(());
             let _ = release_lock_rx.await;
             Ok(())
@@ -6338,8 +6340,7 @@ async fn release_legal_hold_refuses_a_sealed_row_instead_of_clearing_it() {
         .expect("migration must succeed");
 
     let mut source = shards.source().await;
-    let result =
-        autumn_harvest::release_legal_hold(&mut source, exec_id, Utc::now()).await;
+    let result = autumn_harvest::release_legal_hold(&mut source, exec_id, Utc::now()).await;
 
     match result {
         Err(HarvestError::ShardUnavailable { shard_id, .. }) => {
