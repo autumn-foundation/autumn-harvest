@@ -6657,9 +6657,10 @@ fn first_persist_capability_miss(
 /// which makes an unregistered target the same blameless fleet condition every
 /// other #804 site releases for — canonically a rolling deploy where the old
 /// pod runs the source phase and only the new peer registers the target phase.
-/// Without this, `check_continue_as_new_type` funnels it into
-/// `persist_workflow_failure` and the predecessor is terminally failed by a
-/// worker that simply arrived first.
+/// Without this, `resolve_continue_as_new_verdict` (issue #1409) resolves
+/// the unregistered target into a `RootFailure` verdict. That verdict's
+/// write funnels into `persist_workflow_failure`, terminally failing the
+/// predecessor by a worker that simply arrived first.
 ///
 /// **Only the unregistered case.** `classify_continue_as_new_target` rejects a
 /// target for five other reasons, and none of them is about this worker:
@@ -16977,7 +16978,7 @@ async fn resolve_continue_as_new_verdict(
 /// [`resolve_continue_as_new_verdict`], but for a whole [`WorkflowOutcome`]:
 /// `Some` only for `ContinuedAsNew`, `None` for every other outcome.
 ///
-/// Six internal paths inside continue-as-new persistence can redirect a
+/// Several internal paths inside continue-as-new persistence can redirect a
 /// `ContinuedAsNew` outcome to a real `WorkflowFailed`. They are an
 /// unsupported child, a blank/unregistered/DAG/occupied-slot target, an
 /// over-cap input, and an over-cap quota key. Issue #952's abandoned-dispatch
@@ -18693,6 +18694,18 @@ async fn persist_terminal_outcome_commands(
     // Issue #1409: resolve a `ContinuedAsNew` outcome's verdict NOW, before
     // deciding whether to record this cycle's abandoned dispatches below —
     // see `resolve_continue_as_new_verdict_for_outcome`'s doc.
+    //
+    // This now runs BEFORE `apply_race_loser_cancellations` and
+    // `create_detached_child_executions` further down, whereas the
+    // pre-#1409 shape ran this check only at the very end, after both. That
+    // is safe: neither can create a competing occupant of the
+    // `(target_type, execution.workflow_id)` slot `resolve_successor_slot`
+    // locks on. A race-loser cancellation appends terminal events to
+    // ALREADY-existing rows; it never inserts a fresh
+    // `harvest_workflow_executions` row. A detached child's row is always
+    // keyed `workflow_id = child_id.to_string()`. That is an opaque id
+    // minted fresh for that spawn, never the predecessor's own
+    // `workflow_id`, so it can never collide with the successor's slot.
     let continue_as_new_verdict =
         resolve_continue_as_new_verdict_for_outcome(conn, registry, execution, &outcome).await?;
     let will_redirect_to_failure = matches!(

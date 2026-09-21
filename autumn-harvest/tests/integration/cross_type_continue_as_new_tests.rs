@@ -819,6 +819,15 @@ async fn a_cap_redirected_transition_still_records_its_abandoned_dispatch() {
         "the abandoned dispatch must carry its synthetic terminal half of the pair; got {:?}",
         history.events
     );
+    assert!(
+        matches!(
+            history.events.last(),
+            Some(WorkflowEvent::WorkflowFailed { .. })
+        ),
+        "the abandoned-dispatch pair must be appended BEFORE the terminal event, not after \
+         (issue #1409's event-id ordering guarantee); got {:?}",
+        history.events
+    );
 }
 
 /// A cap-rejected transition on a SCHEDULED run must increment the
@@ -1719,6 +1728,103 @@ async fn a_child_workflow_cannot_cross_type_continue_either() {
             .is_some_and(|e| e.contains("child workflows")),
         "the root-only guard must still reject a cross-type continuation, got {:?}",
         failed.error
+    );
+}
+
+/// Issue #1409: the root-only guard is one of several internal paths that
+/// can redirect a `ContinuedAsNew` outcome to a terminal failure. It has the
+/// most distinct control flow of the four: an early `parent_id.is_some()`
+/// check, ahead of `check_continue_as_new_type`'s machinery, with its own
+/// `persist_child_workflow_failure` write. A child that also abandons an
+/// activity dispatch in the same cycle must still get issue #952's synthetic
+/// terminal pair. That matches the target-cap and quota-key redirects.
+#[tokio::test]
+async fn a_child_workflow_rejected_continue_as_new_still_records_its_abandoned_dispatch() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let child_type = leaked("child_abandoned_phase_one");
+    let target = leaked("child_abandoned_phase_two");
+    let workflow_id = format!("child-{}", Uuid::new_v4().simple());
+
+    let parent = start_root(
+        &mut conn,
+        leaked("parent_holder_abandoned"),
+        &format!("parent-{}", Uuid::new_v4().simple()),
+        serde_json::json!({}),
+    )
+    .await;
+    let child = start_root(
+        &mut conn,
+        child_type,
+        &workflow_id,
+        serde_json::json!({"next_type": target}),
+    )
+    .await;
+    diesel::update(harvest_workflow_executions::table.find(child.as_uuid()))
+        .set(harvest_workflow_executions::parent_id.eq(Some(parent.as_uuid())))
+        .execute(&mut conn)
+        .await
+        .expect("reparent the child");
+
+    let reg = Arc::new(HandlerRegistry::new(
+        vec![
+            wf(child_type, phase_one_forwarding_with_abandoned_activity),
+            wf(target, phase_two),
+        ],
+        vec![act_info(ABANDONED_ACTIVITY_NAME, abandoned_activity_noop)],
+    ));
+    let worker = build_runtime_worker("w-1409-child-abandoned", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+    let failed = wait_for_execution_state(&url, child, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("child workflows")),
+        "the root-only guard must still reject a cross-type continuation, got {:?}",
+        failed.error
+    );
+
+    let history = load_history_from_url(&url, child).await;
+    assert!(
+        !history
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowContinuedAsNew { .. })),
+        "a rejected continuation may not record a continue-as-new"
+    );
+    assert!(
+        history.events.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityScheduled { name, .. } if name == ABANDONED_ACTIVITY_NAME
+        )),
+        "issue #1409: a child's continue-as-new rejected by the root-only guard must still \
+         record the cycle's abandoned activity dispatch; got {:?}",
+        history.events
+    );
+    assert!(
+        history.events.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityFailed {
+                non_retryable: true,
+                ..
+            }
+        )),
+        "the abandoned dispatch must carry its synthetic terminal half of the pair; got {:?}",
+        history.events
+    );
+    assert!(
+        matches!(
+            history.events.last(),
+            Some(WorkflowEvent::WorkflowFailed { .. })
+        ),
+        "the abandoned-dispatch pair must be appended BEFORE the terminal event, not after \
+         (issue #1409's event-id ordering guarantee); got {:?}",
+        history.events
     );
 }
 
