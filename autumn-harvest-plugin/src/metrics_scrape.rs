@@ -204,8 +204,8 @@ impl HarvestMetricsRecorder {
     /// format (issue #1611).
     ///
     /// `MetricsSource::collect` below is the only place that walks `Inner`
-    /// into `MetricFamily` values; this method renders exactly that output,
-    /// so a standalone embedder with no `autumn_web::actuator` endpoint to
+    /// into `MetricFamily` values. This method renders exactly that output.
+    /// A standalone embedder with no `autumn_web::actuator` endpoint to
     /// mount sees the same series the plugin path's `/actuator/prometheus`
     /// serves. Serving it needs one route:
     ///
@@ -270,8 +270,8 @@ fn escape_label_value(s: &str) -> String {
 }
 
 /// Format a sample value per Prometheus text format. `f64::to_string()`
-/// renders infinities and NaN in a shape the exposition format does not
-/// accept; the plugin path's own `/actuator/prometheus` renderer special-cases
+/// renders infinities and NaN in a shape the exposition format rejects.
+/// The plugin path's own `/actuator/prometheus` renderer special-cases
 /// them the same way, so this stays consistent with it.
 fn format_sample_value(v: f64) -> String {
     if v == f64::INFINITY {
@@ -1166,32 +1166,20 @@ mod tests {
     fn render_prometheus_escapes_a_backslash_in_a_label_value() {
         let recorder = HarvestMetricsRecorder::new();
         recorder.record_workflow_started("a\\b", "q");
-        assert!(
-            recorder
-                .render_prometheus()
-                .contains("workflow=\"a\\\\b\"")
-        );
+        assert!(recorder.render_prometheus().contains("workflow=\"a\\\\b\""));
     }
 
     #[test]
     fn render_prometheus_escapes_a_double_quote_in_a_label_value() {
         let recorder = HarvestMetricsRecorder::new();
         recorder.record_workflow_started("a\"b", "q");
-        assert!(
-            recorder
-                .render_prometheus()
-                .contains("workflow=\"a\\\"b\"")
-        );
+        assert!(recorder.render_prometheus().contains("workflow=\"a\\\"b\""));
     }
 
     #[test]
     fn render_prometheus_escapes_a_newline_in_a_label_value() {
         let recorder = HarvestMetricsRecorder::new();
         recorder.record_workflow_started("a\nb", "q");
-        assert!(
-            recorder
-                .render_prometheus()
-                .contains("workflow=\"a\\nb\"")
-        );
+        assert!(recorder.render_prometheus().contains("workflow=\"a\\nb\""));
     }
 }

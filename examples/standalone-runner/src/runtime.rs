@@ -39,14 +39,17 @@ pub fn standalone_runtime_config(database_url: String) -> HarvestRuntimeConfig {
 
 /// `metrics` is the same `HarvestMetricsRecorder` instance `server.rs` wires
 /// into the `/metrics` route (issue #1611). The plugin path's
-/// `HarvestPlugin::with_metrics_scrape()` does this same
-/// `HarvestBuilder::telemetry(..)` call for the caller; a standalone
-/// embedder has no plugin to do it, so it is one explicit argument here
-/// instead.
+/// `HarvestPlugin::with_metrics_scrape()` makes this same
+/// `HarvestBuilder::telemetry(..)` call for the caller. A standalone
+/// embedder has no plugin to do it, so it is one explicit argument here.
 pub fn standalone_builder(metrics: HarvestMetricsRecorder) -> HarvestBuilder {
     HarvestBuilder::default()
         .workflows(workflows::workflows())
         .activities(activities::activities())
         .worker(WorkerConfig::default().with_queues([RUNNER_QUEUE]))
-        .telemetry(TelemetryConfig::builder().metrics(Arc::new(metrics)).build())
+        .telemetry(
+            TelemetryConfig::builder()
+                .metrics(Arc::new(metrics))
+                .build(),
+        )
 }

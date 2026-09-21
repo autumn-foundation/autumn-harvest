@@ -32,7 +32,10 @@ pub fn build_router(api_state: HarvestApiState, metrics: HarvestMetricsRecorder)
                 let metrics = metrics.clone();
                 async move {
                     (
-                        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/plain; version=0.0.4",
+                        )],
                         metrics.render_prometheus(),
                     )
                 }

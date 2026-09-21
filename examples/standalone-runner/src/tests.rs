@@ -165,10 +165,8 @@ async fn preflight_succeeds_once_dev_profile_is_declared() {
 
 /// Closes issue #1611. A standalone mount has no `autumn_web::actuator`
 /// endpoint to feed, so `/metrics` is the only place its recorded samples
-/// are ever readable. Before this route existed, an embedder who enabled
-/// the recorder still had every sample discarded -- accumulated in
-/// `HarvestMetricsRecorder`'s internal maps with nothing that could render
-/// them back out.
+/// are ever readable. Before this route, an embedder who enabled the
+/// recorder had every sample discarded, with no way to render them out.
 #[tokio::test]
 async fn metrics_route_renders_a_recorded_sample_as_prometheus_text() {
     let metrics = HarvestMetricsRecorder::new();
