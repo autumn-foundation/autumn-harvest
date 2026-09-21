@@ -381,7 +381,8 @@ spelling only) undercounted every test using an argument, e.g.
 `quota_enforcement_tests.rs` has **44** — and, checked against the rest of
 the manifest for the first time this round, `event_partitioning_tests.rs`
 alone has **148**, more than either of shard 10's suites individually
-(it lands on shard 7 — row 28, `28 % 11 = 7` — not shard 10). **This
+(it lands on shard 6 — row 28, `28 % 11 = 6`, corrected from an earlier
+draft's arithmetic error — not shard 10). **This
 session has not done a full per-shard accounting across all 11 shards**,
 so "shard 10 carries the manifest's two largest suites" is `ci.yml`'s own
 historical claim from the time of the 2026 fix, not something this session
@@ -799,7 +800,7 @@ grep -c "^#\[tokio::test" autumn-harvest/tests/integration/integration_e2e.rs \
 # -> 118, 44, and 148 -- the full attribute count (matching e.g.
 #    #[tokio::test(flavor = "multi_thread")] too). event_partitioning_tests
 #    is individually LARGER than either shard-10 suite, and lands on a
-#    DIFFERENT shard (row 28, 28 % 11 = 7) -- "the manifest's two largest
+#    DIFFERENT shard (row 28, 28 % 11 = 6) -- "the manifest's two largest
 #    suites" is ci.yml's claim from its own 2026 fix, not re-verified
 #    against today's manifest by this session.
 
