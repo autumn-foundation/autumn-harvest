@@ -76,6 +76,16 @@ deterministically would need new concurrency-test infrastructure
 disproportionate to a one-line guard. Verified by inspection and the full
 existing suite.
 
+A deleted outbox row is still not proof no delivery happened (Codex
+follow-up x2). An earlier attempt could have started the target and then
+failed at its OWN outbox-delete step, leaving the row for a later,
+differently-configured attempt to reject as oversized. The rejection path
+now re-checks the target's any-state existence on the target shard FIRST,
+mirroring the existence check `relay_gate_checked_start` itself already
+runs before claiming a delivery. A target that already exists is treated
+as delivered (drop the stale outbox row, leave `fires.outcome` `NULL`)
+instead of rejected.
+
 **Migration `20260920215812`.** `harvest_completion_trigger_fires` gains two
 nullable columns, `target_shard` and `target_workflow_name`, populated by
 `completion_trigger.rs` at relay time. Reading the historical values a fire

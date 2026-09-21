@@ -2602,43 +2602,81 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                     cap_bytes,
                     "[completion_trigger outbox] permanent error: oversized input payload; deleting outbox row"
                 );
-                let resolved: Result<bool, crate::error::HarvestError> =
-                    Box::pin(conn.transaction(async |tx| {
-                        let deleted = diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
+
+                // Re-check the target's any-state existence FIRST, on the
+                // TARGET shard (issue #1401, Codex follow-up x2). This
+                // mirrors the existence check `relay_gate_checked_start`
+                // itself already runs before claiming a delivery.
+                //
+                // The outbox row still existing is not proof this rejection
+                // is the whole story. An earlier attempt could have started
+                // the target successfully. That attempt could then have
+                // failed at ITS OWN outbox-delete step. The row would then
+                // wait for a later, differently-configured attempt, which
+                // could reject it as oversized.
+                let already_delivered = crate::execution::execution_exists_by_key(
+                    &mut target_conn,
+                    &task.target_workflow_name,
+                    &task.target_workflow_id,
+                )
+                .await;
+                let resolved: Result<bool, crate::error::HarvestError> = match already_delivered {
+                    Ok(true) => {
+                        tracing::debug!(
+                            source_exec_id = %task.source_exec_id,
+                            trigger_id = %task.trigger_id,
+                            "[completion_trigger outbox] target already exists (any \
+                             state); treating the stale outbox row as delivered, not \
+                             rejected"
+                        );
+                        diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
                             .filter(outbox_dsl::id.eq(task.id))
+                            .execute(conn)
+                            .await
+                            .map_err(crate::error::database_error)
+                            .map(|_| false)
+                    }
+                    Ok(false) => {
+                        Box::pin(conn.transaction(async |tx| {
+                            let deleted =
+                                diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
+                                    .filter(outbox_dsl::id.eq(task.id))
+                                    .execute(tx)
+                                    .await
+                                    .map_err(crate::error::database_error)?;
+                            // Zero rows deleted means another attempt already
+                            // claimed and resolved this row (issue #1401, Codex
+                            // follow-up). A rolling deployment is one example:
+                            // a differently-configured worker could deliver it
+                            // successfully in between this attempt's own
+                            // rolled-back claim and this transaction. Marking
+                            // the fire `payload_too_large` here would overwrite
+                            // that success with a wrong, permanent rejection.
+                            if deleted == 0 {
+                                return Ok(false);
+                            }
+                            diesel::update(
+                                fires_dsl::harvest_completion_trigger_fires
+                                    .filter(fires_dsl::source_exec_id.eq(task.source_exec_id))
+                                    .filter(fires_dsl::trigger_id.eq(task.trigger_id)),
+                            )
+                            .set(fires_dsl::outcome.eq(Some("payload_too_large")))
                             .execute(tx)
                             .await
                             .map_err(crate::error::database_error)?;
-                        // Zero rows deleted means another attempt already
-                        // claimed and resolved this row (issue #1401, Codex
-                        // follow-up). A rolling deployment is one example:
-                        // a differently-configured worker could deliver it
-                        // successfully in between this attempt's own
-                        // rolled-back claim and this transaction. Marking
-                        // the fire `payload_too_large` here would overwrite
-                        // that success with a wrong, permanent rejection.
-                        if deleted == 0 {
-                            return Ok(false);
-                        }
-                        diesel::update(
-                            fires_dsl::harvest_completion_trigger_fires
-                                .filter(fires_dsl::source_exec_id.eq(task.source_exec_id))
-                                .filter(fires_dsl::trigger_id.eq(task.trigger_id)),
-                        )
-                        .set(fires_dsl::outcome.eq(Some("payload_too_large")))
-                        .execute(tx)
+                            Ok(true)
+                        }))
                         .await
-                        .map_err(crate::error::database_error)?;
-                        Ok(true)
-                    }))
-                    .await;
+                    }
+                    Err(e) => Err(e),
+                };
                 match resolved {
                     Ok(false) => {
                         tracing::warn!(
                             source_exec_id = %task.source_exec_id,
                             trigger_id = %task.trigger_id,
-                            "[completion_trigger outbox] outbox row already claimed by \
-                             another attempt; leaving its fire outcome untouched"
+                            "[completion_trigger outbox] outbox row already claimed or \
+                             already delivered; leaving its fire outcome untouched"
                         );
                     }
                     Err(e) => {
