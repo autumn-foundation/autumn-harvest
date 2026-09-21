@@ -397,9 +397,11 @@ pub(crate) struct WorkerListParams {
     /// Filter by build ID (exact match).
     #[serde(default)]
     build_id: Option<String>,
-    /// Auto-refresh interval in seconds (emits a `<meta http-equiv="refresh">` tag).
+    /// Auto-refresh interval in seconds (emits a `<meta http-equiv="refresh">`
+    /// tag). `String`, not `u64` — same fix as `page`/`limit` above (issue
+    /// #1604), reusing `parse_refresh_query_field` (issue #1630).
     #[serde(default)]
-    refresh: Option<u64>,
+    refresh: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -452,8 +454,10 @@ pub(crate) struct DeadLetterListParams {
     failed_before: Option<String>,
     #[serde(default)]
     shard_id: Option<String>,
+    // `refresh` is `String`, not `u64` — same fix as `page`/`limit` above
+    // (issue #1604), reusing `parse_refresh_query_field` (issue #1630).
     #[serde(default)]
-    refresh: Option<u64>,
+    refresh: Option<String>,
     #[serde(default)]
     flash: Option<String>,
     /// `summary` switches to the root-cause aggregation view (issue #385).
@@ -2498,6 +2502,10 @@ async fn list_dead_letters_ui(
         params.shard_id.as_deref(),
     );
 
+    // Same fix, `refresh` (issue #1604): reuses the DAG-detail page's own
+    // `parse_refresh_query_field` (issue #1630).
+    let (refresh, refresh_error) = parse_refresh_query_field(params.refresh.as_deref());
+
     let pool = api_state.storage_pool().map_err(map_error)?;
 
     // Summary toggle (issue #385): the root-cause aggregation view.
@@ -2510,7 +2518,8 @@ async fn list_dead_letters_ui(
             limit,
             &limit_raw,
             limit_error.as_deref(),
-            params.refresh,
+            refresh,
+            refresh_error.as_deref(),
             params.flash.as_deref(),
         )
         .await;
@@ -2590,7 +2599,8 @@ async fn list_dead_letters_ui(
         &limit_raw,
         has_next,
         total_for_pagination,
-        params.refresh,
+        refresh,
+        refresh_error.as_deref(),
         params.flash.as_deref(),
         limit_error.as_deref(),
         page_error.as_deref(),
@@ -2998,6 +3008,10 @@ async fn list_workers_ui(
     let (limit, limit_raw, limit_error) =
         parse_limit_query_field(params.limit.as_deref(), DEFAULT_PAGE_SIZE);
     let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
+
+    // Same fix, `refresh` (issue #1604): reuses the DAG-detail page's own
+    // `parse_refresh_query_field` (issue #1630).
+    let (refresh, refresh_error) = parse_refresh_query_field(params.refresh.as_deref());
     let offset = page.saturating_mul(limit);
 
     let stale_threshold = api_state.worker_stale_threshold();
@@ -3095,7 +3109,8 @@ async fn list_workers_ui(
         &stale_raw,
         stale_error.as_deref(),
         build_id_filter,
-        params.refresh,
+        refresh,
+        refresh_error.as_deref(),
         &limit_raw,
         limit_error.as_deref(),
         page_error.as_deref(),
@@ -3513,6 +3528,7 @@ fn render_dead_letters_page(
     has_next: bool,
     total_matching: usize,
     refresh: Option<u64>,
+    refresh_error: Option<&str>,
     flash: Option<&str>,
     limit_error: Option<&str>,
     page_error: Option<&str>,
@@ -3521,6 +3537,9 @@ fn render_dead_letters_page(
         h2 { "Dead Letters" }
         @if let Some(message) = flash {
             div.flash role="status" tabindex="-1" autofocus { (message) }
+        }
+        @if let Some(error) = refresh_error {
+            span.field-error role="alert" { (error) }
         }
         (render_dead_letter_view_toggle(filters, filter_raw, limit, limit_raw, refresh, None, false))
         (render_dead_letter_filters(filters, filter_raw, limit, limit_raw, limit_error, refresh))
@@ -3583,6 +3602,7 @@ async fn render_dead_letters_summary_view(
     limit_raw: &str,
     limit_error: Option<&str>,
     refresh: Option<u64>,
+    refresh_error: Option<&str>,
     flash: Option<&str>,
 ) -> Result<Markup, AutumnError> {
     let group_by = parse_dlq_summary_group_by(group_by_raw)?;
@@ -3613,6 +3633,9 @@ async fn render_dead_letters_summary_view(
         h2 { "Dead Letters" }
         @if let Some(message) = flash {
             div.flash role="status" tabindex="-1" autofocus { (message) }
+        }
+        @if let Some(error) = refresh_error {
+            span.field-error role="alert" { (error) }
         }
         (render_dead_letter_view_toggle(filters, filter_raw, limit, limit_raw, refresh, Some(&group_by_value), true))
         (render_dead_letter_filters(filters, filter_raw, limit, limit_raw, limit_error, refresh))
@@ -4538,6 +4561,7 @@ fn render_workers_page(
     stale_error: Option<&str>,
     build_id_filter: Option<&str>,
     refresh: Option<u64>,
+    refresh_error: Option<&str>,
     limit_raw: &str,
     limit_error: Option<&str>,
     page_error: Option<&str>,
@@ -4546,6 +4570,10 @@ fn render_workers_page(
 
     let body = html! {
         h2 { "Workers" }
+
+        @if let Some(error) = refresh_error {
+            span.field-error role="alert" { (error) }
+        }
 
         // Fleet health banner
         (render_fleet_banner(stats, banner_state))
@@ -8332,8 +8360,10 @@ pub(crate) struct ScheduleListParams {
     health: Option<String>,
     #[serde(default)]
     shard_id: Option<String>,
+    // `refresh` is `String`, not `u64` — same fix as `page`/`limit` above
+    // (issue #1604), reusing `parse_refresh_query_field` (issue #1630).
     #[serde(default)]
-    refresh: Option<u64>,
+    refresh: Option<String>,
     #[serde(default)]
     flash: Option<String>,
 }
@@ -8850,6 +8880,10 @@ async fn list_schedules_ui(
     let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
     let offset = page.saturating_mul(limit);
 
+    // Same fix, `refresh` (issue #1604): reuses the DAG-detail page's own
+    // `parse_refresh_query_field` (issue #1630).
+    let (refresh, refresh_error) = parse_refresh_query_field(params.refresh.as_deref());
+
     // The page used to `?`-propagate each of these on a bad value. That
     // aborted the whole request with a bare 400 before the filter form
     // ever rendered. It discarded whichever of the five filters the
@@ -8941,7 +8975,8 @@ async fn list_schedules_ui(
         total_filtered,
         &unhealthy_summary,
         &distribution,
-        params.refresh,
+        refresh,
+        refresh_error.as_deref(),
         params.flash.as_deref(),
         limit_error.as_deref(),
         page_error.as_deref(),
@@ -9905,6 +9940,7 @@ fn render_schedules_page(
     unhealthy_summary: &str,
     distribution: &str,
     refresh: Option<u64>,
+    refresh_error: Option<&str>,
     flash: Option<&str>,
     limit_error: Option<&str>,
     page_error: Option<&str>,
@@ -9921,6 +9957,9 @@ fn render_schedules_page(
 
         @if let Some(message) = flash {
             div.flash role="status" tabindex="-1" autofocus { (message) }
+        }
+        @if let Some(error) = refresh_error {
+            span.field-error role="alert" { (error) }
         }
 
         @if !unhealthy_summary.is_empty() {
@@ -14128,6 +14167,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .into_string();
         assert!(
@@ -14907,6 +14947,7 @@ mod tests {
             false,
             0,
             Some(30),
+            None,
             None,
             None,
             None,
