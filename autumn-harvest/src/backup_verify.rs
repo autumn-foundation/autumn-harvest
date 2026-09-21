@@ -2041,6 +2041,21 @@ mod probes {
     /// RESOLVED outcome (`condition_unmet`/`admission_blocked`) started
     /// nothing on any shard, so it is excluded outright.
     ///
+    /// **Residual gap for fires rejected before this fix shipped** (Codex
+    /// follow-up). `enforce_completion_triggers_outbox_with_codecs` now sets
+    /// `outcome = 'payload_too_large'` in the same transaction as the
+    /// outbox delete. A fire it permanently rejects is excluded above like
+    /// any other RESOLVED outcome. A fire an OLDER build rejected the same
+    /// way has `outcome IS NULL` and no outbox row instead, since that
+    /// write did not exist yet. This is the identical shape this scan
+    /// reads as a candidate for adjudication. Nothing durable records
+    /// which case applies. So this scan cannot tell a pre-fix rejection
+    /// from a genuinely lost relay after the fact. This is the same
+    /// category of unfixable-after-the-fact gap as the pre-migration
+    /// `target_shard`/`target_workflow_name` reconstruction documented on
+    /// [`route_trigger_fires`]. It is scoped to fires rejected before this
+    /// deploy, not to fires written before the migration.
+    ///
     /// Each row stands alone. Unlike the event scan, no group spans more
     /// than one row, so plain keyset pagination on the primary key
     /// `(source_exec_id, trigger_id)` cannot split anything.

@@ -363,6 +363,16 @@ ack, it refuses; with the ack, it still only reads.
   make that pick wrong in either direction. These reconstruction gaps are
   residual, unfixable-after-the-fact limitations for data written before the
   migration only.
+
+  **Fires rejected before this fix shipped.** A permanently rejected relay
+  (oversized input payload) now resolves `fires.outcome` to
+  `payload_too_large` in the same transaction as the outbox delete, so
+  verify excludes it like any other resolved fire. A fire an older build
+  rejected the same way, before that write existed, was left with
+  `outcome IS NULL` and no outbox row — indistinguishable after the fact
+  from a genuinely lost relay, since nothing durable records which case
+  applies. This is a residual, unfixable-after-the-fact gap for fires
+  rejected before this deploy only, not tied to the migration date above.
 - **(e) A machine-readable report** (`--format json`) with a nonzero exit on any
   failed check.
 

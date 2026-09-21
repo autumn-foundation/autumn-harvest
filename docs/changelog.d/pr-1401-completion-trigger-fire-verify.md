@@ -136,6 +136,16 @@ way an admission-gate block already did
 (`enforce_completion_triggers_outbox_with_codecs`, `payload_too_large`), so
 it is likewise excluded rather than misread as a lost delivery.
 
+A fire an older build rejected the same way, before this write existed
+(Codex follow-up x11), was left `outcome IS NULL` with no outbox row —
+the same shape the scan reads as a candidate for adjudication. Nothing
+durable records which case applies, so verify cannot tell that fire from
+a genuinely lost relay after the fact. This is the same category of
+residual, unfixable-after-the-fact gap as the pre-migration
+`target_shard`/`target_workflow_name` reconstruction below, scoped to
+fires rejected before this deploy rather than fires written before the
+migration. See `docs/runbooks/backup-restore.md` §4.2(d).
+
 That resolution now also checks its own outbox delete affected a row
 before marking the fire (Codex follow-up). A rolled-back claim followed
 by a concurrent, successful delivery of the SAME row — plausible during a
