@@ -38,30 +38,35 @@
         {
           "name": "state",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Comma-separated execution states (e.g. RUNNING,FAILED)."
         },
         {
           "name": "workflow_name",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by registered workflow name."
         },
         {
           "name": "owner",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by the execution owner, matched exactly. A blank value is ignored."
         },
         {
           "name": "severity",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by the execution severity label, matched exactly. A blank value is ignored."
         },
         {
           "name": "search_attr",
           "in": "query",
+          "type": "string",
           "required": false,
           "repeated": true,
           "description": "Search attribute filter in key:value form (exact-match string equality). May be repeated."
@@ -69,6 +74,7 @@
         {
           "name": "search_attr_filter",
           "in": "query",
+          "type": "string",
           "required": false,
           "repeated": true,
           "description": "Typed comparison/set predicate over search attributes in key:op:value form, op in {eq, ne, gt, gte, lt, lte, in, exists} (issue #506). Repeatable; ANDed. Numeric values compare numerically, booleans as booleans, else strings. Comparison ops require a numeric value. Malformed predicates and nested .-paths return 400. Backed by the existing idx_harvest_we_search GIN index (no migration)."
@@ -76,96 +82,112 @@
         {
           "name": "limit",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Maximum number of results to return (legacy; use page_size for paginated access)."
         },
         {
           "name": "page_size",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Number of results per page (1\u2013200). Activates the paginated response envelope {workflows, next_cursor}."
         },
         {
           "name": "cursor",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Opaque keyset pagination cursor from a previous response's next_cursor field."
         },
         {
           "name": "order",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Sort direction: 'asc' (oldest first) or 'desc' (newest first, default). Activates the paginated response envelope."
         },
         {
           "name": "started_after",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter to executions whose started_at is after this RFC 3339 timestamp (e.g. 2026-01-01T00:00:00Z)."
         },
         {
           "name": "started_before",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter to executions whose started_at is before this RFC 3339 timestamp."
         },
         {
           "name": "exec_id_prefix",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Case-insensitive prefix match on the execution UUID string."
         },
         {
           "name": "sla_breached",
           "in": "query",
+          "type": "boolean",
           "required": false,
           "description": "When 'true', return only executions whose soft SLA has been breached (issue #487)."
         },
         {
           "name": "nd_blocked",
           "in": "query",
+          "type": "boolean",
           "required": false,
           "description": "When 'true', return only RUNNING executions currently blocked on replay non-determinism (issue #603). Each row carries nd_blocked_at / nd_block_reason / nd_block_count plus the structured divergence diagnostic (failure_cause, expected, actual, event_index, workflow_type, build_id) in search_attrs."
         },
         {
           "name": "legal_hold",
           "in": "query",
+          "type": "boolean",
           "required": false,
           "description": "When 'true', return only executions currently under an active legal hold (issue #747): legal_hold_set_at IS NOT NULL AND (legal_hold_until IS NULL OR legal_hold_until > now)."
         },
         {
           "name": "start_source",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by workflow-start provenance (issue #740). One of the bounded StartSource set: api, schedule, backfill, signal_with_start, update_with_start, completion_trigger, webhook, child, batch, continue_as_new, reset, outbox, or 'unknown' (matches NULL / pre-upgrade rows). Any other value returns 400."
         },
         {
           "name": "failure_cause",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter to executions whose search_attrs carry this failure_cause value."
         },
         {
           "name": "no_progress_minutes",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Stalled-workflow discovery (issue #486). A positive integer N. Returns RUNNING and SUSPENDED executions with no recorded progress for N minutes, sorted by staleness. PAUSED executions are excluded unless state=PAUSED is given, because a pause blocks progress by design. Keyset pagination does not apply on this path. A value below 1, or a non-numeric value, returns 400. Cannot be combined with history_bloat_min_events, which returns 400."
         },
         {
           "name": "include_sleeping",
           "in": "query",
+          "type": "boolean",
           "required": false,
           "description": "When 'true', keep correctly-sleeping executions in the no_progress_minutes result. An execution is correctly sleeping when a future-dated timer is its only pending item and no timer is overdue. Such an execution is excluded by default, because it has nothing to progress on."
         },
         {
           "name": "min_history_events",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "General-purpose history-size filter (issue #493). A non-negative integer N. Restricts the response to executions whose recorded harvest_events count is >= N. Composes freely with state, order and pagination, unlike history_bloat_min_events."
         },
         {
           "name": "history_bloat_min_events",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Operator early-warning discovery for workflow history bloat (issue #704). A non-negative integer N. Restricts the response to live (non-terminal) executions whose current recorded harvest_events count is >= N, sorted by history size descending (largest first), each row carrying its history_event_count so callers can rank/triage without a second call. Not supported together with cursor/page_size/order pagination (results are sorted by a computed value, which has no keyset cursor) -- combining them returns 400. A non-numeric or negative value returns 400. Deliberately a DIFFERENT query parameter from the unrelated, pre-existing general-purpose min_history_events filter (issue #493), which composes freely with state=/order=/pagination and returns executions of any state in the caller's chosen order -- the two parameters must never be conflated (see PR #1139 review)."
         }
@@ -202,18 +224,21 @@
         {
           "name": "group_by",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Comma-separated grouping dimensions: state, workflow_name, or state,workflow_name. Defaults to state."
         },
         {
           "name": "workflow_name",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by registered workflow name (applied before grouping)."
         },
         {
           "name": "state",
           "in": "query",
+          "type": "string",
           "required": false,
           "repeated": true,
           "description": "Comma-separated or repeated execution states (e.g. RUNNING,FAILED) to include (applied before grouping)."
@@ -221,18 +246,21 @@
         {
           "name": "started_after",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter to executions whose started_at is on or after this RFC 3339 timestamp."
         },
         {
           "name": "started_before",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter to executions whose started_at is on or before this RFC 3339 timestamp."
         },
         {
           "name": "limit_groups",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Cap on returned (state, workflow_name) groups (default 50, max 500); long tail rolls into a single group with other:true."
         }
@@ -275,18 +303,21 @@
         {
           "name": "workflow_name",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by registered workflow name (exact match)."
         },
         {
           "name": "workflow_id",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by workflow ID (exact match)."
         },
         {
           "name": "state",
           "in": "query",
+          "type": "string",
           "required": false,
           "repeated": true,
           "description": "Comma-separated or repeated terminal states (e.g. COMPLETED,FAILED)."
@@ -294,18 +325,21 @@
         {
           "name": "completed_after",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter to summaries whose completed_at is on or after this RFC 3339 timestamp."
         },
         {
           "name": "completed_before",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter to summaries whose completed_at is on or before this RFC 3339 timestamp."
         },
         {
           "name": "search_attr",
           "in": "query",
+          "type": "string",
           "required": false,
           "repeated": true,
           "description": "Search-attribute containment filter in key:value form (JSONB @> exact-match). May be repeated; ANDed."
@@ -313,18 +347,21 @@
         {
           "name": "limit",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Maximum number of results to return (default 50, max 500). page_size is accepted as an alias."
         },
         {
           "name": "cursor",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Opaque keyset pagination cursor from a previous response's next_cursor field."
         },
         {
           "name": "order",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Sort direction: 'desc' (default, newest-first) or 'asc'. Any other value returns 400. Threaded through both the ordering and the keyset cursor comparison, matching GET /workflows (issue #498)."
         }
@@ -365,6 +402,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         }
@@ -409,24 +447,28 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         },
         {
           "name": "limit",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Maximum events per page (1\u20131000, default 100)."
         },
         {
           "name": "after",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Exclusive cursor anchor (harvest_events.id). Opaque \u2014 treat as a string; absent means start from the first event."
         },
         {
           "name": "event_type",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Repeatable. Filter to matching event type discriminators (e.g. TimerStarted, ActivityCompleted). Unknown names yield an empty page."
         }
@@ -472,12 +514,14 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         },
         {
           "name": "wait",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Optional wait duration such as 250ms, 5s, or 1m. Defaults to 0s. Values above the server ceiling (default 30s, configurable via set_workflow_result_max_wait) are silently clamped \u2014 not rejected with 400."
         }
@@ -536,18 +580,21 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         },
         {
           "name": "payload_policy",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Payload inclusion policy: full (default), redacted, or omit."
         },
         {
           "name": "max_bytes",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Soft byte cap on total payload size."
         }
@@ -587,12 +634,14 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Parent execution UUID."
         },
         {
           "name": "status",
           "in": "query",
+          "type": "string",
           "required": false,
           "repeated": true,
           "description": "Filter by child status (e.g. Running, Failed). May be repeated."
@@ -600,24 +649,28 @@
         {
           "name": "workflow_name",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by child workflow name."
         },
         {
           "name": "limit",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Maximum number of results."
         },
         {
           "name": "cursor",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Pagination cursor."
         },
         {
           "name": "depth",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Maximum recursion depth for nested children."
         }
@@ -658,24 +711,28 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Root execution UUID (may be any node in the tree)."
         },
         {
           "name": "max_depth",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Recursion depth cap below the root. Default 20, must be 1–50. Out of range is rejected with 400 rather than silently clamped."
         },
         {
           "name": "max_nodes",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Total node cap INCLUDING the root. Default 1000, must be 1–10000. Out of range is rejected with 400."
         },
         {
           "name": "summary",
           "in": "query",
+          "type": "boolean",
           "required": false,
           "description": "`true`/`1` returns the per-state descendant roll-up instead of the nested tree."
         }
@@ -735,6 +792,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         }
@@ -785,6 +843,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         }
@@ -827,30 +886,35 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         },
         {
           "name": "limit",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Page size; default 200. Values above 1000 are clamped down; a value \u003c= 0 is rejected with 400 rather than clamped up."
         },
         {
           "name": "cursor",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Exclusive keyset cursor: the previous page's last seq. `after` is accepted as an alias."
         },
         {
           "name": "level",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Repeatable, or comma-separated. One of info, warn, error. An unknown value returns 400 rather than silently matching nothing \u2014 a typo would otherwise answer \"no lines\" for a run that has plenty. Omitted means all levels."
         },
         {
           "name": "since",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "RFC 3339 exclusive lower bound on occurred_at. A convenience bound only \u2014 paginate with cursor, since occurred_at is not monotonic across workers."
         }
@@ -905,6 +969,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         }
@@ -956,6 +1021,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         }
@@ -1009,6 +1075,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID of any member of the chain."
         }
@@ -1050,6 +1117,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         }
@@ -1106,6 +1174,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         }
@@ -1144,6 +1213,7 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Registered workflow function name."
         }
@@ -1455,6 +1525,7 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Registered workflow function name."
         }
@@ -1604,6 +1675,7 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Registered workflow function name."
         }
@@ -1801,6 +1873,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         }
@@ -1872,6 +1945,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         }
@@ -1925,6 +1999,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID of the terminal source run to re-run."
         }
@@ -2004,6 +2079,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         }
@@ -2062,6 +2138,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         }
@@ -2113,6 +2190,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         }
@@ -2187,6 +2265,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         }
@@ -2251,6 +2330,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         }
@@ -2314,6 +2394,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         }
@@ -2366,12 +2447,14 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Workflow execution UUID."
         },
         {
           "name": "activity_exec_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Activity execution ID (the task-queue row PK, surfaced as activity_exec_id in GET /workflows/{id}/stack)."
         }
@@ -2428,12 +2511,14 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Workflow execution UUID."
         },
         {
           "name": "activity_exec_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Activity execution ID (the task-queue row PK, surfaced as activity_exec_id in GET /workflows/{id}/stack)."
         }
@@ -2496,6 +2581,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Workflow execution UUID."
         }
@@ -2551,12 +2637,14 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Workflow execution UUID."
         },
         {
           "name": "delivery_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Completion-delivery row UUID, as returned by GET /workflows/{id}/completion-deliveries."
         }
@@ -2620,12 +2708,14 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         },
         {
           "name": "dry_run",
           "in": "query",
+          "type": "boolean",
           "required": false,
           "description": "When true, return the preview without creating a new execution."
         }
@@ -2761,24 +2851,28 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         },
         {
           "name": "signal_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Registered signal handler name."
         },
         {
           "name": "Idempotency-Key",
           "in": "header",
+          "type": "string",
           "required": false,
           "description": "Exactly-once delivery key (issue #521). Wins over the idempotency_key query param when both are present. A present but empty or non-UTF-8 value is rejected with 400 rather than degraded to at-least-once."
         },
         {
           "name": "idempotency_key",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Exactly-once delivery key (issue #521). Lower precedence than the Idempotency-Key header."
         }
@@ -2827,12 +2921,14 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         },
         {
           "name": "query_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Registered query handler name."
         }
@@ -2877,12 +2973,14 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         },
         {
           "name": "query_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Registered query handler name."
         }
@@ -2937,6 +3035,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         }
@@ -2977,24 +3076,28 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         },
         {
           "name": "update_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Registered update handler name."
         },
         {
           "name": "wait",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "admitted \u2014 return when validated; completed \u2014 block until handler returns (default)."
         },
         {
           "name": "timeout_secs",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Maximum seconds to wait."
         }
@@ -3103,12 +3206,14 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         },
         {
           "name": "update_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Update UUID returned by POST \u2026/update/{name}."
         }
@@ -3203,12 +3308,14 @@
         {
           "name": "dag_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Registered DAG name."
         },
         {
           "name": "limit",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Maximum number of runs to return."
         }
@@ -3239,12 +3346,14 @@
         {
           "name": "dag_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Registered (unified) DAG name."
         },
         {
           "name": "run_exec_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution id of the DAG run to inspect."
         }
@@ -3306,12 +3415,14 @@
         {
           "name": "dag_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Registered (unified) DAG name."
         },
         {
           "name": "run_exec_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution id of the failed DAG run to retry."
         }
@@ -3443,6 +3554,7 @@
         {
           "name": "dag_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Registered DAG name."
         }
@@ -3492,6 +3604,7 @@
         {
           "name": "dag_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Registered DAG name."
         }
@@ -3532,6 +3645,7 @@
         {
           "name": "limit",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Maximum number of entries to return."
         },
@@ -3566,60 +3680,70 @@
         {
           "name": "group_by",
           "in": "query",
+          "type": "string",
           "required": true,
           "description": "Repeatable grouping dimension: workflow_name, activity_name, queue_name, task_type, time_bucket, failure_signature, dlq_reason, or error_class. Repeats build a hierarchical key."
         },
         {
           "name": "time_bucket",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Granularity for the time_bucket dimension: hour (default) or day."
         },
         {
           "name": "workflow_name",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by workflow name (applied before grouping)."
         },
         {
           "name": "activity_name",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by activity function name."
         },
         {
           "name": "queue_name",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by task queue name."
         },
         {
           "name": "since",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Inclusive lower bound on failed_at: RFC 3339 timestamp or relative duration like 24h."
         },
         {
           "name": "until",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Exclusive upper bound on failed_at: RFC 3339 timestamp or relative duration."
         },
         {
           "name": "min_attempts",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Only include entries with at least this many attempts."
         },
         {
           "name": "limit_groups",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Cap on returned groups (default 50, max 500); long tail rolls into a single _other group."
         },
         {
           "name": "samples_per_group",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Representative dead_letter_ids per group (default 3, max 10)."
         }
@@ -3884,6 +4008,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "DeadLetter UUID."
         }
@@ -4026,6 +4151,7 @@
         {
           "name": "token",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Opaque task token issued when the activity was scheduled."
         }
@@ -4076,6 +4202,7 @@
         {
           "name": "token",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Opaque task token."
         }
@@ -4131,6 +4258,7 @@
         {
           "name": "token",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Opaque task token."
         }
@@ -4180,30 +4308,35 @@
         {
           "name": "queue",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by task queue name."
         },
         {
           "name": "shard_id",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Filter by shard ID."
         },
         {
           "name": "status",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by lifecycle status: Active, Draining, or Stopped."
         },
         {
           "name": "health",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by health: healthy or stale."
         },
         {
           "name": "limit",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Maximum number of workers to return [1\u2013500]."
         }
@@ -4239,6 +4372,7 @@
         {
           "name": "worker_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Worker process identifier."
         }
@@ -4300,24 +4434,28 @@
         {
           "name": "queue",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by task queue name."
         },
         {
           "name": "shard_id",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Filter by shard ID."
         },
         {
           "name": "status",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by lifecycle status."
         },
         {
           "name": "limit",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Maximum number of workers to preview."
         }
@@ -4350,6 +4488,7 @@
         {
           "name": "worker_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Worker process identifier."
         }
@@ -4405,6 +4544,7 @@
         {
           "name": "worker_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Worker process identifier."
         }
@@ -4438,6 +4578,7 @@
         {
           "name": "limit",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Maximum number of operations to return."
         },
@@ -4610,6 +4751,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Task UUID."
         }
@@ -4666,6 +4808,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Batch job UUID."
         }
@@ -4716,6 +4859,7 @@
         {
           "name": "name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Registered workflow type name."
         }
@@ -4743,6 +4887,7 @@
         {
           "name": "name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Registered workflow type name."
         }
@@ -4987,6 +5132,7 @@
         {
           "name": "key",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Opaque rate limit identifier key."
         }
@@ -5039,6 +5185,7 @@
         {
           "name": "activity_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Name of a registered activity that declares a static (non-dynamic) rate limit."
         }
@@ -5130,6 +5277,7 @@
         {
           "name": "activity_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Name of a registered activity that declares a static (non-dynamic) rate limit."
         }
@@ -5201,6 +5349,7 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Name of a registered workflow that declares a static (non-dynamic) start throttle."
         }
@@ -5292,6 +5441,7 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Name of a registered workflow that declares a static (non-dynamic) start throttle."
         }
@@ -5362,6 +5512,7 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Name of a registered workflow that declares a static (non-dynamic) start throttle."
         }
@@ -5457,6 +5608,7 @@
         {
           "name": "activity_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Name of the activity whose circuit breaker to inspect."
         }
@@ -5494,6 +5646,7 @@
         {
           "name": "activity_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Name of the activity whose circuit breaker to pin open."
         }
@@ -5534,6 +5687,7 @@
         {
           "name": "activity_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Name of the activity whose circuit breaker to reset."
         }
@@ -5573,6 +5727,7 @@
         {
           "name": "candidate_shard",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Shard ID of a new shard to probe before enabling writes."
         }
@@ -5605,6 +5760,7 @@
         {
           "name": "queue_name",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Narrow the report to a single queue name. Any *decoded* string is accepted -- there is no invalid value, so a repeated key resolves last-value-wins and the value is matched verbatim (never trimmed; only the literal empty string normalizes to no filter, since a queue name may legitimately carry surrounding or all whitespace); an unknown or never-scheduled queue name simply yields uncovered: false, never an error. A malformed percent-encoding (e.g. an invalid UTF-8 byte sequence like %FF) is rejected with a 400 before decoding is even attempted -- see the 400 error_responses entry."
         }
@@ -5709,30 +5865,35 @@
         {
           "name": "workflow_name",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by registered workflow name."
         },
         {
           "name": "change_id",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by version-gate change ID."
         },
         {
           "name": "recorded_version",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Filter by recorded version number."
         },
         {
           "name": "state_group",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Execution state group: active or terminal."
         },
         {
           "name": "shard_id",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Restrict to a single shard."
         }
@@ -5765,30 +5926,35 @@
         {
           "name": "change_id",
           "in": "query",
+          "type": "string",
           "required": true,
           "description": "Version-gate change ID to inspect."
         },
         {
           "name": "min_safe_version",
           "in": "query",
+          "type": "integer",
           "required": true,
           "description": "Versions strictly below this value are considered old branches."
         },
         {
           "name": "workflow_name",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Narrow to a specific workflow name."
         },
         {
           "name": "state_group",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Execution state group filter."
         },
         {
           "name": "shard_id",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Restrict to a single shard."
         }
@@ -5826,6 +5992,7 @@
         {
           "name": "workflow_type",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Narrow the report to a single workflow type. Still returns the full object (non_terminal_count = 0 + safe_to_remove when none found)."
         }
@@ -5979,18 +6146,21 @@
         {
           "name": "from",
           "in": "query",
+          "type": "string",
           "required": true,
           "description": "Inclusive lower bound of the aggregation window: RFC 3339 timestamp or relative duration like 24h."
         },
         {
           "name": "to",
           "in": "query",
+          "type": "string",
           "required": true,
           "description": "Inclusive upper bound of the aggregation window: RFC 3339 timestamp or relative duration like 24h."
         },
         {
           "name": "group_by",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "workflow_name (default) or search_attr:<key> (e.g. search_attr:tenant_id) to bucket by a tenant key carried on executions."
         }
@@ -6305,6 +6475,7 @@
         {
           "name": "format",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Output format: json (default) or prometheus plain-text."
         }
@@ -6355,54 +6526,63 @@
         {
           "name": "workflow_name",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by workflow name."
         },
         {
           "name": "state_group",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Execution state group: active or terminal."
         },
         {
           "name": "state",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Comma-separated execution states, as an alternative to the state_group shorthand. An unknown state returns 400."
         },
         {
           "name": "updated_after",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "RFC 3339 timestamp \u2014 include executions updated after this time."
         },
         {
           "name": "updated_before",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "RFC 3339 timestamp \u2014 include executions updated before this time."
         },
         {
           "name": "shard_id",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Restrict to a single shard."
         },
         {
           "name": "limit",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Maximum number of histories to export."
         },
         {
           "name": "payload_policy",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Payload inclusion: full, redacted, or omit."
         },
         {
           "name": "max_bytes",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Cap on the decoded payload bytes an entry may contribute. An entry over the cap is reported with its size instead of its payload."
         }
@@ -6446,48 +6626,56 @@
         {
           "name": "per_workflow",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Maximum executions to sample per workflow type (default 50, clamped to 500). The effective value is echoed in filters.per_workflow."
         },
         {
           "name": "states",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Comma-separated non-terminal states to sample (default RUNNING,PAUSED). SUSPENDED is accepted as an alias for RUNNING. A terminal or unknown state returns 400 rather than a silently-empty sample."
         },
         {
           "name": "state",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Alias for states."
         },
         {
           "name": "workflow_name",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Restrict the sample to a single workflow type."
         },
         {
           "name": "order",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Which end of each type's in-flight population to sample: oldest (default) or newest."
         },
         {
           "name": "shard_id",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Restrict to a single shard."
         },
         {
           "name": "payload_policy",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Payload inclusion: full, redacted (default), or omit. full additionally applies the admin-gated read-path decode (issue #608)."
         },
         {
           "name": "max_bytes",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Per-execution export size ceiling; an over-size history is reported in failures and omitted from exports."
         }
@@ -6537,54 +6725,63 @@
         {
           "name": "state",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by handoff state (e.g. PENDING,FAILED)."
         },
         {
           "name": "workflow_name",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by workflow name."
         },
         {
           "name": "execution_id",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by execution UUID."
         },
         {
           "name": "activity_name",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by activity function name."
         },
         {
           "name": "token",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by task token UUID."
         },
         {
           "name": "shard_id",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Restrict to a single shard."
         },
         {
           "name": "due_before",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "RFC 3339 timestamp \u2014 only return handoffs due before this time."
         },
         {
           "name": "updated_before",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "RFC 3339 timestamp \u2014 only return handoffs last updated before this time."
         },
         {
           "name": "limit",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Maximum number of results."
         }
@@ -6620,6 +6817,7 @@
         {
           "name": "token",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Task token UUID."
         }
@@ -6779,6 +6977,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Schedule UUID."
         }
@@ -6995,6 +7194,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Schedule UUID."
         }
@@ -7153,6 +7353,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Schedule UUID."
         }
@@ -7196,6 +7397,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Schedule UUID."
         }
@@ -7233,6 +7435,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Schedule UUID."
         }
@@ -7274,6 +7477,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Schedule UUID."
         }
@@ -7429,12 +7633,14 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Schedule UUID."
         },
         {
           "name": "force",
           "in": "query",
+          "type": "boolean",
           "required": false,
           "description": "If true, trigger even if the schedule is paused. Default: false."
         }
@@ -7517,18 +7723,21 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Schedule UUID."
         },
         {
           "name": "count",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Number of fire-time entries to return. Defaults to 10, max 100."
         },
         {
           "name": "from",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "ISO-8601 UTC instant to start the preview from. Defaults to now."
         }
@@ -7768,6 +7977,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Schedule UUID."
         },
@@ -7859,6 +8069,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Schedule UUID."
         },
@@ -7941,6 +8152,7 @@
         {
           "name": "name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Calendar name."
         }
@@ -8080,6 +8292,7 @@
         {
           "name": "name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Calendar name."
         }
@@ -8126,6 +8339,7 @@
         {
           "name": "name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Calendar name."
         }
@@ -8168,54 +8382,63 @@
         {
           "name": "actor",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by actor identity."
         },
         {
           "name": "operation",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by operation name (e.g. workflow.cancel)."
         },
         {
           "name": "target_type",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by target resource type (e.g. workflow, schedule)."
         },
         {
           "name": "target_id",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by target resource ID."
         },
         {
           "name": "status",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by outcome: succeeded or failed."
         },
         {
           "name": "since",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "RFC 3339 timestamp \u2014 only return records after this time."
         },
         {
           "name": "before",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "RFC 3339 timestamp \u2014 only return records before this time. Pair with before_id to page past rows tied on this time."
         },
         {
           "name": "before_id",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Row id tiebreaker for before. Use the last row id from the prior page."
         },
         {
           "name": "limit",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Maximum number of records to return."
         }
@@ -8242,6 +8465,7 @@
         {
           "name": "exec_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Execution UUID."
         }
@@ -8249,6 +8473,7 @@
       "headers": [
         {
           "name": "Last-Event-ID",
+          "type": "string",
           "required": false,
           "description": "harvest_events.id BIGSERIAL cursor. When present, the server replays events with id > n before entering live-tail mode."
         }
@@ -8482,12 +8707,14 @@
         {
           "name": "build_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "The worker build."
         },
         {
           "name": "compat_with",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "The assigned build to remove from the compatibility set."
         }
@@ -8669,6 +8896,7 @@
         {
           "name": "queue_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Task queue whose ramp should be cleared."
         }
@@ -8831,6 +9059,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "UUID of the gate to lift."
         }
@@ -8961,6 +9190,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "UUID of the token to revoke."
         }
@@ -9027,6 +9257,7 @@
         {
           "name": "queue_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "The task queue to hold, matched EXACTLY. Leading or trailing whitespace is rejected with a 400 rather than trimmed: queue names are stored verbatim at enqueue time, so `\"payments \"` and `\"payments\"` are two genuinely distinct, independently reachable queues and trimming would silently hold the wrong one while reporting success. Send the exact name. Interior whitespace is allowed."
         }
@@ -9120,6 +9351,7 @@
         {
           "name": "queue_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "The task queue to release, matched EXACTLY. Leading or trailing whitespace is rejected with a 400 rather than trimmed, symmetrically with the pause route — see its description for why. Send the exact name."
         }
@@ -9239,6 +9471,7 @@
         {
           "name": "activity_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "The activity type to inspect, matched EXACTLY (no trimming) against both the registered catalogue and the pause table."
         }
@@ -9283,6 +9516,7 @@
         {
           "name": "activity_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "The activity type to hold, matched EXACTLY. Leading or trailing whitespace is rejected with a 400 rather than trimmed: the hold is matched on exact equality, so a stray space would either hold nothing or hold a different activity while reporting success. Registration is NOT required -- a management process need not register every activity the fleet runs, so an unregistered name is accepted and surfaces on the read endpoints with `registered: false`. A registered name whose activity is LOCAL is rejected with a 400 (see the route description); an unregistered name is still accepted, since it may be a genuinely remote activity this node does not register."
         }
@@ -9376,6 +9610,7 @@
         {
           "name": "activity_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "The activity type to release, matched EXACTLY. Leading or trailing whitespace is rejected with a 400 rather than trimmed, symmetrically with the pause route -- see its description for why."
         }
@@ -9456,6 +9691,7 @@
         {
           "name": "queue_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Target task queue name."
         }
@@ -9498,6 +9734,7 @@
         {
           "name": "id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Task UUID."
         }
@@ -9549,6 +9786,7 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Workflow type name."
         }
@@ -9571,6 +9809,7 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow type name."
         }
@@ -9600,6 +9839,7 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow type name."
         }
@@ -9630,12 +9870,14 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
         },
         {
           "name": "workflow_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow id assigned by the embedder at start."
         }
@@ -9682,6 +9924,7 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow type name."
         }
@@ -9709,18 +9952,21 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
         },
         {
           "name": "workflow_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow id assigned by the embedder at start."
         },
         {
           "name": "wait",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Optional wait duration (e.g. 5s). Values above the server ceiling are clamped."
         }
@@ -9783,12 +10029,14 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
         },
         {
           "name": "workflow_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow id assigned by the embedder at start."
         }
@@ -9834,18 +10082,21 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
         },
         {
           "name": "workflow_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow id assigned by the embedder at start."
         },
         {
           "name": "status",
           "in": "query",
+          "type": "string",
           "required": false,
           "repeated": true,
           "description": "Filter by child status. May be repeated."
@@ -9853,24 +10104,28 @@
         {
           "name": "workflow_name",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Filter by child workflow name."
         },
         {
           "name": "limit",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Maximum number of results."
         },
         {
           "name": "cursor",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Pagination cursor."
         },
         {
           "name": "depth",
           "in": "query",
+          "type": "integer",
           "required": false,
           "description": "Maximum recursion depth."
         }
@@ -9917,30 +10172,35 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
         },
         {
           "name": "workflow_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow id assigned by the embedder at start."
         },
         {
           "name": "signal_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Registered signal handler name."
         },
         {
           "name": "Idempotency-Key",
           "in": "header",
+          "type": "string",
           "required": false,
           "description": "Exactly-once delivery key; wins over the query param."
         },
         {
           "name": "idempotency_key",
           "in": "query",
+          "type": "string",
           "required": false,
           "description": "Exactly-once delivery key (lower precedence than the header)."
         }
@@ -10000,18 +10260,21 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
         },
         {
           "name": "workflow_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow id assigned by the embedder at start."
         },
         {
           "name": "query_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Registered query handler name."
         }
@@ -10065,18 +10328,21 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
         },
         {
           "name": "workflow_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow id assigned by the embedder at start."
         },
         {
           "name": "query_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Registered query handler name."
         }
@@ -10139,12 +10405,14 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
         },
         {
           "name": "workflow_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow id assigned by the embedder at start."
         }
@@ -10215,12 +10483,14 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
         },
         {
           "name": "workflow_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow id assigned by the embedder at start."
         }
@@ -10292,12 +10562,14 @@
         {
           "name": "workflow_name",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
         },
         {
           "name": "workflow_id",
           "in": "path",
+          "type": "string",
           "required": true,
           "description": "Business workflow id assigned by the embedder at start."
         }

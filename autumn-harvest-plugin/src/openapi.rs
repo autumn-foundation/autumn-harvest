@@ -374,12 +374,15 @@ fn parameters(route: &Value) -> Result<Vec<Value>, OpenApiError> {
                 ))
             })?;
             let repeated = param["repeated"].as_bool().unwrap_or(false);
+            let declared_type = param["type"].as_str().ok_or_else(|| {
+                OpenApiError(format!("{method} {path}: parameter {name} has no `type`"))
+            })?;
             out.push(parameter(
                 name,
                 location,
                 required,
                 param["description"].as_str(),
-                param["type"].as_str(),
+                declared_type,
                 repeated,
             ));
         }
@@ -391,12 +394,15 @@ fn parameters(route: &Value) -> Result<Vec<Value>, OpenApiError> {
                 .as_str()
                 .ok_or_else(|| OpenApiError(format!("{method} {path}: a header has no `name`")))?;
             let required = header["required"].as_bool().unwrap_or(false);
+            let declared_type = header["type"].as_str().ok_or_else(|| {
+                OpenApiError(format!("{method} {path}: header {name} has no `type`"))
+            })?;
             out.push(parameter(
                 name,
                 "header",
                 required,
                 header["description"].as_str(),
-                header["type"].as_str(),
+                declared_type,
                 false,
             ));
         }
@@ -412,10 +418,10 @@ fn parameter(
     location: &str,
     required: bool,
     description: Option<&str>,
-    declared_type: Option<&str>,
+    declared_type: &str,
     repeated: bool,
 ) -> Value {
-    let scalar = json!({ "type": declared_type.unwrap_or("string") });
+    let scalar = json!({ "type": declared_type });
     let schema = if repeated {
         json!({ "type": "array", "items": scalar })
     } else {
@@ -904,10 +910,51 @@ mod tests {
 
     #[test]
     fn repeated_query_parameters_are_exploded_arrays() {
-        let param = parameter("search_attr", "query", false, Some("Filter."), None, true);
+        let param = parameter(
+            "search_attr",
+            "query",
+            false,
+            Some("Filter."),
+            "string",
+            true,
+        );
         assert_eq!(param["schema"]["type"], "array");
         assert_eq!(param["schema"]["items"]["type"], "string");
         assert_eq!(param["explode"], json!(true));
+    }
+
+    /// Issue #1411 (item 1): a parameter with no declared `type` must fail the
+    /// build, not silently default to `string`. A default hides a real
+    /// mismatch, such as a client sending a string where the handler parses
+    /// an integer or a bool.
+    #[test]
+    fn a_query_parameter_with_no_type_fails() {
+        let route = json!({
+            "method": "GET",
+            "path": "/x",
+            "params": [
+                { "name": "limit", "in": "query", "required": false },
+            ],
+        });
+        let error = parameters(&route).expect_err("a missing type must fail");
+        assert!(error.to_string().contains("limit"), "{error}");
+        assert!(error.to_string().contains("`type`"), "{error}");
+    }
+
+    /// Same requirement for a header parameter, which resolves its type
+    /// through a separate branch of `parameters()`.
+    #[test]
+    fn a_header_parameter_with_no_type_fails() {
+        let route = json!({
+            "method": "POST",
+            "path": "/x",
+            "headers": [
+                { "name": "Idempotency-Key", "required": false },
+            ],
+        });
+        let error = parameters(&route).expect_err("a missing type must fail");
+        assert!(error.to_string().contains("Idempotency-Key"), "{error}");
+        assert!(error.to_string().contains("`type`"), "{error}");
     }
 
     #[test]
