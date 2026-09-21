@@ -169,6 +169,7 @@ mod queue_pause_tests;
 mod quota_enforcement_tests;
 mod quota_history_bytes_perf_tests;
 mod quota_lock_ordering_tests;
+mod quota_reconcile_candidate_scan_perf_tests;
 mod quota_reconcile_tests;
 mod quota_supersede_ordering_tests;
 mod rate_limit_bucket_gc_tests;
