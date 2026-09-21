@@ -320,6 +320,15 @@ struct CandidateRow {
 /// this in practice. It is a full index, so it pays for that terminal
 /// history too.
 ///
+/// This is not a one-time rollout cost. Only rows this sweep backfills
+/// ever leave the candidate index. A non-quota'd row never does, since
+/// nothing ever sets its `quota_key`. Once every target row is
+/// backfilled, every future tick still walks the full non-quota'd
+/// population. It looks for a match that no longer exists, then returns
+/// zero rows. Measured directly: 504,201 buffers, 267ms, every tick,
+/// forever, at 500,000 non-quota'd rows -- worse than any single tick
+/// measured during the backfill itself.
+///
 /// The rejected `(workflow_name, id)` index was built and tested
 /// directly. The unforced planner does not pick it either. The reason is
 /// a cost misestimate, not a hard limitation. Forcing the planner onto

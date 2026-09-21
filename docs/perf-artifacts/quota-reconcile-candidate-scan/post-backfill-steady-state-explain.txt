@@ -1,0 +1,14 @@
+-- CANDIDATE_SQL immediately after a full backfill pass completes @ noise=500000 (largest fixture) -- every future heartbeat tick's permanent cost, not a one-time rollout expense --
+Limit  (cost=0.42..367.71 rows=200 width=58) (actual time=314.267..314.269 rows=0 loops=1)
+  Output: id, workflow_name, input
+  Buffers: shared hit=503767 read=434 dirtied=824 written=179
+  ->  Index Scan using idx_harvest_we_quota_reconcile_candidates on public.harvest_workflow_executions  (cost=0.42..70689.63 rows=38493 width=58) (actual time=314.265..314.265 rows=0 loops=1)
+        Output: id, workflow_name, input
+        Filter: (harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[]))
+        Rows Removed by Filter: 500000
+        Buffers: shared hit=503767 read=434 dirtied=824 written=179
+Query Identifier: -6326276906317664478
+Planning:
+  Buffers: shared hit=20
+Planning Time: 0.293 ms
+Execution Time: 314.287 ms

@@ -518,6 +518,24 @@ async fn zz_capture_quota_reconcile_candidate_scan_evidence() {
             usize::try_from(TARGET_ACTIVE).expect("TARGET_ACTIVE fits in usize"),
             "every target row must be backfilled by the end of one full pass"
         );
+
+        // Steady-state cost: only the target rows ever leave the candidate
+        // index. The 500,000 non-quota'd noise rows never do, since nothing
+        // ever sets their quota_key. Once every target row is backfilled,
+        // this exact call is what every FUTURE heartbeat tick costs. It
+        // recurs forever, not a one-time rollout expense (issue #1226
+        // follow-up review).
+        let post_backfill_plan = explain_candidate_scan(&mut conn).await;
+        std::fs::write(
+            out_dir.join("post-backfill-steady-state-explain.txt"),
+            format!(
+                "-- CANDIDATE_SQL immediately after a full backfill pass completes \
+                 @ noise={} (largest fixture) -- every future heartbeat tick's \
+                 permanent cost, not a one-time rollout expense --\n{post_backfill_plan}\n",
+                NOISE_SWEEP[NOISE_SWEEP.len() - 1]
+            ),
+        )
+        .expect("write post-backfill-steady-state artifact");
     }
 
     if let Some(reason) = skip_reason {

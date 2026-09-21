@@ -75,9 +75,9 @@ Seeded, deterministic, production-shaped:
 
 | noise rows | plan chosen | buffers | rows removed by filter | exec time |
 |---:|---|---:|---:|---:|
-| 20,000 | Index Scan on `idx_harvest_we_quota_reconcile_candidates`, residual filter | 3,870 (all hit) | 3,657 | 2.0ms |
-| 100,000 | same | 18,970 (all hit) | 18,682 | 9.5ms |
-| 500,000 | same | 95,091 (hit+read) | 94,467 | 137.0ms |
+| 20,000 | Index Scan on `idx_harvest_we_quota_reconcile_candidates`, residual filter | 3,870 (all hit) | 3,657 | 1.6ms |
+| 100,000 | same | 18,970 (all hit) | 18,682 | 9.8ms |
+| 500,000 | same | 95,091 (hit+read) | 94,467 | 141.3ms |
 
 Figures match the committed `noise-*.explain.txt` files exactly.
 
@@ -169,26 +169,47 @@ reproduced twice with identical totals:
 This is six calls, not one. `spawn_quota_key_reconciler_for_shard` makes
 exactly one `reconcile_quota_keys_from` call per `worker_heartbeat_interval`
 tick, so 503,105 is the total cost of a full pass over the candidate set --
-six heartbeat intervals here, not a single one. A single interval's cost is
-the "Plan" table above: 95,091 buffers for one first-tick call at this same
-500,000-noise size, the number that actually clears the impact floor's
-5%-of-workload-buffers bar for a single-shard, single-heartbeat-interval
-sweep. Half a million buffers for the full pass is the aggregate a
-deployment pays once, on first adopting quotas for a type with this large a
-pre-existing backfill population; steady-state cost after that pass
-completes is zero, since every row has left the candidate set.
+six heartbeat intervals here, not a single one. A single interval's cost
+during the backfill is the "Plan" table above: 95,091 buffers for one
+first-tick call at this same 500,000-noise size, the number that actually
+clears the impact floor's 5%-of-workload-buffers bar for a single-shard,
+single-heartbeat-interval sweep.
+
+**Steady state is not zero. It is worse than the backfill itself.** Only
+the 1,000 target rows ever leave the candidate index -- their `quota_key`
+gets set, so they stop matching `quota_key IS NULL`. The 500,000 non-quota'd
+noise rows never do, since nothing ever sets their `quota_key` (see the
+module doc's "KNOWN SCALING TRADE-OFF" section). Once the target backlog is
+fully backfilled, `CANDIDATE_SQL` has zero rows left it can match, but it
+does not know that in advance: it still walks the id-ordered candidate
+index from the last cursor position (which wraps to the start once a batch
+comes back short) looking for a `billing_saga` row that no longer exists,
+scanning every one of the 500,000 noise rows before giving up and
+returning zero rows. Measured directly, immediately after the backfill
+pass completes, against the identical fixture:
+
+| calls | buffers | rows removed by filter | rows returned | exec time |
+|---:|---:|---:|---:|---:|
+| 1 | 504,201 (hit/read split varies, total reproduced identically twice) | 500,000 | 0 | 267-314ms |
+
+That is not a one-time rollout expense. It is the **permanent** cost of
+*every* heartbeat tick, forever, for as long as this deployment has both a
+quota'd workflow type and a non-quota'd population sharing the table --
+worse than any single tick measured during the backfill itself, and with
+no natural end.
 
 ## 💡 Verdict
 
 The scaling risk the migration comment names is real, confirmed at
-production-shaped scale, and the specific reason the proposed index
-does not help in practice is now precisely diagnosed: a planner
-cardinality misestimate under `= ANY($1)` against a partial index whose
-predicate correlates with the leading column, not an inherent inability
-to use the index at all. The buffer gap between the plan Postgres picks
-and the plan it could pick is 500x-2,000x, measured against the
-identical fixture (the admissible, cache-independent gate; see "Root
-cause" above for why no exec-time claim is made alongside it).
+production-shaped scale, worse than a rollout-window cost (it never ends),
+and the specific reason the proposed index does not help in practice is
+now precisely diagnosed: a planner cardinality misestimate under
+`= ANY($1)` against a partial index whose predicate correlates with the
+leading column, not an inherent inability to use the index at all. The
+buffer gap between the plan Postgres picks and the plan it could pick is
+500x-2,000x, measured against the identical fixture (the admissible,
+cache-independent gate; see "Root cause" above for why no exec-time claim
+is made alongside it).
 
 ## 🔧 Why no fix ships in this PR
 
@@ -227,7 +248,10 @@ Neither is this pass's "smallest change that moves the counter":
 Per this agent's process, a change like either is an "ask before": the
 author decides. This PR stops at diagnosis, with the mechanism nailed
 down precisely enough that whoever picks up the fix does not need to
-re-run this investigation.
+re-run this investigation. Given the permanent, forever-recurring steady-
+state cost measured above, this diagnosis is worth prioritizing sooner
+rather than later in any deployment that mixes quota'd and non-quota'd
+workflow types at this population scale.
 
 ## 🔬 Reproduce
 
