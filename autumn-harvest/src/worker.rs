@@ -28412,10 +28412,15 @@ impl Worker {
     /// The single-pool poll loop.
     ///
     /// `dispatch_allowed` is the run-start decision of
-    /// [`dispatch_allowed_for_span`]. The multi-shard loop
-    /// (`run_poll_loop_multi`) has its own, per-shard dispatch branch (issue
-    /// #1429). Each shard reads and claims through its own installed
-    /// channel when one exists, and polls Postgres otherwise.
+    /// [`dispatch_allowed_for_span`], gating the single global dispatch
+    /// slot. A per-shard channel installed for `shard` overrides it (issue
+    /// #1429 review). This loop always polls exactly one shard (or none),
+    /// so a channel already scoped to that shard is unambiguous. That holds
+    /// regardless of how many other shards the worker's `ShardedDbPool`
+    /// has. The multi-shard loop (`run_poll_loop_multi`) has its own,
+    /// per-shard dispatch branch (issue #1429). Each shard reads and claims
+    /// through its own installed channel when one exists, and polls
+    /// Postgres otherwise.
     async fn run_poll_loop(
         &self,
         pool: &DbPool,
@@ -28454,7 +28459,23 @@ impl Worker {
             // reconcile sweep publishes in `(priority DESC, scheduled_at ASC)`
             // order, so priority is best effort under dispatch. The weighted
             // permutation still governs the `poll_once` fallback.
-            if let Some(installed) = crate::dispatch::installed() {
+            //
+            // Prefer a per-shard channel installed for exactly this loop's
+            // one polled shard (issue #1429 review). `dispatch_allowed`
+            // gates only the single global slot. It refuses a worker
+            // spanning more than one *pool* shard, because that slot cannot
+            // tell which shard a reference belongs to. A per-shard channel
+            // has no such ambiguity. It is already scoped to `shard` by
+            // construction. So it stays eligible even when a sibling shard
+            // in the same `ShardedDbPool` this worker was never assigned
+            // also has an installed channel. Without this, a worker
+            // assigned to exactly one shard of a multi-shard pool silently
+            // fell back to Postgres. That happened despite a matching
+            // per-shard channel sitting installed and unused, while
+            // `/admin/config` still reported dispatch as installed.
+            let per_shard_installed = shard.and_then(crate::dispatch::installed_for_shard);
+            let dispatch_allowed = per_shard_installed.is_some() || dispatch_allowed;
+            if let Some(installed) = per_shard_installed.or_else(crate::dispatch::installed) {
                 if dispatch_allowed {
                     if self
                         .run_dispatch_iteration(pool, shard, &installed, &mut dispatch_state)

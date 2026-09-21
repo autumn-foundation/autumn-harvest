@@ -743,7 +743,7 @@ impl RedisDispatch {
         // stable, so this never starves same-priority work. The reconcile
         // sweep's own `(priority DESC, scheduled_at ASC)` publish order is
         // the other half of this best-effort signal.
-        candidates.sort_by(|a, b| b.2.priority.cmp(&a.2.priority));
+        candidates.sort_by_key(|a| std::cmp::Reverse(a.2.priority));
 
         let mut leases = Vec::new();
         let mut surplus = Vec::new();
