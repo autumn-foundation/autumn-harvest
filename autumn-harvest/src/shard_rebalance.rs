@@ -4568,7 +4568,7 @@ mod db {
     /// Re-resolves through [`conn_for_execution_forwarded`] on every attempt,
     /// rather than checking out the shard the refusal names directly (issue
     /// #1405 review). That shard can alias the connection this call already
-    /// dropped a moment earlier — a pre-split staging deployment, the same
+    /// dropped a moment earlier. A pre-split staging deployment is the same
     /// case [`conn_for_execution_forwarded_with_shard`]'s own hop loop
     /// guards against. A raw checkout on a size-one aliased pool would then
     /// wait forever for the connection this call itself just released.
