@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use autumn_harvest_plugin::metrics_scrape::HarvestMetricsRecorder;
 use autumn_harvest_plugin::prelude::*;
 use autumn_web::config::DatabaseConfig;
 use autumn_web::reexports::axum::{self, Json, routing::get};
@@ -7,19 +8,38 @@ use serde_json::json;
 
 use crate::runtime::{standalone_builder, standalone_runtime_config};
 
-/// Assemble the raw Axum app the runner listens on: the runner health route
-/// plus `harvest_api_router` nested under `/api/harvest`.
+/// Assemble the raw Axum app the runner listens on: the runner health route,
+/// a Prometheus scrape route fed by `metrics`, plus `harvest_api_router`
+/// nested under `/api/harvest`.
 ///
 /// Split out of [`run`] so a test can drive it with `tower::ServiceExt::oneshot`
 /// without binding a socket or starting a `HarvestRunner` (see `tests.rs`).
 ///
 /// No `autumn_web::AppState` is required (issue #1607). `harvest_api_router`
 /// returns `Router<()>`, so the standalone mount carries no autumn-web state.
-pub fn build_router(api_state: HarvestApiState) -> axum::Router {
+/// `/metrics` needs none either: `HarvestMetricsRecorder::render_prometheus`
+/// (issue #1611) is the framework-neutral counterpart of the plugin path's
+/// `/actuator/prometheus`, so this route is the entire integration.
+pub fn build_router(api_state: HarvestApiState, metrics: HarvestMetricsRecorder) -> axum::Router {
     axum::Router::new()
         .route(
             "/",
             get(|| async { Json(json!({ "service": "standalone-runner" })) }),
+        )
+        .route(
+            "/metrics",
+            get(move || {
+                let metrics = metrics.clone();
+                async move {
+                    (
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/plain; version=0.0.4",
+                        )],
+                        metrics.render_prometheus(),
+                    )
+                }
+            }),
         )
         .nest("/api/harvest", harvest_api_router(api_state))
 }
@@ -79,8 +99,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     })?
     .ok_or("DATABASE_URL must create a Postgres pool")?;
 
+    let metrics = HarvestMetricsRecorder::new();
     let config = standalone_runtime_config(database_url);
-    let built = standalone_builder().try_build()?;
+    let built = standalone_builder(metrics.clone()).try_build()?;
     let runner = HarvestRunner::start(built, &config, HarvestRunnerResources::new(pool))
         .await
         .map_err(|error| format!("failed to start Harvest runner: {error}"))?;
@@ -90,7 +111,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     api_state.install_storage_pool(runner.storage_pool());
     api_state.install(runner.api_runtime());
 
-    let app = build_router(api_state);
+    let app = build_router(api_state, metrics);
 
     let address = SocketAddr::from(([127, 0, 0, 1], 8082));
     tracing::info!(%address, "standalone Harvest runner listening");

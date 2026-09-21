@@ -1226,6 +1226,48 @@ pub async fn load_events_after_row_id(
         .map_err(crate::error::database_error)
 }
 
+/// Translate a stable per-execution `event_id` to the `harvest_events.id`
+/// that names it on `conn`'s database (fresh review, P1 follow-up).
+///
+/// An SSE resume cursor (`Last-Event-ID`) is a `harvest_events.id` value,
+/// local to whichever database currently holds the row. `stage_copy`
+/// deliberately does not carry `id` across a shard-rebalance migration.
+/// The target assigns fresh values from its own `BIGSERIAL` sequence. A
+/// live stream that rebinds to a migrated execution's new shard
+/// mid-flight must therefore re-resolve its cursor here before its next
+/// [`load_events_after_row_id`] call. Otherwise that call compares the
+/// OLD database's `id` against the NEW one's. That silently drops every
+/// subsequent event if the target's ids happen to be lower, or replays
+/// already-seen history as duplicates if higher. `event_id` is copied
+/// byte-for-byte by `stage_copy`, so it is what identifies "the same event"
+/// across the move.
+///
+/// Returns `None` if `exec_id` has no event with this `event_id` on
+/// `conn`'s database. That case is normally unreachable once a migration
+/// has cut over, since the target holds the whole copied history. It is
+/// kept as an explicit `Option` rather than an error. That lets a
+/// caller fail open (e.g. resume from the start) instead of tearing
+/// down the stream over it.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[cfg(feature = "db")]
+pub async fn row_id_for_event_id(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    event_id: i32,
+) -> HarvestResult<Option<i64>> {
+    harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_events::event_id.eq(event_id))
+        .select(harvest_events::id)
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)
+}
+
 /// A single deserialized row from a paged history query.
 #[derive(Debug)]
 pub struct PagedHistoryEvent {

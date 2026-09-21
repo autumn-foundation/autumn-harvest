@@ -391,6 +391,145 @@ async fn summary_disabled_deletes_and_writes_no_summary() {
     assert_eq!(count_summaries(&mut conn).await, 0, "no summary row");
 }
 
+/// Issue #1317 review, P1. A row this shard EVER received via
+/// shard-rebalance migration can still be the un-reconciled forwarding
+/// target of a `MIGRATED` seal on another shard. Deleting it with no trace
+/// at all, even under the default `summary: None` policy, would make that
+/// seal's reconciliation error forever. So this one case gets a minimal,
+/// payload-free tombstone summary even though summary retention is
+/// otherwise off.
+#[tokio::test]
+async fn summary_disabled_still_tombstones_a_row_that_was_ever_a_migration_target() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let old = Utc::now() - chrono::Duration::days(2);
+    let exec_id = insert_completed_full(
+        &mut conn,
+        "wf",
+        "migrated-target",
+        "COMPLETED",
+        old,
+        None,
+        None,
+        Some(serde_json::json!({"tenant": "acme"})),
+    )
+    .await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET migrated_from_shards = '[0]'::jsonb \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(&mut conn)
+    .await
+    .expect("mark the row as a migration target");
+
+    let config = history_only(Some(Duration::from_secs(86_400))); // summary: None
+    let metrics = Arc::new(CapturingMetrics::default());
+    let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
+
+    assert_eq!(result.deleted_count, 1);
+    assert_eq!(
+        result.summarized_count, 1,
+        "a migration target must be tombstoned even with summary retention off"
+    );
+    assert_eq!(count_executions(&mut conn).await, 0, "execution deleted");
+    assert_eq!(
+        count_summaries(&mut conn).await,
+        1,
+        "tombstone summary written"
+    );
+
+    let s = load_summary(&mut conn, exec_id).await.expect("summary row");
+    assert_eq!(s.workflow_name, "wf");
+    assert_eq!(s.workflow_id, "migrated-target");
+    assert_eq!(s.state, "COMPLETED");
+    assert!(s.result.is_none(), "the tombstone never captures a payload");
+    assert!(s.error.is_none(), "the tombstone never captures a payload");
+    assert!(
+        s.search_attrs.is_none(),
+        "a forced no-policy tombstone must never carry search attrs -- \
+         they can hold plaintext business/PII data"
+    );
+}
+
+/// Read a still-live execution row's `parent_id`.
+async fn execution_parent(conn: &mut AsyncPgConnection, exec_id: uuid::Uuid) -> Option<uuid::Uuid> {
+    #[derive(diesel::QueryableByName)]
+    struct ParentRow {
+        #[diesel(sql_type = Nullable<diesel::sql_types::Uuid>)]
+        parent_id: Option<uuid::Uuid>,
+    }
+    diesel::sql_query("SELECT parent_id FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id)
+        .get_result::<ParentRow>(conn)
+        .await
+        .expect("execution row must still exist")
+        .parent_id
+}
+
+/// Issue #1317 review, P1 follow-up. The forced migration-target tombstone
+/// (previous test) writes a summary row even though `summary` retention is
+/// off. `delete_candidate_execution`'s child-lineage null-out must treat
+/// that exactly like a configured summary policy. A child still inside its
+/// own retention window must keep its `parent_id` pointed at the parent.
+/// It must not be cleared just because no `SummaryPolicy` is configured.
+/// Otherwise a LATER #495 erase of the parent's tombstone summary can never
+/// discover that child, via `collect_child_ids` or otherwise.
+#[tokio::test]
+async fn migration_tombstone_preserves_a_still_live_childs_parent_id() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let old = Utc::now() - chrono::Duration::days(2);
+    let recent = Utc::now() - chrono::Duration::seconds(1);
+
+    let parent = insert_completed(&mut conn, "parent_wf", "migrated-parent", old).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET migrated_from_shards = '[0]'::jsonb \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(parent)
+    .execute(&mut conn)
+    .await
+    .expect("mark the parent as a migration target");
+
+    // Recent enough that this tick's age cutoff (1 day) leaves it alone.
+    let child = insert_completed(&mut conn, "child_wf", "c1", recent).await;
+    set_parent(&mut conn, child, parent).await;
+
+    // Summary retention OFF -- only the forced migration tombstone should
+    // produce a summary row this tick.
+    let config = history_only(Some(Duration::from_secs(86_400)));
+    let metrics = Arc::new(CapturingMetrics::default());
+    let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
+
+    assert_eq!(
+        result.deleted_count, 1,
+        "only the parent is old enough to delete"
+    );
+    assert_eq!(
+        result.summarized_count, 1,
+        "the forced tombstone summarized the parent"
+    );
+    assert_eq!(
+        count_executions(&mut conn).await,
+        1,
+        "the child execution row survives this tick"
+    );
+
+    assert_eq!(
+        execution_parent(&mut conn, child).await,
+        Some(parent),
+        "the surviving child must keep parent_id -- the parent got a forced \
+         tombstone summary despite summary retention being off"
+    );
+}
+
 // AC2 + AC3: a summary row is written in the same delete transaction, carrying
 // identity/timing/shard/search-attrs. summarized_count reported.
 #[tokio::test]
@@ -583,6 +722,88 @@ async fn summary_gc_deletes_expired_and_emits_metric() {
         metrics.summary_deleted(),
         vec![("gc_wf".to_string(), 2)],
         "summary GC emits the per-workflow deletion count"
+    );
+}
+
+/// Issue #1317 review, P1 follow-up. A summary demoted from a row that was
+/// EVER a shard-rebalance migration target can still be the only surviving
+/// evidence an un-reconciled seal elsewhere needs.
+///
+/// A bounded `SummaryPolicy` must not hard-delete it past its horizon like
+/// an ordinary summary. That would reopen the exact "seal blocked forever"
+/// gap on a delay instead of immediately. It must, however, still strip the
+/// row's OPT-IN payload fields past that same horizon (issue #1317 review,
+/// P1 follow-up). Otherwise a `SummaryPolicy` that captures payloads
+/// retains them forever for any execution a shard rebalance ever touched,
+/// silently turning a finite horizon into unbounded retention.
+#[tokio::test]
+async fn summary_gc_tombstones_but_never_deletes_a_migration_target_summary() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let now = Utc::now();
+    // An ordinary old summary (GC-eligible) and a migration-target summary
+    // just as old, carrying a payload (result/error/search_attrs). The
+    // test also proves the payload gets stripped rather than left intact.
+    let ordinary = insert_summary(&mut conn, "gc_wf", "g1", now - chrono::Duration::days(2)).await;
+    let migrated_id: uuid::Uuid = diesel::sql_query(
+        "INSERT INTO harvest_execution_summaries
+            (execution_id, workflow_name, workflow_id, state, started_at,
+             completed_at, duration_ms, shard_id, migrated_from_shards,
+             result, error, search_attrs)
+         VALUES (gen_random_uuid(), 'gc_wf', 'g2', 'COMPLETED', $1, $1, 5000, 0,
+                 '[0]'::jsonb, '{\"secret\":\"payload\"}'::jsonb, 'boom',
+                 '{\"tenant\":\"acme\"}'::jsonb)
+         RETURNING execution_id AS id",
+    )
+    .bind::<Timestamptz, _>(now - chrono::Duration::days(2))
+    .get_result::<IdRow>(&mut conn)
+    .await
+    .expect("insert migration-target summary")
+    .id;
+
+    let config = history_only(Some(Duration::from_secs(86_400)))
+        .with_summary_retention(SummaryPolicy::for_duration(Duration::from_secs(3_600)));
+    let metrics = Arc::new(CapturingMetrics::default());
+    run_one_tick(pool, config, Arc::clone(&metrics)).await;
+
+    assert!(
+        load_summary(&mut conn, ordinary).await.is_none(),
+        "an ordinary old summary is still GC'd normally"
+    );
+    let migrated = load_summary(&mut conn, migrated_id)
+        .await
+        .expect("a migration-target summary must survive its configured horizon");
+    assert_eq!(
+        migrated.state, "COMPLETED",
+        "reconciliation-relevant state stays"
+    );
+    assert_eq!(
+        migrated.workflow_name, "gc_wf",
+        "reconciliation-relevant identity stays"
+    );
+    assert_eq!(
+        migrated.workflow_id, "g2",
+        "reconciliation-relevant identity stays"
+    );
+    assert!(
+        migrated.result.is_none(),
+        "the payload-bearing result field must be stripped past the horizon"
+    );
+    assert!(
+        migrated.error.is_none(),
+        "the payload-bearing error field must be stripped past the horizon"
+    );
+    assert!(
+        migrated.search_attrs.is_none(),
+        "the payload-bearing search_attrs field must be stripped past the horizon"
+    );
+    assert_eq!(
+        count_summaries(&mut conn).await,
+        1,
+        "only the migration-target summary remains"
     );
 }
 
@@ -966,6 +1187,67 @@ async fn legal_held_execution_is_not_summarized_until_released() {
     .execute(&mut conn)
     .await
     .expect("release hold");
+
+    let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
+    assert_eq!(result.deleted_count, 1);
+    assert_eq!(result.summarized_count, 1);
+    assert_eq!(count_executions(&mut conn).await, 0, "now deleted");
+    assert_eq!(count_summaries(&mut conn).await, 1, "now summarized");
+}
+
+// Issue #1317 review, P1 follow-up. `stage_copy` can seal a row
+// `CONTINUED_AS_NEW` mid-flight to vacate its business key. That row then
+// carries a non-NULL `staging_vacated_state`, the real prior state a
+// migration abort restores. Retention must not delete it out from under
+// an in-flight migration. The abort path could never restore it, and any
+// summary would record the transient `CONTINUED_AS_NEW` instead of the
+// run's real outcome.
+#[tokio::test]
+async fn staging_vacated_row_is_not_summarized_until_the_marker_clears() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let old = Utc::now() - chrono::Duration::days(2);
+    let exec_id = insert_completed(&mut conn, "staged_wf", "s1", old).await;
+    // Seal it exactly as `stage_copy`'s vacate does: CONTINUED_AS_NEW with
+    // the real prior state carried in `staging_vacated_state`.
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions
+         SET state = 'CONTINUED_AS_NEW', staging_vacated_state = 'COMPLETED'
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(&mut conn)
+    .await
+    .expect("seal as an in-flight staging vacate");
+
+    let config = history_only(Some(Duration::from_secs(86_400)))
+        .with_summary_retention(SummaryPolicy::for_days(30));
+    let metrics = Arc::new(CapturingMetrics::default());
+    run_one_tick(pool.clone(), config.clone(), Arc::clone(&metrics)).await;
+
+    assert_eq!(
+        count_executions(&mut conn).await,
+        1,
+        "staging-vacated row not deleted"
+    );
+    assert_eq!(
+        count_summaries(&mut conn).await,
+        0,
+        "staging-vacated row not summarized"
+    );
+
+    // The migration settles (success or abort both clear the marker), tick
+    // again.
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET staging_vacated_state = NULL WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(&mut conn)
+    .await
+    .expect("clear the marker");
 
     let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
     assert_eq!(result.deleted_count, 1);

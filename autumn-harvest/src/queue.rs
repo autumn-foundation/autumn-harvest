@@ -37,6 +37,68 @@ const IMMEDIATE_SCHEDULE_SKEW_SECS: i32 = 5;
 const IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE: Duration =
     Duration::seconds(IMMEDIATE_SCHEDULE_SKEW_SECS as i64);
 
+/// Convert a retry delay to fractional seconds for `make_interval` (issue
+/// #1389).
+///
+/// `requeue_for_retry` and its siblings compute their retry deadline as
+/// `clock_timestamp() + make_interval(secs => ...)`, inside the `UPDATE`
+/// statement itself. This stamps it on Postgres's own clock. `claim_task`
+/// later checks that same deadline against that same clock
+/// (`scheduled_at <= NOW()`).
+///
+/// `clock_timestamp()`, not `NOW()`: some callers run this `UPDATE` inside a
+/// transaction that already did other work (a row lock, a prior write).
+/// `NOW()` is frozen at that transaction's start, so it would understate the
+/// elapsed backoff by however long that prior work took.
+/// `clock_timestamp()` is volatile and reads the real time at execution.
+///
+/// A host-computed deadline (`Utc::now() + delay`) can already be due by the
+/// time `claim_task` checks it, when the host clock trails Postgres's.
+/// Computing the deadline on Postgres's own clock removes that mismatch by
+/// construction, for any `delay`.
+/// Microsecond precision, not millisecond (issue #1389 review). `JitterPolicy::Full`
+/// picks any value between zero and the base interval, so a sub-millisecond
+/// delay is a real, reachable case. Truncating to whole milliseconds would
+/// round such a delay down to zero: an immediate retry instead of a short one.
+#[allow(clippy::cast_precision_loss)] // microsecond delay never approaches 2^53
+fn delay_secs(delay: Duration) -> f64 {
+    delay.num_microseconds().map_or_else(
+        // Out of `i64` microsecond range (roughly 292,000 years): fall back
+        // to millisecond precision, which cannot overflow here either way.
+        || delay.num_milliseconds() as f64 / 1000.0,
+        |us| us as f64 / 1_000_000.0,
+    )
+}
+
+#[derive(diesel::QueryableByName)]
+struct ClockTimestampRow {
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    now: DateTime<Utc>,
+}
+
+/// Probe Postgres's own, live clock (issue #1389).
+///
+/// Uses `clock_timestamp()`, not `NOW()`, so a caller inside an open
+/// transaction still gets the real current time, not that transaction's
+/// frozen start time.
+///
+/// A caller deciding whether a retry still fits inside
+/// `schedule_to_close_at` needs this. [`requeue_for_retry`] and its
+/// siblings already compute their own deadline on this same clock. A
+/// host-clock decision here could otherwise disagree with the deadline
+/// they actually write.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn db_clock_now(conn: &mut AsyncPgConnection) -> HarvestResult<DateTime<Utc>> {
+    diesel::sql_query("SELECT clock_timestamp() AS now")
+        .get_result::<ClockTimestampRow>(conn)
+        .await
+        .map(|row| row.now)
+        .map_err(crate::error::database_error)
+}
+
 /// Compute the **DB-clock** portion of schedule-to-start latency in seconds: the
 /// wait from a task's *true* eligibility to when it was claimed (`claimed_at`),
 /// clamped to `0`.
@@ -2809,12 +2871,11 @@ struct PendingRequeueChangeset {
     /// distinct-worker set and the total counter can never disagree about
     /// whether the streak was broken.
     capability_miss_workers: Vec<String>,
-    scheduled_at: chrono::DateTime<Utc>,
     error: Option<String>,
 }
 
 impl PendingRequeueChangeset {
-    const fn new(next_run: chrono::DateTime<Utc>, previous_error: String) -> Self {
+    const fn new(previous_error: String) -> Self {
         Self {
             state: "PENDING",
             worker_id: None,
@@ -2823,7 +2884,6 @@ impl PendingRequeueChangeset {
             crash_strikes: 0,
             capability_misses: 0,
             capability_miss_workers: Vec::new(),
-            scheduled_at: next_run,
             error: Some(previous_error),
         }
     }
@@ -2851,18 +2911,31 @@ pub async fn requeue_for_retry(
     previous_error: &str,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Double, Timestamptz};
 
-    let next_run = Utc::now() + delay;
-    let changeset = PendingRequeueChangeset::new(next_run, previous_error.to_string());
+    let changeset = PendingRequeueChangeset::new(previous_error.to_string());
 
-    let (queue_name, priority, task_type) = diesel::update(
+    let (queue_name, priority, task_type, next_run) = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
     )
-    .set(&changeset)
-    .returning((dsl::queue_name, dsl::priority, dsl::task_type))
-    .get_result::<(String, i32, String)>(conn)
+    .set((
+        changeset,
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
+    ))
+    .returning((
+        dsl::queue_name,
+        dsl::priority,
+        dsl::task_type,
+        dsl::scheduled_at,
+    ))
+    .get_result::<(String, i32, String, chrono::DateTime<Utc>)>(conn)
     .await
     .optional()
     .map_err(crate::error::database_error)?
@@ -2894,6 +2967,122 @@ pub async fn requeue_for_retry(
     }
 
     Ok(())
+}
+
+/// Reset a `RUNNING` workflow task to `PENDING` with a future `scheduled_at`.
+///
+/// This is the bounded backoff retry for a quota or shard-admission
+/// rejection (issue #956). It also clears a stale `mixed_signal_suspension`
+/// sentinel, and a mid-cycle wake flag, in the same update.
+///
+/// Mirrors [`requeue_for_retry`], restricted to `task_type = 'workflow'`
+/// rows (every caller holds a workflow task), with two extra clears:
+///
+/// - `activity_name`: without this clear, an old sentinel can survive. An
+///   earlier, unrelated cycle may stamp it during a timer-and-signal race
+///   (issue #476/#600). A surviving sentinel still matches the wake-forward
+///   arm of `primary_repend_workflow_task_query`. Any unrelated wake then
+///   resets `scheduled_at` to now. This defeats the backoff (issue #1391).
+/// - `wake_requested`: a wake captured mid-cycle must not short-circuit the
+///   backoff. The row is durably `PENDING`. It is deferred purely by
+///   `scheduled_at` (`claim_task` enforces `scheduled_at <= NOW()`). So a
+///   wake arriving during the backoff is not lost. The next claim's full
+///   history replay recovers it instead.
+///
+/// `requeue_workflow_task_nd_blocked` clears the same two columns for the
+/// similar ND-block backoff (issue #603).
+///
+/// No `pg_notify`: the task is deliberately not claimable until
+/// `scheduled_at`, so waking pollers early would be pure noise.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::NotFound`] when the task is not a
+/// claimed (`RUNNING`) workflow task, and
+/// [`crate::error::HarvestError::Database`] on update failure.
+pub async fn requeue_workflow_task_for_quota_retry(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    delay: Duration,
+    previous_error: &str,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_task_queue::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Double, Timestamptz};
+
+    let changeset = PendingRequeueChangeset::new(previous_error.to_string());
+
+    let updated = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::task_type.eq("workflow")),
+    )
+    .set((
+        changeset,
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
+        dsl::wake_requested.eq(false),
+        dsl::activity_name.eq(None::<String>),
+    ))
+    .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
+    .get_results::<(String, i32, chrono::DateTime<Utc>)>(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    let Some((queue_name, priority, next_run)) = updated.into_iter().next() else {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not a running workflow task"
+        )));
+    };
+
+    // Dispatch hint (issue #1312). No `pg_notify` fires here on purpose --
+    // same rationale as `requeue_workflow_task_nd_blocked`.
+    record_pending_hint(
+        task_id,
+        &queue_name,
+        next_run,
+        priority,
+        crate::dispatch::DispatchKind::Workflow,
+    );
+
+    Ok(())
+}
+
+/// Build the `SET` clause used by [`requeue_workflow_task_for_quota_retry`]
+/// so a no-DB unit test can assert the generated SQL shape (issue #1391).
+/// Mirrors the `requeue_after_panic_query` shape-test precedent.
+#[cfg(test)]
+fn requeue_workflow_task_for_quota_retry_query(
+    changeset: PendingRequeueChangeset,
+    delay: Duration,
+) -> String {
+    use crate::schema::harvest_task_queue::dsl;
+    use diesel::debug_query;
+    use diesel::dsl::sql;
+    use diesel::pg::Pg;
+    use diesel::sql_types::{Double, Timestamptz};
+
+    let query = diesel::update(
+        dsl::harvest_task_queue
+            .find(Uuid::nil())
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::task_type.eq("workflow")),
+    )
+    .set((
+        changeset,
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
+        dsl::wake_requested.eq(false),
+        dsl::activity_name.eq(None::<String>),
+    ));
+    debug_query::<Pg, _>(&query).to_string()
 }
 
 /// Re-pend an ND-blocked workflow task with a future `scheduled_at` (issue
@@ -2931,9 +3120,10 @@ pub async fn requeue_workflow_task_nd_blocked(
     reason: &str,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Double, Timestamptz};
 
-    let next_run = Utc::now() + delay;
-    let changeset = PendingRequeueChangeset::new(next_run, reason.to_string());
+    let changeset = PendingRequeueChangeset::new(reason.to_string());
 
     let updated = diesel::update(
         dsl::harvest_task_queue
@@ -2943,18 +3133,23 @@ pub async fn requeue_workflow_task_nd_blocked(
     )
     .set((
         changeset,
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
         dsl::sticky_worker_id.eq(None::<String>),
         dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
         dsl::sticky_timeout.eq(None::<chrono::Duration>),
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
     ))
-    .returning((dsl::queue_name, dsl::priority))
-    .get_results::<(String, i32)>(conn)
+    .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
+    .get_results::<(String, i32, chrono::DateTime<Utc>)>(conn)
     .await
     .map_err(crate::error::database_error)?;
 
-    let Some((queue_name, priority)) = updated.into_iter().next() else {
+    let Some((queue_name, priority, next_run)) = updated.into_iter().next() else {
         return Err(crate::error::HarvestError::NotFound(format!(
             "task queue item {task_id} is not a running workflow task"
         )));
@@ -2981,10 +3176,12 @@ pub async fn requeue_workflow_task_nd_blocked(
 /// Takes the changeset by value so the returned query owns it (the caller only
 /// needs the SQL text, never to execute it).
 #[cfg(test)]
-fn requeue_after_panic_query(changeset: PendingRequeueChangeset) -> String {
+fn requeue_after_panic_query(changeset: PendingRequeueChangeset, delay: Duration) -> String {
     use crate::schema::harvest_task_queue::dsl;
     use diesel::debug_query;
+    use diesel::dsl::sql;
     use diesel::pg::Pg;
+    use diesel::sql_types::{Double, Timestamptz};
 
     let query = diesel::update(
         dsl::harvest_task_queue
@@ -2994,6 +3191,11 @@ fn requeue_after_panic_query(changeset: PendingRequeueChangeset) -> String {
     )
     .set((
         changeset,
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
         dsl::sticky_worker_id.eq(None::<String>),
         dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
         dsl::sticky_timeout.eq(None::<chrono::Duration>),
@@ -3038,9 +3240,10 @@ pub async fn requeue_workflow_task_after_panic(
     reason: &str,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Double, Timestamptz};
 
-    let next_run = Utc::now() + delay;
-    let changeset = PendingRequeueChangeset::new(next_run, reason.to_string());
+    let changeset = PendingRequeueChangeset::new(reason.to_string());
 
     let updated = diesel::update(
         dsl::harvest_task_queue
@@ -3050,18 +3253,23 @@ pub async fn requeue_workflow_task_after_panic(
     )
     .set((
         changeset,
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
         dsl::sticky_worker_id.eq(None::<String>),
         dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
         dsl::sticky_timeout.eq(None::<chrono::Duration>),
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
     ))
-    .returning((dsl::queue_name, dsl::priority))
-    .get_results::<(String, i32)>(conn)
+    .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
+    .get_results::<(String, i32, chrono::DateTime<Utc>)>(conn)
     .await
     .map_err(crate::error::database_error)?;
 
-    let Some((queue_name, priority)) = updated.into_iter().next() else {
+    let Some((queue_name, priority, next_run)) = updated.into_iter().next() else {
         return Err(crate::error::HarvestError::NotFound(format!(
             "task queue item {task_id} is not a running workflow task"
         )));
@@ -9870,8 +10078,7 @@ mod tests {
         use diesel::debug_query;
         use diesel::pg::Pg;
 
-        let changeset =
-            PendingRequeueChangeset::new(chrono::Utc::now(), "some retryable error".to_string());
+        let changeset = PendingRequeueChangeset::new("some retryable error".to_string());
         let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
             .set(&changeset);
         let debug = debug_query::<Pg, _>(&query).to_string();
@@ -9894,8 +10101,11 @@ mod tests {
         );
         assert!(debug.contains("\"state\" = "));
         assert!(debug.contains("\"crash_strikes\" = "));
-        assert!(debug.contains("\"scheduled_at\" = "));
         assert!(debug.contains("\"error\" = "));
+        // `scheduled_at` is no longer part of this shared changeset (issue
+        // #1389): each caller adds it separately, computed on Postgres's own
+        // clock. See `requeue_after_panic_query_resets_and_unpins_the_task_row`.
+        assert!(!debug.contains("\"scheduled_at\""));
     }
 
     /// Issue #804: reaching the shared pending-requeue path PROVES the claiming
@@ -9914,8 +10124,7 @@ mod tests {
         use diesel::debug_query;
         use diesel::pg::Pg;
 
-        let changeset =
-            PendingRequeueChangeset::new(chrono::Utc::now(), "some retryable error".to_string());
+        let changeset = PendingRequeueChangeset::new("some retryable error".to_string());
 
         // The VALUE is the whole point: a non-zero reset would silently make the
         // counter cumulative and escalate healthy runs on a later deploy. A
@@ -9999,9 +10208,8 @@ mod tests {
     /// purely by `scheduled_at` and re-claimable by any worker.
     #[test]
     fn requeue_after_panic_query_resets_and_unpins_the_task_row() {
-        let changeset =
-            PendingRequeueChangeset::new(chrono::Utc::now(), "handler panic: boom".to_string());
-        let sql = requeue_after_panic_query(changeset);
+        let changeset = PendingRequeueChangeset::new("handler panic: boom".to_string());
+        let sql = requeue_after_panic_query(changeset, Duration::seconds(5));
 
         // Every column is emitted as a bound parameter (`= $N`) by
         // `debug_query`, mirroring the sibling `pending_requeue_changeset`
@@ -10010,7 +10218,6 @@ mod tests {
         for column in [
             "state",
             "crash_strikes",
-            "scheduled_at",
             "worker_id",
             "started_at",
             "last_heartbeat_at",
@@ -10026,6 +10233,12 @@ mod tests {
                 "{column} must appear as a bound column in the SET clause: {sql}"
             );
         }
+        // `scheduled_at` is computed on Postgres's own clock (issue #1389),
+        // not bound as a plain parameter.
+        assert!(
+            sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => $"),
+            "scheduled_at must be computed from Postgres's own clock: {sql}"
+        );
         // The null-ing columns (worker_id/started_at/last_heartbeat_at +
         // sticky_worker_id/sticky_until/sticky_timeout + activity_name) all bind
         // `None` (SQL NULL), and wake_requested binds `false`.
@@ -10040,6 +10253,49 @@ mod tests {
         // Restricted to claimed (RUNNING) workflow rows.
         assert!(sql.contains("\"task_type\""), "{sql}");
         assert!(sql.contains("\"state\""), "{sql}");
+    }
+
+    /// Issue #1391: this must generate a `SET` clause that clears both
+    /// `wake_requested` and the stale `activity_name` sentinel. It also
+    /// restricts the update to `RUNNING` workflow rows. This mirrors
+    /// `requeue_workflow_task_after_panic`'s own pin above. A no-DB test
+    /// pins this so a future edit cannot silently drop either clear and
+    /// reopen issue #1391 or its #603 sibling.
+    #[test]
+    fn requeue_workflow_task_for_quota_retry_query_clears_sentinel_and_wake() {
+        let changeset = PendingRequeueChangeset::new("quota exceeded".to_string());
+        let sql = requeue_workflow_task_for_quota_retry_query(changeset, Duration::seconds(5));
+
+        for column in ["wake_requested", "activity_name"] {
+            assert!(
+                sql.contains(&format!("\"{column}\" = $")),
+                "{column} must appear as a bound column in the SET clause: {sql}"
+            );
+        }
+        // `scheduled_at` is computed on Postgres's own clock (issue #1389),
+        // not bound as a plain parameter.
+        assert!(
+            sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => $"),
+            "scheduled_at must be computed from Postgres's own clock: {sql}"
+        );
+        // activity_name binds `None` (SQL NULL); wake_requested binds `false`.
+        assert!(
+            sql.contains("None"),
+            "activity_name must bind to None (SQL NULL): {sql}"
+        );
+        assert!(
+            sql.contains("false"),
+            "wake_requested must bind to false: {sql}"
+        );
+        // Restricted to claimed (RUNNING) workflow rows.
+        assert!(sql.contains("\"task_type\""), "{sql}");
+        assert!(sql.contains("\"state\""), "{sql}");
+        // `scheduled_at` is computed on Postgres's own clock (issue #1389),
+        // not the host clock, mirroring the panic-retry sibling pin above.
+        assert!(
+            sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => $"),
+            "scheduled_at must be computed from Postgres's own clock: {sql}"
+        );
     }
 
     #[test]
@@ -10128,6 +10384,25 @@ mod tests {
                 now
             ) < f64::EPSILON
         );
+    }
+
+    /// `delay_secs` feeds `make_interval(secs => ...)` (issue #1389), so it
+    /// must convert exactly, including sub-second and zero delays.
+    #[test]
+    fn delay_secs_converts_exactly() {
+        assert!((delay_secs(Duration::seconds(2)) - 2.0).abs() < f64::EPSILON);
+        assert!((delay_secs(Duration::milliseconds(500)) - 0.5).abs() < f64::EPSILON);
+        assert!((delay_secs(Duration::zero()) - 0.0).abs() < f64::EPSILON);
+        assert!((delay_secs(Duration::seconds(-3)) - (-3.0)).abs() < f64::EPSILON);
+    }
+
+    /// `JitterPolicy::Full` can pick a sub-millisecond delay (issue #1389
+    /// review). Truncating to whole milliseconds would round it down to
+    /// zero, turning a short retry into an immediate one.
+    #[test]
+    fn delay_secs_preserves_sub_millisecond_precision() {
+        assert!((delay_secs(Duration::microseconds(500)) - 0.0005).abs() < f64::EPSILON);
+        assert!((delay_secs(Duration::microseconds(1)) - 0.000_001).abs() < f64::EPSILON);
     }
 
     #[test]

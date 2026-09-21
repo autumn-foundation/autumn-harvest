@@ -746,6 +746,40 @@ pub struct DiagnosisInputs {
     pub nd_block: Option<NdBlockFacts>,
 }
 
+/// Does the activity's circuit breaker block dispatch right now?
+///
+/// `true` for a half-open breaker: a probe is admissible now.
+///
+/// `true` for an open breaker whose cooldown will not clear by the row's
+/// effective dispatch instant (`max(now, scheduled_at)`).
+///
+/// `false` for a closed or absent breaker, and for an organically-tripped
+/// open breaker whose cooldown clears by then.
+/// `CircuitBreakerRegistry::on_dispatch` then admits the row's own next
+/// attempt as the recovery probe, so nothing fast-fails it (issue #1193).
+///
+/// A forced-open breaker ignores its cooldown field and always blocks;
+/// only `force-close` clears it (issue #1193).
+///
+/// Shared by [`classify_pending_activity`], [`activity_precedence_for_facts`]
+/// and the diagnose endpoint's reason-code builder, so all three name the
+/// same set of currently-blocking rows (issue #1371).
+#[must_use]
+pub fn activity_circuit_currently_blocks(facts: &PendingActivityFacts, now: DateTime<Utc>) -> bool {
+    match facts.circuit_phase {
+        None => false,
+        Some(BlockingCircuitPhase::HalfOpen) => true,
+        Some(BlockingCircuitPhase::Open) => {
+            let effective_dispatch_instant = facts.scheduled_at.max(now);
+            let organic_cooldown_clears_by_dispatch = !facts.circuit_forced_open
+                && facts
+                    .circuit_cooldown_until
+                    .is_some_and(|deadline| effective_dispatch_instant >= deadline);
+            !organic_cooldown_clears_by_dispatch
+        }
+    }
+}
+
 /// Rank a pending-activity verdict by how hard its impediment is to clear.
 ///
 /// Higher wins. Used to pick the **worst** verdict across a fan-out so a single
@@ -855,24 +889,10 @@ fn activity_precedence_for_facts(facts: &PendingActivityFacts, now: DateTime<Utc
     if facts.rate_limit_bucket_missing && facts.rate_limit_key.is_some() {
         return 8; // ActivityRateLimitBucketMissing
     }
-    // Issue #1193 Codex round-4/round-5 P2: mirrors `classify_pending_activity`'s
-    // `organic_cooldown_clears_by_dispatch` guard -- an organic trip whose
-    // cooldown will have already elapsed by the effective dispatch instant
-    // (`max(now, scheduled_at)`, since an already-due row could be attempted
-    // any moment) is not a circuit-open verdict at all, so it must fall
-    // through to the not-due-yet ranks below rather than claim one of the
-    // circuit ranks.
-    let effective_dispatch_instant = facts.scheduled_at.max(now);
-    let organic_cooldown_clears_by_dispatch = facts.circuit_phase
-        == Some(BlockingCircuitPhase::Open)
-        && !facts.circuit_forced_open
-        && facts
-            .circuit_cooldown_until
-            .is_some_and(|deadline| effective_dispatch_instant >= deadline);
-    if !organic_cooldown_clears_by_dispatch
-        && facts.circuit_phase.is_some()
-        && facts.activity_name.is_some()
-    {
+    // Uses `activity_circuit_currently_blocks` (issue #1193). A row whose
+    // breaker no longer blocks by the effective dispatch instant is not a
+    // circuit-open verdict. It falls through to the not-due-yet ranks below.
+    if activity_circuit_currently_blocks(facts, now) && facts.activity_name.is_some() {
         // Issue #1193: the three circuit shapes are ranked by health severity
         // (forced > organic > half-open), mirroring `activity_precedence`, so
         // a same-rank tie between two DIFFERENTLY-healthed shapes can never
@@ -989,46 +1009,19 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
         };
     }
 
-    // 5. The breaker fast-fails dispatch. Only an activity the task row actually
-    //    names can carry one, so an unnamed row can never reach here.
+    // 5. The breaker fast-fails dispatch. Only an activity the task row
+    //    actually names can carry one, so an unnamed row can never reach
+    //    here.
     //
-    //    EXCEPTION (issue #1193 Codex round-4/round-5 P2): an ORGANIC trip
-    //    whose cooldown will have already elapsed by the time this row is
-    //    actually attempted is not "heading for a terminal failure".
-    //    `CircuitBreakerRegistry::on_dispatch` checks the elapsed cooldown at
-    //    the ACTUAL dispatch instant, so if the deadline lands at or before
-    //    that instant, THIS row's own future attempt is what gets admitted as
-    //    the recovery probe (or dispatches normally once closed) -- it does
-    //    not fast-fail at all.
-    //
-    //    The instant compared against is `max(now, scheduled_at)`, not
-    //    `scheduled_at` alone: a row that is ALREADY due (`scheduled_at <=
-    //    now`) can attempt at any moment, so `now` is the earliest it could
-    //    be dispatched -- and a read-only snapshot deliberately keeps
-    //    reporting `open` with a *past* `cooldown_until` until some dispatch
-    //    actually admits the probe (round-5 P2 on PR #1365; see
-    //    `circuit_cooldown_until` in `api.rs`), so `scheduled_at > now` alone
-    //    would wrongly exclude an already-due, already-probe-ready row.
-    //    Falling through here reports the same `activity_retrying` /
-    //    `activity_deferred` a not-yet-due row gets, or -- for an
-    //    already-due, otherwise-unimpeded row -- `HealthyInProgress`, exactly
-    //    as if there were no breaker in the way; both are correct, since the
-    //    next claim attempt is what the registry would admit as the probe.
-    //
-    //    Scoped narrowly: a forced-open breaker has no cooldown to compare
-    //    against (unconditionally `Stalled`, correctly, since only
-    //    `force-close` clears it), and an organic trip with an
-    //    unrepresentable cooldown (`cooldown_until: None`) has no deadline to
-    //    compare either, so both keep reporting circuit-open exactly as
-    //    before -- there is no evidence here that it will clear.
-    let effective_dispatch_instant = facts.scheduled_at.max(now);
-    let organic_cooldown_clears_by_dispatch = facts.circuit_phase
-        == Some(BlockingCircuitPhase::Open)
-        && !facts.circuit_forced_open
-        && facts
-            .circuit_cooldown_until
-            .is_some_and(|deadline| effective_dispatch_instant >= deadline);
-    if !organic_cooldown_clears_by_dispatch
+    //    `activity_circuit_currently_blocks` (issue #1371) holds the
+    //    exception. An organic trip whose cooldown clears by the row's own
+    //    effective dispatch instant admits that row's own next attempt as
+    //    the recovery probe. It does not fast-fail. Falling through then
+    //    reports the same verdict a not-yet-due row gets. An already-due,
+    //    otherwise-unimpeded row instead gets `HealthyInProgress`, exactly
+    //    as if there were no breaker in the way. See that function's doc
+    //    comment for the full rationale (issue #1193).
+    if activity_circuit_currently_blocks(facts, now)
         && let (Some(phase), Some(name)) = (facts.circuit_phase, facts.activity_name.as_ref())
     {
         return BlockedOn::ActivityCircuitOpen {
@@ -2538,10 +2531,53 @@ mod tests {
         );
     }
 
-    /// An operator-forced-open breaker admits no probe on any timer, so it has
-    /// no meaningful cooldown to advertise, and its `forced_open` flag is
-    /// authoritative (Codex round-1 P2 on PR #1365) -- sourced from the
-    /// registry directly, not inferred from the absent cooldown.
+    /// Direct coverage of the shared predicate (issue #1371). It must agree
+    /// with `classify_pending_activity`'s own guard on every shape swept by
+    /// the organic-cooldown tests above, since both now share one
+    /// implementation.
+    #[test]
+    fn activity_circuit_currently_blocks_matches_each_shape() {
+        // No breaker at all.
+        let facts = healthy_activity();
+        assert!(!activity_circuit_currently_blocks(&facts, t(0)));
+
+        // Half-open: a probe is admissible now, so it always blocks.
+        let mut facts = healthy_activity();
+        facts.circuit_phase = Some(BlockingCircuitPhase::HalfOpen);
+        assert!(activity_circuit_currently_blocks(&facts, t(0)));
+
+        // Organic open, cooldown already cleared by the effective dispatch
+        // instant: the row's own next attempt is the recovery probe.
+        let mut facts = healthy_activity();
+        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
+        facts.circuit_cooldown_until = Some(t(-5));
+        assert!(!activity_circuit_currently_blocks(&facts, t(0)));
+
+        // Organic open, cooldown still ahead: still fast-fails.
+        let mut facts = healthy_activity();
+        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
+        facts.circuit_cooldown_until = Some(t(5));
+        assert!(activity_circuit_currently_blocks(&facts, t(0)));
+
+        // Organic open, unrepresentable cooldown: no evidence it clears.
+        let mut facts = healthy_activity();
+        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
+        facts.circuit_cooldown_until = None;
+        assert!(activity_circuit_currently_blocks(&facts, t(0)));
+
+        // Forced open ignores a past cooldown entirely; only force-close
+        // clears it.
+        let mut facts = healthy_activity();
+        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
+        facts.circuit_forced_open = true;
+        facts.circuit_cooldown_until = Some(t(-5));
+        assert!(activity_circuit_currently_blocks(&facts, t(0)));
+    }
+
+    /// An operator-forced-open breaker admits no probe on any timer, so it
+    /// has no meaningful cooldown to advertise. Its `forced_open` flag is
+    /// authoritative (issue #1193): sourced from the registry directly, not
+    /// inferred from the absent cooldown.
     #[test]
     fn forced_open_circuit_reports_no_cooldown() {
         let mut facts = healthy_activity();

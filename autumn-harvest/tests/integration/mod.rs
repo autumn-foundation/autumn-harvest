@@ -190,6 +190,7 @@ mod retention_reclaim_support;
 mod retention_summary_tests;
 mod retry_after_tests;
 mod retry_chain_routing_tests;
+mod retry_clock_skew_tests;
 mod retry_now_tests;
 mod saga_tests;
 mod scanner_liveness_tests;

@@ -121,6 +121,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          retention_summary_tests
 linux        autumn-harvest         integration                      -                          retry_after_tests
 linux        autumn-harvest         integration                      -                          retry_chain_routing_tests
+linux        autumn-harvest         integration                      -                          retry_clock_skew_tests
 linux        autumn-harvest         integration                      -                          scanner_tick_db_tests
 linux        autumn-harvest         integration                      -                          schedule_runs_tests
 linux        autumn-harvest         integration                      -                          scheduler_overdue_pass_perf
@@ -195,6 +196,7 @@ linux        autumn-harvest-plugin  schedule_bulk_audit_perf         -          
 linux        autumn-harvest-plugin  schedule_overdue_aux_perf        -                          -
 linux        autumn-harvest-plugin  schedule_runs_integration        -                          -
 linux        autumn-harvest-plugin  shard_placement_integration      -                          -
+linux        autumn-harvest-plugin  signal_with_start_shard_rebalance_integration  -                          -
 linux        autumn-harvest-plugin  stall_diagnosis_integration      -                          -
 linux        autumn-harvest-plugin  start_idempotency_integration    -                          -
 linux        autumn-harvest-plugin  start_source_integration         -                          -

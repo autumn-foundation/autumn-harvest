@@ -12,7 +12,9 @@
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::time::Duration;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -21,7 +23,10 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 use autumn_harvest::debounce::DebounceStartOptions;
 use autumn_harvest::event_batch::{AdmitBatchParams, admit_batched_start, fire_due_event_batches};
+use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::NoOpMetrics;
+use autumn_harvest::types::ShardId;
+use autumn_harvest::worker::DbPool;
 
 async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
     let container = Postgres::default()
@@ -41,6 +46,25 @@ async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
         .expect("migrations");
 
     (conn, container)
+}
+
+/// Derive a running container's own Postgres URL (issue #1362). Needed to
+/// build a `DbPool` aimed at the same physical database `setup_db` already
+/// connected to, for the multi-shard test below.
+async fn container_url(container: &ContainerAsync<Postgres>) -> String {
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    format!("postgresql://postgres:postgres@{host}:{port}/postgres")
+}
+
+/// Build a connection pool for a database URL (issue #1362), to construct a
+/// `ShardedDbPool` test fixture.
+fn build_test_pool(database_url: &str) -> DbPool {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
+    deadpool::managed::Pool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("failed to build test pool")
 }
 
 #[tokio::test]
@@ -383,4 +407,94 @@ async fn admit_batched_start_rejects_empty_workflow_id_before_writing_a_row() {
             .expect("count query")
             .n;
     assert_eq!(n, 0, "no row was written");
+}
+
+// ── Multi-shard scanning (issue #1362) ──────────────────────────────────────
+//
+// `harvest_event_batches` filters by an explicit `shard_id` column when the
+// scanner is given one (see `fire_due_on_conn`'s `due_sql`), unlike
+// debounce/throttle's shard-per-database model. So, mirroring
+// `completion_callback_tests.rs`'s sharded test, this uses ONE physical
+// database with two `ShardId`s pointing at pools built from the same URL.
+
+// The multi-shard branch had no integration coverage before this test:
+// every existing call in this file passes `&None` and `&[]`. Each assigned
+// shard's own due row must fire on a single scanner tick.
+#[tokio::test]
+async fn fire_due_event_batches_fires_each_assigned_shards_own_due_row() {
+    let (mut conn, container) = setup_db().await;
+
+    let p0 = AdmitBatchParams {
+        workflow_name: "shard_batch_wf".to_string(),
+        batch_key: "key-shard0".to_string(),
+        workflow_id: "shard-batch-0".to_string(),
+        queue_name: "default".to_string(),
+        payload: json!({"shard": 0}),
+        start_options: DebounceStartOptions::default(),
+        max_wait: Duration::from_secs(10),
+        max_size: 5,
+        shard_id: 0,
+    };
+    admit_batched_start(&mut conn, p0, None)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let p1 = AdmitBatchParams {
+        workflow_name: "shard_batch_wf".to_string(),
+        batch_key: "key-shard1".to_string(),
+        workflow_id: "shard-batch-1".to_string(),
+        queue_name: "default".to_string(),
+        payload: json!({"shard": 1}),
+        start_options: DebounceStartOptions::default(),
+        max_wait: Duration::from_secs(10),
+        max_size: 5,
+        shard_id: 1,
+    };
+    admit_batched_start(&mut conn, p1, None)
+        .await
+        .unwrap()
+        .unwrap();
+
+    diesel::sql_query("UPDATE harvest_event_batches SET fire_at = NOW() - INTERVAL '1 minute'")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let url = container_url(&container).await;
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), build_test_pool(&url));
+    pools.insert(ShardId::new(1), build_test_pool(&url));
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    let fired = fire_due_event_batches(
+        &mut conn,
+        &Some(sharded_pool),
+        &[ShardId::new(0), ShardId::new(1)],
+        &NoOpMetrics,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(fired, 2, "each assigned shard's own due row must fire");
+
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    for wf_id in ["shard-batch-0", "shard-batch-1"] {
+        let n = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE workflow_id = $1",
+        )
+        .bind::<diesel::sql_types::Text, _>(wf_id)
+        .get_result::<Count>(&mut conn)
+        .await
+        .expect("count query")
+        .n;
+        assert_eq!(
+            n, 1,
+            "{wf_id} must have been started by its own shard's fire"
+        );
+    }
 }

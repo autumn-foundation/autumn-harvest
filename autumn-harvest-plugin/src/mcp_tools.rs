@@ -1266,7 +1266,20 @@ async fn watch_tool(
     // caught by the first notification instead of being lost. Continue-as-new
     // successors always live on the same shard, so one listener connection
     // covers the whole chain even if we later jump to a successor's exec_id.
-    let notification_url = match api_state.sse_notification_url(exec_id.shard()) {
+    //
+    // Resolved through the forwarding pointer, not `exec_id.shard()` (issue
+    // #1317). A rebalanced execution's origin shard is not where
+    // `load_owned_execution` below actually finds it. This LISTEN
+    // connection must open against the same database, or every
+    // notification for the chain is missed.
+    let Some(shard) = crate::api::resolve_shard_best_effort(&api_state, exec_id).await else {
+        return crate::api::map_error(autumn_harvest::error::HarvestError::ShardUnavailable {
+            shard_id: exec_id.shard().as_i32(),
+            reason: format!("could not resolve the current shard for {exec_id}"),
+        })
+        .into_response();
+    };
+    let notification_url = match api_state.sse_notification_url(shard) {
         Ok(url) => url,
         Err(e) => return crate::api::map_error(e).into_response(),
     };
@@ -1331,8 +1344,32 @@ async fn watch_tool(
         }
 
         let mut listener = listener;
+        let mut listener_shard = shard;
         let mut exec_id = exec_id;
         loop {
+            // Shard-residence rebind (issue #1317 review, P2 follow-up).
+            // The doc comment above guarantees a continue-as-new successor
+            // stays on the same shard, so tracking `exec_id` alone covers
+            // that case. It says nothing about a shard-rebalance migration,
+            // which is a different mechanism. The listener would stay
+            // bound to the shard it first resolved. Once the watched
+            // execution migrates, that silently degrades wakeups from
+            // event-driven to poll-only cadence (bounded by `wait_timeout`
+            // below).
+            if let Ok(pool) = api_clone.storage_pool()
+                && let Ok(current_shard) = autumn_harvest::shard_rebalance::resolve_execution_shard(
+                    pool.sharded_pool(),
+                    exec_id,
+                )
+                .await
+                && current_shard != listener_shard
+                && let Ok(url) = api_clone.sse_notification_url(current_shard)
+                && let Ok(l) = WorkflowEventListener::connect(&url).await
+            {
+                listener = l;
+                listener_shard = current_shard;
+            }
+
             // 2x keepalive so the KeepAlive wrapper pings between wakeups; a
             // TimedOut wakeup re-checks terminal state as a missed-NOTIFY
             // safety net without emitting a progress frame.

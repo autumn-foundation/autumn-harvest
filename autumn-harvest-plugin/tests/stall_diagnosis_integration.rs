@@ -961,6 +961,112 @@ async fn ac5_organic_circuit_already_cleared_by_snapshot_reports_healthy() {
          {body}"
     );
     assert_eq!(body["health"], "healthy", "body: {body}");
+    // Issue #1371: `contributing_reason_codes` is built independently of
+    // `blocked_on` and must agree with it. A stale `circuit_open` here would
+    // contradict the endpoint's own "currently holds" contract for this
+    // exact row.
+    assert!(
+        !body["contributing_reason_codes"]
+            .as_array()
+            .expect("reason codes")
+            .iter()
+            .any(|r| r == "circuit_open"),
+        "an already-cleared organic cooldown must not contribute circuit_open: {body}"
+    );
+}
+
+/// Issue #1371, per-row rather than per-response. Two activities in ONE
+/// execution: slot A's organic cooldown has already cleared (must NOT
+/// contribute `circuit_open`), slot B's has not (must still contribute it).
+/// Proves the filter is scoped to the row whose guard actually fires, not a
+/// blanket suppression once any row's guard fires anywhere in the fan-out.
+#[tokio::test]
+async fn ac5_fan_out_omits_circuit_open_for_a_cleared_slot_but_keeps_a_still_open_sibling() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let (api_state, registry) = build_api_state_with_registry(&pool, true);
+    // Slot A: `charge_card`, 30s cooldown, tripped and left to cool -- still
+    // certainly open by the time the snapshot is read.
+    let now = std::time::Instant::now();
+    for _ in 0..3 {
+        registry
+            .circuit_breakers()
+            .on_external_failure("charge_card", now);
+    }
+    // Slot B: `quick_probe`, 150ms cooldown, tripped then slept past it.
+    let trip_at = std::time::Instant::now();
+    for _ in 0..3 {
+        registry
+            .circuit_breakers()
+            .on_external_failure("quick_probe", trip_at);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let app = build_api_app(api_state);
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_activity_task(
+        &pool,
+        exec_id,
+        "charge_card",
+        "payments",
+        "PENDING",
+        1,
+        Some("gateway 503"),
+        "NOW() - INTERVAL '1 minute'",
+    )
+    .await;
+    seed_activity_task(
+        &pool,
+        exec_id,
+        "quick_probe",
+        "quickpay",
+        "PENDING",
+        1,
+        Some("gateway 503"),
+        "NOW() - INTERVAL '1 minute'",
+    )
+    .await;
+    // One worker row covering BOTH queues: `seed_live_worker` upserts on
+    // `ON CONFLICT (worker_id) DO NOTHING`, so a second call for the same
+    // `LOCAL_WORKER_ID` would silently drop the first queue.
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_workers \
+             (worker_id, last_heartbeat_at, status, queues, shard_assignments, \
+              max_concurrency, host) \
+             VALUES ($1, NOW(), 'Active', $2, '[0]'::jsonb, 10, 'test-host')",
+        )
+        .bind::<diesel::sql_types::Text, _>(LOCAL_WORKER_ID)
+        .bind::<diesel::sql_types::Jsonb, _>(json!(["payments", "quickpay"]))
+        .execute(&mut conn)
+        .await
+        .expect("seed worker covering both queues");
+    }
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "activity_circuit_open",
+        "the still-open slot outranks the cleared one's healthy verdict: {body}"
+    );
+    let reasons = body["contributing_reason_codes"]
+        .as_array()
+        .expect("reasons");
+    assert!(
+        reasons.iter().any(|r| r == "circuit_open"),
+        "the still-open sibling must contribute circuit_open: {body}"
+    );
+    assert!(
+        !reasons.iter().any(|r| r == "no_live_worker"),
+        "both slots have a live poller: {body}"
+    );
 }
 
 /// A backing-off task (future `scheduled_at`) on a covered queue with a closed

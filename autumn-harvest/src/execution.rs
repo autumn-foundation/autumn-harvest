@@ -22,10 +22,11 @@ use crate::info::WorkflowInfo;
 use crate::models::{NewHarvestSignal, NewWorkflowExecution, WorkflowExecution};
 use crate::queue::{self, EnqueueParams, TaskType};
 use crate::schema::{harvest_signals, harvest_workflow_executions};
+use crate::shard::ShardedDbPool;
 use crate::store;
 use crate::telemetry::TraceContextCarrier;
 use crate::types::{
-    ExecutionId, ParentClosePolicy, Priority, StartSource, WorkflowIdConflictPolicy,
+    ExecutionId, ParentClosePolicy, Priority, ShardId, StartSource, WorkflowIdConflictPolicy,
     WorkflowIdReusePolicy,
 };
 
@@ -1258,6 +1259,141 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         // function's environment.
         let mut tx_deferred_checks = Vec::new();
 
+        // Serialize this whole admission decision against every other start
+        // racing the same business key (issue #948 Codex review, comment
+        // 4053489196, follow-up to c52d895). Taken unconditionally, before
+        // any occupant read. The occupant check below, the reconciled-seal
+        // lookup, and the fresh `INSERT`, are then all atomic. A concurrent
+        // transaction deciding the same key cannot interleave with any of
+        // them. The active-uniqueness index alone does not serialize that,
+        // because a reconciled seal is deliberately excluded from it. See
+        // `lock_execution_admission`'s own doc comment for the race this
+        // closes.
+        lock_execution_admission(conn, request.workflow_name, request.workflow_id).await?;
+
+        // `RejectDuplicate` must refuse against a reconciled `MIGRATED`
+        // seal. `AllowDuplicateFailedOnly` must attach to one whose live
+        // copy did NOT fail, not silently create past either (fresh
+        // review, P1 follow-up x2). The active-uniqueness index below
+        // excludes an observed-terminal seal, so a fresh run succeeds
+        // with a plain `INSERT` under every OTHER case. See
+        // `an_allow_duplicate_start_creates_a_fresh_run_too_once_the_
+        // seal_is_reconciled`, which deliberately pins that outcome for
+        // plain `AllowDuplicate` (attaching to the seal's own stale,
+        // un-refreshed row would be useless there).
+        //
+        // Neither policy below shares that "attach is useless" reasoning.
+        // `RejectDuplicate` has no attach case at all: a reconciled seal
+        // still means this business key has already run once, full stop.
+        // `AllowDuplicateFailedOnly` promises to return a non-failed prior
+        // UNCHANGED, precisely so a successful run is never silently
+        // repeated. A fresh run for a `COMPLETED`/`TIMED_OUT` live copy
+        // would be a genuine second admission, not merely fresher data.
+        // Only a `FAILED`/`CANCELLED` live copy still wants the fresh
+        // `INSERT` below to run, exactly as it already does.
+        //
+        // The `INSERT` cannot see any of this on its own, since the index
+        // no longer protects a reconciled seal, so check explicitly
+        // first. `FOR UPDATE` locks the row. A reconciler racing this
+        // exact check then blocks until this transaction commits or
+        // rolls back. It cannot reconcile the seal in the gap between
+        // this read and the insert.
+        //
+        // This block runs BEFORE the admission-gate check below (issue
+        // #1596 review, comment_id 4055454416). `try_load_active_execution_
+        // for_update` deliberately excludes a reconciled seal, so the
+        // gate's own occupant read sees `None` and treats the request as a
+        // fresh create. Neither outcome below admits a new execution.
+        // A `RejectDuplicate` refusal and an `AllowDuplicateFailedOnly`
+        // attach both return an EXISTING row instead. Evaluating the gate
+        // first would misreport a refusal as `AdmissionBlocked`, not the
+        // promised `AlreadyExists`. It would also block an attach that
+        // creates nothing for the gate to legitimately guard. Resolve the
+        // seal first. Reach the gate only on a genuine fresh-create path:
+        // no seal, or a FAILED/CANCELLED seal that falls through to the
+        // INSERT below. That keeps the gate scoped to admissions it can
+        // actually block.
+        if matches!(
+            request.reuse_policy,
+            WorkflowIdReusePolicy::RejectDuplicate
+                | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+        ) {
+            // A reconciled seal is only authoritative when nothing newer
+            // occupies the key (fresh review, P1 follow-up). A run that
+            // started after the seal was released is the real current
+            // occupant. That includes an active run, and one already
+            // terminal but not yet sealed or migrated itself.
+            // `try_load_active_execution_for_update` already answers
+            // exactly that question. It is safe to call again here, even
+            // when the admission-gate block below already did. It is the
+            // same lock, on the same connection, in the same
+            // transaction. When it finds an occupant, skip the seal
+            // check entirely. Let the ordinary insert/conflict path
+            // below resolve the policy against the real occupant instead.
+            let current_occupant = try_load_active_execution_for_update(
+                conn,
+                request.workflow_name,
+                request.workflow_id,
+            )
+            .await?;
+            if current_occupant.is_none() {
+                // A business key can accumulate more than one reconciled
+                // seal over time. Each repeat run gets its own row, and
+                // any of them may have migrated and reconciled
+                // independently. `started_at DESC` picks the newest one,
+                // the same recency rule
+                // `resolve_execution_id_by_workflow_id` already uses.
+                // Without it, an unordered `LIMIT 1` could return an
+                // older seal instead, attaching to a stale outcome or
+                // replacing the wrong one.
+                let reconciled_seal: Option<WorkflowExecution> = harvest_workflow_executions::table
+                    .filter(harvest_workflow_executions::workflow_name.eq(request.workflow_name))
+                    .filter(harvest_workflow_executions::workflow_id.eq(request.workflow_id))
+                    .filter(harvest_workflow_executions::state.eq("MIGRATED"))
+                    .filter(harvest_workflow_executions::migrated_run_terminal_at.is_not_null())
+                    .order(harvest_workflow_executions::started_at.desc())
+                    .select(WorkflowExecution::as_select())
+                    .for_update()
+                    .first(&mut *conn)
+                    .await
+                    .optional()
+                    .map_err(database_error)?;
+                if let Some(seal) = reconciled_seal {
+                    if request.reuse_policy == WorkflowIdReusePolicy::RejectDuplicate {
+                        // Report the effective terminal state, not the
+                        // seal's own `MIGRATED` marker (issue #1596 review,
+                        // P2), matching the attach path just below.
+                        // `MIGRATED` is an internal forwarding state; a
+                        // caller checking this refusal for a specific
+                        // outcome must not be told the run is still
+                        // migrating.
+                        return Err(HarvestError::AlreadyExists {
+                            existing_exec_id: ExecutionId::from_uuid(seal.id),
+                            existing_state: seal.effective_terminal_state().to_string(),
+                        });
+                    }
+                    if !matches!(seal.effective_terminal_state(), "FAILED" | "CANCELLED") {
+                        // Report the live copy's effective terminal state,
+                        // not the seal's own `MIGRATED` marker (Codex P2
+                        // review, comment 4054062525). `MIGRATED` is an
+                        // internal forwarding state. A public start API
+                        // must not leak it as if the run were nonterminal.
+                        let mut attached_seal = seal;
+                        attached_seal.state = attached_seal.effective_terminal_state().to_string();
+                        return Ok((
+                            StartedWorkflowExecution::from_row(attached_seal, false),
+                            Vec::new(),
+                            tx_deferred_checks,
+                            Vec::new(),
+                        ));
+                    }
+                    // FAILED/CANCELLED: fall through, the INSERT below
+                    // replaces it exactly as `AllowDuplicateFailedOnly`
+                    // already does for any other failed/cancelled prior.
+                }
+            }
+        }
+
         // Authoritative locked gate (issue #618, PR #1014). For every
         // policy EXCEPT TerminateIfRunning (gated unlocked at POINT 1
         // above), take the `FOR UPDATE` lock on any non-sealed prior
@@ -1270,6 +1406,14 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         // lock is reused by the INSERT / `..._by_key_for_update` load
         // below. `reject_fresh_if_debounced` starts pass `gate = None`, so
         // this never runs on the debounce path.
+        //
+        // Runs AFTER the reconciled-seal block above (issue #1596 review,
+        // comment_id 4055454416). That block already returned for the two
+        // outcomes that admit no new execution. Reaching here means one of
+        // two things: no reconciled seal applies, or one did and was
+        // FAILED/CANCELLED. Either way, the INSERT below is a genuine
+        // fresh create the gate may legitimately block.
+        //
         // Recompute the fast-path predicate from the (cloned) request:
         // POINT 1 + the pre-check already applied the unlocked gate for the
         // state-independent `terminate_via_pre_check` case, so skip it here.
@@ -1537,11 +1681,22 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             }
         };
 
+        // A MIGRATED seal whose live copy has since finished is not an
+        // active conflict any more (issue #1317). `is_active_conflict_state`
+        // classifies `MIGRATED` as active unconditionally. That is right
+        // while the live run is going but wrong forever after. Nothing
+        // else ever re-checks it, so a start of the same business key
+        // attached to a dead seal permanently. `migrated_run_terminal_at`
+        // is the reconciler's record that the live copy has finished;
+        // treat that exactly like any other terminal prior below.
+        let seal_observed_terminal =
+            existing.state == "MIGRATED" && existing.migrated_run_terminal_at.is_some();
+
         // Branch on active-vs-terminal FIRST (issue #685). An ACTIVE
         // (RUNNING/PAUSED) prior is governed by the orthogonal conflict
         // axis; a terminal non-sealed prior is governed by the reuse axis
         // exactly as before (the conflict axis has no effect there).
-        if is_active_conflict_state(&existing.state) {
+        if is_active_conflict_state(&existing.state) && !seal_observed_terminal {
             match effective_active_conflict_behavior(request.reuse_policy, request.conflict_policy)
             {
                 // Return the existing running/paused execution unchanged —
@@ -1685,7 +1840,15 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                 }),
 
                 WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
-                    match existing.state.as_str() {
+                    // A reconciled `MIGRATED` seal's own `state` stays
+                    // `MIGRATED` forever, never `FAILED`/`CANCELLED` (fresh
+                    // review, P2 follow-up). `effective_terminal_state`
+                    // reads the live copy's OWN observed terminal state
+                    // for exactly that row. A failed live copy still
+                    // replaces here, instead of silently attaching to a
+                    // dead seal.
+                    let effective_state = existing.effective_terminal_state().to_string();
+                    match effective_state.as_str() {
                         "FAILED" | "CANCELLED" => {
                             // Replacing a terminal prior is a fresh start.
                             if reject_fresh_if_debounced {
@@ -2850,14 +3013,26 @@ async fn replace_execution(
     // Seal the prior execution row as CONTINUED_AS_NEW. This removes it from
     // the partial unique index scope (WHERE state NOT IN sealed states),
     // allowing the new row to be inserted without violating the constraint.
-    diesel::update(harvest_workflow_executions::table.find(existing.id))
-        .set((
-            harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
-        ))
-        .execute(conn)
-        .await
-        .map_err(database_error)?;
+    //
+    // A MIGRATED seal is the one exception (issue #1317). Only
+    // `TerminateIfRunning` can reach this function with `existing.state ==
+    // "MIGRATED"`, and only once its live copy is observed terminal (the
+    // caller's `seal_observed_terminal` gate). Overwriting `state` here
+    // would defeat retention's and erasure's protection of the forwarding
+    // pointer, both keyed on `state = 'MIGRATED'` exactly. The active
+    // partial index already excludes an observed-terminal seal via
+    // `migrated_run_terminal_at IS NULL`. So this row is already outside
+    // the uniqueness scope without touching its state at all.
+    if existing.state != "MIGRATED" {
+        diesel::update(harvest_workflow_executions::table.find(existing.id))
+            .set((
+                harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
+                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            ))
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+    }
 
     let new_execution = diesel::insert_into(harvest_workflow_executions::table)
         .values(new_row)
@@ -3469,11 +3644,27 @@ pub const RETRY_CHAIN_MAX_REDRIVES: usize = RETRY_CHAIN_MAX_DEPTH;
 /// [`HarvestError::Database`] for query failures, and
 /// [`HarvestError::RetryChainMaxDepthExceeded`] when the chain exceeds [`RETRY_CHAIN_MAX_DEPTH`]
 /// (fail-closed — see that constant).
+///
+/// `pool`/`held_shard` name the shard `conn` is already checked out from.
+/// That lets a hop which has itself been rebalanced be followed to its live
+/// shard (issue #1596 review, PR #1596 comment 4052029175). See
+/// [`walk_retry_chain`] for why that residence check exists.
+///
+/// Also returns the shard the live attempt actually lives on (issue #1596
+/// follow-up review, comment 4052389744), which can differ from
+/// `held_shard`. `conn` itself is not moved. A caller that runs any
+/// follow-up query against the returned execution must first
+/// [`crate::shard_rebalance::bind_to_shard`] using this shard. It must not
+/// reuse `conn` unconditionally. Otherwise a follow-up against a live
+/// attempt that hopped shards silently runs against the wrong database.
+/// That is exactly the class of bug this whole primitive exists to close.
 pub async fn resolve_live_attempt(
     conn: &mut AsyncPgConnection,
+    pool: &ShardedDbPool,
+    held_shard: ShardId,
     exec_id: ExecutionId,
-) -> HarvestResult<WorkflowExecution> {
-    let mut chain = walk_retry_chain(conn, exec_id).await?;
+) -> HarvestResult<(WorkflowExecution, ShardId)> {
+    let mut chain = walk_retry_chain(conn, pool, held_shard, exec_id).await?;
     Ok(chain
         .pop()
         .expect("walk_retry_chain always returns at least the addressed row"))
@@ -3489,20 +3680,126 @@ pub async fn resolve_live_attempt(
 /// of row loads the plain resolve already performed — the walk had to load
 /// every intermediate row anyway to read its `state`.
 ///
+/// # Residence, not just origin (issue #1596 review, comment 4052029175)
+///
+/// A retry successor is minted on its predecessor's shard. Nothing stops it
+/// from being rebalanced away afterwards. Shard rebalancing (issue #964)
+/// moves any quiescent execution, and a parked retry successor qualifies
+/// like any other. `conn`/`held_shard` are only ever resolved for `exec_id`
+/// as the CALLER understands its residence, typically its origin shard.
+///
+/// Reading a later hop on that same connection would find whatever row
+/// physically exists there. After a rebalance, that is the origin shard's
+/// sealed `MIGRATED` stub, not the live copy. `"MIGRATED" != "FAILED"`. The
+/// old walk stopped right there and returned the stub as the live attempt.
+/// That is silently wrong for every consumer, `load_effective_execution`
+/// above all. A result waiter would poll a nonterminal seal forever. A
+/// listener rebind would keep watching the wrong execution.
+///
+/// This holds for `exec_id` itself, the walk's seed, exactly as much as it
+/// holds for a later retry hop (issue #1596 follow-up review, comment
+/// 4053840606). The addressed execution can have been migrated
+/// independent of any retry of its own. A caller's `conn` is typically
+/// resolved for its origin shard alone, with no reason to know about a
+/// migration. Reading the seed there first, before any hop check ever
+/// runs, would see the same stale `MIGRATED` stub and stop the walk before
+/// it starts. The seed's own residence is therefore resolved first, via
+/// the same [`crate::shard_rebalance::resolve_execution_shard_holding`]
+/// every later hop uses.
+///
+/// So every hop's residence is resolved before its state is trusted, via
+/// [`crate::shard_rebalance::resolve_execution_shard_holding`]. A hop that
+/// lands on the connection already in hand costs nothing extra. Only a hop
+/// that has actually moved pays for a fresh checkout.
+///
+/// Every checkout past the seed is guarded by
+/// [`crate::shard_rebalance::forwarding_hop_conflict`]. It checks both
+/// `held_shard` (the caller's own connection, held for this whole call) and
+/// the walk's own previous hop. This mirrors
+/// [`crate::shard_rebalance::live_copy_is_terminal`]'s identical discipline.
+/// Otherwise a hop landing back on either one could deadlock a
+/// pool-size-one shard against a connection this call already holds open.
+/// The seed's own checkout needs no such guard: it is the walk's first
+/// read, so no other hop's connection is open yet to alias.
+///
+/// Each row is paired with the shard it was actually read from (issue #1596
+/// follow-up review, comment 4052389744). That shard is not necessarily
+/// `held_shard`, once a hop has moved, or even for the seed itself, once
+/// its own migration is resolved. A caller that must act on a specific
+/// element needs that element's own shard. [`retry_chain_ids`]'s own
+/// consumers sometimes must act on an element other than the last one. Use
+/// [`crate::shard_rebalance::bind_to_shard`] before running any follow-up
+/// query against it. No index is guaranteed to sit on `conn`'s own shard.
+///
 /// # Errors
 ///
-/// Returns [`HarvestError::NotFound`] when `exec_id` does not exist,
-/// [`HarvestError::Database`] for query failures, and
-/// [`HarvestError::RetryChainMaxDepthExceeded`] when the chain exceeds [`RETRY_CHAIN_MAX_DEPTH`]
-/// (see the fail-closed rationale on that constant).
+/// Returns [`HarvestError::NotFound`] when `exec_id` does not exist.
+/// Returns [`HarvestError::Database`] for query failures. Returns
+/// [`HarvestError::RetryChainMaxDepthExceeded`] when the chain exceeds
+/// [`RETRY_CHAIN_MAX_DEPTH`] (see the fail-closed rationale on that
+/// constant). Returns [`HarvestError::ShardUnavailable`] when a hop's live
+/// shard cannot be reached from this node, or would deadlock a connection
+/// already held.
 pub async fn walk_retry_chain(
     conn: &mut AsyncPgConnection,
+    pool: &ShardedDbPool,
+    held_shard: ShardId,
     exec_id: ExecutionId,
-) -> HarvestResult<Vec<WorkflowExecution>> {
-    let mut chain = vec![load_execution_row(conn, exec_id).await?];
+) -> HarvestResult<Vec<(WorkflowExecution, ShardId)>> {
+    // Tracks which connection is actually being read right now. It stays the
+    // caller's own `conn` until a hop moves off `held_shard`, then switches
+    // to this walk's own checked-out connection. Reusing `conn` for as long
+    // as possible keeps the common, never-rebalanced case free of any extra
+    // checkout.
+    enum ActiveConn<'a> {
+        Held(&'a mut AsyncPgConnection),
+        Owned(Box<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>>),
+    }
+    impl ActiveConn<'_> {
+        fn as_mut(&mut self) -> &mut AsyncPgConnection {
+            match self {
+                Self::Held(conn) => conn,
+                Self::Owned(conn) => conn,
+            }
+        }
+    }
+
+    let mut active = ActiveConn::Held(conn);
+    let mut current_shard = held_shard;
+
+    // Resolve the SEED's own residence before trusting its state, exactly
+    // as every later hop already does below (issue #1596 follow-up
+    // review, comment 4053840606). The addressed execution can itself
+    // have been migrated, independent of any retry. Reading it on
+    // `held_shard` alone would then see the origin-side `MIGRATED` seal.
+    // `"MIGRATED" != "FAILED"` stops the walk immediately, before it ever
+    // reaches the seed's own retry successor on its new shard.
+    //
+    // No [`crate::shard_rebalance::forwarding_hop_conflict`] check is
+    // needed here, unlike every later hop. This is the walk's very first
+    // read. `held_shard` is the only connection held so far. It is also
+    // the reference point a move away from it is compared against, so
+    // aliasing it is not possible yet.
+    let seed_shard = crate::shard_rebalance::resolve_execution_shard_holding(
+        active.as_mut(),
+        pool,
+        exec_id,
+        held_shard,
+    )
+    .await?;
+    if seed_shard != held_shard && !pool.same_physical_pool(seed_shard, held_shard) {
+        active = ActiveConn::Owned(Box::new(
+            crate::shard_rebalance::conn_for_shard(pool, seed_shard).await?,
+        ));
+        current_shard = seed_shard;
+    }
+    let mut chain = vec![(
+        load_execution_row(active.as_mut(), exec_id).await?,
+        current_shard,
+    )];
     for _ in 0..RETRY_CHAIN_MAX_DEPTH {
         let (current_id, current_failed) = {
-            let current = chain
+            let (current, _) = chain
                 .last()
                 .expect("the chain is seeded with the addressed row");
             (current.id, current.state == "FAILED")
@@ -3523,14 +3820,50 @@ pub async fn walk_retry_chain(
                 harvest_workflow_executions::id.asc(),
             ))
             .select(harvest_workflow_executions::id)
-            .first(conn)
+            .first(active.as_mut())
             .await
             .optional()
             .map_err(database_error)?;
         let Some(next_id) = next else {
             return Ok(chain);
         };
-        chain.push(load_execution_row(conn, ExecutionId::from_uuid(next_id)).await?);
+        let next_id = ExecutionId::from_uuid(next_id);
+
+        // Resolve where `next_id` actually lives before loading it, relative
+        // to whichever connection this walk currently holds.
+        let next_shard = crate::shard_rebalance::resolve_execution_shard_holding(
+            active.as_mut(),
+            pool,
+            next_id,
+            current_shard,
+        )
+        .await?;
+        if next_shard != current_shard && !pool.same_physical_pool(next_shard, current_shard) {
+            // The hop moved off the connection this walk is currently
+            // reading. Refuse a checkout that would alias `held_shard` (the
+            // caller's own connection, held for this entire call). Also
+            // refuse one that aliases the walk's own previous hop, past the
+            // very first one. Either would deadlock a pool-size-one shard
+            // against a connection already checked out.
+            let previous_hop = (current_shard != held_shard).then_some(current_shard);
+            if let Some(err) = crate::shard_rebalance::forwarding_hop_conflict(
+                pool,
+                next_shard,
+                previous_hop,
+                held_shard,
+                exec_id,
+            ) {
+                return Err(err);
+            }
+            active = ActiveConn::Owned(Box::new(
+                crate::shard_rebalance::conn_for_shard(pool, next_shard).await?,
+            ));
+            current_shard = next_shard;
+        }
+        chain.push((
+            load_execution_row(active.as_mut(), next_id).await?,
+            current_shard,
+        ));
     }
     // Unreachable for any real chain (see `RETRY_CHAIN_MAX_DEPTH`). Reaching it
     // means the chain is pathological — a cycle, or a `max_attempts` far above
@@ -3552,36 +3885,220 @@ pub async fn walk_retry_chain(
     })
 }
 
-/// [`walk_retry_chain`], returning only the [`ExecutionId`]s.
+/// [`walk_retry_chain`], returning only the [`ExecutionId`]s, each paired
+/// with the shard it was actually read from (issue #1596 follow-up review,
+/// comment 4052389744).
 ///
-/// Ordered `exec_id` first, live attempt last.
+/// Ordered `exec_id` first, live attempt last. A caller that must act on any
+/// element other than the last needs each one's own shard. The management
+/// API's search for which attempt carries a given update admission is one
+/// example. No index is guaranteed to sit on `conn`'s own shard. Even index
+/// 0 may have moved, if `exec_id` itself was migrated (issue #1596
+/// follow-up review, comment 4053840606).
 ///
 /// # Errors
 ///
 /// See [`walk_retry_chain`].
 pub async fn retry_chain_ids(
     conn: &mut AsyncPgConnection,
+    pool: &ShardedDbPool,
+    held_shard: ShardId,
     exec_id: ExecutionId,
-) -> HarvestResult<Vec<ExecutionId>> {
-    Ok(walk_retry_chain(conn, exec_id)
+) -> HarvestResult<Vec<(ExecutionId, ShardId)>> {
+    Ok(walk_retry_chain(conn, pool, held_shard, exec_id)
         .await?
         .into_iter()
-        .map(|e| ExecutionId::from_uuid(e.id))
+        .map(|(e, shard)| (ExecutionId::from_uuid(e.id), shard))
         .collect())
 }
 
-/// [`resolve_live_attempt`], returning only the resolved [`ExecutionId`].
+/// [`resolve_live_attempt`], returning only the resolved [`ExecutionId`] and
+/// its shard.
 ///
 /// # Errors
 ///
 /// See [`resolve_live_attempt`].
 pub async fn resolve_live_attempt_id(
     conn: &mut AsyncPgConnection,
+    pool: &ShardedDbPool,
+    held_shard: ShardId,
     exec_id: ExecutionId,
-) -> HarvestResult<ExecutionId> {
-    resolve_live_attempt(conn, exec_id)
+) -> HarvestResult<(ExecutionId, ShardId)> {
+    resolve_live_attempt(conn, pool, held_shard, exec_id)
         .await
-        .map(|e| ExecutionId::from_uuid(e.id))
+        .map(|(e, shard)| (ExecutionId::from_uuid(e.id), shard))
+}
+
+/// The pre-#1596 walk: every hop read on `conn` alone, with no residence
+/// check. This is [`resolve_live_attempt_id_best_effort`]'s fallback when it
+/// cannot recover a [`ShardedDbPool`] or a held shard for `exec_id`.
+///
+/// # Errors
+///
+/// See [`walk_retry_chain`].
+async fn walk_retry_chain_on_conn_only(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Vec<WorkflowExecution>> {
+    let mut chain = vec![load_execution_row(conn, exec_id).await?];
+    for _ in 0..RETRY_CHAIN_MAX_DEPTH {
+        let (current_id, current_failed) = {
+            let current = chain
+                .last()
+                .expect("the chain is seeded with the addressed row");
+            (current.id, current.state == "FAILED")
+        };
+        if !current_failed {
+            return Ok(chain);
+        }
+        let next: Option<Uuid> = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::retry_of_exec_id.eq(Some(current_id)))
+            .order((
+                harvest_workflow_executions::started_at.asc(),
+                harvest_workflow_executions::id.asc(),
+            ))
+            .select(harvest_workflow_executions::id)
+            .first(conn)
+            .await
+            .optional()
+            .map_err(database_error)?;
+        let Some(next_id) = next else {
+            return Ok(chain);
+        };
+        chain.push(load_execution_row(conn, ExecutionId::from_uuid(next_id)).await?);
+    }
+    tracing::error!(
+        execution_id = %exec_id,
+        max_depth = RETRY_CHAIN_MAX_DEPTH,
+        "harvest: retry chain exceeded the maximum walk depth; refusing to route \
+         to a possibly-stale attempt"
+    );
+    Err(HarvestError::RetryChainMaxDepthExceeded {
+        exec_id,
+        max_depth: RETRY_CHAIN_MAX_DEPTH,
+    })
+}
+
+/// A connection this call checked out itself, for a caller of
+/// [`resolve_live_attempt_id_best_effort`] to use for every follow-up
+/// operation against the resolved live attempt.
+pub type BestEffortRebind =
+    Box<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>>;
+
+/// [`resolve_live_attempt_id`], for a caller with no [`ShardedDbPool`] of its
+/// own to pass in (issue #1596 review).
+///
+/// Signal delivery and in-process update admission are public entry points.
+/// Their `conn` is supplied by application code generated at compile time by
+/// `autumn-harvest-macros`. Their signature predates sharding, and cannot
+/// grow a pool parameter without breaking every generated caller. This
+/// recovers the pieces of context [`resolve_live_attempt_id`] needs from
+/// [`crate::shard::GLOBAL_SHARDED_POOL`] and
+/// [`crate::shard_rebalance::shard_of_held_row`] instead.
+///
+/// Also returns a connection for the caller to run every follow-up
+/// operation against the resolved live attempt through (issue #1596
+/// follow-up review, comment 4052389744). Resolving the id alone is not
+/// enough. A hop the walk follows internally can land on a different shard
+/// than `conn`. Reusing `conn` for the follow-up would then silently
+/// operate on the wrong database. That is the same class of bug the
+/// retry-chain walker itself was fixed for, one layer up.
+///
+/// The returned connection is `Some` fresh checkout exactly when the live
+/// attempt's shard differs from `conn`'s own. It is `None` in every other
+/// case, meaning `conn` itself is already correct. Three cases give `None`.
+/// No sharded pool was ever installed: a single-shard embedder, or a test
+/// harness wired with a bare connection. Or `exec_id`'s row is not on this
+/// connection at all. Or the live attempt never left `conn`'s shard. The
+/// first two fall back to walking on `conn` alone, exactly as this function
+/// did before issue #1596. That is not a silent downgrade. With no pool to
+/// move it to, a retry successor cannot have been rebalanced anywhere.
+///
+/// # Errors
+///
+/// See [`walk_retry_chain`].
+pub async fn resolve_live_attempt_id_best_effort(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<(ExecutionId, Option<BestEffortRebind>)> {
+    let pool = crate::shard::GLOBAL_SHARDED_POOL
+        .read()
+        .ok()
+        .and_then(|p| p.clone());
+    let held_shard = match &pool {
+        Some(_) => crate::shard_rebalance::shard_of_held_row(conn, exec_id).await,
+        None => None,
+    };
+    let Some((pool, held_shard)) = pool.zip(held_shard) else {
+        let chain = walk_retry_chain_on_conn_only(conn, exec_id).await?;
+        let target = chain
+            .last()
+            .expect("walk_retry_chain_on_conn_only always returns at least the addressed row")
+            .id;
+        return Ok((ExecutionId::from_uuid(target), None));
+    };
+    let (target, target_shard) = resolve_live_attempt_id(conn, &pool, held_shard, exec_id).await?;
+    if target_shard == held_shard || pool.same_physical_pool(target_shard, held_shard) {
+        return Ok((target, None));
+    }
+    let fresh = crate::shard_rebalance::conn_for_shard(&pool, target_shard).await?;
+    Ok((target, Some(Box::new(fresh))))
+}
+
+/// Bind to `exec_id`'s own shard for a caller with no [`ShardedDbPool`] of
+/// its own (issue #1596 follow-up review, comment 4052389744).
+///
+/// This is the building block [`resolve_live_attempt_id_best_effort`] uses
+/// for the id it resolves. It is exposed here for a caller that already has
+/// an `ExecutionId` in hand. That caller only needs to make sure `conn` is
+/// actually positioned on it.
+///
+/// `send_signal_from_resolved` is the motivating case. It can be called
+/// with a `resolved` id a caller obtained independently: the management
+/// API's own pool-aware resolve. So `conn` is not guaranteed to be bound to
+/// it the way a fresh [`resolve_live_attempt_id_best_effort`] call would
+/// guarantee for ITS OWN result.
+///
+/// Returns `None` when `conn` is already correct. That covers two cases:
+/// no sharded pool was ever installed, or `exec_id`'s row is visible on
+/// `conn` and is not itself a forwarding seal. Returns `Some` freshly
+/// checked-out connection, resolved through `exec_id`'s own forwarding
+/// chain, otherwise.
+///
+/// A row's mere presence on `conn` does not prove `conn` is correct (issue
+/// #1596 follow-up review, comment 4053705972). A retry successor migrated
+/// off `conn`'s shard still leaves its `MIGRATED` seal visible there. The
+/// row exists, but it is not the live copy. Trusting presence alone sent
+/// every follow-up query to that stale seal instead of the shard the
+/// successor actually runs on now. This checks the row's forwarding
+/// pointer first, and only trusts `conn` when the row is present and NOT
+/// forwarding.
+///
+/// # Errors
+///
+/// [`HarvestError::ShardUnavailable`] when `exec_id`'s live shard cannot be
+/// reached from this node.
+pub async fn bind_to_shard_best_effort(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Option<BestEffortRebind>> {
+    let Some(pool) = crate::shard::GLOBAL_SHARDED_POOL
+        .read()
+        .ok()
+        .and_then(|p| p.clone())
+    else {
+        return Ok(None);
+    };
+    let held = crate::shard_rebalance::shard_of_held_row(conn, exec_id).await;
+    if held.is_some()
+        && crate::shard_rebalance::forward_of_held_row(conn, exec_id)
+            .await
+            .is_none()
+    {
+        return Ok(None);
+    }
+    let fresh = crate::shard_rebalance::conn_for_execution_forwarded(&pool, exec_id).await?;
+    Ok(Some(Box::new(fresh)))
 }
 
 /// Load one execution row by id.
@@ -3613,6 +4130,15 @@ async fn load_execution_row(
 ///
 /// This is deliberately **never** consulted after an operation that DID take
 /// effect: re-driving a delivered signal would double-deliver it.
+///
+/// Every redrive site below drops its current `rebind` before calling
+/// [`resolve_live_attempt_id_best_effort`] again (fresh review, P1
+/// follow-up). The attempt just acted on can have moved shards, so `rebind`
+/// still holds that shard's connection open. A migrated attempt's retry
+/// successor is usually inserted on that SAME shard. Re-resolving while the
+/// old connection is still held would then need a second connection to that
+/// same pool. The documented single-connection configuration cannot supply
+/// one, so the resolve blocks until checkout times out instead of redriving.
 #[must_use]
 pub const fn redrive_target(acted_on: ExecutionId, freshly_resolved: ExecutionId) -> bool {
     acted_on.as_uuid().as_u128() != freshly_resolved.as_uuid().as_u128()
@@ -3642,28 +4168,48 @@ pub const fn redrive_target(acted_on: ExecutionId, freshly_resolved: ExecutionId
 /// [`HarvestError::Config`] when the resolved live attempt is already terminal
 /// (an exhausted chain), and [`HarvestError::Database`] for persistence
 /// failures.
+///
+/// `conn` is supplied by the caller. This function's signature predates
+/// sharding. It is a public part of the crate's API surface. A direct
+/// embedder can call it with a bare connection, so its shard is not known
+/// here. [`resolve_live_attempt_id_best_effort`] (issue #1596 review;
+/// follow-up review, comment 4052389744) recovers it from the row itself.
+/// It binds every hop it resolves to that hop's own real shard before the
+/// cancel runs against it. Resolving the id alone is not enough when the
+/// live attempt has moved, because `conn` itself does not move with it.
 pub async fn cancel_live_attempt(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     reason: &str,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<CancelledWorkflowExecution> {
-    let mut target = resolve_live_attempt_id(conn, exec_id).await?;
+    let (mut target, mut rebind) = resolve_live_attempt_id_best_effort(conn, exec_id).await?;
     for _ in 0..RETRY_CHAIN_MAX_REDRIVES {
-        match cancel_workflow_execution(conn, target, reason, metrics).await {
+        let active: &mut AsyncPgConnection = match &mut rebind {
+            Some(fresh) => fresh,
+            None => conn,
+        };
+        let result = cancel_workflow_execution(active, target, reason, metrics).await;
+        match result {
             Ok(result) => return Ok(result),
             Err(error) => {
-                let fresh = resolve_live_attempt_id(conn, exec_id)
+                drop(rebind.take());
+                let (fresh, fresh_rebind) = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
-                    .unwrap_or(target);
+                    .unwrap_or((target, None));
                 if !redrive_target(target, fresh) {
                     return Err(error);
                 }
                 target = fresh;
+                rebind = fresh_rebind;
             }
         }
     }
-    cancel_workflow_execution(conn, target, reason, metrics).await
+    let active: &mut AsyncPgConnection = match &mut rebind {
+        Some(fresh) => fresh,
+        None => conn,
+    };
+    cancel_workflow_execution(active, target, reason, metrics).await
 }
 
 /// Terminate the **live attempt** of the logical run named by `exec_id` (#843).
@@ -3683,15 +4229,27 @@ pub async fn cancel_live_attempt(
 ///
 /// Returns [`HarvestError::NotFound`] when the execution does not exist and
 /// [`HarvestError::Database`] for persistence failures.
+///
+/// `conn` is supplied by the caller. This function's signature predates
+/// sharding, so its shard is not known here.
+/// [`resolve_live_attempt_id_best_effort`] (issue #1596 review; follow-up
+/// review, comment 4052389744) recovers it from the row itself. It binds
+/// every hop it resolves to that hop's own real shard before the terminate
+/// runs against it.
 pub async fn terminate_live_attempt(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     reason: &str,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<CancelledWorkflowExecution> {
-    let mut target = resolve_live_attempt_id(conn, exec_id).await?;
+    let (mut target, mut rebind) = resolve_live_attempt_id_best_effort(conn, exec_id).await?;
     for _ in 0..RETRY_CHAIN_MAX_REDRIVES {
-        match terminate_workflow_execution(conn, target, reason, metrics).await {
+        let active: &mut AsyncPgConnection = match &mut rebind {
+            Some(fresh) => fresh,
+            None => conn,
+        };
+        let result = terminate_workflow_execution(active, target, reason, metrics).await;
+        match result {
             // A genuine seal, or an idempotent no-op against a row that is
             // terminal for a reason OTHER than a retryable failure, is the
             // final answer. Only a no-op against a `FAILED` row can mean the
@@ -3700,26 +4258,34 @@ pub async fn terminate_live_attempt(
                 return Ok(result);
             }
             Ok(result) => {
-                let fresh = resolve_live_attempt_id(conn, exec_id)
+                drop(rebind.take());
+                let (fresh, fresh_rebind) = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
-                    .unwrap_or(target);
+                    .unwrap_or((target, None));
                 if !redrive_target(target, fresh) {
                     return Ok(result);
                 }
                 target = fresh;
+                rebind = fresh_rebind;
             }
             Err(error) => {
-                let fresh = resolve_live_attempt_id(conn, exec_id)
+                drop(rebind.take());
+                let (fresh, fresh_rebind) = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
-                    .unwrap_or(target);
+                    .unwrap_or((target, None));
                 if !redrive_target(target, fresh) {
                     return Err(error);
                 }
                 target = fresh;
+                rebind = fresh_rebind;
             }
         }
     }
-    terminate_workflow_execution(conn, target, reason, metrics).await
+    let active: &mut AsyncPgConnection = match &mut rebind {
+        Some(fresh) => fresh,
+        None => conn,
+    };
+    terminate_workflow_execution(active, target, reason, metrics).await
 }
 
 /// Pause the **live attempt** of the logical run named by `exec_id` (#843).
@@ -3738,6 +4304,13 @@ pub async fn terminate_live_attempt(
 /// Returns [`HarvestError::NotFound`] when the execution does not exist,
 /// [`HarvestError::Config`] when the resolved live attempt is terminal (an
 /// exhausted chain), and [`HarvestError::Database`] for persistence failures.
+///
+/// `conn` is supplied by the caller. This function's signature predates
+/// sharding, so its shard is not known here.
+/// [`resolve_live_attempt_id_best_effort`] (issue #1596 review; follow-up
+/// review, comment 4052389744) recovers it from the row itself. It binds
+/// every hop it resolves to that hop's own real shard before the pause
+/// runs against it.
 pub async fn pause_live_attempt(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -3745,22 +4318,33 @@ pub async fn pause_live_attempt(
     actor: &str,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<PausedWorkflowExecution> {
-    let mut target = resolve_live_attempt_id(conn, exec_id).await?;
+    let (mut target, mut rebind) = resolve_live_attempt_id_best_effort(conn, exec_id).await?;
     for _ in 0..RETRY_CHAIN_MAX_REDRIVES {
-        match pause_workflow_execution(conn, target, reason, actor, metrics).await {
+        let active: &mut AsyncPgConnection = match &mut rebind {
+            Some(fresh) => fresh,
+            None => conn,
+        };
+        let result = pause_workflow_execution(active, target, reason, actor, metrics).await;
+        match result {
             Ok(result) => return Ok(result),
             Err(error) => {
-                let fresh = resolve_live_attempt_id(conn, exec_id)
+                drop(rebind.take());
+                let (fresh, fresh_rebind) = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
-                    .unwrap_or(target);
+                    .unwrap_or((target, None));
                 if !redrive_target(target, fresh) {
                     return Err(error);
                 }
                 target = fresh;
+                rebind = fresh_rebind;
             }
         }
     }
-    pause_workflow_execution(conn, target, reason, actor, metrics).await
+    let active: &mut AsyncPgConnection = match &mut rebind {
+        Some(fresh) => fresh,
+        None => conn,
+    };
+    pause_workflow_execution(active, target, reason, actor, metrics).await
 }
 
 /// Resume the **live attempt** of the logical run named by `exec_id` (#843).
@@ -3779,39 +4363,59 @@ pub async fn pause_live_attempt(
 ///
 /// Returns [`HarvestError::NotFound`] when the execution does not exist and
 /// [`HarvestError::Database`] for persistence failures.
+///
+/// `conn` is supplied by the caller. This function's signature predates
+/// sharding, so its shard is not known here.
+/// [`resolve_live_attempt_id_best_effort`] (issue #1596 review; follow-up
+/// review, comment 4052389744) recovers it from the row itself. It binds
+/// every hop it resolves to that hop's own real shard before the resume
+/// runs against it.
 pub async fn resume_live_attempt(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     actor: &str,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<ResumedWorkflowExecution> {
-    let mut target = resolve_live_attempt_id(conn, exec_id).await?;
+    let (mut target, mut rebind) = resolve_live_attempt_id_best_effort(conn, exec_id).await?;
     for _ in 0..RETRY_CHAIN_MAX_REDRIVES {
-        match resume_workflow_execution(conn, target, actor, metrics).await {
+        let active: &mut AsyncPgConnection = match &mut rebind {
+            Some(fresh) => fresh,
+            None => conn,
+        };
+        let result = resume_workflow_execution(active, target, actor, metrics).await;
+        match result {
             Ok(result) if result.newly_resumed || result.state != "FAILED" => {
                 return Ok(result);
             }
             Ok(result) => {
-                let fresh = resolve_live_attempt_id(conn, exec_id)
+                drop(rebind.take());
+                let (fresh, fresh_rebind) = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
-                    .unwrap_or(target);
+                    .unwrap_or((target, None));
                 if !redrive_target(target, fresh) {
                     return Ok(result);
                 }
                 target = fresh;
+                rebind = fresh_rebind;
             }
             Err(error) => {
-                let fresh = resolve_live_attempt_id(conn, exec_id)
+                drop(rebind.take());
+                let (fresh, fresh_rebind) = resolve_live_attempt_id_best_effort(conn, exec_id)
                     .await
-                    .unwrap_or(target);
+                    .unwrap_or((target, None));
                 if !redrive_target(target, fresh) {
                     return Err(error);
                 }
                 target = fresh;
+                rebind = fresh_rebind;
             }
         }
     }
-    resume_workflow_execution(conn, target, actor, metrics).await
+    let active: &mut AsyncPgConnection = match &mut rebind {
+        Some(fresh) => fresh,
+        None => conn,
+    };
+    resume_workflow_execution(active, target, actor, metrics).await
 }
 
 /// Maximum length of an operator-supplied pause reason (issue #383).
@@ -5339,8 +5943,28 @@ pub fn workflow_id_slot_is_released(state: &str) -> bool {
     matches!(state, "CONTINUED_AS_NEW" | "TERMINATED")
 }
 
-/// Non-locking lookup used for the `TerminateIfRunning` pre-check outside any
-/// transaction. Returns `None` if no active execution exists.
+/// Non-locking lookup used for the `TerminateIfRunning` pre-check outside
+/// any transaction.
+///
+/// Also used by [`crate::throttle::resolve_bypass`] to predict the
+/// authoritative start path's attach-vs-create decision ahead of it.
+/// Returns `None` if no non-sealed execution exists.
+///
+/// An observed-terminal `MIGRATED` seal no longer occupies the
+/// active-uniqueness slot (issue #1317). The widened index already excludes
+/// it. So a fresh start of any reuse policy succeeds against it via a plain
+/// `INSERT`. This function's callers care about the reuse-policy branch
+/// (`load_workflow_execution_by_key_for_update`'s ATTACH/CREATE decision).
+/// That branch is never even reached for a SOLE reconciled seal, because
+/// nothing conflicts with the insert.
+///
+/// Returning the seal as `Some` here would read as a live prior. That
+/// would wrongly tell `resolve_bypass` to skip the throttle reservation
+/// for what is actually a fresh admission (fresh review, P2 follow-up
+/// considered and rejected). See
+/// `an_allow_duplicate_start_creates_a_fresh_run_too_once_the_seal_is_reconciled`
+/// and `a_reconciled_seal_alone_does_not_bypass_the_throttle_token`. Both
+/// pin the fresh-create outcome this exclusion must keep agreeing with.
 pub async fn try_load_by_key(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
@@ -5350,6 +5974,7 @@ pub async fn try_load_by_key(
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
         .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
+        .filter(harvest_workflow_executions::migrated_run_terminal_at.is_null())
         .select(WorkflowExecution::as_select())
         .first(conn)
         .await
@@ -5497,9 +6122,19 @@ pub async fn resolve_execution_id_by_workflow_id(
 
     // No active run on this shard: the most-recently-started row is the
     // most-recent terminal.
+    //
+    // A reconciled `MIGRATED` seal (`migrated_run_terminal_at` set) is
+    // excluded outright rather than left to lose an ordinary `started_at`
+    // tie-break (issue #1317 review, P1 follow-up). In practice a fresh
+    // same-key run can only start after this seal's business key was
+    // released. Its own `started_at` is therefore always later and already
+    // wins here. The explicit exclusion removes the dependency on that
+    // timing invariant instead of relying on it. It matches every other
+    // "is this key still occupied" predicate in the engine.
     let terminal = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+        .filter(harvest_workflow_executions::migrated_run_terminal_at.is_null())
         .order(harvest_workflow_executions::started_at.desc())
         .select((
             harvest_workflow_executions::id,
@@ -5923,6 +6558,19 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
             let mut deferred_starts = Vec::new();
             let mut deferred_checks = Vec::new();
             let mut cancel_metrics = Vec::new();
+
+            // Acquire the business-key admission lock FIRST, before any row
+            // lock this transaction takes (issue #1596 review, comment_id
+            // 4055601101). `resolve_effective_signal_with_start_policy`
+            // below takes `FOR UPDATE` on the incumbent row for
+            // `AllowDuplicate`/`AllowDuplicateFailedOnly`. A concurrent
+            // ordinary start (`start_or_load_workflow_execution_collect_
+            // with_codecs_and_quota_override`) takes this SAME advisory
+            // lock before its own row lock. Taking the row lock first here
+            // would let the two transactions form a row-lock/advisory-lock
+            // cycle, which Postgres resolves by aborting one as a
+            // deadlock. One lock order, taken first everywhere, closes it.
+            lock_execution_admission(conn, request.workflow_name, request.workflow_id).await?;
 
             // Cross-execution dedupe: scope by (workflow_name, workflow_id, key)
             // so escalation/reset paths on a new exec_id don't re-queue the signal.
@@ -6997,6 +7645,74 @@ async fn resolve_effective_signal_with_start_policy(
     }
 }
 
+/// Domain-separated advisory-lock namespace for one `(workflow_name,
+/// workflow_id)` business key (issue #948 Codex review, comment
+/// 4053489196).
+///
+/// Length-prefixes `workflow_name` so two distinct keys can never resolve to
+/// the same namespace string. A bare `format!("{workflow_name}:{workflow_id}")`
+/// would let `("ab", "c")` and `("a", "b:c")` hash identically, since both
+/// join to `"ab:c"`-shaped text once either field itself contains the `:`
+/// separator. Recording the decimal length up front fixes exactly where
+/// `workflow_name` ends, so no content in either field can shift the
+/// boundary.
+#[cfg(feature = "db")]
+fn admission_lock_namespace(workflow_name: &str, workflow_id: &str) -> String {
+    format!(
+        "exec_admission:v1:{}:{workflow_name}:{workflow_id}",
+        workflow_name.len()
+    )
+}
+
+/// Serialize the whole admission decision for one `(workflow_name,
+/// workflow_id)` business key behind a transaction-scoped advisory lock
+/// (issue #948 Codex review, comment 4053489196, follow-up to c52d895).
+///
+/// Taken unconditionally, first, inside the admission transaction in
+/// [`start_or_load_workflow_execution_collect_with_codecs_and_quota_override`].
+/// Every reuse policy funnels through that one transaction. This single
+/// call point therefore serializes the occupant check, the reconciled-seal
+/// lookup, and the fresh `INSERT`, against every other start racing the
+/// same key.
+///
+/// Also taken first, for the same reason, at the top of the outer
+/// transactions in `signal_with_start_workflow_execution_with_metrics_and_
+/// codecs` and `update_with_start_workflow_execution_with_metrics_and_
+/// codecs` (issue #1596 review, `comment_id` 4055601101). Both resolve their
+/// effective reuse policy through a `FOR UPDATE` row lock on the incumbent
+/// row. Taking that row lock before this advisory lock would let a
+/// concurrent ordinary start -- which takes this lock first -- form a
+/// row-lock/advisory-lock cycle. One lock order, taken first on every
+/// admission path, closes it.
+///
+/// # Why the partial unique index does not already do this
+///
+/// The active-uniqueness index only covers non-sealed rows. A reconciled
+/// `MIGRATED` seal is deliberately excluded from it too (issue #1317). Two
+/// concurrent starts can therefore both find no occupant, and both read
+/// the same reconciled seal, and both act on it. A third transaction's
+/// plain `INSERT` for the same key can land in between. Nothing in the
+/// index serializes that interleaving. This lock closes the window for
+/// every reuse policy, not only the two that read the reconciled seal.
+///
+/// `pg_advisory_xact_lock` releases automatically at commit or rollback, so
+/// it needs no explicit unlock and cannot outlive the admission
+/// transaction it guards.
+#[cfg(feature = "db")]
+async fn lock_execution_admission(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> HarvestResult<()> {
+    let namespace = admission_lock_namespace(workflow_name, workflow_id);
+    diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind::<diesel::sql_types::Text, _>(namespace)
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+    Ok(())
+}
+
 /// Locking variant of [`try_load_by_key`] used by
 /// [`signal_with_start_workflow_execution`]'s resolver. Returns `None` when
 /// no active execution exists. Acquires `FOR UPDATE` so the caller's outer
@@ -7008,10 +7724,19 @@ async fn try_load_active_execution_for_update(
     workflow_name: &str,
     workflow_id: &str,
 ) -> HarvestResult<Option<WorkflowExecution>> {
+    // An observed-terminal `MIGRATED` seal no longer occupies the
+    // active-uniqueness slot (issue #1317). The widened index already
+    // excludes it. Callers of this function read `Some` as "a prior
+    // occupies the slot": the admission gate's
+    // `start_will_create_new_execution` check, and the `signal_with_start`
+    // policy resolver. Neither has a `seal_observed_terminal` check of its
+    // own. A sole reconciled seal must therefore read as `None` here,
+    // matching the INSERT it would not actually block.
     harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
         .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
+        .filter(harvest_workflow_executions::migrated_run_terminal_at.is_null())
         .select(WorkflowExecution::as_select())
         .for_update()
         .first(conn)
@@ -7099,10 +7824,22 @@ async fn load_workflow_execution_by_key_for_update(
     workflow_name: &str,
     workflow_id: &str,
 ) -> HarvestResult<WorkflowExecution> {
+    // A reconciled `MIGRATED` seal (`migrated_run_terminal_at` set) and a
+    // fresh replacement row can both match this filter at once (issue
+    // #1317 review). The seal is excluded from the active partial index.
+    // It is not excluded from this non-sealed filter, which only excludes
+    // `CONTINUED_AS_NEW`/`TERMINATED`. Order the released seal LAST so a
+    // live replacement always wins the `for_update` lock. The seal is
+    // only ever returned when it is the sole match.
     harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
         .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
+        .order(
+            harvest_workflow_executions::migrated_run_terminal_at
+                .is_null()
+                .desc(),
+        )
         .select(WorkflowExecution::as_select())
         .for_update()
         .first(conn)
@@ -7307,6 +8044,13 @@ pub async fn update_with_start_workflow_execution_with_metrics_and_codecs(
             let mut deferred_starts = Vec::new();
             let mut deferred_checks = Vec::new();
             let mut cancel_metrics = Vec::new();
+
+            // Acquire the business-key admission lock FIRST, before any row
+            // lock this transaction takes (issue #1596 review, comment_id
+            // 4055601101). See the sibling comment in
+            // `signal_with_start_workflow_execution_with_metrics_and_codecs`
+            // for the deadlock this ordering closes.
+            lock_execution_admission(conn, request.workflow_name, request.workflow_id).await?;
 
             // Cross-execution idempotency dedupe scoped to (workflow_name, workflow_id).
             // When an idempotency key is provided we look up by the supplied update_id

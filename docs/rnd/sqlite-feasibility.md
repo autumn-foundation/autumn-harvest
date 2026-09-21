@@ -57,15 +57,15 @@ module counts at the audited revision, recomputed by CI:
 | `diesel` query layer | 58 modules | Query construction is mechanical; the *type* layer is not. |
 | `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 15 modules | Only by dropping multi-worker concurrency. |
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 17 modules | Subsumed by the single write lock. |
-| `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 13 modules | Yes — integer epoch milliseconds. |
+| `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 14 modules | Yes — integer epoch milliseconds. |
 | `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 40 modules | Case by case — the SQL must be read, not inferred from the ORM. |
 | `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 28 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
-| `advisory-lock` (`pg_advisory_*` / `pg_try_advisory_*`) | 12 modules | Subsumed by the single write lock. |
+| `advisory-lock` (`pg_advisory_*` / `pg_try_advisory_*`) | 13 modules | Subsumed by the single write lock. |
 | `to_regclass` table-existence probes | 9 modules | Yes — `sqlite_master` lookup. |
 | `listen/notify` push wakeups | 4 modules | No — polling is a degradation, not a translation. |
 | `gen_random_uuid` server-side ids | 1 module | Yes — mint application-side. |
 
-Plus **107 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
+Plus **110 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
 `INTERVAL`, `UUID`, partial indexes, `gen_random_uuid()` defaults), none of
 which apply to SQLite. The SQLite crate does not translate them; it declares
 its own schema.
@@ -168,7 +168,7 @@ Classification rule:
 | `calendar` | diesel | (a) | Plain CRUD. |
 | `codec_rotation` | diesel, interval-sql, raw-pg-sql, raw-sql, to_regclass | (b) | Lazy re-encryption sweep (issue #948). Every Postgres-ism is a rewrite, not a capability: `::jsonb`/`::TEXT` casts, a `JOIN LATERAL` over the payload-field allowlist, a `~` regex validating the stored key id, and a `to_regclass` probe for the cursor table. The `~` check is the only awkward one — validate the key id in Rust, as the decoder already does. No claim, no lock: the sweep is a batched scan whose writes are compare-and-swaps. |
 | `completion_callback` | diesel, skip-locked, row-lock, to_regclass, raw-sql | (c) | Two-transaction claim scanner; multi-worker delivery dropped. |
-| `completion_trigger` | diesel, skip-locked, advisory-lock, raw-sql | (c) | Terminal-commit fan-out; claim semantics dropped. |
+| `completion_trigger` | diesel, interval-sql, skip-locked, advisory-lock, raw-sql | (c) | Terminal-commit fan-out; claim semantics dropped. The outbox relay's backoff deadlines are computed as `clock_timestamp() + make_interval(secs => …)` (issue #1392) — integer epoch ms for the interval arithmetic, as `build_routing` does. |
 | `concurrency` | diesel, skip-locked, advisory-lock, raw-pg-sql, raw-sql | (c) | Was a pure consumer of the claim invariant; the latest-wins supersede path (#811) added a `pg_advisory_xact_lock(hashtext(key)::bigint)` critical section and a raw candidate scan of its own. Per-key fleet limits are meaningless single-writer, and the advisory lock is subsumed by the single write lock. |
 | `context` | diesel, listen/notify | (c) | Wakeup path; no push primitive exists. |
 | `cross_shard_child` | diesel, interval-sql, raw-pg-sql, raw-sql, row-lock, to_regclass | (c) | The cross-shard child relay (#956). Not a translation problem — the module exists **because** there is more than one database. A single-file SQLite deployment has exactly one shard, so the whole capability (placement, the relay, the outbox row) has nothing to do and would be dropped wholesale, exactly like the per-key fleet limits in `concurrency`. Its own mechanisms are mild (Diesel, one `FOR UPDATE` on the parent row before the terminal append — subsumed by the single write lock — a raw `INTERVAL` retry-backoff predicate that would become integer epoch ms exactly as `build_routing` does, and a `to_regclass('…')::text` probe that lets the relay skip quietly on a database whose migrations have not run — `sqlite_master` answers the same question); the coupling is architectural, not syntactic. |
@@ -177,7 +177,7 @@ Classification rule:
 | `erase` | diesel, row-lock | (b) | Scrub holds a row lock; subsumed by the single write lock. |
 | `error` | diesel, skip-locked | (c) | **Comment-only consumer, like `concurrency` above and `store` below.** `SuspendedClaimAmbiguous` (issue #1182) represents the ambiguity a `SKIP LOCKED` claim probe can produce; a single-writer engine has no such ambiguity to represent, so the variant itself would not exist there. |
 | `event_batch` | diesel, skip-locked, to_regclass, raw-pg-sql, raw-sql | (c) | Scanner claim. |
-| `execution` | diesel, skip-locked, row-lock, interval-sql, raw-pg-sql, raw-sql | (c) | Start/reuse matrix under `FOR UPDATE`; row-lock ordering is load-bearing. |
+| `execution` | diesel, skip-locked, row-lock, advisory-lock, interval-sql, raw-pg-sql, raw-sql | (c) | Start/reuse matrix under `FOR UPDATE`; row-lock ordering is load-bearing. Issue #1596 review added `pg_advisory_xact_lock(hashtext(key)::bigint)` ahead of the row lock, closing an admission race between concurrent starts and a reconciled seal; subsumed by the single write lock. |
 | `external_target_location` | diesel | (c) | Placement-aware resolution for `workflow_id`-addressed signal/cancel (#1146). Like `cross_shard_child` above, the coupling is **architectural, not syntactic**: the module exists *because* there is more than one database. It answers "which shard holds this business key?" by fanning a read across every expected shard and merging the per-shard answers. A single-file SQLite deployment has exactly one shard, so the fan-out has nothing to do — the engine's own single-shard short-circuit already skips it — and the whole module would be dropped, leaving the shard-local resolver it delegates to (`execution::resolve_execution_id_by_workflow_id`) as the entire answer. Its lone mechanism is the `AsyncPgConnection` in its signatures. |
 | `external_task` | diesel, row-lock | (b) | `find_by_token_locked` serialises completion/failure; subsumed. |
 | `handle` | diesel | (a) | Read paths. |

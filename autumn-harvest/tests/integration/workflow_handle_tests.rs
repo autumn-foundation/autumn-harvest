@@ -39,6 +39,44 @@ async fn setup_database_url() -> (String, ContainerAsync<Postgres>) {
     (database_url, container)
 }
 
+fn rewrite_pg_db(base: &str, db: &str) -> String {
+    let after_scheme = base.find("://").map_or(0, |i| i + 3);
+    let rest = &base[after_scheme..];
+    let (authority, tail) = rest
+        .find('/')
+        .map_or((rest, ""), |i| (&rest[..i], &rest[i + 1..]));
+    let query = tail.find('?').map_or("", |i| &tail[i..]);
+    format!("{}{}/{}{}", &base[..after_scheme], authority, db, query)
+}
+
+/// Dual-mode database URL: a throwaway database against
+/// `HARVEST_TEST_DATABASE_URL` when set, otherwise a fresh testcontainers
+/// Postgres. Returns `None` in the container slot for the throwaway-database
+/// path since there is no container to keep alive.
+async fn setup_isolated_database_url() -> (String, Option<ContainerAsync<Postgres>>) {
+    use diesel_async::SimpleAsyncConnection;
+    if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        let db_name = format!("harvest1317_{}", uuid::Uuid::new_v4().simple());
+        let mut admin = <AsyncPgConnection as AsyncConnection>::establish(&base_url)
+            .await
+            .expect("connect to HARVEST_TEST_DATABASE_URL base");
+        admin
+            .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
+            .await
+            .expect("create per-test database");
+        let new_url = rewrite_pg_db(&base_url, &db_name);
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&new_url)
+            .await
+            .expect("connect to per-test database");
+        conn.batch_execute(&autumn_harvest::test_init_sql())
+            .await
+            .expect("apply migrations to per-test database");
+        return (new_url, None);
+    }
+    let (url, container) = setup_database_url().await;
+    (url, Some(container))
+}
+
 fn build_pool(database_url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
     deadpool::managed::Pool::builder(manager)
@@ -216,6 +254,290 @@ async fn result_raw_wakes_on_harvest_events_notification() {
         .expect("result should be successful");
 
     assert_eq!(result, serde_json::json!({"ok": true}));
+}
+
+/// Issue #1317 review, P1: a listener stays bound to whichever shard it
+/// resolved at connect time. If the execution migrates to a different
+/// shard while `result_raw` is waiting, the old connection stays healthy,
+/// with no `ChannelClosed`. Nothing wakes it again unless it rebinds on
+/// its own.
+///
+/// This models the RESULT of a migration directly: copy the row onto the
+/// new shard, seal the old one with a forwarding pointer. It skips the
+/// full staging/verification/cutover machinery, which is orthogonal to
+/// the listener-rebind behavior under test.
+#[tokio::test]
+async fn result_raw_rebinds_its_listener_after_a_migration() {
+    #[derive(diesel::QueryableByName)]
+    struct JsonRow {
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        payload: serde_json::Value,
+    }
+
+    let (url_a, _container_a) = setup_isolated_database_url().await;
+    let (url_b, _container_b) = setup_isolated_database_url().await;
+    let pool_a = build_pool(&url_a);
+    let pool_b = build_pool(&url_b);
+    let mut conn_a = <AsyncPgConnection as AsyncConnection>::establish(&url_a)
+        .await
+        .expect("connect a");
+    let mut conn_b = <AsyncPgConnection as AsyncConnection>::establish(&url_b)
+        .await
+        .expect("connect b");
+
+    let shard_a = autumn_harvest::ShardId::new(0);
+    let shard_b = autumn_harvest::ShardId::new(1);
+    let exec_id = ExecutionId::new_for_shard(shard_a);
+    let started = start_running_workflow(&mut conn_a, exec_id).await;
+
+    let pools: std::collections::BTreeMap<_, _> =
+        [(shard_a, pool_a), (shard_b, pool_b)].into_iter().collect();
+    let sharded_pool = ShardedDbPool::from_map(pools, shard_a);
+    let router = ShardRouter::new(vec![shard_a, shard_b], vec![shard_a, shard_b], shard_a);
+    let client = WorkflowHandleClient::new(
+        sharded_pool,
+        router,
+        [(shard_a, url_a.clone()), (shard_b, url_b.clone())],
+    );
+    let handle = client.handle(started.exec_id);
+
+    let waiter = tokio::spawn(async move { handle.result_raw().await });
+    // Give the waiter time to connect its listener to shard A first.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let row: JsonRow = diesel::sql_query(
+        "SELECT to_jsonb(e) AS payload FROM harvest_workflow_executions e WHERE e.id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(&mut conn_a)
+    .await
+    .expect("read the row to copy");
+
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             SELECT * FROM jsonb_populate_record( \
+                 NULL::harvest_workflow_executions, \
+                 $1::jsonb || jsonb_build_object('shard_id', $2::int))",
+    )
+    .bind::<diesel::sql_types::Jsonb, _>(&row.payload)
+    .bind::<diesel::sql_types::Integer, _>(shard_b.as_i32())
+    .execute(&mut conn_b)
+    .await
+    .expect("copy the row onto shard B");
+
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+            SET state = 'MIGRATED', migrated_to_shard = $2, migrated_at = NOW() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Integer, _>(shard_b.as_i32())
+    .execute(&mut conn_a)
+    .await
+    .expect("seal shard A's row with a forwarding pointer");
+
+    // Give the shard-change check a chance to run against a listener still
+    // bound to shard A, exactly as it would find a real in-flight migration.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    mark_completed(&mut conn_b, exec_id).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect(
+            "the handle must rebind to shard B and wake on its notification, \
+             not hang past the timeout waiting on shard A's stale listener",
+        )
+        .expect("waiter task should not panic")
+        .expect("result should be successful");
+
+    assert_eq!(result, serde_json::json!({"ok": true}));
+}
+
+/// Issue #1317 review, P1 follow-up (companion to the test above).
+/// `result_raw_with_timeout` connects its listener once. Before this fix,
+/// it waited the entire caller-supplied timeout on it. A migration
+/// landing mid-wait would go unnoticed until that timeout elapsed, which
+/// can be minutes or hours. The 30-second timeout used here would fail
+/// this test's own 10-second outer timeout if the fix regressed.
+#[tokio::test]
+async fn result_raw_with_timeout_rebinds_its_listener_after_a_migration() {
+    #[derive(diesel::QueryableByName)]
+    struct JsonRow {
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        payload: serde_json::Value,
+    }
+
+    let (url_a, _container_a) = setup_isolated_database_url().await;
+    let (url_b, _container_b) = setup_isolated_database_url().await;
+    let pool_a = build_pool(&url_a);
+    let pool_b = build_pool(&url_b);
+    let mut conn_a = <AsyncPgConnection as AsyncConnection>::establish(&url_a)
+        .await
+        .expect("connect a");
+    let mut conn_b = <AsyncPgConnection as AsyncConnection>::establish(&url_b)
+        .await
+        .expect("connect b");
+
+    let shard_a = autumn_harvest::ShardId::new(0);
+    let shard_b = autumn_harvest::ShardId::new(1);
+    let exec_id = ExecutionId::new_for_shard(shard_a);
+    let started = start_running_workflow(&mut conn_a, exec_id).await;
+
+    let pools: std::collections::BTreeMap<_, _> =
+        [(shard_a, pool_a), (shard_b, pool_b)].into_iter().collect();
+    let sharded_pool = ShardedDbPool::from_map(pools, shard_a);
+    let router = ShardRouter::new(vec![shard_a, shard_b], vec![shard_a, shard_b], shard_a);
+    let client = WorkflowHandleClient::new(
+        sharded_pool,
+        router,
+        [(shard_a, url_a.clone()), (shard_b, url_b.clone())],
+    );
+    let handle = client.handle(started.exec_id);
+
+    let waiter = tokio::spawn(async move {
+        handle
+            .result_raw_with_timeout(Duration::from_secs(30))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let row: JsonRow = diesel::sql_query(
+        "SELECT to_jsonb(e) AS payload FROM harvest_workflow_executions e WHERE e.id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(&mut conn_a)
+    .await
+    .expect("read the row to copy");
+
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             SELECT * FROM jsonb_populate_record( \
+                 NULL::harvest_workflow_executions, \
+                 $1::jsonb || jsonb_build_object('shard_id', $2::int))",
+    )
+    .bind::<diesel::sql_types::Jsonb, _>(&row.payload)
+    .bind::<diesel::sql_types::Integer, _>(shard_b.as_i32())
+    .execute(&mut conn_b)
+    .await
+    .expect("copy the row onto shard B");
+
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+            SET state = 'MIGRATED', migrated_to_shard = $2, migrated_at = NOW() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Integer, _>(shard_b.as_i32())
+    .execute(&mut conn_a)
+    .await
+    .expect("seal shard A's row with a forwarding pointer");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    mark_completed(&mut conn_b, exec_id).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect(
+            "the handle must rebind to shard B and wake on its notification, \
+             not wait out the full 30s caller timeout on shard A's stale listener",
+        )
+        .expect("waiter task should not panic")
+        .expect("result should be successful");
+
+    assert_eq!(result, serde_json::json!({"ok": true}));
+}
+
+/// Issue #1317 review, P1 follow-up (companion to the tests above):
+/// `result_snapshot_with_wait` has the same single-connect listener
+/// pattern. A 30-second wait timeout would fail this test's own 10-second
+/// outer timeout if the fix regressed.
+#[tokio::test]
+async fn result_snapshot_with_wait_rebinds_its_listener_after_a_migration() {
+    #[derive(diesel::QueryableByName)]
+    struct JsonRow {
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        payload: serde_json::Value,
+    }
+
+    let (url_a, _container_a) = setup_isolated_database_url().await;
+    let (url_b, _container_b) = setup_isolated_database_url().await;
+    let pool_a = build_pool(&url_a);
+    let pool_b = build_pool(&url_b);
+    let mut conn_a = <AsyncPgConnection as AsyncConnection>::establish(&url_a)
+        .await
+        .expect("connect a");
+    let mut conn_b = <AsyncPgConnection as AsyncConnection>::establish(&url_b)
+        .await
+        .expect("connect b");
+
+    let shard_a = autumn_harvest::ShardId::new(0);
+    let shard_b = autumn_harvest::ShardId::new(1);
+    let exec_id = ExecutionId::new_for_shard(shard_a);
+    let started = start_running_workflow(&mut conn_a, exec_id).await;
+
+    let pools: std::collections::BTreeMap<_, _> =
+        [(shard_a, pool_a), (shard_b, pool_b)].into_iter().collect();
+    let sharded_pool = ShardedDbPool::from_map(pools, shard_a);
+    let router = ShardRouter::new(vec![shard_a, shard_b], vec![shard_a, shard_b], shard_a);
+    let client = WorkflowHandleClient::new(
+        sharded_pool,
+        router,
+        [(shard_a, url_a.clone()), (shard_b, url_b.clone())],
+    );
+    let handle = client.handle(started.exec_id);
+
+    let waiter = tokio::spawn(async move {
+        handle
+            .result_snapshot_with_wait(Duration::from_secs(30))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let row: JsonRow = diesel::sql_query(
+        "SELECT to_jsonb(e) AS payload FROM harvest_workflow_executions e WHERE e.id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(&mut conn_a)
+    .await
+    .expect("read the row to copy");
+
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             SELECT * FROM jsonb_populate_record( \
+                 NULL::harvest_workflow_executions, \
+                 $1::jsonb || jsonb_build_object('shard_id', $2::int))",
+    )
+    .bind::<diesel::sql_types::Jsonb, _>(&row.payload)
+    .bind::<diesel::sql_types::Integer, _>(shard_b.as_i32())
+    .execute(&mut conn_b)
+    .await
+    .expect("copy the row onto shard B");
+
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+            SET state = 'MIGRATED', migrated_to_shard = $2, migrated_at = NOW() \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Integer, _>(shard_b.as_i32())
+    .execute(&mut conn_a)
+    .await
+    .expect("seal shard A's row with a forwarding pointer");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    mark_completed(&mut conn_b, exec_id).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect(
+            "the handle must rebind to shard B and wake on its notification, \
+             not wait out the full 30s caller timeout on shard A's stale listener",
+        )
+        .expect("waiter task should not panic")
+        .expect("wait should not fail");
+
+    let snapshot = result.expect("workflow must be terminal, not a 204-style miss");
+    assert_eq!(snapshot.state, WorkflowResultState::Completed);
 }
 
 #[tokio::test]
