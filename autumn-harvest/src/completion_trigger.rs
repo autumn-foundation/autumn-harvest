@@ -2662,53 +2662,56 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                 // existence check run immediately after is therefore the
                 // last possible look, and cannot miss a delivery that beat
                 // us to the target.
-                let claimed: Result<usize, crate::error::HarvestError> =
+                //
+                // The claim, the check, and the fires update all run
+                // inside ONE open transaction (issue #1401, Codex follow-up
+                // x9), not as separate steps. A failure at any step rolls
+                // back the delete too. The outbox row is restored for the
+                // next scan tick to retry, instead of being permanently
+                // lost while `fires.outcome` stays NULL.
+                let resolved: Result<bool, crate::error::HarvestError> =
                     Box::pin(conn.transaction(async |tx| {
-                        diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
+                        let deleted = diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
                             .filter(outbox_dsl::id.eq(task.id))
                             .execute(tx)
                             .await
-                            .map_err(crate::error::database_error)
-                    }))
-                    .await;
-                let resolved: Result<bool, crate::error::HarvestError> = match claimed {
-                    // Zero rows deleted means another attempt already
-                    // claimed and resolved this row (issue #1401, Codex
-                    // follow-up). Nothing left for us to do.
-                    Ok(0) => Ok(false),
-                    Ok(_) => {
-                        match crate::execution::execution_exists_by_key(
+                            .map_err(crate::error::database_error)?;
+                        // Zero rows deleted means another attempt already
+                        // claimed and resolved this row (issue #1401, Codex
+                        // follow-up). Nothing left for us to do.
+                        if deleted == 0 {
+                            return Ok(false);
+                        }
+
+                        let already_delivered = crate::execution::execution_exists_by_key(
                             &mut target_conn,
                             &task.target_workflow_name,
                             &task.target_workflow_id,
                         )
-                        .await
-                        {
-                            Ok(true) => {
-                                tracing::debug!(
-                                    source_exec_id = %task.source_exec_id,
-                                    trigger_id = %task.trigger_id,
-                                    "[completion_trigger outbox] target already exists \
-                                     (any state); treating the stale outbox row as \
-                                     delivered, not rejected"
-                                );
-                                Ok(false)
-                            }
-                            Ok(false) => diesel::update(
-                                fires_dsl::harvest_completion_trigger_fires
-                                    .filter(fires_dsl::source_exec_id.eq(task.source_exec_id))
-                                    .filter(fires_dsl::trigger_id.eq(task.trigger_id)),
-                            )
-                            .set(fires_dsl::outcome.eq(Some("payload_too_large")))
-                            .execute(conn)
-                            .await
-                            .map_err(crate::error::database_error)
-                            .map(|_| true),
-                            Err(e) => Err(e),
+                        .await?;
+                        if already_delivered {
+                            tracing::debug!(
+                                source_exec_id = %task.source_exec_id,
+                                trigger_id = %task.trigger_id,
+                                "[completion_trigger outbox] target already exists (any \
+                                 state); treating the stale outbox row as delivered, \
+                                 not rejected"
+                            );
+                            return Ok(false);
                         }
-                    }
-                    Err(e) => Err(e),
-                };
+
+                        diesel::update(
+                            fires_dsl::harvest_completion_trigger_fires
+                                .filter(fires_dsl::source_exec_id.eq(task.source_exec_id))
+                                .filter(fires_dsl::trigger_id.eq(task.trigger_id)),
+                        )
+                        .set(fires_dsl::outcome.eq(Some("payload_too_large")))
+                        .execute(tx)
+                        .await
+                        .map_err(crate::error::database_error)?;
+                        Ok(true)
+                    }))
+                    .await;
                 match resolved {
                     Ok(false) => {
                         tracing::warn!(
@@ -2726,13 +2729,10 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                             "[completion_trigger outbox] failed to resolve the \
                              permanently-rejected fire; backing off this outbox row"
                         );
-                        // A back off applies whether or not the claim itself
-                        // succeeded (issue #1401, Codex follow-up). If the
-                        // claim failed, the row is untouched. It would
-                        // otherwise retry at full poll cadence forever. If
-                        // the claim succeeded and only the existence check
-                        // or fires update failed, the row is already gone,
-                        // so this call is a harmless no-op. It mirrors the
+                        // The whole transaction rolled back on any Err, so
+                        // the outbox row is untouched here (issue #1401,
+                        // Codex follow-up). Without this backoff it would
+                        // retry at full poll cadence forever, mirroring the
                         // generic error arm below.
                         stamp_outbox_relay_backoff(conn, task.id).await;
                     }

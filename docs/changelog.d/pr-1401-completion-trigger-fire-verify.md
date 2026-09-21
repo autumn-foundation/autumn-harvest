@@ -99,6 +99,18 @@ this path, matching the generic error arm; previously a failure here left
 the outbox row's backoff untouched, so it retried at full poll cadence
 regardless of the failure.
 
+**Payload-rejection resolution, made fully atomic** (Codex follow-up x9).
+The claim (delete), the cross-shard existence check, and the fires update
+were three separate steps: if the check or the update failed after the
+delete had already committed, the outbox row was permanently gone while
+`fires.outcome` stayed `NULL` — a fire no scanner would ever revisit, and
+the backoff call on that failure path was a no-op with nothing left to
+stamp. All three now run inside one open transaction: the cross-shard
+check is awaited in the middle of the transaction closure, and a failure
+at any step rolls the delete back too, restoring the outbox row for the
+next scan tick to retry. The backoff call is no longer a conditional
+no-op — every failure in this path now leaves a real row to back off.
+
 **Confirmed delivered, precisely.** `outcome IS NULL` alone is set at
 trigger-evaluation time, before any relay attempt — not proof of delivery.
 The scan additionally requires the matching `harvest_completion_trigger_outbox`
