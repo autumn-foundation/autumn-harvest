@@ -3044,9 +3044,15 @@ mod probes {
     /// the SAME business key -- present, but a forwarding pointer, not the
     /// run. That seal proves the key was claimed. It does not prove the
     /// runnable target survived THIS restore, since the actual row is not
-    /// on this shard's snapshot at all. `all_migrated` is true only when
-    /// every matched row under a key is such a seal. A key with at least
-    /// one non-seal row (the common case) still reads as a genuine match.
+    /// on this shard's snapshot at all. UNLESS the reconciler already
+    /// observed the live copy reach a terminal state. That state is
+    /// `migrated_run_terminal_at IS NOT NULL` (Codex follow-up x17), and
+    /// is durable proof of delivery in its own right. Such a row then
+    /// counts as a genuine match here, not a seal still needing to be
+    /// chased. `all_migrated` is true only when every matched row under a
+    /// key is an UNRECONCILED seal. A key with at least one non-seal or
+    /// already-reconciled row (the common case) still reads as a genuine
+    /// match.
     async fn matching_workflow_executions(
         conn: &mut AsyncPgConnection,
         names: &[String],
@@ -3054,7 +3060,8 @@ mod probes {
     ) -> Result<Vec<WorkflowExecutionMatchRow>, diesel::result::Error> {
         diesel::sql_query(
             "SELECT e.workflow_name, e.workflow_id, \
-                 bool_and(e.state = 'MIGRATED') AS all_migrated, \
+                 bool_and(e.state = 'MIGRATED' AND e.migrated_run_terminal_at IS NULL) \
+                   AS all_migrated, \
                  MAX(e.migrated_to_shard) AS migrated_to_shard \
              FROM harvest_workflow_executions e \
              JOIN UNNEST($1::text[], $2::text[]) AS t(workflow_name, workflow_id) \
@@ -3666,44 +3673,85 @@ mod probes {
         Ok((existing, migrated_seal_only))
     }
 
-    /// Try to confirm each `MIGRATED`-seal-only key on the shard its seal
-    /// points to, one round trip per distinct destination shard (Codex
-    /// follow-up x16). A destination outside the supplied `--shard` list,
-    /// or unreachable, is left unconfirmed. The caller keeps reporting it
-    /// `unproven`, same as today. This is a SINGLE hop. A seal found on
-    /// the destination that is itself another seal still counts as
-    /// confirmed here. That mirrors the single-hop `migrated_to_shard`
-    /// convention already used elsewhere in the engine. A chained
-    /// migration is a residual limitation, not a regression this
-    /// introduces.
+    /// Try to confirm each `MIGRATED`-seal-only key by following its
+    /// forwarding chain, one round trip per distinct shard per hop (Codex
+    /// follow-up x16/x18). `shard_rebalance.rs` explicitly supports A -> B
+    /// -> C chains. A destination that is ITSELF an unreconciled seal
+    /// keeps chasing its own `migrated_to_shard` rather than being
+    /// accepted on sight. Bounded at `targets.len()` hops. A legitimate
+    /// chain cannot revisit a shard, so needing more hops than shards
+    /// exist means a cycle, and this stops rather than looping forever.
+    ///
+    /// A destination row genuinely absent still proves delivery via
+    /// `harvest_execution_summaries` (Codex follow-up x19), mirroring the
+    /// ordinary absent-target path elsewhere in this module. A shard
+    /// outside the supplied `--shard` list, or unreachable, is left
+    /// unconfirmed at that hop. The caller keeps reporting the fire
+    /// `unproven`, same as before this function existed.
     async fn confirm_migrated_seals(
         targets: &[ShardTarget],
         seals: &std::collections::HashMap<(String, String), Option<i32>>,
     ) -> std::collections::HashSet<(String, String)> {
-        let mut by_shard: std::collections::BTreeMap<i32, Vec<(String, String)>> =
-            std::collections::BTreeMap::new();
-        for (key, dest) in seals {
-            if let Some(dest_shard) = dest {
-                by_shard.entry(*dest_shard).or_default().push(key.clone());
-            }
-        }
-
         let mut confirmed = std::collections::HashSet::new();
-        for (dest_shard, keys) in by_shard {
-            let Some(target) = targets.iter().find(|t| t.shard_id == dest_shard) else {
-                continue;
-            };
-            let Ok(mut dest_conn) = connect_read_only(&target.dsn).await else {
-                continue;
-            };
-            let names: Vec<String> = keys.iter().map(|(n, _)| n.clone()).collect();
-            let ids: Vec<String> = keys.iter().map(|(_, i)| i.clone()).collect();
-            if let Ok(found) =
-                matching_workflow_keys(&mut dest_conn, "harvest_workflow_executions", &names, &ids)
-                    .await
-            {
-                confirmed.extend(found);
+        let mut pending: std::collections::HashMap<(String, String), i32> = seals
+            .iter()
+            .filter_map(|(key, dest)| dest.map(|shard| (key.clone(), shard)))
+            .collect();
+
+        for _ in 0..targets.len().max(1) {
+            if pending.is_empty() {
+                break;
             }
+            let mut by_shard: std::collections::BTreeMap<i32, Vec<(String, String)>> =
+                std::collections::BTreeMap::new();
+            for (key, shard) in &pending {
+                by_shard.entry(*shard).or_default().push(key.clone());
+            }
+
+            let mut next_pending = std::collections::HashMap::new();
+            for (dest_shard, keys) in by_shard {
+                let Some(target) = targets.iter().find(|t| t.shard_id == dest_shard) else {
+                    continue;
+                };
+                let Ok(mut dest_conn) = connect_read_only(&target.dsn).await else {
+                    continue;
+                };
+                let names: Vec<String> = keys.iter().map(|(n, _)| n.clone()).collect();
+                let ids: Vec<String> = keys.iter().map(|(_, i)| i.clone()).collect();
+
+                let Ok((existing, still_seals)) =
+                    match_live_targets(&mut dest_conn, &names, &ids).await
+                else {
+                    continue;
+                };
+                confirmed.extend(keys.iter().filter(|k| existing.contains(*k)).cloned());
+
+                let absent: Vec<(String, String)> = keys
+                    .into_iter()
+                    .filter(|k| !existing.contains(k) && !still_seals.contains_key(k))
+                    .collect();
+                if !absent.is_empty() {
+                    let absent_names: Vec<String> = absent.iter().map(|(n, _)| n.clone()).collect();
+                    let absent_ids: Vec<String> = absent.iter().map(|(_, i)| i.clone()).collect();
+                    if let Ok(retained) = matching_workflow_keys(
+                        &mut dest_conn,
+                        "harvest_execution_summaries",
+                        &absent_names,
+                        &absent_ids,
+                    )
+                    .await
+                    {
+                        confirmed.extend(retained);
+                    }
+                }
+
+                for (key, next_shard) in still_seals {
+                    if let Some(next_shard) = next_shard {
+                        next_pending.insert(key, next_shard);
+                    }
+                }
+            }
+            pending = next_pending;
         }
         confirmed
     }
