@@ -1214,6 +1214,153 @@ impl HandlerRegistry {
                 per.max(self.max_activity_input_bytes)
             })
     }
+
+    /// Resolve the declared `execution_timeout`/`sla`/ceiling for a
+    /// scheduler-initiated start of `name` (issue #1412).
+    ///
+    /// `name` is a registered workflow's own name. `name` can also be a
+    /// DAG's shadow `WorkflowInfo` name (`DagInfo::as_workflow_info`
+    /// registers a DAG under its own name). One lookup covers both kinds.
+    ///
+    /// Returns raw declared values. This function clamps nothing. A caller
+    /// applies the ceiling to `execution_timeout` itself. A caller also
+    /// clamps `sla` to `execution_timeout` itself, when needed. Behavior
+    /// does not change from before this extraction. This function
+    /// centralizes the lookup only, not the downstream policy.
+    ///
+    /// `(None, None, None)` when `name` is not registered and the registry
+    /// declares no fleet-wide ceiling.
+    #[must_use]
+    pub fn resolve_dispatch_deadline(
+        &self,
+        name: &str,
+    ) -> (
+        Option<chrono::Duration>,
+        Option<chrono::Duration>,
+        Option<chrono::Duration>,
+    ) {
+        let info = self.workflows.get(name);
+        let execution_timeout = info
+            .and_then(|info| info.execution_timeout)
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        let sla = info
+            .and_then(|info| info.sla)
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        let ceiling = self
+            .max_workflow_execution_timeout
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        (execution_timeout, sla, ceiling)
+    }
+}
+
+#[cfg(test)]
+mod resolve_dispatch_deadline_tests {
+    use super::*;
+
+    /// Build a bare `WorkflowInfo` with only the deadline fields set.
+    fn deadline_info_fixture(
+        name: &'static str,
+        execution_timeout: Option<std::time::Duration>,
+        sla: Option<std::time::Duration>,
+    ) -> WorkflowInfo {
+        WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
+            mcp: false,
+            name,
+            module: "tests",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout,
+            chain_execution_timeout: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            sla,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }
+    }
+
+    #[test]
+    fn unregistered_name_resolves_to_none() {
+        let registry = HandlerRegistry::new(vec![], vec![]);
+        assert_eq!(
+            registry.resolve_dispatch_deadline("no_such_workflow"),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn declared_values_are_propagated_raw() {
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "wf",
+                Some(std::time::Duration::from_secs(60)),
+                Some(std::time::Duration::from_secs(30)),
+            )],
+            vec![],
+        );
+        assert_eq!(
+            registry.resolve_dispatch_deadline("wf"),
+            (
+                Some(chrono::Duration::seconds(60)),
+                Some(chrono::Duration::seconds(30)),
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn undeclared_values_resolve_to_none() {
+        let registry = HandlerRegistry::new(vec![deadline_info_fixture("wf", None, None)], vec![]);
+        assert_eq!(
+            registry.resolve_dispatch_deadline("wf"),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn ceiling_is_read_from_the_registry_regardless_of_name() {
+        let registry = HandlerRegistry::new(vec![], vec![])
+            .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600)));
+        assert_eq!(
+            registry.resolve_dispatch_deadline("no_such_workflow"),
+            (None, None, Some(chrono::Duration::seconds(3600)))
+        );
+    }
+
+    #[test]
+    fn ceiling_is_never_applied_to_the_declared_value_here() {
+        // resolve_dispatch_deadline returns raw declared values; clamping
+        // against the ceiling is each call site's own concern, unchanged
+        // from before this extraction (issue #1412).
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "wf",
+                Some(std::time::Duration::from_secs(7200)),
+                None,
+            )],
+            vec![],
+        )
+        .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600)));
+        assert_eq!(
+            registry.resolve_dispatch_deadline("wf"),
+            (
+                Some(chrono::Duration::seconds(7200)),
+                None,
+                Some(chrono::Duration::seconds(3600))
+            )
+        );
+    }
 }
 
 impl std::fmt::Debug for HandlerRegistry {

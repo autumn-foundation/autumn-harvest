@@ -30627,20 +30627,14 @@ pub(crate) async fn schedule_backfill_inner(
                     },
                 );
                 let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
-                // Issue #743 review (PR #1141, Finding #5): a workflow backfill
-                // must ALSO thread the declared `execution_timeout` and the
-                // fleet-wide `max_workflow_execution_timeout` ceiling into the
-                // start below -- `info_execution_timeout` was already resolved
-                // above (it feeds the `sla` clamp) but was never applied to the
-                // execution row itself, leaving a backfilled run with no hard
-                // deadline even when the workflow type declares one. Mirrors the
-                // DAG branch's identical fix immediately below.
-                let workflow_execution_timeout =
-                    info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
-                let workflow_max_execution_timeout_ceiling = runtime
-                    .registry
-                    .max_workflow_execution_timeout
-                    .and_then(|d| chrono::Duration::from_std(d).ok());
+                // Issue #1412: thread the declared execution_timeout and the
+                // fleet-wide ceiling into the start below, via the same shared
+                // lookup the DAG branch uses right below. `info_execution_timeout`
+                // above still separately feeds the `sla` clamp on the raw
+                // `std::time::Duration` form -- `resolve_dispatch_deadline` returns
+                // an unclamped `sla` too, so it is discarded here.
+                let (workflow_execution_timeout, _, workflow_max_execution_timeout_ceiling) =
+                    runtime.registry.resolve_dispatch_deadline(&wf_name);
 
                 // issue #377: check admission gates before firing a backfill run.
                 // Workflow backfill writes to pool.default_pool() and creates
@@ -31186,32 +31180,23 @@ pub(crate) async fn schedule_backfill_inner(
                             )
                         });
 
-                // Issue #743 review (PR #1141, Finding #5): a DAG backfill must
-                // thread the DAG's declared execution_timeout/sla, and the
-                // fleet-wide max_workflow_execution_timeout ceiling, the SAME
-                // way the scheduler tick's dispatch path and a manual/MCP
-                // trigger (`trigger_unified_dag`) already do -- resolved from the
-                // DAG's own shadow `WorkflowInfo`, registered under `dag_name` in
-                // `registry.workflows` by `DagInfo::as_workflow_info()`. Kept as a
-                // separate lookup from the `(owner, runbook_url, severity)` tuple
-                // above (sourced from `runtime.dags()`) so this fix stays scoped
-                // to the deadline fields and never touches classic-DAG behavior
-                // for those three unrelated fields. `chain_execution_timeout` is
-                // deliberately left `None` for a DAG start (issue #617: DAGs
-                // carry no chain-scoped lifetime cap), matching
-                // `DagInfo::as_workflow_info()`'s own `chain_execution_timeout:
-                // None`.
-                let dag_wf_info = runtime.registry.workflows.get(&dag_name);
-                let dag_execution_timeout = dag_wf_info
-                    .and_then(|info| info.execution_timeout)
-                    .and_then(|d| chrono::Duration::from_std(d).ok());
-                let dag_sla = dag_wf_info
-                    .and_then(|info| info.sla)
-                    .and_then(|d| chrono::Duration::from_std(d).ok());
-                let dag_max_execution_timeout_ceiling = runtime
-                    .registry
-                    .max_workflow_execution_timeout
-                    .and_then(|d| chrono::Duration::from_std(d).ok());
+                // Issue #1412: a DAG backfill must thread the DAG's declared
+                // execution_timeout/sla/ceiling. The scheduler tick's dispatch path
+                // and the manual/MCP trigger (`trigger_unified_dag`) already do this.
+                // One shared lookup resolves these fields from the DAG's own shadow
+                // `WorkflowInfo`. `DagInfo::as_workflow_info()` registers this shadow
+                // entry under `dag_name` in `registry.workflows`.
+                //
+                // This lookup stays separate from the `(owner, runbook_url, severity)`
+                // tuple above. That tuple comes from `runtime.dags()`. Keeping the
+                // lookups separate scopes this fix to the deadline fields only; it
+                // never touches classic-DAG behavior for those three unrelated fields.
+                //
+                // `chain_execution_timeout` stays `None` for a DAG start (issue #617).
+                // DAGs carry no chain-scoped lifetime cap. This matches
+                // `DagInfo::as_workflow_info()`'s own `chain_execution_timeout: None`.
+                let (dag_execution_timeout, dag_sla, dag_max_execution_timeout_ceiling) =
+                    runtime.registry.resolve_dispatch_deadline(&dag_name);
 
                 // issue #377: enforce admission gates for DAG backfills, mirroring
                 // the workflow backfill branch gate check.
