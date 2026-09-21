@@ -2151,11 +2151,19 @@ mod probes {
         // EXISTENCE probe does not: fetch at most one row past the cursor.
         // Empty proves nothing remains, for any qualifying-row count. One
         // row proves the opposite, just as certainly.
+        //
+        // That one confirmation row is deliberately NOT added to `rows`
+        // (Codex follow-up x21). Appending it, then unconditionally
+        // reporting truncation, made the truncation message lie exactly
+        // when the qualifying count was one row over budget. That row was
+        // in fact adjudicated, yet "the remainder was NOT adjudicated"
+        // still printed. Leaving it out keeps `rows.len()` and the
+        // message consistent in every case, at the cost of discarding one
+        // already-fetched row when truncation is genuine.
         let confirmation = fetch_trigger_fire_page(conn, 1, cursor).await?;
         if confirmation.is_empty() {
             return Ok((rows, None));
         }
-        rows.extend(confirmation);
 
         let truncation = format!(
             "completion-trigger fire scan hit its page ceiling after {} rows \
