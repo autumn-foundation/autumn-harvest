@@ -650,40 +650,50 @@ async fn a_read_across_two_queues_returns_at_most_the_requested_count() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capped_read_favors_the_higher_priority_candidates() {
-    // Issue #1429. Priority is still best effort under one FIFO stream, but
-    // when a read holds more candidates than the caller's cap, the ones it
-    // actually delivers must be the highest-priority ones, with the rest
+    // Issue #1429. Priority is still best effort under one FIFO stream: a
+    // read sized exactly to one queue's ready backlog (`COUNT` on the Redis
+    // side) never holds more candidates than the cap, so there is nothing
+    // to favor. The favoring only has candidates to choose from when a read
+    // spans queues and their combined `COUNT` ceiling (`per_stream_count`,
+    // rounded up per queue) hands back more than the caller's cap — the
+    // same surplus `a_read_across_two_queues_returns_at_most_the_requested_count`
+    // exercises. This case pins that, once such a surplus exists, the ones
+    // actually delivered are the highest-priority candidates, with the rest
     // requeued rather than picked by arrival order.
     let Some(fixture) = try_start(Duration::from_secs(60)).await else {
         return;
     };
-    let queues = vec!["priority".to_string()];
+    let queues = vec!["priority-a".to_string(), "priority-b".to_string()];
 
-    let mut low = hint("priority", Uuid::new_v4(), Utc::now());
-    low.priority = 0;
-    let mut high_a = hint("priority", Uuid::new_v4(), Utc::now());
-    high_a.priority = 5;
-    let mut high_b = hint("priority", Uuid::new_v4(), Utc::now());
-    high_b.priority = 5;
+    let mut low_1 = hint("priority-a", Uuid::new_v4(), Utc::now());
+    low_1.priority = 0;
+    let mut low_2 = hint("priority-a", Uuid::new_v4(), Utc::now());
+    low_2.priority = 0;
+    let mut high_1 = hint("priority-b", Uuid::new_v4(), Utc::now());
+    high_1.priority = 5;
+    let mut high_2 = hint("priority-b", Uuid::new_v4(), Utc::now());
+    high_2.priority = 5;
     fixture
         .dispatch
-        .publish(&[low.clone(), high_a.clone(), high_b.clone()])
+        .publish(&[low_1.clone(), low_2.clone(), high_1.clone(), high_2.clone()])
         .await
         .expect("publish");
 
-    let leases = read(&fixture, &queues, 2).await;
-    assert_eq!(leases.len(), 2, "the read must honour the caller's cap");
+    // `per_stream_count(3, 2)` rounds up to `COUNT 2` per queue, so this read
+    // can see all 4 published entries in one call -- a surplus of 1 over the
+    // cap of 3.
+    let leases = read(&fixture, &queues, 3).await;
+    assert_eq!(leases.len(), 3, "the read must honour the caller's cap");
     let delivered: std::collections::HashSet<Uuid> =
         leases.iter().map(|lease| lease.task_id).collect();
-    assert_eq!(
-        delivered,
-        [high_a.task_id, high_b.task_id].into_iter().collect(),
-        "the two priority-5 references must be the ones delivered, not the priority-0 one"
+    assert!(
+        delivered.contains(&high_1.task_id) && delivered.contains(&high_2.task_id),
+        "both priority-5 references must be delivered before any priority-0 one: {delivered:?}"
     );
 
     let rest = read(&fixture, &queues, 10).await;
-    assert_eq!(rest.len(), 1, "the low-priority reference is requeued");
-    assert_eq!(rest[0].task_id, low.task_id);
+    assert_eq!(rest.len(), 1, "the one surplus low-priority reference is requeued");
+    assert!(rest[0].task_id == low_1.task_id || rest[0].task_id == low_2.task_id);
 }
 
 #[tokio::test(flavor = "multi_thread")]

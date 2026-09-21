@@ -92,10 +92,13 @@
 //!   this type (issue #1429; see `autumn-harvest-plugin`'s per-shard
 //!   install and `autumn_harvest::dispatch::install_for_shard`).
 //! - **Priority is best effort.** One stream per queue delivers in arrival
-//!   order. The reconcile sweep publishes in priority order, and a capped
-//!   read favors the highest-priority candidates it holds over lower ones
-//!   (issue #1429) — together the closest approximation to priority order
-//!   this channel offers without a per-priority stream.
+//!   order, so a read sized to exactly one queue's ready backlog sees no
+//!   priority signal at all — `COUNT` caps what Redis returns before this
+//!   channel ever sees the candidates. The reconcile sweep publishes in
+//!   priority order, and a read that spans queues favors the
+//!   highest-priority candidates over lower ones among whatever surplus that
+//!   span already produces (issue #1429), with no extra round trip. Neither
+//!   is a per-priority stream.
 //! - **Sticky affinity is best effort.** Any worker in the consumer group may
 //!   read any reference. The Postgres claim predicate still enforces the
 //!   affinity gate, and a rejected reference is released with backoff.

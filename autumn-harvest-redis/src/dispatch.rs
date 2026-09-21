@@ -713,10 +713,14 @@ impl RedisDispatch {
         }
 
         // Priority is best effort under dispatch (issue #1429): one FIFO
-        // stream per queue carries no priority order on its own. When one
-        // read holds more candidates than `max`, a stable sort by priority
-        // (descending) before the split favors the highest-priority
-        // candidates for the leases this call actually claims, and requeues
+        // stream per queue carries no priority order on its own, and `COUNT`
+        // caps what Redis returns per stream before this call ever sees a
+        // candidate -- a read sized to exactly one queue's ready backlog
+        // therefore has nothing to sort. A read that spans queues can still
+        // hold more candidates than `max` (`per_stream_count` rounds each
+        // queue's `COUNT` up), and a stable sort by priority (descending)
+        // before the split then favors the highest-priority candidates among
+        // that surplus for the leases this call actually claims, requeuing
         // the rest. Ties keep arrival order (the sort is stable), so this
         // never starves same-priority work. The reconcile sweep's own
         // `(priority DESC, scheduled_at ASC)` publish order is the other half
