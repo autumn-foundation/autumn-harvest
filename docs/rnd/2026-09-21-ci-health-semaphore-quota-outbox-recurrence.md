@@ -1,11 +1,25 @@
 # 🚦 Semaphore CI health — `quota_enforcement_tests`' unexplained outbox-retry
 # timeout recurs a 2nd confirmed time (byte-identical panic, new branch, 6
-# days later), `corpus::seeded_corpus_is_clean_under_the_syntactic_layer`
-# recurs again undiagnosed, and one branch's worker-wide wait-timeout
-# cascade — not a suite defect on the evidence gathered
+# days later); `corpus::seeded_corpus_is_clean_under_the_syntactic_layer`'s
+# 5th occurrence confirms the 09-18 report's diagnosis still holds (own-diff
+# dead code, not a flake); one branch's worker-wide wait-timeout cascade —
+# not a suite defect on the evidence gathered
 
 **Status:** health report — no PR opened against `ci.yml` or any test. Continues
 the series from `docs/rnd/2026-09-20-ci-health-semaphore-migration-count-message-fix.md`.
+
+**Corrected twice after review** (Codex on this PR): the initial draft of
+item 3 reopened `corpus::seeded_corpus_is_clean_under_the_syntactic_layer`
+as "still undiagnosed" and miscounted it as a 4th occurrence on a fifth
+branch, without checking today's occurrence against the 09-18 report's own
+diagnostic-clarity fix — which was live in the log this session already had
+and, once grepped, shows the exact same deterministic dead-code mechanism
+that report closed as "not a flake." Separately, the census math in the
+Diagnosis and Measurement sections omitted `35553863066` (item 2's quota
+recurrence) from its 15/2/2 breakdown entirely — it belongs in neither the
+deterministic bucket nor the two items it was implicitly left out of, so the
+totals undercounted the unresolved population. Both corrected below, inline
+at the point each applies.
 
 ## 🎯 Verdict path
 
@@ -35,7 +49,7 @@ small enough to cover fully):
 | `35533403023` | `claude/exciting-babbage-r3nfok` | comment-hygiene Tier B (`activity.rs`/`workflow.rs` sentence length, own diff) |
 | `35534123956` | `claude/magical-gauss-10blzb` | same `E0061`, unfixed, 4th push |
 | `35534264738` | `claude/lucid-pasteur-9m45n7` | `sqlite_feasibility_docs`: 2 failures (own doc/schema mismatch) |
-| `35535026904` | `claude/kind-hopper-wbrak0` | clippy dead-code (`backup_verify.rs::absence_is_decisive_loss`, own diff) **and** `corpus::seeded_corpus_is_clean_under_the_syntactic_layer` — see item 3 |
+| `35535026904` | `claude/kind-hopper-wbrak0` | clippy dead-code (`backup_verify.rs::absence_is_decisive_loss`) **and** `corpus::seeded_corpus_is_clean_under_the_syntactic_layer` — same defect, two independent gates, root-caused, see item 3 |
 | `35535358141` | `claude/fix-pending-requeue-changeset-arity` | `Test DB (linux, shard 1)`: `cross_region_dr_tests` — see below, not root-caused this session |
 | `35536291030` | `claude/magical-gauss-10blzb` | same `E0061`, unfixed, 5th push |
 | `35549811155` | `claude/exciting-babbage-r3nfok` | run conclusion `failure`, but `get_job_logs(failed_only=true)` returns 0 failed jobs of 30 — see the data-quality note below |
@@ -125,27 +139,43 @@ of where to spend the ≥20x budget this role has not yet had the means to
 run (no Docker in this session's sandbox; see the 09-16 report's identical
 constraint).
 
-### 3. `corpus::seeded_corpus_is_clean_under_the_syntactic_layer`: recurs again, still undiagnosed
+### 3. `corpus::seeded_corpus_is_clean_under_the_syntactic_layer`: 5th confirmed occurrence, and it is the same deterministic dead-code defect the 09-18 report already diagnosed and closed — not a flake
+
+**Correction (post-review):** the first draft of this section reopened this
+test as "still undiagnosed" and miscounted the occurrence total. Both wrong.
+The 09-18 report
+(`docs/rnd/2026-09-18-ci-health-semaphore-corpus-gate-diagnostic-fix.md`)
+already root-caused this exact recurring signature: three sessions (09-15,
+09-16, 09-17) had carried it forward as an undiagnosed flake candidate
+because the test's own panic message threw away the actual `rustc`
+diagnostic under `--message-format=json`. That report fixed the message (not
+the test's assertion — a diagnostic-clarity change only) and, on direct log
+inspection of 4 known occurrences at the time (3 on `claude/bold-lovelace-agnczk`,
+1 on `claude/pensive-brahmagupta-jafcou`), found every one traced to real,
+own-branch dead code under `-D warnings` — explicitly concluding "this item
+is not a flake, was never a flake."
 
 Run `35535026904` (`Semantic determinism analysis (harvest-verify)`,
-`claude/kind-hopper-wbrak0`, 2026-09-20T20:16:44Z) failed this same test
-again: `test result: FAILED. 5 passed; 1 failed` — the identical pass/fail
-split the 09-15 and 09-16 reports already recorded for this signature's
-prior occurrences. The 09-18 report (`docs/rnd/2026-09-18-ci-health-semaphore-corpus-gate-diagnostic-fix.md`)
-shipped a diagnostic-clarity fix for a *different* self-contradicting panic
-message in this same test file (rustc diagnostics dropped on the floor under
-`--message-format=json`), explicitly noting it was closing a diagnostic gap,
-**not** the recurring `seeded_corpus_is_clean_under_the_syntactic_layer`
-failure itself, which the 09-16 report already flagged as "the closest thing
-in this report's data to a suite-attributable-flake candidate" at 3
-occurrences. Today's is at least a 4th confirmed occurrence (09-15 report:
-3 of 5 pushes on one branch; 09-16 report: one of those resurfacing in its
-own window's sample; today: a fresh occurrence on a fifth, unrelated branch).
-Not root-caused this session — this report did not have time to pull the
-09-18 fix's improved diagnostic output for this specific run (the improved
-panic message should now surface the actual `rustc` finding rather than a
-bare `FAILED`), which would be the fastest next step for whoever picks this
-up.
+`claude/kind-hopper-wbrak0`, 2026-09-20T20:16:44Z) is a **5th** occurrence, on
+a **third** distinct branch — this report's first draft undercounted it as a
+4th occurrence on a fifth branch, not having cross-checked the 09-18 report's
+own tally. This session already had this run's job log in hand (fetched for
+the census above) and, re-grepped after review for the 09-18 fix's `---
+rustc diagnostics ---` section rather than just the tail:
+
+```
+error: function `route_trigger_fires` is never used
+error: function `absence_is_decisive_loss` is never used
+error: could not compile `autumn-harvest` (lib) due to 4 previous errors
+```
+
+`absence_is_decisive_loss` is the identical function the census table's
+clippy dead-code row (same run, `Lint` job) already names — confirming this
+is the exact mechanism the 09-18 report closed: one real dead-code defect in
+this branch's own diff, caught independently and correctly by two gates
+(`Lint`'s clippy step and the corpus test's own nested `-D warnings`
+rebuild), not a suite-level flake and not requiring any further diagnosis.
+**No action needed; not carried forward.**
 
 ### 4. `claude/keen-bardeen-amm1ft`: one run, 6 of 30 shards fail, most panics at one shared polling helper — own-branch, not a suite defect on this evidence
 
@@ -196,11 +226,19 @@ clustered with anything else in this window.
 
 ## 🔍 Diagnosis
 
-**Item 1 (census)** is the suite working as designed for 15 of 19 explicit
-failures — deterministic own-branch defects (compile breaks, clippy, `cargo
-fmt`, comment-hygiene, doc staleness), all correctly gated. 2 of 19
-(`35549811155`, `35523524313`) are a census/tooling gap, not a suite defect
-claim. The remaining 2 (items 4 and 5) are unclassified single occurrences.
+**Item 1 (census). Correction (post-review):** the first draft's "15/2/2"
+breakdown silently dropped `35553863066` (item 2's quota recurrence) from
+the count — it belongs in neither the deterministic bucket nor the two
+named "unclassified" items, so the totals undercounted by one run. Corrected:
+14 of 19 explicit failures are the suite working as designed — deterministic
+own-branch defects (compile breaks, clippy, `cargo fmt`, comment-hygiene,
+doc staleness, and, per item 3's correction above, `35535026904`'s corpus
+failure), all correctly gated and root-caused. 2 of 19 (`35549811155`,
+`35523524313`) are a census/tooling gap, not a suite defect claim. The
+remaining 3 of 19 are unresolved single occurrences with no rendered
+test-vs-product verdict: item 2 (`35553863066`, quota outbox-retry), item 4
+(`35563198153`, worker-wide wait-timeout cascade), and item 5
+(`35535358141`, `cross_region_dr_tests`).
 
 **Item 2** cannot yet be given a test-vs-product verdict — this role's own
 hard gate (requirement 3) blocks a fix PR until the nondeterminism is shown
@@ -215,11 +253,10 @@ available in-session should point the ≥20x rerun campaign at
 `quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded`
 before any other candidate in this series' backlog.**
 
-**Item 3** remains undiagnosed after a 4th occurrence. Below this role's
-≥20-rerun bar, but now recurring often enough (roughly weekly, across five
-distinct branches over the series) that it is worth someone spending 20
-minutes reading the 09-18 fix's improved diagnostic output against a fresh
-occurrence, which might resolve it far faster than a rerun campaign.
+**Item 3** is closed, per the correction above: the 09-18 report's diagnosis
+holds on this 5th occurrence too — real, own-branch dead code, correctly
+caught by two independent gates, not a suite defect. No further action, and
+not carried forward to the next report.
 
 **Item 4** is explicitly not rendered as a test-vs-product verdict — the
 evidence gathered this session (one run, one branch, no diff read, no
@@ -249,35 +286,39 @@ Carried forward, unchanged from prior reports in this series:
    comparatively less urgent now, at 0/1 confirmed exposure and no fresh
    occurrences since) — still not run by any session; no Docker available
    in this session's sandbox.
-4. **`corpus::seeded_corpus_is_clean_under_the_syntactic_layer`** — a 4th
-   occurrence, still undiagnosed; the 09-18 report's improved diagnostic
-   output for this file has not yet been checked against a fresh occurrence.
-5. **The `list_workflow_runs` conclusion vs. `list_workflow_jobs` gap**
+4. **The `list_workflow_runs` conclusion vs. `list_workflow_jobs` gap**
    (item 1's data-quality note) — 2 of 19 runs this window report `failure`
    overall with 0 job-level failures found; not previously logged in this
    series in exactly this form (distinct from the cancelled-run-hides-a-
    failure direction the 09-06/09-11 reports found — this is the reverse:
    an explicit `failure` conclusion the jobs API cannot account for).
-6. **The remaining cancelled-run population** — the 44 cancelled runs in
+5. **The remaining cancelled-run population** — the 44 cancelled runs in
    this window were not job-logged at all this session (time budget went to
    the 19 explicit failures instead, all 19 of which were checked, a
    improvement over prior reports' partial samples).
 
 ## 📊 Measurement
 
-- **Census:** 78 runs in window, 19 explicit failures, all 19 job-logged
-  (100% of explicit failures this window, versus partial samples in most
-  prior reports). 15/19 deterministic own-branch defects, root-caused. 2/19
-  a census/tooling gap (conclusion/job mismatch). 2/19 unclassified single
-  occurrences (items 4, 5).
+- **Census: correction (post-review).** The first draft's "15/2/2" omitted
+  `35553863066` (item 2) from the count. Corrected: 78 runs in window, 19
+  explicit failures, all 19 job-logged (100% of explicit failures this
+  window, versus partial samples in most prior reports). 14/19 deterministic
+  own-branch defects, root-caused — including `35535026904`'s corpus/clippy
+  pair, per item 3's correction. 2/19 a census/tooling gap (conclusion/job
+  mismatch). 3/19 unresolved single occurrences with no rendered
+  test-vs-product verdict (items 2, 4, 5).
 - **Item 2:** 2/2 confirmed occurrences of
   `quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded`
   carry byte-identical panic text (`"target row was never created by the
   outbox retry; last count was 1"`), 6 days apart, 2 different branches. Not
   a rate (n=2, no rerun protocol run). No revert check applies — no fix was
   made or attempted this session.
-- **Item 3:** 4th confirmed occurrence (this session's own count from this
-  series' prior reports plus today's), still no rate, no mechanism.
+- **Item 3: correction (post-review).** 5th confirmed occurrence (not a 4th,
+  per the correction above), on a 3rd distinct branch — direct log
+  inspection (re-grepped after review for the `--- rustc diagnostics ---`
+  section this session already had in hand) confirms the identical
+  dead-code mechanism the 09-18 report closed. Root-caused, not a flake, no
+  rate needed.
 - **Item 4:** 1 occurrence, 6/30 shards, ~40 failing tests in the worst
   shard, large majority sharing one panic site
   (`integration_e2e.rs:1383:6`, the `wait_for_execution_state_with_timeout`
@@ -321,6 +362,16 @@ grep -n "panicked at\|FAILED\|error\[" shard3.log | head -60
 #    integration_e2e.rs:1383:6 ("workflow should reach expected state
 #    within timeout: Elapsed(())"), inside wait_for_execution_state_with_timeout:
 sed -n '1370,1384p' autumn-harvest/tests/integration/integration_e2e.rs
+
+# Item 3's re-grep (post-review correction): the run's log was already
+# fetched for the census; re-checking it for the 09-18 fix's diagnostic
+# section instead of just the tail:
+# get_job_logs(job_id=106142430329, return_content=false) -> signed URL
+curl -sS -o corpus_job.log '<signed logs_url>'
+grep -n "never used\|could not compile\|rustc diagnostics\|dead-code" corpus_job.log
+# -> "error: function `absence_is_decisive_loss` is never used" -- the
+#    identical function this run's Lint/clippy job independently flagged,
+#    confirming the 09-18 report's diagnosed mechanism, not a fresh flake.
 
 # The E0061 compile break, already fixed on trunk-dev:
 git log --oneline -1 --grep="requeue_workflow_task_for_quota_retry compile break"
