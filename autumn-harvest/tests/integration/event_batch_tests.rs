@@ -409,6 +409,102 @@ async fn admit_batched_start_rejects_empty_workflow_id_before_writing_a_row() {
     assert_eq!(n, 0, "no row was written");
 }
 
+// ── Legacy empty-workflow_id row healing (issue #1430) ──────────────────────
+//
+// A row admitted before #1353's guard shipped can hold a stored empty
+// workflow_id. The ON CONFLICT upsert never touched that stored id. A later
+// valid request for the same key then merged its payload into the poisoned
+// row. Its own accepted outcome came back with an empty id. The scanner
+// later deleted the whole row as unfireable. That silently dropped the new
+// request's payload along with the legacy one. Admission must instead heal
+// the stored id to the new request's valid id.
+
+/// Seed a pre-#1353 event-batch row directly. The empty-id guard postdates
+/// such a row, so only a direct table write can produce one.
+async fn seed_legacy_empty_id_batch_row(conn: &mut AsyncPgConnection, wf: &str, key: &str) {
+    diesel::sql_query(
+        "INSERT INTO harvest_event_batches
+            (workflow_name, batch_key, workflow_id, queue_name, buffered_payloads,
+             start_options, fire_at, max_size)
+         VALUES ($1, $2, '', 'default', '[{\"legacy\": true}]'::jsonb,
+                 '{}'::jsonb, NOW() + INTERVAL '1 hour', 5)",
+    )
+    .bind::<diesel::sql_types::Text, _>(wf)
+    .bind::<diesel::sql_types::Text, _>(key)
+    .execute(conn)
+    .await
+    .expect("seed legacy row");
+}
+
+/// Count rows in `harvest_workflow_executions` for a given `workflow_id`.
+async fn execution_count(conn: &mut AsyncPgConnection, wf_id: &str) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+
+    diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE workflow_id=$1")
+        .bind::<diesel::sql_types::Text, _>(wf_id)
+        .get_result::<Count>(conn)
+        .await
+        .expect("execution count query")
+        .n
+}
+
+#[tokio::test]
+async fn admit_heals_a_legacy_empty_workflow_id_row_to_the_new_valid_id() {
+    let (mut conn, _container) = setup_db().await;
+
+    let wf = "legacy_heal_batch_wf";
+    let key = "key-legacy-heal";
+    seed_legacy_empty_id_batch_row(&mut conn, wf, key).await;
+
+    let new_id = "legacy-heal-batch-valid-001";
+    let p = AdmitBatchParams {
+        workflow_name: wf.to_string(),
+        batch_key: key.to_string(),
+        workflow_id: new_id.to_string(),
+        queue_name: "default".to_string(),
+        payload: json!({"fresh": true}),
+        start_options: DebounceStartOptions::default(),
+        max_wait: Duration::from_secs(60),
+        max_size: 5,
+        shard_id: 0,
+    };
+    let (outcome, _deferred_starts) = admit_batched_start(&mut conn, p, None)
+        .await
+        .expect("admit onto the legacy row")
+        .expect("admission accepted");
+
+    assert!(
+        !outcome.is_flushed,
+        "two buffered payloads must stay under max_size 5"
+    );
+    assert_eq!(
+        outcome.workflow_id, new_id,
+        "a new valid request must heal a legacy empty-id row's stored id, not inherit the poison"
+    );
+
+    diesel::sql_query("UPDATE harvest_event_batches SET fire_at = NOW() - INTERVAL '1 minute'")
+        .execute(&mut conn)
+        .await
+        .expect("force fire_at into the past");
+
+    let fired = fire_due_event_batches(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("fire");
+    assert_eq!(
+        fired, 1,
+        "the healed row must fire, not be dropped as poison"
+    );
+    assert_eq!(
+        execution_count(&mut conn, new_id).await,
+        1,
+        "the execution must start under the new request's valid id"
+    );
+}
+
 // ── Multi-shard scanning (issue #1362) ──────────────────────────────────────
 //
 // `harvest_event_batches` filters by an explicit `shard_id` column when the

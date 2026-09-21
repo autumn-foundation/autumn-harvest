@@ -951,6 +951,83 @@ async fn admit_rejects_empty_workflow_id_before_writing_a_row() {
     assert_eq!(debounce_row_count(&mut conn, wf, key).await, 0);
 }
 
+// ── Legacy empty-workflow_id row healing (issue #1430) ──────────────────────
+//
+// A row admitted before #1353's guard shipped can hold a stored empty
+// workflow_id. The ON CONFLICT upsert kept that stored id unconditionally.
+// A later valid request for the same key then merged its input into the
+// poisoned row. Its own accepted outcome came back with an empty id. The
+// scanner later deleted the whole row as unfireable. That silently dropped
+// the new request along with the legacy one. Admission must instead heal
+// the stored id to the new request's valid id.
+
+/// Seed a pre-#1353 debounce row directly. The empty-id guard postdates
+/// such a row, so only a direct table write can produce one.
+async fn seed_legacy_empty_id_debounce_row(conn: &mut AsyncPgConnection, wf: &str, key: &str) {
+    use diesel_async::RunQueryDsl;
+
+    diesel::sql_query(
+        "INSERT INTO harvest_debounce
+            (workflow_name, debounce_key, workflow_id, queue_name, last_input,
+             start_options, effective_fire_at, max_fire_at)
+         VALUES ($1, $2, '', 'default', '{\"legacy\": true}'::jsonb,
+                 '{}'::jsonb, NOW() + INTERVAL '1 hour', NOW() + INTERVAL '1 hour')",
+    )
+    .bind::<diesel::sql_types::Text, _>(wf)
+    .bind::<diesel::sql_types::Text, _>(key)
+    .execute(conn)
+    .await
+    .expect("seed legacy row");
+}
+
+#[tokio::test]
+async fn admit_heals_a_legacy_empty_workflow_id_row_to_the_new_valid_id() {
+    let (mut conn, _c) = setup_db().await;
+
+    let wf = "legacy_heal_wf";
+    let key = "tenant:legacy-heal";
+    seed_legacy_empty_id_debounce_row(&mut conn, wf, key).await;
+
+    let window = Duration::from_millis(1);
+    let max_wait = Duration::from_secs(60);
+    let new_id = "legacy-heal-valid-001";
+    let outcome = admit_debounced_start_ungated(
+        &mut conn,
+        admit_params(
+            wf,
+            key,
+            new_id,
+            serde_json::json!({"fresh": true}),
+            window,
+            max_wait,
+        ),
+    )
+    .await
+    .expect("admit onto the legacy row");
+
+    assert_eq!(
+        outcome.workflow_id, new_id,
+        "a new valid request must heal a legacy empty-id row's stored id, not inherit the poison"
+    );
+    assert_eq!(debounce_row_count(&mut conn, wf, key).await, 1);
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let metrics = no_op_metrics();
+    let fired = fire_due_debounced_starts(&mut conn, &None, &[], &metrics)
+        .await
+        .expect("fire");
+    assert_eq!(
+        fired, 1,
+        "the healed row must fire, not be dropped as poison"
+    );
+    assert_eq!(debounce_row_count(&mut conn, wf, key).await, 0);
+    assert_eq!(
+        execution_count(&mut conn, wf, new_id).await,
+        1,
+        "the execution must start under the new request's valid id"
+    );
+}
+
 // ── Multi-shard scanning (issue #1362) ──────────────────────────────────────
 //
 // `harvest_debounce` shards by physical database, not by a `shard_id`

@@ -255,7 +255,9 @@ pub struct DebounceAdmitOutcome {
     pub debounce_key: String,
     /// The stable `workflow_id` the eventual run will be created with. This is
     /// the **first** request's id for the key (kept across retriggers), which
-    /// the caller should echo instead of its own generated id.
+    /// the caller should echo instead of its own generated id. See
+    /// [`admit_debounced_start`]'s doc comment for the legacy-empty-id healing
+    /// exception (issue #1430).
     pub workflow_id: String,
     /// Current fire deadline after this admission.
     pub fire_at: DateTime<Utc>,
@@ -294,6 +296,12 @@ pub struct PendingDebounceRecord {
 /// first request** so the stable id echoed in every `202` response is the one
 /// the run will actually be created with; the stored id is returned so the
 /// caller can echo it rather than its own (possibly-discarded) generated id.
+///
+/// **Legacy healing (issue #1430):** a row admitted before the #1353 empty-id
+/// guard shipped can hold a stored empty `workflow_id`. Such a row can never
+/// start. A conflicting upsert heals it: the stored id becomes this request's
+/// id instead of staying empty. Only an empty stored id is ever healed; a
+/// valid first-request id is still kept, as documented above.
 ///
 /// Returns the current state of the record after the upsert.
 ///
@@ -390,8 +398,17 @@ pub async fn admit_debounced_start(
         VALUES
             ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, NOW(), NOW())
         ON CONFLICT (workflow_name, debounce_key) DO UPDATE SET
-            -- workflow_id is intentionally NOT overwritten: the first request's
-            -- id is the one the run is created with, and every 202 echoes it.
+            -- workflow_id keeps the first request's id: that is the id the
+            -- run is created with, and every 202 echoes it. One exception
+            -- (issue #1430): a row admitted before #1353's guard shipped can
+            -- hold a stored empty id. Heal it to this request's valid id
+            -- instead of keeping the poisoned empty string. Otherwise this
+            -- request's merged payload rides a row the fire-time guard can
+            -- only discard.
+            workflow_id = CASE
+                WHEN harvest_debounce.workflow_id = '' THEN EXCLUDED.workflow_id
+                ELSE harvest_debounce.workflow_id
+            END,
             queue_name        = EXCLUDED.queue_name,
             last_input        = EXCLUDED.last_input,
             -- issue #921 review (Codex P2): start_options is last-input-wins
