@@ -47,11 +47,23 @@ placeholder for that one field access before comparing, so the rest of
 the function (the policy lookup, the `has_any_cap` guard, the resolved-key
 construction) is still checked byte-for-byte.
 
+Text identity is not the whole invariant: `order_due_rows_for_deadlock_free_firing`
+being correct and unchanged does not help if a fire path stops calling it.
+Codex review on PR #1696 also found that gap: this script did not check
+that either scanner's claim loop still calls the wrapper, so removing or
+bypassing that one call site would restore claim-order firing (and its
+ABBA deadlock risk) while every tracked function stayed identical.
+`CALL_SITE_GUARDS` closes it: for each scanner's `fire_due_on_conn`, it
+asserts the wrapper call appears, and appears before the per-row firing
+loop starts.
+
 Usage:
     python3 docs/audits/quota-lock-ordering-sync.py
 
-Exit code is 1 if either copy is missing a tracked function, or if any
-tracked function's text has diverged between the two files; 0 otherwise.
+Exit code is 1 if either copy is missing a tracked function, if any
+tracked function's text has diverged between the two files, or if a
+guarded call site no longer calls the ordering wrapper before its firing
+loop; 0 otherwise.
 """
 import difflib
 import re
@@ -84,6 +96,18 @@ FIELD_NORMALIZATIONS: dict[str, tuple[str, str]] = {
 }
 NORMALIZED_PLACEHOLDER = "row.__normalized_input_field__"
 
+# Each entry names an enclosing function, in both files, that must call
+# `wrapper_call` before `loop_pattern`'s first match — the invariant that
+# a claimed batch is reordered before any row fires. This is a structural
+# check on the CALLER, not a text comparison of the wrapper itself.
+CALL_SITE_GUARDS = [
+    {
+        "enclosing_fn": "fire_due_on_conn",
+        "wrapper_call": "order_due_rows_for_deadlock_free_firing",
+        "loop_pattern": re.compile(r"for\s+\w+\s+in\s+due_rows\b"),
+    },
+]
+
 FN_SIGNATURE_RE_TEMPLATE = r"\n(?:async )?fn {name}\s*\("
 
 
@@ -111,6 +135,37 @@ def extract_function(text: str, name: str) -> str | None:
             depth -= 1
         i += 1
     return text[start:i]
+
+
+def check_call_site_guard(
+    text: str, file_label: str, enclosing_fn: str, wrapper_call: str, loop_pattern: re.Pattern
+) -> str | None:
+    """Return a failure message, or `None` if the guard holds.
+
+    Finds `enclosing_fn`'s body, then requires a call to `wrapper_call`
+    that appears strictly before `loop_pattern`'s first match inside that
+    same body. Either match missing, or the call appearing at or after
+    the loop, is a failure: the ordering wrapper must run before any row
+    in the claimed batch fires.
+    """
+    body = extract_function(text, enclosing_fn)
+    if body is None:
+        return f"{file_label}: enclosing function `{enclosing_fn}` not found"
+
+    call_match = re.search(re.escape(wrapper_call) + r"\s*\(", body)
+    if call_match is None:
+        return f"{file_label}::{enclosing_fn}: no call to `{wrapper_call}` found"
+
+    loop_match = loop_pattern.search(body)
+    if loop_match is None:
+        return f"{file_label}::{enclosing_fn}: no `{loop_pattern.pattern}` firing loop found"
+
+    if call_match.start() >= loop_match.start():
+        return (
+            f"{file_label}::{enclosing_fn}: `{wrapper_call}` is called at or after "
+            "the firing loop starts, not before it"
+        )
+    return None
 
 
 def main() -> int:
@@ -177,7 +232,34 @@ def main() -> int:
     else:
         print("All tracked functions are byte-identical between the two copies.")
 
-    return 1 if failures else 0
+    print()
+    guard_failures = 0
+    for guard in CALL_SITE_GUARDS:
+        for label, text in ((str(DEBOUNCE.relative_to(REPO_ROOT)), debounce_text),
+                            (str(THROTTLE.relative_to(REPO_ROOT)), throttle_text)):
+            error = check_call_site_guard(
+                text, label, guard["enclosing_fn"], guard["wrapper_call"], guard["loop_pattern"]
+            )
+            if error is None:
+                print(
+                    f"OK   {label}::{guard['enclosing_fn']} calls "
+                    f"`{guard['wrapper_call']}` before its firing loop"
+                )
+            else:
+                guard_failures += 1
+                print(f"FAIL {error}")
+
+    print()
+    if guard_failures:
+        print(
+            f"{guard_failures} call-site guard(s) failed (fails CI). A fire path "
+            "must call its ordering wrapper before iterating the claimed batch — "
+            "see CALL_SITE_GUARDS in this script."
+        )
+    else:
+        print("All guarded call sites invoke their ordering wrapper before firing.")
+
+    return 1 if (failures or guard_failures) else 0
 
 
 if __name__ == "__main__":
