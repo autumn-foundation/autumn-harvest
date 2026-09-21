@@ -24000,11 +24000,21 @@ async fn set_legal_hold_handler(
     }
 
     let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let exec_id_str = exec_id.to_string();
+    let pool = api_state.storage_pool().map_err(map_error)?;
 
-    let result =
-        autumn_harvest::set_legal_hold(&mut conn, exec_id, &reason, hold_until, &actor, now).await;
+    // Issue #1405: `set_legal_hold` refuses a row a concurrent cutover sealed
+    // out from under it, rather than writing the hold onto the sealed
+    // tombstone. The `_forwarded` sibling follows the pointer and retries.
+    let result = ::autumn_harvest::shard_rebalance::set_legal_hold_forwarded(
+        pool.sharded_pool(),
+        exec_id,
+        &reason,
+        hold_until,
+        &actor,
+        now,
+    )
+    .await;
 
     let (status, error_summary) = match &result {
         Ok(_) => (STATUS_SUCCEEDED, None),
@@ -24023,7 +24033,12 @@ async fn set_legal_hold_handler(
         shard_id: None,
         source: &source,
     };
-    let _ = audit::insert_audit(&mut conn, &ar).await;
+    // Best-effort, on its own connection: the write above already committed
+    // (or refused) on its own shard, so an audit-log failure here must not
+    // mask that outcome from the caller.
+    if let Ok(mut conn) = db_conn_for_execution(&api_state, exec_id).await {
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+    }
 
     match result {
         Ok(outcome) => Ok((axum::http::StatusCode::OK, Json(outcome))),
@@ -24052,10 +24067,16 @@ async fn release_legal_hold_handler(
     let route = "POST /workflows/{id}/legal-hold/release";
 
     let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let exec_id_str = exec_id.to_string();
+    let pool = api_state.storage_pool().map_err(map_error)?;
 
-    let result = autumn_harvest::release_legal_hold(&mut conn, exec_id, chrono::Utc::now()).await;
+    // Issue #1405: see the same-shaped comment in set_legal_hold_handler.
+    let result = ::autumn_harvest::shard_rebalance::release_legal_hold_forwarded(
+        pool.sharded_pool(),
+        exec_id,
+        chrono::Utc::now(),
+    )
+    .await;
 
     let (status, error_summary) = match &result {
         Ok(_) => (STATUS_SUCCEEDED, None),
@@ -24074,7 +24095,11 @@ async fn release_legal_hold_handler(
         shard_id: None,
         source: &source,
     };
-    let _ = audit::insert_audit(&mut conn, &ar).await;
+    // Best-effort, on its own connection: see the same-shaped comment in
+    // set_legal_hold_handler.
+    if let Ok(mut conn) = db_conn_for_execution(&api_state, exec_id).await {
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+    }
 
     match result {
         Ok(outcome) => Ok((axum::http::StatusCode::OK, Json(outcome))),

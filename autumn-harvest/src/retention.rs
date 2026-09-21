@@ -3559,12 +3559,14 @@ mod legal_hold_db {
 
     use super::{LegalHoldOutcome, legal_hold_active};
 
-    /// The four legal-hold columns loaded from a locked execution row.
+    /// The four legal-hold columns, plus the forwarding pointer, loaded from a
+    /// locked execution row.
     type HoldColumns = (
         Option<DateTime<Utc>>,
         Option<DateTime<Utc>>,
         Option<String>,
         Option<String>,
+        Option<i32>,
     );
 
     async fn load_hold_for_update(
@@ -3578,6 +3580,7 @@ mod legal_hold_db {
                 harvest_workflow_executions::legal_hold_until,
                 harvest_workflow_executions::legal_hold_reason,
                 harvest_workflow_executions::legal_hold_actor,
+                harvest_workflow_executions::migrated_to_shard,
             ))
             .for_update()
             .first::<HoldColumns>(conn)
@@ -3585,6 +3588,41 @@ mod legal_hold_db {
             .optional()
             .map_err(database_error)?
             .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
+    }
+
+    /// Refuse a write onto a sealed row (issue #1405).
+    ///
+    /// A caller resolves its connection to `exec_id`'s shard once, before the
+    /// `FOR UPDATE` lock above is requested. A concurrent cutover can seal the
+    /// row — set `migrated_to_shard` — in the window between that resolution
+    /// and the lock grant. The lock still succeeds; a sealed row is a normal
+    /// row to `SELECT ... FOR UPDATE`. Without this check the hold write lands
+    /// on the forwarding tombstone, the API reports success, and the live copy
+    /// on the target shard never sees it.
+    ///
+    /// Matched on the pointer, not on `state = 'MIGRATED'` (same reasoning as
+    /// [`crate::shard_rebalance::forward_of_held_row`]): the pointer is what
+    /// makes the row a tombstone, regardless of what a later forced state
+    /// write does to `state` itself.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError::ShardUnavailable`], naming the shard the row forwards
+    /// to, when `migrated_to_shard` is set. The caller must re-resolve there
+    /// and retry — [`crate::shard_rebalance::set_legal_hold_forwarded`] and
+    /// [`crate::shard_rebalance::release_legal_hold_forwarded`] do exactly
+    /// that.
+    fn refuse_if_sealed(exec_id: ExecutionId, migrated_to_shard: Option<i32>) -> HarvestResult<()> {
+        match migrated_to_shard {
+            None => Ok(()),
+            Some(shard_id) => Err(HarvestError::ShardUnavailable {
+                shard_id,
+                reason: format!(
+                    "workflow execution {exec_id} sealed to shard {shard_id} mid shard-rebalance; \
+                     re-resolve it through its forwarding pointer and retry"
+                ),
+            }),
+        }
     }
 
     /// Place (or refresh) a per-execution legal hold (issue #747). Shard-local:
@@ -3598,6 +3636,10 @@ mod legal_hold_db {
     /// # Errors
     ///
     /// - [`HarvestError::NotFound`] when the execution does not exist (→ 404).
+    /// - [`HarvestError::ShardUnavailable`] when the row was sealed by a
+    ///   shard rebalance under the lock (issue #1405). Nothing is written.
+    ///   Prefer [`crate::shard_rebalance::set_legal_hold_forwarded`], which
+    ///   retries this for you.
     /// - [`HarvestError::Database`] on any persistence failure.
     pub async fn set_legal_hold(
         conn: &mut AsyncPgConnection,
@@ -3619,8 +3661,9 @@ mod legal_hold_db {
         // in autocommit mode.
         Box::pin(
             conn.transaction::<LegalHoldOutcome, HarvestError, _>(async |conn| {
-                let (set_at, until, cur_reason, cur_actor) =
+                let (set_at, until, cur_reason, cur_actor, migrated_to_shard) =
                     load_hold_for_update(conn, exec_id).await?;
+                refuse_if_sealed(exec_id, migrated_to_shard)?;
 
                 if legal_hold_active(set_at, until, now) {
                     // Idempotent: an active hold already exists. Do NOT overwrite
@@ -3680,6 +3723,10 @@ mod legal_hold_db {
     /// # Errors
     ///
     /// - [`HarvestError::NotFound`] when the execution does not exist (→ 404).
+    /// - [`HarvestError::ShardUnavailable`] when the row was sealed by a
+    ///   shard rebalance under the lock (issue #1405). Nothing is cleared.
+    ///   Prefer [`crate::shard_rebalance::release_legal_hold_forwarded`],
+    ///   which retries this for you.
     /// - [`HarvestError::Database`] on any persistence failure.
     pub async fn release_legal_hold(
         conn: &mut AsyncPgConnection,
@@ -3691,7 +3738,9 @@ mod legal_hold_db {
         // concurrent set/release.
         Box::pin(
             conn.transaction::<LegalHoldOutcome, HarvestError, _>(async |conn| {
-                let (set_at, _until, _reason, _actor) = load_hold_for_update(conn, exec_id).await?;
+                let (set_at, _until, _reason, _actor, migrated_to_shard) =
+                    load_hold_for_update(conn, exec_id).await?;
+                refuse_if_sealed(exec_id, migrated_to_shard)?;
 
                 let was_set = set_at.is_some();
                 if was_set {
