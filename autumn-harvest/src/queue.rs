@@ -10255,29 +10255,17 @@ mod tests {
         assert!(sql.contains("\"state\""), "{sql}");
     }
 
-    /// Issue #1391: this must generate a `SET` clause that pushes
-    /// `scheduled_at` into the future off the database clock. It must also
-    /// clear both `wake_requested` and the stale `activity_name` sentinel,
-    /// and restrict the update to `RUNNING` workflow rows. This mirrors
+    /// Issue #1391: this must generate a `SET` clause that clears both
+    /// `wake_requested` and the stale `activity_name` sentinel. It also
+    /// restricts the update to `RUNNING` workflow rows. This mirrors
     /// `requeue_workflow_task_after_panic`'s own pin above. A no-DB test
-    /// pins this so a future edit cannot silently drop the backoff or
-    /// either clear, and reopen issue #1391 or its #603 sibling.
-    ///
-    /// `scheduled_at` must bind off `clock_timestamp()`, not a host-computed
-    /// timestamp (Codex review, PR #1670). A worker clock that trails
-    /// Postgres would otherwise let a persistently quota-blocked task
-    /// satisfy `claim_task`'s eligibility check right away. The task would
-    /// then hot-spin instead of backing off.
+    /// pins this so a future edit cannot silently drop either clear and
+    /// reopen issue #1391 or its #603 sibling.
     #[test]
     fn requeue_workflow_task_for_quota_retry_query_clears_sentinel_and_wake() {
         let changeset = PendingRequeueChangeset::new("quota exceeded".to_string());
-        let sql = requeue_workflow_task_for_quota_retry_query(changeset, Duration::seconds(30));
+        let sql = requeue_workflow_task_for_quota_retry_query(changeset, Duration::seconds(5));
 
-        assert!(
-            sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => "),
-            "scheduled_at must bind off the database clock, not a host-computed \
-             timestamp: {sql}"
-        );
         for column in ["wake_requested", "activity_name"] {
             assert!(
                 sql.contains(&format!("\"{column}\" = $")),
@@ -10296,6 +10284,12 @@ mod tests {
         // Restricted to claimed (RUNNING) workflow rows.
         assert!(sql.contains("\"task_type\""), "{sql}");
         assert!(sql.contains("\"state\""), "{sql}");
+        // `scheduled_at` is computed on Postgres's own clock (issue #1389),
+        // not the host clock, mirroring the panic-retry sibling pin above.
+        assert!(
+            sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => $"),
+            "scheduled_at must be computed from Postgres's own clock: {sql}"
+        );
     }
 
     #[test]
