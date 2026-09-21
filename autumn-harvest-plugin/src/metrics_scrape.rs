@@ -221,22 +221,25 @@ impl HarvestMetricsRecorder {
     /// `.route("/metrics", get(move || { let r = recorder.clone(); async move { r.render_prometheus() } }))`.
     #[must_use]
     pub fn render_prometheus(&self) -> String {
+        use std::fmt::Write as _;
+
         let mut out = String::new();
         for family in MetricsSource::collect(self) {
             let kind = match family.kind {
                 MetricKind::Counter => "counter",
                 MetricKind::Gauge => "gauge",
             };
-            out.push_str(&format!(
-                "# HELP {} {}\n",
+            let _ = writeln!(
+                out,
+                "# HELP {} {}",
                 family.name,
                 escape_help_text(&family.help)
-            ));
-            out.push_str(&format!("# TYPE {} {kind}\n", family.name));
+            );
+            let _ = writeln!(out, "# TYPE {} {kind}", family.name);
             for sample in &family.samples {
                 let value = format_sample_value(sample.value);
                 if sample.labels.is_empty() {
-                    out.push_str(&format!("{} {value}\n", family.name));
+                    let _ = writeln!(out, "{} {value}", family.name);
                 } else {
                     let labels = sample
                         .labels
@@ -244,7 +247,7 @@ impl HarvestMetricsRecorder {
                         .map(|(k, v)| format!("{k}=\"{}\"", escape_label_value(v)))
                         .collect::<Vec<_>>()
                         .join(",");
-                    out.push_str(&format!("{}{{{labels}}} {value}\n", family.name));
+                    let _ = writeln!(out, "{}{{{labels}}} {value}", family.name);
                 }
             }
         }
