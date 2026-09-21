@@ -1460,6 +1460,11 @@ fn snapshot_quota_policies() -> std::collections::HashMap<String, crate::quota::
 /// bucket that mixes quota keys can, rarely, admit a newer row before an
 /// older one. That only happens in the same tick, under scarce tokens.
 /// The delayed row is not lost. It fires on the very next scan.
+///
+/// Sibling of `debounce.rs`'s copy of this function (issue #1230 Finding 2
+/// clone class, tracked in issue #1695). `docs/audits/quota-lock-ordering-sync.py`
+/// gates CI on the two copies staying byte-identical. A fix here must land
+/// in both files in the same change.
 #[cfg(feature = "db")]
 async fn order_due_rows_for_deadlock_free_firing(
     conn: &mut diesel_async::AsyncPgConnection,

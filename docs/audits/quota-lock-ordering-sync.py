@@ -28,11 +28,16 @@ script is the substitute for the abstraction: it fails CI the moment the
 two copies diverge, so the sync work review already had to do by hand
 across PR #1480 stays enforced automatically instead of by convention.
 
-Scope is the three functions confirmed byte-identical by direct diff:
-`resolve_quota_lock_ids`, `order_rows_by_quota_lock_id`, and
-`snapshot_quota_policies`. `resolve_row_quota_lock_key` is intentionally
-excluded — it destructures each file's own `FireDueRow` shape, so it can
-never be identical text and is not part of this clone class.
+Scope is the four functions confirmed byte-identical by direct diff:
+`resolve_quota_lock_ids`, `order_rows_by_quota_lock_id`,
+`snapshot_quota_policies`, and `order_due_rows_for_deadlock_free_firing`
+(the wrapper composing the other three — Codex review on PR #1696 found
+this fourth function belonged in the tracked set too, since a change to
+how it composes them would drift the two copies while leaving the other
+three individually unchanged). `resolve_row_quota_lock_key` is
+intentionally excluded — it destructures each file's own `FireDueRow`
+shape, so it can never be identical text and is not part of this clone
+class.
 
 Usage:
     python3 docs/audits/quota-lock-ordering-sync.py
@@ -56,6 +61,7 @@ TRACKED_FUNCTIONS = [
     "resolve_quota_lock_ids",
     "order_rows_by_quota_lock_id",
     "snapshot_quota_policies",
+    "order_due_rows_for_deadlock_free_firing",
 ]
 
 FN_SIGNATURE_RE_TEMPLATE = r"\n(?:async )?fn {name}\s*\("

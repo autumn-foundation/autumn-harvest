@@ -688,6 +688,11 @@ fn snapshot_quota_policies() -> std::collections::HashMap<String, crate::quota::
 /// None of them took the shared mutex (review). Splitting the map out as
 /// an explicit argument removes the shared global from the tested code
 /// path entirely. So there is nothing left to race.
+///
+/// Sibling of `throttle.rs`'s copy of this function (issue #1230 Finding 2
+/// clone class, tracked in issue #1695). `docs/audits/quota-lock-ordering-sync.py`
+/// gates CI on the two copies staying byte-identical. A fix here must land
+/// in both files in the same change.
 #[cfg(feature = "db")]
 async fn order_due_rows_for_deadlock_free_firing(
     conn: &mut diesel_async::AsyncPgConnection,
