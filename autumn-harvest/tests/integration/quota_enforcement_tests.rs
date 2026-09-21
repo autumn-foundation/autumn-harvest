@@ -1965,6 +1965,186 @@ async fn awaited_child_spawn_quota_check_excludes_its_own_just_appended_history_
 }
 
 // ---------------------------------------------------------------------------
+// Issue #1589: `persist_all_started_child_workflows`'s local-child loop
+// batches children into one multi-row INSERT per table when their OWN
+// `enforce_quota_admission` call is a proven no-op. That no-op case is:
+// no declared policy, no active cap, or no resolved key. A child with an
+// active cap keeps the original sequential insert-then-admit path
+// instead. These tests are the
+// direct proof that the split preserves `enforce_quota_admission`'s
+// graduated admission property, and its all-or-nothing rollback, when a
+// SINGLE decision mixes both groups. That mix is exactly the scenario the
+// split's own safety argument depends on.
+// ---------------------------------------------------------------------------
+
+fn mixed_fan_out_parent<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let uncapped_type = input["uncapped_type"]
+            .as_str()
+            .expect("input.uncapped_type must be present")
+            .to_string();
+        let capped_type = input["capped_type"]
+            .as_str()
+            .expect("input.capped_type must be present")
+            .to_string();
+        let capped_count = input["capped_count"].as_u64().unwrap_or(0);
+
+        // Three uncapped (batchable) children, then N capped (sequential)
+        // children sharing one quota key -- one decision, two groups.
+        let mut children: Vec<(String, serde_json::Value)> = (0..3)
+            .map(|i| (uncapped_type.clone(), serde_json::json!({"i": i})))
+            .collect();
+        for _ in 0..capped_count {
+            children.push((
+                capped_type.clone(),
+                serde_json::json!({"tenant_id": "acme"}),
+            ));
+        }
+
+        let results = ctx
+            .spawn_child_workflow_fan_out_raw(children)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "results": results }))
+    })
+}
+
+fn mixed_fan_out_leaf<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(serde_json::json!("leaf_done")) })
+}
+
+/// Within the cap: 3 uncapped children (batched) plus exactly 2 capped
+/// children sharing one key against a cap of 2 (sequential, admitted at
+/// the boundary). Both groups must be fully admitted -- the batched
+/// group's existence must not depend on, or interfere with, the
+/// sequential group's admission.
+#[tokio::test]
+async fn mixed_fan_out_admits_the_batched_group_and_exactly_caps_the_sequential_group() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let parent_wf = leaked("mixed_fanout_parent_ok");
+    let uncapped_wf = leaked("mixed_fanout_uncapped_ok");
+    let capped_wf = leaked("mixed_fanout_capped_ok");
+
+    let mut capped_info = wf_info(capped_wf, mixed_fan_out_leaf);
+    capped_info.quota = Some(QuotaPolicy::new("tenant_id").with_max_active_executions(2));
+
+    let reg = registry(vec![
+        wf_info(parent_wf, mixed_fan_out_parent),
+        wf_info(uncapped_wf, mixed_fan_out_leaf),
+        capped_info,
+    ]);
+
+    let parent = start_root(
+        &mut conn,
+        parent_wf,
+        &format!("parent-{}", Uuid::new_v4().simple()),
+        serde_json::json!({
+            "uncapped_type": uncapped_wf,
+            "capped_type": capped_wf,
+            "capped_count": 2u64,
+        }),
+    )
+    .await;
+
+    let worker = build_runtime_worker("w-1589-mixed-ok", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+    wait_for_execution_state(&url, parent, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    let count_sql =
+        "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions WHERE workflow_name = $1";
+    assert_eq!(
+        count_rows(&mut conn, count_sql, &[uncapped_wf]).await,
+        3,
+        "all 3 batched (uncapped) children must exist regardless of the capped group \
+         sharing the same decision"
+    );
+    assert_eq!(
+        count_rows(&mut conn, count_sql, &[capped_wf]).await,
+        2,
+        "both capped children must be admitted -- exactly at the cap, none over"
+    );
+}
+
+/// Over the cap: 3 uncapped children (batched) plus 3 capped children
+/// sharing one key against a cap of 2. The 3rd capped child's admission
+/// must fail. That failure must roll back the WHOLE decision, including
+/// the already-batched uncapped group, since both groups persist inside
+/// the same outer transaction. The parent parks and retries rather than
+/// completing with a partial fan-out.
+#[tokio::test]
+async fn mixed_fan_out_rolls_back_the_whole_decision_when_the_sequential_group_exceeds_cap() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let parent_wf = leaked("mixed_fanout_parent_reject");
+    let uncapped_wf = leaked("mixed_fanout_uncapped_reject");
+    let capped_wf = leaked("mixed_fanout_capped_reject");
+
+    let mut capped_info = wf_info(capped_wf, mixed_fan_out_leaf);
+    capped_info.quota = Some(QuotaPolicy::new("tenant_id").with_max_active_executions(2));
+
+    let reg = registry(vec![
+        wf_info(parent_wf, mixed_fan_out_parent),
+        wf_info(uncapped_wf, mixed_fan_out_leaf),
+        capped_info,
+    ]);
+
+    let parent = start_root(
+        &mut conn,
+        parent_wf,
+        &format!("parent-{}", Uuid::new_v4().simple()),
+        serde_json::json!({
+            "uncapped_type": uncapped_wf,
+            "capped_type": capped_wf,
+            "capped_count": 3u64, // exceeds the cap of 2 WITHIN this one decision
+        }),
+    )
+    .await;
+
+    let worker = build_runtime_worker("w-1589-mixed-reject", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+
+    // The rejection parks + backoff-retries the parent. It never
+    // completes, since every retry hits the identical over-cap decision.
+    // Give the worker a few cycles, then assert nothing from either group
+    // ever committed.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    assert_eq!(
+        load_execution(&mut conn, parent).await.state,
+        "RUNNING",
+        "the parent must stay RUNNING (parked/retrying), never completing on a \
+         decision whose capped group can never be fully admitted"
+    );
+    let count_sql =
+        "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions WHERE workflow_name = $1";
+    assert_eq!(
+        count_rows(&mut conn, count_sql, &[uncapped_wf]).await,
+        0,
+        "the batched (uncapped) group's inserts must roll back too -- the whole \
+         decision is one transaction"
+    );
+    assert_eq!(
+        count_rows(&mut conn, count_sql, &[capped_wf]).await,
+        0,
+        "none of the over-cap capped group's children may survive a rolled-back decision"
+    );
+
+    worker.shutdown();
+    handle.await.expect("worker join");
+}
+
+// ---------------------------------------------------------------------------
 // Issue #946, Codex round-3 review — the child-timeout-race primitive
 // (`ctx.spawn_child_workflow_timeout`, issue #779) dispatches through
 // `persist_child_timeout_race` -> `insert_awaited_child_execution`, a THIRD

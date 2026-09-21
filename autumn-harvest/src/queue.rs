@@ -3012,6 +3012,14 @@ pub async fn requeue_workflow_task_for_quota_retry(
 
     let changeset = PendingRequeueChangeset::new(previous_error.to_string());
 
+    // `scheduled_at` is computed on Postgres's own `clock_timestamp()`, not
+    // the host's `Utc::now()` (Codex review, issue #1589). A trailing
+    // worker host clock could otherwise bind a `scheduled_at` already at
+    // or before the database's own `NOW()`. `claim_task` compares against
+    // that, so the row would be immediately claimable again. That defeats
+    // this function's whole purpose: a bounded backoff against a durably
+    // exhausted quota. Mirrors `requeue_for_retry`'s and
+    // `requeue_workflow_task_nd_blocked`'s identical DB-clock computation.
     let updated = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
@@ -10261,6 +10269,11 @@ mod tests {
     /// `requeue_workflow_task_after_panic`'s own pin above. A no-DB test
     /// pins this so a future edit cannot silently drop either clear and
     /// reopen issue #1391 or its #603 sibling.
+    ///
+    /// Also pins the Codex-review fix (issue #1589): `scheduled_at` must be
+    /// computed via Postgres's own `clock_timestamp()`, not bound as a
+    /// host-computed literal. A trailing worker host clock must not be
+    /// able to bind an already-past deadline.
     #[test]
     fn requeue_workflow_task_for_quota_retry_query_clears_sentinel_and_wake() {
         let changeset = PendingRequeueChangeset::new("quota exceeded".to_string());

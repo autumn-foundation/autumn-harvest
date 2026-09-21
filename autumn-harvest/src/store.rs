@@ -358,6 +358,264 @@ pub async fn append_events_offloaded_with_codecs(
     Ok(inserted)
 }
 
+/// Postgres's per-statement bind-parameter ceiling (issue #1589). Mirrors
+/// `queue::enqueue_batch`'s identical constant -- kept as a separate copy
+/// here since the two chunkers bound different row shapes.
+#[cfg(feature = "db")]
+const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
+
+/// [`NewHarvestEvent`]'s field count. Pinned by a regression test below so
+/// an added column is caught, not silently under-counted.
+#[cfg(feature = "db")]
+const NEW_HARVEST_EVENT_COLUMNS: usize = 4;
+
+/// Rows per chunk, floored so `ROWS_PER_EVENT_INSERT_CHUNK *
+/// NEW_HARVEST_EVENT_COLUMNS` never reaches [`POSTGRES_MAX_BIND_PARAMS`].
+#[cfg(feature = "db")]
+const ROWS_PER_EVENT_INSERT_CHUNK: usize = POSTGRES_MAX_BIND_PARAMS / NEW_HARVEST_EVENT_COLUMNS;
+
+/// [`crate::models::NewHarvestPayloadRef`]'s field count (issue #1589
+/// Codex review: a batch's offloaded refs need their own chunk bound, not
+/// just the event rows). Pinned by a regression test below.
+#[cfg(feature = "db")]
+const NEW_HARVEST_PAYLOAD_REF_COLUMNS: usize = 4;
+
+/// Rows per chunk, floored so `ROWS_PER_PAYLOAD_REF_INSERT_CHUNK *
+/// NEW_HARVEST_PAYLOAD_REF_COLUMNS` never reaches [`POSTGRES_MAX_BIND_PARAMS`].
+#[cfg(feature = "db")]
+const ROWS_PER_PAYLOAD_REF_INSERT_CHUNK: usize =
+    POSTGRES_MAX_BIND_PARAMS / NEW_HARVEST_PAYLOAD_REF_COLUMNS;
+
+/// Byte budget on one chunk's summed `event_data` size. Mirrors
+/// `queue::enqueue_batch`'s identical-purpose `MAX_CHUNK_PAYLOAD_BYTES`.
+///
+/// [`ROWS_PER_EVENT_INSERT_CHUNK`] alone bounds parameter count, not
+/// memory. A `WorkflowStarted` input may validly reach
+/// [`crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES`] (2 MiB). Offload
+/// (issue #524) only shrinks it when a `PayloadOffloader` is configured,
+/// and only once the threshold is crossed. Without this bound, a fan-out
+/// of thousands of near-max-size children could still build one
+/// multi-gigabyte `INSERT`.
+#[cfg(feature = "db")]
+const MAX_EVENT_CHUNK_PAYLOAD_BYTES: usize = 8 * 1024 * 1024; // 4x DEFAULT_MAX_WORKFLOW_INPUT_BYTES
+
+#[cfg(feature = "db")]
+const _: () = assert!(
+    MAX_EVENT_CHUNK_PAYLOAD_BYTES as u64 == 4 * crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES
+);
+
+/// Exact byte length `serde_json::to_vec(value)` would produce, without
+/// allocating that `Vec`. Mirrors `queue.rs`'s identical helper, generic
+/// over anything `Serialize` (issue #1589 Codex review) so it can measure
+/// a `WorkflowEvent` directly, before that event is ever encoded.
+#[cfg(feature = "db")]
+fn json_byte_len<T: serde::Serialize>(value: &T) -> usize {
+    struct CountingWriter(usize);
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = CountingWriter(0);
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+
+/// Splits `events` into `[start, end)` index ranges, each within both
+/// [`ROWS_PER_EVENT_INSERT_CHUNK`] rows and
+/// [`MAX_EVENT_CHUNK_PAYLOAD_BYTES`] of summed event size.
+///
+/// Measured directly from each `WorkflowEvent` (Codex review, issue
+/// #1589), before any [`NewHarvestEvent`] row is built, encoded, or
+/// offloaded. Peak memory during that build therefore stays bounded by
+/// one chunk, not the whole `events` slice. This is a size ESTIMATE, not
+/// the exact post-encode/post-offload byte count -- a codec or an offload
+/// can shrink or grow a payload. The budget is wide enough to absorb that
+/// slack, the same way `queue.rs`'s own pre-transformation measurement
+/// does for `enqueue_batch`.
+///
+/// Mirrors `queue.rs`'s `compute_chunk_bounds` shape. A non-empty `events`
+/// always returns at least one range, and every event falls into exactly
+/// one of them, in order.
+#[cfg(feature = "db")]
+fn compute_event_chunk_bounds(events: &[(ExecutionId, WorkflowEvent)]) -> Vec<(usize, usize)> {
+    let mut chunk_bounds = Vec::new();
+    let mut chunk_start = 0_usize;
+    while chunk_start < events.len() {
+        let mut chunk_end = chunk_start + 1;
+        let mut payload_bytes = json_byte_len(&events[chunk_start].1);
+        while chunk_end < events.len() && chunk_end - chunk_start < ROWS_PER_EVENT_INSERT_CHUNK {
+            let next_bytes = json_byte_len(&events[chunk_end].1);
+            if payload_bytes + next_bytes > MAX_EVENT_CHUNK_PAYLOAD_BYTES {
+                break;
+            }
+            payload_bytes += next_bytes;
+            chunk_end += 1;
+        }
+        chunk_bounds.push((chunk_start, chunk_end));
+        chunk_start = chunk_end;
+    }
+    chunk_bounds
+}
+
+/// The distinct shards `events` represents, sorted and deduplicated.
+///
+/// Issue #1589: [`append_new_execution_started_events_batch`] is a `pub`
+/// helper. It must not assume every event shares one shard just because
+/// its only current caller happens to guarantee that. Every distinct
+/// shard here gets its own DR fence check.
+#[cfg(feature = "db")]
+fn distinct_shards(events: &[(ExecutionId, WorkflowEvent)]) -> Vec<crate::types::ShardId> {
+    let mut shards: Vec<crate::types::ShardId> =
+        events.iter().map(|(exec_id, _)| exec_id.shard()).collect();
+    shards.sort_unstable();
+    shards.dedup();
+    shards
+}
+
+/// Append one `WorkflowStarted` event per execution, batched.
+///
+/// One multi-row `INSERT` per chunk, instead of one `INSERT` per execution
+/// (issue #1589 -- the local awaited-child fan-out loop in `worker.rs`'s
+/// `persist_all_started_child_workflows`).
+///
+/// Every execution here is brand new, so its history is empty and every row
+/// uses `event_id = 0`. Unlike a single execution's own event append, no row
+/// here re-reads `MAX(event_id) FOR UPDATE` to serialize against a sibling.
+/// There is no sibling sharing an execution id to serialize against.
+///
+/// `events` is not required to share one shard. The only current
+/// caller's local children always land on the parent's shard (issue
+/// #956), and so happen to. This is a `pub` helper another caller could
+/// reach with mixed shards. So the DR write-authority fence (issue
+/// #954) is asserted for every DISTINCT shard a chunk represents, not
+/// just its first event's. Each check runs inside that chunk's own
+/// transaction, paired with its `INSERT`s. A single-shard chunk pays
+/// for exactly one fence check, same as before.
+///
+/// **Atomicity is per chunk, not across the whole call** (Codex review).
+/// Each chunk commits in its own transaction, opened after that chunk's
+/// offload upload. It is never one transaction wrapping every chunk,
+/// which would hold the DR fence lock across every chunk's upload. A
+/// caller that needs the whole batch to succeed or fail together, across
+/// chunk boundaries, must wrap this call in its own enclosing
+/// transaction. A failure then rolls back every chunk's savepoint too,
+/// not just the one that failed. The only current caller already does
+/// this. `events` here is always well under one chunk in practice.
+/// Even when it is not, `persist_all_started_child_workflows` calls this
+/// from inside its own outer transaction.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on `INSERT` failure, a
+/// codec error on encode failure, or a payload-store error on offload
+/// failure.
+#[cfg(feature = "db")]
+pub async fn append_new_execution_started_events_batch(
+    conn: &mut AsyncPgConnection,
+    events: &[(ExecutionId, WorkflowEvent)],
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
+    use crate::models::NewHarvestPayloadRef;
+    use crate::schema::harvest_payload_refs;
+
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    // Chunk boundaries are decided up front from `events` itself (Codex
+    // review, issue #1589), before any row is encoded or offloaded. Each
+    // chunk then builds, encodes, offloads, and inserts its own small row
+    // `Vec`s in turn. Peak memory therefore stays bounded by one chunk's
+    // payload, not the whole `events` slice.
+    //
+    // The DR write-authority fence (issue #954) is asserted separately,
+    // per chunk, in its OWN transaction. That transaction opens AFTER
+    // that chunk's offload upload -- never one transaction wrapping
+    // every chunk (issue #1589). `assert_fence`'s `FOR SHARE` row lock
+    // is held until its transaction commits, not released between
+    // statements. One transaction around the whole loop would hold that
+    // lock across every chunk's network upload. That would block a
+    // concurrent DR fencing operation for the whole batch.
+    // `append_events_offloaded_with_codecs` fixed this identical hazard
+    // for the single-execution append path by uploading before the
+    // fenced transaction opens. This mirrors it once per chunk.
+    for (start, end) in compute_event_chunk_bounds(events) {
+        let chunk_shards = distinct_shards(&events[start..end]);
+
+        let mut rows: Vec<NewHarvestEvent<'_>> = events[start..end]
+            .iter()
+            .map(|(exec_id, event)| {
+                Ok(NewHarvestEvent {
+                    workflow_exec_id: exec_id.as_uuid(),
+                    event_id: 0,
+                    event_type: event.type_name(),
+                    event_data: codecs.encode_event(event)?,
+                })
+            })
+            .collect::<Result<_, crate::error::HarvestError>>()?;
+
+        // Offload runs before the fenced transaction below, exactly like
+        // `append_events_offloaded_with_codecs` (encode-then-offload,
+        // ADR-0003).
+        let mut ref_rows: Vec<NewHarvestPayloadRef> = Vec::new();
+        if let Some(offloader) = offloader {
+            for row in &mut rows {
+                let refs = offloader.offload_event_value(&mut row.event_data).await?;
+                ref_rows.extend(refs.into_iter().map(|r| NewHarvestPayloadRef {
+                    blob_key: r.blob_key,
+                    workflow_exec_id: row.workflow_exec_id,
+                    store_id: r.store_id,
+                    byte_len: i64::try_from(r.byte_len).unwrap_or(i64::MAX),
+                }));
+            }
+        }
+
+        Box::pin(
+            conn.transaction::<(), crate::error::HarvestError, _>(async |conn| {
+                for shard in &chunk_shards {
+                    crate::replication::assert_fence(conn, *shard).await?;
+                }
+                diesel::insert_into(harvest_events::table)
+                    .values(&rows)
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+
+                for ref_chunk in ref_rows.chunks(ROWS_PER_PAYLOAD_REF_INSERT_CHUNK) {
+                    diesel::insert_into(harvest_payload_refs::table)
+                        .values(ref_chunk)
+                        .on_conflict_do_nothing()
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
+                }
+                Ok(())
+            }),
+        )
+        .await?;
+        drop(rows);
+        drop(ref_rows);
+    }
+
+    for (exec_id, event) in events {
+        crate::notify::notify_workflow_events_appended(
+            conn,
+            exec_id.as_uuid(),
+            1,
+            event.type_name(),
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 /// Record per-execution references to offloaded payload blobs (issue #524).
 ///
 /// Idempotent: a duplicate `(blob_key, workflow_exec_id)` row is ignored, so a
@@ -2297,6 +2555,148 @@ mod tests {
         assert_eq!(rows[1].event_id, 1);
         assert_eq!(rows[0].event_type, "WorkflowStarted");
         assert_eq!(rows[1].event_type, "ActivityScheduled");
+    }
+
+    /// Pins [`NEW_HARVEST_EVENT_COLUMNS`], and therefore
+    /// [`ROWS_PER_EVENT_INSERT_CHUNK`], to `NewHarvestEvent`'s real field
+    /// count, by exhaustive destructure (issue #1589, mirrors
+    /// `queue.rs`'s identical regression test for `NewTaskQueueItem`).
+    /// Adding, removing, or renaming a field breaks this match at compile
+    /// time. The chunk size then cannot silently drift out of sync with the
+    /// row width it bounds.
+    #[cfg(feature = "db")]
+    #[test]
+    fn new_harvest_event_column_count_matches_the_constant() {
+        let sample = NewHarvestEvent {
+            workflow_exec_id: uuid::Uuid::nil(),
+            event_id: 0,
+            event_type: "WorkflowStarted",
+            event_data: serde_json::Value::Null,
+        };
+        let NewHarvestEvent {
+            workflow_exec_id: _,
+            event_id: _,
+            event_type: _,
+            event_data: _,
+        } = sample;
+        const {
+            assert!(NEW_HARVEST_EVENT_COLUMNS == 4);
+            assert!(
+                ROWS_PER_EVENT_INSERT_CHUNK * NEW_HARVEST_EVENT_COLUMNS <= POSTGRES_MAX_BIND_PARAMS
+            );
+        }
+    }
+
+    /// Pins [`NEW_HARVEST_PAYLOAD_REF_COLUMNS`], and therefore
+    /// [`ROWS_PER_PAYLOAD_REF_INSERT_CHUNK`], to `NewHarvestPayloadRef`'s
+    /// real field count, by exhaustive destructure (issue #1589). Adding,
+    /// removing, or renaming a field breaks this match at compile time.
+    #[cfg(feature = "db")]
+    #[test]
+    fn new_harvest_payload_ref_column_count_matches_the_constant() {
+        let sample = crate::models::NewHarvestPayloadRef {
+            blob_key: String::new(),
+            workflow_exec_id: uuid::Uuid::nil(),
+            store_id: String::new(),
+            byte_len: 0,
+        };
+        let crate::models::NewHarvestPayloadRef {
+            blob_key: _,
+            workflow_exec_id: _,
+            store_id: _,
+            byte_len: _,
+        } = sample;
+        const {
+            assert!(NEW_HARVEST_PAYLOAD_REF_COLUMNS == 4);
+            assert!(
+                ROWS_PER_PAYLOAD_REF_INSERT_CHUNK * NEW_HARVEST_PAYLOAD_REF_COLUMNS
+                    <= POSTGRES_MAX_BIND_PARAMS
+            );
+        }
+    }
+
+    /// Mirrors `queue.rs`'s `chunk_bounds_splits_near_max_size_inputs_into_many_small_chunks`
+    /// (issue #1589). A run of near-max-size `WorkflowStarted` inputs must
+    /// split into many small chunks under [`MAX_EVENT_CHUNK_PAYLOAD_BYTES`],
+    /// not all land in one chunk sized only by
+    /// [`ROWS_PER_EVENT_INSERT_CHUNK`].
+    #[cfg(feature = "db")]
+    #[test]
+    fn event_chunk_bounds_splits_near_max_size_inputs_into_many_small_chunks() {
+        let near_max_bytes =
+            usize::try_from(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES).unwrap();
+        let events: Vec<(ExecutionId, WorkflowEvent)> = (0..200)
+            .map(|_| {
+                let payload = "x".repeat(near_max_bytes);
+                (
+                    ExecutionId::new(),
+                    WorkflowEvent::WorkflowStarted {
+                        input: serde_json::json!(payload),
+                        timestamp: Utc::now(),
+                        last_completion_result: None,
+                        last_error: None,
+                        scheduled_time: None,
+                    },
+                )
+            })
+            .collect();
+        let bounds = compute_event_chunk_bounds(&events);
+
+        assert!(
+            bounds.len() > 10,
+            "200 near-max-size events must split into many small chunks, got {} chunk(s)",
+            bounds.len()
+        );
+        for &(start, end) in &bounds {
+            let row_sizes: Vec<usize> = events[start..end]
+                .iter()
+                .map(|(_, event)| json_byte_len(event))
+                .collect();
+            let chunk_payload: usize = row_sizes.iter().sum();
+            let largest_row = row_sizes.iter().copied().max().unwrap_or(0);
+            assert!(
+                chunk_payload <= MAX_EVENT_CHUNK_PAYLOAD_BYTES + largest_row,
+                "chunk [{start}, {end}) carries {chunk_payload} bytes, over the \
+                 {MAX_EVENT_CHUNK_PAYLOAD_BYTES}-byte budget by more than one row's allowance"
+            );
+        }
+        let mut next_expected = 0;
+        for &(start, end) in &bounds {
+            assert_eq!(start, next_expected, "chunks must be contiguous, no gaps");
+            assert!(end > start, "every chunk must carry at least one event");
+            next_expected = end;
+        }
+        assert_eq!(
+            next_expected,
+            events.len(),
+            "every event must fall into a chunk"
+        );
+    }
+
+    /// Codex review, issue #1589: a `pub` helper must not silently fence
+    /// only the first event's shard. `distinct_shards` must report every
+    /// shard a batch represents, deduplicated, so the caller can fence
+    /// each one.
+    #[cfg(feature = "db")]
+    #[test]
+    fn distinct_shards_reports_every_shard_deduplicated() {
+        let shard_a = crate::types::ShardId::new(0);
+        let shard_b = crate::types::ShardId::new(1);
+        let started = |shard: crate::types::ShardId| {
+            (
+                ExecutionId::new_for_shard(shard),
+                WorkflowEvent::WorkflowStarted {
+                    input: serde_json::json!({}),
+                    timestamp: Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
+                    scheduled_time: None,
+                },
+            )
+        };
+        let events = vec![started(shard_a), started(shard_b), started(shard_a)];
+
+        assert_eq!(distinct_shards(&events), vec![shard_a, shard_b]);
     }
 
     #[test]

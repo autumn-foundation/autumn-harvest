@@ -10380,9 +10380,35 @@ async fn persist_all_started_child_workflows(
             .await?;
         }
 
+        // Issue #1589 (direction a): route each local child to the
+        // sequential insert-then-admit path, or to a batched-insert path.
+        // The routing checks whether its OWN `enforce_quota_admission` call
+        // would touch the database at all. That function no-ops (zero
+        // queries) in exactly three cases: no declared policy, no active
+        // cap, or no resolved key -- checked below. A child in that shape
+        // can never reject a sibling or be rejected by one. The insert-
+        // then-admit ORDER carries no information for it. So the whole
+        // group can be inserted, appended, and enqueued as one batch each,
+        // instead of one row each.
+        let mut sequential_children: Vec<LocalChildPlan<'_>> = Vec::new();
+        let mut batchable_children: Vec<LocalChildPlan<'_>> = Vec::new();
+        // Issue #1589: `RetryPolicy::non_retryable_errors` is an unbounded
+        // `Vec<String>`. Without this cache, a same-type fan-out would
+        // resolve and hold one independent deep copy per child. All
+        // copies stay alive at once before the first insert chunk runs.
+        // The cache lets same-type children in this fan-out share ONE
+        // resolved `Arc`. Peak memory then scales with distinct workflow
+        // types, not with child count.
+        let mut retry_policy_cache: HashMap<&str, Arc<serde_json::Value>> = HashMap::new();
         for child in &local_new_children {
-            let child_workflow_id = child.child_id.to_string();
-            let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
+            let mut defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
+            if let Some(policy) = defaults.retry_policy.take() {
+                defaults.retry_policy = Some(cached_retry_policy(
+                    &mut retry_policy_cache,
+                    child.workflow_name.as_str(),
+                    policy,
+                ));
+            }
             // Resolve + bound the CHILD's own quota key from ITS OWN declared
             // policy (issue #946, Codex round-3 review) -- a spawned child
             // accumulates its own history/DLQ/active-execution footprint
@@ -10404,52 +10430,44 @@ async fn persist_all_started_child_workflows(
                     activity_name: None,
                 });
             }
-            let child_row = NewWorkflowExecution {
-                continued_from_exec_id: None,
-                first_exec_id: None,
-                chain_execution_timeout: defaults.chain_execution_timeout,
-                chain_deadline_at: defaults.chain_deadline_at,
-                id: child.child_id.as_uuid(),
-                workflow_name: &child.workflow_name,
-                workflow_id: &child_workflow_id,
-                run_id: uuid::Uuid::new_v4(),
-                shard_id,
-                input: child.input.clone(),
-                parent_id: Some(parent_exec_id.as_uuid()),
-                queue_name: &queue_name,
-                execution_timeout: defaults.execution_timeout,
-                deadline_at: defaults.deadline_at,
-                sla: defaults.sla,
-                sla_deadline_at: defaults.sla_deadline_at,
-                memo: None,
-                search_attrs: None,
-                assigned_build_id: parent_execution.assigned_build_id.clone(),
-                parent_close_policy: None, // awaited child
-                owner: defaults.owner,
-                runbook_url: defaults.runbook_url,
-                severity: defaults.severity,
-                context_headers: parent_execution.context_headers.clone(),
-                schedule_id: None, // child workflows are not scheduled fires
-                scheduled_for: None,
-                workflow_attempt: 1,
-                workflow_retry_policy: defaults.retry_policy,
-                retry_of_exec_id: None,
-                origin: None, // child workflow, not a schedule fire (issue #534)
-                // Children get only builder-wide default callback
-                // targets, resolved at their own terminal transition
-                // (issue #605) — no per-execution override here.
-                completion_callbacks: None,
-                start_source: Some(crate::types::StartSource::Child.as_str()),
-                start_source_ref: Some(parent_exec_id_str.as_str()),
-                started_by: None,
-                // A spawned child is enforced against its OWN declared quota
-                // policy (issue #946, Codex round-3 review) -- resolved and
-                // bound-checked above via `child_quota_key`. Stamping it here
-                // (rather than `None`) keeps the row correctly tagged for
-                // future usage accounting even on a re-park path where this
-                // child already exists and enforcement below is skipped.
-                quota_key: child_quota_key.as_deref(),
+            let admission_is_noop = defaults
+                .quota
+                .as_ref()
+                .is_none_or(|policy| !policy.has_any_cap() || child_quota_key.is_none());
+            let plan = LocalChildPlan {
+                child,
+                defaults,
+                child_workflow_id: child.child_id.to_string(),
+                child_quota_key,
             };
+            if admission_is_noop {
+                batchable_children.push(plan);
+            } else {
+                sequential_children.push(plan);
+            }
+        }
+
+        // Children with an active cap on their own declared policy keep the
+        // original sequential insert-then-admit contract, one child at a
+        // time, unchanged. `enforce_quota_admission`'s graduated "admit
+        // first K, reject the rest" property (see that function's own doc
+        // comment) is therefore unaffected by this split.
+        for plan in &sequential_children {
+            let child = plan.child;
+            // A spawned child is enforced against its OWN declared quota
+            // policy (issue #946, Codex round-3 review) -- resolved and
+            // bound-checked above via `child_quota_key`. Stamping it here
+            // (rather than `None`) keeps the row correctly tagged for
+            // future usage accounting even on a re-park path where this
+            // child already exists and enforcement below is skipped.
+            let child_row = build_child_row(
+                plan,
+                shard_id,
+                &queue_name,
+                parent_exec_id,
+                parent_execution,
+                &parent_exec_id_str,
+            );
             let child_started_event = WorkflowEvent::WorkflowStarted {
                 input: child.input.clone(),
                 timestamp: chrono::Utc::now(),
@@ -10498,8 +10516,8 @@ async fn persist_all_started_child_workflows(
             // an unrelated tenant's quota (Codex round-3 review).
             crate::execution::enforce_quota_admission(
                 conn,
-                defaults.quota,
-                child_quota_key.as_deref(),
+                plan.defaults.quota,
+                plan.child_quota_key.as_deref(),
                 &child.workflow_name,
                 Some(registry.telemetry().metrics.as_ref()),
                 None, // no dry-run credit on a child spawn (children never declare cancel_running)
@@ -10516,6 +10534,103 @@ async fn persist_all_started_child_workflows(
             )
             .await?;
             queue::enqueue(conn, &params).await?;
+        }
+
+        // Children whose admission is a proven no-op get one multi-row
+        // INSERT per table for the whole group, chunked under Postgres's
+        // bind-parameter ceiling. That replaces one INSERT per child --
+        // issue #1589's own measured N -> 3N shape. `enforce_quota_admission`
+        // is not called here at all. The `admission_is_noop` routing above
+        // already proves it would return immediately without a query.
+        // Chunk boundaries are decided up front from `batchable_children`'s
+        // own borrowed `child.input` (Codex review, issue #1589), before
+        // any row is built. Each chunk then builds its own small row
+        // `Vec`s for all three tables, inserts them, and drops them. Peak
+        // memory therefore stays bounded by one chunk's payload, not the
+        // whole batchable group's.
+        //
+        // `shared_context_headers_bytes` (Codex review): `build_child_row`
+        // clones the PARENT's own `context_headers` into every row. Unlike
+        // `child.input`, that clone is never validated against
+        // `payload_max_workflow_input`. It must be counted once per row
+        // too. Otherwise a large inherited header could build an oversized
+        // chunk the byte budget never saw coming.
+        let shared_context_headers_bytes = parent_execution
+            .context_headers
+            .as_ref()
+            .map_or(0, json_byte_len);
+        for (start, end) in
+            compute_local_child_chunk_bounds(&batchable_children, shared_context_headers_bytes)
+        {
+            let plan_chunk = &batchable_children[start..end];
+
+            let child_rows: Vec<NewWorkflowExecution<'_>> = plan_chunk
+                .iter()
+                .map(|plan| {
+                    build_child_row(
+                        plan,
+                        shard_id,
+                        &queue_name,
+                        parent_exec_id,
+                        parent_execution,
+                        &parent_exec_id_str,
+                    )
+                })
+                .collect();
+            diesel::insert_into(harvest_workflow_executions::table)
+                .values(&child_rows)
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            drop(child_rows);
+
+            let started_events: Vec<(ExecutionId, WorkflowEvent)> = plan_chunk
+                .iter()
+                .map(|plan| {
+                    (
+                        plan.child.child_id,
+                        WorkflowEvent::WorkflowStarted {
+                            input: plan.child.input.clone(),
+                            timestamp: chrono::Utc::now(),
+                            last_completion_result: None,
+                            last_error: None,
+                            scheduled_time: None, // child workflows are not scheduler-fired
+                        },
+                    )
+                })
+                .collect();
+            store::append_new_execution_started_events_batch(
+                conn,
+                &started_events,
+                registry.payload_offloader(),
+                registry.payload_codecs(),
+            )
+            .await?;
+            drop(started_events);
+
+            let enqueue_params: Vec<queue::EnqueueParams> = plan_chunk
+                .iter()
+                .map(|plan| {
+                    let child = plan.child;
+                    let mut params = queue::EnqueueParams::new(
+                        queue_name.clone(),
+                        TaskType::Workflow,
+                        child.input.clone(),
+                    );
+                    params.workflow_exec_id = Some(child.child_id.as_uuid());
+                    params
+                        .required_build_id
+                        .clone_from(&parent_execution.assigned_build_id);
+                    (params.concurrency_key, params.max_concurrent) =
+                        resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
+                    params.trace_context = child_trace_ctxs
+                        .get(&child.child_id.as_uuid())
+                        .cloned()
+                        .flatten();
+                    params
+                })
+                .collect();
+            queue::enqueue_batch(conn, &enqueue_params).await?;
         }
 
         // Check for already-terminal children only in the re-park path
@@ -10647,7 +10762,13 @@ struct ChildWorkflowDefaults {
     deadline_at: Option<chrono::DateTime<chrono::Utc>>,
     chain_execution_timeout: Option<chrono::Duration>,
     chain_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
-    retry_policy: Option<serde_json::Value>,
+    /// Shared, not owned per child (issue #1589).
+    /// `RetryPolicy::non_retryable_errors` is an unbounded `Vec<String>`.
+    /// A same-type fan-out with a large policy would otherwise hold one
+    /// independent deep copy per `LocalChildPlan`. All copies stay alive
+    /// at once before the first insert chunk runs. `Arc` lets same-type
+    /// children in one fan-out share the one resolved value.
+    retry_policy: Option<Arc<serde_json::Value>>,
     /// The child's OWN declared quota policy (issue #946), resolved from its
     /// registered `WorkflowInfo` — never inherited from the parent. A child
     /// spawn is a genuine fresh admission from a resource-accumulation
@@ -10656,6 +10777,219 @@ struct ChildWorkflowDefaults {
     /// visible to the target type's own quota accounting exactly like any
     /// other registry-aware start path.
     quota: Option<crate::quota::QuotaPolicy>,
+}
+
+/// Postgres's per-statement bind-parameter ceiling (issue #1589). Mirrors
+/// `queue.rs`'s and `store.rs`'s identical constant -- kept as a separate
+/// copy here since each chunker bounds a different row shape.
+const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
+
+/// [`NewWorkflowExecution`]'s field count. Pinned by a regression test
+/// below so an added column is caught, not silently under-counted.
+const NEW_WORKFLOW_EXECUTION_COLUMNS: usize = 35;
+
+/// Rows per chunk, floored so `ROWS_PER_EXECUTION_INSERT_CHUNK *
+/// NEW_WORKFLOW_EXECUTION_COLUMNS` never reaches [`POSTGRES_MAX_BIND_PARAMS`].
+const ROWS_PER_EXECUTION_INSERT_CHUNK: usize =
+    POSTGRES_MAX_BIND_PARAMS / NEW_WORKFLOW_EXECUTION_COLUMNS;
+
+/// Byte budget on one chunk's summed `input` size. Mirrors
+/// `queue::enqueue_batch`'s identical-purpose `MAX_CHUNK_PAYLOAD_BYTES`.
+///
+/// [`ROWS_PER_EXECUTION_INSERT_CHUNK`] alone bounds parameter count, not
+/// memory. A child's input may validly reach
+/// [`crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES`] (2 MiB). This row's
+/// `input` is never offloaded -- offload (issue #524) applies to event
+/// history, not the execution row itself. Without this bound, a fan-out of
+/// thousands of near-max-size children could still build one
+/// multi-gigabyte `INSERT`.
+const MAX_EXECUTION_CHUNK_PAYLOAD_BYTES: usize = 8 * 1024 * 1024; // 4x DEFAULT_MAX_WORKFLOW_INPUT_BYTES
+
+const _: () = assert!(
+    MAX_EXECUTION_CHUNK_PAYLOAD_BYTES as u64
+        == 4 * crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES
+);
+
+/// Exact byte length `serde_json::to_vec(value)` would produce, without
+/// allocating that `Vec`. Mirrors `queue.rs`'s identical helper.
+fn json_byte_len(value: &serde_json::Value) -> usize {
+    struct CountingWriter(usize);
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = CountingWriter(0);
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+
+/// One local awaited child's precomputed spawn inputs (issue #1589).
+///
+/// Built once per child in `persist_all_started_child_workflows`. Then
+/// routed to either the sequential insert-then-admit path, or the
+/// batched-insert path. The routing depends on whether its
+/// `enforce_quota_admission` call would be a no-op -- see that function's
+/// own early returns.
+struct LocalChildPlan<'a> {
+    child: &'a StartedChildWorkflowCommand,
+    defaults: ChildWorkflowDefaults,
+    child_workflow_id: String,
+    child_quota_key: Option<String>,
+}
+
+/// One plan's contribution to a chunk's summed payload: its own
+/// `child.input`, plus `shared_row_bytes`, plus its own resolved retry
+/// policy (Codex review, issue #1589).
+///
+/// `build_child_row` clones `plan.defaults.retry_policy` into every row
+/// (an owned `Value` is unavoidable there -- diesel needs one per row).
+/// The `Arc` cache in the fan-out loop only bounds how many independent
+/// copies exist BEFORE chunking. It says nothing about how much of that
+/// policy lands in a single chunk's `INSERT`. Without this term, a
+/// large same-type retry policy packed to the row-count ceiling could
+/// still build a chunk far over [`MAX_EXECUTION_CHUNK_PAYLOAD_BYTES`].
+/// This holds even though every child's own `input` is tiny.
+fn plan_row_bytes(plan: &LocalChildPlan<'_>, shared_row_bytes: usize) -> usize {
+    let retry_policy_bytes = plan
+        .defaults
+        .retry_policy
+        .as_deref()
+        .map_or(0, json_byte_len);
+    json_byte_len(&plan.child.input) + shared_row_bytes + retry_policy_bytes
+}
+
+/// Splits `plans` into `[start, end)` index ranges, each within both
+/// [`ROWS_PER_EXECUTION_INSERT_CHUNK`] rows and
+/// [`MAX_EXECUTION_CHUNK_PAYLOAD_BYTES`] of summed row payload. Whichever
+/// bound is reached first ends a chunk.
+///
+/// Measured directly from each plan via [`plan_row_bytes`] (Codex review,
+/// issue #1589). This runs before any `NewWorkflowExecution`/event/enqueue
+/// row is built. The batched-insert loop then builds, inserts, and drops
+/// each chunk's own small row `Vec`s in turn. Peak memory therefore stays
+/// bounded by one chunk's payload, not the whole group's.
+///
+/// Mirrors `queue.rs`'s `compute_chunk_bounds` shape. A non-empty `plans`
+/// always returns at least one range, and every plan falls into exactly
+/// one of them, in order.
+fn compute_local_child_chunk_bounds(
+    plans: &[LocalChildPlan<'_>],
+    shared_row_bytes: usize,
+) -> Vec<(usize, usize)> {
+    let mut chunk_bounds = Vec::new();
+    let mut chunk_start = 0_usize;
+    while chunk_start < plans.len() {
+        let mut chunk_end = chunk_start + 1;
+        let mut payload_bytes = plan_row_bytes(&plans[chunk_start], shared_row_bytes);
+        while chunk_end < plans.len() && chunk_end - chunk_start < ROWS_PER_EXECUTION_INSERT_CHUNK {
+            let next_bytes = plan_row_bytes(&plans[chunk_end], shared_row_bytes);
+            if payload_bytes + next_bytes > MAX_EXECUTION_CHUNK_PAYLOAD_BYTES {
+                break;
+            }
+            payload_bytes += next_bytes;
+            chunk_end += 1;
+        }
+        chunk_bounds.push((chunk_start, chunk_end));
+        chunk_start = chunk_end;
+    }
+    chunk_bounds
+}
+
+/// Returns the cached retry-policy `Arc` for `workflow_name`, storing
+/// `policy` as the entry on first use (issue #1589).
+///
+/// `RetryPolicy::non_retryable_errors` is an unbounded `Vec<String>`.
+/// Without this cache, a same-type fan-out would resolve and hold one
+/// independent deep copy per child. All copies stay alive at once
+/// before the first insert chunk runs. Same-type children in one
+/// fan-out then share ONE `Arc`. Peak memory then scales with distinct
+/// workflow types, not with child count.
+fn cached_retry_policy<'a>(
+    cache: &mut HashMap<&'a str, Arc<serde_json::Value>>,
+    workflow_name: &'a str,
+    policy: Arc<serde_json::Value>,
+) -> Arc<serde_json::Value> {
+    Arc::clone(cache.entry(workflow_name).or_insert(policy))
+}
+
+/// Builds one local awaited child's insert row from its [`LocalChildPlan`].
+///
+/// Shared by both the sequential and the batched-insert paths in
+/// `persist_all_started_child_workflows` (issue #1589). So the two paths
+/// cannot drift on which fields a child row carries.
+fn build_child_row<'p>(
+    plan: &'p LocalChildPlan<'_>,
+    shard_id: i32,
+    queue_name: &'p str,
+    parent_exec_id: ExecutionId,
+    parent_execution: &'p WorkflowExecution,
+    parent_exec_id_str: &'p str,
+) -> NewWorkflowExecution<'p> {
+    let child = plan.child;
+    // Absolute deadlines are anchored HERE, not read from `plan.defaults`
+    // (Codex review, issue #1589). `plan.defaults` is resolved once, up
+    // front, for every local child before any is inserted. A later chunk's
+    // row can be built well after that -- behind the sequential group's
+    // own admission checks, or behind earlier batched chunks' round trips.
+    // Reading a deadline computed that early would anchor it to a stale
+    // "now", not the row's real `started_at`. A short-timeout child could
+    // then be born already overdue. `execution_timeout`/`sla`/
+    // `chain_execution_timeout` are plain durations. Recomputing the
+    // absolute deadline from `Utc::now()` at build time is exactly what
+    // `resolve_child_workflow_defaults` itself does for every other,
+    // immediate-use caller.
+    let now = chrono::Utc::now();
+    let deadline_at = plan.defaults.execution_timeout.map(|d| now + d);
+    let sla_deadline_at = plan.defaults.sla.map(|d| now + d);
+    let chain_deadline_at = plan
+        .defaults
+        .chain_execution_timeout
+        .and_then(|d| now.checked_add_signed(d));
+    NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
+        chain_execution_timeout: plan.defaults.chain_execution_timeout,
+        chain_deadline_at,
+        id: child.child_id.as_uuid(),
+        workflow_name: &child.workflow_name,
+        workflow_id: &plan.child_workflow_id,
+        run_id: uuid::Uuid::new_v4(),
+        shard_id,
+        input: child.input.clone(),
+        parent_id: Some(parent_exec_id.as_uuid()),
+        queue_name,
+        execution_timeout: plan.defaults.execution_timeout,
+        deadline_at,
+        sla: plan.defaults.sla,
+        sla_deadline_at,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: parent_execution.assigned_build_id.clone(),
+        parent_close_policy: None, // awaited child
+        owner: plan.defaults.owner,
+        runbook_url: plan.defaults.runbook_url,
+        severity: plan.defaults.severity,
+        context_headers: parent_execution.context_headers.clone(),
+        schedule_id: None, // child workflows are not scheduled fires
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: plan.defaults.retry_policy.as_deref().cloned(),
+        retry_of_exec_id: None,
+        origin: None, // child workflow, not a schedule fire (issue #534)
+        // Children get only builder-wide default callback targets,
+        // resolved at their own terminal transition (issue #605) -- no
+        // per-execution override here.
+        completion_callbacks: None,
+        start_source: Some(crate::types::StartSource::Child.as_str()),
+        start_source_ref: Some(parent_exec_id_str),
+        started_by: None,
+        quota_key: plan.child_quota_key.as_deref(),
+    }
 }
 
 /// Apply `max_workflow_attempts_ceiling` to a detached child's serialized retry
@@ -10777,9 +11111,9 @@ fn cross_shard_child_spec(
         // without this a workflow whose declared policy exceeds the ceiling would
         // get all its declared attempts purely because it was placed remotely.
         retry_policy: if detached {
-            clamp_detached_retry_policy(registry, defaults.retry_policy.clone())
+            clamp_detached_retry_policy(registry, defaults.retry_policy.as_deref().cloned())
         } else {
-            defaults.retry_policy.clone()
+            defaults.retry_policy.as_deref().cloned()
         },
         trace_context,
         quota_key,
@@ -10878,7 +11212,9 @@ fn resolve_child_workflow_defaults(
         deadline_at,
         chain_execution_timeout,
         chain_deadline_at,
-        retry_policy: retry_policy.and_then(|p| serde_json::to_value(&p).ok()),
+        retry_policy: retry_policy
+            .and_then(|p| serde_json::to_value(&p).ok())
+            .map(Arc::new),
         quota,
     }
 }
@@ -10995,7 +11331,7 @@ async fn insert_awaited_child_execution(
         schedule_id: None, // child workflows are not scheduled fires
         scheduled_for: None,
         workflow_attempt: 1,
-        workflow_retry_policy: defaults.retry_policy,
+        workflow_retry_policy: defaults.retry_policy.as_deref().cloned(),
         retry_of_exec_id: None,
         origin: None, // child workflow, not a schedule fire (issue #534)
         // Children get only builder-wide default callback targets, resolved at
@@ -29649,6 +29985,324 @@ pub(crate) fn under_provisioned_shard_pools(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins [`NEW_WORKFLOW_EXECUTION_COLUMNS`], and therefore
+    /// [`ROWS_PER_EXECUTION_INSERT_CHUNK`], to `NewWorkflowExecution`'s real
+    /// field count, by exhaustive destructure (issue #1589, mirrors
+    /// `queue.rs`'s identical regression test for `NewTaskQueueItem`).
+    /// Adding, removing, or renaming a field breaks this match at compile
+    /// time. The chunk size then cannot silently drift out of sync with the
+    /// row width it bounds.
+    #[test]
+    fn new_workflow_execution_column_count_matches_the_constant() {
+        let sample = crate::models::NewWorkflowExecution {
+            id: uuid::Uuid::nil(),
+            workflow_name: "wf",
+            workflow_id: "wf-id",
+            run_id: uuid::Uuid::nil(),
+            shard_id: 0,
+            input: serde_json::Value::Null,
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            deadline_at: None,
+            chain_execution_timeout: None,
+            chain_deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+            parent_close_policy: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            origin: None,
+            completion_callbacks: None,
+            continued_from_exec_id: None,
+            first_exec_id: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
+            quota_key: None,
+        };
+        let crate::models::NewWorkflowExecution {
+            id: _,
+            workflow_name: _,
+            workflow_id: _,
+            run_id: _,
+            shard_id: _,
+            input: _,
+            parent_id: _,
+            queue_name: _,
+            execution_timeout: _,
+            deadline_at: _,
+            chain_execution_timeout: _,
+            chain_deadline_at: _,
+            memo: _,
+            search_attrs: _,
+            assigned_build_id: _,
+            parent_close_policy: _,
+            owner: _,
+            runbook_url: _,
+            severity: _,
+            context_headers: _,
+            sla: _,
+            sla_deadline_at: _,
+            schedule_id: _,
+            scheduled_for: _,
+            workflow_attempt: _,
+            workflow_retry_policy: _,
+            retry_of_exec_id: _,
+            origin: _,
+            completion_callbacks: _,
+            continued_from_exec_id: _,
+            first_exec_id: _,
+            start_source: _,
+            start_source_ref: _,
+            started_by: _,
+            quota_key: _,
+        } = sample;
+        const {
+            assert!(NEW_WORKFLOW_EXECUTION_COLUMNS == 35);
+            assert!(
+                ROWS_PER_EXECUTION_INSERT_CHUNK * NEW_WORKFLOW_EXECUTION_COLUMNS
+                    <= POSTGRES_MAX_BIND_PARAMS
+            );
+        }
+    }
+
+    /// Mirrors `queue.rs`'s `chunk_bounds_splits_near_max_size_inputs_into_many_small_chunks`
+    /// (issue #1589). A run of near-max-size child inputs must split into
+    /// many small chunks under [`MAX_EXECUTION_CHUNK_PAYLOAD_BYTES`], not
+    /// all land in one chunk sized only by
+    /// [`ROWS_PER_EXECUTION_INSERT_CHUNK`].
+    #[test]
+    fn execution_chunk_bounds_splits_near_max_size_inputs_into_many_small_chunks() {
+        let near_max_bytes =
+            usize::try_from(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES).unwrap();
+        let commands: Vec<StartedChildWorkflowCommand> = (0..200)
+            .map(|_| StartedChildWorkflowCommand {
+                child_id: ExecutionId::new(),
+                workflow_name: "wf".to_string(),
+                input: serde_json::json!("x".repeat(near_max_bytes)),
+            })
+            .collect();
+        let plans: Vec<LocalChildPlan<'_>> = commands
+            .iter()
+            .map(|child| LocalChildPlan {
+                child,
+                defaults: ChildWorkflowDefaults {
+                    owner: None,
+                    runbook_url: None,
+                    severity: None,
+                    sla: None,
+                    sla_deadline_at: None,
+                    execution_timeout: None,
+                    deadline_at: None,
+                    chain_execution_timeout: None,
+                    chain_deadline_at: None,
+                    retry_policy: None,
+                    quota: None,
+                },
+                child_workflow_id: child.child_id.to_string(),
+                child_quota_key: None,
+            })
+            .collect();
+
+        let bounds = compute_local_child_chunk_bounds(&plans, 0);
+
+        assert!(
+            bounds.len() > 10,
+            "200 near-max-size plans must split into many small chunks, got {} chunk(s)",
+            bounds.len()
+        );
+        for &(start, end) in &bounds {
+            let row_sizes: Vec<usize> = plans[start..end]
+                .iter()
+                .map(|p| json_byte_len(&p.child.input))
+                .collect();
+            let chunk_payload: usize = row_sizes.iter().sum();
+            let largest_row = row_sizes.iter().copied().max().unwrap_or(0);
+            assert!(
+                chunk_payload <= MAX_EXECUTION_CHUNK_PAYLOAD_BYTES + largest_row,
+                "chunk [{start}, {end}) carries {chunk_payload} bytes, over the \
+                 {MAX_EXECUTION_CHUNK_PAYLOAD_BYTES}-byte budget by more than one row's allowance"
+            );
+        }
+        let mut next_expected = 0;
+        for &(start, end) in &bounds {
+            assert_eq!(start, next_expected, "chunks must be contiguous, no gaps");
+            assert!(end > start, "every chunk must carry at least one plan");
+            next_expected = end;
+        }
+        assert_eq!(
+            next_expected,
+            plans.len(),
+            "every plan must fall into a chunk"
+        );
+    }
+
+    /// Codex review, issue #1589: `build_child_row` clones the PARENT's own
+    /// `context_headers` into every row. A large inherited header must
+    /// therefore shrink the chunk size the same way a large `child.input`
+    /// does, even when every child's own input is tiny. Proves
+    /// `shared_row_bytes` actually participates in the budget, not just
+    /// `child.input`.
+    #[test]
+    fn execution_chunk_bounds_accounts_for_shared_per_row_bytes() {
+        let commands: Vec<StartedChildWorkflowCommand> = (0..200)
+            .map(|_| StartedChildWorkflowCommand {
+                child_id: ExecutionId::new(),
+                workflow_name: "wf".to_string(),
+                input: serde_json::json!("tiny"),
+            })
+            .collect();
+        let plans: Vec<LocalChildPlan<'_>> = commands
+            .iter()
+            .map(|child| LocalChildPlan {
+                child,
+                defaults: ChildWorkflowDefaults {
+                    owner: None,
+                    runbook_url: None,
+                    severity: None,
+                    sla: None,
+                    sla_deadline_at: None,
+                    execution_timeout: None,
+                    deadline_at: None,
+                    chain_execution_timeout: None,
+                    chain_deadline_at: None,
+                    retry_policy: None,
+                    quota: None,
+                },
+                child_workflow_id: child.child_id.to_string(),
+                child_quota_key: None,
+            })
+            .collect();
+
+        // Every child's own input is 6 bytes -- 200 of them would trivially
+        // fit in one row-count-bounded chunk with `shared_row_bytes = 0`.
+        let bounds_without_shared = compute_local_child_chunk_bounds(&plans, 0);
+        assert_eq!(
+            bounds_without_shared.len(),
+            1,
+            "tiny inputs alone must fit in one chunk"
+        );
+
+        // A large shared per-row payload (e.g. inherited `context_headers`)
+        // must still force many small chunks, exactly like a large
+        // `child.input` would.
+        let near_max_bytes =
+            usize::try_from(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES).unwrap();
+        let bounds_with_shared = compute_local_child_chunk_bounds(&plans, near_max_bytes);
+        assert!(
+            bounds_with_shared.len() > 10,
+            "a large shared per-row payload must split 200 plans into many small chunks, \
+             got {} chunk(s)",
+            bounds_with_shared.len()
+        );
+        for &(start, end) in &bounds_with_shared {
+            let chunk_payload = (end - start) * near_max_bytes;
+            assert!(
+                chunk_payload <= MAX_EXECUTION_CHUNK_PAYLOAD_BYTES + near_max_bytes,
+                "chunk [{start}, {end}) carries {chunk_payload} bytes of shared payload alone, \
+                 over the {MAX_EXECUTION_CHUNK_PAYLOAD_BYTES}-byte budget by more than one \
+                 row's allowance"
+            );
+        }
+    }
+
+    /// Issue #1589: `build_child_row` clones each plan's own resolved
+    /// retry policy into its row. A large same-type policy must
+    /// therefore shrink the chunk size the same way a large `child.input`
+    /// does. This holds even though the `Arc` cache means every plan
+    /// here points at the SAME underlying policy.
+    #[test]
+    fn execution_chunk_bounds_accounts_for_the_retry_policy() {
+        let commands: Vec<StartedChildWorkflowCommand> = (0..200)
+            .map(|_| StartedChildWorkflowCommand {
+                child_id: ExecutionId::new(),
+                workflow_name: "wf".to_string(),
+                input: serde_json::json!("tiny"),
+            })
+            .collect();
+        let near_max_bytes =
+            usize::try_from(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES).unwrap();
+        let large_policy = Arc::new(serde_json::json!("x".repeat(near_max_bytes)));
+        let plans: Vec<LocalChildPlan<'_>> = commands
+            .iter()
+            .map(|child| LocalChildPlan {
+                child,
+                defaults: ChildWorkflowDefaults {
+                    owner: None,
+                    runbook_url: None,
+                    severity: None,
+                    sla: None,
+                    sla_deadline_at: None,
+                    execution_timeout: None,
+                    deadline_at: None,
+                    chain_execution_timeout: None,
+                    chain_deadline_at: None,
+                    retry_policy: Some(Arc::clone(&large_policy)),
+                    quota: None,
+                },
+                child_workflow_id: child.child_id.to_string(),
+                child_quota_key: None,
+            })
+            .collect();
+
+        let bounds = compute_local_child_chunk_bounds(&plans, 0);
+        assert!(
+            bounds.len() > 10,
+            "a large retry policy shared by every plan must still split 200 plans into many \
+             small chunks, got {} chunk(s)",
+            bounds.len()
+        );
+        for &(start, end) in &bounds {
+            let chunk_payload = (end - start) * near_max_bytes;
+            assert!(
+                chunk_payload <= MAX_EXECUTION_CHUNK_PAYLOAD_BYTES + near_max_bytes,
+                "chunk [{start}, {end}) carries {chunk_payload} bytes of retry-policy payload \
+                 alone, over the {MAX_EXECUTION_CHUNK_PAYLOAD_BYTES}-byte budget by more than \
+                 one row's allowance"
+            );
+        }
+    }
+
+    /// Issue #1589: a same-type fan-out must share one retry-policy
+    /// `Arc`, not hold an independent deep copy per child. `Arc::ptr_eq`
+    /// proves the second lookup for the same workflow name reused the
+    /// first `Arc` instead of allocating a new one.
+    #[test]
+    fn cached_retry_policy_shares_the_arc_across_same_type_children() {
+        let mut cache: HashMap<&str, Arc<serde_json::Value>> = HashMap::new();
+        let first_child_policy = Arc::new(serde_json::json!({"max_attempts": 5}));
+        let shared_a = cached_retry_policy(&mut cache, "wf", first_child_policy);
+
+        // The second child of the same type resolves its OWN fresh `Arc`.
+        // This mirrors `resolve_child_workflow_defaults` serializing again
+        // per child. The cache must discard it and hand back the first.
+        let second_child_policy = Arc::new(serde_json::json!({"max_attempts": 5}));
+        let shared_b = cached_retry_policy(&mut cache, "wf", second_child_policy);
+        assert!(
+            Arc::ptr_eq(&shared_a, &shared_b),
+            "same workflow type must reuse the cached Arc, not hold an independent copy"
+        );
+
+        // A different workflow type must not reuse another type's policy.
+        let other_type_policy = Arc::new(serde_json::json!({"max_attempts": 1}));
+        let shared_c = cached_retry_policy(&mut cache, "other_wf", other_type_policy);
+        assert!(
+            !Arc::ptr_eq(&shared_a, &shared_c),
+            "distinct workflow types must not share a cached Arc"
+        );
+    }
 
     fn scheduled(
         activity_id: ActivityExecId,
