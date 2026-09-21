@@ -7985,7 +7985,13 @@
           "name": "before",
           "in": "query",
           "required": false,
-          "description": "RFC 3339 timestamp \u2014 only return records before this time."
+          "description": "RFC 3339 timestamp \u2014 only return records before this time. Pair with before_id to page past rows tied on this time."
+        },
+        {
+          "name": "before_id",
+          "in": "query",
+          "required": false,
+          "description": "Row id tiebreaker for before. Use the last row id from the prior page."
         },
         {
           "name": "limit",

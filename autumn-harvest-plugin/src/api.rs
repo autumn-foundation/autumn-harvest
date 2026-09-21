@@ -9416,6 +9416,9 @@ struct AuditListQuery {
     since: Option<String>,
     /// ISO 8601 timestamp upper bound (exclusive).
     before: Option<String>,
+    /// Row id tiebreaker for `before` (issue #1408). Pass the prior page's
+    /// last row id to page past rows tied on `before`.
+    before_id: Option<uuid::Uuid>,
     limit: Option<i64>,
 }
 
@@ -9447,6 +9450,7 @@ async fn list_audit_records(
         status: query.status,
         since,
         before,
+        before_id: query.before_id,
         limit,
     };
 

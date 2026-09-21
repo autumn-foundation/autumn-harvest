@@ -119,6 +119,108 @@ async fn insert_and_retrieve_audit_record() {
     assert!(rows[0].error_summary.is_none());
 }
 
+// ── issue #1408: `before` cursor and tied `occurred_at` rows ─────────────────
+
+/// Three rows in one `insert_audit_batch` call share one DB-assigned
+/// `occurred_at` (single `INSERT`, single `NOW()`), the same way PR #1407's
+/// bulk-pause/resume UI actions do.
+async fn insert_three_tied_rows(conn: &mut diesel_async::AsyncPgConnection) -> Vec<uuid::Uuid> {
+    let records = [
+        succeeded_record("ops", OP_WORKFLOW_START, TARGET_WORKFLOW, Some("a")),
+        succeeded_record("ops", OP_WORKFLOW_START, TARGET_WORKFLOW, Some("b")),
+        succeeded_record("ops", OP_WORKFLOW_START, TARGET_WORKFLOW, Some("c")),
+    ];
+    audit::insert_audit_batch(conn, &records)
+        .await
+        .expect("batch insert")
+}
+
+#[tokio::test]
+async fn audit_list_before_only_cursor_can_drop_a_tied_row() {
+    let (mut conn, _c) = make_conn().await;
+    let ids = insert_three_tied_rows(&mut conn).await;
+
+    let first_page = audit::list_audit(
+        &mut conn,
+        &AuditFilters {
+            limit: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("first page");
+    assert_eq!(first_page.len(), 2);
+
+    let last = first_page.last().expect("first page has rows");
+    let second_page = audit::list_audit(
+        &mut conn,
+        &AuditFilters {
+            before: Some(last.occurred_at),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("second page");
+
+    // The legacy single-column cursor excludes every row tied with `last`'s
+    // timestamp, including the unseen third row. This pins the known gap the
+    // `before_id` cursor below closes.
+    let seen: std::collections::HashSet<_> = first_page
+        .iter()
+        .chain(second_page.iter())
+        .map(|r| r.id)
+        .collect();
+    assert_ne!(
+        seen.len(),
+        ids.len(),
+        "before-only cursor is expected to drop a row tied at the page boundary"
+    );
+}
+
+#[tokio::test]
+async fn audit_list_before_id_cursor_walks_every_tied_row_once() {
+    let (mut conn, _c) = make_conn().await;
+    let ids = insert_three_tied_rows(&mut conn).await;
+
+    let first_page = audit::list_audit(
+        &mut conn,
+        &AuditFilters {
+            limit: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("first page");
+    assert_eq!(first_page.len(), 2);
+
+    let last = first_page.last().expect("first page has rows");
+    let second_page = audit::list_audit(
+        &mut conn,
+        &AuditFilters {
+            before: Some(last.occurred_at),
+            before_id: Some(last.id),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("second page");
+
+    let mut seen: Vec<uuid::Uuid> = first_page
+        .iter()
+        .chain(second_page.iter())
+        .map(|r| r.id)
+        .collect();
+    seen.sort();
+    let mut expected = ids;
+    expected.sort();
+    assert_eq!(
+        seen, expected,
+        "the before_id cursor must walk every tied row exactly once"
+    );
+}
+
 #[tokio::test]
 async fn audit_list_filter_by_actor() {
     let (mut conn, _c) = make_conn().await;

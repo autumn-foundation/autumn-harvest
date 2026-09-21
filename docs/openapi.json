@@ -564,9 +564,18 @@
             }
           },
           {
-            "description": "RFC 3339 timestamp — only return records before this time.",
+            "description": "RFC 3339 timestamp — only return records before this time. Pair with before_id to page past rows tied on this time.",
             "in": "query",
             "name": "before",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Row id tiebreaker for before. Use the last row id from the prior page.",
+            "in": "query",
+            "name": "before_id",
             "required": false,
             "schema": {
               "type": "string"
