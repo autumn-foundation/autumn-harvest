@@ -135,9 +135,13 @@ alone. No exec-time claim is made for this comparison.
 
 Forcing the plan (row 2) proves the index itself is not the problem:
 once selected, it is **~2,000x cheaper in buffers** than what the
-unforced planner picks. The literal-equality form (row 3) is cheaper
-still, since a plain `=` lets Postgres recognize the index already
-returns `id`-ordered output and skip the sort entirely.
+unforced planner picks. The literal-equality form (row 3) is still
+**~500x cheaper** than the unforced plan, though not cheaper than the
+forced bitmap-plus-sort form (row 2) by buffers -- 189 versus 46. Its
+advantage is structural, not a lower buffer count: a plain `=` lets
+Postgres recognize the index already returns `id`-ordered output and
+skip the sort and the parallel bitmap machinery entirely, so it needs
+no forcing to reach a cheap plan at all.
 
 So the verdict is narrower and more actionable than either earlier
 draft claimed: the composite index **would help enormously**. What
