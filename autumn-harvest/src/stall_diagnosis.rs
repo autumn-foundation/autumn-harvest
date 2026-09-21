@@ -690,16 +690,16 @@ pub struct WorkflowTaskFacts {
     /// The row's `created_at` (issue #1191). `None` for a pre-`#501`
     /// legacy row that predates the column.
     ///
-    /// Three writers touch this column on a workflow task row, all setting
-    /// `created_at = clock_timestamp()` in the same statement that resets
-    /// `scheduled_at` for a fresh dispatch attempt: `queue`'s
+    /// Three writers touch this column on a workflow task row: `queue`'s
     /// `primary_repend_workflow_task_query` and
-    /// `release_suspended_workflow_claim_query`, and
-    /// `shard_rebalance::activate_target`'s signal re-pend. Every other
-    /// production write path, `queue::reschedule_task` included, leaves it
-    /// alone. So `created_at` proves something timestamp proximity to an
-    /// armed timer's `fires_at` cannot: whether one of THOSE THREE write
-    /// paths produced the row's current shape. See
+    /// `release_suspended_workflow_claim_query`, plus
+    /// `shard_rebalance::activate_target`'s signal re-pend. All three set
+    /// `created_at = clock_timestamp()` in the same statement that resets
+    /// `scheduled_at` for a fresh dispatch attempt. Every other production
+    /// write path, `queue::reschedule_task` included, leaves it alone. So
+    /// `created_at` proves something timestamp proximity to an armed
+    /// timer's `fires_at` cannot: whether one of THOSE THREE write paths
+    /// produced the row's current shape. See
     /// [`wake_source_repended_this_row`].
     pub created_at: Option<DateTime<Utc>>,
     /// The `fires_at` of the durable timer this row is currently armed for
@@ -718,15 +718,16 @@ pub struct WorkflowTaskFacts {
     /// coincidence.
     ///
     /// Cleared to `None` by every path that hands the row to a genuinely
-    /// different wake reason: `queue`'s `primary_repend_workflow_task_query`
-    /// and `release_suspended_workflow_claim_query` (a signal, a child, or
-    /// an external handoff resolved), `shard_rebalance::activate_target`'s
-    /// signal re-pend, and the three backoff retries
-    /// (`requeue_workflow_task_for_quota_retry`,
-    /// `requeue_workflow_task_nd_blocked`,
-    /// `requeue_workflow_task_after_panic`) — none of those retries owes
-    /// its `scheduled_at` to the originally-armed timer either. The first
-    /// two also stamp `created_at` fresh; see
+    /// different wake reason. `queue`'s `primary_repend_workflow_task_query`
+    /// and `release_suspended_workflow_claim_query` clear it when a
+    /// signal, a child, or an external handoff resolves.
+    /// `shard_rebalance::activate_target`'s signal re-pend clears it too.
+    /// So do the three backoff retries:
+    /// `requeue_workflow_task_for_quota_retry`,
+    /// `requeue_workflow_task_nd_blocked`, and
+    /// `requeue_workflow_task_after_panic`. None of those retries owes its
+    /// `scheduled_at` to the originally-armed timer either. The first two
+    /// clearers also stamp `created_at` fresh; see
     /// [`wake_source_repended_this_row`] for that fingerprint.
     pub timer_fires_at: Option<DateTime<Utc>>,
 }
@@ -1406,21 +1407,21 @@ fn wake_source_repended_this_row(task: &WorkflowTaskFacts) -> bool {
 ///    it would be vetoed as a false re-pend, rather than reported as the
 ///    missed wake it is.
 /// 2. `task.timer_fires_at == Some(fires_at)`, cleared by
-///    [`wake_source_repended_this_row`] (issue #1402). `reschedule_task` is
-///    also the one writer of `timer_fires_at`, from that same value — but
-///    unlike `scheduled_at`, nothing else ever moves it. A queue-pause
+///    [`wake_source_repended_this_row`] (issue #1402). `reschedule_task`
+///    is also the one writer of `timer_fires_at`, from that same value.
+///    Unlike `scheduled_at`, nothing else ever moves it. A queue-pause
 ///    resume credit, an orphan reclaim, or a capability-miss release can
 ///    each drift `scheduled_at` an UNBOUNDED distance from `fires_at`
-///    without changing the wake reason, defeating both this match and
+///    without changing the wake reason. That defeats both this match and
 ///    `timer_owns_the_wake`'s tolerance below. The preserved marker
 ///    survives that drift, so it is what proves the row is still this
 ///    timer's even once `scheduled_at` no longer says so. Still deferred
 ///    to `wake_source_repended_this_row`, same as the tolerance match
 ///    below: a genuinely different wake reason always repends through a
-///    path that clears this marker in production, but nothing stops a
-///    future write-path bug from forgetting to, so this guard is what
-///    keeps that failure mode safe (a missed clear costs a false
-///    `sleeping_timer`, never a false `timer_overdue`).
+///    path that clears this marker in production. But nothing stops a
+///    future write-path bug from forgetting to clear it. This guard is
+///    what keeps that failure mode safe. A missed clear costs a false
+///    `sleeping_timer`, never a false `timer_overdue`.
 /// 3. A merely CLOSE match cleared by [`wake_source_repended_this_row`] --
 ///    never a close match alone (issue #1191 review). This is
 ///    [`timer_owns_the_wake`]'s tolerance: an unrelated timer landing near
@@ -1597,12 +1598,12 @@ pub fn classify_execution(inputs: &DiagnosisInputs, now: DateTime<Utc>) -> Optio
     // Issue #1402: `scheduled_at` is not the only source of that proof.
     // `queue_pause`'s resume credit, `poison_pill`'s orphan reclaim, and a
     // capability-miss release can each move `scheduled_at` an unbounded
-    // distance from `fires_at` for the SAME wake reason — no different
-    // wake source repended the row, dispatch just stayed saturated (or the
-    // queue stayed paused) long enough to drift it past both the exact
-    // match and the tolerance. `timer_fires_at` survives that drift, so
-    // [`is_the_missed_timer_wake`] also checks it. See that function's doc
-    // comment for the full three-way match it runs.
+    // distance from `fires_at` for the SAME wake reason. No different
+    // wake source repended the row. Dispatch just stayed saturated (or
+    // the queue stayed paused) long enough to drift it past both the
+    // exact match and the tolerance. `timer_fires_at` survives that
+    // drift, so [`is_the_missed_timer_wake`] also checks it. See that
+    // function's doc comment for the full three-way match it runs.
     // A durable side-table wait does not advance on its own: a timer fires only
     // when a worker claims the owning workflow task. So a HARD impediment on
     // that task — an operator queue pause (issue #619) or no live poller —
@@ -3919,12 +3920,12 @@ mod tests {
 
     /// The preserved marker is evidence, not proof on its own: it must
     /// still defer to `wake_source_repended_this_row` (issue #1402). A row
-    /// whose wake reason genuinely changed (a signal, a child, or a handoff
-    /// resolved) always goes through a path that clears `timer_fires_at`
-    /// in production, but this pins the classifier's own behavior for the
-    /// case where it is not cleared, so a future write-path bug that
-    /// forgets to null it out fails safe rather than misattributing the
-    /// row to a stale, unrelated timer.
+    /// whose wake reason genuinely changed (a signal, a child, or a
+    /// handoff resolved) always goes through a path that clears
+    /// `timer_fires_at` in production. This pins the classifier's own
+    /// behavior for the case where it is not cleared. A future write-path
+    /// bug that forgets to null it out must fail safe, not misattribute
+    /// the row to a stale, unrelated timer.
     #[test]
     fn overdue_timer_marker_is_vetoed_by_real_repend_evidence() {
         let inputs = DiagnosisInputs {
@@ -3953,10 +3954,10 @@ mod tests {
         assert_eq!(verdict.health(), ExecutionHealth::Healthy, "{verdict:?}");
     }
 
-    /// A row with no marker at all (a pre-#1402 legacy row, or one this
-    /// endpoint's own writes never armed a timer for) keeps the pre-#1402
-    /// ladder byte-identical: `timer_owns_the_wake`'s tolerance is still
-    /// what decides it.
+    /// A row with no marker at all keeps the pre-#1402 ladder
+    /// byte-identical. That covers a pre-#1402 legacy row, or one this
+    /// endpoint's own writes never armed a timer for.
+    /// `timer_owns_the_wake`'s tolerance is still what decides it.
     #[test]
     fn overdue_timer_without_a_marker_falls_back_to_timer_owns_the_wake() {
         let inputs = DiagnosisInputs {
@@ -3984,10 +3985,10 @@ mod tests {
     /// Issue #1402 review. Two overdue timers: an OLD, unrelated one that
     /// happens to sort first by `fires_at`, and the row's genuine owner.
     /// `classify_execution` picks `min_by_key(fires_at)` among every
-    /// candidate `is_the_missed_timer_wake` accepts -- the marker match
+    /// candidate `is_the_missed_timer_wake` accepts. The marker match
     /// must be the only thing that decides which timer is a candidate at
-    /// all, or the older, unrelated timer would win the tie-break and
-    /// report the wrong deadline.
+    /// all. Otherwise the older, unrelated timer would win the tie-break
+    /// and report the wrong deadline.
     #[test]
     fn overdue_timer_marker_picks_the_owning_timer_not_the_earliest_one() {
         let inputs = DiagnosisInputs {
@@ -4025,10 +4026,10 @@ mod tests {
     }
 
     /// Issue #1402 review. A stale `timer_fires_at` left on a PARKED row
-    /// is already safe by construction: `workflow_wake_was_missed` gates
+    /// is already safe by construction. `workflow_wake_was_missed` gates
     /// on `state == "PENDING"` before `is_the_missed_timer_wake` ever
-    /// runs, so a parked row's own wait (a signal here) always wins. This
-    /// pins that behavior so a future reordering of the two checks cannot
+    /// runs. So a parked row's own wait (a signal here) always wins. This
+    /// pins that behavior. A future reordering of the two checks must not
     /// silently reintroduce the misattribution.
     #[test]
     fn overdue_timer_marker_on_a_parked_row_never_masks_its_own_wait() {
@@ -4060,9 +4061,9 @@ mod tests {
 
     /// Issue #1402 review. `wake_source_repended_this_row` answers `false`
     /// (no evidence either way) for a pre-`#501` legacy row with no
-    /// `created_at` -- it cannot veto a marker match there. That is safe,
-    /// not a hole: the marker itself is only ever set by
-    /// `queue::reschedule_task`, from the same value as `fires_at`, so a
+    /// `created_at`. It cannot veto a marker match there. That is safe,
+    /// not a hole. The marker itself is only ever set by
+    /// `queue::reschedule_task`, from the same value as `fires_at`. So a
     /// `Some` marker is current, positive evidence on its own. This pins
     /// that the ladder still resolves correctly without the veto's help.
     #[test]

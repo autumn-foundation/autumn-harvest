@@ -1953,8 +1953,8 @@ async fn overdue_timer_still_wins_when_the_task_own_wake_was_missed() {
 /// long past both the exact match and `timer_owns_the_wake`'s tolerance.
 /// Before this fix it masked a genuinely missed wake as a healthy
 /// `sleeping_timer`. Reproduces the regression end to end against the
-/// real production write paths: `queue::reschedule_task` arms the timer,
-/// then the real `queue_pause::pause_queue`/`resume_queue` pair holds and
+/// real production write paths. `queue::reschedule_task` arms the timer.
+/// The real `queue_pause::pause_queue`/`resume_queue` pair then holds and
 /// releases the queue. The diagnose endpoint must still report
 /// `timer_overdue`.
 #[tokio::test]
@@ -2018,11 +2018,11 @@ async fn overdue_timer_still_wins_after_a_queue_pause_resume_shift() {
     seed_live_worker(&pool, "w-live", "resume-shift-q").await;
 
     // The real production pause/resume pair. `paused_at` is backdated
-    // after the pause so the credit shift models an hours-long real-world
-    // hold rather than this test's own millisecond round trip -- a gap
-    // that would otherwise land inside `timer_owns_the_wake`'s 2-second
-    // tolerance and pass even without issue #1402's fix, silently
-    // defeating the regression this test exists to pin.
+    // after the pause. The credit shift then models an hours-long
+    // real-world hold, not this test's own millisecond round trip. A
+    // millisecond gap would land inside `timer_owns_the_wake`'s 2-second
+    // tolerance and pass even without issue #1402's fix. That would
+    // silently defeat the regression this test exists to pin.
     {
         let mut conn = pool.get().await.expect("pooled conn");
         queue_pause::pause_queue(&mut conn, "resume-shift-q", "maintenance", "operator", None)
@@ -2049,14 +2049,13 @@ async fn overdue_timer_still_wins_after_a_queue_pause_resume_shift() {
     assert_eq!(body["health"], "stalled", "body: {body}");
 }
 
-/// Issue #1402's original ask: confirm a queue-pause resume of a
+/// Issue #1402's original ask. Confirm a queue-pause resume of a
 /// workflow-type row that was NOT timer-owned still behaves correctly
 /// when an unrelated armed timer happens to be nearby. This row's own
-/// wake source was a signal/child/handoff (`wake_workflow_task`'s repend
-/// fingerprint: `scheduled_at` = wake instant, `created_at` ~5s later,
-/// `timer_fires_at` unset), not a timer -- the resume credit must not
-/// turn it into a false `timer_overdue` for the unrelated timer sitting
-/// nearby.
+/// wake source was a signal/child/handoff -- `wake_workflow_task`'s
+/// repend fingerprint: `scheduled_at` = wake instant, `created_at` ~5s
+/// later, `timer_fires_at` unset. The resume credit must not turn it
+/// into a false `timer_overdue` for the unrelated timer sitting nearby.
 #[tokio::test]
 async fn queue_pause_resume_does_not_misattribute_an_unrelated_timer_to_a_signal_repend() {
     let (url, _guard) = setup_database().await;
@@ -2103,9 +2102,9 @@ async fn queue_pause_resume_does_not_misattribute_an_unrelated_timer_to_a_signal
     }
     seed_live_worker(&pool, "w-live", "resume-safety-q").await;
 
-    // Pause and resume the queue the row happens to sit on -- unrelated to
-    // why the row is PENDING, but still credits held time onto
-    // scheduled_at, drifting it further from the unrelated timer's
+    // Pause and resume the queue the row happens to sit on. That is
+    // unrelated to why the row is PENDING, but it still credits held time
+    // onto scheduled_at, drifting it further from the unrelated timer's
     // fires_at than it already was.
     {
         let mut conn = pool.get().await.expect("pooled conn");

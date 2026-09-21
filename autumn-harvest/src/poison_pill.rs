@@ -1071,10 +1071,10 @@ pub use scanner::{
 mod tests {
     use super::*;
 
-    /// Issue #1402: an orphan reclaim keeps the SAME wake reason a crashed
-    /// worker was already processing, so it must NOT clear
-    /// `timer_fires_at` -- doing so would defeat the marker for a
-    /// genuinely timer-owned row recovering from a crash.
+    /// Issue #1402: an orphan reclaim keeps the SAME wake reason a
+    /// crashed worker was already processing. It must NOT clear
+    /// `timer_fires_at` -- that would defeat the marker for a genuinely
+    /// timer-owned row recovering from a crash.
     #[test]
     fn requeue_orphan_stmt_preserves_the_timer_marker() {
         let sql = requeue_orphan_stmt();

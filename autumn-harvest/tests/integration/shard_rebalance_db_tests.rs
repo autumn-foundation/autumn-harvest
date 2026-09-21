@@ -1227,22 +1227,23 @@ async fn a_signal_arriving_after_cutover_is_retried_then_delivered_to_the_target
 
 /// Issue #1402 (the original ask, and the false-positive risk the
 /// `activate_target` re-pend's `created_at` fix closes). A workflow task
-/// row that was genuinely timer-owned before migration --
+/// row can be genuinely timer-owned before migration:
 /// `scheduled_at = timer_fires_at = fires_at`, exactly what
-/// `queue::reschedule_task` produces -- gets re-pended by `activate_target`
-/// for an unrelated reason: a signal is already waiting at activation
-/// time. The unfired timer is still there, now unrelated. Without
-/// `activate_target` refreshing `created_at` (and clearing `timer_fires_at`)
-/// in the same statement, `stall_diagnosis` could misattribute the signal
-/// wake to that stale timer and report a false `timer_overdue`.
+/// `queue::reschedule_task` produces. `activate_target` re-pends that
+/// row for an unrelated reason: a signal is already waiting at
+/// activation time. The unfired timer is still there, now unrelated.
+/// `activate_target` must refresh `created_at` and clear
+/// `timer_fires_at` in the same statement. Otherwise `stall_diagnosis`
+/// could misattribute the signal wake to that stale timer and report a
+/// false `timer_overdue`.
 #[tokio::test]
 async fn activation_repend_does_not_misattribute_a_stale_timer_to_the_new_signal_wake() {
     let shards = setup_two_shards().await;
     // The standard timer-parked, replay-consistent fixture: a real
     // `TimerStarted` event plus the matching `harvest_timers`/
-    // `harvest_task_queue` rows `park_on_timer` inserts, 7 days out --
-    // quiescence refuses to migrate a `PENDING` row already due
-    // (`scheduled_at <= NOW()`), so cutover needs it in the future right
+    // `harvest_task_queue` rows `park_on_timer` inserts, 7 days out.
+    // Quiescence refuses to migrate a `PENDING` row already due
+    // (`scheduled_at <= NOW()`). So cutover needs it in the future right
     // up to the moment it is staged.
     let exec_id = quiescent_fixture(&shards, "repend-timer-safety").await;
 
@@ -1258,14 +1259,14 @@ async fn activation_repend_does_not_misattribute_a_stale_timer_to_the_new_signal
         .await
         .expect("verify");
 
-    // Now simulate time passing between staging and activation: the timer
-    // that was 7 days out at staging time (satisfying quiescence) has
-    // since become overdue, exactly `queue::reschedule_task`'s shape
-    // (`scheduled_at = timer_fires_at = fires_at`, `created_at` older
-    // than all three). `stage_copy` already copied `harvest_timers` onto
-    // the target; rewrite it there. The workflow task row itself is not
-    // live on the target yet -- `activate_target` restores it from the
-    // `staged_task` JSONB captured on the source at stage time -- so that
+    // Now simulate time passing between staging and activation. The
+    // timer was 7 days out at staging time, satisfying quiescence. It
+    // has since become overdue -- exactly `queue::reschedule_task`'s
+    // shape: `scheduled_at = timer_fires_at = fires_at`, `created_at`
+    // older than all three. `stage_copy` already copied `harvest_timers`
+    // onto the target; rewrite it there. The workflow task row itself is
+    // not live on the target yet. `activate_target` restores it from the
+    // `staged_task` JSONB captured on the source at stage time, so that
     // payload is rewritten instead. Neither touches the event history
     // verification already checked byte-for-byte.
     let fires_at = Utc::now() - Duration::hours(2);

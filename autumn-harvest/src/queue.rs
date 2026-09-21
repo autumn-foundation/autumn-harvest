@@ -3528,13 +3528,14 @@ impl CleanContinuationChangeset {
 /// from the last flushed checkpoint.
 ///
 /// Every caller passes a durable timer's own `fires_at` (issue #1402):
-/// `persist_started_timer` and its mixed-signal/child-race siblings, always
-/// with the exact value just written to `harvest_timers.fires_at`. This is
-/// the ONE path that stamps `timer_fires_at` from `scheduled_at`, which is
-/// what lets [`crate::stall_diagnosis::is_the_missed_timer_wake`] trust the
-/// column later, even after some other path drifts `scheduled_at` again
-/// without changing the wake reason. See `timer_fires_at`'s column comment
-/// in the schema for the full argument.
+/// `persist_started_timer` and its mixed-signal/child-race siblings,
+/// always with the exact value just written to `harvest_timers.fires_at`.
+/// This is the ONE path that stamps `timer_fires_at` from `scheduled_at`.
+/// That is what lets
+/// [`crate::stall_diagnosis::is_the_missed_timer_wake`] trust the column
+/// later, even after some other path drifts `scheduled_at` again without
+/// changing the wake reason. See `timer_fires_at`'s column comment in the
+/// schema for the full argument.
 ///
 /// # Errors
 ///
@@ -4302,9 +4303,9 @@ pub async fn claim_still_held_for_update(
 /// in place would let an unrelated, already-resolved crash history count
 /// against a task that just proved itself dispatchable.
 ///
-/// Also clears `timer_fires_at` (issue #1402): this release hands the row
-/// to a fresh dispatch attempt at the current instant, not to the timer
-/// (if any) that last armed it, so a stale marker must not outlive it.
+/// Also clears `timer_fires_at` (issue #1402). This release hands the
+/// row to a fresh dispatch attempt at the current instant, not to
+/// whatever timer last armed it. A stale marker must not outlive it.
 const fn release_suspended_workflow_claim_query() -> &'static str {
     "UPDATE harvest_task_queue \
      SET state = 'PENDING', \
@@ -4961,9 +4962,9 @@ pub async fn wake_workflow_task(
 /// claimed follow-up task (issue #501 review). The wake instant is this cycle's
 /// true eligibility, so an immediately-served wake correctly reports ~0.
 ///
-/// Also clears `timer_fires_at` (issue #1402): a signal, child, or external
-/// handoff woke this row, not the timer (if any) that last armed it, so
-/// that marker must not survive to name the wrong cause later.
+/// Also clears `timer_fires_at` (issue #1402). A signal, child, or
+/// external handoff woke this row, not whatever timer last armed it.
+/// That marker must not survive to name the wrong cause later.
 ///
 /// The statement returns the hint columns rather than `queue_name` alone
 /// (issue #1312). A re-pended row is then published to the dispatch channel
@@ -9718,8 +9719,9 @@ mod tests {
     }
 
     /// Issue #1402: a capability-miss release hands the row to a fresh
-    /// dispatch attempt at the SAME wake reason -- a capable peer taking
-    /// over, not a new one -- so it must NOT clear `timer_fires_at`.
+    /// dispatch attempt at the SAME wake reason. A capable peer takes
+    /// over; the wake reason itself does not change. It must NOT clear
+    /// `timer_fires_at`.
     #[test]
     fn capability_miss_release_query_preserves_the_timer_marker() {
         for phase in [
@@ -10264,20 +10266,21 @@ mod tests {
         );
     }
 
-    /// Issue #1402: `CleanContinuationChangeset` is shared by
-    /// `reschedule_task` (a genuine timer arm) AND `defer_rate_limited_task`
-    /// (a dispatch-time rate-limit deferral, never a timer arm). Only
-    /// `reschedule_task` adds `timer_fires_at` as an EXTRA tuple element
-    /// alongside the shared changeset -- the changeset itself must never
-    /// carry that column, or `defer_rate_limited_task` would silently
-    /// inherit it and stamp a stale/wrong marker on an activity row.
+    /// Issue #1402: `CleanContinuationChangeset` is shared by two callers.
+    /// `reschedule_task` is a genuine timer arm. `defer_rate_limited_task`
+    /// is a dispatch-time rate-limit deferral, never a timer arm. Only
+    /// `reschedule_task` adds `timer_fires_at`, as an EXTRA tuple element
+    /// alongside the shared changeset. The changeset itself must never
+    /// carry that column. Otherwise `defer_rate_limited_task` would
+    /// silently inherit it and stamp a stale marker on an activity row.
+    ///
     /// Real end-to-end coverage that `reschedule_task` itself stamps the
-    /// right value lives in
-    /// `stall_diagnosis_integration::overdue_timer_still_wins_after_a_queue_pause_resume_shift`
-    /// (a DB integration test against the real function); `debug_query`'s
-    /// `Display` never renders bound values, so a no-DB shape test here
-    /// could only ever pin the shared changeset's OWN columns, not prove
-    /// `reschedule_task` writes the correct value.
+    /// right value lives in a DB integration test against the real
+    /// function:
+    /// `stall_diagnosis_integration::overdue_timer_still_wins_after_a_queue_pause_resume_shift`.
+    /// `debug_query`'s `Display` never renders bound values. So a no-DB
+    /// shape test here could only ever pin the shared changeset's OWN
+    /// columns, not prove `reschedule_task` writes the correct value.
     #[test]
     fn clean_continuation_changeset_never_carries_the_timer_marker() {
         use crate::schema::harvest_task_queue::dsl;
@@ -10339,10 +10342,10 @@ mod tests {
             sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => $"),
             "scheduled_at must be computed from Postgres's own clock: {sql}"
         );
-        // The null-ing columns (worker_id/started_at/last_heartbeat_at +
-        // sticky_worker_id/sticky_until/sticky_timeout + activity_name +
-        // timer_fires_at, issue #1402 -- a panic retry is not a timer
-        // wake) all bind `None` (SQL NULL), and wake_requested binds
+        // The null-ing columns all bind `None` (SQL NULL): worker_id,
+        // started_at, last_heartbeat_at, sticky_worker_id, sticky_until,
+        // sticky_timeout, activity_name, and timer_fires_at. A panic
+        // retry is not a timer wake (issue #1402). wake_requested binds
         // `false`.
         assert!(
             sql.matches("None").count() >= 8,

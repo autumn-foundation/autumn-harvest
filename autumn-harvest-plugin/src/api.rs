@@ -13558,10 +13558,10 @@ type WorkflowTaskRow = (
     // reason, even though every row this endpoint's own writes produce
     // sets it.
     Option<chrono::DateTime<chrono::Utc>>, // created_at
-    // Issue #1402: the timer-provenance marker
-    // `is_the_missed_timer_wake` checks once `scheduled_at` alone no
-    // longer proves ownership (a queue-pause resume credit, an orphan
-    // reclaim, or a capability-miss release can each drift it).
+    // Issue #1402: the timer-provenance marker `is_the_missed_timer_wake`
+    // checks. `scheduled_at` alone can stop proving ownership: a
+    // queue-pause resume credit, an orphan reclaim, or a capability-miss
+    // release can each drift it.
     Option<chrono::DateTime<chrono::Utc>>, // timer_fires_at
 );
 
