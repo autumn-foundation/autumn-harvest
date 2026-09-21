@@ -433,9 +433,9 @@ impl RedisProbe {
 
     async fn marker_keys(&self) -> Vec<String> {
         // Issue #1429: a marker now nests its queue's hash tag
-        // (`{prefix:dispatch:queue}:marker:task_id`), so the glob matches
-        // through the literal `{`/`}` rather than a plain `:marker:` segment
-        // straight off the prefix.
+        // (`{prefix:dispatch:queue}:marker:task_id`). The glob matches
+        // through the literal `{`/`}`, rather than a plain `:marker:`
+        // segment straight off the prefix.
         self.keys(&format!("{{{}:dispatch:*}}:marker:*", self.prefix))
             .await
     }

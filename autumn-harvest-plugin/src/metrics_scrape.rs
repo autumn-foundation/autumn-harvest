@@ -1042,9 +1042,9 @@ mod tests {
     #[test]
     fn dispatch_dropped_hints_is_an_unlabeled_last_write_wins_gauge() {
         // Issue #1429: the dispatch background publisher already counts
-        // dropped hints (`dispatch::dropped_hints()`); this pins that the
-        // built-in scrape recorder renders it, and that a later sample
-        // replaces the earlier one rather than summing.
+        // dropped hints (`dispatch::dropped_hints()`). This pins that the
+        // built-in scrape recorder renders it. A later sample replaces the
+        // earlier one rather than summing.
         let recorder = HarvestMetricsRecorder::new();
         recorder.record_dispatch_dropped_hints(3);
         recorder.record_dispatch_dropped_hints(5);

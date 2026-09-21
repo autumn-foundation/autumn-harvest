@@ -650,16 +650,18 @@ async fn a_read_across_two_queues_returns_at_most_the_requested_count() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capped_read_favors_the_higher_priority_candidates() {
-    // Issue #1429. Priority is still best effort under one FIFO stream: a
-    // read sized exactly to one queue's ready backlog (`COUNT` on the Redis
-    // side) never holds more candidates than the cap, so there is nothing
-    // to favor. The favoring only has candidates to choose from when a read
-    // spans queues and their combined `COUNT` ceiling (`per_stream_count`,
-    // rounded up per queue) hands back more than the caller's cap — the
-    // same surplus `a_read_across_two_queues_returns_at_most_the_requested_count`
-    // exercises. This case pins that, once such a surplus exists, the ones
-    // actually delivered are the highest-priority candidates, with the rest
-    // requeued rather than picked by arrival order.
+    // Issue #1429. Priority is still best effort under one FIFO stream. A
+    // read sized exactly to one queue's ready backlog never holds more
+    // candidates than the cap. `COUNT` on the Redis side enforces that
+    // limit, so there is nothing to favor in that case.
+    // The favoring only has candidates to choose from when a read spans
+    // queues. Their combined `COUNT` ceiling (`per_stream_count`, rounded up
+    // per queue) then hands back more than the caller's cap. That is the
+    // same surplus
+    // `a_read_across_two_queues_returns_at_most_the_requested_count`
+    // exercises. This case pins that once such a surplus exists, the ones
+    // actually delivered are the highest-priority candidates. The rest are
+    // requeued, rather than picked by arrival order.
     let Some(fixture) = try_start(Duration::from_secs(60)).await else {
         return;
     };
@@ -679,9 +681,9 @@ async fn a_capped_read_favors_the_higher_priority_candidates() {
         .await
         .expect("publish");
 
-    // `per_stream_count(3, 2)` rounds up to `COUNT 2` per queue, so this read
-    // can see all 4 published entries in one call -- a surplus of 1 over the
-    // cap of 3.
+    // `per_stream_count(3, 2)` rounds up to `COUNT 2` per queue. This read
+    // can therefore see all 4 published entries in one call, a surplus of 1
+    // over the cap of 3.
     let leases = read(&fixture, &queues, 3).await;
     assert_eq!(leases.len(), 3, "the read must honour the caller's cap");
     let delivered: std::collections::HashSet<Uuid> =

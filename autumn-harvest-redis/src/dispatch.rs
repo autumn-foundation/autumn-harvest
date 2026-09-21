@@ -12,10 +12,10 @@
 //!
 //! ## Key family
 //!
-//! Every key for one queue nests the literal substring `{prefix:dispatch:queue}`
-//! — the queue's Redis Cluster hash tag (issue #1429) — so a multi-key script
+//! Every key for one queue nests the literal substring `{prefix:dispatch:queue}`,
+//! the queue's Redis Cluster hash tag (issue #1429). A multi-key script
 //! (`PUBLISH_LUA`, `REQUEUE_LUA`, `PROMOTE_MARKED_LUA`) touching several of
-//! them in one call stays in one Cluster slot.
+//! them in one call therefore stays in one Cluster slot.
 //!
 //! - `{prefix:dispatch:queue}` — the stream of claimable references.
 //! - `{prefix:dispatch:queue}:delayed` — a sorted set of references that are
@@ -567,9 +567,9 @@ impl RedisDispatch {
     }
 
     /// Give several entries back to their streams in one round trip per
-    /// queue. Each entry carries its own due time (issue #1429), so a batch
-    /// may mix an immediate requeue (a surplus read, a recovered entry) with
-    /// a backed-off release.
+    /// queue. Each entry carries its own due time (issue #1429). A batch may
+    /// therefore mix an immediate requeue (a surplus read, a recovered
+    /// entry) with a backed-off release.
     ///
     /// The delivered entry is acked and deleted first, so the pending entries
     /// list never holds a reference the worker no longer owns. The marker is
@@ -712,19 +712,19 @@ impl RedisDispatch {
             }
         }
 
-        // Priority is best effort under dispatch (issue #1429): one FIFO
-        // stream per queue carries no priority order on its own, and `COUNT`
-        // caps what Redis returns per stream before this call ever sees a
-        // candidate -- a read sized to exactly one queue's ready backlog
+        // Priority is best effort under dispatch (issue #1429). One FIFO
+        // stream per queue carries no priority order on its own. `COUNT`
+        // also caps what Redis returns per stream before this call ever sees
+        // a candidate. A read sized to exactly one queue's ready backlog
         // therefore has nothing to sort. A read that spans queues can still
-        // hold more candidates than `max` (`per_stream_count` rounds each
-        // queue's `COUNT` up), and a stable sort by priority (descending)
-        // before the split then favors the highest-priority candidates among
-        // that surplus for the leases this call actually claims, requeuing
-        // the rest. Ties keep arrival order (the sort is stable), so this
-        // never starves same-priority work. The reconcile sweep's own
-        // `(priority DESC, scheduled_at ASC)` publish order is the other half
-        // of this best-effort signal.
+        // hold more candidates than `max`, because `per_stream_count` rounds
+        // each queue's `COUNT` up. A stable sort by priority (descending),
+        // before the split, then favors the highest-priority candidates
+        // among that surplus for the leases this call actually claims. It
+        // requeues the rest. Ties keep arrival order, since the sort is
+        // stable, so this never starves same-priority work. The reconcile
+        // sweep's own `(priority DESC, scheduled_at ASC)` publish order is
+        // the other half of this best-effort signal.
         candidates.sort_by(|a, b| b.2.priority.cmp(&a.2.priority));
 
         let mut leases = Vec::new();
@@ -839,9 +839,9 @@ impl RedisDispatch {
     /// Drop several leases in one round trip (issue #1429).
     ///
     /// Same shape as [`Self::ack_inner`], batched into one atomic pipeline
-    /// covering every lease regardless of which queue it came from — `XACK`,
+    /// covering every lease regardless of which queue it came from. `XACK`,
     /// `XDEL` and the marker delete do not need `EVALSHA`'s single-queue key
-    /// grouping, so nothing here needs to split by queue.
+    /// grouping. Nothing here needs to split by queue.
     async fn ack_many_inner(&self, leases: &[DispatchLease]) -> RedisAdapterResult<()> {
         if leases.is_empty() {
             return Ok(());
@@ -866,8 +866,8 @@ impl RedisDispatch {
     /// Give several leases back at once, each after its own delay
     /// (issue #1429).
     ///
-    /// Builds every entry's fresh reference and due time up front, then
-    /// makes one [`Self::requeue_batch`] call — one round trip per distinct
+    /// Builds every entry's fresh reference and due time up front. It then
+    /// makes one [`Self::requeue_batch`] call: one round trip per distinct
     /// queue in the batch, not one per lease.
     async fn release_many_inner(
         &self,
@@ -995,8 +995,8 @@ impl RedisDispatch {
     ///
     /// The `XPENDING` scan that finds idle entries runs once, pipelined
     /// across every queue (issue #1429). `XCLAIM` and the requeue still run
-    /// per queue with idle entries: their reply shapes and payloads are
-    /// per-queue, and only a queue actually holding idle work pays for them.
+    /// per queue with idle entries. Their reply shapes and payloads are
+    /// per-queue, so only a queue actually holding idle work pays for them.
     async fn recover_queues(&self, queues: &[String]) -> RedisAdapterResult<usize> {
         if queues.is_empty() {
             return Ok(0);

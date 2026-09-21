@@ -39,9 +39,9 @@ pub fn dlq_key(prefix: &str, queue_name: &str) -> String {
 ///
 /// Every dispatch key for `queue_name` nests this substring in `{...}`.
 /// Redis Cluster hashes only the bytes between the first `{` and the next
-/// `}` to pick a slot, so every key sharing this tag lands on the same slot
-/// and the channel's multi-key scripts (`PUBLISH_LUA`, `REQUEUE_LUA`,
-/// `PROMOTE_MARKED_LUA`) stay valid on a cluster.
+/// `}` to pick a slot. Every key sharing this tag therefore lands on the
+/// same slot, and the channel's multi-key scripts (`PUBLISH_LUA`,
+/// `REQUEUE_LUA`, `PROMOTE_MARKED_LUA`) stay valid on a cluster.
 fn dispatch_key_tag(prefix: &str, queue_name: &str) -> String {
     format!("{{{prefix}:dispatch:{queue_name}}}")
 }
@@ -78,11 +78,12 @@ pub fn dispatch_payloads_key(prefix: &str, queue_name: &str) -> String {
 ///
 /// The marker makes a publish idempotent per task id. It expires after the
 /// configured dedupe TTL, so a leaked marker cannot block a republish for
-/// ever. The key carries `queue_name`'s hash tag (issue #1429): a publish or
+/// ever. The key carries `queue_name`'s hash tag (issue #1429). A publish or
 /// a release touches the marker in the same multi-key script call as the
-/// queue's stream, delayed set and payload hash, so it must land in the same
-/// Redis Cluster slot as the rest of that call's keys. A task id identifies
-/// a row on exactly one queue, so this never collides across queues.
+/// queue's stream, delayed set and payload hash. It must therefore land in
+/// the same Redis Cluster slot as the rest of that call's keys. A task id
+/// identifies a row on exactly one queue, so this never collides across
+/// queues.
 #[must_use]
 pub fn dispatch_marker_key(prefix: &str, queue_name: &str, task_id: &str) -> String {
     format!("{}{task_id}", dispatch_marker_prefix(prefix, queue_name))

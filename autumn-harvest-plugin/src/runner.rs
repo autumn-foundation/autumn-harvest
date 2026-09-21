@@ -1090,10 +1090,11 @@ impl HarvestRunner {
         .map_err(AutumnError::service_unavailable_msg)?;
         // A span of one shard (or none) installs the single-shard channel,
         // named by that one shard's key family. A wider span installs one
-        // channel per shard instead (issue #1429): `Worker::new` requires
-        // full per-shard coverage before it accepts the wider span, so a
+        // channel per shard instead (issue #1429). `Worker::new` requires
+        // full per-shard coverage before it accepts the wider span. A
         // partial install here — cut short by a shard connect failure —
-        // fails startup rather than leaving some shards silently uncovered.
+        // therefore fails startup, rather than leaving some shards silently
+        // uncovered.
         let (dispatch_guard, dispatch_installed, dispatch_shard) = if dispatch_shards.len() > 1 {
             let installed_shards =
                 install_dispatch_channels_for_shards(config, &dispatch_shards).await?;
@@ -1401,7 +1402,7 @@ fn capture_effective_config(
         DEFAULT_WORKER_POLL_INTERVAL,
         Some(resolved_sharding),
         // The `[harvest.redis]` section is filled in by `start`, once the
-        // dispatch channel install has actually run (issue #1429): this
+        // dispatch channel install has actually run (issue #1429). This
         // capture happens inside `PreparedHarvestRuntime::build`, before
         // `install_dispatch_channel` and with no access to `config.redis`.
         None,
@@ -1443,31 +1444,30 @@ fn reject_dispatch_queue_names(redis_url_set: bool, queues: &[String]) -> Result
 /// it owns one database and no shard layout.
 const DEFAULT_DISPATCH_SHARD: ShardId = ShardId::new(0);
 
-/// The Redis key prefix this process owns, for the shard it serves.
+/// The Redis key prefix one shard's dispatch channel owns.
 ///
-/// Issue #1312 limits Redis dispatch to a runtime that resolves one shard
-/// pool. A sharded fleet meets that limit by running one process per shard, so
-/// every process passes the check. The configured prefix alone would then give
-/// every process in the fleet the same `{prefix}:dispatch:{queue}` stream. A
-/// worker for shard B would read shard A's reference, probe B's database, find
-/// no row, release it three times and ack it as absent. Shard A's row would
-/// wait for A's reconcile sweep, and a peer could steal it again.
+/// Two callers use this. A one-process-per-shard fleet (issue #1312) calls
+/// it once, for the single shard that process resolves. A process that
+/// spans several shards in one runtime (issue #1429) calls it once per
+/// shard, installing one channel per call. Either way, the configured
+/// prefix alone would give every shard the same `{prefix}:dispatch:{queue}`
+/// stream. A worker for shard B would then read shard A's reference. It
+/// would probe B's database, find no row, release it three times, and ack
+/// it as absent. Shard A's row would wait for A's reconcile sweep, and a
+/// peer could steal it again.
 ///
-/// The shard suffix gives each shard its own key family, so a reference only
-/// ever reaches a process that holds the named row. The suffix extends the
-/// configured prefix and never replaces it, so an operator who namespaces the
-/// prefix per environment keeps that namespace.
+/// The shard suffix gives each shard its own key family instead, so a
+/// reference only ever reaches a channel that can resolve the named row. It
+/// extends the configured prefix and never replaces it. An operator who
+/// namespaces the prefix per environment keeps that namespace.
 ///
 /// [`DEFAULT_DISPATCH_SHARD`] keeps the plain prefix. Every single-database
-/// deployment resolves that shard, and a suffix there would move the key
+/// deployment resolves that shard. A suffix there would move the key
 /// family away from the references a previous release published.
 ///
-/// A central API process that spans several shards still rejects Redis
-/// dispatch at startup. Issue #1429 tracks true multi-shard routing.
-///
-/// Used unconditionally by [`dispatch_config_view`], which every build
-/// evaluates regardless of the `redis` cargo feature, so this function is
-/// never dead code even on a build without it.
+/// Used unconditionally by [`dispatch_config_view`] too, which every build
+/// evaluates regardless of the `redis` cargo feature. This function is
+/// therefore never dead code, even on a build without that feature.
 #[must_use]
 fn effective_dispatch_prefix(configured: &str, shard: Option<ShardId>) -> String {
     match shard {
@@ -1482,13 +1482,13 @@ fn effective_dispatch_prefix(configured: &str, shard: Option<ShardId>) -> String
 /// (issue #1429).
 ///
 /// `installed` is the return value of [`install_dispatch_channel`], not a
-/// re-derivation from `redis.url`: a configured URL that fails to connect
-/// aborts `start` before this runs, so the two agree in practice, but the
+/// re-derivation from `redis.url`. A configured URL that fails to connect
+/// aborts `start` before this runs, so the two agree in practice. The
 /// caller's own result is the fact and never a guess.
 ///
 /// The reported `key_prefix` is the effective, shard-suffixed prefix this
-/// process actually publishes under (see [`effective_dispatch_prefix`]), so
-/// an operator comparing two shards' `/admin/config` output sees the
+/// process actually publishes under (see [`effective_dispatch_prefix`]). An
+/// operator comparing two shards' `/admin/config` output then sees the
 /// difference between their key families, not the one configured value the
 /// two processes share.
 #[must_use]
@@ -1671,16 +1671,17 @@ async fn install_dispatch_channel(
 /// more than one shard (issue #1429).
 ///
 /// Each shard gets its own connection and its own shard-suffixed key prefix
-/// (see [`effective_dispatch_prefix`]) — the same key-family split the
-/// existing one-process-per-shard deployment already relies on, except every
-/// shard's channel now lives in this one process. `Worker::new` reads and
-/// claims each shard through its own installed channel; a shard with none
-/// stays on the Postgres path. Immediate hints from `queue.rs` helpers still
-/// route through the single-shard slot only (which this path never
-/// populates), so on a multi-shard runtime only the reconcile sweep
-/// publishes — a reconcile-interval latency cost, never a lost or
-/// duplicated dispatch (the reconcile sweep is the durability floor for
-/// every dispatch path).
+/// (see [`effective_dispatch_prefix`]). This is the same key-family split
+/// the existing one-process-per-shard deployment already relies on, except
+/// every shard's channel now lives in this one process. `Worker::new` reads
+/// and claims each shard through its own installed channel. A shard with
+/// none stays on the Postgres path.
+///
+/// Immediate hints from `queue.rs` helpers still route through the
+/// single-shard slot only, which this path never populates. So on a
+/// multi-shard runtime only the reconcile sweep publishes. That costs
+/// reconcile-interval latency, never a lost or duplicated dispatch: the
+/// reconcile sweep is the durability floor for every dispatch path.
 ///
 /// Returns the shards this call actually installed, so the caller's guard
 /// can unwind exactly those if a later startup step fails.

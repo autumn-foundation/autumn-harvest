@@ -5873,12 +5873,12 @@ pub(crate) const fn dispatch_allowed_for_span(
 /// installed (issue #1429).
 ///
 /// The multi-shard poll loop consults [`crate::dispatch::installed_for_shard`]
-/// per shard at read time; this is the matching startup check, so a runtime
+/// per shard at read time. This is the matching startup check. A runtime
 /// missing coverage for even one assigned shard fails loud instead of
-/// silently falling that one shard back to the Postgres path forever. An
-/// empty `assignments` (the unsharded/default span) is never covered here: it
-/// has no shard identity to look up, so it needs the single-shard channel
-/// (`dispatch::install`), not this path.
+/// silently falling that one shard back to the Postgres path forever.
+/// An empty `assignments` (the unsharded/default span) is never covered
+/// here. It has no shard identity to look up, so it needs the
+/// single-shard channel (`dispatch::install`), not this path.
 #[must_use]
 fn per_shard_dispatch_covers(assignments: &[crate::types::ShardId]) -> bool {
     !assignments.is_empty()
@@ -9012,7 +9012,7 @@ async fn process_mutex_releases_from_commands(
 
     // `release_lock` wakes the freed key's new head of line, which raises a
     // dispatch hint (issue #1429). A hint published before the COMMIT below
-    // names a row no reader outside this transaction can see yet; the
+    // names a row no reader outside this transaction can see yet. The
     // buffering scope holds it until the commit, matching every other
     // transaction owner that calls `wake_workflow_task`.
     let held_secs = crate::dispatch::buffered_settled(Box::pin(conn.transaction::<Vec<f64>, HarvestError, _>(
@@ -24269,9 +24269,9 @@ fn spawn_queue_pause_sampler(
 /// dispatch background publisher has dropped because its bounded queue was
 /// full. Reads no database: [`crate::dispatch::dropped_hints`] is a plain
 /// in-process counter, so this sampler runs on every build, not only under
-/// the `db` feature. A dropped hint costs latency, not correctness — the
-/// row stays `PENDING` and the reconcile sweep republishes it — so this is
-/// a health signal, not a durability one.
+/// the `db` feature. A dropped hint costs latency, not correctness. The row
+/// stays `PENDING` and the reconcile sweep republishes it. This is a health
+/// signal, not a durability one.
 fn spawn_dispatch_metrics_sampler(
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
@@ -26046,14 +26046,15 @@ impl Worker {
             .map_err(|err| HarvestError::Config(err.to_string()))?;
 
         // A worker that spans several shards cannot tell, from a task id
-        // alone, which shard's database holds the named row — so a
+        // alone, which shard's database holds the named row. A
         // single-channel read on one shard would then be claimed against
         // another shard's database and always miss. `Worker::new` therefore
         // requires either a single-shard span with the single-shard channel
-        // installed (`dispatch::install`), or a per-shard channel installed
-        // for every one of this worker's `shard_assignments`
-        // (`dispatch::install_for_shard`, issue #1429). The multi-shard poll
-        // loop reads and claims each shard against its own matching pair.
+        // installed (`dispatch::install`). Or it requires a per-shard
+        // channel installed for every one of this worker's
+        // `shard_assignments` (`dispatch::install_for_shard`, issue #1429).
+        // The multi-shard poll loop reads and claims each shard against its
+        // own matching pair.
         if crate::dispatch::is_installed() {
             let shard_count = config.shard_assignments.len();
             #[cfg(feature = "db")]
@@ -26666,12 +26667,13 @@ impl Worker {
         let shard_listeners = self.build_shard_listeners(&shard_targets).await;
 
         // Decide each shard's dispatch channel once, here, and hold it for
-        // the whole loop (issue #1429) — the multi-shard mirror of the
-        // single-pool loop's one-time decision just above `run_poll_loop`.
+        // the whole loop (issue #1429). This is the multi-shard mirror of
+        // the single-pool loop's one-time decision just above
+        // `run_poll_loop`.
         // `Worker::new` already required a per-shard channel for every
         // assigned shard before construction succeeded, whenever any
-        // per-shard channel is installed at all; a `None` entry here means
-        // dispatch was never installed for this span, so that shard polls
+        // per-shard channel is installed at all. A `None` entry here means
+        // dispatch was never installed for this span. That shard then polls
         // Postgres, same as no channel at all.
         let shard_dispatch: Vec<Option<crate::dispatch::InstalledDispatch>> = shard_targets
             .iter()
@@ -27993,12 +27995,13 @@ impl Worker {
             // Both pools are full. A reference read now would sit in this
             // worker's hands until a permit frees, which keeps it from a peer
             // that has one. Wait for a permit to free, capped at one poll
-            // interval (issue #1429): a bare sleep here held every claim on
-            // this worker idle for the whole interval even when a running
-            // task finished and freed a permit a moment later. Acquiring and
-            // immediately dropping a permit only detects that one is free; it
-            // never withholds it from a peer or from this same call's own
-            // `dispatch_kind_admitted` check on the next iteration.
+            // interval (issue #1429). A bare sleep here held every claim on
+            // this worker idle for the whole interval. That happened even
+            // when a running task finished and freed a permit a moment
+            // later. Acquiring and immediately dropping a permit only
+            // detects that one is free. It never withholds it from a peer
+            // or from this same call's own `dispatch_kind_admitted` check on
+            // the next iteration.
             tokio::select! {
                 () = self.shutdown.cancelled() => {}
                 () = tokio::time::sleep(self.config.poll_interval) => {}
@@ -28400,8 +28403,8 @@ impl Worker {
     /// `dispatch_allowed` is the run-start decision of
     /// [`dispatch_allowed_for_span`]. The multi-shard loop
     /// (`run_poll_loop_multi`) has its own, per-shard dispatch branch (issue
-    /// #1429): each shard reads and claims through its own installed channel
-    /// when one exists, and polls Postgres otherwise.
+    /// #1429). Each shard reads and claims through its own installed
+    /// channel when one exists, and polls Postgres otherwise.
     async fn run_poll_loop(
         &self,
         pool: &DbPool,

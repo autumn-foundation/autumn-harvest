@@ -262,23 +262,23 @@ pub fn installed() -> Option<InstalledDispatch> {
 
 /// One channel per shard, for a runtime that spans more than one shard.
 ///
-/// [`install`]/[`installed`] above stay the single-shard slot; a multi-shard
+/// [`install`]/[`installed`] above stay the single-shard slot. A multi-shard
 /// runtime never touches them. A worker that spans several shards cannot
-/// tell, from a task id alone, which shard's database holds the named row —
-/// so a reference read from the wrong shard's channel would always miss. Each
-/// shard here therefore gets its own channel, keyed to its own Redis key
-/// family, and the multi-shard poll loop reads and claims against the
+/// tell, from a task id alone, which shard's database holds the named row.
+/// A reference read from the wrong shard's channel would then always miss.
+/// Each shard here therefore gets its own channel, keyed to its own Redis
+/// key family. The multi-shard poll loop reads and claims against the
 /// matching pair.
 ///
-/// Immediate hints (`record_hint`/`record_hints`, raised from `queue.rs`
-/// helpers that do not know which shard they run on) still publish through
-/// the single-shard slot only, which stays empty here — so on a multi-shard
-/// runtime they fall through to the Postgres path, same as no channel
-/// installed at all. Only the reconcile sweep, which already runs once per
-/// shard against that shard's own pool connection, publishes into a
-/// per-shard channel. This costs a reconcile interval of latency on the
-/// first dispatch of a row, never a lost or duplicated one — the same
-/// durability floor every other dispatch path relies on.
+/// Immediate hints still publish through the single-shard slot only, which
+/// stays empty here. `record_hint`/`record_hints` raise them from
+/// `queue.rs` helpers that do not know which shard they run on. So on a
+/// multi-shard runtime they fall through to the Postgres path, same as no
+/// channel installed at all. Only the reconcile sweep publishes into a
+/// per-shard channel. It already runs once per shard, against that shard's
+/// own pool connection. This costs a reconcile interval of latency on the
+/// first dispatch of a row, never a lost or duplicated one. That is the
+/// same durability floor every other dispatch path relies on.
 static INSTALLED_BY_SHARD: RwLock<Option<std::collections::HashMap<crate::types::ShardId, InstalledDispatch>>> =
     RwLock::new(None);
 
@@ -1465,9 +1465,9 @@ mod tests {
         let b = hint("q", Utc::now());
         channel.publish(&[a.clone(), b.clone()]).await.expect("publish");
 
-        // One `next` call already returns both ready entries (`max` is 8);
-        // two separate `read_one` calls would silently drop the second, since
-        // it never returns more than one lease per call.
+        // One `next` call already returns both ready entries (`max` is 8).
+        // Two separate `read_one` calls would silently drop the second,
+        // since it never returns more than one lease per call.
         let leases = channel
             .next(&queues(), "c", 8, Duration::from_millis(0))
             .await

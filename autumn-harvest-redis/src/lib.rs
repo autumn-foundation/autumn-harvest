@@ -73,14 +73,14 @@
 //! ### Limits in v1
 //!
 //! - **Single-node client.** The key family is hash-tagged per queue (issue
-//!   #1429): a queue's stream, delayed set, payload hash and markers all
-//!   carry the same `{prefix:dispatch:queue}` tag, so the multi-key scripts
-//!   (`PUBLISH_LUA`, `REQUEUE_LUA`, `PROMOTE_MARKED_LUA`) stay in one Redis
-//!   Cluster slot. This crate still connects with a single-node
+//!   #1429). A queue's stream, delayed set, payload hash and markers all
+//!   carry the same `{prefix:dispatch:queue}` tag. The multi-key scripts
+//!   (`PUBLISH_LUA`, `REQUEUE_LUA`, `PROMOTE_MARKED_LUA`) therefore stay in
+//!   one Redis Cluster slot. This crate still connects with a single-node
 //!   [`redis::Client`]/[`ConnectionManager`](redis::aio::ConnectionManager),
-//!   not a cluster-aware client, so it does not yet follow `MOVED`/`ASK`
+//!   not a cluster-aware client. It does not yet follow `MOVED`/`ASK`
 //!   redirects across a multi-node Cluster deployment. The hash tags remove
-//!   the `CROSSSLOT` failure; a cluster-aware client is a separate follow-up.
+//!   the `CROSSSLOT` failure. A cluster-aware client is a separate follow-up.
 //! - **No TLS.** A `rediss://` URL is rejected at `connect` with a message
 //!   that says so. The `redis` client's TLS stack depends on an unmaintained
 //!   crate that the dependency ledger refuses; issue #1429 tracks TLS. A
@@ -92,13 +92,13 @@
 //!   this type (issue #1429; see `autumn-harvest-plugin`'s per-shard
 //!   install and `autumn_harvest::dispatch::install_for_shard`).
 //! - **Priority is best effort.** One stream per queue delivers in arrival
-//!   order, so a read sized to exactly one queue's ready backlog sees no
-//!   priority signal at all — `COUNT` caps what Redis returns before this
+//!   order. A read sized to exactly one queue's ready backlog therefore sees
+//!   no priority signal at all. `COUNT` caps what Redis returns, before this
 //!   channel ever sees the candidates. The reconcile sweep publishes in
-//!   priority order, and a read that spans queues favors the
-//!   highest-priority candidates over lower ones among whatever surplus that
-//!   span already produces (issue #1429), with no extra round trip. Neither
-//!   is a per-priority stream.
+//!   priority order instead. A read that spans queues also favors the
+//!   highest-priority candidates over lower ones (issue #1429). It does so
+//!   only among whatever surplus that span already produces, with no extra
+//!   round trip. Neither is a per-priority stream.
 //! - **Sticky affinity is best effort.** Any worker in the consumer group may
 //!   read any reference. The Postgres claim predicate still enforces the
 //!   affinity gate, and a rejected reference is released with backoff.
