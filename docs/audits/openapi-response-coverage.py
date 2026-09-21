@@ -35,9 +35,13 @@ naming several spellings passes when the contract documents any one of them,
 since an alias needs no second entry in the document.
 
 A `StatusCode::` or `AutumnError::` token is ignored inside a helper on
-GENERIC_HELPERS: `map_error` and `conflict_from` translate a runtime error
-into whatever status fits it, not the calling route, so their statuses belong
-to the error, not to every route that reaches them.
+GENERIC_HELPERS: `map_error` translates a runtime error into whatever status
+fits it, not the calling route, so its statuses belong to the error, not to
+every route that reaches it. `conflict_from` is not on that list. Its
+`HarvestError::Config` arm carries one fixed, literal `StatusCode::CONFLICT`
+that belongs to every route calling it, so it is traversed like any other
+helper; its other arms still fall through to `map_error`, which stays
+excluded, so no variable status leaks in through that path.
 
 Each handler is followed one level into the helpers it calls, since a status is
 often selected in a helper such as `queue_pause_partial_status`. A helper called
@@ -93,9 +97,11 @@ VERBS = ("get", "post", "put", "patch", "delete")
 # Helpers whose status depends on the runtime error they are handed rather than
 # on the calling route. Following them would put every status they can produce
 # on every route that calls them, which is noise, not coverage. `conflict_from`
-# is `map_error` with one `HarvestError::Config` arm promoted to 409; the rest
-# of its match falls through to `map_error` itself.
-GENERIC_HELPERS = frozenset({"map_error", "conflict_from"})
+# is not here: its `HarvestError::Config` arm has one fixed, literal 409, so it
+# is traversed like an ordinary helper and that literal is picked up by every
+# route that calls it. Its other arms delegate to `map_error`, which stays
+# excluded, so that delegation contributes no status of its own.
+GENERIC_HELPERS = frozenset({"map_error"})
 
 # `AutumnError::<name>(..)` constructors used in this file, and the status each
 # implies absent a `.with_status(..)` override. Sourced from autumn-web's
