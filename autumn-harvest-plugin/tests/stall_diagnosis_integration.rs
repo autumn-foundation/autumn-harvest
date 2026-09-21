@@ -39,6 +39,8 @@ use autumn_harvest::context::{ActivityContext, WorkflowContext};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::policy::CircuitBreakerPolicy;
+use autumn_harvest::queue;
+use autumn_harvest::queue_pause;
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::store;
@@ -1943,6 +1945,192 @@ async fn overdue_timer_still_wins_when_the_task_own_wake_was_missed() {
     let body = diagnose(&app, exec_id).await;
     assert_eq!(kind(&body), "timer_overdue", "body: {body}");
     assert_eq!(body["health"], "stalled", "body: {body}");
+}
+
+/// Issue #1402. A queue-pause resume credits held time back onto
+/// `scheduled_at` (`queue_pause::resume_shift_scheduled_at_query`). That
+/// can drift it an UNBOUNDED distance from a timer's own `fires_at` --
+/// long past both the exact match and `timer_owns_the_wake`'s tolerance.
+/// Before this fix it masked a genuinely missed wake as a healthy
+/// `sleeping_timer`. Reproduces the regression end to end against the
+/// real production write paths: `queue::reschedule_task` arms the timer,
+/// then the real `queue_pause::pause_queue`/`resume_queue` pair holds and
+/// releases the queue. The diagnose endpoint must still report
+/// `timer_overdue`.
+#[tokio::test]
+async fn overdue_timer_still_wins_after_a_queue_pause_resume_shift() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "timer_wf", "RUNNING", vec![started_event()]).await;
+    let task_id = Uuid::new_v4();
+    // Already overdue by 2 hours before the pause ever starts -- the same
+    // shape a real hours-long operator pause leaves behind once dispatch
+    // catches up.
+    let fires_at = Utc::now() - chrono::Duration::hours(2);
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_task_queue \
+             (id, queue_name, task_type, workflow_exec_id, input, state, priority, \
+              attempt, max_attempts, scheduled_at, worker_id) \
+             VALUES ($1, 'resume-shift-q', 'workflow', $2, '{}'::jsonb, 'RUNNING', 0, 1, 3, \
+                     NOW(), 'w-claiming')",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed running workflow task");
+
+        // The real production write path: `persist_started_timer` calls
+        // this with the identical value it inserts into
+        // `harvest_timers.fires_at`, which is what stamps `timer_fires_at`.
+        queue::reschedule_task(&mut conn, task_id, fires_at)
+            .await
+            .expect("arm the timer");
+
+        // `reschedule_task` never touches `created_at`, so a genuinely
+        // timer-owned row's `created_at` is its ORIGINAL creation time --
+        // older than the timer's own deadline (issue #1191 review). The
+        // seed above left it at insert time; backdate it explicitly.
+        diesel::sql_query(
+            "UPDATE harvest_task_queue SET created_at = NOW() - INTERVAL '3 hours' \
+             WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .execute(&mut conn)
+        .await
+        .expect("backdate created_at");
+
+        diesel::sql_query(
+            "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+             VALUES ($1, $2, 'long_sleep', $3, false)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+        .execute(&mut conn)
+        .await
+        .expect("seed the timer");
+    }
+    seed_live_worker(&pool, "w-live", "resume-shift-q").await;
+
+    // The real production pause/resume pair. `paused_at` is backdated
+    // after the pause so the credit shift models an hours-long real-world
+    // hold rather than this test's own millisecond round trip -- a gap
+    // that would otherwise land inside `timer_owns_the_wake`'s 2-second
+    // tolerance and pass even without issue #1402's fix, silently
+    // defeating the regression this test exists to pin.
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        queue_pause::pause_queue(&mut conn, "resume-shift-q", "maintenance", "operator", None)
+            .await
+            .expect("pause the queue");
+        diesel::sql_query(
+            "UPDATE harvest_queue_pauses SET paused_at = NOW() - INTERVAL '90 minutes' \
+             WHERE queue_name = 'resume-shift-q'",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("backdate the pause");
+        queue_pause::resume_queue(&mut conn, "resume-shift-q", "operator")
+            .await
+            .expect("resume the queue");
+    }
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "timer_overdue",
+        "the resume credit must not mask a genuinely missed timer wake: {body}"
+    );
+    assert_eq!(body["health"], "stalled", "body: {body}");
+}
+
+/// Issue #1402's original ask: confirm a queue-pause resume of a
+/// workflow-type row that was NOT timer-owned still behaves correctly
+/// when an unrelated armed timer happens to be nearby. This row's own
+/// wake source was a signal/child/handoff (`wake_workflow_task`'s repend
+/// fingerprint: `scheduled_at` = wake instant, `created_at` ~5s later,
+/// `timer_fires_at` unset), not a timer -- the resume credit must not
+/// turn it into a false `timer_overdue` for the unrelated timer sitting
+/// nearby.
+#[tokio::test]
+async fn queue_pause_resume_does_not_misattribute_an_unrelated_timer_to_a_signal_repend() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "timer_wf", "RUNNING", vec![started_event()]).await;
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        // Armed long before the wake, unrelated to it -- the same fixture
+        // shape `overdue_timer_is_not_a_stall_when_a_different_wake_source_re_pended_the_task`
+        // uses.
+        diesel::sql_query(
+            "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+             VALUES ($1, $2, 'partner_deadline', NOW() - INTERVAL '20 minutes', false)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed unrelated overdue timer");
+    }
+    // `wake_workflow_task`'s re-pend fingerprint: PENDING, already due,
+    // created_at ~5s after scheduled_at, no timer marker.
+    seed_workflow_task(
+        &pool,
+        exec_id,
+        "resume-safety-q",
+        "PENDING",
+        None,
+        "NOW() - INTERVAL '30 seconds'",
+    )
+    .await;
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "UPDATE harvest_task_queue SET created_at = NOW() - INTERVAL '25 seconds' \
+             WHERE workflow_exec_id = $1 AND task_type = 'workflow'",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("set the repend fingerprint's created_at");
+    }
+    seed_live_worker(&pool, "w-live", "resume-safety-q").await;
+
+    // Pause and resume the queue the row happens to sit on -- unrelated to
+    // why the row is PENDING, but still credits held time onto
+    // scheduled_at, drifting it further from the unrelated timer's
+    // fires_at than it already was.
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        queue_pause::pause_queue(
+            &mut conn,
+            "resume-safety-q",
+            "maintenance",
+            "operator",
+            None,
+        )
+        .await
+        .expect("pause the queue");
+        queue_pause::resume_queue(&mut conn, "resume-safety-q", "operator")
+            .await
+            .expect("resume the queue");
+    }
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "sleeping_timer",
+        "the unrelated timer must not be attributed to this signal-driven \
+         repend just because the queue it sits on was paused and resumed: {body}"
+    );
+    assert_eq!(body["health"], "healthy", "body: {body}");
 }
 
 /// Issue #1191. `wake_workflow_task` re-pends a parked row to PENDING. It

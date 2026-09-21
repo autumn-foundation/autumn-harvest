@@ -3027,6 +3027,10 @@ pub async fn requeue_workflow_task_for_quota_retry(
         ),
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
+        // A quota/shard-admission backoff is not a timer wake (issue
+        // #1402). Clear the marker so it cannot survive to name a stale
+        // timer once this row becomes due again.
+        dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
     ))
     .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
     .get_results::<(String, i32, chrono::DateTime<Utc>)>(conn)
@@ -3081,6 +3085,7 @@ fn requeue_workflow_task_for_quota_retry_query(
         ),
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
+        dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
     ));
     debug_query::<Pg, _>(&query).to_string()
 }
@@ -3143,6 +3148,10 @@ pub async fn requeue_workflow_task_nd_blocked(
         dsl::sticky_timeout.eq(None::<chrono::Duration>),
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
+        // A crash-recovery backoff is not a timer wake (issue #1402).
+        // Clear the marker so it cannot survive to name a stale timer
+        // once this row becomes due again.
+        dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
     ))
     .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
     .get_results::<(String, i32, chrono::DateTime<Utc>)>(conn)
@@ -3201,6 +3210,7 @@ fn requeue_after_panic_query(changeset: PendingRequeueChangeset, delay: Duration
         dsl::sticky_timeout.eq(None::<chrono::Duration>),
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
+        dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
     ));
     debug_query::<Pg, _>(&query).to_string()
 }
@@ -3263,6 +3273,10 @@ pub async fn requeue_workflow_task_after_panic(
         dsl::sticky_timeout.eq(None::<chrono::Duration>),
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
+        // A crash-recovery backoff is not a timer wake (issue #1402).
+        // Clear the marker so it cannot survive to name a stale timer
+        // once this row becomes due again.
+        dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
     ))
     .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
     .get_results::<(String, i32, chrono::DateTime<Utc>)>(conn)
@@ -3513,6 +3527,15 @@ impl CleanContinuationChangeset {
 /// details payload is intentionally preserved so the retry attempt can resume
 /// from the last flushed checkpoint.
 ///
+/// Every caller passes a durable timer's own `fires_at` (issue #1402):
+/// `persist_started_timer` and its mixed-signal/child-race siblings, always
+/// with the exact value just written to `harvest_timers.fires_at`. This is
+/// the ONE path that stamps `timer_fires_at` from `scheduled_at`, which is
+/// what lets [`crate::stall_diagnosis::is_the_missed_timer_wake`] trust the
+/// column later, even after some other path drifts `scheduled_at` again
+/// without changing the wake reason. See `timer_fires_at`'s column comment
+/// in the schema for the full argument.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
@@ -3528,7 +3551,10 @@ pub async fn reschedule_task(
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
     )
-    .set(CleanContinuationChangeset::new(scheduled_at))
+    .set((
+        CleanContinuationChangeset::new(scheduled_at),
+        dsl::timer_fires_at.eq(Some(scheduled_at)),
+    ))
     .returning((dsl::queue_name, dsl::priority, dsl::task_type))
     .get_result::<(String, i32, String)>(conn)
     .await
@@ -4275,6 +4301,10 @@ pub async fn claim_still_held_for_update(
 /// uses to reset the same column for the same reason. Leaving a stale count
 /// in place would let an unrelated, already-resolved crash history count
 /// against a task that just proved itself dispatchable.
+///
+/// Also clears `timer_fires_at` (issue #1402): this release hands the row
+/// to a fresh dispatch attempt at the current instant, not to the timer
+/// (if any) that last armed it, so a stale marker must not outlive it.
 const fn release_suspended_workflow_claim_query() -> &'static str {
     "UPDATE harvest_task_queue \
      SET state = 'PENDING', \
@@ -4288,6 +4318,7 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
          capability_misses = 0, \
          capability_miss_workers = '{}', \
          crash_strikes = 0, \
+         timer_fires_at = NULL, \
          sticky_until = CASE \
              WHEN sticky_worker_id IS NOT NULL AND sticky_timeout IS NOT NULL \
              THEN NOW() + sticky_timeout \
@@ -4930,6 +4961,10 @@ pub async fn wake_workflow_task(
 /// claimed follow-up task (issue #501 review). The wake instant is this cycle's
 /// true eligibility, so an immediately-served wake correctly reports ~0.
 ///
+/// Also clears `timer_fires_at` (issue #1402): a signal, child, or external
+/// handoff woke this row, not the timer (if any) that last armed it, so
+/// that marker must not survive to name the wrong cause later.
+///
 /// The statement returns the hint columns rather than `queue_name` alone
 /// (issue #1312). A re-pended row is then published to the dispatch channel
 /// with its own id, due time and priority.
@@ -4957,6 +4992,7 @@ const fn primary_repend_workflow_task_query() -> &'static str {
          scheduled_at = $2, \
          created_at = clock_timestamp(), \
          activity_name = NULL, \
+         timer_fires_at = NULL, \
          sticky_until = CASE \
              WHEN sticky_worker_id IS NOT NULL AND sticky_timeout IS NOT NULL \
              THEN NOW() + sticky_timeout \
@@ -9201,6 +9237,11 @@ mod tests {
             sql.contains("activity_name = 'mixed_signal_suspension'"),
             "must also target an elapsed mixed-signal PENDING row (issue #383)",
         );
+        assert!(
+            sql.contains("timer_fires_at = NULL"),
+            "a signal/child/handoff wake must clear the stale timer-provenance \
+             marker (issue #1402): {sql}",
+        );
     }
 
     #[test]
@@ -9231,6 +9272,11 @@ mod tests {
         assert!(sql.contains("SET state = 'PENDING'"));
         assert!(sql.contains("worker_id = NULL"));
         assert!(sql.contains("started_at = NULL"));
+        assert!(
+            sql.contains("timer_fires_at = NULL"),
+            "a fresh dispatch attempt must clear the stale timer-provenance \
+             marker (issue #1402): {sql}",
+        );
         assert!(
             sql.contains("wake_requested = FALSE"),
             "a wake that landed in the SKIP LOCKED contention window must be \
@@ -9668,6 +9714,25 @@ mod tests {
                  poison-pill reclaim must not be clobbered",
             );
             assert!(sql.contains("id = $1"));
+        }
+    }
+
+    /// Issue #1402: a capability-miss release hands the row to a fresh
+    /// dispatch attempt at the SAME wake reason -- a capable peer taking
+    /// over, not a new one -- so it must NOT clear `timer_fires_at`.
+    #[test]
+    fn capability_miss_release_query_preserves_the_timer_marker() {
+        for phase in [
+            CapabilityMissPhase::AfterHandler,
+            CapabilityMissPhase::BeforeHandler,
+            CapabilityMissPhase::DuringHandler,
+        ] {
+            let sql = release_task_for_capability_miss_query(phase);
+            assert!(
+                !sql.contains("timer_fires_at"),
+                "{phase:?}: a capability-miss release must leave \
+                 timer_fires_at untouched: {sql}"
+            );
         }
     }
 
@@ -10199,6 +10264,40 @@ mod tests {
         );
     }
 
+    /// Issue #1402: `CleanContinuationChangeset` is shared by
+    /// `reschedule_task` (a genuine timer arm) AND `defer_rate_limited_task`
+    /// (a dispatch-time rate-limit deferral, never a timer arm). Only
+    /// `reschedule_task` adds `timer_fires_at` as an EXTRA tuple element
+    /// alongside the shared changeset -- the changeset itself must never
+    /// carry that column, or `defer_rate_limited_task` would silently
+    /// inherit it and stamp a stale/wrong marker on an activity row.
+    /// Real end-to-end coverage that `reschedule_task` itself stamps the
+    /// right value lives in
+    /// `stall_diagnosis_integration::overdue_timer_still_wins_after_a_queue_pause_resume_shift`
+    /// (a DB integration test against the real function); `debug_query`'s
+    /// `Display` never renders bound values, so a no-DB shape test here
+    /// could only ever pin the shared changeset's OWN columns, not prove
+    /// `reschedule_task` writes the correct value.
+    #[test]
+    fn clean_continuation_changeset_never_carries_the_timer_marker() {
+        use crate::schema::harvest_task_queue::dsl;
+        use diesel::debug_query;
+        use diesel::pg::Pg;
+
+        let changeset = CleanContinuationChangeset::new(chrono::Utc::now());
+        let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
+            .set(&changeset);
+        let debug = debug_query::<Pg, _>(&query).to_string();
+
+        assert!(
+            !debug.contains("timer_fires_at"),
+            "the shared changeset must not carry timer_fires_at -- only \
+             reschedule_task's own call site may add it, or \
+             defer_rate_limited_task would inherit it for an activity row: \
+             {debug}"
+        );
+    }
+
     /// Issue #782: `requeue_workflow_task_after_panic` must generate a `SET`
     /// clause that (a) resets the shared pending-requeue columns (`state` →
     /// PENDING, `crash_strikes` bound so the poison-pill reclaimer never trips,
@@ -10227,6 +10326,7 @@ mod tests {
             "wake_requested",
             "activity_name",
             "error",
+            "timer_fires_at",
         ] {
             assert!(
                 sql.contains(&format!("\"{column}\" = $")),
@@ -10240,11 +10340,13 @@ mod tests {
             "scheduled_at must be computed from Postgres's own clock: {sql}"
         );
         // The null-ing columns (worker_id/started_at/last_heartbeat_at +
-        // sticky_worker_id/sticky_until/sticky_timeout + activity_name) all bind
-        // `None` (SQL NULL), and wake_requested binds `false`.
+        // sticky_worker_id/sticky_until/sticky_timeout + activity_name +
+        // timer_fires_at, issue #1402 -- a panic retry is not a timer
+        // wake) all bind `None` (SQL NULL), and wake_requested binds
+        // `false`.
         assert!(
-            sql.matches("None").count() >= 7,
-            "the seven null-ing columns must all bind to None (SQL NULL): {sql}"
+            sql.matches("None").count() >= 8,
+            "the eight null-ing columns must all bind to None (SQL NULL): {sql}"
         );
         assert!(
             sql.contains("false"),
@@ -10266,7 +10368,7 @@ mod tests {
         let changeset = PendingRequeueChangeset::new("quota exceeded".to_string());
         let sql = requeue_workflow_task_for_quota_retry_query(changeset, Duration::seconds(5));
 
-        for column in ["wake_requested", "activity_name"] {
+        for column in ["wake_requested", "activity_name", "timer_fires_at"] {
             assert!(
                 sql.contains(&format!("\"{column}\" = $")),
                 "{column} must appear as a bound column in the SET clause: {sql}"
@@ -10278,10 +10380,13 @@ mod tests {
             sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => $"),
             "scheduled_at must be computed from Postgres's own clock: {sql}"
         );
-        // activity_name binds `None` (SQL NULL); wake_requested binds `false`.
+        // activity_name and timer_fires_at (issue #1402: a quota retry is
+        // not a timer wake) both bind `None` (SQL NULL); wake_requested
+        // binds `false`.
         assert!(
-            sql.contains("None"),
-            "activity_name must bind to None (SQL NULL): {sql}"
+            sql.matches("None").count() >= 2,
+            "activity_name and timer_fires_at must both bind to None \
+             (SQL NULL): {sql}"
         );
         assert!(
             sql.contains("false"),

@@ -1071,6 +1071,19 @@ pub use scanner::{
 mod tests {
     use super::*;
 
+    /// Issue #1402: an orphan reclaim keeps the SAME wake reason a crashed
+    /// worker was already processing, so it must NOT clear
+    /// `timer_fires_at` -- doing so would defeat the marker for a
+    /// genuinely timer-owned row recovering from a crash.
+    #[test]
+    fn requeue_orphan_stmt_preserves_the_timer_marker() {
+        let sql = requeue_orphan_stmt();
+        assert!(
+            !sql.contains("timer_fires_at"),
+            "an orphan reclaim must leave timer_fires_at untouched: {sql}"
+        );
+    }
+
     #[test]
     fn first_strike_under_threshold_requeues() {
         assert_eq!(quarantine_decision(1, 3), ReclaimAction::Requeue);
