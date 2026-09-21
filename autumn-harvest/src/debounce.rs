@@ -564,6 +564,13 @@ type FiredDebounce = (
 /// #1230 Finding 2 review). See
 /// [`order_due_rows_for_deadlock_free_firing`]'s doc comment for the full
 /// history.
+///
+/// Sibling of `throttle.rs`'s copy of this function (clone class, tracked
+/// in issue #1695). It differs only in the one field name `FireDueRow`
+/// forces to differ (`last_input` here, `input` there).
+/// `docs/audits/quota-lock-ordering-sync.py` normalizes that one field and
+/// gates CI on the rest staying byte-identical. A fix here must land in
+/// both files in the same change.
 #[cfg(feature = "db")]
 fn resolve_row_quota_lock_key(
     row: &FireDueRow,

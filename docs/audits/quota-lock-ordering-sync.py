@@ -28,16 +28,24 @@ script is the substitute for the abstraction: it fails CI the moment the
 two copies diverge, so the sync work review already had to do by hand
 across PR #1480 stays enforced automatically instead of by convention.
 
-Scope is the four functions confirmed byte-identical by direct diff:
-`resolve_quota_lock_ids`, `order_rows_by_quota_lock_id`,
-`snapshot_quota_policies`, and `order_due_rows_for_deadlock_free_firing`
-(the wrapper composing the other three — Codex review on PR #1696 found
-this fourth function belonged in the tracked set too, since a change to
-how it composes them would drift the two copies while leaving the other
-three individually unchanged). `resolve_row_quota_lock_key` is
-intentionally excluded — it destructures each file's own `FireDueRow`
-shape, so it can never be identical text and is not part of this clone
-class.
+Scope is five functions confirmed byte-identical (four outright, one after
+normalizing one known field-name difference — see `FIELD_NORMALIZATIONS`
+below) by direct diff: `resolve_quota_lock_ids`,
+`order_rows_by_quota_lock_id`, `snapshot_quota_policies`,
+`order_due_rows_for_deadlock_free_firing` (the wrapper composing the first
+three), and `resolve_row_quota_lock_key`. Codex review on PR #1696 found
+both the wrapper and the resolver belonged in the tracked set: a change to
+how the wrapper composes the other functions, or to the resolver's
+policy/key logic, would drift the two copies while every other tracked
+function stayed individually unchanged.
+
+`resolve_row_quota_lock_key` reads its row's input from a field each
+file's own `FireDueRow` names differently (`last_input` in debounce.rs,
+`input` in throttle.rs) — the one structural difference the two scanners'
+row shapes actually require. `FIELD_NORMALIZATIONS` substitutes a common
+placeholder for that one field access before comparing, so the rest of
+the function (the policy lookup, the `has_any_cap` guard, the resolved-key
+construction) is still checked byte-for-byte.
 
 Usage:
     python3 docs/audits/quota-lock-ordering-sync.py
@@ -54,15 +62,27 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEBOUNCE = REPO_ROOT / "autumn-harvest" / "src" / "debounce.rs"
 THROTTLE = REPO_ROOT / "autumn-harvest" / "src" / "throttle.rs"
 
-# The clone class confirmed byte-identical between debounce.rs and
-# throttle.rs (issue #1230 Finding 2 / PR #1480). Deliberately excludes
-# resolve_row_quota_lock_key, which is per-file by construction.
+# The clone class confirmed byte-identical (outright, or after
+# FIELD_NORMALIZATIONS) between debounce.rs and throttle.rs (issue #1230
+# Finding 2 / PR #1480).
 TRACKED_FUNCTIONS = [
     "resolve_quota_lock_ids",
     "order_rows_by_quota_lock_id",
     "snapshot_quota_policies",
     "order_due_rows_for_deadlock_free_firing",
+    "resolve_row_quota_lock_key",
 ]
+
+# Per-function field-name normalization: a tracked function whose two
+# copies read one field under a name the row type itself forces to
+# differ. Each entry replaces a debounce.rs-side substring and a
+# throttle.rs-side substring with the same placeholder before comparing,
+# so the rest of the function is still held to a byte-identical bar. A
+# function not listed here is compared with no normalization at all.
+FIELD_NORMALIZATIONS: dict[str, tuple[str, str]] = {
+    "resolve_row_quota_lock_key": ("row.last_input", "row.input"),
+}
+NORMALIZED_PLACEHOLDER = "row.__normalized_input_field__"
 
 FN_SIGNATURE_RE_TEMPLATE = r"\n(?:async )?fn {name}\s*\("
 
@@ -118,15 +138,25 @@ def main() -> int:
             print(f"FAIL {name}: not found in {', '.join(missing_from)}")
             continue
 
-        if a == b:
-            print(f"OK   {name}: byte-identical ({len(a)} chars)")
+        a_compared, b_compared = a, b
+        normalized_note = ""
+        if name in FIELD_NORMALIZATIONS:
+            debounce_pattern, throttle_pattern = FIELD_NORMALIZATIONS[name]
+            a_compared = a.replace(debounce_pattern, NORMALIZED_PLACEHOLDER)
+            b_compared = b.replace(throttle_pattern, NORMALIZED_PLACEHOLDER)
+            normalized_note = (
+                f" (after normalizing `{debounce_pattern}` / `{throttle_pattern}`)"
+            )
+
+        if a_compared == b_compared:
+            print(f"OK   {name}: byte-identical{normalized_note} ({len(a)} chars)")
             continue
 
         failures += 1
-        print(f"FAIL {name}: copies have diverged")
+        print(f"FAIL {name}: copies have diverged{normalized_note}")
         diff = difflib.unified_diff(
-            a.splitlines(),
-            b.splitlines(),
+            a_compared.splitlines(),
+            b_compared.splitlines(),
             fromfile=f"debounce.rs::{name}",
             tofile=f"throttle.rs::{name}",
             lineterm="",
