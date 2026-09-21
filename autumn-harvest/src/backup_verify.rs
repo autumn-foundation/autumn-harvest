@@ -3001,6 +3001,52 @@ mod probes {
     /// batch, not just the query, bounds both.
     const WORKFLOW_KEY_LOOKUP_CHUNK: usize = 1_000;
 
+    /// One matched `harvest_workflow_executions` business key, along with
+    /// whether EVERY row under it is a `MIGRATED` forwarding seal (Codex
+    /// follow-up x13).
+    #[derive(diesel::QueryableByName)]
+    struct WorkflowExecutionMatchRow {
+        #[diesel(sql_type = Text)]
+        workflow_name: String,
+        #[diesel(sql_type = Text)]
+        workflow_id: String,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        all_migrated: bool,
+    }
+
+    /// Like [`matching_workflow_keys`] against `harvest_workflow_executions`,
+    /// but distinguishes a genuine row from a `MIGRATED` forwarding seal.
+    ///
+    /// A completion-trigger fire's target shard is a historical fact
+    /// (persisted at relay time) or a reconstruction against CURRENT
+    /// topology (a pre-migration fire). Either way, it names the shard the
+    /// target STARTED on. A shard rebalance since then can move the live
+    /// row to a different shard. It leaves a `MIGRATED` seal behind under
+    /// the SAME business key -- present, but a forwarding pointer, not the
+    /// run. That seal proves the key was claimed. It does not prove the
+    /// runnable target survived THIS restore, since the actual row is not
+    /// on this shard's snapshot at all. `all_migrated` is true only when
+    /// every matched row under a key is such a seal. A key with at least
+    /// one non-seal row (the common case) still reads as a genuine match.
+    async fn matching_workflow_executions(
+        conn: &mut AsyncPgConnection,
+        names: &[String],
+        ids: &[String],
+    ) -> Result<Vec<WorkflowExecutionMatchRow>, diesel::result::Error> {
+        diesel::sql_query(
+            "SELECT e.workflow_name, e.workflow_id, \
+                 bool_and(e.state = 'MIGRATED') AS all_migrated \
+             FROM harvest_workflow_executions e \
+             JOIN UNNEST($1::text[], $2::text[]) AS t(workflow_name, workflow_id) \
+               ON e.workflow_name = t.workflow_name AND e.workflow_id = t.workflow_id \
+             GROUP BY e.workflow_name, e.workflow_id",
+        )
+        .bind::<diesel::sql_types::Array<Text>, _>(names)
+        .bind::<diesel::sql_types::Array<Text>, _>(ids)
+        .load(conn)
+        .await
+    }
+
     /// Which of the given business keys exist in `table_name`, in ONE
     /// round trip.
     ///
@@ -3502,11 +3548,45 @@ mod probes {
     /// never larger than [`WORKFLOW_KEY_LOOKUP_CHUNK`], so every vector
     /// built here is bounded the same way.
     ///
-    /// `matching_workflow_keys` checks the whole chunk in one query against
-    /// `harvest_workflow_executions`. This is the same ANY-STATE existence
-    /// check `relay_gate_checked_start` itself runs before starting the
-    /// target, read-only against a restored snapshot. It checks the absent
-    /// remainder in one more query against `harvest_execution_summaries`.
+    /// `matching_workflow_executions` checks the whole chunk in one query
+    /// against `harvest_workflow_executions`. A genuine match is the same
+    /// ANY-STATE existence check `relay_gate_checked_start` itself runs
+    /// before starting the target, read-only against a restored snapshot.
+    /// A key matched by `MIGRATED` seals only is neither delivered nor
+    /// absent. It goes straight to `unproven`, skipping the
+    /// retention/timestamp checks below (Codex follow-up x13). Everything
+    /// genuinely absent is checked in one more query against
+    /// `harvest_execution_summaries`.
+    /// Match `chunk`'s targets against `harvest_workflow_executions`, split
+    /// into keys backed by a genuine row and keys backed by `MIGRATED`
+    /// forwarding seals only. Split out of
+    /// [`adjudicate_trigger_fire_chunk`] to keep that function under the
+    /// line-count lint.
+    async fn match_live_targets(
+        conn: &mut AsyncPgConnection,
+        names: &[String],
+        ids: &[String],
+    ) -> Result<
+        (
+            std::collections::HashSet<(String, String)>,
+            std::collections::HashSet<(String, String)>,
+        ),
+        diesel::result::Error,
+    > {
+        let matches = matching_workflow_executions(conn, names, ids).await?;
+        let mut existing = std::collections::HashSet::new();
+        let mut migrated_seal_only = std::collections::HashSet::new();
+        for row in matches {
+            let key = (row.workflow_name, row.workflow_id);
+            if row.all_migrated {
+                migrated_seal_only.insert(key);
+            } else {
+                existing.insert(key);
+            }
+        }
+        Ok((existing, migrated_seal_only))
+    }
+
     async fn adjudicate_trigger_fire_chunk(
         conn: &mut AsyncPgConnection,
         chunk: &[&super::PendingTriggerFire],
@@ -3524,24 +3604,37 @@ mod probes {
             .collect();
         let ids: Vec<String> = chunk.iter().map(|f| f.target_workflow_id.clone()).collect();
 
-        let existing =
-            match matching_workflow_keys(conn, "harvest_workflow_executions", &names, &ids).await {
-                Ok(keys) => keys,
-                Err(e) => {
-                    for fire in chunk {
-                        out.push_lookup_error(format!(
-                            "{} existence check failed: {e}",
-                            fire.target_workflow_id
-                        ));
-                    }
-                    return;
+        let (existing, migrated_seal_only) = match match_live_targets(conn, &names, &ids).await {
+            Ok(sets) => sets,
+            Err(e) => {
+                for fire in chunk {
+                    out.push_lookup_error(format!(
+                        "{} existence check failed: {e}",
+                        fire.target_workflow_id
+                    ));
                 }
-            };
+                return;
+            }
+        };
+
+        for fire in chunk {
+            let key = (fire.target_workflow_name.clone(), fire.target_workflow_id.clone());
+            if migrated_seal_only.contains(&key) {
+                out.push_unproven(format!(
+                    "{} (fired by {} on shard {}) matches a MIGRATED forwarding seal only \
+                     on shard {}; the live run may have rebalanced to a shard this \
+                     restore does not cover",
+                    fire.target_workflow_id, fire.source_exec_id, fire.source_shard,
+                    fire.target_shard
+                ));
+            }
+        }
 
         let absent: Vec<&&super::PendingTriggerFire> = chunk
             .iter()
             .filter(|f| {
-                !existing.contains(&(f.target_workflow_name.clone(), f.target_workflow_id.clone()))
+                let key = (f.target_workflow_name.clone(), f.target_workflow_id.clone());
+                !existing.contains(&key) && !migrated_seal_only.contains(&key)
             })
             .collect();
         if absent.is_empty() {
