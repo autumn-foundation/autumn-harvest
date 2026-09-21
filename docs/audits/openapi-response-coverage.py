@@ -13,7 +13,15 @@ anything missing there is missing from every generated client. This audit reads
 the router and the handlers in `autumn-harvest-plugin/src/api.rs` and compares
 them against the contract.
 
-For check 1 it collects the `StatusCode::` values each handler can return.
+For check 1 it collects the `StatusCode::` values each handler can return,
+plus the status implied by each `AutumnError::` constructor it calls (see
+`AUTUMN_ERROR_STATUS`). A constructor call chained into `.with_status(..)`
+carries the overridden status instead, so it is skipped there -- the
+`StatusCode::` literal inside that `.with_status(..)` call is what the plain
+scan already requires. A constructor passed bare, as in
+`.map_err(AutumnError::bad_request_msg)`, names no call and so cannot chain
+`.with_status(..)`: its status is always the constructor's own.
+
 Checks 2 and 3 resolve each `Json<T>` extractor to its struct. A field is
 mandatory when it is neither an `Option` nor carries a serde default, since axum
 rejects a request that omits one. A field serde accepts but the contract omits
@@ -26,10 +34,10 @@ top of a `pairs` loop is read, so a key computed at runtime is invisible. An arm
 naming several spellings passes when the contract documents any one of them,
 since an alias needs no second entry in the document.
 
-A `StatusCode::` used in a comparison rather than a response is ignored, and so
-is one inside a helper on GENERIC_HELPERS: `map_error` translates a runtime
-error variant, so its statuses belong to the error, not to every route that
-calls it.
+A `StatusCode::` or `AutumnError::` token is ignored inside a helper on
+GENERIC_HELPERS: `map_error` and `conflict_from` translate a runtime error
+into whatever status fits it, not the calling route, so their statuses belong
+to the error, not to every route that reaches them.
 
 Each handler is followed one level into the helpers it calls, since a status is
 often selected in a helper such as `queue_pause_partial_status`. A helper called
@@ -39,11 +47,6 @@ helper it shares.
 
 A route that parses its query with a typed `Query<T>` extractor is outside check
 4, which reads match arms rather than struct fields.
-
-Second known limit: only a literal `StatusCode::` is read. An `AutumnError`
-constructor carries an implied status with no such token, so
-`service_unavailable_msg` and its siblings are invisible here. Issue #1411
-tracks extending this check to them.
 
 Exit code 1 on any finding. Run standalone:
 
@@ -89,8 +92,24 @@ VERBS = ("get", "post", "put", "patch", "delete")
 
 # Helpers whose status depends on the runtime error they are handed rather than
 # on the calling route. Following them would put every status they can produce
-# on every route that calls them, which is noise, not coverage.
-GENERIC_HELPERS = frozenset({"map_error"})
+# on every route that calls them, which is noise, not coverage. `conflict_from`
+# is `map_error` with one `HarvestError::Config` arm promoted to 409; the rest
+# of its match falls through to `map_error` itself.
+GENERIC_HELPERS = frozenset({"map_error", "conflict_from"})
+
+# `AutumnError::<name>(..)` constructors used in this file, and the status each
+# implies absent a `.with_status(..)` override. Sourced from autumn-web's
+# `error.rs`; a constructor with no call site here is omitted rather than
+# guessed at, matching how NAMED above only lists used status names.
+AUTUMN_ERROR_STATUS = {
+    "internal_server_error": 500,
+    "internal_server_error_msg": 500,
+    "not_found_msg": 404,
+    "bad_request_msg": 400,
+    "service_unavailable_msg": 503,
+    "unauthorized_msg": 401,
+    "validation": 422,
+}
 
 # A query-key match arm, naming one key or several spellings of one.
 KEY_ARM = re.compile(r'^\s*("[a-z_0-9-]+"(?:\s*\|\s*"[a-z_0-9-]+")*)\s*=>')
@@ -254,6 +273,20 @@ def key_arms(body: str) -> list[tuple[str, ...]]:
     return arms
 
 
+def overridden_by_with_status(body: str, call_open_paren: int) -> bool:
+    """Whether a `.with_status(..)` call immediately follows a call whose
+    argument list opens at `call_open_paren` (the `(` right after the
+    constructor name).
+
+    The constructor's own implied status is not what the route returns when
+    this is true; the `StatusCode::` literal inside `.with_status(..)` is,
+    and the plain scan already requires that literal to be declared.
+    """
+    call_text = balanced(body[call_open_paren:])
+    after = body[call_open_paren + len(call_text) :]
+    return after.lstrip().startswith(".with_status(")
+
+
 def declared_statuses(route: dict) -> set[int]:
     statuses = {route["success_response"]["status"]}
     statuses |= {entry["status"] for entry in route.get("additional_responses", [])}
@@ -314,6 +347,45 @@ def main() -> int:
                 findings.append(
                     "  %s %s returns %d, undeclared\n    api.rs:%d  %s"
                     % (method, path, status, line, lines[line - 1].strip()[:88])
+                )
+            for hit in re.finditer(r"AutumnError::([a-z_]+)\(", reached):
+                status = AUTUMN_ERROR_STATUS.get(hit.group(1))
+                if status is None or status in declared:
+                    continue
+                if overridden_by_with_status(reached, hit.end() - 1):
+                    continue
+                line = source[: offset + hit.start()].count("\n") + 1
+                findings.append(
+                    "  %s %s returns %d via AutumnError::%s, undeclared\n"
+                    "    api.rs:%d  %s"
+                    % (
+                        method,
+                        path,
+                        status,
+                        hit.group(1),
+                        line,
+                        lines[line - 1].strip()[:88],
+                    )
+                )
+            # A constructor passed bare, e.g. `.map_err(AutumnError::bad_request_msg)`,
+            # names no call and so cannot chain `.with_status(..)`: its status is
+            # always the constructor's own.
+            for hit in re.finditer(r"AutumnError::([a-z_]+)\)", reached):
+                status = AUTUMN_ERROR_STATUS.get(hit.group(1))
+                if status is None or status in declared:
+                    continue
+                line = source[: offset + hit.start()].count("\n") + 1
+                findings.append(
+                    "  %s %s returns %d via AutumnError::%s (bare fn ref), "
+                    "undeclared\n    api.rs:%d  %s"
+                    % (
+                        method,
+                        path,
+                        status,
+                        hit.group(1),
+                        line,
+                        lines[line - 1].strip()[:88],
+                    )
                 )
 
     body_findings: list[str] = []

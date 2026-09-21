@@ -386,6 +386,10 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "The id path segment is not a valid execution id."
+        },
+        {
           "status": 404,
           "description": "Execution not found."
         },
@@ -757,6 +761,10 @@
         "notes": "Each entry in pending_activities and pending_local_activities carries an optional nested last_failure object (issue #773) \u2014 {error_type, error, attempt, non_retryable, failed_at?, details?} \u2014 omitted entirely when the activity has never failed, so healthy-run responses stay byte-identical to pre-#773 builds. It answers \"why is this activity retrying?\" alongside the next_retry_at countdown without a second round-trip. Availability of the fields differs by activity kind because retryable failures are not event-sourced (an AC2-vs-AC5 reconciliation; #773 adds no migration): for a backing-off REGULAR (task-queue) activity \u2014 the primary case \u2014 last_failure is sourced from the harvest_task_queue.error column that queue::requeue_for_retry sets on each retryable failure (no ActivityFailed event is appended), so error and attempt are present, error_type defaults to \"Error\", non_retryable is false, and failed_at/details are omitted (the task row has no failure timestamp or structured detail); for LOCAL activities (and any event-sourced failure) last_failure is sourced from the most recent LocalActivityFailed event and includes failed_at (the event timestamp), with error_type \"Error\", non_retryable false, and no details. When read-path payload decoding (issue #608) is active for the request, last_failure.error is tolerantly decoded like every other payload field."
       },
       "error_responses": [
+        {
+          "status": 400,
+          "description": "The id path segment is not a valid execution id."
+        },
         {
           "status": 404,
           "description": "Execution not found."
@@ -1411,6 +1419,10 @@
           "description": "Requires admin authentication only when the request can forcibly cancel a currently-ACTIVE (RUNNING/PAUSED) prior \u2014 i.e. the resolved active-conflict behavior is Terminate (issue #685): conflict_policy=terminate_existing (any reuse_policy), or reuse_policy=terminate_if_running with the default/omitted conflict_policy. Non-destructive combinations \u2014 e.g. reuse_policy=terminate_if_running combined with conflict_policy=use_existing (the idempotent-starter shape) or conflict_policy=fail \u2014 cannot cancel a live run and do NOT require admin. Returned only when admin is required and admin auth is absent."
         },
         {
+          "status": 404,
+          "description": "Workflow function not registered."
+        },
+        {
           "status": 409,
           "description": "Duplicate workflow_id with conflicting reuse policy, or conflict_policy=fail over an ACTIVE (RUNNING/PAUSED) prior (issue #685)."
         },
@@ -1745,6 +1757,10 @@
           "description": "Invalid request body, workflow name, id_reuse_policy, or update validator rejection."
         },
         {
+          "status": 401,
+          "description": "id_reuse_policy=terminate_if_running requires admin authentication."
+        },
+        {
           "status": 404,
           "description": "Workflow function not registered."
         },
@@ -1828,6 +1844,10 @@
       ],
       "error_responses": [
         {
+          "status": 400,
+          "description": "The id path segment is not a valid execution id."
+        },
+        {
           "status": 404,
           "description": "Execution not found."
         },
@@ -1880,6 +1900,10 @@
         ]
       },
       "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid execution id, or invalid JSON body."
+        },
         {
           "status": 404,
           "description": "Execution not found."
@@ -2061,6 +2085,10 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "The id path segment is not a valid execution id."
+        },
+        {
           "status": 404,
           "description": "Execution not found."
         },
@@ -2194,6 +2222,10 @@
         ]
       },
       "error_responses": [
+        {
+          "status": 400,
+          "description": "The id path segment is not a valid execution id."
+        },
         {
           "status": 404,
           "description": "Execution not found."
@@ -2368,6 +2400,10 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "The id path segment is not a valid execution id."
+        },
+        {
           "status": 404,
           "description": "Execution or activity task not found, including task belonging to a different workflow, or activity_exec_id is not a valid UUID. Note: external-handoff activity IDs are a different id-space from task-queue PKs; passing one will return 404."
         },
@@ -2491,6 +2527,10 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "The id path segment is not a valid execution id."
+        },
+        {
           "status": 404,
           "description": "Execution not found."
         },
@@ -2555,6 +2595,10 @@
         }
       ],
       "error_responses": [
+        {
+          "status": 400,
+          "description": "The id path segment is not a valid execution id."
+        },
         {
           "status": 404,
           "description": "Execution not found, or delivery_id is unknown / not a valid UUID."
@@ -2693,12 +2737,16 @@
           "description": "Execution not found."
         },
         {
+          "status": 409,
+          "description": "The source execution is terminal, or it holds a durable mutex that the reset cannot take."
+        },
+        {
           "status": 500,
           "description": "Database error."
         },
         {
-          "status": 409,
-          "description": "The source execution is terminal, or it holds a durable mutex that the reset cannot take."
+          "status": 503,
+          "description": "The reset succeeded but the audit record for it could not be written. The new execution exists; retry is not needed."
         }
       ]
     },
@@ -2795,6 +2843,10 @@
         "free_form": true
       },
       "error_responses": [
+        {
+          "status": 400,
+          "description": "The id path segment is not a valid execution id."
+        },
         {
           "status": 404,
           "description": "Execution not found or query handler not registered."
@@ -2896,6 +2948,10 @@
         "note": "JSON array of registered query handler name strings, sorted alphabetically."
       },
       "error_responses": [
+        {
+          "status": 400,
+          "description": "The id path segment is not a valid execution id."
+        },
         {
           "status": 404,
           "description": "Execution not found."
@@ -3369,6 +3425,10 @@
         {
           "status": 409,
           "description": "Run succeeded (use a fresh run), run still running (cancel first), or reset boundary mid unresolved side effect (remediation hint included)."
+        },
+        {
+          "status": 503,
+          "description": "The retry fork committed but the audit record insert failed."
         }
       ]
     },
@@ -3414,6 +3474,10 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "An admission gate blocks the trigger, or the run started but the audit record insert failed."
         }
       ]
     },
@@ -3578,14 +3642,17 @@
           "description": "Invalid parameter value (unknown group_by dimension, malformed duration, or out-of-range limit)."
         },
         {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
+        },
+        {
           "status": 500,
           "description": "Database error."
         },
         {
-          "status": 400,
-          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
+          "status": 503,
+          "description": "The storage pool is not configured, so shards cannot be enumerated."
         }
-
       ]
     },
     {
@@ -3847,6 +3914,10 @@
       ],
       "error_responses": [
         {
+          "status": 400,
+          "description": "The dead-letter id is not a valid UUID."
+        },
+        {
           "status": 404,
           "description": "Dead letter not found."
         },
@@ -3981,6 +4052,10 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "The token path segment is not a valid external task token."
+        },
+        {
           "status": 404,
           "description": "Token not found or already completed."
         },
@@ -4032,6 +4107,10 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "The token path segment is not a valid external task token."
+        },
+        {
           "status": 404,
           "description": "Token not found."
         },
@@ -4077,6 +4156,10 @@
         ]
       },
       "error_responses": [
+        {
+          "status": 400,
+          "description": "The token path segment is not a valid external task token."
+        },
         {
           "status": 404,
           "description": "Token not found."
@@ -4133,14 +4216,17 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
+        },
+        {
           "status": 500,
           "description": "Database error."
         },
         {
-          "status": 400,
-          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
+          "status": 503,
+          "description": "The storage pool is not configured, so shards cannot be enumerated."
         }
-
       ]
     },
     {
@@ -4197,6 +4283,10 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured, so no shard can be queried."
         }
       ]
     },
@@ -4287,6 +4377,10 @@
         ]
       },
       "error_responses": [
+        {
+          "status": 400,
+          "description": "The deadline_at field is not a valid RFC 3339 timestamp."
+        },
         {
           "status": 404,
           "description": "Worker not found."
@@ -4583,6 +4677,10 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "The batch job id is malformed."
+        },
+        {
           "status": 404,
           "description": "Batch job not found."
         },
@@ -4690,6 +4788,14 @@
         "free_form": true
       },
       "error_responses": [
+        {
+          "status": 400,
+          "description": "The request body fails to parse as JSON."
+        },
+        {
+          "status": 401,
+          "description": "The caller lacks harvest admin access."
+        },
         {
           "status": 409,
           "description": "atomic=true and at least one item failed validation."
@@ -4915,6 +5021,10 @@
         {
           "status": 500,
           "description": "Database write error."
+        },
+        {
+          "status": 503,
+          "description": "The upsert failed on at least one shard, so the override is not applied fleet-wide."
         }
       ]
     },
@@ -5777,6 +5887,10 @@
         {
           "status": 500,
           "description": "Internal error."
+        },
+        {
+          "status": 503,
+          "description": "This node owns no local retention runtime, or the run-now trigger channel failed to accept the signal."
         }
       ]
     },
@@ -6521,12 +6635,20 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "The external task token is malformed."
+        },
+        {
           "status": 404,
           "description": "Token not found."
         },
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The token is not found on inspected shards, and one or more shards are unavailable."
         }
       ]
     },
@@ -6618,6 +6740,10 @@
           "description": "Invalid input layout."
         },
         {
+          "status": 404,
+          "description": "The source or target workflow name is not registered."
+        },
+        {
           "status": 500,
           "description": "Database error."
         }
@@ -6686,6 +6812,10 @@
         ]
       },
       "error_responses": [
+        {
+          "status": 400,
+          "description": "The schedule id is malformed."
+        },
         {
           "status": 404,
           "description": "Schedule not found."
@@ -6843,6 +6973,10 @@
         {
           "status": 400,
           "description": "Invalid cron expression or missing required fields."
+        },
+        {
+          "status": 404,
+          "description": "The target workflow name is not registered."
         },
         {
           "status": 500,
@@ -7116,6 +7250,10 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "The schedule id is malformed, or the schedule is managed by a DAG or in-process workflow schedule catalog and cannot be deleted through the API."
+        },
+        {
           "status": 404,
           "description": "Schedule not found."
         },
@@ -7273,6 +7411,10 @@
         {
           "status": 500,
           "description": "Database error or partial shard failure."
+        },
+        {
+          "status": 503,
+          "description": "The schedule row names neither a workflow nor a DAG, an inconsistent state."
         }
       ]
     },
@@ -7344,20 +7486,24 @@
       },
       "error_responses": [
         {
-          "status": 409,
-          "description": "Schedule is paused and force=true was not passed."
+          "status": 400,
+          "description": "Invalid overlap_policy override."
         },
         {
           "status": 404,
           "description": "Schedule not found."
         },
         {
-          "status": 400,
-          "description": "Invalid overlap_policy override."
+          "status": 409,
+          "description": "Schedule is paused and force=true was not passed."
         },
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The schedule row names neither a workflow nor a DAG, or an admission gate blocks the manual trigger."
         }
       ]
     },
@@ -7753,6 +7899,10 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "The schedule id is malformed."
+        },
+        {
           "status": 404,
           "description": "Schedule not found."
         },
@@ -7902,12 +8052,20 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "The calendar name is empty."
+        },
+        {
           "status": 409,
           "description": "Calendar name already exists."
         },
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The create could not reach every shard, or no shard was reachable at all."
         }
       ]
     },
@@ -7950,6 +8108,10 @@
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The exclusion update failed on at least one shard; retry to converge."
         }
       ]
     },
@@ -7979,12 +8141,20 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "The calendar is a built-in calendar and cannot be deleted."
+        },
+        {
           "status": 404,
           "description": "Calendar not found."
         },
         {
           "status": 500,
           "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The delete fails on one or more shards; retry to converge."
         }
       ]
     },
@@ -8199,6 +8369,10 @@
       ],
       "error_responses": [
         {
+          "status": 400,
+          "description": "queue_name or build_id is empty after trimming."
+        },
+        {
           "status": 401,
           "description": "Unauthenticated request."
         },
@@ -8283,6 +8457,10 @@
         }
       ],
       "error_responses": [
+        {
+          "status": 400,
+          "description": "build_id or compatible_with is empty after trimming."
+        },
         {
           "status": 401,
           "description": "Unauthenticated request."
@@ -8384,6 +8562,10 @@
         ]
       },
       "error_responses": [
+        {
+          "status": 400,
+          "description": "build_id is empty after trimming."
+        },
         {
           "status": 401,
           "description": "Unauthenticated request."
@@ -8556,6 +8738,10 @@
       },
       "error_responses": [
         {
+          "status": 500,
+          "description": "The storage pool is unavailable, or the database list operation fails."
+        },
+        {
           "status": 503,
           "description": "Database unavailable."
         }
@@ -8625,6 +8811,10 @@
           "description": "Active gate limit (100) reached."
         },
         {
+          "status": 500,
+          "description": "The storage pool is unavailable, or gate creation fails with an error other than an active-gate limit or scope validation."
+        },
+        {
           "status": 503,
           "description": "Database unavailable."
         }
@@ -8662,6 +8852,10 @@
           "description": "Unauthenticated request."
         },
         {
+          "status": 500,
+          "description": "The storage pool is unavailable, or the database lift operation fails."
+        },
+        {
           "status": 503,
           "description": "Database unavailable."
         }
@@ -8684,6 +8878,10 @@
         {
           "status": 401,
           "description": "Unauthenticated request."
+        },
+        {
+          "status": 500,
+          "description": "The storage pool is unavailable, or the database list operation fails."
         },
         {
           "status": 503,
@@ -8782,6 +8980,10 @@
         {
           "status": 401,
           "description": "Unauthenticated request."
+        },
+        {
+          "status": 500,
+          "description": "The storage pool is unavailable, or the database revoke operation fails."
         },
         {
           "status": 503,
@@ -9319,6 +9521,10 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "The task id is malformed."
+        },
+        {
           "status": 401,
           "description": "Unauthenticated request."
         },
@@ -9447,6 +9653,10 @@
         "note": "Same body as GET /workflows/{id}; resolved execution_id also in the X-Harvest-Execution-Id header."
       },
       "error_responses": [
+        {
+          "status": 400,
+          "description": "The workflow_id path segment is empty."
+        },
         {
           "status": 404,
           "description": "No run for (workflow_name, workflow_id)."
@@ -9596,6 +9806,10 @@
         "note": "Same body as GET /workflows/{id}/stack; resolved execution_id in the X-Harvest-Execution-Id header."
       },
       "error_responses": [
+        {
+          "status": 400,
+          "description": "The workflow_id path segment is empty."
+        },
         {
           "status": 404,
           "description": "No run for (workflow_name, workflow_id)."
@@ -9818,6 +10032,10 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "The workflow_id path segment is empty."
+        },
+        {
           "status": 404,
           "description": "No run for (workflow_name, workflow_id), or query handler not registered."
         },
@@ -9961,6 +10179,10 @@
       },
       "error_responses": [
         {
+          "status": 400,
+          "description": "The workflow_id path segment is empty."
+        },
+        {
           "status": 401,
           "description": "Admin authentication required."
         },
@@ -10103,6 +10325,10 @@
         ]
       },
       "error_responses": [
+        {
+          "status": 400,
+          "description": "The workflow_id path segment is empty."
+        },
         {
           "status": 401,
           "description": "Admin authentication required."
