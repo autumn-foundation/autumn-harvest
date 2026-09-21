@@ -20,17 +20,21 @@ feature-depth = 1
 # ---------------------------------------------------------------------------
 [advisories]
 yanked = "deny"
-# `unsound` defaults to cargo-deny's `Scope::Workspace`, which only reports
-# an informational=unsound advisory when a *workspace member* directly
-# depends on the affected instance. That silently drops any unsound finding
-# reached only transitively (the common case: an unsound advisory sitting
-# two or more hops below a workspace member, as both RUSTSEC-2026-0253 and
-# RUSTSEC-2026-0190 turned out to be) -- cargo-deny simply never evaluates
-# those instances, ignore-listed or not. `unmaintained` already defaults to
-# `Scope::All` below; `unsound` is the one category with a narrower default,
-# so it needs the same override made explicit here rather than left to
-# cargo-deny's default.
-unsound = "all"
+# `unsound` used to default to cargo-deny's `Scope::Workspace`, silently
+# dropping any unsound finding reached only transitively (the common case:
+# RUSTSEC-2026-0253 and RUSTSEC-2026-0190 both sat two or more hops below a
+# workspace member). This file used to set `unsound = "all"` here to widen
+# that scope. cargo-deny 0.18 removed the field outright (it now hard-fails
+# config validation as a deprecated key -- see cargo-deny PR#611) because the
+# underlying gap it worked around is fixed upstream: an unsound advisory is
+# unconditionally denied for every reachable instance now, workspace or
+# transitive, with no scope knob at all. Confirmed by reading
+# cargo-deny-0.18.9's own source (`advisories/cfg.rs`: `unsound` is parsed
+# only via `deprecated::<LintLevel>()` and discarded; `advisories/diags.rs`
+# assigns every `AdvisoryType::Unsound` finding `LintLevel::Deny`
+# unconditionally, with no `Scope` check anywhere in that path, unlike
+# `unmaintained` below which still reads its `Scope` field). So removing the
+# line only drops dead config; it does not narrow what gets caught.
 ignore = [
     # RUSTSEC-2026-0253 — lru, use-after-free in LruCache::pop() when a
     # stored key's Drop panics mid-pop (pop() drops the key via
@@ -75,8 +79,11 @@ ignore = [
     # `cargo deny check` reported "advisory was not encountered" for this
     # ignore entry, not because the ratatui-core instance disappeared or its
     # own revisit trigger fired, but because the scope no longer looked at it.
-    # The `unsound = "all"` override above restores the match; the reasoning
-    # and revisit trigger below are unchanged from PR #1417.
+    # The `unsound = "all"` override that used to sit above restored the
+    # match at the time; cargo-deny 0.18 has since made that unconditional
+    # for every unsound advisory (see the `[advisories]` comment above), so
+    # the override is gone but the match still holds. The reasoning and
+    # revisit trigger below are unchanged from PR #1417.
     { id = "RUSTSEC-2026-0253", reason = "unreachable: only remaining affected instance is ratatui-core 0.1.0's own `lru = \"0.16\"` pin (external, resolves 0.16.4); our own instance is fixed (0.18.4). ratatui-core's cache only calls pop_lru() via resize(), never the vulnerable pop(), and its key type (Rect, Layout) has no custom Drop either. Revisit: ratatui-core bumps past 0.18.2 or starts calling pop()." },
 
     # RUSTSEC-2026-0190 — anyhow, unsoundness in `Error::downcast_mut()`.
@@ -95,10 +102,10 @@ ignore = [
     # direct dependency of ours to bump. No ignore entry needed once patched.
     #
     # This is also the second instance (after RUSTSEC-2026-0253, above) of
-    # an unsound advisory that `unsound = "all"` was needed to even see:
-    # `anyhow` is never a direct workspace dependency either, so under the
-    # cargo-deny default this would have stayed invisible indefinitely, not
-    # just until some pin aged out.
+    # an unsound advisory that the old `unsound = "all"` override was needed
+    # to even see: `anyhow` is never a direct workspace dependency either, so
+    # under cargo-deny's then-default this would have stayed invisible
+    # indefinitely, not just until some pin aged out.
 
     # RUSTSEC-2026-0258 — h2, unbounded empty DATA frames. The hyper-1.x/
     # axum/autumn-web instance (h2 0.4.13) was fixed in the harness PR
