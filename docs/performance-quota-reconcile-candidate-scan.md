@@ -44,17 +44,24 @@ server-generated UUIDs, so target and noise rows interleave uniformly in
 
 ## 🧭 Plan — first tick at each noise size
 
-| noise rows | plan chosen | buffers | rows removed by filter |
+| noise rows | plan chosen | buffers (hit+read) | rows removed by filter |
 |---:|---|---:|---:|
-| 20,000 | Index Scan on `idx_harvest_we_quota_reconcile_candidates`, residual `workflow_name` filter | 4,690 (all hit) | 4,469 |
-| 100,000 | Bitmap Heap Scan via `idx_harvest_wfx_workflow_identity` (unrelated, pre-existing index on `workflow_name`) + Sort + top-N Limit | 35 | 0 |
-| 500,000 | same as 100,000 | 44 | 0 |
+| 20,000 | Index Scan on `idx_harvest_we_quota_reconcile_candidates`, residual `workflow_name` filter | ~4,400-4,700 | ~4,200-4,500 |
+| 100,000 | Bitmap Heap Scan via `idx_harvest_wfx_workflow_identity` (unrelated, pre-existing index on `workflow_name`) + Sort + top-N Limit | ~35 | 0 |
+| 500,000 | same as 100,000 | ~35-44 | 0 |
+
+Row ids are random UUIDs, so the exact discard count at 20,000 noise
+rows jitters a few percent run to run. The plan choice and the
+order-of-magnitude gap between the two regimes do not: repeated runs
+land the 20,000-row case between 4,400 and 4,700 buffers, and the
+100,000/500,000-row cases both stay near 35, never closer than two
+orders of magnitude.
 
 At 20,000 noise rows the planner picks exactly the plan the migration
 comment warned about: an id-ordered index scan filtering
-`workflow_name` row by row, discarding 4,469 non-matching rows to fill
-one 200-row batch. Above roughly 100,000 noise rows, the planner
-switches to a different plan entirely — a Bitmap Index Scan on
+`workflow_name` row by row, discarding thousands of non-matching rows
+to fill one 200-row batch. Above roughly 100,000 noise rows, the
+planner switches to a different plan entirely — a Bitmap Index Scan on
 `idx_harvest_wfx_workflow_identity`, an unrelated index added by
 migration `20260710000002_harvest_workflow_continue_chain` for
 continue-as-new chain lookups, which happens to make `workflow_name`
@@ -91,9 +98,9 @@ Real `reconcile_quota_keys_from` calls, driven to completion (6 ticks,
 
 | calls | shared_blks_hit | shared_blks_read | total_buffers |
 |---:|---:|---:|---:|
-| 6 | 614 | 43 | 657 |
+| 6 | 166 | 33 | 199 |
 
-657 buffers for a full backfill pass over a 501,000-row candidate
+Under 200 buffers for a full backfill pass over a 501,000-row candidate
 population is not a workload cost worth optimizing against — nowhere
 near the impact floor's 5%-of-workload-buffers threshold for even
 considering a change, let alone the 20% reduction floor a change would
@@ -105,7 +112,7 @@ The scaling risk the migration comment names is real, but only in a
 narrow, low-severity band: a moderate non-quota'd population (tested at
 20,000 rows) before the planner's cost model crosses over to the
 `idx_harvest_wfx_workflow_identity` plan. Even there, the extra cost is
-4,690 buffers, entirely cache hits, no reads — not an I/O concern, and
+a few thousand buffers, entirely cache hits, no reads — not an I/O concern, and
 one tick, not a per-request cost. Above that band the concern
 self-resolves through an unrelated existing index, not through anything
 `quota_reconcile.rs` does on purpose.
