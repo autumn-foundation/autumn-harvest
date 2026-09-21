@@ -1421,6 +1421,38 @@
         "Worker logs for '[audit_export] failed to acquire a connection for the export tick' or 'timed out acquiring a connection for the export tick' (the dedicated export task, issue #1269), or '[audit_export] failed to get connection to shard' / 'timed out acquiring a connection for this shard' (an embedder driving fire_due_audit_exports by hand)"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_audit_export_unobservable"
+    },
+    {
+      "id": "harvest_dispatch_dropped_hints",
+      "status": "enforceable",
+      "signal_source": "METRIC_DISPATCH_DROPPED_HINTS / harvest.dispatch.dropped_hints, a per-process gauge sampled from the Redis dispatch background publisher's drop counter (issue #1429).",
+      "default_threshold": "Ticket when the counter keeps climbing for 15 minutes past a single burst window.",
+      "severity": "ticket",
+      "owner_persona": "service on-call",
+      "description": "The Redis dispatch background publisher's bounded queue is full, so this process is dropping hints. A dropped hint costs latency only -- the row stays PENDING and the worker's reconcile sweep republishes it -- so this is a health signal, not a durability one.",
+      "first_action": "GET /api/harvest/admin/config (confirm the dispatch channel is installed and read its reconcile_batch/reconcile_interval_ms)",
+      "dependencies": [
+        {
+          "ref": "#1429",
+          "status": "shipped",
+          "surface": "METRIC_DISPATCH_DROPPED_HINTS / harvest.dispatch.dropped_hints"
+        }
+      ],
+      "prometheus": {
+        "mode": "native-metric",
+        "notes": "Unlabeled gauge, one series per process. A sustained climb over the alert window, not a single sample, is the signal.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "increase(harvest_dispatch_dropped_hints[15m]) > 0"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/admin/config",
+        "harvest queue backlog --output json"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_dispatch_dropped_hints"
     }
   ]
 }

@@ -391,7 +391,7 @@ impl RedisProbe {
     }
 
     fn stream_key(&self, queue: &str) -> String {
-        format!("{}:dispatch:{queue}", self.prefix)
+        autumn_harvest_redis::dispatch_stream_key(&self.prefix, queue)
     }
 
     async fn stream_len(&self, queue: &str) -> i64 {
@@ -432,7 +432,11 @@ impl RedisProbe {
     }
 
     async fn marker_keys(&self) -> Vec<String> {
-        self.keys(&format!("{}:dispatch:marker:*", self.prefix))
+        // Issue #1429: a marker now nests its queue's hash tag
+        // (`{prefix:dispatch:queue}:marker:task_id`), so the glob matches
+        // through the literal `{`/`}` rather than a plain `:marker:` segment
+        // straight off the prefix.
+        self.keys(&format!("{{{}:dispatch:*}}:marker:*", self.prefix))
             .await
     }
 

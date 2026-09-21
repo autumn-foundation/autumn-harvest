@@ -12,7 +12,10 @@
 use std::time::{Duration, Instant};
 
 use autumn_harvest::dispatch::{DispatchHint, DispatchLease, TaskDispatch};
-use autumn_harvest_redis::{RedisDispatch, RedisDispatchConfig};
+use autumn_harvest_redis::{
+    RedisDispatch, RedisDispatchConfig, dispatch_delayed_key, dispatch_marker_key,
+    dispatch_stream_key,
+};
 use chrono::{DateTime, Utc};
 use redis::AsyncCommands;
 use testcontainers::runners::AsyncRunner;
@@ -32,11 +35,11 @@ struct Fixture {
 
 impl Fixture {
     fn stream_key(&self, queue: &str) -> String {
-        format!("{}:dispatch:{queue}", self.prefix)
+        dispatch_stream_key(&self.prefix, queue)
     }
 
-    fn marker_key(&self, task_id: Uuid) -> String {
-        format!("{}:dispatch:marker:{task_id}", self.prefix)
+    fn marker_key(&self, queue: &str, task_id: Uuid) -> String {
+        dispatch_marker_key(&self.prefix, queue, &task_id.to_string())
     }
 
     async fn stream_len(&self, queue: &str) -> i64 {
@@ -44,9 +47,11 @@ impl Fixture {
         conn.xlen(self.stream_key(queue)).await.expect("xlen")
     }
 
-    async fn marker_exists(&self, task_id: Uuid) -> bool {
+    async fn marker_exists(&self, queue: &str, task_id: Uuid) -> bool {
         let mut conn = self.raw.clone();
-        conn.exists(self.marker_key(task_id)).await.expect("exists")
+        conn.exists(self.marker_key(queue, task_id))
+            .await
+            .expect("exists")
     }
 
     async fn pending_count(&self, queue: &str) -> usize {
@@ -445,13 +450,13 @@ async fn ack_deletes_the_marker_so_a_republish_is_delivered() {
     let leases = read(&fixture, &queues, 10).await;
     assert_eq!(leases.len(), 1);
     assert!(
-        fixture.marker_exists(task_id).await,
+        fixture.marker_exists("acked", task_id).await,
         "publish sets a marker"
     );
 
     fixture.dispatch.ack(&leases[0]).await.expect("ack");
     assert!(
-        !fixture.marker_exists(task_id).await,
+        !fixture.marker_exists("acked", task_id).await,
         "ack must delete the marker"
     );
     assert_eq!(
@@ -498,6 +503,48 @@ async fn maintain_recovers_an_unacked_lease_after_the_visibility_timeout() {
     assert_eq!(again.len(), 1, "a recovered entry is delivered again");
     assert_eq!(again[0].task_id, task_id);
     assert_eq!(again[0].redeliveries, 1, "recovery counts one redelivery");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn maintain_recovers_unacked_leases_across_several_queues_in_one_pass() {
+    // Issue #1429: recovery pipelines its `XPENDING` scan across every queue
+    // in one round trip. This pins that a multi-queue pass still recovers
+    // every queue's idle entries correctly, not only a single queue's.
+    let Some(fixture) = try_start(Duration::from_millis(300)).await else {
+        return;
+    };
+    let queues = vec!["crashed-a".to_string(), "crashed-b".to_string()];
+    let task_a = Uuid::new_v4();
+    let task_b = Uuid::new_v4();
+
+    fixture
+        .dispatch
+        .publish(&[hint("crashed-a", task_a, Utc::now())])
+        .await
+        .expect("publish a");
+    fixture
+        .dispatch
+        .publish(&[hint("crashed-b", task_b, Utc::now())])
+        .await
+        .expect("publish b");
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 2);
+    // Both consumers "crash": neither lease is acked nor released.
+    assert_eq!(fixture.pending_count("crashed-a").await, 1);
+    assert_eq!(fixture.pending_count("crashed-b").await, 1);
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let counts = fixture.dispatch.maintain(&queues).await.expect("maintain");
+    assert_eq!(counts.recovered, 2, "both queues' idle entries must recover");
+    assert_eq!(fixture.pending_count("crashed-a").await, 0);
+    assert_eq!(fixture.pending_count("crashed-b").await, 0);
+
+    let again = read(&fixture, &queues, 10).await;
+    let recovered_ids: std::collections::HashSet<Uuid> =
+        again.iter().map(|lease| lease.task_id).collect();
+    assert_eq!(again.len(), 2, "both recovered entries are delivered again");
+    assert!(recovered_ids.contains(&task_a));
+    assert!(recovered_ids.contains(&task_b));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -599,6 +646,44 @@ async fn a_read_across_two_queues_returns_at_most_the_requested_count() {
     seen.sort_unstable();
     published.sort_unstable();
     assert_eq!(seen, published, "every reference must be delivered once");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capped_read_favors_the_higher_priority_candidates() {
+    // Issue #1429. Priority is still best effort under one FIFO stream, but
+    // when a read holds more candidates than the caller's cap, the ones it
+    // actually delivers must be the highest-priority ones, with the rest
+    // requeued rather than picked by arrival order.
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["priority".to_string()];
+
+    let mut low = hint("priority", Uuid::new_v4(), Utc::now());
+    low.priority = 0;
+    let mut high_a = hint("priority", Uuid::new_v4(), Utc::now());
+    high_a.priority = 5;
+    let mut high_b = hint("priority", Uuid::new_v4(), Utc::now());
+    high_b.priority = 5;
+    fixture
+        .dispatch
+        .publish(&[low.clone(), high_a.clone(), high_b.clone()])
+        .await
+        .expect("publish");
+
+    let leases = read(&fixture, &queues, 2).await;
+    assert_eq!(leases.len(), 2, "the read must honour the caller's cap");
+    let delivered: std::collections::HashSet<Uuid> =
+        leases.iter().map(|lease| lease.task_id).collect();
+    assert_eq!(
+        delivered,
+        [high_a.task_id, high_b.task_id].into_iter().collect(),
+        "the two priority-5 references must be the ones delivered, not the priority-0 one"
+    );
+
+    let rest = read(&fixture, &queues, 10).await;
+    assert_eq!(rest.len(), 1, "the low-priority reference is requeued");
+    assert_eq!(rest[0].task_id, low.task_id);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -838,7 +923,7 @@ async fn a_republish_restores_a_stream_entry_that_vanished() {
         .expect("xdel");
     assert_eq!(fixture.stream_len("vanished").await, 0);
     assert!(
-        fixture.marker_exists(task_id).await,
+        fixture.marker_exists("vanished", task_id).await,
         "the case needs the marker to outlive the entry"
     );
 
@@ -877,13 +962,13 @@ async fn a_republish_restores_a_parked_reference_that_vanished() {
     // The parked reference goes; the marker stays.
     let mut conn = fixture.raw.clone();
     let _: i64 = redis::cmd("ZREM")
-        .arg(format!("{}:dispatch:parked:delayed", fixture.prefix))
+        .arg(dispatch_delayed_key(&fixture.prefix, "parked"))
         .arg(task_id.to_string())
         .query_async(&mut conn)
         .await
         .expect("zrem");
     assert!(
-        fixture.marker_exists(task_id).await,
+        fixture.marker_exists("parked", task_id).await,
         "the case needs the marker to outlive the parked reference"
     );
 

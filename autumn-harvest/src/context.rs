@@ -15323,7 +15323,13 @@ impl ActivityContext {
                 format!("transactional activity failed to acquire DB connection: {e}")
             })?;
 
-        let result = Box::pin(conn.transaction::<T, TxError, _>(async |conn| {
+        // Issue #1429: `wake_workflow_task` below raises a dispatch hint. The
+        // buffering scope ties the publish to this transaction's own commit
+        // (nesting-safe: a no-op passthrough when the caller's task body
+        // already holds an outer scope), rather than relying only on that
+        // outer scope, which does not distinguish this transaction's own
+        // rollback from the task body's overall outcome.
+        let result = crate::dispatch::buffered_settled(Box::pin(conn.transaction::<T, TxError, _>(async |conn| {
             // Run user domain writes.
             let user_result = f(conn).await.map_err(TxError::User)?;
 
@@ -15402,7 +15408,7 @@ impl ActivityContext {
             crate::queue::wake_workflow_task(conn, exec_id).await?;
 
             Ok(user_result)
-        }))
+        })))
         .await;
 
         match result {

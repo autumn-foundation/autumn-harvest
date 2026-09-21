@@ -8,7 +8,7 @@ use autumn_harvest::BuiltHarvest;
 use autumn_harvest::batch::{BatchExecutorConfig, run_executor_once};
 use autumn_harvest::context::SharedStateMap;
 use autumn_harvest::effective_config::{
-    EffectiveConfigView, PayloadCapsView, PoolConfigView, ShardedInfo,
+    DispatchConfigView, EffectiveConfigView, PayloadCapsView, PoolConfigView, ShardedInfo,
 };
 use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::retention::{RetentionConfig, RetentionRuntime};
@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{HarvestApiRuntime, HarvestRetentionRuntime};
-use crate::config::{HarvestRuntimeConfig, OrphanStartupAction};
+use crate::config::{HarvestRedisConfig, HarvestRuntimeConfig, OrphanStartupAction};
 use crate::state::{AppDbPool, HarvestDbPool};
 use crate::workflow_reachability::{
     ReachabilityReportStatus, ReachabilityVerdict, StartupOrphanDecision,
@@ -1078,32 +1078,39 @@ impl HarvestRunner {
             })?;
         }
 
-        // Issue #1312: install the process-global dispatch channel BEFORE the
-        // worker is constructed, and in every mode. An API-only process owns
-        // no worker but still publishes references for the fleet, so the
-        // install cannot sit inside the `worker_enabled` branch.
-        //
-        // The shard-span check runs BEFORE the install (contract C7). A
-        // multi-shard process must fail startup without a connected channel
-        // behind it. `Worker::new` repeats the check, but only a
-        // worker-enabled process reaches it.
+        // Issue #1312: install the process-global dispatch channel(s) BEFORE
+        // the worker is constructed, and in every mode. An API-only process
+        // owns no worker but still publishes references for the fleet, so
+        // the install cannot sit inside the `worker_enabled` branch.
         let dispatch_shards = prepared.storage_pool.sharded_pool().shard_ids();
-        reject_multi_shard_dispatch(config.redis.url.is_some(), dispatch_shards.len())
-            .map_err(AutumnError::service_unavailable_msg)?;
         reject_dispatch_queue_names(
             config.redis.url.is_some(),
             &prepared.worker_runtime_config.queues,
         )
         .map_err(AutumnError::service_unavailable_msg)?;
-        // The shard this process owns, which names its key family. The check
-        // above proves the runtime resolves one shard at most, so any other
-        // count leaves the configured prefix alone.
-        let dispatch_shard = match dispatch_shards.as_slice() {
-            [only] => Some(*only),
-            _ => None,
+        // A span of one shard (or none) installs the single-shard channel,
+        // named by that one shard's key family. A wider span installs one
+        // channel per shard instead (issue #1429): `Worker::new` requires
+        // full per-shard coverage before it accepts the wider span, so a
+        // partial install here — cut short by a shard connect failure —
+        // fails startup rather than leaving some shards silently uncovered.
+        let (dispatch_guard, dispatch_installed, dispatch_shard) = if dispatch_shards.len() > 1 {
+            let installed_shards =
+                install_dispatch_channels_for_shards(config, &dispatch_shards).await?;
+            let installed = !installed_shards.is_empty();
+            (
+                DispatchInstallGuard::new_shards(installed_shards),
+                installed,
+                None,
+            )
+        } else {
+            let dispatch_shard = match dispatch_shards.as_slice() {
+                [only] => Some(*only),
+                _ => None,
+            };
+            let installed = install_dispatch_channel(config, dispatch_shard).await?;
+            (DispatchInstallGuard::new(installed), installed, dispatch_shard)
         };
-        let dispatch_installed = install_dispatch_channel(config, dispatch_shard).await?;
-        let dispatch_guard = DispatchInstallGuard::new(dispatch_installed);
 
         let worker = if config.worker_enabled {
             let worker = Worker::new(
@@ -1139,6 +1146,11 @@ impl HarvestRunner {
             guard.commit();
         }
         dispatch_guard.commit();
+        prepared.effective_config.dispatch = Some(dispatch_config_view(
+            &config.redis,
+            dispatch_installed,
+            dispatch_shard,
+        ));
 
         let worker_id = worker
             .as_ref()
@@ -1388,32 +1400,12 @@ fn capture_effective_config(
         pool_view,
         DEFAULT_WORKER_POLL_INTERVAL,
         Some(resolved_sharding),
+        // The `[harvest.redis]` section is filled in by `start`, once the
+        // dispatch channel install has actually run (issue #1429): this
+        // capture happens inside `PreparedHarvestRuntime::build`, before
+        // `install_dispatch_channel` and with no access to `config.redis`.
+        None,
     )
-}
-
-/// Reject Redis dispatch on a runtime that spans more than one shard.
-///
-/// Issue #1312 contract C7. A reference carries a task id and no connection.
-/// A runtime that owns several shard pools cannot tell which pool holds the
-/// named row. A reference read for one shard would then be claimed against
-/// another shard's database, and it would always miss. `Worker::new` applies
-/// the same rule. A worker-disabled process never builds a worker, and it
-/// would still publish. This check therefore runs in the runner, before the
-/// install.
-///
-/// # Errors
-///
-/// Returns the operator-facing message when a URL is configured and
-/// `shard_count` is above one.
-fn reject_multi_shard_dispatch(redis_url_set: bool, shard_count: usize) -> Result<(), String> {
-    if redis_url_set && shard_count > 1 {
-        return Err(format!(
-            "harvest.redis.url is set and this runtime resolves {shard_count} shard pools; \
-             redis dispatch supports single-shard runtimes only in v1 (issue #1312). Unset \
-             harvest.redis.url, or run one process per shard"
-        ));
-    }
-    Ok(())
 }
 
 /// Reject Redis dispatch on a runtime whose queue names the channel cannot
@@ -1472,7 +1464,10 @@ const DEFAULT_DISPATCH_SHARD: ShardId = ShardId::new(0);
 ///
 /// A central API process that spans several shards still rejects Redis
 /// dispatch at startup. Issue #1429 tracks true multi-shard routing.
-#[cfg_attr(not(feature = "redis"), allow(dead_code))]
+///
+/// Used unconditionally by [`dispatch_config_view`], which every build
+/// evaluates regardless of the `redis` cargo feature, so this function is
+/// never dead code even on a build without it.
 #[must_use]
 fn effective_dispatch_prefix(configured: &str, shard: Option<ShardId>) -> String {
     match shard {
@@ -1483,7 +1478,52 @@ fn effective_dispatch_prefix(configured: &str, shard: Option<ShardId>) -> String
     }
 }
 
-/// Uninstall the process-global dispatch channel when startup fails later.
+/// Build the `[harvest.redis]` section of the effective-config snapshot
+/// (issue #1429).
+///
+/// `installed` is the return value of [`install_dispatch_channel`], not a
+/// re-derivation from `redis.url`: a configured URL that fails to connect
+/// aborts `start` before this runs, so the two agree in practice, but the
+/// caller's own result is the fact and never a guess.
+///
+/// The reported `key_prefix` is the effective, shard-suffixed prefix this
+/// process actually publishes under (see [`effective_dispatch_prefix`]), so
+/// an operator comparing two shards' `/admin/config` output sees the
+/// difference between their key families, not the one configured value the
+/// two processes share.
+#[must_use]
+fn dispatch_config_view(
+    redis: &HarvestRedisConfig,
+    installed: bool,
+    shard: Option<ShardId>,
+) -> DispatchConfigView {
+    let configured = redis.url.is_some();
+    DispatchConfigView {
+        installed,
+        endpoint: redis.redacted_url(),
+        key_prefix: configured.then(|| effective_dispatch_prefix(&redis.key_prefix, shard)),
+        consumer_group: configured.then(|| redis.consumer_group.clone()),
+        visibility_timeout_ms: configured.then_some(redis.visibility_timeout_ms),
+        poll_interval_ms: configured.then_some(redis.poll_interval_ms),
+        reconcile_interval_ms: configured.then_some(redis.reconcile_interval_ms),
+        reconcile_batch: configured.then_some(redis.reconcile_batch),
+    }
+}
+
+/// What kind of dispatch install [`DispatchInstallGuard`] owns.
+enum DispatchInstallKind {
+    /// Nothing installed. Dropping the guard does nothing.
+    None,
+    /// The single-shard slot (`dispatch::install`).
+    Single,
+    /// The per-shard slots (`dispatch::install_for_shard`, issue #1429) this
+    /// call populated. Unwinding clears every per-shard slot in the process,
+    /// mirroring how the single-shard `Single` variant clears the whole
+    /// process-wide single-shard slot rather than tracking provenance.
+    Shards(Vec<ShardId>),
+}
+
+/// Uninstall the process-global dispatch channel(s) when startup fails later.
 ///
 /// `start` installs the channel before it builds the worker, because an
 /// API-only process publishes too. A step after the install can still fail.
@@ -1492,27 +1532,47 @@ fn effective_dispatch_prefix(configured: &str, shard: Option<ShardId>) -> String
 /// unless [`DispatchInstallGuard::commit`] runs, which mirrors how
 /// `DeferredAuditExportInstall` guards the audit sink.
 struct DispatchInstallGuard {
-    /// True while the guard owns an install that startup has not confirmed.
-    armed: bool,
+    /// `None` once the guard is committed or was never armed.
+    kind: DispatchInstallKind,
 }
 
 impl DispatchInstallGuard {
-    /// A guard over an install that happened, or an inert guard when it did
-    /// not.
+    /// A guard over a single-shard install that happened, or an inert guard
+    /// when it did not.
     const fn new(installed: bool) -> Self {
-        Self { armed: installed }
+        Self {
+            kind: if installed {
+                DispatchInstallKind::Single
+            } else {
+                DispatchInstallKind::None
+            },
+        }
     }
 
-    /// Keep the channel installed. Startup has passed every fallible step.
+    /// A guard over the per-shard installs `shards` names (issue #1429), or
+    /// an inert guard when `shards` is empty.
+    fn new_shards(shards: Vec<ShardId>) -> Self {
+        Self {
+            kind: if shards.is_empty() {
+                DispatchInstallKind::None
+            } else {
+                DispatchInstallKind::Shards(shards)
+            },
+        }
+    }
+
+    /// Keep the channel(s) installed. Startup has passed every fallible step.
     fn commit(mut self) {
-        self.armed = false;
+        self.kind = DispatchInstallKind::None;
     }
 }
 
 impl Drop for DispatchInstallGuard {
     fn drop(&mut self) {
-        if self.armed {
-            autumn_harvest::dispatch::uninstall();
+        match self.kind {
+            DispatchInstallKind::None => {}
+            DispatchInstallKind::Single => autumn_harvest::dispatch::uninstall(),
+            DispatchInstallKind::Shards(_) => autumn_harvest::dispatch::uninstall_all_shards(),
         }
     }
 }
@@ -1582,6 +1642,7 @@ async fn install_dispatch_channel(
         autumn_harvest::dispatch::DispatchSettings {
             poll_interval: Duration::from_millis(config.redis.poll_interval_ms),
             reconcile_interval: Duration::from_millis(config.redis.reconcile_interval_ms),
+            reconcile_batch: config.redis.reconcile_batch,
             ..autumn_harvest::dispatch::DispatchSettings::default()
         },
     );
@@ -1592,10 +1653,115 @@ async fn install_dispatch_channel(
         consumer_group = %config.redis.consumer_group,
         poll_interval_ms = config.redis.poll_interval_ms,
         reconcile_interval_ms = config.redis.reconcile_interval_ms,
+        reconcile_batch = config.redis.reconcile_batch,
         "redis dispatch enabled: workers read task references from redis and claim the named \
          row in postgres"
     );
     Ok(true)
+}
+
+/// Install one Redis dispatch channel per shard for a runtime that spans
+/// more than one shard (issue #1429).
+///
+/// Each shard gets its own connection and its own shard-suffixed key prefix
+/// (see [`effective_dispatch_prefix`]) — the same key-family split the
+/// existing one-process-per-shard deployment already relies on, except every
+/// shard's channel now lives in this one process. `Worker::new` reads and
+/// claims each shard through its own installed channel; a shard with none
+/// stays on the Postgres path. Immediate hints from `queue.rs` helpers still
+/// route through the single-shard slot only (which this path never
+/// populates), so on a multi-shard runtime only the reconcile sweep
+/// publishes — a reconcile-interval latency cost, never a lost or
+/// duplicated dispatch (the reconcile sweep is the durability floor for
+/// every dispatch path).
+///
+/// Returns the shards this call actually installed, so the caller's guard
+/// can unwind exactly those if a later startup step fails.
+///
+/// # Errors
+///
+/// Returns an error, naming the shard, the first time a shard's Redis
+/// endpoint cannot be reached. Shards already installed earlier in this call
+/// stay installed; the caller's guard unwinds them along with the rest of
+/// startup if it never reaches `commit`.
+#[cfg(feature = "redis")]
+async fn install_dispatch_channels_for_shards(
+    config: &HarvestRuntimeConfig,
+    shards: &[ShardId],
+) -> autumn_web::AutumnResult<Vec<ShardId>> {
+    use std::time::Duration;
+
+    let (Some(url), Some(endpoint)) = (config.redis.url.as_deref(), config.redis.redacted_url())
+    else {
+        // Redis is off for this start. Per-shard slots are process wide, so a
+        // set a previous runtime installed is still live (mirrors
+        // `install_dispatch_channel`'s single-shard handling).
+        autumn_harvest::dispatch::uninstall_all_shards();
+        return Ok(Vec::new());
+    };
+
+    let mut installed_shards = Vec::with_capacity(shards.len());
+    for &shard in shards {
+        let key_prefix = effective_dispatch_prefix(&config.redis.key_prefix, Some(shard));
+        let channel = autumn_harvest_redis::RedisDispatch::connect(
+            url,
+            autumn_harvest_redis::RedisDispatchConfig {
+                key_prefix: key_prefix.clone(),
+                consumer_group: config.redis.consumer_group.clone(),
+                visibility_timeout: Duration::from_millis(config.redis.visibility_timeout_ms),
+                dedupe_ttl: DISPATCH_DEDUPE_TTL,
+            },
+        )
+        .await
+        .map_err(|error| {
+            AutumnError::service_unavailable_msg(format!(
+                "failed to connect the Redis dispatch channel for shard {} at {endpoint}: \
+                 {error}",
+                shard.as_i32()
+            ))
+        })?;
+
+        autumn_harvest::dispatch::install_for_shard(
+            shard,
+            Arc::new(channel),
+            autumn_harvest::dispatch::DispatchSettings {
+                poll_interval: Duration::from_millis(config.redis.poll_interval_ms),
+                reconcile_interval: Duration::from_millis(config.redis.reconcile_interval_ms),
+                reconcile_batch: config.redis.reconcile_batch,
+                ..autumn_harvest::dispatch::DispatchSettings::default()
+            },
+        );
+        installed_shards.push(shard);
+
+        tracing::info!(
+            shard = shard.as_i32(),
+            endpoint = %endpoint,
+            key_prefix = %key_prefix,
+            consumer_group = %config.redis.consumer_group,
+            poll_interval_ms = config.redis.poll_interval_ms,
+            reconcile_interval_ms = config.redis.reconcile_interval_ms,
+            reconcile_batch = config.redis.reconcile_batch,
+            "redis dispatch enabled for shard: workers read task references from redis and \
+             claim the named row in postgres"
+        );
+    }
+    Ok(installed_shards)
+}
+
+/// No per-shard dispatch channel exists without the `redis` cargo feature.
+/// Mirrors [`install_dispatch_channel`]'s no-feature stub.
+///
+/// # Errors
+///
+/// Never returns an error.
+#[cfg(not(feature = "redis"))]
+#[allow(clippy::unused_async)]
+async fn install_dispatch_channels_for_shards(
+    _config: &HarvestRuntimeConfig,
+    _shards: &[ShardId],
+) -> autumn_web::AutumnResult<Vec<ShardId>> {
+    autumn_harvest::dispatch::uninstall_all_shards();
+    Ok(Vec::new())
 }
 
 /// No dispatch channel exists without the `redis` cargo feature.
@@ -2156,34 +2322,6 @@ mod tests {
             "a caller that already ran the gate must be able to say so",
         );
     }
-    /// Redis dispatch is single-shard in v1 (issue #1312, contract C7). The
-    /// runner rejects the combination before it installs the channel, so a
-    /// multi-shard process never reaches a connected channel it cannot use.
-    #[test]
-    fn redis_dispatch_is_rejected_on_a_multi_shard_runtime() {
-        let error = super::reject_multi_shard_dispatch(true, 3)
-            .expect_err("a multi-shard runtime must reject redis dispatch");
-
-        assert!(
-            error.contains("1312") && error.contains("single-shard"),
-            "expected the rejection to name the limit and the issue, got {error}"
-        );
-    }
-
-    /// A single-shard runtime is the supported shape, so the check passes.
-    #[test]
-    fn redis_dispatch_is_accepted_on_a_single_shard_runtime() {
-        super::reject_multi_shard_dispatch(true, 1)
-            .expect("a single-shard runtime must accept redis dispatch");
-    }
-
-    /// With no URL the channel stays off, so the shard span does not matter.
-    #[test]
-    fn a_multi_shard_runtime_without_a_redis_url_starts() {
-        super::reject_multi_shard_dispatch(false, 4)
-            .expect("a runtime with redis dispatch off must not be rejected");
-    }
-
     /// An unsharded runtime keeps the configured prefix exactly (issue #1312).
     ///
     /// Every existing single-database deployment resolves the default shard.
@@ -2428,6 +2566,95 @@ mod tests {
             "stop must not uninstall a channel this runner never installed"
         );
         autumn_harvest::dispatch::uninstall();
+    }
+
+    /// A restart with Redis off must clear per-shard channels too (issue
+    /// #1429), the multi-shard mirror of
+    /// `a_disabled_start_clears_a_previously_installed_channel`.
+    #[test]
+    fn a_disabled_start_clears_previously_installed_per_shard_channels() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        let shard = ShardId::new(1);
+        autumn_harvest::dispatch::install_for_shard(
+            shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        let config = crate::config::HarvestRuntimeConfig::default();
+        assert!(
+            config.redis.url.is_none(),
+            "the default config has redis dispatch off"
+        );
+        let installed_shards = block_on(super::install_dispatch_channels_for_shards(
+            &config,
+            &[shard],
+        ))
+        .expect("a disabled start must succeed");
+
+        assert!(
+            installed_shards.is_empty(),
+            "a disabled start installs no per-shard channel"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(shard).is_none(),
+            "a disabled start must clear the per-shard channel a previous runtime installed"
+        );
+    }
+
+    /// [`DispatchInstallGuard::new_shards`] unwinds every shard it was given
+    /// when it drops uncommitted, mirroring the single-shard guard's own
+    /// unwind test.
+    #[test]
+    fn an_uncommitted_shard_guard_unwinds_every_shard_it_installed() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        let shard_a = ShardId::new(1);
+        let shard_b = ShardId::new(2);
+        for shard in [shard_a, shard_b] {
+            autumn_harvest::dispatch::install_for_shard(
+                shard,
+                std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+                autumn_harvest::dispatch::DispatchSettings::default(),
+            );
+        }
+
+        drop(super::DispatchInstallGuard::new_shards(vec![
+            shard_a, shard_b,
+        ]));
+
+        assert!(autumn_harvest::dispatch::installed_for_shard(shard_a).is_none());
+        assert!(autumn_harvest::dispatch::installed_for_shard(shard_b).is_none());
+    }
+
+    /// A committed shard guard leaves the per-shard channels installed.
+    #[test]
+    fn a_committed_shard_guard_leaves_the_channels_installed() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        let shard = ShardId::new(1);
+        autumn_harvest::dispatch::install_for_shard(
+            shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        super::DispatchInstallGuard::new_shards(vec![shard]).commit();
+
+        assert!(autumn_harvest::dispatch::installed_for_shard(shard).is_some());
+        autumn_harvest::dispatch::uninstall_all_shards();
     }
 
     /// The process-global dispatch slot is one resource. The dispatch cases

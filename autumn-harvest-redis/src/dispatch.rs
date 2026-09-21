@@ -12,12 +12,18 @@
 //!
 //! ## Key family
 //!
-//! - `{prefix}:dispatch:{queue}` — the stream of claimable references.
-//! - `{prefix}:dispatch:{queue}:delayed` — a sorted set of references that are
+//! Every key for one queue nests the literal substring `{prefix:dispatch:queue}`
+//! — the queue's Redis Cluster hash tag (issue #1429) — so a multi-key script
+//! (`PUBLISH_LUA`, `REQUEUE_LUA`, `PROMOTE_MARKED_LUA`) touching several of
+//! them in one call stays in one Cluster slot.
+//!
+//! - `{prefix:dispatch:queue}` — the stream of claimable references.
+//! - `{prefix:dispatch:queue}:delayed` — a sorted set of references that are
 //!   not yet due, scored by due time in unix milliseconds.
-//! - `{prefix}:dispatch:{queue}:delayed:payloads` — the payload of each
+//! - `{prefix:dispatch:queue}:delayed:payloads` — the payload of each
 //!   delayed reference, keyed by task id.
-//! - `{prefix}:dispatch:marker:{task_id}` — the dedupe marker.
+//! - `{prefix:dispatch:queue}:marker:{task_id}` — the dedupe marker. Scoped to
+//!   its queue's tag, not global, so it lands in that queue's slot too.
 //!
 //! The standalone [`crate::RedisTaskQueue`] owns `{prefix}:queue:*` and
 //! `{prefix}:scheduled:*`. The two key families do not overlap, so one Redis
@@ -348,8 +354,8 @@ impl RedisDispatch {
         dispatch_payloads_key(&self.config.key_prefix, queue_name)
     }
 
-    fn marker_key(&self, task_id: Uuid) -> String {
-        dispatch_marker_key(&self.config.key_prefix, &task_id.to_string())
+    fn marker_key(&self, queue_name: &str, task_id: Uuid) -> String {
+        dispatch_marker_key(&self.config.key_prefix, queue_name, &task_id.to_string())
     }
 
     fn dedupe_ttl_secs(&self) -> i64 {
@@ -421,7 +427,7 @@ impl RedisDispatch {
                 .arg(self.payloads_key(queue))
                 .arg(self.stream_key(queue))
                 .arg(now_ms)
-                .arg(dispatch_marker_prefix(&self.config.key_prefix))
+                .arg(dispatch_marker_prefix(&self.config.key_prefix, queue))
                 .arg(self.dedupe_ttl_secs());
         }
         pipe
@@ -556,11 +562,14 @@ impl RedisDispatch {
         reference: &DispatchRef,
         due: DateTime<Utc>,
     ) -> RedisAdapterResult<()> {
-        let entries = [(handle.to_string(), reference.clone())];
-        self.requeue_batch(&entries, due).await
+        let entries = [(handle.to_string(), reference.clone(), due)];
+        self.requeue_batch(&entries).await
     }
 
-    /// Give several entries back to their streams in one round trip.
+    /// Give several entries back to their streams in one round trip per
+    /// queue. Each entry carries its own due time (issue #1429), so a batch
+    /// may mix an immediate requeue (a surplus read, a recovered entry) with
+    /// a backed-off release.
     ///
     /// The delivered entry is acked and deleted first, so the pending entries
     /// list never holds a reference the worker no longer owns. The marker is
@@ -575,21 +584,20 @@ impl RedisDispatch {
     /// `XADD` generates.
     async fn requeue_batch(
         &self,
-        entries: &[(String, DispatchRef)],
-        due: DateTime<Utc>,
+        entries: &[(String, DispatchRef, DateTime<Utc>)],
     ) -> RedisAdapterResult<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut by_queue: HashMap<&str, Vec<(&String, &DispatchRef)>> = HashMap::new();
-        for (handle, reference) in entries {
+        let mut by_queue: HashMap<&str, Vec<(&String, &DispatchRef, DateTime<Utc>)>> =
+            HashMap::new();
+        for (handle, reference, due) in entries {
             by_queue
                 .entry(reference.queue_name.as_str())
                 .or_default()
-                .push((handle, reference));
+                .push((handle, reference, *due));
         }
         let now_ms = Utc::now().timestamp_millis();
-        let due_ms = due.timestamp_millis();
         let ttl = self.dedupe_ttl_secs();
         for (queue, batch) in by_queue {
             let mut invocation = self.requeue_script.prepare_invoke();
@@ -597,18 +605,18 @@ impl RedisDispatch {
                 .key(self.stream_key(queue))
                 .key(self.delayed_key(queue))
                 .key(self.payloads_key(queue));
-            for (_, reference) in &batch {
-                invocation.key(self.marker_key(reference.task_id));
+            for (_, reference, _) in &batch {
+                invocation.key(self.marker_key(queue, reference.task_id));
             }
             invocation
                 .arg(now_ms)
                 .arg(ttl)
                 .arg(self.config.consumer_group.as_str());
-            for (handle, reference) in &batch {
+            for (handle, reference, due) in &batch {
                 invocation
                     .arg(handle_entry_id(handle))
                     .arg(reference.task_id.to_string())
-                    .arg(due_ms)
+                    .arg(due.timestamp_millis())
                     .arg(reference.marker_value())
                     .arg(serde_json::to_string(reference)?);
             }
@@ -642,7 +650,7 @@ impl RedisDispatch {
                 .key(self.delayed_key(queue))
                 .key(self.payloads_key(queue));
             for hint in &batch {
-                invocation.key(self.marker_key(hint.task_id));
+                invocation.key(self.marker_key(queue, hint.task_id));
             }
             invocation.arg(now_ms).arg(ttl);
             for hint in &batch {
@@ -677,8 +685,7 @@ impl RedisDispatch {
             .read_with_heal(queues, &ordered, consumer, count, wait)
             .await?;
 
-        let mut leases = Vec::new();
-        let mut surplus = Vec::new();
+        let mut candidates = Vec::new();
         let mut malformed = Vec::new();
         for stream in reply.keys {
             let stream_key = stream.key;
@@ -701,12 +708,29 @@ impl RedisDispatch {
                     malformed.push((stream_key.clone(), entry.id));
                     continue;
                 };
-                if leases.len() < max {
-                    let handle = encode_handle(&entry.id, &payload);
-                    leases.push(reference.into_lease(handle));
-                } else {
-                    surplus.push((entry.id, reference));
-                }
+                candidates.push((entry.id, payload, reference));
+            }
+        }
+
+        // Priority is best effort under dispatch (issue #1429): one FIFO
+        // stream per queue carries no priority order on its own. When one
+        // read holds more candidates than `max`, a stable sort by priority
+        // (descending) before the split favors the highest-priority
+        // candidates for the leases this call actually claims, and requeues
+        // the rest. Ties keep arrival order (the sort is stable), so this
+        // never starves same-priority work. The reconcile sweep's own
+        // `(priority DESC, scheduled_at ASC)` publish order is the other half
+        // of this best-effort signal.
+        candidates.sort_by(|a, b| b.2.priority.cmp(&a.2.priority));
+
+        let mut leases = Vec::new();
+        let mut surplus = Vec::new();
+        for (entry_id, payload, reference) in candidates {
+            if leases.len() < max {
+                let handle = encode_handle(&entry_id, &payload);
+                leases.push(reference.into_lease(handle));
+            } else {
+                surplus.push((entry_id, reference));
             }
         }
 
@@ -715,14 +739,20 @@ impl RedisDispatch {
         // timeout. One pipeline carries the whole surplus. A failure there
         // costs one redelivery per entry, which the visibility timeout already
         // covers, so the leases already collected are returned either way.
-        if !surplus.is_empty()
-            && let Err(error) = self.requeue_batch(&surplus, Utc::now()).await
-        {
-            tracing::warn!(
-                error = %error,
-                surplus = surplus.len(),
-                "failed to requeue surplus dispatch references"
-            );
+        if !surplus.is_empty() {
+            let now = Utc::now();
+            let surplus_len = surplus.len();
+            let surplus_entries: Vec<(String, DispatchRef, DateTime<Utc>)> = surplus
+                .into_iter()
+                .map(|(handle, reference)| (handle, reference, now))
+                .collect();
+            if let Err(error) = self.requeue_batch(&surplus_entries).await {
+                tracing::warn!(
+                    error = %error,
+                    surplus = surplus_len,
+                    "failed to requeue surplus dispatch references"
+                );
+            }
         }
 
         if let Err(error) = self.discard_entries(&malformed).await {
@@ -775,7 +805,7 @@ impl RedisDispatch {
             .ignore()
             .xdel(&key, &[entry_id])
             .ignore()
-            .del(self.marker_key(lease.task_id))
+            .del(self.marker_key(&lease.queue_name, lease.task_id))
             .ignore()
             .query_async::<()>(&mut conn)
             .await?;
@@ -802,30 +832,108 @@ impl RedisDispatch {
             .await
     }
 
-    /// Re-add every entry that has been idle in the pending entries list
-    /// longer than the visibility timeout.
-    async fn recover_queue(&self, queue_name: &str) -> RedisAdapterResult<usize> {
-        self.ensure_group(queue_name, false).await?;
-        let key = self.stream_key(queue_name);
-        let mut conn = self.conn.clone();
-
-        let pending: StreamPendingCountReply = conn
-            .xpending_count(&key, &self.config.consumer_group, "-", "+", RECOVER_BATCH)
-            .await?;
-        if pending.ids.is_empty() {
-            return Ok(0);
+    /// Drop several leases in one round trip (issue #1429).
+    ///
+    /// Same shape as [`Self::ack_inner`], batched into one atomic pipeline
+    /// covering every lease regardless of which queue it came from — `XACK`,
+    /// `XDEL` and the marker delete do not need `EVALSHA`'s single-queue key
+    /// grouping, so nothing here needs to split by queue.
+    async fn ack_many_inner(&self, leases: &[DispatchLease]) -> RedisAdapterResult<()> {
+        if leases.is_empty() {
+            return Ok(());
         }
-        let visibility_ms = self.visibility_ms();
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        for lease in leases {
+            let key = self.stream_key(&lease.queue_name);
+            let entry_id = handle_entry_id(&lease.handle);
+            pipe.xack(&key, &self.config.consumer_group, &[entry_id])
+                .ignore()
+                .xdel(&key, &[entry_id])
+                .ignore()
+                .del(self.marker_key(&lease.queue_name, lease.task_id))
+                .ignore();
+        }
+        let mut conn = self.conn.clone();
+        pipe.query_async::<()>(&mut conn).await?;
+        Ok(())
+    }
+
+    /// Give several leases back at once, each after its own delay
+    /// (issue #1429).
+    ///
+    /// Builds every entry's fresh reference and due time up front, then
+    /// makes one [`Self::requeue_batch`] call — one round trip per distinct
+    /// queue in the batch, not one per lease.
+    async fn release_many_inner(
+        &self,
+        leases: &[(DispatchLease, Duration)],
+    ) -> RedisAdapterResult<()> {
+        if leases.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now();
+        let mut entries = Vec::with_capacity(leases.len());
+        for (lease, delay) in leases {
+            // The handle carries the payload (contract C2), so no read-back
+            // is needed and the priority survives the release.
+            let mut reference = handle_payload(&lease.handle)
+                .and_then(|payload| serde_json::from_str::<DispatchRef>(payload).ok())
+                .unwrap_or_else(|| DispatchRef::from_lease(lease));
+            reference.redeliveries = lease.redeliveries.saturating_add(1);
+            let chrono_delay = chrono::Duration::from_std(*delay).map_err(|err| {
+                RedisAdapterError::DurationOutOfRange(format!("release delay: {err}"))
+            })?;
+            entries.push((lease.handle.clone(), reference, now + chrono_delay));
+        }
+        self.requeue_batch(&entries).await
+    }
+
+    /// One `XPENDING` per queue, in one pipeline (issue #1429).
+    ///
+    /// Mirrors [`Self::promote_pipeline`]: recovery used to cost one round
+    /// trip per queue per pass just to learn which queues have idle entries
+    /// at all. This folds that scan into the one round trip every other pass
+    /// already pays.
+    fn pending_pipeline(&self, queues: &[String]) -> redis::Pipeline {
+        let mut pipe = redis::pipe();
+        for queue in queues {
+            pipe.xpending_count(
+                self.stream_key(queue),
+                &self.config.consumer_group,
+                "-",
+                "+",
+                RECOVER_BATCH,
+            );
+        }
+        pipe
+    }
+
+    /// Idle entry ids in `pending`, at or past the visibility timeout.
+    fn idle_entry_ids(pending: &StreamPendingCountReply, visibility_ms: u64) -> Vec<String> {
         let threshold = usize::try_from(visibility_ms).unwrap_or(usize::MAX);
-        let idle: Vec<String> = pending
+        pending
             .ids
             .iter()
             .filter(|entry| entry.last_delivered_ms >= threshold)
             .map(|entry| entry.id.clone())
-            .collect();
+            .collect()
+    }
+
+    /// Re-add one queue's entries that have been idle in the pending entries
+    /// list longer than the visibility timeout. `idle` is the id list a
+    /// prior `XPENDING` (see [`Self::pending_pipeline`]) already found.
+    async fn recover_idle_entries(
+        &self,
+        queue_name: &str,
+        idle: &[String],
+    ) -> RedisAdapterResult<usize> {
         if idle.is_empty() {
             return Ok(0);
         }
+        let key = self.stream_key(queue_name);
+        let mut conn = self.conn.clone();
+        let visibility_ms = self.visibility_ms();
 
         // XCLAIM moves the entries to a sentinel consumer so their payloads
         // can be read. `XREADGROUP >` never returns a pending entry, so the
@@ -836,7 +944,7 @@ impl RedisDispatch {
                 &self.config.consumer_group,
                 RECOVERY_CONSUMER,
                 visibility_ms,
-                &idle,
+                idle,
             )
             .await?;
 
@@ -870,14 +978,37 @@ impl RedisDispatch {
         // here. See [`RedisDispatch::discard_entries`].
         self.discard_entries(&malformed).await?;
         let count = recovered.len();
-        self.requeue_batch(&recovered, Utc::now()).await?;
+        let now = Utc::now();
+        let recovered_entries: Vec<(String, DispatchRef, DateTime<Utc>)> = recovered
+            .into_iter()
+            .map(|(handle, reference)| (handle, reference, now))
+            .collect();
+        self.requeue_batch(&recovered_entries).await?;
         Ok(count)
     }
 
+    /// Re-add every idle pending entry across `queues`.
+    ///
+    /// The `XPENDING` scan that finds idle entries runs once, pipelined
+    /// across every queue (issue #1429). `XCLAIM` and the requeue still run
+    /// per queue with idle entries: their reply shapes and payloads are
+    /// per-queue, and only a queue actually holding idle work pays for them.
     async fn recover_queues(&self, queues: &[String]) -> RedisAdapterResult<usize> {
+        if queues.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_groups(queues, false).await?;
+        let mut conn = self.conn.clone();
+        let visibility_ms = self.visibility_ms();
+        let pendings: Vec<StreamPendingCountReply> = self
+            .pending_pipeline(queues)
+            .query_async(&mut conn)
+            .await?;
+
         let mut total = 0;
-        for queue in queues {
-            total += self.recover_queue(queue).await?;
+        for (queue, pending) in queues.iter().zip(pendings.iter()) {
+            let idle = Self::idle_entry_ids(pending, visibility_ms);
+            total += self.recover_idle_entries(queue, &idle).await?;
         }
         Ok(total)
     }
@@ -912,6 +1043,14 @@ impl TaskDispatch for RedisDispatch {
 
     async fn release(&self, lease: &DispatchLease, delay: Duration) -> HarvestResult<()> {
         harvest(self.release_inner(lease, delay).await)
+    }
+
+    async fn ack_many(&self, leases: &[DispatchLease]) -> HarvestResult<()> {
+        harvest(self.ack_many_inner(leases).await)
+    }
+
+    async fn release_many(&self, leases: &[(DispatchLease, Duration)]) -> HarvestResult<()> {
+        harvest(self.release_many_inner(leases).await)
     }
 
     async fn maintain(&self, queues: &[String]) -> HarvestResult<DispatchMaintenance> {

@@ -72,19 +72,30 @@
 //!
 //! ### Limits in v1
 //!
-//! - **Single Redis instance.** Redis Cluster is not supported. The key
-//!   family spreads a queue's stream, delayed set, payload hash and markers
-//!   over several keys. No hash tag binds them to one slot. A cluster would
-//!   therefore reject the multi-key scripts.
+//! - **Single-node client.** The key family is hash-tagged per queue (issue
+//!   #1429): a queue's stream, delayed set, payload hash and markers all
+//!   carry the same `{prefix:dispatch:queue}` tag, so the multi-key scripts
+//!   (`PUBLISH_LUA`, `REQUEUE_LUA`, `PROMOTE_MARKED_LUA`) stay in one Redis
+//!   Cluster slot. This crate still connects with a single-node
+//!   [`redis::Client`]/[`ConnectionManager`](redis::aio::ConnectionManager),
+//!   not a cluster-aware client, so it does not yet follow `MOVED`/`ASK`
+//!   redirects across a multi-node Cluster deployment. The hash tags remove
+//!   the `CROSSSLOT` failure; a cluster-aware client is a separate follow-up.
 //! - **No TLS.** A `rediss://` URL is rejected at `connect` with a message
 //!   that says so. The `redis` client's TLS stack depends on an unmaintained
 //!   crate that the dependency ledger refuses; issue #1429 tracks TLS. A
 //!   plain `redis://` URL sends the password in cleartext.
-//! - **Single shard only.** A hint carries a shard slot, but a sharded
-//!   runtime rejects Redis dispatch at validation.
+//! - **One channel per shard, not one channel that spans shards.** A single
+//!   [`RedisDispatch`] instance still addresses one key family and expects
+//!   every reference it carries to belong to one database. A multi-shard
+//!   runtime therefore installs one instance per shard rather than widening
+//!   this type (issue #1429; see `autumn-harvest-plugin`'s per-shard
+//!   install and `autumn_harvest::dispatch::install_for_shard`).
 //! - **Priority is best effort.** One stream per queue delivers in arrival
-//!   order. The reconcile sweep publishes in priority order, which is the
-//!   only priority signal the channel carries.
+//!   order. The reconcile sweep publishes in priority order, and a capped
+//!   read favors the highest-priority candidates it holds over lower ones
+//!   (issue #1429) — together the closest approximation to priority order
+//!   this channel offers without a per-priority stream.
 //! - **Sticky affinity is best effort.** Any worker in the consumer group may
 //!   read any reference. The Postgres claim predicate still enforces the
 //!   affinity gate, and a rejected reference is released with backoff.

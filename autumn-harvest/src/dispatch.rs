@@ -186,6 +186,30 @@ pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
     /// Give a reference back so it is delivered again after `delay`.
     async fn release(&self, lease: &DispatchLease, delay: Duration) -> HarvestResult<()>;
 
+    /// Drop several references at once (issue #1429).
+    ///
+    /// The default calls [`Self::ack`] once per lease, so an implementation
+    /// with no batched path stays correct. An implementation that can dispose
+    /// of a batch in one round trip should override this.
+    async fn ack_many(&self, leases: &[DispatchLease]) -> HarvestResult<()> {
+        for lease in leases {
+            self.ack(lease).await?;
+        }
+        Ok(())
+    }
+
+    /// Give several references back at once, each after its own delay
+    /// (issue #1429).
+    ///
+    /// The default calls [`Self::release`] once per lease. An implementation
+    /// that can requeue a batch in one round trip should override this.
+    async fn release_many(&self, leases: &[(DispatchLease, Duration)]) -> HarvestResult<()> {
+        for (lease, delay) in leases {
+            self.release(lease, *delay).await?;
+        }
+        Ok(())
+    }
+
     /// Promote due delayed references and recover references held by a
     /// consumer that stopped acking.
     async fn maintain(&self, queues: &[String]) -> HarvestResult<DispatchMaintenance>;
@@ -230,6 +254,63 @@ pub fn uninstall() {
 #[must_use]
 pub fn installed() -> Option<InstalledDispatch> {
     INSTALLED.read().ok().and_then(|slot| slot.clone())
+}
+
+// ---------------------------------------------------------------------------
+// Per-shard channels (issue #1429)
+// ---------------------------------------------------------------------------
+
+/// One channel per shard, for a runtime that spans more than one shard.
+///
+/// [`install`]/[`installed`] above stay the single-shard slot; a multi-shard
+/// runtime never touches them. A worker that spans several shards cannot
+/// tell, from a task id alone, which shard's database holds the named row —
+/// so a reference read from the wrong shard's channel would always miss. Each
+/// shard here therefore gets its own channel, keyed to its own Redis key
+/// family, and the multi-shard poll loop reads and claims against the
+/// matching pair.
+///
+/// Immediate hints (`record_hint`/`record_hints`, raised from `queue.rs`
+/// helpers that do not know which shard they run on) still publish through
+/// the single-shard slot only, which stays empty here — so on a multi-shard
+/// runtime they fall through to the Postgres path, same as no channel
+/// installed at all. Only the reconcile sweep, which already runs once per
+/// shard against that shard's own pool connection, publishes into a
+/// per-shard channel. This costs a reconcile interval of latency on the
+/// first dispatch of a row, never a lost or duplicated one — the same
+/// durability floor every other dispatch path relies on.
+static INSTALLED_BY_SHARD: RwLock<Option<std::collections::HashMap<crate::types::ShardId, InstalledDispatch>>> =
+    RwLock::new(None);
+
+/// Install a channel for one shard of a multi-shard runtime.
+///
+/// A later call for the same shard replaces the earlier one. Does not touch
+/// [`install`]'s single-shard slot.
+pub fn install_for_shard(shard: crate::types::ShardId, channel: Arc<dyn TaskDispatch>, settings: DispatchSettings) {
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        slot.get_or_insert_with(std::collections::HashMap::new)
+            .insert(shard, InstalledDispatch { channel, settings });
+        ANY_INSTALLED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The channel installed for `shard`, if any.
+#[must_use]
+pub fn installed_for_shard(shard: crate::types::ShardId) -> Option<InstalledDispatch> {
+    INSTALLED_BY_SHARD
+        .read()
+        .ok()
+        .and_then(|slot| slot.as_ref().and_then(|map| map.get(&shard).cloned()))
+}
+
+/// Remove every per-shard channel. Tests use this between cases.
+pub fn uninstall_all_shards() {
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        *slot = None;
+    }
+    if INSTALLED.read().is_ok_and(|slot| slot.is_none()) {
+        ANY_INSTALLED.store(false, Ordering::Relaxed);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1090,6 +1171,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn per_shard_channels_are_independent_of_each_other_and_of_the_global_slot() {
+        // Issue #1429. A multi-shard runtime installs one channel per shard;
+        // this pins that the slots do not leak into each other or into the
+        // single-shard `install`/`installed` pair.
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let shard_a = crate::types::ShardId::new(1);
+        let shard_b = crate::types::ShardId::new(2);
+        let channel_a = Arc::new(MemoryDispatch::new());
+        let channel_b = Arc::new(MemoryDispatch::new());
+        install_for_shard(
+            shard_a,
+            Arc::clone(&channel_a) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        install_for_shard(
+            shard_b,
+            Arc::clone(&channel_b) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        assert!(installed_for_shard(shard_a).is_some());
+        assert!(installed_for_shard(shard_b).is_some());
+        assert!(
+            installed_for_shard(crate::types::ShardId::new(9)).is_none(),
+            "an unregistered shard has no channel"
+        );
+        assert!(
+            installed().is_none(),
+            "installing per-shard channels must not populate the single-shard slot"
+        );
+
+        uninstall_all_shards();
+        assert!(installed_for_shard(shard_a).is_none());
+        assert!(installed_for_shard(shard_b).is_none());
+    }
+
+    #[tokio::test]
     async fn a_hint_outside_a_scope_reaches_the_channel() {
         let _guard = INSTALL_LOCK.lock().await;
         let channel = Arc::new(MemoryDispatch::new());
@@ -1333,6 +1454,60 @@ mod tests {
         channel.ack(&lease).await.expect("ack");
         assert_eq!(channel.acked_ids(), vec![one.task_id]);
         assert!(channel.is_drained());
+    }
+
+    #[tokio::test]
+    async fn ack_many_drops_every_lease_in_the_batch() {
+        // Issue #1429. `MemoryDispatch` does not override `ack_many`, so this
+        // exercises the trait's default sequential implementation.
+        let channel = MemoryDispatch::new();
+        let a = hint("q", Utc::now());
+        let b = hint("q", Utc::now());
+        channel.publish(&[a.clone(), b.clone()]).await.expect("publish");
+
+        let first = read_one(&channel).await.expect("first lease");
+        let second = read_one(&channel).await.expect("second lease");
+        assert_eq!(channel.outstanding_leases(), 2);
+
+        channel
+            .ack_many(&[first, second])
+            .await
+            .expect("ack_many");
+        let mut acked = channel.acked_ids();
+        acked.sort();
+        let mut expected = vec![a.task_id, b.task_id];
+        expected.sort();
+        assert_eq!(acked, expected);
+        assert!(channel.is_drained());
+    }
+
+    #[tokio::test]
+    async fn release_many_gives_every_lease_back_with_its_own_delay() {
+        // Issue #1429. Each lease in the batch carries its own delay, so a
+        // batch may mix an immediate return with a backed-off one.
+        let channel = MemoryDispatch::new();
+        let a = hint("q", Utc::now());
+        let b = hint("q", Utc::now());
+        channel.publish(&[a.clone(), b.clone()]).await.expect("publish");
+
+        let first = read_one(&channel).await.expect("first lease");
+        let second = read_one(&channel).await.expect("second lease");
+
+        channel
+            .release_many(&[
+                (first, Duration::from_millis(0)),
+                (second, Duration::from_millis(0)),
+            ])
+            .await
+            .expect("release_many");
+        let mut released = channel.released_ids();
+        released.sort();
+        let mut expected = vec![a.task_id, b.task_id];
+        expected.sort();
+        assert_eq!(released, expected);
+
+        let redelivered = read_one(&channel).await.expect("redelivered");
+        assert_eq!(redelivered.redeliveries, 1);
     }
 
     #[tokio::test]

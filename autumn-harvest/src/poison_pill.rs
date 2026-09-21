@@ -691,8 +691,15 @@ mod scanner {
         // workflow's (id, name, schedule_id, origin) when it was actually failed
         // RUNNING → FAILED so the schedule failure counter can be bumped (with
         // the correct origin) after commit.
+        //
+        // `fail_owning_workflow` wakes a detached parent, which raises a
+        // dispatch hint (issue #1429). This scanner runs on its own timer,
+        // outside any worker task body's catch-all buffering scope, so the
+        // hint would otherwise reach the channel before this COMMIT. The
+        // buffering scope holds it until then, matching every other
+        // transaction owner that calls `wake_workflow_task`.
         let (acted, failed_workflow, deferred_starts, closed_children, pending_cancel_metrics) =
-            Box::pin(conn.transaction::<(
+            crate::dispatch::buffered_settled(Box::pin(conn.transaction::<(
                 bool,
                 Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
                 Vec<DeferredTriggerStart>,
@@ -762,7 +769,7 @@ mod scanner {
                     closed_children,
                     pending_cancel_metrics,
                 ))
-            }))
+            })))
             .await?;
 
         if acted {

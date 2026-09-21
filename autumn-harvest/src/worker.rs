@@ -5869,6 +5869,24 @@ pub(crate) const fn dispatch_allowed_for_span(
     shard_assignments <= 1 && pool_shards <= 1
 }
 
+/// Whether every one of `assignments` has its own per-shard dispatch channel
+/// installed (issue #1429).
+///
+/// The multi-shard poll loop consults [`crate::dispatch::installed_for_shard`]
+/// per shard at read time; this is the matching startup check, so a runtime
+/// missing coverage for even one assigned shard fails loud instead of
+/// silently falling that one shard back to the Postgres path forever. An
+/// empty `assignments` (the unsharded/default span) is never covered here: it
+/// has no shard identity to look up, so it needs the single-shard channel
+/// (`dispatch::install`), not this path.
+#[must_use]
+fn per_shard_dispatch_covers(assignments: &[crate::types::ShardId]) -> bool {
+    !assignments.is_empty()
+        && assignments
+            .iter()
+            .all(|shard| crate::dispatch::installed_for_shard(*shard).is_some())
+}
+
 /// Whether a shard's poll loop may claim tasks, given that shard's pending
 /// fleet-registration state (issue #804, Codex round-54 P1).
 ///
@@ -8992,8 +9010,13 @@ async fn process_mutex_releases_from_commands(
     releases.sort_by(|a, b| a.0.cmp(&b.0));
     let metrics_enabled = metrics.is_enabled();
 
-    let held_secs = conn
-        .transaction::<Vec<f64>, HarvestError, _>(async |conn| {
+    // `release_lock` wakes the freed key's new head of line, which raises a
+    // dispatch hint (issue #1429). A hint published before the COMMIT below
+    // names a row no reader outside this transaction can see yet; the
+    // buffering scope holds it until the commit, matching every other
+    // transaction owner that calls `wake_workflow_task`.
+    let held_secs = crate::dispatch::buffered_settled(Box::pin(conn.transaction::<Vec<f64>, HarvestError, _>(
+        async |conn| {
             let releases = releases.clone();
             let mut held = Vec::new();
             for (key, lock_seq) in releases {
@@ -9008,8 +9031,9 @@ async fn process_mutex_releases_from_commands(
                 }
             }
             Ok(held)
-        })
-        .await?;
+        },
+    )))
+    .await?;
 
     for secs in held_secs {
         metrics.record_mutex_held(workflow_name, secs);
@@ -24239,6 +24263,39 @@ fn spawn_queue_pause_sampler(
     })
 }
 
+/// Spawn the dispatch dropped-hints gauge sampler (issue #1429).
+///
+/// Emits `harvest.dispatch.dropped_hints`, the running total of hints the
+/// dispatch background publisher has dropped because its bounded queue was
+/// full. Reads no database: [`crate::dispatch::dropped_hints`] is a plain
+/// in-process counter, so this sampler runs on every build, not only under
+/// the `db` feature. A dropped hint costs latency, not correctness — the
+/// row stays `PENDING` and the reconcile sweep republishes it — so this is
+/// a health signal, not a durability one.
+fn spawn_dispatch_metrics_sampler(
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+            telemetry
+                .metrics
+                .record_dispatch_dropped_hints(crate::dispatch::dropped_hints());
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+    })
+}
+
 /// Spawn the overdue-schedule sampler (issue #696).
 ///
 /// Emits the `harvest.schedule.overdue` gauge (`1`/`0` per schedule) so a
@@ -25030,6 +25087,9 @@ struct WorkerMonitoringHandles {
     schedule_overdue_sampler: Option<tokio::task::JoinHandle<()>>,
     /// Paused-queue gauge sampler (issue #619). `None` without the `db` feature.
     queue_pause_sampler: Option<tokio::task::JoinHandle<()>>,
+    /// Dispatch dropped-hints gauge sampler (issue #1429). Reads no database,
+    /// so it runs on every build regardless of the `db` feature.
+    dispatch_metrics_sampler: tokio::task::JoinHandle<()>,
     /// Adaptive slot-tuner control loops (issue #548). Empty when no tuner
     /// is configured.
     slot_tuners: Vec<tokio::task::JoinHandle<()>>,
@@ -25985,14 +26045,16 @@ impl Worker {
         crate::builder::validate_activity_rate_limits(registry.activities.values())
             .map_err(|err| HarvestError::Config(err.to_string()))?;
 
-        // Redis dispatch is single-shard in v1 (issue #1312). The channel
-        // carries a task id and no connection. A worker that drains several
-        // shards cannot tell which pool holds the named row. A reference read
-        // on one shard would then be claimed against another shard's database
-        // and always miss. Reject the combination at startup rather than let
-        // it degrade to a silent no-claim loop. `shard` on `DispatchHint`
-        // carries the follow-up that lifts this limit.
-        if crate::dispatch::installed().is_some() {
+        // A worker that spans several shards cannot tell, from a task id
+        // alone, which shard's database holds the named row — so a
+        // single-channel read on one shard would then be claimed against
+        // another shard's database and always miss. `Worker::new` therefore
+        // requires either a single-shard span with the single-shard channel
+        // installed (`dispatch::install`), or a per-shard channel installed
+        // for every one of this worker's `shard_assignments`
+        // (`dispatch::install_for_shard`, issue #1429). The multi-shard poll
+        // loop reads and claims each shard against its own matching pair.
+        if crate::dispatch::is_installed() {
             let shard_count = config.shard_assignments.len();
             #[cfg(feature = "db")]
             let pool_shards = config
@@ -26001,12 +26063,19 @@ impl Worker {
                 .map_or(0, crate::shard::ShardedDbPool::len);
             #[cfg(not(feature = "db"))]
             let pool_shards = 0;
-            if !dispatch_allowed_for_span(shard_count, pool_shards) {
+            let single_shard_channel = crate::dispatch::installed().is_some();
+            let covered = if single_shard_channel {
+                dispatch_allowed_for_span(shard_count, pool_shards)
+            } else {
+                per_shard_dispatch_covers(&config.shard_assignments)
+            };
+            if !covered {
                 return Err(HarvestError::Config(format!(
                     "a dispatch channel is installed and this worker spans \
                      {shard_count} shard assignments and {pool_shards} sharded pool \
-                     entries; dispatch supports single-shard runtimes only in v1 \
-                     (issue #1312)"
+                     entries; a wide span needs either a single-shard channel and \
+                     a span of one, or a per-shard channel installed for every \
+                     assigned shard (issue #1429)"
                 )));
             }
 
@@ -26596,10 +26665,24 @@ impl Worker {
 
         let shard_listeners = self.build_shard_listeners(&shard_targets).await;
 
+        // Decide each shard's dispatch channel once, here, and hold it for
+        // the whole loop (issue #1429) — the multi-shard mirror of the
+        // single-pool loop's one-time decision just above `run_poll_loop`.
+        // `Worker::new` already required a per-shard channel for every
+        // assigned shard before construction succeeded, whenever any
+        // per-shard channel is installed at all; a `None` entry here means
+        // dispatch was never installed for this span, so that shard polls
+        // Postgres, same as no channel at all.
+        let shard_dispatch: Vec<Option<crate::dispatch::InstalledDispatch>> = shard_targets
+            .iter()
+            .map(|(shard, _)| crate::dispatch::installed_for_shard(*shard))
+            .collect();
+
         self.run_poll_loop_multi(
             shard_targets.clone(),
             shard_listeners,
             &registration_pending_per_shard,
+            &shard_dispatch,
         )
         .await;
 
@@ -26659,11 +26742,18 @@ impl Worker {
         shard_targets: Vec<(crate::types::ShardId, DbPool)>,
         mut shard_listeners: Vec<Option<crate::notify::QueueListener>>,
         registration_pending_per_shard: &[Arc<AtomicBool>],
+        shard_dispatch: &[Option<crate::dispatch::InstalledDispatch>],
     ) {
         let n = shard_targets.len();
         // Rotating start index prevents the first shard from being permanently
         // favoured when multiple shards have work (fix #4).
         let mut start_idx = 0usize;
+        // One dispatch-loop state per shard (issue #1429), inert for a shard
+        // with no channel installed. Persisted across iterations, unlike
+        // `shard_dispatch` itself: the reconcile cursor and the degraded-mode
+        // cooldown must survive from one iteration to the next.
+        let mut dispatch_states: Vec<DispatchLoopState> =
+            shard_targets.iter().map(|_| DispatchLoopState::new()).collect();
 
         while !self.shutdown.is_cancelled() {
             let mut any_claimed = false;
@@ -26682,14 +26772,27 @@ impl Worker {
                 )) {
                     continue;
                 }
-                if self
-                    .poll_once(
+                // Issue #1429: a shard with its own dispatch channel installed
+                // reads and claims through it, exactly like the single-pool
+                // loop's dispatch branch. A shard with none polls Postgres,
+                // unchanged.
+                let dispatched = if let Some(installed) = &shard_dispatch[idx] {
+                    self.run_dispatch_iteration(
+                        &shard_targets[idx].1,
+                        Some(shard_targets[idx].0),
+                        installed,
+                        &mut dispatch_states[idx],
+                    )
+                    .await
+                } else {
+                    self.poll_once(
                         &shard_targets[idx].1,
                         shard_acquire_bound(true, self.config.poll_interval),
                         Some(shard_targets[idx].0),
                     )
                     .await
-                {
+                };
+                if dispatched {
                     any_claimed = true;
                     // Per-shard dispatch counter (issue #961, AC5). Emitted
                     // here rather than inside `poll_once`/`dispatch_task`
@@ -26855,6 +26958,9 @@ impl Worker {
             && let Err(error) = handle.await
         {
             tracing::warn!(error = %error, "queue pause sampler failed during shutdown");
+        }
+        if let Err(error) = monitors.dispatch_metrics_sampler.await {
+            tracing::warn!(error = %error, "dispatch metrics sampler failed during shutdown");
         }
         for handle in monitors.slot_tuners {
             if let Err(error) = handle.await {
@@ -27266,6 +27372,12 @@ impl Worker {
         ));
         #[cfg(not(feature = "db"))]
         let queue_pause_sampler: Option<tokio::task::JoinHandle<()>> = None;
+        // Issue #1429: no database read, so this runs on every build.
+        let dispatch_metrics_sampler = spawn_dispatch_metrics_sampler(
+            self.shutdown.clone(),
+            self.registry.telemetry().clone(),
+            self.config.poll_interval,
+        );
         // Poison-pill reclaimer, pause auto-resumer, and timeout checker all run
         // per-shard so that orphaned tasks, over-long pauses, and timed-out
         // tasks/executions on every assigned shard are recovered (fix #3,
@@ -27749,6 +27861,7 @@ impl Worker {
             replication_sampler,
             schedule_overdue_sampler,
             queue_pause_sampler,
+            dispatch_metrics_sampler,
             slot_tuners,
             workflow_slot_target,
             activity_slot_target,
@@ -27879,10 +27992,18 @@ impl Worker {
         ) else {
             // Both pools are full. A reference read now would sit in this
             // worker's hands until a permit frees, which keeps it from a peer
-            // that has one. Sleep one poll interval instead.
+            // that has one. Wait for a permit to free, capped at one poll
+            // interval (issue #1429): a bare sleep here held every claim on
+            // this worker idle for the whole interval even when a running
+            // task finished and freed a permit a moment later. Acquiring and
+            // immediately dropping a permit only detects that one is free; it
+            // never withholds it from a peer or from this same call's own
+            // `dispatch_kind_admitted` check on the next iteration.
             tokio::select! {
                 () = self.shutdown.cancelled() => {}
                 () = tokio::time::sleep(self.config.poll_interval) => {}
+                Ok(permit) = self.workflow_semaphore.acquire() => { drop(permit); }
+                Ok(permit) = self.activity_semaphore.acquire() => { drop(permit); }
             }
             return false;
         };
@@ -27923,12 +28044,21 @@ impl Worker {
         };
 
         let mut dispatched = false;
-        for lease in leases {
+        // Leases this iteration gives straight back with no claim attempt
+        // (shutdown, or no free permit for the pool a reference needs). None
+        // of these was ever claimed, so batching their disposal costs only a
+        // little latency on an already-released reference, never a lost or
+        // duplicated one. One `release_many` call replaces one `release` call
+        // per such lease (issue #1429).
+        let mut to_release: Vec<(crate::dispatch::DispatchLease, Duration)> = Vec::new();
+        let mut leases = leases.into_iter();
+        while let Some(lease) = leases.next() {
             if self.shutdown.is_cancelled() {
-                // Give the reference straight back so a peer serves it now.
-                let _ = dispatch_call(installed.channel.release(&lease, Duration::ZERO), "release")
-                    .await;
-                continue;
+                // Give every remaining reference straight back so a peer
+                // serves them now.
+                to_release.push((lease, Duration::ZERO));
+                to_release.extend(leases.map(|lease| (lease, Duration::ZERO)));
+                break;
             }
             if !dispatch_kind_admitted(
                 lease.kind,
@@ -27937,8 +28067,7 @@ impl Worker {
             ) {
                 // No permit for this pool. Give the reference straight back, so
                 // a peer with capacity reads it on its next poll.
-                let _ = dispatch_call(installed.channel.release(&lease, Duration::ZERO), "release")
-                    .await;
+                to_release.push((lease, Duration::ZERO));
                 continue;
             }
             // The reservation is taken before the claim and lives until the
@@ -27955,6 +28084,9 @@ impl Worker {
             dispatched |= self
                 .consume_reference(pool, shard, installed, state, lease, reservation)
                 .await;
+        }
+        if !to_release.is_empty() {
+            let _ = dispatch_call(installed.channel.release_many(&to_release), "release").await;
         }
         dispatched
     }
@@ -28267,8 +28399,9 @@ impl Worker {
     ///
     /// `dispatch_allowed` is the run-start decision of
     /// [`dispatch_allowed_for_span`]. The multi-shard loop
-    /// (`run_poll_loop_multi`) has no dispatch branch at all, so every loop
-    /// `run_multi_shard` starts is on the Postgres path by construction.
+    /// (`run_poll_loop_multi`) has its own, per-shard dispatch branch (issue
+    /// #1429): each shard reads and claims through its own installed channel
+    /// when one exists, and polls Postgres otherwise.
     async fn run_poll_loop(
         &self,
         pool: &DbPool,
@@ -28328,8 +28461,10 @@ impl Worker {
                         worker_id = %self.config.worker_id,
                         shard_assignments = self.config.shard_assignments.len(),
                         "a dispatch channel is installed but this worker spans more than one \
-                         shard; dispatch supports single-shard runtimes only in v1 (issue \
-                         #1312). This worker claims through postgres"
+                         shard; the single-pool poll loop cannot route a reference to the \
+                         right shard's pool (issue #1312). A multi-shard runtime needs a \
+                         per-shard channel and the multi-shard poll loop (issue #1429). This \
+                         worker claims through postgres"
                     );
                 }
             }
@@ -41524,6 +41659,52 @@ mod tests {
         assert!(!dispatch_allowed_for_span(4, 4), "a wide worker is refused");
     }
 
+    /// A multi-shard span may still dispatch, but only when every assigned
+    /// shard has its own channel installed (issue #1429).
+    #[cfg(feature = "testing")]
+    #[test]
+    fn per_shard_dispatch_requires_full_coverage() {
+        crate::dispatch::uninstall_all_shards();
+
+        let shard_a = crate::types::ShardId::new(1);
+        let shard_b = crate::types::ShardId::new(2);
+
+        assert!(
+            !per_shard_dispatch_covers(&[]),
+            "an empty span has no shard identity to cover"
+        );
+        assert!(
+            !per_shard_dispatch_covers(&[shard_a, shard_b]),
+            "neither shard has a channel yet"
+        );
+
+        crate::dispatch::install_for_shard(
+            shard_a,
+            std::sync::Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+        assert!(
+            !per_shard_dispatch_covers(&[shard_a, shard_b]),
+            "shard_b still has no channel, so the span is not fully covered"
+        );
+        assert!(
+            per_shard_dispatch_covers(&[shard_a]),
+            "a span of only the covered shard is fully covered"
+        );
+
+        crate::dispatch::install_for_shard(
+            shard_b,
+            std::sync::Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+        assert!(
+            per_shard_dispatch_covers(&[shard_a, shard_b]),
+            "both assigned shards now have their own channel"
+        );
+
+        crate::dispatch::uninstall_all_shards();
+    }
+
     /// A full page means the walk may
     /// have more rows below it, so the next sweep continues from the cursor.
     #[test]
@@ -41670,6 +41851,41 @@ mod tests {
             !message.contains("  "),
             "the rejection message has a run of spaces: {message}"
         );
-        assert!(message.contains("single-shard runtimes only"), "{message}");
+        assert!(
+            message.contains("per-shard channel installed for every assigned shard"),
+            "{message}"
+        );
+    }
+
+    /// A multi-shard runtime is accepted once every assigned shard has its
+    /// own per-shard channel (issue #1429), the counterpart to
+    /// `the_sharded_runtime_rejection_reads_as_one_sentence` above.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_fully_covered_multi_shard_runtime_is_accepted() {
+        crate::dispatch::uninstall_all_shards();
+        let shard_0 = crate::types::ShardId::new(0);
+        let shard_1 = crate::types::ShardId::new(1);
+        for shard in [shard_0, shard_1] {
+            crate::dispatch::install_for_shard(
+                shard,
+                Arc::new(crate::dispatch::MemoryDispatch::new()),
+                crate::dispatch::DispatchSettings::default(),
+            );
+        }
+
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let config = WorkerRuntimeConfig {
+            shard_assignments: vec![shard_0, shard_1],
+            ..default_runtime_config()
+        };
+        let result = Worker::new(config, registry);
+        crate::dispatch::uninstall_all_shards();
+
+        assert!(
+            result.is_ok(),
+            "full per-shard coverage must accept a multi-shard runtime, got {:?}",
+            result.err()
+        );
     }
 }

@@ -179,6 +179,10 @@ struct Inner {
     connector_dispatched: Counter,
     connector_poisoned: Counter,
     connector_lag: Gauge,
+    // Issue #1429: the dispatch background publisher's dropped-hint counter
+    // already exists (`dispatch::dropped_hints()`); without an override here
+    // it stays invisible to the built-in scrape endpoint.
+    dispatch_dropped_hints: Gauge,
 }
 
 /// In-process aggregator for the built-in Prometheus scrape endpoint
@@ -351,6 +355,11 @@ impl MetricsRecorder for HarvestMetricsRecorder {
         self.0
             .dlq_entries
             .set(vec![shard.to_string()], depth as f64);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_dispatch_dropped_hints(&self, total: u64) {
+        self.0.dispatch_dropped_hints.set(Vec::new(), total as f64);
     }
 
     fn record_schedule_run(&self, kind: &str, name: &str) {
@@ -688,6 +697,13 @@ fn push_sampler_adjacent_metrics(families: &mut Vec<MetricFamily>, inner: &Inner
         &[METRIC_LABEL_KIND, METRIC_LABEL_NAME],
         inner.schedule_overdue.snapshot(),
     );
+    push_gauge(
+        families,
+        "harvest_dispatch_dropped_hints",
+        "Cumulative dispatch hints dropped because the background publisher queue was full",
+        &[],
+        inner.dispatch_dropped_hints.snapshot(),
+    );
 }
 
 /// Broker-connector families (issue #944).
@@ -1021,6 +1037,24 @@ mod tests {
             sample_value(f, &[("kind", "workflow"), ("name", "foo")]),
             0.0
         );
+    }
+
+    #[test]
+    fn dispatch_dropped_hints_is_an_unlabeled_last_write_wins_gauge() {
+        // Issue #1429: the dispatch background publisher already counts
+        // dropped hints (`dispatch::dropped_hints()`); this pins that the
+        // built-in scrape recorder renders it, and that a later sample
+        // replaces the earlier one rather than summing.
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_dispatch_dropped_hints(3);
+        recorder.record_dispatch_dropped_hints(5);
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_dispatch_dropped_hints");
+        assert_eq!(f.kind, MetricKind::Gauge);
+        assert_eq!(f.samples.len(), 1);
+        assert_eq!(f.samples[0].labels.len(), 0);
+        assert_eq!(f.samples[0].value, 5.0);
     }
 
     #[test]

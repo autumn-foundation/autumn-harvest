@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use autumn_harvest::dispatch::DEFAULT_DISPATCH_RECONCILE_BATCH;
 use autumn_web::config::{ConfigError, DatabaseConfig, Env, OsEnv};
 use serde::Deserialize;
 
@@ -80,6 +81,8 @@ pub struct HarvestRedisConfig {
     pub poll_interval_ms: u64,
     /// Interval for the reconcile sweep over due `PENDING` rows.
     pub reconcile_interval_ms: u64,
+    /// Row cap for one reconcile sweep per queue (issue #1429).
+    pub reconcile_batch: usize,
 }
 
 /// What to do when workflow-type reachability finds an orphaned type at
@@ -224,6 +227,9 @@ impl HarvestRuntimeConfig {
         if let Some(reconcile_interval_ms) = partial.redis.reconcile_interval_ms {
             self.redis.reconcile_interval_ms = reconcile_interval_ms;
         }
+        if let Some(reconcile_batch) = partial.redis.reconcile_batch {
+            self.redis.reconcile_batch = reconcile_batch;
+        }
     }
 
     fn apply_env_overrides(&mut self, env: &dyn Env) -> Result<(), ConfigError> {
@@ -326,6 +332,10 @@ impl HarvestRuntimeConfig {
                 "AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS",
                 &reconcile_interval_ms,
             )?;
+        }
+        if let Ok(reconcile_batch) = env.var("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH") {
+            self.redis.reconcile_batch =
+                parse_usize("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH", &reconcile_batch)?;
         }
 
         Ok(())
@@ -433,6 +443,11 @@ impl HarvestRuntimeConfig {
         if self.redis.reconcile_interval_ms < 1 {
             return Err(ConfigError::Validation(
                 "harvest.redis.reconcile_interval_ms must be at least 1".to_owned(),
+            ));
+        }
+        if self.redis.reconcile_batch < 1 {
+            return Err(ConfigError::Validation(
+                "harvest.redis.reconcile_batch must be at least 1".to_owned(),
             ));
         }
 
@@ -557,6 +572,7 @@ impl Default for HarvestRedisConfig {
             visibility_timeout_ms: 60_000,
             poll_interval_ms: 20,
             reconcile_interval_ms: 1_000,
+            reconcile_batch: DEFAULT_DISPATCH_RECONCILE_BATCH,
         }
     }
 }
@@ -652,6 +668,7 @@ struct PartialHarvestRedisConfig {
     visibility_timeout_ms: Option<u64>,
     poll_interval_ms: Option<u64>,
     reconcile_interval_ms: Option<u64>,
+    reconcile_batch: Option<usize>,
 }
 
 fn find_config_file_named(filename: &str, env: &dyn Env) -> PathBuf {
@@ -803,6 +820,12 @@ fn parse_u64(key: &str, value: &str) -> Result<u64, ConfigError> {
 fn parse_u32(key: &str, value: &str) -> Result<u32, ConfigError> {
     value
         .parse::<u32>()
+        .map_err(|_| ConfigError::Validation(format!("invalid integer for {key}: {value:?}")))
+}
+
+fn parse_usize(key: &str, value: &str) -> Result<usize, ConfigError> {
+    value
+        .parse::<usize>()
         .map_err(|_| ConfigError::Validation(format!("invalid integer for {key}: {value:?}")))
 }
 
@@ -1112,6 +1135,7 @@ orphaned_workflows = "explode"
         assert_eq!(config.redis.visibility_timeout_ms, 60_000);
         assert_eq!(config.redis.poll_interval_ms, 20);
         assert_eq!(config.redis.reconcile_interval_ms, 1_000);
+        assert_eq!(config.redis.reconcile_batch, DEFAULT_DISPATCH_RECONCILE_BATCH);
     }
 
     #[test]
@@ -1126,6 +1150,7 @@ consumer_group = "acme_workers"
 visibility_timeout_ms = 30000
 poll_interval_ms = 5
 reconcile_interval_ms = 250
+reconcile_batch = 500
 "#,
         );
         let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
@@ -1138,6 +1163,7 @@ reconcile_interval_ms = 250
         assert_eq!(config.redis.visibility_timeout_ms, 30_000);
         assert_eq!(config.redis.poll_interval_ms, 5);
         assert_eq!(config.redis.reconcile_interval_ms, 250);
+        assert_eq!(config.redis.reconcile_batch, 500);
     }
 
     #[test]
@@ -1156,7 +1182,8 @@ key_prefix = "from_toml"
             .with("AUTUMN_HARVEST_REDIS__CONSUMER_GROUP", "env_workers")
             .with("AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS", "15000")
             .with("AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS", "40")
-            .with("AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS", "2000");
+            .with("AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS", "2000")
+            .with("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH", "750");
 
         let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
 
@@ -1165,6 +1192,7 @@ key_prefix = "from_toml"
         assert_eq!(config.redis.visibility_timeout_ms, 15_000);
         assert_eq!(config.redis.poll_interval_ms, 40);
         assert_eq!(config.redis.reconcile_interval_ms, 2_000);
+        assert_eq!(config.redis.reconcile_batch, 750);
     }
 
     #[test]
@@ -1201,6 +1229,19 @@ key_prefix = "from_toml"
                 .to_string()
                 .contains("harvest.redis.reconcile_interval_ms"),
             "expected a redis reconcile_interval_ms validation error, got {error}"
+        );
+    }
+
+    #[test]
+    fn harvest_config_redis_rejects_a_zero_reconcile_batch() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH", "0");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a zero reconcile batch must fail validation");
+
+        assert!(
+            error.to_string().contains("harvest.redis.reconcile_batch"),
+            "expected a redis reconcile_batch validation error, got {error}"
         );
     }
 

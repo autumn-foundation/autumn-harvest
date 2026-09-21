@@ -1084,7 +1084,10 @@ async fn commit_workflow_execution_timeout(
     Vec<(ExecutionId, String)>,
     Vec<crate::execution::StartCancelledRun>,
 )> {
-    Box::pin(conn.transaction::<(
+    // `wake_parent_for_child_timeout` below raises a dispatch hint (issue
+    // #1429). The scope ties its publish to this transaction's commit, so
+    // a reader never probes a parent row before it is visible.
+    crate::dispatch::buffered_settled(Box::pin(conn.transaction::<(
         bool,
         Vec<crate::completion_trigger::DeferredTriggerStart>,
         Vec<(ExecutionId, String)>,
@@ -1161,7 +1164,7 @@ async fn commit_workflow_execution_timeout(
             .await?;
         deferred.extend(triggers);
         Ok((true, deferred, closed_children, pending_cancel_metrics))
-    }))
+    })))
     .await
 }
 
@@ -1195,7 +1198,9 @@ async fn enforce_activity_timeout(
     // `default_transaction_isolation = repeatable read` on the database or the
     // role disable the guarantee from outside this code.
     let mut tx = conn.build_transaction().read_committed();
-    let enforced = Box::pin(tx.run::<bool, HarvestError, _>(async |conn| {
+    // `wake_workflow_task` below raises a dispatch hint (issue #1429). The
+    // scope ties its publish to this transaction's commit.
+    let enforced = crate::dispatch::buffered_settled(Box::pin(tx.run::<bool, HarvestError, _>(async |conn| {
         let error = error.clone();
 
         // Authoritative QUEUE-pause re-check (issue #619). The scan predicate
@@ -1400,7 +1405,7 @@ async fn enforce_activity_timeout(
         queue::fail_task(conn, task.id, &error).await?;
         queue::wake_workflow_task(conn, exec_id).await?;
         Ok(true)
-    }))
+    })))
     .await?;
 
     // Circuit breaker (issue #369): a start-to-close / heartbeat timeout against
@@ -1602,7 +1607,9 @@ pub async fn force_fail_activity(
     let exec_id = execution_id_from_uuid(workflow_exec_id);
     let reason = reason.map(str::to_owned);
 
-    Box::pin(
+    // `wake_workflow_task` below raises a dispatch hint (issue #1429). The
+    // scope ties its publish to this transaction's commit.
+    crate::dispatch::buffered_settled(Box::pin(
         conn.transaction::<ForceFailActivityOutcome, HarvestError, _>(async |conn| {
             // Lock ordering (harvest_task_queue convention, see the comment in
             // `enforce_external_task_timeouts`): execution row FIRST, then the
@@ -1766,7 +1773,7 @@ pub async fn force_fail_activity(
                 already_forced: false,
             })
         }),
-    )
+    ))
     .await
 }
 
@@ -1788,7 +1795,9 @@ async fn enforce_workflow_timeout(
     // review). Without it, a `repeatable read` session default lets this
     // enforcer time out the whole execution after a pause was acknowledged.
     let mut tx = conn.build_transaction().read_committed();
-    let enforced = Box::pin(tx.run::<_, HarvestError, _>(async |conn| {
+    // `wake_parent_for_child_timeout` below raises a dispatch hint (issue
+    // #1429). The scope ties its publish to this transaction's commit.
+    let enforced = crate::dispatch::buffered_settled(Box::pin(tx.run::<_, HarvestError, _>(async |conn| {
         // Authoritative QUEUE-pause re-check (issue #619), the exact mirror of
         // the one in `enforce_activity_timeout` — see that function for the full
         // rationale on why an advisory lock (not a bare re-read) is required and
@@ -1899,7 +1908,7 @@ async fn enforce_workflow_timeout(
             closed_children,
             pending_cancel_metrics,
         )))
-    }))
+    })))
     .await?;
 
     // Suppressed by a queue pause: nothing was written, so there is nothing to
@@ -2025,7 +2034,9 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
             timeout_type: TimeoutType::ScheduleToClose,
         };
 
-        let result = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+        // `wake_workflow_task` below raises a dispatch hint (issue #1429).
+        // The scope ties its publish to this transaction's commit.
+        let result = crate::dispatch::buffered_settled(Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
             // Per-table lock-ordering convention (issue #609
             // post-review hardening, third bot-review round):
             //
@@ -2129,7 +2140,7 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
             store::append_single_event(conn, exec_id, timeout_event).await?;
             queue::wake_workflow_task(conn, exec_id).await?;
             Ok(true)
-        }))
+        })))
         .await;
 
         match result {
@@ -3167,7 +3178,10 @@ pub async fn enforce_external_signals_outbox(
         let codecs_clone = codecs.clone();
         let excluded_clone = excluded_event_ids.clone();
 
-        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = Box::pin(conn
+        // The terminal-event append below can raise a dispatch hint through
+        // `wake_workflow_task` (issue #1429). The scope ties its publish to
+        // this step transaction's commit.
+        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = crate::dispatch::buffered_settled(Box::pin(conn
             .transaction::<Option<(bool, Option<i64>)>, HarvestError, _>(async |conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
@@ -3401,7 +3415,7 @@ pub async fn enforce_external_signals_outbox(
                 } else {
                     Ok(Some((false, Some(row.id))))
                 }
-            }))
+            })))
             .await;
 
         match step_res {
@@ -3675,7 +3689,10 @@ pub async fn enforce_external_cancels_outbox(
         let codecs_clone = codecs.clone();
         let excluded_clone = excluded_event_ids.clone();
 
-        let step_res: Result<Option<CancelStepOutcome>, HarvestError> = Box::pin(conn
+        // The terminal-event append below can raise a dispatch hint through
+        // `wake_workflow_task` (issue #1429). The scope ties its publish to
+        // this step transaction's commit.
+        let step_res: Result<Option<CancelStepOutcome>, HarvestError> = crate::dispatch::buffered_settled(Box::pin(conn
             .transaction::<Option<CancelStepOutcome>, HarvestError, _>(async |conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
@@ -4056,7 +4073,7 @@ pub async fn enforce_external_cancels_outbox(
                 } else {
                     Ok(Some((false, Some(row.id), deferred_starts, cancel_metrics, deferred_checks, caller_shard)))
                 }
-            }))
+            })))
             .await;
 
         match step_res {
@@ -4336,7 +4353,10 @@ pub async fn enforce_external_awaits_outbox(
         let codecs_clone = codecs.clone();
         let excluded_clone = excluded_event_ids.clone();
 
-        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = Box::pin(conn
+        // The terminal-event append below can raise a dispatch hint through
+        // `wake_workflow_task` (issue #1429). The scope ties its publish to
+        // this step transaction's commit.
+        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = crate::dispatch::buffered_settled(Box::pin(conn
             .transaction::<Option<(bool, Option<i64>)>, HarvestError, _>(async |conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
@@ -4565,7 +4585,7 @@ pub async fn enforce_external_awaits_outbox(
                 } else {
                     Ok(Some((false, Some(row.id))))
                 }
-            }))
+            })))
             .await;
 
         match step_res {
@@ -5150,8 +5170,11 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
         let workflow_name = row.workflow_name.clone();
         let queue_name = row.queue_name.clone();
 
+        // `wake_parent_for_child_timeout` below raises a dispatch hint
+        // (issue #1429). The scope ties its publish to this transaction's
+        // commit.
         let (applied, deferred_starts, closed_children, pending_cancel_metrics) =
-            Box::pin(conn.transaction::<(
+            crate::dispatch::buffered_settled(Box::pin(conn.transaction::<(
                 bool,
                 Vec<crate::completion_trigger::DeferredTriggerStart>,
                 Vec<(ExecutionId, String)>,
@@ -5232,7 +5255,7 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
                     .await?;
                 deferred.extend(triggers);
                 Ok((true, deferred, closed_children, pending_cancel_metrics))
-            }))
+            })))
             .await?;
 
         if !applied {

@@ -2062,8 +2062,11 @@ impl PendingHintRow {
             queue_name: self.queue_name,
             scheduled_at: self.scheduled_at,
             priority: self.priority,
-            // v1 rejects Redis dispatch on a sharded runtime at validation, so
-            // a hint never has to name a shard. The field carries the follow-up.
+            // A multi-shard runtime routes by installed CHANNEL, not by this
+            // field (issue #1429): each shard gets its own per-shard channel
+            // and key family, so a reference published into it already
+            // carries an unambiguous shard identity by construction. This
+            // hint-level field stays unset; nothing reads it yet.
             shard: None,
             kind: Some(crate::dispatch::DispatchKind::from(self.task_type.as_str())),
         }
