@@ -17,6 +17,7 @@ to wire into CI as a gate.
 | `openapi-response-coverage.py` | The API contract against the handlers it describes: every `StatusCode::` a handler or the helpers it calls returns is declared for that route, every request-body field that is mandatory on the wire is marked required, every field serde accepts is documented, and every query key a hand-rolled parser matches is documented | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `comment-hygiene.py` | Comment defects across every `*.rs`: commented-out code, unreferenced TODOs, narrative asides, blank block edges (all gated at zero), plus review-round archaeology, contractions and over-long sentences (ratcheted against the merge base, so a change may not add one to a file it touches) | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `audit-catalog-coverage.py` | Every `*.py` script in `docs/audits/` has a row in this table | Yes — `.github/workflows/ci.yml`, `lint` job |
+| `quota-lock-ordering-sync.py` | `resolve_quota_lock_ids`, `order_rows_by_quota_lock_id`, and `snapshot_quota_policies` stay byte-identical between `autumn-harvest/src/debounce.rs` and `autumn-harvest/src/throttle.rs` — a clone class (issue #1230 Finding 2) an Echo duplication survey (issue #1695) found below the project's merge bar (2 instances, no missed-fix defect on record), linked instead of merged | Yes — `.github/workflows/ci.yml`, `lint` job |
 
 ## Comment hygiene: the two tiers
 
