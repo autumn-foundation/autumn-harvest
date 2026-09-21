@@ -81,6 +81,18 @@
 //!   not a cluster-aware client. It does not yet follow `MOVED`/`ASK`
 //!   redirects across a multi-node Cluster deployment. The hash tags remove
 //!   the `CROSSSLOT` failure. A cluster-aware client is a separate follow-up.
+//! - **Upgrading from a pre-#1429 deployment leaves old keys behind.** Every
+//!   dispatch key moved from `{prefix}:dispatch:{queue}...` to the tagged
+//!   `{prefix:dispatch:queue}...` form above. No code reads the old,
+//!   untagged names any more. An old worker's live stream, delayed-set and
+//!   payload entries at those keys are therefore orphaned once every old
+//!   worker has stopped. Unlike the dedupe marker, they carry no TTL. No
+//!   task is lost: Postgres stays the source of truth, and the reconcile
+//!   sweep republishes every `PENDING` row under the new keys regardless.
+//!   The old keys just sit there. An operator upgrading a deployment with
+//!   a large backlog should `SCAN` for the old `{prefix}:dispatch:*`
+//!   pattern and `DEL` what it finds. Do that once no old worker is still
+//!   running.
 //! - **No TLS.** A `rediss://` URL is rejected at `connect` with a message
 //!   that says so. The `redis` client's TLS stack depends on an unmaintained
 //!   crate that the dependency ledger refuses. This is not one of issue
