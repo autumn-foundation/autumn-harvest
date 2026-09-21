@@ -1087,9 +1087,16 @@ fn absence_is_decisive_loss(
     // decisive loss instead of proof of life. Floor it at zero: a
     // negative tolerance means "no tolerance", not "invert the check".
     let max_skew_secs = max_skew_secs.max(0);
+    // A very large positive value can still overflow `Duration::seconds`'s
+    // representable range and panic (Codex follow-up). That would abort
+    // the whole verify run instead of returning an undetermined report.
+    // Fall back to the largest representable tolerance instead. An
+    // out-of-range request means "tolerate anything." That is the safe
+    // reading of an unbounded skew allowance, not a crash.
+    let max_skew = chrono::Duration::try_seconds(max_skew_secs).unwrap_or(chrono::Duration::MAX);
     matches!(
         target_latest_event_at,
-        Some(latest) if fired_at - latest > chrono::Duration::seconds(max_skew_secs)
+        Some(latest) if fired_at - latest > max_skew
     )
 }
 
@@ -4430,6 +4437,26 @@ mod tests {
             absence_is_decisive_loss(fired_at, Some(fired_at - chrono::Duration::seconds(1)), -60),
             "a negative tolerance floors to zero, so any positive gap is still \
              decisive loss"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
+    fn absence_is_decisive_loss_clamps_a_skew_tolerance_too_large_for_a_chrono_duration() {
+        // `VerifyOptions::max_skew_secs` is a public, unvalidated field
+        // (Codex follow-up). `chrono::Duration::seconds` panics when its
+        // argument overflows the representable range. This must return a
+        // finding instead of aborting the whole verify run.
+        let fired_at = Utc::now();
+
+        assert!(
+            !absence_is_decisive_loss(
+                fired_at,
+                Some(fired_at - chrono::Duration::seconds(30)),
+                i64::MAX
+            ),
+            "an out-of-range tolerance means \"treat as unbounded,\" so a \
+             small gap must still read as proof of life, not a panic"
         );
     }
 
