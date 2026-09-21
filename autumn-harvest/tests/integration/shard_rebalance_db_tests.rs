@@ -473,7 +473,10 @@ async fn legal_hold_set_at_of(
 
 /// `harvest_workflow_executions.legal_hold_reason`, `NULL` when no hold is
 /// recorded on this row.
-async fn legal_hold_reason_of(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Option<String> {
+async fn legal_hold_reason_of(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> Option<String> {
     let row: Option<ScalarText> = diesel::sql_query(
         "SELECT legal_hold_reason AS value FROM harvest_workflow_executions WHERE id = $1",
     )
@@ -6461,15 +6464,15 @@ async fn release_legal_hold_forwarded_clears_the_hold_on_the_live_copy_after_a_c
 }
 
 /// Lock the row so a concurrent cutover queues behind it, spawn `cutover`
-/// (which also queues), release the lock, confirm the cutover sealed the
-/// row, and return the write task `spawn_after_cutover_queued` spawned --
-/// the shared setup half of the two tests below.
+/// (which also queues), release the lock, and confirm the cutover sealed
+/// the row. Then return the write task `spawn_after_cutover_queued`
+/// spawned -- the shared setup half of the two tests below.
 ///
-/// `cutover` is spawned strictly before `spawn_after_cutover_queued` runs,
-/// so a lock waiter its returned task starts queues behind cutover and is
-/// granted the row only once the seal has already committed. Returning the
-/// caller's `JoinHandle` (rather than awaiting it here) lets the caller
-/// unwrap its own result with its own error message.
+/// `cutover` is spawned strictly before `spawn_after_cutover_queued` runs.
+/// A lock waiter its returned task starts therefore queues behind cutover,
+/// and is granted the row only once the seal has already committed.
+/// Returning the caller's `JoinHandle` (rather than awaiting it here) lets
+/// the caller unwrap its own result with its own error message.
 async fn seal_mid_flight<F, T>(
     shards: &TwoShards,
     exec_id: ExecutionId,
@@ -6483,10 +6486,12 @@ where
     let (release_lock_tx, release_lock_rx) = tokio::sync::oneshot::channel();
     let holder_task = tokio::spawn(async move {
         Box::pin(holder.transaction::<(), HarvestError, _>(async |conn| {
-            diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
-                .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-                .execute(&mut *conn)
-                .await?;
+            diesel::sql_query(
+                "SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .execute(&mut *conn)
+            .await?;
             let _ = lock_held_tx.send(());
             let _ = release_lock_rx.await;
             Ok(())
@@ -6519,10 +6524,11 @@ where
 
 #[tokio::test]
 async fn set_legal_hold_forwarded_recovers_from_a_seal_mid_flight() {
-    // Issue #1405 follow-up review: the four tests above prove the core
-    // refusal and prove the forwarded wrapper works when called AFTER a
-    // migration has already settled -- neither exercises the wrapper's own
-    // retry loop actually catching a refusal and looping. This test does:
+    // Issue #1405 follow-up review. The four tests above prove the core
+    // refusal. They also prove the forwarded wrapper works when called
+    // AFTER a migration has already settled. Neither exercises the
+    // wrapper's own retry loop actually catching a refusal and looping.
+    // This test does:
     // the wrapper's first resolution happens before the seal, its first
     // `FOR UPDATE` is granted after it, and it must recover on its own.
     let shards = setup_two_shards().await;

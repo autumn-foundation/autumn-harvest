@@ -4576,8 +4576,8 @@ mod db {
     /// be simpler or safer.
     ///
     /// Also returns the shard the write landed on (issue #1405 follow-up
-    /// review), so a caller that must attribute a follow-up action -- an
-    /// audit log, say -- to a shard does not pay for a second resolution.
+    /// review). A caller that must attribute a follow-up action -- an audit
+    /// log, say -- to a shard does not pay for a second resolution.
     ///
     /// # Errors
     ///
@@ -4616,8 +4616,8 @@ mod db {
     /// seal (issue #1405).
     ///
     /// See [`set_legal_hold_forwarded`] for the shape of the race this
-    /// closes, why each attempt re-resolves from scratch, and why the
-    /// landing shard is returned alongside the outcome.
+    /// closes and why each attempt re-resolves from scratch. The landing
+    /// shard is returned alongside the outcome for the same reason.
     ///
     /// # Errors
     ///

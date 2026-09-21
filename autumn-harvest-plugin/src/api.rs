@@ -24041,12 +24041,11 @@ async fn set_legal_hold_handler(
     // scratch. On refusal or a genuine error nothing committed, so falling
     // back to the usual resolution is fine.
     let audit_conn = match &result {
-        Ok((_, shard)) => ::autumn_harvest::shard_rebalance::conn_for_shard(
-            pool.sharded_pool(),
-            *shard,
-        )
-        .await
-        .ok(),
+        Ok((_, shard)) => {
+            ::autumn_harvest::shard_rebalance::conn_for_shard(pool.sharded_pool(), *shard)
+                .await
+                .ok()
+        }
         Err(_) => db_conn_for_execution(&api_state, exec_id).await.ok(),
     };
     if let Some(mut conn) = audit_conn {
@@ -24111,12 +24110,11 @@ async fn release_legal_hold_handler(
     // Best-effort, on its own connection. See the same-shaped comment in
     // set_legal_hold_handler.
     let audit_conn = match &result {
-        Ok((_, shard)) => ::autumn_harvest::shard_rebalance::conn_for_shard(
-            pool.sharded_pool(),
-            *shard,
-        )
-        .await
-        .ok(),
+        Ok((_, shard)) => {
+            ::autumn_harvest::shard_rebalance::conn_for_shard(pool.sharded_pool(), *shard)
+                .await
+                .ok()
+        }
         Err(_) => db_conn_for_execution(&api_state, exec_id).await.ok(),
     };
     if let Some(mut conn) = audit_conn {
