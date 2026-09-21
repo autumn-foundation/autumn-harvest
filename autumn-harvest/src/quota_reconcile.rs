@@ -312,13 +312,27 @@ struct CandidateRow {
 ///
 /// Measured against production-shaped fixtures (issue #1226 follow-up,
 /// see `docs/performance-quota-reconcile-candidate-scan.md`). The
-/// residual filter costs at most a few thousand cache-hit buffers at
-/// moderate non-quota'd population sizes. Above roughly 100,000 such
-/// rows, the planner switches to a cheaper plan through the unrelated,
-/// pre-existing `idx_harvest_wfx_workflow_identity` index. The rejected
-/// `(workflow_name, id)` index was tested directly too. It gives no
-/// meaningful buffer reduction over that existing plan. No code change
-/// is warranted.
+/// residual filter cost is real. It grows with the non-quota'd
+/// population: about 3,800 buffers at 20,000 such rows. It reaches about
+/// 98,000 buffers, and a 148ms single-batch execution time, at 500,000.
+/// That is once the quota'd workflow type also carries its own realistic
+/// terminal history. `idx_harvest_wfx_workflow_identity` does not rescue
+/// this in practice. It is a full index, so it pays for that terminal
+/// history too.
+///
+/// The rejected `(workflow_name, id)` index was built and tested
+/// directly. It does not help either, for a distinct, specific reason.
+/// Postgres does not use a leading-column index for ordered access under
+/// `= ANY($1)`, only under a plain `=`. The same index against the same
+/// fixture drops the cost from about 98,000 buffers to about 200 under a
+/// literal `workflow_name = $1` rewrite.
+///
+/// A structural fix exists in principle: one bounded, ordered scan per
+/// registered quota'd workflow name, merged by `id`. Changing this
+/// function's shape from one static query to a dynamic per-name form is
+/// not a mechanical rewrite, though. It touches the keyset cursor's
+/// anti-starvation guarantee this module's doc comment describes at
+/// length, and needs a human decision. No fix ships in this pass.
 ///
 /// `AND ($2::uuid IS NULL OR id > $2) ORDER BY id LIMIT $3` is a keyset
 /// cursor, not a bare `LIMIT`. A row this sweep can never resolve --

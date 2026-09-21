@@ -1,22 +1,14 @@
 -- SAME unmodified CANDIDATE_SQL, with the migration comment's rejected (workflow_name, id) partial index also present @ noise=500000 -- shows whether the planner would even choose it --
-Limit  (cost=3176.08..3176.58 rows=200 width=58) (actual time=0.385..0.404 rows=200 loops=1)
+Limit  (cost=0.42..366.65 rows=200 width=58) (actual time=0.174..65.741 rows=200 loops=1)
   Output: id, workflow_name, input
-  Buffers: shared hit=23 read=9
-  ->  Sort  (cost=3176.08..3178.63 rows=1017 width=58) (actual time=0.384..0.391 rows=200 loops=1)
+  Buffers: shared hit=97781 read=10
+  ->  Index Scan using idx_harvest_we_quota_reconcile_candidates on public.harvest_workflow_executions  (cost=0.42..70472.80 rows=38486 width=58) (actual time=0.173..65.695 rows=200 loops=1)
         Output: id, workflow_name, input
-        Sort Key: harvest_workflow_executions.id
-        Sort Method: top-N heapsort  Memory: 71kB
-        Buffers: shared hit=23 read=9
-        ->  Bitmap Heap Scan on public.harvest_workflow_executions  (cost=36.30..3132.13 rows=1017 width=58) (actual time=0.074..0.193 rows=1000 loops=1)
-              Output: id, workflow_name, input
-              Recheck Cond: ((harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[])) AND (harvest_workflow_executions.quota_key IS NULL) AND (harvest_workflow_executions.state = ANY ('{RUNNING,PAUSED}'::text[])))
-              Heap Blocks: exact=23
-              Buffers: shared hit=23 read=9
-              ->  Bitmap Index Scan on idx_ledger_experiment_we_quota_reconcile_by_name_id  (cost=0.00..36.05 rows=1017 width=0) (actual time=0.064..0.065 rows=1000 loops=1)
-                    Index Cond: (harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[]))
-                    Buffers: shared read=9
-Query Identifier: -6117039850821027187
+        Filter: (harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[]))
+        Rows Removed by Filter: 97127
+        Buffers: shared hit=97781 read=10
+Query Identifier: 2386123318688224501
 Planning:
-  Buffers: shared hit=79 read=1
-Planning Time: 0.585 ms
-Execution Time: 0.438 ms
+  Buffers: shared hit=60 read=28
+Planning Time: 0.676 ms
+Execution Time: 65.780 ms

@@ -1,23 +1,14 @@
 -- CANDIDATE_SQL @ target=1000 rows / noise=500000 rows across 50 non-quota'd workflow types, first tick (after_id=NULL, batch_size=200) --
-Limit  (cost=2923.93..2924.43 rows=200 width=58) (actual time=0.660..0.687 rows=200 loops=1)
+Limit  (cost=0.42..364.52 rows=200 width=58) (actual time=0.818..148.231 rows=200 loops=1)
   Output: id, workflow_name, input
-  Buffers: shared hit=2 read=33 written=33
-  ->  Sort  (cost=2923.93..2926.01 rows=834 width=58) (actual time=0.658..0.674 rows=200 loops=1)
+  Buffers: shared hit=86809 read=10982 written=10838
+  ->  Index Scan using idx_harvest_we_quota_reconcile_candidates on public.harvest_workflow_executions  (cost=0.42..70447.81 rows=38697 width=58) (actual time=0.816..148.139 rows=200 loops=1)
         Output: id, workflow_name, input
-        Sort Key: harvest_workflow_executions.id
-        Sort Method: top-N heapsort  Memory: 71kB
-        Buffers: shared hit=2 read=33 written=33
-        ->  Bitmap Heap Scan on public.harvest_workflow_executions  (cost=47.52..2887.88 rows=834 width=58) (actual time=0.110..0.423 rows=1000 loops=1)
-              Output: id, workflow_name, input
-              Recheck Cond: (harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[]))
-              Filter: ((harvest_workflow_executions.quota_key IS NULL) AND (harvest_workflow_executions.state = ANY ('{RUNNING,PAUSED}'::text[])))
-              Heap Blocks: exact=23
-              Buffers: shared hit=2 read=33 written=33
-              ->  Bitmap Index Scan on idx_harvest_wfx_workflow_identity  (cost=0.00..47.31 rows=918 width=0) (actual time=0.094..0.094 rows=1000 loops=1)
-                    Index Cond: (harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[]))
-                    Buffers: shared hit=2 read=10 written=10
-Query Identifier: -6117039850821027187
+        Filter: (harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[]))
+        Rows Removed by Filter: 97127
+        Buffers: shared hit=86809 read=10982 written=10838
+Query Identifier: 2386123318688224501
 Planning:
-  Buffers: shared hit=207 read=57 written=19
-Planning Time: 1.043 ms
-Execution Time: 0.721 ms
+  Buffers: shared hit=211 read=57
+Planning Time: 1.183 ms
+Execution Time: 148.285 ms

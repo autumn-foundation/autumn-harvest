@@ -28,7 +28,12 @@
 //! workflow type (`billing_saga`, policy key `tenant_id`) has a small,
 //! fixed pre-upgrade backfill population. That population is 1,000
 //! `RUNNING`/`PAUSED` rows with `quota_key IS NULL`, matching the issue
-//! #1226 rollout-window scenario.
+//! #1226 rollout-window scenario. [`TARGET_TERMINAL`] adds 50,000 of its
+//! own terminal rows too — a realistic accumulated history for a
+//! workflow type important enough to have a declared `QuotaPolicy`.
+//! `idx_harvest_wfx_workflow_identity` is not partial by state, so this
+//! history matters directly to this file's measurement; see
+//! [`TARGET_TERMINAL`]'s doc comment.
 //!
 //! Alongside it sits a large population of 50 distinct NON-quota'd
 //! workflow types with no declared `QuotaPolicy`. Those rows are also
@@ -69,6 +74,12 @@ use super::claim_bench_support::db;
 
 const NOISE_SWEEP: [i64; 3] = [20_000, 100_000, 500_000];
 const TARGET_ACTIVE: i64 = 1_000;
+/// `idx_harvest_wfx_workflow_identity` is NOT partial by state. A busy
+/// quota'd workflow type accumulates terminal history of its own, and any
+/// plan that seeks through that index scans this history too. Fixed
+/// (independent of [`NOISE_SWEEP`]) so its effect isolates from the noise
+/// population's effect (issue #1226 follow-up review, PR #1691).
+const TARGET_TERMINAL: i64 = 50_000;
 const TARGET_WORKFLOW: &str = "billing_saga";
 const NOISE_WORKFLOW_TYPES: i64 = 50;
 const SHARD: Option<ShardId> = Some(ShardId::new(0));
@@ -170,6 +181,18 @@ async fn seed_fixture(conn: &mut diesel_async::AsyncPgConnection, noise_count: i
     .execute(conn)
     .await
     .expect("seed target workflow rows");
+
+    diesel::sql_query(format!(
+        "INSERT INTO harvest_workflow_executions \
+           (id, workflow_name, workflow_id, shard_id, state, input, quota_key) \
+         SELECT gen_random_uuid(), '{TARGET_WORKFLOW}', 'target-terminal-' || i, 0, \
+                'COMPLETED', jsonb_build_object('tenant_id', 'tenant_' || (i % 500)), \
+                'tenant_' || (i % 500) \
+         FROM generate_series(1, {TARGET_TERMINAL}) AS i"
+    ))
+    .execute(conn)
+    .await
+    .expect("seed target workflow terminal history");
 
     diesel::sql_query(format!(
         "INSERT INTO harvest_workflow_executions \

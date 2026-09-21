@@ -1,23 +1,14 @@
 -- CANDIDATE_SQL @ target=1000 rows / noise=100000 rows across 50 non-quota'd workflow types, first tick (after_id=NULL, batch_size=200) --
-Limit  (cost=1939.15..1939.65 rows=200 width=58) (actual time=0.667..0.700 rows=200 loops=1)
+Limit  (cost=0.42..159.18 rows=200 width=59) (actual time=0.141..11.723 rows=200 loops=1)
   Output: id, workflow_name, input
-  Buffers: shared hit=35
-  ->  Sort  (cost=1939.15..1941.34 rows=874 width=58) (actual time=0.666..0.676 rows=200 loops=1)
+  Buffers: shared hit=20141
+  ->  Index Scan using idx_harvest_we_quota_reconcile_candidates on public.harvest_workflow_executions  (cost=0.42..17538.87 rows=22094 width=59) (actual time=0.140..11.700 rows=200 loops=1)
         Output: id, workflow_name, input
-        Sort Key: harvest_workflow_executions.id
-        Sort Method: top-N heapsort  Memory: 70kB
-        Buffers: shared hit=35
-        ->  Bitmap Heap Scan on public.harvest_workflow_executions  (cost=47.82..1901.38 rows=874 width=58) (actual time=0.098..0.401 rows=1000 loops=1)
-              Output: id, workflow_name, input
-              Recheck Cond: (harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[]))
-              Filter: ((harvest_workflow_executions.quota_key IS NULL) AND (harvest_workflow_executions.state = ANY ('{RUNNING,PAUSED}'::text[])))
-              Heap Blocks: exact=23
-              Buffers: shared hit=35
-              ->  Bitmap Index Scan on idx_harvest_wfx_workflow_identity  (cost=0.00..47.60 rows=958 width=0) (actual time=0.081..0.082 rows=1000 loops=1)
-                    Index Cond: (harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[]))
-                    Buffers: shared hit=12
-Query Identifier: -6117039850821027187
+        Filter: (harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[]))
+        Rows Removed by Filter: 19839
+        Buffers: shared hit=20141
+Query Identifier: 2386123318688224501
 Planning:
-  Buffers: shared hit=245 read=21
-Planning Time: 1.472 ms
-Execution Time: 0.740 ms
+  Buffers: shared hit=248 read=20
+Planning Time: 1.052 ms
+Execution Time: 11.751 ms
