@@ -43480,14 +43480,19 @@ async fn stream_execution_events(
     // client last saw it. Only this connection's own `id` sequence is
     // meaningful to the backfill query below. Falls open to -1 (from the
     // start, bounded by the buffer-depth cap below) when no cursor was
-    // sent. It also falls open when the cursor names no event on this
-    // shard. This mirrors the fallback the live-tail rebind below uses.
+    // sent. It also falls open on `Ok(None)`, when the cursor names no
+    // event on this shard.
+    //
+    // A real `Err` is a different case (Codex review, P2): the connection
+    // is still usable but the lookup itself failed. The response has not
+    // started yet at this point, so return the database error instead of
+    // masking it as "no cursor". Silently falling open here would resend
+    // the client its full history, not merely miss a resume optimization.
     let last_row_id: i64 = match last_event_id {
-        Some(event_id) => store::row_id_for_event_id(&mut conn, exec_id, event_id)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(-1),
+        Some(event_id) => match store::row_id_for_event_id(&mut conn, exec_id, event_id).await {
+            Ok(row_id) => row_id.unwrap_or(-1),
+            Err(e) => return map_error(e).into_response(),
+        },
         None => -1,
     };
 
