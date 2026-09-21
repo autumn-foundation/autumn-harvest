@@ -294,6 +294,75 @@ pub(crate) struct WorkflowDetailParams {
     /// `info` | `warn` | `error`. Absent or unrecognised means "all levels".
     #[serde(default)]
     log_level: Option<String>,
+
+    // Echoed back by a failed Send signal / Reset to event N / Trigger
+    // update submission (issue #1687). The operator's entered values
+    // survive the redirect that renders their validation error this way.
+    // Before this, every failure branch of those three action forms
+    // redirected to `?flash={error}` alone. The collapsed `<details>`
+    // closed back to empty. A mistyped JSON payload or event number had to
+    // be retyped from memory. See `WorkflowActionEcho`.
+    #[serde(default)]
+    signal_error: Option<String>,
+    #[serde(default)]
+    signal_name: Option<String>,
+    #[serde(default)]
+    signal_payload: Option<String>,
+    #[serde(default)]
+    reset_error: Option<String>,
+    #[serde(default)]
+    reset_event: Option<String>,
+    #[serde(default)]
+    reset_reason: Option<String>,
+    #[serde(default)]
+    update_error: Option<String>,
+    #[serde(default)]
+    update_name: Option<String>,
+    #[serde(default)]
+    update_payload: Option<String>,
+}
+
+/// Entered values and the validation error for the Send signal / Reset to
+/// event N / Trigger update forms. Echoed back from `WorkflowDetailParams`
+/// after a failed submission (issue #1687).
+///
+/// Each of the three action forms on the workflow detail page is a
+/// `<details>`-collapsed form that POSTs and redirects back to this same
+/// page. Before this type existed, every failure branch of those handlers
+/// redirected to `?flash={error}` alone. The redirect re-rendered the form
+/// collapsed and empty. The operator's signal name, JSON payload, reset
+/// event number/reason, or update name/payload were gone. Only a generic
+/// top-of-page flash said something had failed. `render_workflow_detail`
+/// uses these fields to keep the relevant `<details>` open. It pre-fills
+/// the inputs with what was submitted, and shows the error inline next to
+/// the field that caused it.
+#[derive(Debug, Default)]
+struct WorkflowActionEcho {
+    signal_error: Option<String>,
+    signal_name: Option<String>,
+    signal_payload: Option<String>,
+    reset_error: Option<String>,
+    reset_event: Option<String>,
+    reset_reason: Option<String>,
+    update_error: Option<String>,
+    update_name: Option<String>,
+    update_payload: Option<String>,
+}
+
+impl WorkflowActionEcho {
+    fn from_params(params: &WorkflowDetailParams) -> Self {
+        Self {
+            signal_error: params.signal_error.clone(),
+            signal_name: params.signal_name.clone(),
+            signal_payload: params.signal_payload.clone(),
+            reset_error: params.reset_error.clone(),
+            reset_event: params.reset_event.clone(),
+            reset_reason: params.reset_reason.clone(),
+            update_error: params.update_error.clone(),
+            update_name: params.update_name.clone(),
+            update_payload: params.update_payload.clone(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1729,6 +1798,7 @@ async fn workflow_detail_ui(
             truncated: log_truncated,
             read_failed: log_read_failed,
         },
+        &WorkflowActionEcho::from_params(&params),
     ))
 }
 
@@ -2244,7 +2314,18 @@ async fn signal_workflow_ui(
     )
     .await;
 
-    let redirect_url = format!("../../workflows/{id}?flash={flash}");
+    // On failure, echo the entered signal name and payload back through the
+    // redirect (issue #1687). The re-rendered, re-opened form is not blank
+    // this way — the operator does not retype a JSON payload after a typo.
+    let redirect_url = match &error_summary {
+        None => format!("../../workflows/{id}?flash={flash}"),
+        Some(error) => format!(
+            "../../workflows/{id}?flash={flash}&signal_error={}&signal_name={}&signal_payload={}",
+            url_encode(error),
+            url_encode(&form.signal_name),
+            url_encode(payload_str),
+        ),
+    };
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
 
@@ -2354,7 +2435,17 @@ async fn reset_workflow_ui(
     )
     .await;
 
-    let redirect_url = format!("../../workflows/{id}?flash={flash}");
+    // On failure, echo the entered event number and reason back through the
+    // redirect (issue #1687) — same reasoning as `signal_workflow_ui`.
+    let redirect_url = match &error_summary {
+        None => format!("../../workflows/{id}?flash={flash}"),
+        Some(error) => format!(
+            "../../workflows/{id}?flash={flash}&reset_error={}&reset_event={}&reset_reason={}",
+            url_encode(error),
+            url_encode(&form.reset_to_event_id),
+            url_encode(form.reason.as_deref().unwrap_or("")),
+        ),
+    };
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
 
@@ -2395,7 +2486,14 @@ async fn trigger_update_ui(
                 )
                 .await;
                 let flash = url_encode(&err_msg);
-                let redirect_url = format!("../../workflows/{id}?flash={flash}");
+                // Echo the entered update name and payload back (issue
+                // #1687) — same reasoning as `signal_workflow_ui`.
+                let redirect_url = format!(
+                    "../../workflows/{id}?flash={flash}&update_error={}&update_name={}&update_payload={}",
+                    url_encode(&err_msg),
+                    url_encode(&form.update_name),
+                    url_encode(payload_str),
+                );
                 return Ok(axum::response::Redirect::to(&redirect_url).into_response());
             }
         }
@@ -2464,7 +2562,15 @@ async fn trigger_update_ui(
     )
     .await;
 
-    let redirect_url = format!("../../workflows/{id}?flash={flash}");
+    let redirect_url = match &error_summary {
+        None => format!("../../workflows/{id}?flash={flash}"),
+        Some(error) => format!(
+            "../../workflows/{id}?flash={flash}&update_error={}&update_name={}&update_payload={}",
+            url_encode(error),
+            url_encode(&form.update_name),
+            url_encode(payload_str),
+        ),
+    };
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
 
@@ -5436,6 +5542,7 @@ fn render_workflow_detail(
     jump_event_error: Option<&str>,
     continue_as_new_threshold: Option<u64>,
     logs: &WorkflowLogsPanelData<'_>,
+    action_echo: &WorkflowActionEcho,
 ) -> Markup {
     let exec_id_str = execution.id.to_string();
     let title = format!("{} · Vantage", execution.workflow_name);
@@ -5540,44 +5647,65 @@ fn render_workflow_detail(
                 button.danger type="submit" disabled[terminal]
                     title=[terminal.then_some("Workflow is terminal")] { "Terminate" }
             }
-            details style="display:inline-block" {
+            details style="display:inline-block" open[action_echo.signal_error.is_some()] {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Send signal" }
                 form method="post" action={ (exec_id_str) "/signal" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Signal name"
-                        input type="text" name="signal_name" required placeholder="e.g. approve" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        input type="text" name="signal_name" required placeholder="e.g. approve"
+                            value=(action_echo.signal_name.as_deref().unwrap_or(""))
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Payload (JSON)"
-                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {}
+                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {
+                            (action_echo.signal_payload.as_deref().unwrap_or(""))
+                        }
+                    }
+                    @if let Some(error) = action_echo.signal_error.as_deref() {
+                        span.field-error role="alert" { (error) }
                     }
                     button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Send" }
                 }
             }
-            details style="display:inline-block" {
+            details style="display:inline-block" open[action_echo.reset_error.is_some()] {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Reset to event N" }
                 form method="post" action={ (exec_id_str) "/reset" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Event # (1-based, as shown in timeline)"
-                        input type="number" name="reset_to_event_id" min="1" required placeholder="1" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        input type="number" name="reset_to_event_id" min="1" required placeholder="1"
+                            value=(action_echo.reset_event.as_deref().unwrap_or(""))
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Reason"
-                        input type="text" name="reason" placeholder="rollback" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        input type="text" name="reason" placeholder="rollback"
+                            value=(action_echo.reset_reason.as_deref().unwrap_or(""))
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                    }
+                    @if let Some(error) = action_echo.reset_error.as_deref() {
+                        span.field-error role="alert" { (error) }
                     }
                     button type="submit" style="background:#92400e;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" onclick="return confirm('Reset this workflow execution? This is destructive.')" { "Reset" }
                 }
             }
-            details style="display:inline-block" {
+            details style="display:inline-block" open[action_echo.update_error.is_some()] {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Trigger update" }
                 form method="post" action={ (exec_id_str) "/trigger-update" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Update name"
-                        input type="text" name="update_name" required placeholder="e.g. set_priority" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        input type="text" name="update_name" required placeholder="e.g. set_priority"
+                            value=(action_echo.update_name.as_deref().unwrap_or(""))
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Payload (JSON)"
-                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {}
+                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {
+                            (action_echo.update_payload.as_deref().unwrap_or(""))
+                        }
+                    }
+                    @if let Some(error) = action_echo.update_error.as_deref() {
+                        span.field-error role="alert" { (error) }
                     }
                     button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Submit" }
                 }
@@ -14813,6 +14941,7 @@ mod tests {
             None,
             Some(10_000),
             &WorkflowLogsPanelData::default(),
+            &WorkflowActionEcho::default(),
         )
         .into_string();
 
@@ -14849,6 +14978,7 @@ mod tests {
             None,
             None,
             &WorkflowLogsPanelData::default(),
+            &WorkflowActionEcho::default(),
         )
         .into_string();
 
@@ -14881,6 +15011,7 @@ mod tests {
             None,
             Some(500),
             &WorkflowLogsPanelData::default(),
+            &WorkflowActionEcho::default(),
         )
         .into_string();
 
@@ -16632,6 +16763,7 @@ mod tests {
             None,
             None,
             logs,
+            &WorkflowActionEcho::default(),
         )
         .into_string()
     }
@@ -16755,6 +16887,7 @@ mod tests {
                 admin: true,
                 ..Default::default()
             },
+            &WorkflowActionEcho::default(),
         )
         .into_string();
         // maud escapes `&` inside an attribute value, which is the correct
@@ -16795,6 +16928,7 @@ mod tests {
                 admin: true,
                 ..Default::default()
             },
+            &WorkflowActionEcho::default(),
         )
         .into_string();
 
@@ -16841,6 +16975,7 @@ mod tests {
             Some("Invalid jump_event 'zap'; expected a whole number. Jump ignored."),
             None,
             &WorkflowLogsPanelData::default(),
+            &WorkflowActionEcho::default(),
         )
         .into_string();
         assert!(
@@ -16850,6 +16985,117 @@ mod tests {
         assert!(
             html.contains("Invalid jump_event 'zap'"),
             "the jump_event error must render inline: {html}"
+        );
+    }
+
+    /// RED before this fix (issue #1687): a failed Send signal / Reset to
+    /// event N / Trigger update submission redirected to `?flash={error}`
+    /// alone. The collapsed `<details>` re-rendered closed and empty.
+    /// The operator's signal name, JSON payload, reset event number/reason,
+    /// or update name/payload were gone. Only a generic top-of-page flash
+    /// remained. GREEN: `WorkflowActionEcho` keeps the relevant `<details>`
+    /// open, and pre-fills its inputs with what was submitted. It shows the
+    /// error next to the field that rejected it, matching the
+    /// `BackfillFormEcho` mechanism the backfill launcher already uses.
+    #[test]
+    fn render_workflow_detail_echoes_entered_values_on_action_form_errors() {
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let echo = WorkflowActionEcho {
+            signal_error: Some("Invalid JSON payload: expected value".to_string()),
+            signal_name: Some("approve".to_string()),
+            signal_payload: Some("{not json".to_string()),
+            reset_error: Some("invalid event number 'zz'; expected a whole number".to_string()),
+            reset_event: Some("zz".to_string()),
+            reset_reason: Some("rollback after incident".to_string()),
+            update_error: Some("Invalid JSON payload: expected value".to_string()),
+            update_name: Some("set_priority".to_string()),
+            update_payload: Some("{also not json".to_string()),
+        };
+        let html = render_workflow_detail(
+            &execution,
+            0,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            None,
+            None,
+            None,
+            &WorkflowLogsPanelData::default(),
+            &echo,
+        )
+        .into_string();
+
+        assert!(
+            html.contains("Invalid JSON payload: expected value"),
+            "the signal form's error must render inline: {html}"
+        );
+        assert!(
+            html.contains(r#"name="signal_name" required placeholder="e.g. approve" value="approve""#),
+            "the signal name the operator typed must be redisplayed, not blanked: {html}"
+        );
+        assert!(
+            html.contains("{not json"),
+            "the signal payload the operator typed must be redisplayed, not blanked: {html}"
+        );
+
+        assert!(
+            html.contains("invalid event number") && html.contains("expected a whole number"),
+            "the reset form's error must render inline: {html}"
+        );
+        assert!(
+            html.contains(r#"name="reset_to_event_id" min="1" required placeholder="1" value="zz""#),
+            "the reset event number the operator typed must be redisplayed, not blanked: {html}"
+        );
+        assert!(
+            html.contains("rollback after incident"),
+            "the reset reason the operator typed must be redisplayed, not blanked: {html}"
+        );
+
+        assert!(
+            html.contains(r#"name="update_name" required placeholder="e.g. set_priority" value="set_priority""#),
+            "the update name the operator typed must be redisplayed, not blanked: {html}"
+        );
+        assert!(
+            html.contains("{also not json"),
+            "the update payload the operator typed must be redisplayed, not blanked: {html}"
+        );
+    }
+
+    /// Companion to the echo test above. With no error, none of the three
+    /// action forms should be forced open. They stay collapsed by default,
+    /// same as every prior page load.
+    #[test]
+    fn render_workflow_detail_leaves_action_forms_collapsed_with_no_error() {
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let html = render_workflow_detail(
+            &execution,
+            0,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            None,
+            None,
+            None,
+            &WorkflowLogsPanelData::default(),
+            &WorkflowActionEcho::default(),
+        )
+        .into_string();
+
+        assert!(
+            !html.contains("<details style=\"display:inline-block\" open"),
+            "no action form should be forced open absent an error: {html}"
         );
     }
 

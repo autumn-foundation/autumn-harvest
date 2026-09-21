@@ -5558,6 +5558,80 @@ async fn detail_page_reset_action_with_invalid_event_number_redirects_with_flash
     );
 }
 
+/// GREEN (issue #1687) — a rejected reset submission used to redirect with
+/// only a generic flash. The collapsed "Reset to event N" panel re-rendered
+/// empty, so the operator's event number and reason were gone. The redirect
+/// now also carries the entered values. The re-rendered page shows the
+/// panel open and pre-filled with exactly what was submitted.
+#[tokio::test]
+async fn detail_page_reset_action_with_invalid_event_number_preserves_entered_reason() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "reset_wf4", "reset-4").await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (_status, headers, _body) = post_form(
+        &app,
+        &format!("/workflows/{exec_id}/reset"),
+        "reset_to_event_id=not-a-number&reason=rollback+after+incident",
+    )
+    .await;
+    let location = headers
+        .get("location")
+        .expect("redirect must have Location header")
+        .to_str()
+        .unwrap();
+    let query = location.split_once('?').map_or("", |(_, q)| q);
+
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}?{query}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        html.contains(r#"name="reset_to_event_id" min="1" required placeholder="1" value="not-a-number""#),
+        "the entered event number must be redisplayed, not blanked: {html}"
+    );
+    assert!(
+        html.contains("rollback after incident"),
+        "the entered reason must be redisplayed, not blanked: {html}"
+    );
+    assert!(
+        html.contains(r#"<details style="display:inline-block" open"#),
+        "the Reset to event N panel must re-open on its own error: {html}"
+    );
+}
+
+/// Same mechanism (issue #1687), for Send signal's invalid-JSON-payload path.
+#[tokio::test]
+async fn detail_page_signal_action_with_invalid_payload_preserves_entered_values() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "signal_wf3", "signal-3").await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (_status, headers, _body) = post_form(
+        &app,
+        &format!("/workflows/{exec_id}/signal"),
+        "signal_name=approve&payload=%7Bnot+json",
+    )
+    .await;
+    let location = headers
+        .get("location")
+        .expect("redirect must have Location header")
+        .to_str()
+        .unwrap();
+    let query = location.split_once('?').map_or("", |(_, q)| q);
+
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}?{query}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        html.contains(r#"name="signal_name" required placeholder="e.g. approve" value="approve""#),
+        "the entered signal name must be redisplayed, not blanked: {html}"
+    );
+    assert!(
+        html.contains("{not json"),
+        "the entered payload must be redisplayed, not blanked: {html}"
+    );
+}
+
 /// Detail page shows a "Jump to event" control in large histories.
 #[tokio::test]
 async fn detail_page_has_jump_to_event_n_control() {
