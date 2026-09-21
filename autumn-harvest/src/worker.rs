@@ -28012,7 +28012,7 @@ impl Worker {
         // below the Postgres rate. The cooldown expires on its own, and the
         // next iteration probes the channel again.
         if state.degraded.is_degraded() {
-            return self.drain_postgres(pool, shard).await;
+            return self.drain_postgres(pool, shard, multi_shard).await;
         }
 
         // A maintenance success does not clear the degraded window. Only a
@@ -28026,13 +28026,13 @@ impl Worker {
             .await
         {
             self.enter_degraded(state, &error, "dispatch maintenance failed", settings);
-            return self.drain_postgres(pool, shard).await;
+            return self.drain_postgres(pool, shard, multi_shard).await;
         }
 
         if DispatchLoopState::due(&mut state.reconciled, settings.reconcile_interval)
             && !self.run_dispatch_reconcile(pool, installed, state).await
         {
-            return self.drain_postgres(pool, shard).await;
+            return self.drain_postgres(pool, shard, multi_shard).await;
         }
 
         // One read sized to the free permits of each pool, so the worker never
@@ -28085,7 +28085,7 @@ impl Worker {
             }
             Ok(Err(error)) => {
                 self.enter_degraded(state, &error, "dispatch read failed", settings);
-                return self.drain_postgres(pool, shard).await;
+                return self.drain_postgres(pool, shard, multi_shard).await;
             }
             Err(_) => {
                 let error = HarvestError::Dispatch(format!(
@@ -28093,7 +28093,7 @@ impl Worker {
                     block_for + DISPATCH_CALL_TIMEOUT
                 ));
                 self.enter_degraded(state, &error, "dispatch read timed out", settings);
-                return self.drain_postgres(pool, shard).await;
+                return self.drain_postgres(pool, shard, multi_shard).await;
             }
         };
 
@@ -28162,8 +28162,18 @@ impl Worker {
     /// call. A channel call that fails can cost the poll interval plus the call
     /// timeout. One claim per call is a throughput collapse, not a fallback.
     ///
+    /// `multi_shard` follows [`dispatch_read_block`] (Codex review, issue
+    /// #1429). The closing wait is capped the same way the channel read is.
+    /// So one shard's degraded-mode fallback does not park a multi-shard
+    /// round-robin behind it for a full `poll_interval`.
+    ///
     /// Returns `true` when at least one task was dispatched.
-    async fn drain_postgres(&self, pool: &DbPool, shard: Option<crate::types::ShardId>) -> bool {
+    async fn drain_postgres(
+        &self,
+        pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
+        multi_shard: bool,
+    ) -> bool {
         let mut dispatched = false;
         while !self.shutdown.is_cancelled() {
             if !self
@@ -28178,9 +28188,10 @@ impl Worker {
             }
             dispatched = true;
         }
+        let wait = dispatch_read_block(multi_shard, self.config.poll_interval);
         tokio::select! {
             () = self.shutdown.cancelled() => {}
-            () = tokio::time::sleep(self.config.poll_interval) => {}
+            () = tokio::time::sleep(wait) => {}
         }
         dispatched
     }
