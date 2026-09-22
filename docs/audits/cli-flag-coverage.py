@@ -50,7 +50,13 @@ _drift = importlib.util.module_from_spec(_drift_spec)
 _drift_spec.loader.exec_module(_drift)
 extract_cli_ground_truth = _drift.extract_cli_ground_truth
 mask_fenced = _drift.mask_fenced
+join_shell_continuations = _drift.join_shell_continuations
+HARVEST_CMD_LINE_RE = _drift.HARVEST_CMD_LINE_RE
 FLAG_TOKEN_RE = _drift.FLAG_TOKEN_RE
+
+# Same fenced-block languages config-cli-drift.py's own CLI-invocation scan
+# accepts as runnable-shell content.
+INVOCATION_LANGS = ("bash", "sh", "shell", "console", "", "text")
 
 _link_check_spec = importlib.util.spec_from_file_location(
     "corpus_link_check", Path(__file__).with_name("corpus-link-check.py")
@@ -88,20 +94,25 @@ def flags_documented_in(path: Path) -> set:
     mention counts on its own: this corpus's runbooks routinely document a
     flag in an explanatory sentence or a table row ("`--dry-run` previews
     without writing") without repeating a full runnable example every time,
-    and that answers a reader's question just as well.
+    and that answers a reader's question just as well. Fenced code has no
+    such single-subject guarantee, so it gets the stricter treatment below.
 
-    Inside a fenced code block, a `--flag` mention counts only if the block
-    also contains the word `harvest` somewhere in it (not necessarily the
-    same line — a multi-line invocation may put `harvest workflow reset` on
-    one line and `--to-event` on a continuation). Found in review:
-    `docs/upgrading/0.5.0.md` shows a fenced ` ```bash ` block containing
-    only `diesel migration generate --version` — no mention of `harvest`
-    anywhere in that block — and an earlier version of this scan, which
-    matched `--flag` against raw page text with no fence-aware distinction,
-    credited that as documentation of harvest's own `--version`
-    (`#[command(version)]`): a false match on a different tool's homonymous
-    flag. A block that never says `harvest` is never a `harvest` example,
-    whatever flags happen to appear in it."""
+    Inside a fenced code block, a `--flag` mention counts only when it sits
+    on the SAME logical command line (backslash continuations joined, same
+    as config-cli-drift.py's own drift scan) as an actual `harvest`
+    invocation — not merely somewhere in the same block. Two false credits
+    were found in review before landing on this: matching raw page text
+    with no fence awareness at all credited `diesel migration generate
+    --version` (docs/upgrading/0.5.0.md) as documentation of harvest's own
+    `--version`; loosening that to "the block merely contains the word
+    `harvest` anywhere" still credited `--depth` from an unrelated `git
+    fetch --depth=1` line that happened to share a block with a real
+    `cargo run ... --bin harvest -- schema check ...` invocation two lines
+    later (docs/workflow-schema-contract-guide.md) — `--depth` is a real
+    `workflow children` flag, so that credit hid a genuine gap. Reusing
+    config-cli-drift.py's own per-line HARVEST_CMD_LINE_RE (git, diesel,
+    cargo's OWN flags never match it) closes both: a flag counts only when
+    it is an argument on the harvest invocation itself."""
     text = path.read_text(encoding="utf-8", errors="replace")
     masked_lines, blocks = mask_fenced(text.splitlines())
     found = set()
@@ -110,12 +121,18 @@ def flags_documented_in(path: Path) -> set:
     for m in FLAG_TOKEN_RE.finditer(prose_text):
         found.add(m.group(1))
 
-    for _lang, block_lines in blocks:
-        block_text = "\n".join(block_lines)
-        if "harvest" not in block_text:
+    for lang, block_lines in blocks:
+        if lang not in INVOCATION_LANGS:
             continue
-        for m in FLAG_TOKEN_RE.finditer(block_text):
-            found.add(m.group(1))
+        for line in join_shell_continuations(block_lines):
+            cm = HARVEST_CMD_LINE_RE.search(line)
+            if not cm or line.strip().startswith("#"):
+                continue
+            before = line[: cm.start()]
+            if "curl" in before or "http://" in line or "https://" in line:
+                continue
+            for fm in FLAG_TOKEN_RE.finditer(cm.group(1)):
+                found.add(fm.group(1))
 
     return found
 
