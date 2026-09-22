@@ -179,6 +179,34 @@ task, run the trivial handler, persist `WorkflowCompleted`, evaluate
 triggers inline, commit) occasionally exceed 30s under load. Carried
 forward for the next session, not closed here.
 
+**A live occurrence landed on this PR's own CI while this correction was
+being written** (`Test DB (linux, shard 0)`, commit `4ce17a5`, run
+`35781489366`): the exact panic site predicted above,
+`integration_e2e.rs:1383:6` from `quota_enforcement_tests.rs:3786`, the
+SOURCE-completion wait — not the mechanism this session's fix addresses.
+Every other test in the module passed (46/46) on that run.
+
+Tried to reproduce it locally with the same harness used for the fixed
+flake, to see if it is the same "single-VM CPU oversubscription" story:
+**it is not, at least not at the stress levels this session could apply.**
+16x oversubscription (64 `yes` loops), 15 runs — 0 failures. Doubled to 32x
+(128 loops), 15 more runs — 0 failures, 30/30 total. The fixed flake
+reproduced reliably at 8x; the scanner-driven retry path (the ~6s runs)
+stayed comfortably bounded even at 32x. This is a genuine negative result,
+not an absence of trying: whatever makes a single decision cycle exceed 30s
+on a real GitHub Actions runner is not reproduced by same-VM CPU
+oversubscription of the kind that reliably broke the other panic site.
+Candidates this narrows toward, none confirmed: real hypervisor-level
+steal time (categorically different from same-kernel oversubscription — a
+stolen vCPU cannot run anything on the VM, including a local busy-loop
+stress harness, so this session's method cannot simulate it), I/O-bound
+latency (Postgres round-trip tail latency under real disk/network
+conditions this sandbox's local Postgres does not reproduce), or a genuine
+retry/correctness issue in the decision-cycle path (e.g., poison-pill
+strikes accumulating, or a transient DB error triggering more than one
+attempt) that would need worker-level tracing captured from a real CI run,
+not a local one, to catch.
+
 ## 🔧 Treatment
 
 One-line-of-intent fix, in `completion_trigger_defers_to_outbox_when_target_quota_exceeded`
