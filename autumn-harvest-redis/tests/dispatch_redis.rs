@@ -822,6 +822,53 @@ async fn a_busy_queue_gets_the_full_budget_among_idle_peers() {
     assert_eq!(delivered, published);
 }
 
+/// A persistently broken queue must surface as an error, not a quiet
+/// success, even while a healthy sibling queue keeps delivering (Codex
+/// review, issue #1429).
+///
+/// `read_across_queues` used to swallow a failing queue's error whenever
+/// any other queue in the same pass returned an entry. Consider a queue
+/// whose stream key is the wrong Redis type: `WRONGTYPE`, which
+/// `read_with_heal` cannot self-heal the way it heals `NOGROUP`. It would
+/// then never surface its own failure as long as a busy sibling kept
+/// every pass "ready". The
+/// caller's `enter_degraded` fallback never engaged, so the broken queue
+/// went undrained except by the much slower reconcile sweep.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_persistently_broken_queue_is_not_masked_by_a_healthy_sibling() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["healthy".to_string(), "broken".to_string()];
+
+    fixture
+        .dispatch
+        .publish(&[hint("healthy", Uuid::new_v4(), Utc::now())])
+        .await
+        .expect("publish");
+
+    // Corrupt "broken"'s stream key to a non-stream type. `XREADGROUP` on
+    // it then fails `WRONGTYPE`, which `read_with_heal` cannot self-heal
+    // (only `NOGROUP` is healed).
+    let mut raw = fixture.raw.clone();
+    let _: () = redis::cmd("SET")
+        .arg(fixture.stream_key("broken"))
+        .arg("not-a-stream")
+        .query_async(&mut raw)
+        .await
+        .expect("corrupt the broken queue's stream key");
+
+    let result = fixture
+        .dispatch
+        .next(&queues, "consumer-1", 10, Duration::from_millis(50))
+        .await;
+    assert!(
+        result.is_err(),
+        "a persistently broken queue must surface as an error, not a quiet \
+         success, even though the healthy queue had a ready entry"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn every_queue_is_served_when_the_read_cap_is_one() {
     let Some(fixture) = try_start(Duration::from_secs(60)).await else {

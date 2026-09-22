@@ -261,6 +261,15 @@ pub fn uninstall() {
         *slot = None;
         ANY_INSTALLED.store(false, Ordering::Relaxed);
     }
+    stop_publisher();
+}
+
+/// Abort the background publisher task and drop its sender, if either is
+/// installed.
+///
+/// A later hint starts a fresh publisher lazily ([`publish_in_background`]),
+/// so this never needs to be re-armed by its own caller.
+fn stop_publisher() {
     let publisher = lock(&PUBLISHER).take();
     if let Some(publisher) = publisher {
         publisher.task.abort();
@@ -326,6 +335,15 @@ pub fn installed_for_shard(shard: crate::types::ShardId) -> Option<InstalledDisp
 }
 
 /// Remove every per-shard channel. Tests use this between cases.
+///
+/// Also stops the background publisher, mirroring [`uninstall`] (Codex
+/// review, issue #1429). A multi-shard runtime can start that publisher
+/// through [`crate::dispatch::buffered_settled_in_background`]. It can
+/// never actually publish there, though: `publish_now` only ever reads
+/// the single-shard slot, never a per-shard one. Left running past this
+/// call, its task and channel sender would otherwise leak across an
+/// embedded runner's restart. It would wait on hints that only ever
+/// reach a dead end.
 pub fn uninstall_all_shards() {
     if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
         *slot = None;
@@ -333,6 +351,7 @@ pub fn uninstall_all_shards() {
     if INSTALLED.read().is_ok_and(|slot| slot.is_none()) {
         ANY_INSTALLED.store(false, Ordering::Relaxed);
     }
+    stop_publisher();
 }
 
 // ---------------------------------------------------------------------------
@@ -1610,6 +1629,34 @@ mod tests {
         assert!(outcome.is_ok());
         assert_eq!(channel.published_ids(), vec![committed.task_id]);
         uninstall();
+    }
+
+    /// `uninstall_all_shards` stops the background publisher, the
+    /// multi-shard mirror of `uninstall`'s own cleanup (Codex review,
+    /// issue #1429).
+    ///
+    /// A multi-shard runtime can start the publisher through
+    /// `buffered_settled_in_background`, even though `publish_now` only
+    /// ever reads the single-shard slot and can never actually publish
+    /// there. Left running, that task and its sender would leak across an
+    /// embedded runner's restart.
+    #[tokio::test]
+    async fn uninstall_all_shards_stops_the_background_publisher() {
+        let _guard = INSTALL_LOCK.lock().await;
+        publish_in_background(hint("q", Utc::now()));
+        assert!(
+            lock(&PUBLISHER)
+                .as_ref()
+                .is_some_and(|publisher| !publisher.task.is_finished()),
+            "the test fixture must start the publisher"
+        );
+
+        uninstall_all_shards();
+
+        assert!(
+            lock(&PUBLISHER).is_none(),
+            "uninstall_all_shards must stop and clear the background publisher"
+        );
     }
 
     #[tokio::test]

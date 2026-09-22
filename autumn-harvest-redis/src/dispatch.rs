@@ -710,10 +710,20 @@ impl RedisDispatch {
     /// to the caller, until visibility recovery reclaims them — a real
     /// latency cost this batching should not add. Every queue is
     /// attempted, mirroring the same attempt-every-queue-and-keep-going
-    /// shape `ack_many_inner` and `requeue_batch` already use. The error
-    /// returns only when nothing at all was read. So a genuine channel
-    /// outage still surfaces, and drives the caller into degraded mode,
-    /// rather than reading as a quiet empty batch.
+    /// shape `ack_many_inner` and `requeue_batch` already use.
+    ///
+    /// Returns the error alongside the reply rather than swallowing it
+    /// whenever some other queue's read still succeeded (Codex review,
+    /// issue #1429). A queue that persistently fails its read — a
+    /// wrong-typed key, say — must not go undrained forever. That is what
+    /// would happen if a busy sibling queue kept every pass "successful"
+    /// from the caller's point of view. [`Self::next_inner`] requeues
+    /// whatever this call did collect, and propagates the error in that
+    /// case. So the worker's degraded-mode fallback still engages instead
+    /// of silently masking a broken queue. The `Err` variant is reserved
+    /// for when nothing at all was read, so a genuine channel outage still
+    /// surfaces even with no
+    /// entries to requeue.
     async fn read_across_queues(
         &self,
         queues: &[String],
@@ -721,7 +731,7 @@ impl RedisDispatch {
         consumer: &str,
         max: usize,
         wait: Duration,
-    ) -> RedisAdapterResult<StreamReadReply> {
+    ) -> RedisAdapterResult<(StreamReadReply, Option<RedisAdapterError>)> {
         let mut reply = StreamReadReply::default();
         let mut any_ready = false;
         let mut first_error = None;
@@ -749,11 +759,6 @@ impl RedisDispatch {
                     reply.keys.extend(one.keys);
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        queue = %key,
-                        error = %error,
-                        "dispatch read failed for one queue in a multi-queue pass"
-                    );
                     first_error.get_or_insert(error);
                 }
             }
@@ -786,7 +791,7 @@ impl RedisDispatch {
         if !any_ready && let Some(error) = first_error {
             return Err(error);
         }
-        Ok(reply)
+        Ok((reply, first_error))
     }
 
     async fn next_inner(
@@ -817,7 +822,7 @@ impl RedisDispatch {
         // own rotation leads with. `ordered` rotates every call, so
         // blocking fairness matches the round-robin already used to decide
         // which queue's `COUNT` fills the batch first.
-        let reply = self
+        let (reply, read_error) = self
             .read_across_queues(queues, &ordered, consumer, max, wait)
             .await?;
 
@@ -863,10 +868,18 @@ impl RedisDispatch {
         // the other half of this best-effort signal.
         candidates.sort_by_key(|a| std::cmp::Reverse(a.2.priority));
 
+        // A sibling queue's read failed while this one succeeded
+        // (`read_error`, from `read_across_queues`; see its own doc
+        // comment). Deliver nothing and requeue every candidate instead of
+        // the normal `max` cap. The caller then still sees the failure,
+        // rather than a quiet, apparently-successful read (Codex review,
+        // issue #1429). The failing queue would otherwise never surface
+        // its own trouble while a busy sibling keeps every pass "ready".
+        let deliver_cap = if read_error.is_some() { 0 } else { max };
         let mut leases = Vec::new();
         let mut surplus = Vec::new();
         for (entry_id, payload, reference) in candidates {
-            if leases.len() < max {
+            if leases.len() < deliver_cap {
                 let handle = encode_handle(&entry_id, &payload);
                 leases.push(reference.into_lease(handle));
             } else {
@@ -901,6 +914,9 @@ impl RedisDispatch {
                 malformed = malformed.len(),
                 "failed to discard unreadable dispatch entries"
             );
+        }
+        if let Some(error) = read_error {
+            return Err(error);
         }
         Ok(leases)
     }
