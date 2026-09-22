@@ -240,8 +240,13 @@ jobs:
         # #[workflow(allow_nondeterministic_apis)], or HVG010 hard-blocks
         # the build; (2) a plain `let mut approvals` captured by the
         # condition closure can never also be reassigned by the loop body
-        # while that borrow is live (E0506). See
-        # scripts/check-signals-clean-approval-example-determinism.sh.
+        # while that borrow is live (E0506). E0506 is a borrow-checker
+        # property, not a syntax shape, so this actually compiles the
+        # pinned block with `cargo check` (see the script's own docstring
+        # for why a text heuristic proved gameable in review) rather than
+        # pattern-matching stand-in text -- one extra `cargo check
+        # --example` in a job that already builds this crate for clippy
+        # below. See scripts/check-signals-clean-approval-example-determinism.sh.
         run: ./scripts/check-signals-clean-approval-example-determinism.sh
       - name: Check reliability-knobs continue_as_new checkpoint example
         # Guards a real, reproduced-live compile failure an Onramp
