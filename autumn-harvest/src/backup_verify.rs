@@ -3174,67 +3174,66 @@ mod probes {
     /// rewritten to avoid this exact query class, for issue #1401. That fix
     /// was never carried over to this, its older sibling. Chunking (rather
     /// than one whole-shard batch) bounds request and result-set size the
-    /// same way it does there.
+    /// same way it does there. Each chunk's state map is adjudicated and
+    /// discarded before the next chunk's lookup starts. This matches how
+    /// `adjudicate_trigger_fires` discards its own per-chunk keys (Codex
+    /// follow-up). Otherwise the chunk bound would cap round-trip size only.
+    /// It would not bound the aggregate map this function holds for the
+    /// whole reference set.
     async fn adjudicate_refs(conn: &mut AsyncPgConnection, owned: &[&PendingRef]) -> RefBuckets {
         let mut out = RefBuckets::default();
 
-        // A chunk-level failure marks every reference in that chunk as a
-        // lookup error rather than aborting the whole batch, mirroring
-        // `adjudicate_trigger_fire_chunk`'s per-chunk error handling.
-        let mut states: std::collections::HashMap<Uuid, String> = std::collections::HashMap::new();
-        let mut lookup_failed: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
         for chunk in owned.chunks(WORKFLOW_KEY_LOOKUP_CHUNK) {
             let ids: Vec<Uuid> = chunk.iter().map(|r| r.target).collect();
-            match matching_execution_states(conn, &ids).await {
-                Ok(found) => states.extend(found),
+            // A chunk-level failure marks every reference in that chunk as a
+            // lookup error rather than aborting the whole batch, mirroring
+            // `adjudicate_trigger_fire_chunk`'s per-chunk error handling.
+            let states = match matching_execution_states(conn, &ids).await {
+                Ok(found) => found,
                 Err(e) => {
                     for r in chunk {
                         out.lookup_errors
                             .push(format!("{} lookup failed: {e}", r.target));
-                        lookup_failed.insert(r.target);
                     }
+                    continue;
                 }
-            }
-        }
+            };
 
-        for r in owned {
-            if lookup_failed.contains(&r.target) {
-                continue;
-            }
-            // Absent from `states` means zero rows matched -- the batched
-            // equivalent of the old `.optional()` `None` branch. A chunk-level
-            // `Err` was already recorded above and is skipped here, so this
-            // loop only ever sees "found, with a state" or "genuinely absent".
-            let state: Option<String> = states.get(&r.target).cloned();
+            for r in chunk {
+                // Absent from `states` means zero rows matched -- the batched
+                // equivalent of the old `.optional()` `None` branch.
+                let state: Option<String> = states.get(&r.target).cloned();
 
-            match (&r.kind, state) {
-                (RefKind::AwaitedChild, None) => {
-                    out.missing_child.push(format!(
-                        "{} (awaited by {} on shard {})",
-                        r.target, r.source_exec, r.source_shard
-                    ));
-                }
-                (RefKind::ChildTerminalRecorded, Some(s))
-                    if !crate::erase::is_terminal_state(&s) =>
-                {
-                    out.rolled_back.push(format!(
-                        "{} is {s} on shard {} but {} on shard {} recorded its terminal",
-                        r.target, r.owner_shard, r.source_exec, r.source_shard
-                    ));
-                }
-                // A recorded child terminal whose execution row exists AND is
-                // itself terminal matches what the owner recorded -- clean.
-                (RefKind::ChildTerminalRecorded | RefKind::AwaitedChild, Some(_)) => {}
-                // The execution row is gone entirely. Ordinary retention is
-                // ONE explanation. A target shard restored to before the
-                // execution ever existed is another. This tool cannot tell
-                // them apart without a durable marker. A retention summary is
-                // that marker. Present, it proves retention and the
-                // reference stays silent exactly as before. Absent, the
-                // absence is reported rather than assumed benign (issue
-                // #1205).
-                (RefKind::ChildTerminalRecorded | RefKind::ExternalEffectDelivered(_), None) => {
-                    match retention_summary_exists(conn, r.target).await {
+                match (&r.kind, state) {
+                    (RefKind::AwaitedChild, None) => {
+                        out.missing_child.push(format!(
+                            "{} (awaited by {} on shard {})",
+                            r.target, r.source_exec, r.source_shard
+                        ));
+                    }
+                    (RefKind::ChildTerminalRecorded, Some(s))
+                        if !crate::erase::is_terminal_state(&s) =>
+                    {
+                        out.rolled_back.push(format!(
+                            "{} is {s} on shard {} but {} on shard {} recorded its terminal",
+                            r.target, r.owner_shard, r.source_exec, r.source_shard
+                        ));
+                    }
+                    // A recorded child terminal whose execution row exists AND is
+                    // itself terminal matches what the owner recorded -- clean.
+                    (RefKind::ChildTerminalRecorded | RefKind::AwaitedChild, Some(_)) => {}
+                    // The execution row is gone entirely. Ordinary retention is
+                    // ONE explanation. A target shard restored to before the
+                    // execution ever existed is another. This tool cannot tell
+                    // them apart without a durable marker. A retention summary is
+                    // that marker. Present, it proves retention and the
+                    // reference stays silent exactly as before. Absent, the
+                    // absence is reported rather than assumed benign (issue
+                    // #1205).
+                    (
+                        RefKind::ChildTerminalRecorded | RefKind::ExternalEffectDelivered(_),
+                        None,
+                    ) => match retention_summary_exists(conn, r.target).await {
                         Ok(true) => {}
                         Ok(false) => out.retention_unproven.push(format!(
                             "{} (referenced by {} on shard {}; absent with no \
@@ -3244,43 +3243,43 @@ mod probes {
                         Err(e) => out
                             .lookup_errors
                             .push(format!("{} retention-summary lookup failed: {e}", r.target)),
+                    },
+                    (RefKind::ExternalTarget, None) => {
+                        out.missing_external.push(format!(
+                            "{} (requested by {} on shard {})",
+                            r.target, r.source_exec, r.source_shard
+                        ));
                     }
-                }
-                (RefKind::ExternalTarget, None) => {
-                    out.missing_external.push(format!(
-                        "{} (requested by {} on shard {})",
-                        r.target, r.source_exec, r.source_shard
-                    ));
-                }
-                (RefKind::ExternalTarget, Some(_)) => {
-                    out.pending_external.push(format!(
-                        "{} (requested by {} on shard {})",
-                        r.target, r.source_exec, r.source_shard
-                    ));
-                }
-                (RefKind::ExternalEffectDelivered(effect), Some(s)) => {
-                    match effect_verdict(conn, r.target, effect, &s).await {
-                        Ok(EffectVerdict::Survived) => {}
-                        Ok(EffectVerdict::Unverifiable) => {
-                            out.unverifiable_effect.push(format!(
-                                "{} unkeyed signal delivered by {} on shard {} cannot be \
+                    (RefKind::ExternalTarget, Some(_)) => {
+                        out.pending_external.push(format!(
+                            "{} (requested by {} on shard {})",
+                            r.target, r.source_exec, r.source_shard
+                        ));
+                    }
+                    (RefKind::ExternalEffectDelivered(effect), Some(s)) => {
+                        match effect_verdict(conn, r.target, effect, &s).await {
+                            Ok(EffectVerdict::Survived) => {}
+                            Ok(EffectVerdict::Unverifiable) => {
+                                out.unverifiable_effect.push(format!(
+                                    "{} unkeyed signal delivered by {} on shard {} cannot be \
                                  identified on shard {} (a signal of that name is present, \
                                  but the engine records no per-delivery identity)",
-                                r.target, r.source_exec, r.source_shard, r.owner_shard
-                            ));
-                        }
-                        Ok(EffectVerdict::Lost) => out.lost_effect.push(format!(
-                            "{} {} delivered by {} on shard {} left no trace on shard {} \
+                                    r.target, r.source_exec, r.source_shard, r.owner_shard
+                                ));
+                            }
+                            Ok(EffectVerdict::Lost) => out.lost_effect.push(format!(
+                                "{} {} delivered by {} on shard {} left no trace on shard {} \
                              (target is {s})",
-                            effect.label(),
-                            r.target,
-                            r.source_exec,
-                            r.source_shard,
-                            r.owner_shard
-                        )),
-                        Err(e) => out
-                            .lookup_errors
-                            .push(format!("{} effect check failed: {e}", r.target)),
+                                effect.label(),
+                                r.target,
+                                r.source_exec,
+                                r.source_shard,
+                                r.owner_shard
+                            )),
+                            Err(e) => out
+                                .lookup_errors
+                                .push(format!("{} effect check failed: {e}", r.target)),
+                        }
                     }
                 }
             }
