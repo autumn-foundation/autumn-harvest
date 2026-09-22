@@ -73,12 +73,12 @@ pub fn effective_queue_weights<'a, S: std::hash::BuildHasher>(
 ///   a seeded `StdRng` in tests for reproducibility).
 ///
 /// Returns a permutation of all queue names, borrowed from `pairs` — no
-/// string allocation on this poll-time hot path (issue #515 Bolt follow-up:
-/// this used to `.to_owned()` every queue name on every poll regardless of
-/// how many the caller's claim loop actually tries before it finds work; a
-/// dhat profile at 16 queues / 20,000 polls found those clones were 300,000
-/// of the harness's 420,035 total allocations. See
-/// `docs/performance-queue-fairness.md`).
+/// string allocation on this poll-time hot path. This used to `.to_owned()`
+/// every queue name on every poll (issue #515 Bolt follow-up). That
+/// happened regardless of how many the caller's claim loop actually tries
+/// before it finds work. A dhat profile at 16 queues / 20,000 polls found
+/// those clones were 300,000 of the harness's 420,035 total allocations.
+/// See `docs/performance-queue-fairness.md`.
 #[must_use]
 pub fn weighted_queue_order<'a>(
     pairs: &[(&'a str, u32)],
