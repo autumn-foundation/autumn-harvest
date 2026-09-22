@@ -228,6 +228,45 @@ jobs:
         # as an untracked file one `git add -A` away from being committed.
         # See scripts/check-agentd-runtime-artifacts-ignored.sh.
         run: ./scripts/check-agentd-runtime-artifacts-ignored.sh
+      - name: Check signals chapter's clean await_condition example
+        # Guards two real, reproduced-live compile failures an Onramp
+        # clean-room pass found in chapter 4's "Clean Declarative
+        # await_condition" example (collect_approvals_clean) -- the pattern
+        # the chapter explicitly recommends over the "tedious" manual loop
+        # right above it. Neither is a syntax error, so
+        # docs/audits/doc-snippet-syntax.py's rustfmt-only check passed both
+        # blocks clean: (1) racing wait_for_signal against
+        # await_condition_timeout with futures::future::select needs
+        # #[workflow(allow_nondeterministic_apis)], or HVG010 hard-blocks
+        # the build; (2) a plain `let mut approvals` captured by the
+        # condition closure can never also be reassigned by the loop body
+        # while that borrow is live (E0506). E0506 is a borrow-checker
+        # property, not a syntax shape, so this actually compiles the
+        # pinned block with `cargo check` (see the script's own docstring
+        # for why a text heuristic proved gameable in review) rather than
+        # pattern-matching stand-in text -- one extra `cargo check
+        # --example` in a job that already builds this crate for clippy
+        # below. See scripts/check-signals-clean-approval-example-determinism.sh.
+        run: ./scripts/check-signals-clean-approval-example-determinism.sh
+      - name: Check reliability-knobs continue_as_new checkpoint example
+        # Guards a real, reproduced-live compile failure an Onramp
+        # clean-room pass found in chapter 7's flagship deadline-aware
+        # checkpoint example: `ctx.continue_as_new(...).await?` inside a
+        # `Result<_, String>` workflow, with no real conversion from the
+        # `HarvestError` continue_as_new returns first (E0277, no
+        # `From<HarvestError> for String`). Not a syntax error, so
+        # doc-snippet-syntax.py's rustfmt-only check passed it clean. The
+        # same broken snippet also lived, unenforced, inside
+        # autumn-harvest/examples/long_lived_entity_deadline.rs's own
+        # ```rust,ignore``` module-doc illustration, so this checks both.
+        # Whether a `.map_err(...)` closure actually produces `String` is a
+        # type-checker property, not a text shape (review found two
+        # text-heuristic attempts gameable in a row -- a loose window, then
+        # an `.await.map_err(|e| e)?` identity closure), so this compiles
+        # each pinned snippet with `cargo check` rather than pattern-
+        # matching stand-in text. See
+        # scripts/check-continue-as-new-checkpoint-example.sh.
+        run: ./scripts/check-continue-as-new-checkpoint-example.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest
