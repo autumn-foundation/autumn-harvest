@@ -278,8 +278,11 @@ PGPASSWORD=harvest psql -U harvest -h 127.0.0.1 -d harvest_test \
   -f target/debug/build/autumn-harvest-*/out/all_migrations_bundle.sql
 export HARVEST_TEST_DATABASE_URL="postgres://harvest:harvest@127.0.0.1:5432/harvest_test"
 
-# CPU oversubscription (8x on a 4-core box):
-for i in $(seq 1 32); do yes > /dev/null & done
+# CPU oversubscription (8x on a 4-core box). Capture the PIDs -- the
+# no-stress section below needs these actually stopped, not just
+# outlived, or its own "no stress needed" claim does not hold.
+STRESS_PIDS=()
+for i in $(seq 1 32); do yes > /dev/null & STRESS_PIDS+=("$!"); done
 
 # Reproduce the pre-fix flake (run against trunk-dev HEAD, before this
 # session's fix, to confirm the failure rate below still holds):
@@ -299,6 +302,10 @@ for i in $(seq 1 40); do
 done
 # -> 0/40 failures (this session's own run; a second 30-run batch also
 #    0/30, 70/70 total).
+
+# Stop the CPU burners before anything claiming "no stress needed" --
+# otherwise they are still running underneath it and that claim is false.
+kill "${STRESS_PIDS[@]}" 2>/dev/null
 
 # The unrelated, pre-existing full-module flake (no stress needed):
 for i in 1 2 3; do
