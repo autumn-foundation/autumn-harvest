@@ -1214,6 +1214,214 @@ impl HandlerRegistry {
                 per.max(self.max_activity_input_bytes)
             })
     }
+
+    /// Resolve the declared `execution_timeout`/`sla`/ceiling for a
+    /// scheduler-initiated start of `name` (issue #1412).
+    ///
+    /// `name` is a registered workflow's own name. `name` can also be a
+    /// DAG's shadow `WorkflowInfo` name (`DagInfo::as_workflow_info`
+    /// registers a DAG under its own name). One lookup covers both kinds.
+    ///
+    /// Returns raw declared values. This function clamps nothing. A caller
+    /// applies the ceiling to `execution_timeout` itself. A caller also
+    /// clamps `sla` to `execution_timeout` itself, when needed. Behavior
+    /// does not change from before this extraction. This function
+    /// centralizes the lookup only, not the downstream policy.
+    ///
+    /// Every field is `None` when `name` is not registered and the
+    /// registry declares no fleet-wide ceiling.
+    #[must_use]
+    pub fn resolve_dispatch_deadline(&self, name: &str) -> DispatchDeadline {
+        let info = self.workflows.get(name);
+        let execution_timeout = info
+            .and_then(|info| info.execution_timeout)
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        let sla = info
+            .and_then(|info| info.sla)
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        let max_execution_timeout_ceiling = self
+            .max_workflow_execution_timeout
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        DispatchDeadline {
+            execution_timeout,
+            sla,
+            max_execution_timeout_ceiling,
+        }
+    }
+}
+
+/// Return type of [`HandlerRegistry::resolve_dispatch_deadline`] (issue #1412).
+///
+/// A named struct, not a same-typed tuple. A caller cannot silently
+/// transpose `execution_timeout`/`sla`/the ceiling at a new call site — a
+/// mismatched field name fails to compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchDeadline {
+    pub execution_timeout: Option<chrono::Duration>,
+    pub sla: Option<chrono::Duration>,
+    pub max_execution_timeout_ceiling: Option<chrono::Duration>,
+}
+
+#[cfg(test)]
+mod resolve_dispatch_deadline_tests {
+    use super::*;
+
+    /// Build a bare `WorkflowInfo` with only the deadline fields set.
+    fn deadline_info_fixture(
+        name: &'static str,
+        execution_timeout: Option<std::time::Duration>,
+        sla: Option<std::time::Duration>,
+    ) -> WorkflowInfo {
+        WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
+            mcp: false,
+            name,
+            module: "tests",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout,
+            chain_execution_timeout: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            sla,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }
+    }
+
+    #[test]
+    fn unregistered_name_resolves_to_none() {
+        let registry = HandlerRegistry::new(vec![], vec![]);
+        assert_eq!(
+            registry.resolve_dispatch_deadline("no_such_workflow"),
+            DispatchDeadline {
+                execution_timeout: None,
+                sla: None,
+                max_execution_timeout_ceiling: None,
+            }
+        );
+    }
+
+    #[test]
+    fn declared_values_are_propagated_raw() {
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "wf",
+                Some(std::time::Duration::from_secs(60)),
+                Some(std::time::Duration::from_secs(30)),
+            )],
+            vec![],
+        );
+        assert_eq!(
+            registry.resolve_dispatch_deadline("wf"),
+            DispatchDeadline {
+                execution_timeout: Some(chrono::Duration::seconds(60)),
+                sla: Some(chrono::Duration::seconds(30)),
+                max_execution_timeout_ceiling: None,
+            }
+        );
+    }
+
+    #[test]
+    fn undeclared_values_resolve_to_none() {
+        let registry = HandlerRegistry::new(vec![deadline_info_fixture("wf", None, None)], vec![]);
+        assert_eq!(
+            registry.resolve_dispatch_deadline("wf"),
+            DispatchDeadline {
+                execution_timeout: None,
+                sla: None,
+                max_execution_timeout_ceiling: None,
+            }
+        );
+    }
+
+    #[test]
+    fn ceiling_is_read_from_the_registry_regardless_of_name() {
+        let registry = HandlerRegistry::new(vec![], vec![])
+            .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600)));
+        assert_eq!(
+            registry.resolve_dispatch_deadline("no_such_workflow"),
+            DispatchDeadline {
+                execution_timeout: None,
+                sla: None,
+                max_execution_timeout_ceiling: Some(chrono::Duration::seconds(3600)),
+            }
+        );
+    }
+
+    #[test]
+    fn ceiling_is_never_applied_to_the_declared_value_here() {
+        // resolve_dispatch_deadline returns raw declared values; clamping
+        // against the ceiling is each call site's own concern, unchanged
+        // from before this extraction (issue #1412).
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "wf",
+                Some(std::time::Duration::from_secs(7200)),
+                None,
+            )],
+            vec![],
+        )
+        .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600)));
+        assert_eq!(
+            registry.resolve_dispatch_deadline("wf"),
+            DispatchDeadline {
+                execution_timeout: Some(chrono::Duration::seconds(7200)),
+                sla: None,
+                max_execution_timeout_ceiling: Some(chrono::Duration::seconds(3600)),
+            }
+        );
+    }
+
+    /// A DAG's shadow `WorkflowInfo` resolves through the exact same code
+    /// path as a plain `#[workflow]` (issue #1412). `DagInfo::as_workflow_info`
+    /// propagates `execution_timeout`/`sla` verbatim onto that shadow entry,
+    /// and `HandlerRegistry::new` indexes it into `self.workflows` under the
+    /// DAG's own name like any other `WorkflowInfo`.
+    #[test]
+    fn dag_shadow_workflow_info_resolves_like_a_plain_workflow() {
+        let dag = crate::info::DagInfo {
+            name: "my_dag",
+            module: "tests",
+            schedule: None,
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: |_| {},
+            workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+            jitter: std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+            execution_timeout: Some(std::time::Duration::from_secs(120)),
+            sla: Some(std::time::Duration::from_secs(90)),
+        };
+        let shadow_workflow_info = dag
+            .as_workflow_info()
+            .expect("workflow_handler is Some, so as_workflow_info must be Some");
+        let registry = HandlerRegistry::new(vec![shadow_workflow_info], vec![]);
+        assert_eq!(
+            registry.resolve_dispatch_deadline("my_dag"),
+            DispatchDeadline {
+                execution_timeout: Some(chrono::Duration::seconds(120)),
+                sla: Some(chrono::Duration::seconds(90)),
+                max_execution_timeout_ceiling: None,
+            }
+        );
+    }
 }
 
 impl std::fmt::Debug for HandlerRegistry {

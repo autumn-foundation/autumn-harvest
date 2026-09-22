@@ -67,6 +67,7 @@ use autumn_harvest::store::admit_update_event_with_codecs;
 use autumn_harvest::types::{
     ExecutionId as HarvestExecutionId, Priority, ShardId, UpdateId, WorkflowIdReusePolicy,
 };
+use autumn_harvest::worker::DispatchDeadline;
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
 use autumn_harvest::{
     StepKind, StepOutcome, Timeline, TimelineRollup, TimelineStep, derive_timeline,
@@ -9405,27 +9406,25 @@ async fn execute_schedule_trigger_ui(
     // `dag_name`, which is also the key `DagInfo::as_workflow_info()`
     // registers a DAG's shadow `WorkflowInfo` under in `registry.workflows`.
     // So this ONE lookup already resolves both a workflow's AND a DAG's
-    // declared `sla`/`execution_timeout` (issue #743 review, PR #1141
-    // finding #6) -- the previous "DAGs have no SLA concept" framing predates
-    // DAG-level `sla`/`execution_timeout` support and only ever described the
-    // caller's mental model, not an actual code gap; `execution_timeout`
-    // itself was genuinely never resolved here, unlike `sla`.
-    let (sla, wf_default_retry_policy, execution_timeout) = runtime
+    // declared `sla`/`execution_timeout`.
+    let (raw_sla, wf_default_retry_policy, raw_execution_timeout) = runtime
         .registry()
         .workflows
         .get(workflow_name)
         .map_or((None, None, None), |info| {
-            (
-                crate::api::clamp_info_default_sla(info.sla, info.execution_timeout),
-                info.retry_policy.clone(),
-                info.execution_timeout
-                    .and_then(|d| chrono::Duration::from_std(d).ok()),
-            )
+            (info.sla, info.retry_policy.clone(), info.execution_timeout)
         });
-    let max_execution_timeout_ceiling = runtime
-        .registry()
-        .max_workflow_execution_timeout
-        .and_then(|d| chrono::Duration::from_std(d).ok());
+    let sla = crate::api::clamp_info_default_sla(raw_sla, raw_execution_timeout);
+    // Issue #1412: thread the declared execution_timeout and the fleet-wide
+    // ceiling via the same shared lookup the scheduler and DAG-backfill paths
+    // use. `raw_sla`/`raw_execution_timeout` above still separately feed the
+    // `sla` clamp -- `resolve_dispatch_deadline` returns an unclamped `sla`
+    // too, so it is discarded here.
+    let DispatchDeadline {
+        execution_timeout,
+        max_execution_timeout_ceiling,
+        ..
+    } = runtime.registry().resolve_dispatch_deadline(workflow_name);
     // Schedule-level retry_policy takes precedence over the workflow-type default,
     // mirroring the automated tick, backfill, and API trigger-now paths.
     let ui_trigger_retry_policy = row
