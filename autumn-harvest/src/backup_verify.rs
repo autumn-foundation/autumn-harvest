@@ -3132,7 +3132,7 @@ mod probes {
             .collect())
     }
 
-    /// One execution id's state, matched via `= ANY($1)` (issue #1717,
+    /// One execution id's state, matched via `= ANY($1)` (issue #1704,
     /// mirroring the completion-trigger-fire batching `matching_workflow_executions`
     /// already established for issue #1401).
     #[derive(diesel::QueryableByName)]
@@ -3144,7 +3144,7 @@ mod probes {
     }
 
     /// Which of the given execution ids exist, and their state, in ONE round
-    /// trip (issue #1717).
+    /// trip (issue #1704).
     ///
     /// The caller chunks at [`WORKFLOW_KEY_LOOKUP_CHUNK`] -- this function
     /// does not chunk internally, matching [`matching_workflow_keys`]'s own
@@ -3168,7 +3168,7 @@ mod probes {
     ///
     /// The state lookup itself is batched, `= ANY($1)` per
     /// [`WORKFLOW_KEY_LOOKUP_CHUNK`]-sized chunk of `owned`, not one
-    /// `WHERE id = $1` round trip per reference (issue #1717). A restore
+    /// `WHERE id = $1` round trip per reference (issue #1704). A restore
     /// drill's cross-shard reference set can reach into the thousands for a
     /// busy fan-out workflow. `adjudicate_trigger_fires` was already
     /// rewritten to avoid this exact query class, for issue #1401. That fix
