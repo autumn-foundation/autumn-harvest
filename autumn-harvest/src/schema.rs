@@ -754,6 +754,16 @@ diesel::table! {
         /// NULL = fired; `condition_unmet` / `condition_invalid` =
         /// resolved-skipped by the output guard (issue #810).
         outcome -> Nullable<Text>,
+        /// The shard the relay resolved for the target, at relay time (issue
+        /// #1401). NULL on a resolved-skip row (no target was ever picked)
+        /// and on every pre-migration row.
+        target_shard -> Nullable<Integer>,
+        /// `harvest_completion_triggers.target_workflow_name` AT RELAY TIME
+        /// (issue #1401). `sync_completion_triggers` can update that column
+        /// in place, so a join against the CURRENT value can name a target
+        /// this specific fire never used. NULL on a resolved-skip row and on
+        /// every pre-migration row.
+        target_workflow_name -> Nullable<Text>,
     }
 }
 

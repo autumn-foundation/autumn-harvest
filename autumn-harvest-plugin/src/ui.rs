@@ -67,6 +67,7 @@ use autumn_harvest::store::admit_update_event_with_codecs;
 use autumn_harvest::types::{
     ExecutionId as HarvestExecutionId, Priority, ShardId, UpdateId, WorkflowIdReusePolicy,
 };
+use autumn_harvest::worker::DispatchDeadline;
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
 use autumn_harvest::{
     StepKind, StepOutcome, Timeline, TimelineRollup, TimelineStep, derive_timeline,
@@ -1451,7 +1452,11 @@ fn resolve_workflow_detail_event_page(
         parse_page_query_field(event_page_raw);
     let (jump_event, jump_event_error) = parse_jump_event_query_field(jump_event_raw);
     let event_page = jump_event.map_or(event_page_from_query, |jump| {
-        let jump_zero = (jump - 1).max(0);
+        // `saturating_sub`, not `-`: `jump` is unclamped user input, and
+        // `i64::MIN - 1` overflows. Saturating leaves `i64::MIN` itself,
+        // which `.max(0)` still clamps to 0 like any other very-negative
+        // jump_event (Snag repro, boundary tour on `jump_event`).
+        let jump_zero = jump.saturating_sub(1).max(0);
         jump_zero / page_size
     });
     let event_page_error = if jump_event.is_some() {
@@ -9401,27 +9406,25 @@ async fn execute_schedule_trigger_ui(
     // `dag_name`, which is also the key `DagInfo::as_workflow_info()`
     // registers a DAG's shadow `WorkflowInfo` under in `registry.workflows`.
     // So this ONE lookup already resolves both a workflow's AND a DAG's
-    // declared `sla`/`execution_timeout` (issue #743 review, PR #1141
-    // finding #6) -- the previous "DAGs have no SLA concept" framing predates
-    // DAG-level `sla`/`execution_timeout` support and only ever described the
-    // caller's mental model, not an actual code gap; `execution_timeout`
-    // itself was genuinely never resolved here, unlike `sla`.
-    let (sla, wf_default_retry_policy, execution_timeout) = runtime
+    // declared `sla`/`execution_timeout`.
+    let (raw_sla, wf_default_retry_policy, raw_execution_timeout) = runtime
         .registry()
         .workflows
         .get(workflow_name)
         .map_or((None, None, None), |info| {
-            (
-                crate::api::clamp_info_default_sla(info.sla, info.execution_timeout),
-                info.retry_policy.clone(),
-                info.execution_timeout
-                    .and_then(|d| chrono::Duration::from_std(d).ok()),
-            )
+            (info.sla, info.retry_policy.clone(), info.execution_timeout)
         });
-    let max_execution_timeout_ceiling = runtime
-        .registry()
-        .max_workflow_execution_timeout
-        .and_then(|d| chrono::Duration::from_std(d).ok());
+    let sla = crate::api::clamp_info_default_sla(raw_sla, raw_execution_timeout);
+    // Issue #1412: thread the declared execution_timeout and the fleet-wide
+    // ceiling via the same shared lookup the scheduler and DAG-backfill paths
+    // use. `raw_sla`/`raw_execution_timeout` above still separately feed the
+    // `sla` clamp -- `resolve_dispatch_deadline` returns an unclamped `sla`
+    // too, so it is discarded here.
+    let DispatchDeadline {
+        execution_timeout,
+        max_execution_timeout_ceiling,
+        ..
+    } = runtime.registry().resolve_dispatch_deadline(workflow_name);
     // Schedule-level retry_policy takes precedence over the workflow-type default,
     // mirroring the automated tick, backfill, and API trigger-now paths.
     let ui_trigger_retry_policy = row
@@ -11977,6 +11980,27 @@ fn layout_schedules(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GREEN -- the fix under test (Snag repro, boundary tour on
+    /// `jump_event`). The fix in #1627 handles a non-numeric `jump_event`.
+    /// It also handles a small negative one (`-5`, see
+    /// `resolve_workflow_detail_event_page_clamps_a_negative_jump_event_to_zero`).
+    /// But `resolve_workflow_detail_event_page`'s prior `(jump - 1).max(0)`
+    /// still overflowed on `i64::MIN`. `i64::MIN - 1` cannot be
+    /// represented. A debug build panicked on that instead of degrading,
+    /// the default for `cargo test` and `cargo dev`. A GET to
+    /// `/ui/workflows/{exec_id}?jump_event=-9223372036854775808` reached
+    /// this exact call in `workflow_detail_ui`, with no other validation
+    /// in front of it. `saturating_sub` degrades it like any other
+    /// very-negative value instead: page 0, no error.
+    #[test]
+    fn resolve_workflow_detail_event_page_does_not_overflow_on_i64_min_jump_event() {
+        let (page, page_error, jump_error) =
+            resolve_workflow_detail_event_page(None, Some("-9223372036854775808"), 100);
+        assert_eq!(page, 0);
+        assert_eq!(page_error, None);
+        assert_eq!(jump_error, None);
+    }
 
     /// GREEN: a valid bound parses, and the raw display echoes the
     /// caller-supplied text (not a re-formatted RFC 3339 string) with no error.

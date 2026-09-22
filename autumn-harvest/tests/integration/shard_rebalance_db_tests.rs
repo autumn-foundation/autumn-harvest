@@ -49,8 +49,9 @@ use autumn_harvest::shard_rebalance::{
     conn_for_shard, history_fingerprint, list_migration_candidates, load_migration,
     migrate_execution, migrate_quiescent_executions, migrate_quiescent_executions_after,
     observe_quiescence, reconcile_migrated_seal_terminality, reconcile_migrated_seals_after,
-    residence_chain, resolve_execution_shard, resolve_execution_shard_holding,
-    resume_incomplete_migrations, stage_copy, verify_target_copy,
+    release_legal_hold_forwarded, residence_chain, resolve_execution_shard,
+    resolve_execution_shard_holding, resume_incomplete_migrations, set_legal_hold_forwarded,
+    stage_copy, verify_target_copy,
 };
 use autumn_harvest::stall_diagnosis;
 use autumn_harvest::store;
@@ -466,6 +467,46 @@ async fn forward_of(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Optio
     .await
     .optional()
     .expect("query forward");
+    row.and_then(|r| r.value)
+}
+
+#[derive(diesel::QueryableByName)]
+struct ScalarTimestamp {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    value: Option<chrono::DateTime<Utc>>,
+}
+
+/// `harvest_workflow_executions.legal_hold_set_at`, `NULL` when no hold is
+/// recorded on this row.
+async fn legal_hold_set_at_of(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> Option<chrono::DateTime<Utc>> {
+    let row: Option<ScalarTimestamp> = diesel::sql_query(
+        "SELECT legal_hold_set_at AS value FROM harvest_workflow_executions WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(conn)
+    .await
+    .optional()
+    .expect("query legal_hold_set_at");
+    row.and_then(|r| r.value)
+}
+
+/// `harvest_workflow_executions.legal_hold_reason`, `NULL` when no hold is
+/// recorded on this row.
+async fn legal_hold_reason_of(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> Option<String> {
+    let row: Option<ScalarText> = diesel::sql_query(
+        "SELECT legal_hold_reason AS value FROM harvest_workflow_executions WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(conn)
+    .await
+    .optional()
+    .expect("query legal_hold_reason");
     row.and_then(|r| r.value)
 }
 
@@ -6352,6 +6393,395 @@ async fn a_declined_cutover_reports_legal_hold_drift_not_a_wake() {
     assert!(
         !reason.contains("woke") && !reason.contains("quiescent"),
         "a hold-drift decline must not also claim a wake happened; got: {reason}"
+    );
+}
+
+// ── Issue #1405: legal-hold writes vs a mid-flight seal ─────────────────────
+//
+// `set_legal_hold`/`release_legal_hold` take a `FOR UPDATE` lock, then write
+// unconditionally. A caller resolves its connection to the execution's shard
+// once, before that lock is requested (`db_conn_for_execution`, at the top of
+// the API handler). A concurrent cutover can seal the row in the window
+// between that resolution and the lock grant. The lock still succeeds -- a
+// sealed row is an ordinary row to `SELECT ... FOR UPDATE`. The write used to
+// land on the forwarding tombstone while the API reported success.
+
+#[tokio::test]
+async fn set_legal_hold_refuses_a_row_sealed_after_it_resolved_but_before_its_lock_was_granted() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "hold-vs-seal-race").await;
+    let (mut source, mut target) = (shards.source().await, shards.target().await);
+
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+
+    // Lock the row so a concurrent cutover queues behind it. Release it only
+    // after the caller's connection below has resolved -- this reproduces the
+    // exact ordering the bug needs: resolve, THEN seal, THEN lock.
+    let mut holder = shards.source().await;
+    let (lock_held_tx, lock_held_rx) = tokio::sync::oneshot::channel();
+    let (release_lock_tx, release_lock_rx) = tokio::sync::oneshot::channel();
+    let holder_task = tokio::spawn(async move {
+        Box::pin(holder.transaction::<(), HarvestError, _>(async |conn| {
+            diesel::sql_query(
+                "SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .execute(&mut *conn)
+            .await?;
+            let _ = lock_held_tx.send(());
+            let _ = release_lock_rx.await;
+            Ok(())
+        }))
+        .await
+        .expect("holder transaction");
+    });
+    lock_held_rx.await.expect("lock-held signal");
+
+    // The caller's own connection resolves NOW, while the row is still
+    // RUNNING and unsealed -- exactly `db_conn_for_execution`'s one-time,
+    // pre-lock resolution.
+    let (mut caller_conn, _) = conn_for_execution_forwarded_with_shard(&shards.pool, exec_id)
+        .await
+        .expect("resolve before the seal");
+
+    // Cutover queues behind the held lock, then seals the row once it is
+    // released below.
+    let mut cutover_conn = shards.source().await;
+    let cutover_task =
+        tokio::spawn(async move { commit_cutover(&mut cutover_conn, exec_id, TARGET).await });
+    // Give the cutover attempt time to queue behind the held lock before
+    // releasing it, so the ordering does not depend on scheduler luck.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let _ = release_lock_tx.send(());
+    holder_task.await.expect("holder task");
+    assert!(
+        cutover_task.await.expect("cutover task").expect("cutover"),
+        "cutover must seal the source"
+    );
+
+    // The caller's pre-resolved connection now locks and writes onto a row
+    // that was sealed after it resolved.
+    let result = autumn_harvest::set_legal_hold(
+        &mut caller_conn,
+        exec_id,
+        "queued behind cutover",
+        None,
+        "compliance-bot",
+        Utc::now(),
+    )
+    .await;
+
+    match result {
+        Err(HarvestError::ShardUnavailable { shard_id, reason }) => {
+            assert_eq!(
+                shard_id,
+                TARGET.as_i32(),
+                "the refusal must name the shard the row now forwards to"
+            );
+            assert!(
+                reason.contains(&TARGET.as_i32().to_string()),
+                "the refusal reason must name the live shard; got: {reason}"
+            );
+        }
+        other => panic!("expected a ShardUnavailable naming the live shard, got {other:?}"),
+    }
+    assert_eq!(
+        legal_hold_set_at_of(&mut source, exec_id).await,
+        None,
+        "the hold must not land on the sealed tombstone"
+    );
+    assert_eq!(
+        legal_hold_reason_of(&mut source, exec_id).await,
+        None,
+        "no reason must land on the sealed tombstone either"
+    );
+}
+
+#[tokio::test]
+async fn release_legal_hold_refuses_a_sealed_row_instead_of_clearing_it() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "hold-vs-seal-release").await;
+
+    autumn_harvest::set_legal_hold(
+        &mut shards.source().await,
+        exec_id,
+        "under review",
+        None,
+        "compliance-bot",
+        Utc::now(),
+    )
+    .await
+    .expect("place a hold before migrating");
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migration must succeed");
+
+    let mut source = shards.source().await;
+    let result = autumn_harvest::release_legal_hold(&mut source, exec_id, Utc::now()).await;
+
+    match result {
+        Err(HarvestError::ShardUnavailable { shard_id, reason }) => {
+            assert_eq!(shard_id, TARGET.as_i32());
+            assert!(
+                reason.contains(&TARGET.as_i32().to_string()),
+                "the refusal reason must name the live shard; got: {reason}"
+            );
+        }
+        other => panic!("expected a ShardUnavailable naming the live shard, got {other:?}"),
+    }
+    assert!(
+        legal_hold_set_at_of(&mut source, exec_id).await.is_some(),
+        "a refused release must not clear the sealed tombstone's own hold columns"
+    );
+    assert_eq!(
+        legal_hold_reason_of(&mut source, exec_id).await.as_deref(),
+        Some("under review"),
+        "a refused release must not clear the sealed tombstone's reason either"
+    );
+}
+
+#[tokio::test]
+async fn set_legal_hold_forwarded_lands_the_hold_on_the_live_copy_after_a_cutover() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "hold-forwarded-set").await;
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migration must succeed");
+
+    let (outcome, shard) = set_legal_hold_forwarded(
+        &shards.pool,
+        exec_id,
+        "compliance review",
+        None,
+        "compliance-bot",
+        Utc::now(),
+    )
+    .await
+    .expect("the forwarded write must follow the seal to the live copy");
+    assert!(outcome.newly_held);
+    assert_eq!(shard, TARGET, "must report the shard the write landed on");
+
+    assert!(
+        legal_hold_set_at_of(&mut shards.target().await, exec_id)
+            .await
+            .is_some(),
+        "the live copy on the target must carry the hold"
+    );
+    assert_eq!(
+        legal_hold_set_at_of(&mut shards.source().await, exec_id).await,
+        None,
+        "the sealed source must be left untouched"
+    );
+}
+
+#[tokio::test]
+async fn release_legal_hold_forwarded_clears_the_hold_on_the_live_copy_after_a_cutover() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "hold-forwarded-release").await;
+
+    autumn_harvest::set_legal_hold(
+        &mut shards.source().await,
+        exec_id,
+        "under review",
+        None,
+        "compliance-bot",
+        Utc::now(),
+    )
+    .await
+    .expect("place a hold before migrating");
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migration must succeed");
+
+    let (outcome, shard) = release_legal_hold_forwarded(&shards.pool, exec_id, Utc::now())
+        .await
+        .expect("the forwarded release must follow the seal to the live copy");
+    assert!(outcome.released);
+    assert_eq!(shard, TARGET, "must report the shard the release landed on");
+
+    assert_eq!(
+        legal_hold_set_at_of(&mut shards.target().await, exec_id).await,
+        None,
+        "the live copy on the target must no longer carry the hold"
+    );
+    assert!(
+        legal_hold_set_at_of(&mut shards.source().await, exec_id)
+            .await
+            .is_some(),
+        "the sealed source's own columns are untouched by a forwarded release"
+    );
+}
+
+/// Lock the row so a concurrent cutover queues behind it, spawn `cutover`
+/// (which also queues), release the lock, and confirm the cutover sealed
+/// the row. Then return the write task `spawn_after_cutover_queued`
+/// spawned -- the shared setup half of the two tests below.
+///
+/// `cutover` is spawned strictly before `spawn_after_cutover_queued` runs.
+/// A lock waiter its returned task starts therefore queues behind cutover,
+/// and is granted the row only once the seal has already committed.
+/// Returning the caller's `JoinHandle` (rather than awaiting it here) lets
+/// the caller unwrap its own result with its own error message.
+async fn seal_mid_flight<F, T>(
+    shards: &TwoShards,
+    exec_id: ExecutionId,
+    spawn_after_cutover_queued: F,
+) -> tokio::task::JoinHandle<T>
+where
+    F: FnOnce() -> tokio::task::JoinHandle<T>,
+{
+    let mut holder = shards.source().await;
+    let (lock_held_tx, lock_held_rx) = tokio::sync::oneshot::channel();
+    let (release_lock_tx, release_lock_rx) = tokio::sync::oneshot::channel();
+    let holder_task = tokio::spawn(async move {
+        Box::pin(holder.transaction::<(), HarvestError, _>(async |conn| {
+            diesel::sql_query(
+                "SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .execute(&mut *conn)
+            .await?;
+            let _ = lock_held_tx.send(());
+            let _ = release_lock_rx.await;
+            Ok(())
+        }))
+        .await
+        .expect("holder transaction");
+    });
+    lock_held_rx.await.expect("lock-held signal");
+
+    let mut cutover_conn = shards.source().await;
+    let cutover_task =
+        tokio::spawn(async move { commit_cutover(&mut cutover_conn, exec_id, TARGET).await });
+    // Give the cutover attempt time to queue behind the held lock before the
+    // caller's own lock waiter starts, so cutover is granted the row first.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let write_task = spawn_after_cutover_queued();
+    // Give the caller's lock waiter time to queue behind cutover before the
+    // lock is released, so ordering does not depend on scheduler luck.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let _ = release_lock_tx.send(());
+    holder_task.await.expect("holder task");
+    assert!(
+        cutover_task.await.expect("cutover task").expect("cutover"),
+        "cutover must seal the source"
+    );
+    write_task
+}
+
+#[tokio::test]
+async fn set_legal_hold_forwarded_recovers_from_a_seal_mid_flight() {
+    // Issue #1405 follow-up review. The four tests above prove the core
+    // refusal. They also prove the forwarded wrapper works when called
+    // AFTER a migration has already settled. Neither exercises the
+    // wrapper's own retry loop actually catching a refusal and looping.
+    // This test does:
+    // the wrapper's first resolution happens before the seal, its first
+    // `FOR UPDATE` is granted after it, and it must recover on its own.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "hold-forwarded-recovers-set").await;
+    let (mut source, mut target) = (shards.source().await, shards.target().await);
+
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+
+    let pool = shards.pool.clone();
+    // The wrapper's own resolution races no lock (a plain read); only its
+    // `FOR UPDATE` must queue behind cutover. Spawning it here, after
+    // cutover has already queued, is what proves that ordering.
+    let write_task = seal_mid_flight(&shards, exec_id, || {
+        tokio::spawn(async move {
+            set_legal_hold_forwarded(
+                &pool,
+                exec_id,
+                "recovers from a mid-flight seal",
+                None,
+                "compliance-bot",
+                Utc::now(),
+            )
+            .await
+        })
+    })
+    .await;
+
+    let (outcome, shard) = write_task
+        .await
+        .expect("write task")
+        .expect("the wrapper must recover from the mid-flight seal on its own");
+    assert!(outcome.newly_held);
+    assert_eq!(shard, TARGET, "must land on the shard it retried onto");
+    assert!(
+        legal_hold_set_at_of(&mut shards.target().await, exec_id)
+            .await
+            .is_some(),
+        "the retried write must reach the live copy"
+    );
+}
+
+#[tokio::test]
+async fn release_legal_hold_forwarded_recovers_from_a_seal_mid_flight() {
+    // Symmetric to `set_legal_hold_forwarded_recovers_from_a_seal_mid_flight`.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "hold-forwarded-recovers-release").await;
+
+    autumn_harvest::set_legal_hold(
+        &mut shards.source().await,
+        exec_id,
+        "under review",
+        None,
+        "compliance-bot",
+        Utc::now(),
+    )
+    .await
+    .expect("place a hold before staging");
+
+    let (mut source, mut target) = (shards.source().await, shards.target().await);
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+
+    let pool = shards.pool.clone();
+    let write_task = seal_mid_flight(&shards, exec_id, || {
+        tokio::spawn(async move { release_legal_hold_forwarded(&pool, exec_id, Utc::now()).await })
+    })
+    .await;
+
+    let (outcome, shard) = write_task
+        .await
+        .expect("write task")
+        .expect("the wrapper must recover from the mid-flight seal on its own");
+    assert!(outcome.released);
+    assert_eq!(shard, TARGET, "must land on the shard it retried onto");
+    assert_eq!(
+        legal_hold_set_at_of(&mut shards.target().await, exec_id).await,
+        None,
+        "the retried release must reach the live copy"
     );
 }
 

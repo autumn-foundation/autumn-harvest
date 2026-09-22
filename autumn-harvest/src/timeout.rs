@@ -4992,7 +4992,19 @@ pub fn spawn_timeout_checker_for_shard(
             // posture `acquire_shard_conn` already uses for registration and
             // heartbeats. It is better than blocking the whole scanner on
             // one contested pool.
-            match tokio::time::timeout(interval, pool.get()).await {
+            //
+            // Also selected against `cancel` (issue #1426): the `interval`
+            // bound above only limits a merely-slow acquisition. Without this
+            // select, a shutdown request during that wait would still queue
+            // behind the full `interval` before this loop noticed it.
+            let get_result = tokio::select! {
+                () = cancel.cancelled() => {
+                    tracing::debug!("timeout checker cancelled while acquiring a connection");
+                    break;
+                }
+                result = tokio::time::timeout(interval, pool.get()) => result,
+            };
+            match get_result {
                 Ok(Ok(mut conn)) => match enforce_timeouts_once(
                     &mut conn,
                     &*telemetry.metrics,

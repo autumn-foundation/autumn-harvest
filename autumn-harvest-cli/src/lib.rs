@@ -1797,6 +1797,13 @@ enum AuditCommand {
         /// Upper bound (exclusive), RFC 3339.
         #[arg(long)]
         before: Option<String>,
+        /// Row id tiebreaker for `--before` (issue #1408).
+        ///
+        /// Pass the prior page's last row id, alongside `--before`, to page
+        /// past rows tied on that timestamp. Has no effect without
+        /// `--before`.
+        #[arg(long)]
+        before_id: Option<String>,
         /// Maximum number of records to return [1–500].
         #[arg(long, value_parser = clap::value_parser!(i64).range(1..=500))]
         limit: Option<i64>,
@@ -4727,7 +4734,7 @@ pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
             replay.unreadable,
             replay.unreadable
         );
-    } else if replay.unreadable > 0 {
+    } else if replay.unreadable > 0 && replay.skipped_no_handler == 0 {
         // Every sample that reached this check was unreadable, and none
         // replayed at all. This is distinct from the branch below, where
         // nothing replayed because no handler was registered. Handlers may
@@ -4741,6 +4748,23 @@ pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
              history failed to read; see the history_unreadable finding above for the cause. \
              Registering workflow handlers will not fix this.",
             replay.sampled, replay.unreadable
+        );
+    } else if replay.unreadable > 0 {
+        // Nothing replayed, for two separate reasons at once: some samples
+        // were unreadable, others had no registered handler. A fleet-wide
+        // merge across shards can produce this mix (issue #1410). Name both
+        // counts. Registering handlers fixes only the second group.
+        let _ = writeln!(
+            out,
+            "  replay: NOT VERIFIED — {} sampled, {} unreadable, {} skipped (no handler), \
+             0 replayed. {} history/histories failed to read; see the history_unreadable \
+             finding above for the cause. {} had no registered handler. Registering \
+             handlers may fix part of this, not all of it.",
+            replay.sampled,
+            replay.unreadable,
+            replay.skipped_no_handler,
+            replay.unreadable,
+            replay.skipped_no_handler
         );
     } else {
         let _ = writeln!(
@@ -11700,6 +11724,7 @@ fn audit_request(command: &AuditCommand) -> ApiRequest {
             status,
             since,
             before,
+            before_id,
             limit,
         } => {
             let mut params: Vec<(&'static str, String)> = Vec::new();
@@ -11723,6 +11748,9 @@ fn audit_request(command: &AuditCommand) -> ApiRequest {
             }
             if let Some(v) = before {
                 params.push(("before", v.clone()));
+            }
+            if let Some(v) = before_id {
+                params.push(("before_id", v.clone()));
             }
             if let Some(v) = limit {
                 params.push(("limit", v.to_string()));

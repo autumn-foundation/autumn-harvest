@@ -564,9 +564,18 @@
             }
           },
           {
-            "description": "RFC 3339 timestamp — only return records before this time.",
+            "description": "RFC 3339 timestamp — only return records before this time. Pair with before_id to page past rows tied on this time.",
             "in": "query",
             "name": "before",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Row id tiebreaker for before. Use the last row id from the prior page.",
+            "in": "query",
+            "name": "before_id",
             "required": false,
             "schema": {
               "type": "string"
@@ -6388,6 +6397,10 @@
                   "activity_name": {
                     "description": "Filter by activity function name."
                   },
+                  "dead_letter_id": {
+                    "description": "Target exactly one dead letter by id.",
+                    "type": "string"
+                  },
                   "dlq_reason": {
                     "description": "Filter by derived DLQ reason class (compute-on-read, exact match; e.g. poison_pill, retry_exhaustion)."
                   },
@@ -6415,6 +6428,14 @@
                   "queue_name": {
                     "description": "Filter by task queue name (exact match; SQL-expressible). Lets an operator reproduce a queue-scoped aggregate facet exactly."
                   },
+                  "shard_id": {
+                    "description": "Scope the operation to one shard.",
+                    "type": "integer"
+                  },
+                  "task_type": {
+                    "description": "Restrict the cohort to one task type. Alias: task_kind.",
+                    "type": "string"
+                  },
                   "workflow_name": {
                     "description": "Filter by workflow name."
                   }
@@ -6423,7 +6444,7 @@
               }
             }
           },
-          "required": false
+          "required": true
         },
         "responses": {
           "200": {
@@ -6472,6 +6493,10 @@
                   "activity_name": {
                     "description": "Filter by activity function name."
                   },
+                  "dead_letter_id": {
+                    "description": "Target exactly one dead letter by id.",
+                    "type": "string"
+                  },
                   "dlq_reason": {
                     "description": "Filter by derived DLQ reason class (compute-on-read, exact match; e.g. poison_pill, retry_exhaustion)."
                   },
@@ -6499,6 +6524,14 @@
                   "queue_name": {
                     "description": "Filter by task queue name (exact match; SQL-expressible). Lets an operator reproduce a queue-scoped aggregate facet exactly."
                   },
+                  "shard_id": {
+                    "description": "Scope the operation to one shard.",
+                    "type": "integer"
+                  },
+                  "task_type": {
+                    "description": "Restrict the cohort to one task type. Alias: task_kind.",
+                    "type": "string"
+                  },
                   "workflow_name": {
                     "description": "Filter by workflow name."
                   }
@@ -6507,7 +6540,7 @@
               }
             }
           },
-          "required": false
+          "required": true
         },
         "responses": {
           "200": {
@@ -6639,6 +6672,10 @@
                   "reason": {
                     "description": "Optional operator reason recorded on the WorkflowRedriven event."
                   },
+                  "shard_id": {
+                    "description": "Scope the operation to one shard.",
+                    "type": "integer"
+                  },
                   "workflow_name": {
                     "description": "Filter by the owning execution's workflow name."
                   }
@@ -6647,7 +6684,7 @@
               }
             }
           },
-          "required": false
+          "required": true
         },
         "responses": {
           "200": {
@@ -11973,6 +12010,9 @@
           "409": {
             "description": "Duplicate workflow_id with id_reuse_policy=reject_duplicate."
           },
+          "413": {
+            "description": "The serialized workflow input exceeds max_workflow_input_bytes, or the signal payload exceeds max_signal_payload_bytes."
+          },
           "429": {
             "description": "The workflow's declared per-tenant resource quota (issue #946, QuotaPolicy) is exhausted for the resolved key on a FRESH admission only (attaching to an existing run and delivering the signal to it never re-checks the quota). Body is {\"error\": \"quota exceeded\", \"workflow_name\", \"key\", \"resource\", \"limit\", \"current\"}, mirroring the plain start route's arm exactly. Never returned for a workflow with no declared QuotaPolicy."
           },
@@ -12408,6 +12448,9 @@
           },
           "409": {
             "description": "Duplicate workflow_id with id_reuse_policy=reject_duplicate, or execution is PAUSED."
+          },
+          "413": {
+            "description": "The serialized workflow input exceeds max_workflow_input_bytes."
           },
           "422": {
             "description": "Update validator rejected the update_args."

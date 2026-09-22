@@ -1214,6 +1214,214 @@ impl HandlerRegistry {
                 per.max(self.max_activity_input_bytes)
             })
     }
+
+    /// Resolve the declared `execution_timeout`/`sla`/ceiling for a
+    /// scheduler-initiated start of `name` (issue #1412).
+    ///
+    /// `name` is a registered workflow's own name. `name` can also be a
+    /// DAG's shadow `WorkflowInfo` name (`DagInfo::as_workflow_info`
+    /// registers a DAG under its own name). One lookup covers both kinds.
+    ///
+    /// Returns raw declared values. This function clamps nothing. A caller
+    /// applies the ceiling to `execution_timeout` itself. A caller also
+    /// clamps `sla` to `execution_timeout` itself, when needed. Behavior
+    /// does not change from before this extraction. This function
+    /// centralizes the lookup only, not the downstream policy.
+    ///
+    /// Every field is `None` when `name` is not registered and the
+    /// registry declares no fleet-wide ceiling.
+    #[must_use]
+    pub fn resolve_dispatch_deadline(&self, name: &str) -> DispatchDeadline {
+        let info = self.workflows.get(name);
+        let execution_timeout = info
+            .and_then(|info| info.execution_timeout)
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        let sla = info
+            .and_then(|info| info.sla)
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        let max_execution_timeout_ceiling = self
+            .max_workflow_execution_timeout
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        DispatchDeadline {
+            execution_timeout,
+            sla,
+            max_execution_timeout_ceiling,
+        }
+    }
+}
+
+/// Return type of [`HandlerRegistry::resolve_dispatch_deadline`] (issue #1412).
+///
+/// A named struct, not a same-typed tuple. A caller cannot silently
+/// transpose `execution_timeout`/`sla`/the ceiling at a new call site — a
+/// mismatched field name fails to compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchDeadline {
+    pub execution_timeout: Option<chrono::Duration>,
+    pub sla: Option<chrono::Duration>,
+    pub max_execution_timeout_ceiling: Option<chrono::Duration>,
+}
+
+#[cfg(test)]
+mod resolve_dispatch_deadline_tests {
+    use super::*;
+
+    /// Build a bare `WorkflowInfo` with only the deadline fields set.
+    fn deadline_info_fixture(
+        name: &'static str,
+        execution_timeout: Option<std::time::Duration>,
+        sla: Option<std::time::Duration>,
+    ) -> WorkflowInfo {
+        WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
+            mcp: false,
+            name,
+            module: "tests",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout,
+            chain_execution_timeout: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            sla,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }
+    }
+
+    #[test]
+    fn unregistered_name_resolves_to_none() {
+        let registry = HandlerRegistry::new(vec![], vec![]);
+        assert_eq!(
+            registry.resolve_dispatch_deadline("no_such_workflow"),
+            DispatchDeadline {
+                execution_timeout: None,
+                sla: None,
+                max_execution_timeout_ceiling: None,
+            }
+        );
+    }
+
+    #[test]
+    fn declared_values_are_propagated_raw() {
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "wf",
+                Some(std::time::Duration::from_secs(60)),
+                Some(std::time::Duration::from_secs(30)),
+            )],
+            vec![],
+        );
+        assert_eq!(
+            registry.resolve_dispatch_deadline("wf"),
+            DispatchDeadline {
+                execution_timeout: Some(chrono::Duration::seconds(60)),
+                sla: Some(chrono::Duration::seconds(30)),
+                max_execution_timeout_ceiling: None,
+            }
+        );
+    }
+
+    #[test]
+    fn undeclared_values_resolve_to_none() {
+        let registry = HandlerRegistry::new(vec![deadline_info_fixture("wf", None, None)], vec![]);
+        assert_eq!(
+            registry.resolve_dispatch_deadline("wf"),
+            DispatchDeadline {
+                execution_timeout: None,
+                sla: None,
+                max_execution_timeout_ceiling: None,
+            }
+        );
+    }
+
+    #[test]
+    fn ceiling_is_read_from_the_registry_regardless_of_name() {
+        let registry = HandlerRegistry::new(vec![], vec![])
+            .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600)));
+        assert_eq!(
+            registry.resolve_dispatch_deadline("no_such_workflow"),
+            DispatchDeadline {
+                execution_timeout: None,
+                sla: None,
+                max_execution_timeout_ceiling: Some(chrono::Duration::seconds(3600)),
+            }
+        );
+    }
+
+    #[test]
+    fn ceiling_is_never_applied_to_the_declared_value_here() {
+        // resolve_dispatch_deadline returns raw declared values; clamping
+        // against the ceiling is each call site's own concern, unchanged
+        // from before this extraction (issue #1412).
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "wf",
+                Some(std::time::Duration::from_secs(7200)),
+                None,
+            )],
+            vec![],
+        )
+        .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600)));
+        assert_eq!(
+            registry.resolve_dispatch_deadline("wf"),
+            DispatchDeadline {
+                execution_timeout: Some(chrono::Duration::seconds(7200)),
+                sla: None,
+                max_execution_timeout_ceiling: Some(chrono::Duration::seconds(3600)),
+            }
+        );
+    }
+
+    /// A DAG's shadow `WorkflowInfo` resolves through the exact same code
+    /// path as a plain `#[workflow]` (issue #1412). `DagInfo::as_workflow_info`
+    /// propagates `execution_timeout`/`sla` verbatim onto that shadow entry,
+    /// and `HandlerRegistry::new` indexes it into `self.workflows` under the
+    /// DAG's own name like any other `WorkflowInfo`.
+    #[test]
+    fn dag_shadow_workflow_info_resolves_like_a_plain_workflow() {
+        let dag = crate::info::DagInfo {
+            name: "my_dag",
+            module: "tests",
+            schedule: None,
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: |_| {},
+            workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+            jitter: std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+            execution_timeout: Some(std::time::Duration::from_secs(120)),
+            sla: Some(std::time::Duration::from_secs(90)),
+        };
+        let shadow_workflow_info = dag
+            .as_workflow_info()
+            .expect("workflow_handler is Some, so as_workflow_info must be Some");
+        let registry = HandlerRegistry::new(vec![shadow_workflow_info], vec![]);
+        assert_eq!(
+            registry.resolve_dispatch_deadline("my_dag"),
+            DispatchDeadline {
+                execution_timeout: Some(chrono::Duration::seconds(120)),
+                sla: Some(chrono::Duration::seconds(90)),
+                max_execution_timeout_ceiling: None,
+            }
+        );
+    }
 }
 
 impl std::fmt::Debug for HandlerRegistry {
@@ -2082,6 +2290,24 @@ impl AbandonedDispatchPlan {
 /// which is what makes the same records safe.
 const fn records_abandoned_dispatches(outcome: &WorkflowOutcome) -> bool {
     matches!(outcome, WorkflowOutcome::Failed { .. })
+}
+
+/// Whether a `ContinuedAsNew` outcome is exempt from the history hard cap
+/// (issue #1409, Codex P2 on PR #1679).
+///
+/// A genuine continuation escapes onto a fresh successor row, so the
+/// predecessor's own cap is moot -- but only when it carries no
+/// abandoned-dispatch-eligible command. A redirect to `WorkflowFailed` can
+/// append issue #952's synthetic pair onto this SAME row, so the exemption
+/// does not extend there. `resolved_abandoned_dispatch_event_count` is the
+/// caller's pre-dedup upper bound (see [`terminal_history_event_count`]'s
+/// doc): nonzero here means the batch has at least one such command.
+const fn continue_as_new_exempt_from_history_cap(
+    outcome: &WorkflowOutcome,
+    resolved_abandoned_dispatch_event_count: u64,
+) -> bool {
+    matches!(outcome, WorkflowOutcome::ContinuedAsNew { .. })
+        && resolved_abandoned_dispatch_event_count == 0
 }
 
 /// The events recording one dispatch a failing cycle abandoned (issue #952), or
@@ -6657,9 +6883,10 @@ fn first_persist_capability_miss(
 /// which makes an unregistered target the same blameless fleet condition every
 /// other #804 site releases for — canonically a rolling deploy where the old
 /// pod runs the source phase and only the new peer registers the target phase.
-/// Without this, `check_continue_as_new_type` funnels it into
-/// `persist_workflow_failure` and the predecessor is terminally failed by a
-/// worker that simply arrived first.
+/// Without this, `resolve_continue_as_new_verdict` (issue #1409) resolves
+/// the unregistered target into a `RootFailure` verdict. That verdict's
+/// write funnels into `persist_workflow_failure`, terminally failing the
+/// predecessor by a worker that simply arrived first.
 ///
 /// **Only the unregistered case.** `classify_continue_as_new_target` rejects a
 /// target for five other reasons, and none of them is about this worker:
@@ -10380,9 +10607,35 @@ async fn persist_all_started_child_workflows(
             .await?;
         }
 
+        // Issue #1589 (direction a): route each local child to the
+        // sequential insert-then-admit path, or to a batched-insert path.
+        // The routing checks whether its OWN `enforce_quota_admission` call
+        // would touch the database at all. That function no-ops (zero
+        // queries) in exactly three cases: no declared policy, no active
+        // cap, or no resolved key -- checked below. A child in that shape
+        // can never reject a sibling or be rejected by one. The insert-
+        // then-admit ORDER carries no information for it. So the whole
+        // group can be inserted, appended, and enqueued as one batch each,
+        // instead of one row each.
+        let mut sequential_children: Vec<LocalChildPlan<'_>> = Vec::new();
+        let mut batchable_children: Vec<LocalChildPlan<'_>> = Vec::new();
+        // Issue #1589: `RetryPolicy::non_retryable_errors` is an unbounded
+        // `Vec<String>`. Without this cache, a same-type fan-out would
+        // resolve and hold one independent deep copy per child. All
+        // copies stay alive at once before the first insert chunk runs.
+        // The cache lets same-type children in this fan-out share ONE
+        // resolved `Arc`. Peak memory then scales with distinct workflow
+        // types, not with child count.
+        let mut retry_policy_cache: HashMap<&str, Arc<serde_json::Value>> = HashMap::new();
         for child in &local_new_children {
-            let child_workflow_id = child.child_id.to_string();
-            let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
+            let mut defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
+            if let Some(policy) = defaults.retry_policy.take() {
+                defaults.retry_policy = Some(cached_retry_policy(
+                    &mut retry_policy_cache,
+                    child.workflow_name.as_str(),
+                    policy,
+                ));
+            }
             // Resolve + bound the CHILD's own quota key from ITS OWN declared
             // policy (issue #946, Codex round-3 review) -- a spawned child
             // accumulates its own history/DLQ/active-execution footprint
@@ -10404,52 +10657,44 @@ async fn persist_all_started_child_workflows(
                     activity_name: None,
                 });
             }
-            let child_row = NewWorkflowExecution {
-                continued_from_exec_id: None,
-                first_exec_id: None,
-                chain_execution_timeout: defaults.chain_execution_timeout,
-                chain_deadline_at: defaults.chain_deadline_at,
-                id: child.child_id.as_uuid(),
-                workflow_name: &child.workflow_name,
-                workflow_id: &child_workflow_id,
-                run_id: uuid::Uuid::new_v4(),
-                shard_id,
-                input: child.input.clone(),
-                parent_id: Some(parent_exec_id.as_uuid()),
-                queue_name: &queue_name,
-                execution_timeout: defaults.execution_timeout,
-                deadline_at: defaults.deadline_at,
-                sla: defaults.sla,
-                sla_deadline_at: defaults.sla_deadline_at,
-                memo: None,
-                search_attrs: None,
-                assigned_build_id: parent_execution.assigned_build_id.clone(),
-                parent_close_policy: None, // awaited child
-                owner: defaults.owner,
-                runbook_url: defaults.runbook_url,
-                severity: defaults.severity,
-                context_headers: parent_execution.context_headers.clone(),
-                schedule_id: None, // child workflows are not scheduled fires
-                scheduled_for: None,
-                workflow_attempt: 1,
-                workflow_retry_policy: defaults.retry_policy,
-                retry_of_exec_id: None,
-                origin: None, // child workflow, not a schedule fire (issue #534)
-                // Children get only builder-wide default callback
-                // targets, resolved at their own terminal transition
-                // (issue #605) — no per-execution override here.
-                completion_callbacks: None,
-                start_source: Some(crate::types::StartSource::Child.as_str()),
-                start_source_ref: Some(parent_exec_id_str.as_str()),
-                started_by: None,
-                // A spawned child is enforced against its OWN declared quota
-                // policy (issue #946, Codex round-3 review) -- resolved and
-                // bound-checked above via `child_quota_key`. Stamping it here
-                // (rather than `None`) keeps the row correctly tagged for
-                // future usage accounting even on a re-park path where this
-                // child already exists and enforcement below is skipped.
-                quota_key: child_quota_key.as_deref(),
+            let admission_is_noop = defaults
+                .quota
+                .as_ref()
+                .is_none_or(|policy| !policy.has_any_cap() || child_quota_key.is_none());
+            let plan = LocalChildPlan {
+                child,
+                defaults,
+                child_workflow_id: child.child_id.to_string(),
+                child_quota_key,
             };
+            if admission_is_noop {
+                batchable_children.push(plan);
+            } else {
+                sequential_children.push(plan);
+            }
+        }
+
+        // Children with an active cap on their own declared policy keep the
+        // original sequential insert-then-admit contract, one child at a
+        // time, unchanged. `enforce_quota_admission`'s graduated "admit
+        // first K, reject the rest" property (see that function's own doc
+        // comment) is therefore unaffected by this split.
+        for plan in &sequential_children {
+            let child = plan.child;
+            // A spawned child is enforced against its OWN declared quota
+            // policy (issue #946, Codex round-3 review) -- resolved and
+            // bound-checked above via `child_quota_key`. Stamping it here
+            // (rather than `None`) keeps the row correctly tagged for
+            // future usage accounting even on a re-park path where this
+            // child already exists and enforcement below is skipped.
+            let child_row = build_child_row(
+                plan,
+                shard_id,
+                &queue_name,
+                parent_exec_id,
+                parent_execution,
+                &parent_exec_id_str,
+            );
             let child_started_event = WorkflowEvent::WorkflowStarted {
                 input: child.input.clone(),
                 timestamp: chrono::Utc::now(),
@@ -10498,8 +10743,8 @@ async fn persist_all_started_child_workflows(
             // an unrelated tenant's quota (Codex round-3 review).
             crate::execution::enforce_quota_admission(
                 conn,
-                defaults.quota,
-                child_quota_key.as_deref(),
+                plan.defaults.quota,
+                plan.child_quota_key.as_deref(),
                 &child.workflow_name,
                 Some(registry.telemetry().metrics.as_ref()),
                 None, // no dry-run credit on a child spawn (children never declare cancel_running)
@@ -10516,6 +10761,103 @@ async fn persist_all_started_child_workflows(
             )
             .await?;
             queue::enqueue(conn, &params).await?;
+        }
+
+        // Children whose admission is a proven no-op get one multi-row
+        // INSERT per table for the whole group, chunked under Postgres's
+        // bind-parameter ceiling. That replaces one INSERT per child --
+        // issue #1589's own measured N -> 3N shape. `enforce_quota_admission`
+        // is not called here at all. The `admission_is_noop` routing above
+        // already proves it would return immediately without a query.
+        // Chunk boundaries are decided up front from `batchable_children`'s
+        // own borrowed `child.input` (Codex review, issue #1589), before
+        // any row is built. Each chunk then builds its own small row
+        // `Vec`s for all three tables, inserts them, and drops them. Peak
+        // memory therefore stays bounded by one chunk's payload, not the
+        // whole batchable group's.
+        //
+        // `shared_context_headers_bytes` (Codex review): `build_child_row`
+        // clones the PARENT's own `context_headers` into every row. Unlike
+        // `child.input`, that clone is never validated against
+        // `payload_max_workflow_input`. It must be counted once per row
+        // too. Otherwise a large inherited header could build an oversized
+        // chunk the byte budget never saw coming.
+        let shared_context_headers_bytes = parent_execution
+            .context_headers
+            .as_ref()
+            .map_or(0, json_byte_len);
+        for (start, end) in
+            compute_local_child_chunk_bounds(&batchable_children, shared_context_headers_bytes)
+        {
+            let plan_chunk = &batchable_children[start..end];
+
+            let child_rows: Vec<NewWorkflowExecution<'_>> = plan_chunk
+                .iter()
+                .map(|plan| {
+                    build_child_row(
+                        plan,
+                        shard_id,
+                        &queue_name,
+                        parent_exec_id,
+                        parent_execution,
+                        &parent_exec_id_str,
+                    )
+                })
+                .collect();
+            diesel::insert_into(harvest_workflow_executions::table)
+                .values(&child_rows)
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            drop(child_rows);
+
+            let started_events: Vec<(ExecutionId, WorkflowEvent)> = plan_chunk
+                .iter()
+                .map(|plan| {
+                    (
+                        plan.child.child_id,
+                        WorkflowEvent::WorkflowStarted {
+                            input: plan.child.input.clone(),
+                            timestamp: chrono::Utc::now(),
+                            last_completion_result: None,
+                            last_error: None,
+                            scheduled_time: None, // child workflows are not scheduler-fired
+                        },
+                    )
+                })
+                .collect();
+            store::append_new_execution_started_events_batch(
+                conn,
+                &started_events,
+                registry.payload_offloader(),
+                registry.payload_codecs(),
+            )
+            .await?;
+            drop(started_events);
+
+            let enqueue_params: Vec<queue::EnqueueParams> = plan_chunk
+                .iter()
+                .map(|plan| {
+                    let child = plan.child;
+                    let mut params = queue::EnqueueParams::new(
+                        queue_name.clone(),
+                        TaskType::Workflow,
+                        child.input.clone(),
+                    );
+                    params.workflow_exec_id = Some(child.child_id.as_uuid());
+                    params
+                        .required_build_id
+                        .clone_from(&parent_execution.assigned_build_id);
+                    (params.concurrency_key, params.max_concurrent) =
+                        resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
+                    params.trace_context = child_trace_ctxs
+                        .get(&child.child_id.as_uuid())
+                        .cloned()
+                        .flatten();
+                    params
+                })
+                .collect();
+            queue::enqueue_batch(conn, &enqueue_params).await?;
         }
 
         // Check for already-terminal children only in the re-park path
@@ -10647,7 +10989,13 @@ struct ChildWorkflowDefaults {
     deadline_at: Option<chrono::DateTime<chrono::Utc>>,
     chain_execution_timeout: Option<chrono::Duration>,
     chain_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
-    retry_policy: Option<serde_json::Value>,
+    /// Shared, not owned per child (issue #1589).
+    /// `RetryPolicy::non_retryable_errors` is an unbounded `Vec<String>`.
+    /// A same-type fan-out with a large policy would otherwise hold one
+    /// independent deep copy per `LocalChildPlan`. All copies stay alive
+    /// at once before the first insert chunk runs. `Arc` lets same-type
+    /// children in one fan-out share the one resolved value.
+    retry_policy: Option<Arc<serde_json::Value>>,
     /// The child's OWN declared quota policy (issue #946), resolved from its
     /// registered `WorkflowInfo` — never inherited from the parent. A child
     /// spawn is a genuine fresh admission from a resource-accumulation
@@ -10656,6 +11004,219 @@ struct ChildWorkflowDefaults {
     /// visible to the target type's own quota accounting exactly like any
     /// other registry-aware start path.
     quota: Option<crate::quota::QuotaPolicy>,
+}
+
+/// Postgres's per-statement bind-parameter ceiling (issue #1589). Mirrors
+/// `queue.rs`'s and `store.rs`'s identical constant -- kept as a separate
+/// copy here since each chunker bounds a different row shape.
+const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
+
+/// [`NewWorkflowExecution`]'s field count. Pinned by a regression test
+/// below so an added column is caught, not silently under-counted.
+const NEW_WORKFLOW_EXECUTION_COLUMNS: usize = 35;
+
+/// Rows per chunk, floored so `ROWS_PER_EXECUTION_INSERT_CHUNK *
+/// NEW_WORKFLOW_EXECUTION_COLUMNS` never reaches [`POSTGRES_MAX_BIND_PARAMS`].
+const ROWS_PER_EXECUTION_INSERT_CHUNK: usize =
+    POSTGRES_MAX_BIND_PARAMS / NEW_WORKFLOW_EXECUTION_COLUMNS;
+
+/// Byte budget on one chunk's summed `input` size. Mirrors
+/// `queue::enqueue_batch`'s identical-purpose `MAX_CHUNK_PAYLOAD_BYTES`.
+///
+/// [`ROWS_PER_EXECUTION_INSERT_CHUNK`] alone bounds parameter count, not
+/// memory. A child's input may validly reach
+/// [`crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES`] (2 MiB). This row's
+/// `input` is never offloaded -- offload (issue #524) applies to event
+/// history, not the execution row itself. Without this bound, a fan-out of
+/// thousands of near-max-size children could still build one
+/// multi-gigabyte `INSERT`.
+const MAX_EXECUTION_CHUNK_PAYLOAD_BYTES: usize = 8 * 1024 * 1024; // 4x DEFAULT_MAX_WORKFLOW_INPUT_BYTES
+
+const _: () = assert!(
+    MAX_EXECUTION_CHUNK_PAYLOAD_BYTES as u64
+        == 4 * crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES
+);
+
+/// Exact byte length `serde_json::to_vec(value)` would produce, without
+/// allocating that `Vec`. Mirrors `queue.rs`'s identical helper.
+fn json_byte_len(value: &serde_json::Value) -> usize {
+    struct CountingWriter(usize);
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = CountingWriter(0);
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+
+/// One local awaited child's precomputed spawn inputs (issue #1589).
+///
+/// Built once per child in `persist_all_started_child_workflows`. Then
+/// routed to either the sequential insert-then-admit path, or the
+/// batched-insert path. The routing depends on whether its
+/// `enforce_quota_admission` call would be a no-op -- see that function's
+/// own early returns.
+struct LocalChildPlan<'a> {
+    child: &'a StartedChildWorkflowCommand,
+    defaults: ChildWorkflowDefaults,
+    child_workflow_id: String,
+    child_quota_key: Option<String>,
+}
+
+/// One plan's contribution to a chunk's summed payload: its own
+/// `child.input`, plus `shared_row_bytes`, plus its own resolved retry
+/// policy (Codex review, issue #1589).
+///
+/// `build_child_row` clones `plan.defaults.retry_policy` into every row
+/// (an owned `Value` is unavoidable there -- diesel needs one per row).
+/// The `Arc` cache in the fan-out loop only bounds how many independent
+/// copies exist BEFORE chunking. It says nothing about how much of that
+/// policy lands in a single chunk's `INSERT`. Without this term, a
+/// large same-type retry policy packed to the row-count ceiling could
+/// still build a chunk far over [`MAX_EXECUTION_CHUNK_PAYLOAD_BYTES`].
+/// This holds even though every child's own `input` is tiny.
+fn plan_row_bytes(plan: &LocalChildPlan<'_>, shared_row_bytes: usize) -> usize {
+    let retry_policy_bytes = plan
+        .defaults
+        .retry_policy
+        .as_deref()
+        .map_or(0, json_byte_len);
+    json_byte_len(&plan.child.input) + shared_row_bytes + retry_policy_bytes
+}
+
+/// Splits `plans` into `[start, end)` index ranges, each within both
+/// [`ROWS_PER_EXECUTION_INSERT_CHUNK`] rows and
+/// [`MAX_EXECUTION_CHUNK_PAYLOAD_BYTES`] of summed row payload. Whichever
+/// bound is reached first ends a chunk.
+///
+/// Measured directly from each plan via [`plan_row_bytes`] (Codex review,
+/// issue #1589). This runs before any `NewWorkflowExecution`/event/enqueue
+/// row is built. The batched-insert loop then builds, inserts, and drops
+/// each chunk's own small row `Vec`s in turn. Peak memory therefore stays
+/// bounded by one chunk's payload, not the whole group's.
+///
+/// Mirrors `queue.rs`'s `compute_chunk_bounds` shape. A non-empty `plans`
+/// always returns at least one range, and every plan falls into exactly
+/// one of them, in order.
+fn compute_local_child_chunk_bounds(
+    plans: &[LocalChildPlan<'_>],
+    shared_row_bytes: usize,
+) -> Vec<(usize, usize)> {
+    let mut chunk_bounds = Vec::new();
+    let mut chunk_start = 0_usize;
+    while chunk_start < plans.len() {
+        let mut chunk_end = chunk_start + 1;
+        let mut payload_bytes = plan_row_bytes(&plans[chunk_start], shared_row_bytes);
+        while chunk_end < plans.len() && chunk_end - chunk_start < ROWS_PER_EXECUTION_INSERT_CHUNK {
+            let next_bytes = plan_row_bytes(&plans[chunk_end], shared_row_bytes);
+            if payload_bytes + next_bytes > MAX_EXECUTION_CHUNK_PAYLOAD_BYTES {
+                break;
+            }
+            payload_bytes += next_bytes;
+            chunk_end += 1;
+        }
+        chunk_bounds.push((chunk_start, chunk_end));
+        chunk_start = chunk_end;
+    }
+    chunk_bounds
+}
+
+/// Returns the cached retry-policy `Arc` for `workflow_name`, storing
+/// `policy` as the entry on first use (issue #1589).
+///
+/// `RetryPolicy::non_retryable_errors` is an unbounded `Vec<String>`.
+/// Without this cache, a same-type fan-out would resolve and hold one
+/// independent deep copy per child. All copies stay alive at once
+/// before the first insert chunk runs. Same-type children in one
+/// fan-out then share ONE `Arc`. Peak memory then scales with distinct
+/// workflow types, not with child count.
+fn cached_retry_policy<'a>(
+    cache: &mut HashMap<&'a str, Arc<serde_json::Value>>,
+    workflow_name: &'a str,
+    policy: Arc<serde_json::Value>,
+) -> Arc<serde_json::Value> {
+    Arc::clone(cache.entry(workflow_name).or_insert(policy))
+}
+
+/// Builds one local awaited child's insert row from its [`LocalChildPlan`].
+///
+/// Shared by both the sequential and the batched-insert paths in
+/// `persist_all_started_child_workflows` (issue #1589). So the two paths
+/// cannot drift on which fields a child row carries.
+fn build_child_row<'p>(
+    plan: &'p LocalChildPlan<'_>,
+    shard_id: i32,
+    queue_name: &'p str,
+    parent_exec_id: ExecutionId,
+    parent_execution: &'p WorkflowExecution,
+    parent_exec_id_str: &'p str,
+) -> NewWorkflowExecution<'p> {
+    let child = plan.child;
+    // Absolute deadlines are anchored HERE, not read from `plan.defaults`
+    // (Codex review, issue #1589). `plan.defaults` is resolved once, up
+    // front, for every local child before any is inserted. A later chunk's
+    // row can be built well after that -- behind the sequential group's
+    // own admission checks, or behind earlier batched chunks' round trips.
+    // Reading a deadline computed that early would anchor it to a stale
+    // "now", not the row's real `started_at`. A short-timeout child could
+    // then be born already overdue. `execution_timeout`/`sla`/
+    // `chain_execution_timeout` are plain durations. Recomputing the
+    // absolute deadline from `Utc::now()` at build time is exactly what
+    // `resolve_child_workflow_defaults` itself does for every other,
+    // immediate-use caller.
+    let now = chrono::Utc::now();
+    let deadline_at = plan.defaults.execution_timeout.map(|d| now + d);
+    let sla_deadline_at = plan.defaults.sla.map(|d| now + d);
+    let chain_deadline_at = plan
+        .defaults
+        .chain_execution_timeout
+        .and_then(|d| now.checked_add_signed(d));
+    NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
+        chain_execution_timeout: plan.defaults.chain_execution_timeout,
+        chain_deadline_at,
+        id: child.child_id.as_uuid(),
+        workflow_name: &child.workflow_name,
+        workflow_id: &plan.child_workflow_id,
+        run_id: uuid::Uuid::new_v4(),
+        shard_id,
+        input: child.input.clone(),
+        parent_id: Some(parent_exec_id.as_uuid()),
+        queue_name,
+        execution_timeout: plan.defaults.execution_timeout,
+        deadline_at,
+        sla: plan.defaults.sla,
+        sla_deadline_at,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: parent_execution.assigned_build_id.clone(),
+        parent_close_policy: None, // awaited child
+        owner: plan.defaults.owner,
+        runbook_url: plan.defaults.runbook_url,
+        severity: plan.defaults.severity,
+        context_headers: parent_execution.context_headers.clone(),
+        schedule_id: None, // child workflows are not scheduled fires
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: plan.defaults.retry_policy.as_deref().cloned(),
+        retry_of_exec_id: None,
+        origin: None, // child workflow, not a schedule fire (issue #534)
+        // Children get only builder-wide default callback targets,
+        // resolved at their own terminal transition (issue #605) -- no
+        // per-execution override here.
+        completion_callbacks: None,
+        start_source: Some(crate::types::StartSource::Child.as_str()),
+        start_source_ref: Some(parent_exec_id_str),
+        started_by: None,
+        quota_key: plan.child_quota_key.as_deref(),
+    }
 }
 
 /// Apply `max_workflow_attempts_ceiling` to a detached child's serialized retry
@@ -10777,9 +11338,9 @@ fn cross_shard_child_spec(
         // without this a workflow whose declared policy exceeds the ceiling would
         // get all its declared attempts purely because it was placed remotely.
         retry_policy: if detached {
-            clamp_detached_retry_policy(registry, defaults.retry_policy.clone())
+            clamp_detached_retry_policy(registry, defaults.retry_policy.as_deref().cloned())
         } else {
-            defaults.retry_policy.clone()
+            defaults.retry_policy.as_deref().cloned()
         },
         trace_context,
         quota_key,
@@ -10878,7 +11439,9 @@ fn resolve_child_workflow_defaults(
         deadline_at,
         chain_execution_timeout,
         chain_deadline_at,
-        retry_policy: retry_policy.and_then(|p| serde_json::to_value(&p).ok()),
+        retry_policy: retry_policy
+            .and_then(|p| serde_json::to_value(&p).ok())
+            .map(Arc::new),
         quota,
     }
 }
@@ -10995,7 +11558,7 @@ async fn insert_awaited_child_execution(
         schedule_id: None, // child workflows are not scheduled fires
         scheduled_for: None,
         workflow_attempt: 1,
-        workflow_retry_policy: defaults.retry_policy,
+        workflow_retry_policy: defaults.retry_policy.as_deref().cloned(),
         retry_of_exec_id: None,
         origin: None, // child workflow, not a schedule fire (issue #534)
         // Children get only builder-wide default callback targets, resolved at
@@ -16680,6 +17243,10 @@ async fn prepare_workflow_task_with_cache(
 /// changes the spawn-time logical identity its parent recorded) or orphaning
 /// the parent's `ChildWorkflow*` waiter, neither of which has a sound default
 /// in Phase 1. Callers from a child workflow get an explicit failure instead.
+// Issue #1409: write-only now. `resolve_continue_as_new_verdict` makes the
+// decision. A child execution's `parent_id` is enough for that; no DB read
+// is needed. This runs only from the write step, once the verdict already
+// says `ChildUnsupported`.
 async fn reject_child_continue_as_new(
     conn: &mut AsyncPgConnection,
     persistence: &WorkflowTaskPersistence<'_>,
@@ -16687,9 +17254,9 @@ async fn reject_child_continue_as_new(
     // Issue #1243: configured codecs, so this write encodes under the
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
-) -> HarvestResult<bool> {
+) -> HarvestResult<()> {
     let Some(parent_exec_id) = execution.parent_id.map(execution_id_from_uuid) else {
-        return Ok(false);
+        return Ok(());
     };
 
     let error = "continue_as_new is not supported in child workflows in this release";
@@ -16732,14 +17299,11 @@ async fn reject_child_continue_as_new(
         .await?;
     }
 
-    Ok(true)
+    Ok(())
 }
 
 /// Outcome of validating a continue-as-new's target workflow type (issue #803).
 enum ContinueAsNewTypeCheck<'a> {
-    /// The target type is blank or unregistered on this worker: the execution
-    /// has already been failed terminally and the caller must bail.
-    Rejected,
     /// `new_workflow_type` was `None` — a same-type continuation, the legacy
     /// path. Every lifecycle column is carried forward verbatim.
     SameType,
@@ -16748,15 +17312,16 @@ enum ContinueAsNewTypeCheck<'a> {
     CrossType(&'a crate::info::WorkflowInfo),
 }
 
-/// Validate a cross-type continue-as-new target before anything is persisted
-/// (issue #803 AC5).
+/// Validate a cross-type continue-as-new target — a pure decision, no write
+/// (issue #1409). [`resolve_continue_as_new_verdict`] is the only caller. It
+/// makes the terminal-failure write itself, once, after the abandoned-dispatch
+/// decision that depends on this verdict has already been made.
 ///
-/// Continuing into a type no worker can dispatch would seal the predecessor
-/// and leave a successor stuck `RUNNING` forever with nothing to claim it, so
-/// the check runs **before** the seal transaction opens and fails the
-/// predecessor terminally instead — the same shape as
-/// [`reject_child_continue_as_new`], and the same fail-closed posture the
-/// child-spawn paths already take for an unregistered child type.
+/// Continuing into a type no worker can dispatch would seal the predecessor.
+/// It would then leave a successor stuck `RUNNING` forever with nothing to
+/// claim it. So this runs **before** the seal transaction opens — the same
+/// fail-closed posture the child-spawn paths already take for an
+/// unregistered child type.
 ///
 /// Consequence worth knowing: the target must be registered on the worker that
 /// runs the *transition*, so a new phase handler has to reach the whole fleet
@@ -16771,11 +17336,10 @@ enum ContinueAsNewTypeCheck<'a> {
 async fn check_continue_as_new_type<'a>(
     conn: &mut AsyncPgConnection,
     registry: &'a HandlerRegistry,
-    persistence: &WorkflowTaskPersistence<'_>,
     execution: &WorkflowExecution,
     new_workflow_type: Option<&str>,
     slot: &mut SuccessorSlot,
-) -> HarvestResult<ContinueAsNewTypeCheck<'a>> {
+) -> HarvestResult<Result<ContinueAsNewTypeCheck<'a>, String>> {
     let error = match classify_continue_as_new_target(registry, new_workflow_type) {
         Ok(ContinueAsNewTypeCheck::CrossType(info)) => {
             // Routing first: the slot resolution below can only see the
@@ -16819,40 +17383,275 @@ async fn check_continue_as_new_type<'a>(
                 {
                     Ok(resolved) => {
                         *slot = resolved;
-                        return Ok(ContinueAsNewTypeCheck::CrossType(info));
+                        return Ok(Ok(ContinueAsNewTypeCheck::CrossType(info)));
                     }
                     Err(error) => error,
                 }
             }
         }
-        Ok(resolved) => return Ok(resolved),
+        Ok(resolved) => return Ok(Ok(resolved)),
         Err(error) => error,
     };
 
-    // Root-only by construction: `reject_child_continue_as_new` runs first, so
-    // a child execution never reaches here. Retry is deliberately not offered
-    // (`None` for the execution) — a re-run would resolve the same missing
-    // registration and fail identically, matching the child-guard precedent.
-    persist_workflow_failure(
+    Ok(Err(error))
+}
+
+/// Whether a continue-as-new proceeds, or redirects to a terminal failure
+/// (issue #1409).
+///
+/// Carries no borrowed data on purpose. The write step re-derives
+/// `target_info` with a plain, deterministic `registry.workflows.get(..)`
+/// lookup on the unchanged `new_workflow_type`. That is not a re-validation:
+/// the registry and the name are both fixed for the rest of this decision
+/// cycle. It is a cheap, infallible re-read, and it avoids threading a
+/// lifetime through [`persist_workflow_outcome`] for a value that function
+/// never inspects itself.
+enum ContinueAsNewVerdict {
+    /// Redirect to a terminal failure instead of continuing.
+    Redirect(ContinueAsNewRedirect),
+    /// Proceed with the continuation. Carries the successor quota key
+    /// already resolved (and bound-checked) so the write step never
+    /// re-resolves it.
+    Continue { successor_quota_key: Option<String> },
+}
+
+/// The redirect reason a [`ContinueAsNewVerdict::Redirect`] carries (issue
+/// #1409). `ChildUnsupported` picks its own failure write (child vs.
+/// detached-child); the other three checks (target/input-cap/quota-key-cap)
+/// all fail the ROOT write identically, so they share one variant.
+enum ContinueAsNewRedirect {
+    /// `execution` is a child; `continue_as_new` is unsupported there.
+    ChildUnsupported,
+    /// The target/quota-key/input-cap checks rejected the transition. The
+    /// message is already rendered for [`persist_workflow_failure`].
+    RootFailure { error: String },
+}
+
+/// Decide whether this cycle's continue-as-new proceeds or redirects to a
+/// terminal failure (issue #1409).
+///
+/// Resolved ONCE, under the execution row lock the enclosing transaction
+/// already holds. This runs **before**
+/// [`persist_terminal_outcome_commands`] decides whether to record this
+/// cycle's abandoned dispatches (issue #952). So a continue-as-new that will
+/// redirect gets the SAME abandoned-dispatch treatment as any other failing
+/// cycle. The verdict is threaded to
+/// [`persist_workflow_continue_as_new_with_verdict`], which performs the
+/// write this decides but never re-validates.
+/// [`check_continue_as_new_type`]'s cross-shard occupancy read talks to
+/// another shard's live state. A second call could answer differently, and
+/// desync the synthetic-dispatch decision from the actual write.
+async fn resolve_continue_as_new_verdict(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    execution: &WorkflowExecution,
+    input: &serde_json::Value,
+    new_workflow_type: Option<&str>,
+) -> HarvestResult<ContinueAsNewVerdict> {
+    if execution.parent_id.is_some() {
+        return Ok(ContinueAsNewVerdict::Redirect(
+            ContinueAsNewRedirect::ChildUnsupported,
+        ));
+    }
+
+    let mut successor_slot = SuccessorSlot::Free;
+    let target_info = match check_continue_as_new_type(
         conn,
-        persistence.task.id,
-        persistence.exec_id,
-        persistence.next_event_id,
-        persistence.worker_id,
-        persistence.task.crash_strikes,
-        &error,
-        None,
-        None,
-        None,
-        None,
-        None,
-        crate::types::Priority::default(),
-        registry.payload_codecs(),
-        // `metrics: None` above -- nothing can ever be collected here.
-        &mut Vec::new(),
+        registry,
+        execution,
+        new_workflow_type,
+        &mut successor_slot,
     )
-    .await?;
-    Ok(ContinueAsNewTypeCheck::Rejected)
+    .await?
+    {
+        Err(error) => {
+            return Ok(ContinueAsNewVerdict::Redirect(
+                ContinueAsNewRedirect::RootFailure { error },
+            ));
+        }
+        Ok(ContinueAsNewTypeCheck::SameType) => None,
+        Ok(ContinueAsNewTypeCheck::CrossType(info)) => Some(info),
+    };
+
+    // Cross-type input cap (issue #1161). A same-type continuation needs no
+    // check here: `WorkflowContext`'s own in-process check already enforced
+    // the correct cap before the command was pushed. A cross-type target's
+    // cap can only be resolved HERE, where the registry is reachable.
+    if let Some(info) = target_info {
+        let cap = resolve_cross_type_max_input_bytes(info, registry.max_workflow_input_bytes);
+        let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
+        let offload_applies = registry
+            .payload_offloader()
+            .is_some_and(|o| observed > o.threshold());
+        if cap > 0 && observed > cap && !offload_applies {
+            let successor_workflow_name =
+                new_workflow_type.unwrap_or(execution.workflow_name.as_str());
+            let error = HarvestError::PayloadTooLarge {
+                kind: crate::error::PayloadKind::WorkflowInput,
+                observed_bytes: observed,
+                cap_bytes: cap,
+                workflow_type: successor_workflow_name.to_string(),
+                activity_name: None,
+            }
+            .to_string();
+            return Ok(ContinueAsNewVerdict::Redirect(
+                ContinueAsNewRedirect::RootFailure { error },
+            ));
+        }
+    }
+
+    // Per-tenant quota key (issue #946). Same-type carries the predecessor's
+    // already-bound-checked key forward verbatim. Cross-type re-resolves
+    // against the TARGET type's own declared policy and the fresh input.
+    // See `persist_workflow_continue_as_new_with_verdict`'s identical
+    // resolution for why (mirrors `resolve_workflow_concurrency`).
+    let successor_quota_key: Option<String> = new_workflow_type.map_or_else(
+        || execution.quota_key.clone(),
+        |target| {
+            registry
+                .workflows
+                .get(target)
+                .and_then(|info| info.quota)
+                .and_then(|policy| crate::quota::resolve_quota_key(policy.key_expr, input))
+        },
+    );
+    if let Some(key) = successor_quota_key.as_deref()
+        && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
+    {
+        let successor_workflow_name = new_workflow_type.unwrap_or(execution.workflow_name.as_str());
+        let error = HarvestError::PayloadTooLarge {
+            kind: crate::error::PayloadKind::QuotaKey,
+            observed_bytes,
+            cap_bytes: crate::quota::MAX_QUOTA_KEY_BYTES,
+            workflow_type: successor_workflow_name.to_string(),
+            activity_name: None,
+        }
+        .to_string();
+        return Ok(ContinueAsNewVerdict::Redirect(
+            ContinueAsNewRedirect::RootFailure { error },
+        ));
+    }
+
+    Ok(ContinueAsNewVerdict::Continue {
+        successor_quota_key,
+    })
+}
+
+/// Best-effort, DB-free prediction of whether a `ContinuedAsNew` outcome
+/// will redirect to a terminal failure (issue #1409).
+///
+/// Used ONLY to decide the history hard-cap preflight's accounting, in
+/// `process_workflow_task`. This runs before the persist transaction that
+/// alone can resolve the real verdict
+/// ([`resolve_continue_as_new_verdict`], under the execution row lock). It
+/// mirrors that function's checks, but only the ones needing no DB read at
+/// all. Those are: an unsupported child, a blank/DAG/unregistered target,
+/// an unrepresentable declared deadline, an over-cap cross-type input, and
+/// an over-cap quota key.
+///
+/// **Deliberately incomplete.** Two of `resolve_continue_as_new_verdict`'s
+/// checks need a DB read: a live cross-shard occupant, a live
+/// successor-slot occupant. Neither is evaluated here. Re-running them a
+/// second time, unlocked, before the transaction even opens, would be the
+/// exact TOCTOU this design avoids. A redirect from one of those two checks
+/// alone, on a cycle otherwise indistinguishable from a healthy
+/// continuation, makes this function return `false`.
+///
+/// That residual gap in the hard-cap safety net is deliberate. A redirected
+/// cycle near the cap could still slip past it for one of those two
+/// reasons. Closing it would mean flagging every dispatch-then-continue
+/// cycle as a possible redirect. That false-positive-DLQs a healthy
+/// continuation that was always going to succeed. This function trades a
+/// narrow, honest gap in the safety net for ruling that worse failure mode
+/// out.
+fn continue_as_new_certainly_redirects(
+    registry: &HandlerRegistry,
+    execution: &WorkflowExecution,
+    input: &serde_json::Value,
+    new_workflow_type: Option<&str>,
+) -> bool {
+    if execution.parent_id.is_some() {
+        return true;
+    }
+    let target_info = match classify_continue_as_new_target(registry, new_workflow_type) {
+        Err(_) => return true,
+        Ok(ContinueAsNewTypeCheck::SameType) => return false,
+        Ok(ContinueAsNewTypeCheck::CrossType(info)) => info,
+    };
+    let effective_timeout = target_info
+        .execution_timeout
+        .and_then(|d| chrono::Duration::from_std(d).ok())
+        .map(|t| {
+            registry
+                .max_workflow_execution_timeout
+                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .map_or(t, |ceiling| t.min(ceiling))
+        });
+    if classify_successor_deadline_representable(
+        target_info.name,
+        effective_timeout,
+        chrono::Utc::now(),
+    )
+    .is_err()
+    {
+        return true;
+    }
+    let cap = resolve_cross_type_max_input_bytes(target_info, registry.max_workflow_input_bytes);
+    let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
+    let offload_applies = registry
+        .payload_offloader()
+        .is_some_and(|o| observed > o.threshold());
+    if cap > 0 && observed > cap && !offload_applies {
+        return true;
+    }
+    let quota_key = target_info
+        .quota
+        .and_then(|policy| crate::quota::resolve_quota_key(policy.key_expr, input));
+    if let Some(key) = quota_key.as_deref()
+        && crate::quota::quota_key_over_cap(key).is_some()
+    {
+        return true;
+    }
+    false
+}
+
+/// [`resolve_continue_as_new_verdict`], but for a whole [`WorkflowOutcome`]:
+/// `Some` only for `ContinuedAsNew`, `None` for every other outcome.
+///
+/// Several internal paths inside continue-as-new persistence can redirect a
+/// `ContinuedAsNew` outcome to a real `WorkflowFailed`. They are an
+/// unsupported child, a blank/unregistered/DAG/occupied-slot target, an
+/// over-cap input, and an over-cap quota key. Issue #952's abandoned-dispatch
+/// rule is keyed on the outcome that actually gets persisted, not the one
+/// the executor reported.
+///
+/// `persist_terminal_outcome_commands` calls this before deciding whether
+/// to record this cycle's abandoned dispatches. It threads the result to
+/// `persist_workflow_outcome`, so the eventual write never re-validates.
+/// See `resolve_continue_as_new_verdict`'s doc for why a second validation
+/// could disagree with this one.
+async fn resolve_continue_as_new_verdict_for_outcome(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    execution: &WorkflowExecution,
+    outcome: &WorkflowOutcome,
+) -> HarvestResult<Option<ContinueAsNewVerdict>> {
+    let WorkflowOutcome::ContinuedAsNew {
+        input,
+        new_workflow_type,
+    } = outcome
+    else {
+        return Ok(None);
+    };
+    resolve_continue_as_new_verdict(
+        conn,
+        registry,
+        execution,
+        input,
+        new_workflow_type.as_deref(),
+    )
+    .await
+    .map(Some)
 }
 
 /// State of the `(workflow_name, workflow_id)` uniqueness slot the successor
@@ -17493,87 +18292,38 @@ fn resolve_cross_type_max_input_bytes(
         .map_or(global_floor, |per_type| per_type.max(global_floor))
 }
 
-/// Returns `Ok(true)` when this cycle's continue-as-new attempt was
-/// internally redirected to a terminal failure instead of continuing. A
-/// blank/unregistered/DAG target, a live occupant of the successor slot, an
-/// oversized quota key, or an over-cap input (#1161) all redirect this way.
-/// `Ok(false)` means the successor was actually created. The caller
-/// (`persist_workflow_outcome`) uses this to correct the metrics and
-/// schedule-failure-counter accounting it already pre-computed for a plain
-/// `ContinuedAsNew` outcome. That accounting is wrong once this redirect
-/// fires (Codex P2 on PR #1399).
+/// The write step behind [`persist_workflow_continue_as_new`], driven by an
+/// already-resolved `verdict` (issue #1409). Performs the write the verdict
+/// decided; never re-validates. See [`resolve_continue_as_new_verdict`] for
+/// why re-validating here would be unsound, not just wasteful.
+///
+/// Returns `Ok(true)` when `verdict` redirected this cycle to a terminal
+/// failure instead of continuing. `Ok(false)` means the successor was
+/// actually created. The caller (`persist_workflow_outcome`) uses this to
+/// correct the metrics and schedule-failure-counter accounting it already
+/// pre-computed for a plain `ContinuedAsNew` outcome. That accounting is
+/// wrong once this redirect fires (Codex P2 on PR #1399).
 #[allow(clippy::too_many_lines)]
-#[doc(hidden)]
-pub async fn persist_workflow_continue_as_new(
+async fn persist_workflow_continue_as_new_with_verdict(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     persistence: WorkflowTaskPersistence<'_>,
     execution: &WorkflowExecution,
     input: serde_json::Value,
     new_workflow_type: Option<String>,
+    verdict: ContinueAsNewVerdict,
 ) -> HarvestResult<bool> {
     use crate::schema::{harvest_events, harvest_signals, harvest_workflow_executions};
 
     let offloader = registry.payload_offloader();
 
-    if reject_child_continue_as_new(conn, &persistence, execution, registry.payload_codecs())
-        .await?
-    {
-        return Ok(true);
-    }
-
-    // Issue #803: validate a cross-type target before anything is written, so
-    // an unregistered type can never seal the predecessor and strand an
-    // undispatchable successor.
-    // Same-type: the predecessor's own seal frees the slot, so nothing to do.
-    // Cross-type: `check_continue_as_new_type` resolves the target slot into
-    // this and rejects a live occupant before anything is persisted.
-    let mut successor_slot = SuccessorSlot::Free;
-    let target_info = match check_continue_as_new_type(
-        conn,
-        registry,
-        &persistence,
-        execution,
-        new_workflow_type.as_deref(),
-        &mut successor_slot,
-    )
-    .await?
-    {
-        ContinueAsNewTypeCheck::Rejected => {
+    let successor_quota_key = match verdict {
+        ContinueAsNewVerdict::Redirect(ContinueAsNewRedirect::ChildUnsupported) => {
+            reject_child_continue_as_new(conn, &persistence, execution, registry.payload_codecs())
+                .await?;
             return Ok(true);
         }
-        ContinueAsNewTypeCheck::SameType => None,
-        ContinueAsNewTypeCheck::CrossType(info) => Some(info),
-    };
-
-    // Cross-type input cap (issue #1161). A same-type continuation needs no
-    // check here: `WorkflowContext`'s own in-process check already enforced
-    // the correct cap before the command was pushed. A cross-type target's
-    // cap can only be resolved HERE, where the registry is reachable. The
-    // in-process context cannot see another type's `max_input_bytes`.
-    // Reject before any write, exactly like the quota-key check further
-    // below (see its comment for why a bare `Err` here is wrong). Checked
-    // BEFORE the `input.clone()` calls further down, so a rejected input
-    // never pays for two full clones it will never need (Codex-style review
-    // finding).
-    if let Some(info) = target_info {
-        let cap = resolve_cross_type_max_input_bytes(info, registry.max_workflow_input_bytes);
-        let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-        let offload_applies = registry
-            .payload_offloader()
-            .is_some_and(|o| observed > o.threshold());
-        if cap > 0 && observed > cap && !offload_applies {
-            let successor_workflow_name = new_workflow_type
-                .as_deref()
-                .unwrap_or(execution.workflow_name.as_str());
-            let error = HarvestError::PayloadTooLarge {
-                kind: crate::error::PayloadKind::WorkflowInput,
-                observed_bytes: observed,
-                cap_bytes: cap,
-                workflow_type: successor_workflow_name.to_string(),
-                activity_name: None,
-            }
-            .to_string();
+        ContinueAsNewVerdict::Redirect(ContinueAsNewRedirect::RootFailure { error }) => {
             persist_workflow_failure(
                 conn,
                 persistence.task.id,
@@ -17594,7 +18344,15 @@ pub async fn persist_workflow_continue_as_new(
             .await?;
             return Ok(true);
         }
-    }
+        ContinueAsNewVerdict::Continue {
+            successor_quota_key,
+        } => successor_quota_key,
+    };
+    // A plain, deterministic lookup on the already-verdicted target name —
+    // see `ContinueAsNewVerdict`'s doc for why this is not a re-validation.
+    let target_info = new_workflow_type
+        .as_deref()
+        .and_then(|t| registry.workflows.get(t));
 
     // Carry the predecessor's `last_completion_result` forward by its *stored*
     // representation (issue #524 / #488). If it was offloaded, copy the
@@ -17693,90 +18451,19 @@ pub async fn persist_workflow_continue_as_new(
         .as_deref()
         .unwrap_or(execution.workflow_name.as_str());
 
-    // Per-tenant quota key (issue #946). Continue-as-new is in-flight
-    // continuation of an already-admitted run, not a fresh admission, so --
-    // like the concurrency key just above -- this does NOT re-run
-    // enforcement (`quota::check_quota` is never called here). But unlike a
-    // plain bookkeeping value, `quota_key` backs an AGGREGATE accounting
-    // query (`quota::load_quota_usage`) that the tenant's NEXT genuinely-new
-    // admission reads: stamping `None` here would make the predecessor's
-    // active-execution slot (and its history bytes) silently invisible to
-    // that accounting the instant it continues-as-new, letting a looping
-    // entity workflow leak unbounded quota headroom on every hop. Same-type:
-    // carry the predecessor's already-resolved key forward verbatim (mirrors
-    // `execution.quota_key`, exactly like the concurrency key propagation
-    // below). Cross-type (#803): re-resolve against the TARGET type's own
-    // declared policy and the new input, reading `registry` directly --
-    // mirroring `resolve_workflow_concurrency` immediately below -- rather
-    // than the process-global `GLOBAL_WORKFLOW_METADATA` mirror, which is
-    // populated only by `HandlerRegistry::with_state_and_telemetry` and
-    // would silently resolve `None` for a `Worker` built from the raw
-    // `HandlerRegistry::new(..)` constructor even when `registry` itself
-    // has the target's `WorkflowInfo.quota` set correctly.
-    let successor_quota_key: Option<String> = new_workflow_type.as_deref().map_or_else(
-        || execution.quota_key.clone(),
-        |target| {
-            registry
-                .workflows
-                .get(target)
-                .and_then(|info| info.quota)
-                .and_then(|policy| crate::quota::resolve_quota_key(policy.key_expr, &input))
-        },
-    );
-    // Issue #946 (Codex round-3 review): a cross-type continuation
-    // re-resolves the quota key against the TARGET type's own declared
-    // policy and the fresh input -- unlike the same-type carry-forward
-    // above, which reuses a key that was already bound-checked at whatever
-    // earlier point it was first resolved. Reject rather than silently
-    // persisting an oversized key: the aggregate `quota::load_quota_usage`
-    // accounting keys on this column, and every OTHER path that stamps
-    // `quota_key` (fresh starts, the fan-out/child-timeout-race/detached
-    // child spawns) enforces this same bound before the row is written.
-    //
-    // Codex round-3 follow-up: this MUST fail the predecessor terminally
-    // in-place rather than returning `Err` out of this function. This whole
-    // call chain runs on ONE Diesel transaction
-    // (`process_workflow_task`'s `conn.transaction(async |conn| { .. })`),
-    // so a bare `Err` propagating via `?` rolls back everything written on
-    // `conn` so far this cycle and leaves the predecessor stuck `RUNNING`
-    // forever with no error ever recorded. `check_continue_as_new_type`'s
-    // own rejection arm (blank target, unregistered type, DAG target,
-    // occupied successor slot, cross-shard mismatch, unrepresentable
-    // deadline) already writes the terminal failure in-place and returns
-    // `Ok(..)` -- mirror that pattern rather than inventing a second
-    // failure-signalling convention inside this same function.
-    if let Some(key) = successor_quota_key.as_deref()
-        && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
-    {
-        let error = HarvestError::PayloadTooLarge {
-            kind: crate::error::PayloadKind::QuotaKey,
-            observed_bytes,
-            cap_bytes: crate::quota::MAX_QUOTA_KEY_BYTES,
-            workflow_type: successor_workflow_name.to_string(),
-            activity_name: None,
-        }
-        .to_string();
-        persist_workflow_failure(
-            conn,
-            task_id,
-            exec_id,
-            next_event_id,
-            worker_id,
-            persistence.task.crash_strikes,
-            &error,
-            None,
-            None,
-            None,
-            None,
-            None,
-            crate::types::Priority::default(),
-            registry.payload_codecs(),
-            // `metrics: None` above -- nothing can ever be collected here.
-            &mut Vec::new(),
-        )
-        .await?;
-        return Ok(true);
-    }
+    // Per-tenant quota key (issue #946): already resolved and bound-checked
+    // by `resolve_continue_as_new_verdict` (issue #1409). Same-type carries
+    // the predecessor's key forward verbatim. Cross-type re-resolves against
+    // the TARGET type's own declared policy and the fresh input.
+    // Continue-as-new is in-flight continuation of an already-admitted run,
+    // not a fresh admission, so this never re-runs `quota::check_quota`
+    // either way. But unlike a plain bookkeeping value, `quota_key` backs an
+    // AGGREGATE accounting query (`quota::load_quota_usage`) that the
+    // tenant's NEXT genuinely-new admission reads. Stamping `None` here
+    // would make the predecessor's active-execution slot, and its history
+    // bytes, silently invisible to that accounting the instant it
+    // continues-as-new. That would let a looping entity workflow leak
+    // unbounded quota headroom on every hop.
 
     let new_row = NewWorkflowExecution {
         id: new_exec_id.as_uuid(),
@@ -17994,6 +18681,43 @@ pub async fn persist_workflow_continue_as_new(
     .await
 }
 
+/// Resolve this cycle's continue-as-new verdict, then perform the write it
+/// decides (issue #1409). Test-support entry point: kept `#[doc(hidden)]`
+/// rather than semver-stable. It exists so integration tests can drive the
+/// seal transaction directly (see e.g. `terminal_write_ownership_tests`'s
+/// claim-ownership guard). `persist_terminal_outcome_commands` does NOT call
+/// this. It resolves the verdict itself, earlier, so the abandoned-dispatch
+/// decision that depends on it runs first. See
+/// [`resolve_continue_as_new_verdict`]'s doc for why.
+#[doc(hidden)]
+pub async fn persist_workflow_continue_as_new(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    persistence: WorkflowTaskPersistence<'_>,
+    execution: &WorkflowExecution,
+    input: serde_json::Value,
+    new_workflow_type: Option<String>,
+) -> HarvestResult<bool> {
+    let verdict = resolve_continue_as_new_verdict(
+        conn,
+        registry,
+        execution,
+        &input,
+        new_workflow_type.as_deref(),
+    )
+    .await?;
+    persist_workflow_continue_as_new_with_verdict(
+        conn,
+        registry,
+        persistence,
+        execution,
+        input,
+        new_workflow_type,
+        verdict,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn persist_workflow_outcome(
     conn: &mut AsyncPgConnection,
@@ -18031,6 +18755,12 @@ async fn persist_workflow_outcome(
     // `effective_placement_router`. Threaded to `handle_suspended_workflow`'s
     // `Suspended` arm, the only one that can still create a cross-shard child.
     resolved_router: Option<&crate::shard::ShardRouter>,
+    // Issue #1409: the `ContinuedAsNew` arm's verdict, pre-resolved by
+    // `persist_terminal_outcome_commands` BEFORE it decided whether to
+    // record this cycle's abandoned dispatches. `None` when no caller needed
+    // that early decision; the arm then resolves it itself. Every other
+    // outcome arm ignores this.
+    continue_as_new_verdict: Option<ContinueAsNewVerdict>,
 ) -> HarvestResult<(bool, Vec<(ExecutionId, Option<String>)>)> {
     let parent_exec_id = execution.parent_id.map(execution_id_from_uuid);
     // A detached child has parent_close_policy set (non-null). Detached children
@@ -18213,13 +18943,31 @@ async fn persist_workflow_outcome(
             // terminal — the PREDECESSOR — so this stays its own name even for
             // a cross-type continuation (issue #803).
             let workflow_name = execution.workflow_name.clone();
-            let result = persist_workflow_continue_as_new(
+            // Issue #1409: use the pre-resolved verdict when the caller
+            // already needed one, so the abandoned-dispatch decision and
+            // this write agree. Resolve fresh otherwise -- this arm's own
+            // only caller, `persist_terminal_outcome_commands`.
+            let verdict = match continue_as_new_verdict {
+                Some(verdict) => verdict,
+                None => {
+                    resolve_continue_as_new_verdict(
+                        conn,
+                        registry,
+                        execution,
+                        &input,
+                        new_workflow_type.as_deref(),
+                    )
+                    .await?
+                }
+            };
+            let result = persist_workflow_continue_as_new_with_verdict(
                 conn,
                 registry,
                 persistence,
                 execution,
                 input,
                 new_workflow_type,
+                verdict,
             )
             .await;
             fail_execution_on_error(conn, task, worker_id, result, registry.payload_codecs())
@@ -18510,7 +19258,7 @@ async fn run_deferred_schedule_counter(
 /// `FOR UPDATE` pause guard — in a single transaction (issue #383). Schedule
 /// counters are deferred to the caller via [`run_deferred_schedule_counter`]
 /// and run only after that outer transaction commits.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn persist_terminal_outcome_commands(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -18582,13 +19330,38 @@ async fn persist_terminal_outcome_commands(
     // (FINDING 1).
     let (mut timer_events, _armed) =
         plan_timer_lifecycle(conn, persistence.exec_id, pending_cmds).await?;
+
+    // Issue #1409: resolve a `ContinuedAsNew` outcome's verdict NOW, before
+    // deciding whether to record this cycle's abandoned dispatches below —
+    // see `resolve_continue_as_new_verdict_for_outcome`'s doc.
+    //
+    // This now runs BEFORE `apply_race_loser_cancellations` and
+    // `create_detached_child_executions` further down, whereas the
+    // pre-#1409 shape ran this check only at the very end, after both. That
+    // is safe: neither can create a competing occupant of the
+    // `(target_type, execution.workflow_id)` slot `resolve_successor_slot`
+    // locks on. A race-loser cancellation appends terminal events to
+    // ALREADY-existing rows; it never inserts a fresh
+    // `harvest_workflow_executions` row. A detached child's row is always
+    // keyed `workflow_id = child_id.to_string()`. That is an opaque id
+    // minted fresh for that spawn, never the predecessor's own
+    // `workflow_id`, so it can never collide with the successor's slot.
+    let continue_as_new_verdict =
+        resolve_continue_as_new_verdict_for_outcome(conn, registry, execution, &outcome).await?;
+    let will_redirect_to_failure = matches!(
+        continue_as_new_verdict,
+        Some(ContinueAsNewVerdict::Redirect(_))
+    );
+
     // Issue #952: a FAILING cycle also records the awaited work it dispatched
-    // and then abandoned by returning `Err` before it could suspend — otherwise
-    // the persisted history silently drops `StartChildWorkflow` /
-    // `ScheduleActivity` and lies about what the code did. Scoped to `Failed`:
-    // see `AbandonedDispatchPlan::disabled` for why a completed cycle keeps its
-    // pre-#952 behaviour exactly.
-    let abandoned_dispatches = if records_abandoned_dispatches(&outcome) {
+    // and then abandoned by returning `Err` before it could suspend —
+    // otherwise the persisted history silently drops `StartChildWorkflow` /
+    // `ScheduleActivity` and lies about what the code did. Scoped to
+    // `Failed`, or, issue #1409, a `ContinuedAsNew` redirected to one above.
+    // See `AbandonedDispatchPlan::disabled` for why a genuinely completed or
+    // continued cycle keeps its pre-#952 behaviour exactly.
+    let abandoned_dispatches = if records_abandoned_dispatches(&outcome) || will_redirect_to_failure
+    {
         AbandonedDispatchPlan::resolve(conn, pending_cmds, recorded_dispatches.clone()).await?
     } else {
         AbandonedDispatchPlan::disabled()
@@ -18679,6 +19452,7 @@ async fn persist_terminal_outcome_commands(
         pending_cancel_metrics,
         continue_as_new_redirected_to_failure,
         resolved_router,
+        continue_as_new_verdict,
     )
     .await?;
     Ok((retry_scheduled, deferred_checks, race_deferred_triggers))
@@ -18701,8 +19475,14 @@ fn terminal_history_event_count(
     // the abandoned-dispatch records. Issue #1265: pass the hard-cap
     // preflight's resolved value here, from
     // `abandoned_dispatch_event_count_resolved`. Do not recompute a
-    // pre-dedup count. A re-parked dispatch the dedup already zeroed must
-    // not inflate this gauge.
+    // pre-dedup count for a `Failed` outcome. A re-parked dispatch the
+    // dedup already zeroed must not inflate this gauge.
+    //
+    // Issue #1409: a `ContinuedAsNew` outcome is the one exception. Its
+    // caller passes the cheap pre-dedup upper bound instead
+    // (`abandoned_dispatch_event_count`). Whether it will actually redirect
+    // and append these records is only knowable under the execution row
+    // lock this pre-transaction preflight does not hold.
     resolved_abandoned_dispatch_event_count: u64,
 ) -> u64 {
     u64::try_from(next_event_id)
@@ -20925,8 +21705,9 @@ async fn process_workflow_task(
     };
     // Issue #1265: captured here so the `history_size` gauge below can reuse
     // the SAME dedup-resolved count instead of recomputing a pre-dedup one.
-    // It stays 0 for every non-`Failed` outcome (mirrors
-    // `records_abandoned_dispatches`): none of those resolve this count.
+    // It stays 0 for every outcome that cannot append the abandoned-dispatch
+    // pair: `Completed`, `Suspended`, and a `ContinuedAsNew` carrying no
+    // abandoned-dispatch-eligible command at all.
     let mut resolved_abandoned_dispatch_event_count: u64 = 0;
     let pending_durable_event_count = match &outcome {
         WorkflowOutcome::Suspended { commands } => {
@@ -20944,8 +21725,65 @@ async fn process_workflow_task(
                 }
             }
         }
-        WorkflowOutcome::ContinuedAsNew { .. } => pending_update_result_event_count(&pending_cmds)
-            .saturating_add(pre_suspension_event_count(&pending_cmds)),
+        WorkflowOutcome::ContinuedAsNew {
+            input,
+            new_workflow_type,
+        } => {
+            // Issue #1409: a continue-as-new can internally redirect to a
+            // real `WorkflowFailed`. That appends this cycle's
+            // abandoned-dispatch pair (issue #952) onto the SAME
+            // (predecessor) row this preflight is sizing. A genuine
+            // continuation instead escapes onto a fresh successor row --
+            // exactly why this outcome is otherwise exempt from the hard
+            // cap below.
+            //
+            // Only count it when `continue_as_new_certainly_redirects` says
+            // so. Counting it whenever the batch merely CARRIES an
+            // abandoned-dispatch-eligible command false-positive-DLQs the
+            // common healthy case. That case is a race/join dispatch
+            // alongside a continuation that actually succeeds, silently
+            // dropping the dispatch exactly as it always did before this
+            // whole issue. See that function's doc for the narrower,
+            // honest gap this still leaves.
+            //
+            // Resolved against the same dedup persistence applies (issue
+            // #952, mirrors the `Failed` arm below). A re-park of an
+            // already-started child or already-recorded dispatch must not
+            // trip the cap, or inflate the metric, on events that will
+            // never be written.
+            let abandoned = if continue_as_new_certainly_redirects(
+                registry,
+                &prepared.execution,
+                input,
+                new_workflow_type.as_deref(),
+            ) {
+                match abandoned_dispatch_event_count_resolved(
+                    conn,
+                    &pending_cmds,
+                    RecordedDispatchIds::from_history(&history_events),
+                )
+                .await
+                {
+                    Ok(count) => count,
+                    Err(error) => {
+                        return fail_execution_on_error(
+                            conn,
+                            task,
+                            worker_id,
+                            Err::<(), _>(error),
+                            registry.payload_codecs(),
+                        )
+                        .await;
+                    }
+                }
+            } else {
+                0
+            };
+            resolved_abandoned_dispatch_event_count = abandoned;
+            pending_update_result_event_count(&pending_cmds)
+                .saturating_add(pre_suspension_event_count(&pending_cmds))
+                .saturating_add(abandoned)
+        }
         WorkflowOutcome::Completed { .. } => pending_update_result_event_count(&pending_cmds)
             .saturating_add(pre_suspension_event_count(&pending_cmds))
             .saturating_add(terminal_parent_close_cascade_events),
@@ -20986,7 +21824,10 @@ async fn process_workflow_task(
 
     if let Some(cap) = registry.history_policy().event_hard_cap()
         && current_history_event_count >= cap
-        && !matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. })
+        && !continue_as_new_exempt_from_history_cap(
+            &outcome,
+            resolved_abandoned_dispatch_event_count,
+        )
     {
         let deferred = fail_workflow_for_history_cap(
             conn,
@@ -21317,6 +22158,10 @@ async fn process_workflow_task(
                         &mut pending_cancel_metrics,
                         &mut continue_as_new_redirected_to_failure,
                         resolved_router.as_ref(),
+                        // This path never computes an abandoned-dispatch
+                        // decision ahead of time (`is_terminal_with_commands`
+                        // is false here), so the arm resolves its own verdict.
+                        None,
                     )
                     .await?;
                     (retry_scheduled, deferred_checks, Vec::new())
@@ -23193,7 +24038,20 @@ fn spawn_queue_depth_sampler(
             // single-pool path that skipped the sample on read failure (#522).
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -23307,7 +24165,20 @@ fn spawn_concurrency_sampler(
             // doesn't under-report concurrency during a storage outage (#522).
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -23417,7 +24288,20 @@ fn spawn_rate_limit_sampler(
             // doesn't under-report available tokens during a storage outage (#522).
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -23500,7 +24384,15 @@ fn spawn_dlq_depth_sampler(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            let mut conn = match pool.get().await {
+            // Selected against `cancel` (issue #1426). See the comment
+            // above `spawn_worker_heartbeat`'s own `pool.get()` call for
+            // why an unselected acquisition here can park shutdown
+            // forever.
+            let get_result = tokio::select! {
+                () = cancel.cancelled() => break,
+                result = pool.get() => result,
+            };
+            let mut conn = match get_result {
                 Ok(conn) => conn,
                 Err(error) => {
                     tracing::debug!(
@@ -23570,7 +24462,20 @@ fn spawn_queue_pause_sampler(
             let mut read_failed = false;
 
             for pool in &pools {
-                let Ok(mut conn) = pool.get().await else {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let Ok(mut conn) = get_result else {
                     read_failed = true;
                     continue;
                 };
@@ -23846,19 +24751,27 @@ fn spawn_replication_sampler(
             }
 
             for (shard_id, shard_pool) in &targets {
-                if sample_one_shard(
+                match sample_one_shard(
                     *shard_id,
                     shard_pool,
                     &telemetry,
                     watermark_retain,
                     interval,
                     &slot_prefix,
+                    &cancel,
                 )
                 .await
-                    == ShardSample::Fenced
                 {
-                    cancel.cancel();
-                    return;
+                    ShardSample::Fenced => {
+                        cancel.cancel();
+                        return;
+                    }
+                    // Issue #1426: the loop received a cancellation signal
+                    // while acquiring this shard's connection. Abandon the
+                    // remaining targets this tick rather than keep probing
+                    // them one by one against an already-cancelled token.
+                    ShardSample::Cancelled => break,
+                    ShardSample::Continue => {}
                 }
             }
         }
@@ -23874,6 +24787,10 @@ enum ShardSample {
     /// This worker has lost write authority for the shard. The caller stops
     /// the **whole** worker — see `spawn_replication_sampler`.
     Fenced,
+    /// The loop received a cancellation signal while acquiring this
+    /// shard's connection (issue #1426). The caller stops sampling the
+    /// remaining targets this tick.
+    Cancelled,
 }
 
 /// One shard's DR sample: self-fence check, watermark beat, gauges.
@@ -23881,7 +24798,12 @@ enum ShardSample {
 /// Split out of the sampler loop only because that loop outgrew the line
 /// budget; the ordering commentary that matters lives here, with the steps it
 /// describes.
+///
+/// The cancel-aware acquisition added for issue #1426 pushed this function
+/// itself past the same line limit. The ordering commentary above still
+/// argues against splitting it further.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 async fn sample_one_shard(
     shard_id: crate::types::ShardId,
     shard_pool: &DbPool,
@@ -23889,9 +24811,19 @@ async fn sample_one_shard(
     watermark_retain: Duration,
     sample_interval: Duration,
     slot_prefix: &str,
+    cancel: &CancellationToken,
 ) -> ShardSample {
     let shard_u16 = u16::try_from(shard_id.as_i32()).unwrap_or(0);
-    let Ok(mut conn) = shard_pool.get().await else {
+    // Selected against `cancel` (issue #1426): an unselected `pool.get()`
+    // here can park shutdown forever.
+    let get_result = tokio::select! {
+        () = cancel.cancelled() => None,
+        result = shard_pool.get() => Some(result),
+    };
+    let Some(get_result) = get_result else {
+        return ShardSample::Cancelled;
+    };
+    let Ok(mut conn) = get_result else {
         // A pool that cannot be reached is already covered by the worker's own
         // liveness signals; a DR sample is not worth a second alarm for the
         // same condition.
@@ -24071,7 +25003,15 @@ fn spawn_stranded_work_sampler(
                 // (queue, required_capabilities, ...) so coverage can honour the
                 // same eligibility claim_task enforces (issue #522 review).
                 let mut demands: Vec<crate::queue::ClaimablePendingDemand> = {
-                    let mut conn = match shard_pool.get().await {
+                    // Selected against `cancel` (issue #1426): an unselected
+                    // `pool.get()` here can park shutdown forever. Cancellation
+                    // abandons the remaining shards this tick, same as the
+                    // multi-pool samplers above.
+                    let get_result = tokio::select! {
+                        () = cancel.cancelled() => break,
+                        result = shard_pool.get() => result,
+                    };
+                    let mut conn = match get_result {
                         Ok(conn) => conn,
                         Err(error) => {
                             tracing::debug!(
@@ -24118,7 +25058,13 @@ fn spawn_stranded_work_sampler(
                 // collapsed to queue names) so the capability check below can see
                 // each worker's polled queues *and* labels.
                 let covering_workers: Vec<crate::workers::WorkerRow> = {
-                    let Ok(mut conn) = shard_pool.get().await else {
+                    // Selected against `cancel` (issue #1426); see the demands
+                    // acquisition above.
+                    let get_result = tokio::select! {
+                        () = cancel.cancelled() => break,
+                        result = shard_pool.get() => result,
+                    };
+                    let Ok(mut conn) = get_result else {
                         continue;
                     };
                     let filters = crate::workers::WorkerFilters {
@@ -24146,7 +25092,13 @@ fn spawn_stranded_work_sampler(
                 // claim_task enforces. On load failure fall back to an empty set
                 // (exact-match / legacy-worker rules still apply).
                 let compat_set = {
-                    let Ok(mut conn) = shard_pool.get().await else {
+                    // Selected against `cancel` (issue #1426); see the demands
+                    // acquisition above.
+                    let get_result = tokio::select! {
+                        () = cancel.cancelled() => break,
+                        result = shard_pool.get() => result,
+                    };
+                    let Ok(mut conn) = get_result else {
                         continue;
                     };
                     crate::build_routing::load_compat_set(&mut conn)
@@ -24437,7 +25389,15 @@ fn spawn_pause_auto_resumer(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            match pool.get().await {
+            // Selected against `cancel` (issue #1426). See the comment
+            // above `spawn_worker_heartbeat`'s own `pool.get()` call for
+            // why an unselected acquisition here can park shutdown
+            // forever.
+            let get_result = tokio::select! {
+                () = cancel.cancelled() => break,
+                result = pool.get() => result,
+            };
+            match get_result {
                 Ok(mut conn) => {
                     match crate::execution::auto_resume_expired_pauses(
                         &mut conn,
@@ -24513,7 +25473,20 @@ fn spawn_history_oversized_sampler(
             // (#522).
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -24790,7 +25763,20 @@ fn spawn_workflow_active_sampler(
             let mut per_shard: Vec<Vec<(String, ActiveWorkflowState, u64)>> = Vec::new();
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -29649,6 +30635,324 @@ pub(crate) fn under_provisioned_shard_pools(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins [`NEW_WORKFLOW_EXECUTION_COLUMNS`], and therefore
+    /// [`ROWS_PER_EXECUTION_INSERT_CHUNK`], to `NewWorkflowExecution`'s real
+    /// field count, by exhaustive destructure (issue #1589, mirrors
+    /// `queue.rs`'s identical regression test for `NewTaskQueueItem`).
+    /// Adding, removing, or renaming a field breaks this match at compile
+    /// time. The chunk size then cannot silently drift out of sync with the
+    /// row width it bounds.
+    #[test]
+    fn new_workflow_execution_column_count_matches_the_constant() {
+        let sample = crate::models::NewWorkflowExecution {
+            id: uuid::Uuid::nil(),
+            workflow_name: "wf",
+            workflow_id: "wf-id",
+            run_id: uuid::Uuid::nil(),
+            shard_id: 0,
+            input: serde_json::Value::Null,
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            deadline_at: None,
+            chain_execution_timeout: None,
+            chain_deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+            parent_close_policy: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            origin: None,
+            completion_callbacks: None,
+            continued_from_exec_id: None,
+            first_exec_id: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
+            quota_key: None,
+        };
+        let crate::models::NewWorkflowExecution {
+            id: _,
+            workflow_name: _,
+            workflow_id: _,
+            run_id: _,
+            shard_id: _,
+            input: _,
+            parent_id: _,
+            queue_name: _,
+            execution_timeout: _,
+            deadline_at: _,
+            chain_execution_timeout: _,
+            chain_deadline_at: _,
+            memo: _,
+            search_attrs: _,
+            assigned_build_id: _,
+            parent_close_policy: _,
+            owner: _,
+            runbook_url: _,
+            severity: _,
+            context_headers: _,
+            sla: _,
+            sla_deadline_at: _,
+            schedule_id: _,
+            scheduled_for: _,
+            workflow_attempt: _,
+            workflow_retry_policy: _,
+            retry_of_exec_id: _,
+            origin: _,
+            completion_callbacks: _,
+            continued_from_exec_id: _,
+            first_exec_id: _,
+            start_source: _,
+            start_source_ref: _,
+            started_by: _,
+            quota_key: _,
+        } = sample;
+        const {
+            assert!(NEW_WORKFLOW_EXECUTION_COLUMNS == 35);
+            assert!(
+                ROWS_PER_EXECUTION_INSERT_CHUNK * NEW_WORKFLOW_EXECUTION_COLUMNS
+                    <= POSTGRES_MAX_BIND_PARAMS
+            );
+        }
+    }
+
+    /// Mirrors `queue.rs`'s `chunk_bounds_splits_near_max_size_inputs_into_many_small_chunks`
+    /// (issue #1589). A run of near-max-size child inputs must split into
+    /// many small chunks under [`MAX_EXECUTION_CHUNK_PAYLOAD_BYTES`], not
+    /// all land in one chunk sized only by
+    /// [`ROWS_PER_EXECUTION_INSERT_CHUNK`].
+    #[test]
+    fn execution_chunk_bounds_splits_near_max_size_inputs_into_many_small_chunks() {
+        let near_max_bytes =
+            usize::try_from(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES).unwrap();
+        let commands: Vec<StartedChildWorkflowCommand> = (0..200)
+            .map(|_| StartedChildWorkflowCommand {
+                child_id: ExecutionId::new(),
+                workflow_name: "wf".to_string(),
+                input: serde_json::json!("x".repeat(near_max_bytes)),
+            })
+            .collect();
+        let plans: Vec<LocalChildPlan<'_>> = commands
+            .iter()
+            .map(|child| LocalChildPlan {
+                child,
+                defaults: ChildWorkflowDefaults {
+                    owner: None,
+                    runbook_url: None,
+                    severity: None,
+                    sla: None,
+                    sla_deadline_at: None,
+                    execution_timeout: None,
+                    deadline_at: None,
+                    chain_execution_timeout: None,
+                    chain_deadline_at: None,
+                    retry_policy: None,
+                    quota: None,
+                },
+                child_workflow_id: child.child_id.to_string(),
+                child_quota_key: None,
+            })
+            .collect();
+
+        let bounds = compute_local_child_chunk_bounds(&plans, 0);
+
+        assert!(
+            bounds.len() > 10,
+            "200 near-max-size plans must split into many small chunks, got {} chunk(s)",
+            bounds.len()
+        );
+        for &(start, end) in &bounds {
+            let row_sizes: Vec<usize> = plans[start..end]
+                .iter()
+                .map(|p| json_byte_len(&p.child.input))
+                .collect();
+            let chunk_payload: usize = row_sizes.iter().sum();
+            let largest_row = row_sizes.iter().copied().max().unwrap_or(0);
+            assert!(
+                chunk_payload <= MAX_EXECUTION_CHUNK_PAYLOAD_BYTES + largest_row,
+                "chunk [{start}, {end}) carries {chunk_payload} bytes, over the \
+                 {MAX_EXECUTION_CHUNK_PAYLOAD_BYTES}-byte budget by more than one row's allowance"
+            );
+        }
+        let mut next_expected = 0;
+        for &(start, end) in &bounds {
+            assert_eq!(start, next_expected, "chunks must be contiguous, no gaps");
+            assert!(end > start, "every chunk must carry at least one plan");
+            next_expected = end;
+        }
+        assert_eq!(
+            next_expected,
+            plans.len(),
+            "every plan must fall into a chunk"
+        );
+    }
+
+    /// Codex review, issue #1589: `build_child_row` clones the PARENT's own
+    /// `context_headers` into every row. A large inherited header must
+    /// therefore shrink the chunk size the same way a large `child.input`
+    /// does, even when every child's own input is tiny. Proves
+    /// `shared_row_bytes` actually participates in the budget, not just
+    /// `child.input`.
+    #[test]
+    fn execution_chunk_bounds_accounts_for_shared_per_row_bytes() {
+        let commands: Vec<StartedChildWorkflowCommand> = (0..200)
+            .map(|_| StartedChildWorkflowCommand {
+                child_id: ExecutionId::new(),
+                workflow_name: "wf".to_string(),
+                input: serde_json::json!("tiny"),
+            })
+            .collect();
+        let plans: Vec<LocalChildPlan<'_>> = commands
+            .iter()
+            .map(|child| LocalChildPlan {
+                child,
+                defaults: ChildWorkflowDefaults {
+                    owner: None,
+                    runbook_url: None,
+                    severity: None,
+                    sla: None,
+                    sla_deadline_at: None,
+                    execution_timeout: None,
+                    deadline_at: None,
+                    chain_execution_timeout: None,
+                    chain_deadline_at: None,
+                    retry_policy: None,
+                    quota: None,
+                },
+                child_workflow_id: child.child_id.to_string(),
+                child_quota_key: None,
+            })
+            .collect();
+
+        // Every child's own input is 6 bytes -- 200 of them would trivially
+        // fit in one row-count-bounded chunk with `shared_row_bytes = 0`.
+        let bounds_without_shared = compute_local_child_chunk_bounds(&plans, 0);
+        assert_eq!(
+            bounds_without_shared.len(),
+            1,
+            "tiny inputs alone must fit in one chunk"
+        );
+
+        // A large shared per-row payload (e.g. inherited `context_headers`)
+        // must still force many small chunks, exactly like a large
+        // `child.input` would.
+        let near_max_bytes =
+            usize::try_from(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES).unwrap();
+        let bounds_with_shared = compute_local_child_chunk_bounds(&plans, near_max_bytes);
+        assert!(
+            bounds_with_shared.len() > 10,
+            "a large shared per-row payload must split 200 plans into many small chunks, \
+             got {} chunk(s)",
+            bounds_with_shared.len()
+        );
+        for &(start, end) in &bounds_with_shared {
+            let chunk_payload = (end - start) * near_max_bytes;
+            assert!(
+                chunk_payload <= MAX_EXECUTION_CHUNK_PAYLOAD_BYTES + near_max_bytes,
+                "chunk [{start}, {end}) carries {chunk_payload} bytes of shared payload alone, \
+                 over the {MAX_EXECUTION_CHUNK_PAYLOAD_BYTES}-byte budget by more than one \
+                 row's allowance"
+            );
+        }
+    }
+
+    /// Issue #1589: `build_child_row` clones each plan's own resolved
+    /// retry policy into its row. A large same-type policy must
+    /// therefore shrink the chunk size the same way a large `child.input`
+    /// does. This holds even though the `Arc` cache means every plan
+    /// here points at the SAME underlying policy.
+    #[test]
+    fn execution_chunk_bounds_accounts_for_the_retry_policy() {
+        let commands: Vec<StartedChildWorkflowCommand> = (0..200)
+            .map(|_| StartedChildWorkflowCommand {
+                child_id: ExecutionId::new(),
+                workflow_name: "wf".to_string(),
+                input: serde_json::json!("tiny"),
+            })
+            .collect();
+        let near_max_bytes =
+            usize::try_from(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES).unwrap();
+        let large_policy = Arc::new(serde_json::json!("x".repeat(near_max_bytes)));
+        let plans: Vec<LocalChildPlan<'_>> = commands
+            .iter()
+            .map(|child| LocalChildPlan {
+                child,
+                defaults: ChildWorkflowDefaults {
+                    owner: None,
+                    runbook_url: None,
+                    severity: None,
+                    sla: None,
+                    sla_deadline_at: None,
+                    execution_timeout: None,
+                    deadline_at: None,
+                    chain_execution_timeout: None,
+                    chain_deadline_at: None,
+                    retry_policy: Some(Arc::clone(&large_policy)),
+                    quota: None,
+                },
+                child_workflow_id: child.child_id.to_string(),
+                child_quota_key: None,
+            })
+            .collect();
+
+        let bounds = compute_local_child_chunk_bounds(&plans, 0);
+        assert!(
+            bounds.len() > 10,
+            "a large retry policy shared by every plan must still split 200 plans into many \
+             small chunks, got {} chunk(s)",
+            bounds.len()
+        );
+        for &(start, end) in &bounds {
+            let chunk_payload = (end - start) * near_max_bytes;
+            assert!(
+                chunk_payload <= MAX_EXECUTION_CHUNK_PAYLOAD_BYTES + near_max_bytes,
+                "chunk [{start}, {end}) carries {chunk_payload} bytes of retry-policy payload \
+                 alone, over the {MAX_EXECUTION_CHUNK_PAYLOAD_BYTES}-byte budget by more than \
+                 one row's allowance"
+            );
+        }
+    }
+
+    /// Issue #1589: a same-type fan-out must share one retry-policy
+    /// `Arc`, not hold an independent deep copy per child. `Arc::ptr_eq`
+    /// proves the second lookup for the same workflow name reused the
+    /// first `Arc` instead of allocating a new one.
+    #[test]
+    fn cached_retry_policy_shares_the_arc_across_same_type_children() {
+        let mut cache: HashMap<&str, Arc<serde_json::Value>> = HashMap::new();
+        let first_child_policy = Arc::new(serde_json::json!({"max_attempts": 5}));
+        let shared_a = cached_retry_policy(&mut cache, "wf", first_child_policy);
+
+        // The second child of the same type resolves its OWN fresh `Arc`.
+        // This mirrors `resolve_child_workflow_defaults` serializing again
+        // per child. The cache must discard it and hand back the first.
+        let second_child_policy = Arc::new(serde_json::json!({"max_attempts": 5}));
+        let shared_b = cached_retry_policy(&mut cache, "wf", second_child_policy);
+        assert!(
+            Arc::ptr_eq(&shared_a, &shared_b),
+            "same workflow type must reuse the cached Arc, not hold an independent copy"
+        );
+
+        // A different workflow type must not reuse another type's policy.
+        let other_type_policy = Arc::new(serde_json::json!({"max_attempts": 1}));
+        let shared_c = cached_retry_policy(&mut cache, "other_wf", other_type_policy);
+        assert!(
+            !Arc::ptr_eq(&shared_a, &shared_c),
+            "distinct workflow types must not share a cached Arc"
+        );
+    }
 
     fn scheduled(
         activity_id: ActivityExecId,
@@ -39980,6 +41284,140 @@ mod tests {
         assert!(!records_abandoned_dispatches(&WorkflowOutcome::Suspended {
             commands: Vec::new(),
         }));
+    }
+
+    /// Issue #1409 (Codex P2 on PR #1679): a `ContinuedAsNew` that carries no
+    /// abandoned-dispatch-eligible command stays exempt from the history hard
+    /// cap. It truly does escape onto a fresh successor row. One that DOES
+    /// carry such a command loses the exemption, since a redirect to
+    /// `WorkflowFailed` can append issue #952's pair onto the SAME row.
+    /// Every other outcome is never exempt, regardless of the count.
+    #[test]
+    fn only_an_abandoned_dispatch_free_continuation_is_exempt_from_the_history_cap() {
+        let continued = WorkflowOutcome::ContinuedAsNew {
+            input: Value::Null,
+            new_workflow_type: None,
+        };
+        assert!(continue_as_new_exempt_from_history_cap(&continued, 0));
+        assert!(!continue_as_new_exempt_from_history_cap(&continued, 2));
+
+        let failed = WorkflowOutcome::Failed {
+            error: "boom".to_string(),
+            non_deterministic_details: None,
+            handler_panic: false,
+            unhandled_signals: std::collections::BTreeMap::new(),
+        };
+        assert!(!continue_as_new_exempt_from_history_cap(&failed, 0));
+
+        let completed = WorkflowOutcome::Completed {
+            output: Value::Null,
+            unhandled_signals: std::collections::BTreeMap::new(),
+        };
+        assert!(!continue_as_new_exempt_from_history_cap(&completed, 0));
+
+        let suspended = WorkflowOutcome::Suspended {
+            commands: Vec::new(),
+        };
+        assert!(!continue_as_new_exempt_from_history_cap(&suspended, 0));
+    }
+
+    /// Issue #1409: the history hard-cap preflight must not
+    /// false-positive-DLQ a healthy continuation just because it also
+    /// dispatched-then-abandoned something in the same cycle. Pin the exact
+    /// cheap checks this prediction covers. Also pin the two DB-dependent
+    /// ones it deliberately leaves as `false` -- a documented residual gap,
+    /// not a bug.
+    #[test]
+    fn continue_as_new_certainly_redirects_covers_only_the_db_free_checks() {
+        let root = can803_predecessor();
+        let mut child = root.clone();
+        child.parent_id = Some(uuid::Uuid::new_v4());
+
+        let target = can803_wf_info("paid_subscription");
+        let registry = HandlerRegistry::new(vec![target], vec![]);
+        let small_input = serde_json::json!({});
+
+        // A same-type continuation can never redirect for a reason this
+        // function can see -- `check_continue_as_new_type` is not even
+        // consulted for `new_workflow_type: None`.
+        assert!(!continue_as_new_certainly_redirects(
+            &registry,
+            &root,
+            &small_input,
+            None
+        ));
+
+        // A child execution redirects unconditionally (issue #1409's
+        // `ChildUnsupported`), same-type or cross-type alike.
+        assert!(continue_as_new_certainly_redirects(
+            &registry,
+            &child,
+            &small_input,
+            None
+        ));
+        assert!(continue_as_new_certainly_redirects(
+            &registry,
+            &child,
+            &small_input,
+            Some("paid_subscription")
+        ));
+
+        // An unregistered cross-type target redirects -- pure registry
+        // lookup, no DB read.
+        assert!(continue_as_new_certainly_redirects(
+            &registry,
+            &root,
+            &small_input,
+            Some("no_such_type")
+        ));
+
+        // A registered cross-type target with a small input and no quota
+        // policy cannot be shown to redirect by any DB-free check.
+        assert!(!continue_as_new_certainly_redirects(
+            &registry,
+            &root,
+            &small_input,
+            Some("paid_subscription")
+        ));
+
+        // An over-cap cross-type input redirects -- pure size check against
+        // the target's effective cap. `max_input_bytes: None` falls back to
+        // the registry's own floor, lowered here well under the payload
+        // below (the default floor is 2 MiB).
+        let tight_target = can803_wf_info("tight_cap");
+        let tight_registry = HandlerRegistry::new(vec![tight_target], vec![])
+            .with_payload_caps(10_000, 8, 10_000, 10_000);
+        let big_input = serde_json::json!({"blob": "x".repeat(300)});
+        assert!(continue_as_new_certainly_redirects(
+            &tight_registry,
+            &root,
+            &big_input,
+            Some("tight_cap")
+        ));
+
+        // An over-cap quota key redirects -- pure resolve + length check.
+        let mut quota_target = can803_wf_info("quota_target");
+        quota_target.quota = Some(crate::quota::QuotaPolicy::new("tenant_id"));
+        let quota_registry = HandlerRegistry::new(vec![quota_target], vec![]);
+        let oversized_key_input = serde_json::json!({
+            "tenant_id": "x".repeat(
+                usize::try_from(crate::quota::MAX_QUOTA_KEY_BYTES).expect("small") + 1
+            )
+        });
+        assert!(continue_as_new_certainly_redirects(
+            &quota_registry,
+            &root,
+            &oversized_key_input,
+            Some("quota_target")
+        ));
+        // A quota key within bound is not, by itself, a reason to redirect.
+        let in_bound_key_input = serde_json::json!({"tenant_id": "acme"});
+        assert!(!continue_as_new_certainly_redirects(
+            &quota_registry,
+            &root,
+            &in_bound_key_input,
+            Some("quota_target")
+        ));
     }
 
     /// The dedup asks the question the MATCHER asked — "is this dispatch already
