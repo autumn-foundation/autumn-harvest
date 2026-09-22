@@ -252,14 +252,20 @@ jobs:
         # Guards a real, reproduced-live compile failure an Onramp
         # clean-room pass found in chapter 7's flagship deadline-aware
         # checkpoint example: `ctx.continue_as_new(...).await?` inside a
-        # `Result<_, String>` workflow, with no `.map_err(...)` converting
-        # the `HarvestError` continue_as_new returns first (E0277, no
+        # `Result<_, String>` workflow, with no real conversion from the
+        # `HarvestError` continue_as_new returns first (E0277, no
         # `From<HarvestError> for String`). Not a syntax error, so
         # doc-snippet-syntax.py's rustfmt-only check passed it clean. The
         # same broken snippet also lived, unenforced, inside
         # autumn-harvest/examples/long_lived_entity_deadline.rs's own
         # ```rust,ignore``` module-doc illustration, so this checks both.
-        # See scripts/check-continue-as-new-checkpoint-example.sh.
+        # Whether a `.map_err(...)` closure actually produces `String` is a
+        # type-checker property, not a text shape (review found two
+        # text-heuristic attempts gameable in a row -- a loose window, then
+        # an `.await.map_err(|e| e)?` identity closure), so this compiles
+        # each pinned snippet with `cargo check` rather than pattern-
+        # matching stand-in text. See
+        # scripts/check-continue-as-new-checkpoint-example.sh.
         run: ./scripts/check-continue-as-new-checkpoint-example.sh
       - name: Check formatting
         run: cargo fmt --all -- --check

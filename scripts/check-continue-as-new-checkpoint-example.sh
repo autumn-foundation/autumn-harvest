@@ -1,39 +1,34 @@
 #!/usr/bin/env bash
 # Fails if either copy of the "checkpoint before the execution_timeout
 # deadline" continue_as_new example regresses into a real type error: a
-# bare `?` on `ctx.continue_as_new(...).await` inside a `Result<_, String>`
-# workflow, with no `.map_err(...)` converting the error immediately after
-# that `.await`.
+# `ctx.continue_as_new(...).await` whose error is not actually converted to
+# `String` before the surrounding `Result<_, String>` workflow's `?`.
 #
 # Mechanism: `WorkflowContext::continue_as_new` returns
 # `HarvestResult<()>` (`Result<(), HarvestError>`). There is no
-# `From<HarvestError> for String`, so `?` alone does not compile inside a
-# function whose error type is `String` -- E0277. An Onramp clean-room pass
-# found this in docs/getting-started/07-reliability-knobs.md's own flagship
+# `From<HarvestError> for String`, so `?` needs a real conversion first --
+# E0277 otherwise. An Onramp clean-room pass found this in
+# docs/getting-started/07-reliability-knobs.md's own flagship
 # deadline-aware-checkpoint snippet; doc-snippet-syntax.py never catches it
-# because it only runs `rustfmt` (a syntax check), and this is a type error.
-#
-# The same broken snippet also lived, unenforced, inside
+# because it only runs `rustfmt` (a syntax check), and this is a type
+# error. The identical broken snippet also lived, unenforced, inside
 # autumn-harvest/examples/long_lived_entity_deadline.rs's own module-doc
-# comment -- marked ```rust,ignore``` so nothing ever compiled it either,
-# even though the real, working `subscription_entity` fn a few lines below
-# in that same file gets this right with `.map_err(|e| e.to_string())`.
+# comment, marked ```rust,ignore``` so nothing ever compiled it either.
 #
-# Checked per-statement, not with a loose windowed grep (PR #1700 review):
-# a fixed-line-count window around "ctx.continue_as_new(" can be satisfied
-# by a `.map_err(` that belongs to something else entirely -- the
-# `serde_json::to_value(&state)` conversion nested inside the SAME call's
-# own argument list, or, since long_lived_entity_deadline.rs's module-doc
-# comment and its real `subscription_entity` fn each call continue_as_new
-# once, the real fn's own already-correct `.map_err(` masking a regression
-# reintroduced into the doc-comment copy alone. Each `ctx.continue_as_new(
-# ... );` statement is isolated first (accumulated from its opening line
-# to its own terminating `;`, across line breaks, with whitespace and any
-# `//!` doc-comment marker stripped), then checked on its own for the exact
-# substring ".await.map_err(" -- present whether the fix is written as
-# `.await` / `.map_err(...)` on separate lines or chained on one line, and
-# absent from the broken `.await?` (or bare `.await;`) forms, regardless of
-# an unrelated `.map_err(` earlier in the same statement's argument list.
+# This actually compiles each pinned snippet with `cargo check`, rather
+# than pattern-matching stand-in text (two rounds of PR #1700 review found
+# text heuristics gameable here: first a loose window an unrelated
+# `.map_err(` could satisfy, then an `.await.map_err(|e| e)?` identity
+# closure -- syntactically "a map_err right after await", but `|e| e`
+# keeps `HarvestError` instead of producing `String`, so it still fails to
+# compile). Whether a closure's return type actually satisfies `?`'s
+# target is a type-checker property, not a text shape, so there is no
+# third regex worth writing here -- the compiler already settles it.
+# `docs/audits/doc-snippet-syntax.py` deliberately does not do this for the
+# whole 93-block corpus (its own docstring explains why); that tradeoff
+# does not apply to two pinned, previously-broken blocks checked against
+# the crate this same `lint` job already builds for clippy a few steps
+# later.
 #
 # Usage: ./scripts/check-continue-as-new-checkpoint-example.sh
 
@@ -41,72 +36,106 @@ set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-check_file() {
-  local file="$1"
-  local label="$2"
-  local statements
-  local bad=0
+example_name="_onramp_doc_check_continue_as_new_checkpoint"
+example_path="autumn-harvest/examples/${example_name}.rs"
 
-  if [ ! -f "$file" ]; then
-    echo "$file: not found" >&2
+cleanup() {
+  rm -f "$example_path"
+}
+trap cleanup EXIT
+cleanup # self-heal if a previous run was killed before its own trap ran
+
+# Neither pinned snippet defines SubState or its own `use` -- the doc
+# assumes chapter-local context, and the .rs snippet's own `use
+# autumn_harvest::prelude::*;` line duplicates this harmlessly (an
+# identical repeated glob import is not an error). Matches the real
+# SubState in autumn-harvest/examples/long_lived_entity_deadline.rs.
+harness_prelude() {
+  cat <<'RUST_EOF'
+#![allow(clippy::all, clippy::pedantic, clippy::nursery, dead_code)]
+use autumn_harvest::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SubState {
+    pub cycles: u32,
+}
+RUST_EOF
+}
+
+compile_check() {
+  local label="$1"
+  local code="$2"
+  local output
+
+  {
+    harness_prelude
+    echo
+    echo "$code"
+    echo
+    echo "fn main() {"
+    echo "    let _wfs = workflows![subscription_entity];"
+    echo "}"
+  } >"$example_path"
+
+  if ! output="$(cargo check --quiet -p autumn-harvest --example "$example_name" 2>&1)"; then
+    echo "$label does not compile against the real autumn-harvest crate." >&2
+    echo >&2
+    echo "$output" >&2
+    echo >&2
+    echo "See the real, compiling subscription_entity fn in" \
+      "autumn-harvest/examples/long_lived_entity_deadline.rs." >&2
     return 1
   fi
+  return 0
+}
 
-  # One compacted line per `ctx.continue_as_new( ... );` statement, followed
-  # by a "###STMT-END###" marker line -- so a file with more than one call
-  # (the module-doc copy AND the real fn, in long_lived_entity_deadline.rs)
-  # yields one independently-checkable record per call, not one combined
-  # blob where either could satisfy the check for the other.
-  statements="$(awk '
-    /ctx\.continue_as_new\(/ { collecting = 1 }
-    collecting {
+extract_md_block() {
+  awk '
+    /^#\[workflow\(execution_timeout = "24h"\)\]$/ { p = 1 }
+    p && /^```$/ { exit }
+    p { print }
+  ' "docs/getting-started/07-reliability-knobs.md"
+}
+
+extract_rs_doc_comment_block() {
+  awk '
+    /^\/\/! ```rust,ignore$/ { p = 1; next }
+    p && /^\/\/! ```$/ { exit }
+    p {
       line = $0
-      gsub(/\/\/!/, "", line)
-      gsub(/[ \t]+/, "", line)
-      buf = buf line
-      if (line ~ /;$/) {
-        print buf
-        print "###STMT-END###"
-        buf = ""
-        collecting = 0
-      }
+      sub(/^\/\/! ?/, "", line)
+      print line
     }
-  ' "$file")"
-
-  if [ -z "$statements" ]; then
-    echo "$file: could not find a ctx.continue_as_new(...) call in $label;" \
-      "has it moved? Update this guard to match." >&2
-    return 1
-  fi
-
-  while IFS= read -r stmt; do
-    [ -z "$stmt" ] && continue
-    [ "$stmt" = "###STMT-END###" ] && continue
-    if [[ "$stmt" != *".await.map_err("* ]]; then
-      echo "$file: $label has a ctx.continue_as_new(...).await with no" \
-        ".map_err(...) immediately after that .await. continue_as_new" \
-        "returns HarvestResult<()>, and there is no From<HarvestError> for" \
-        "String, so an unconverted '?' does not compile inside a" \
-        "Result<_, String> workflow (E0277)." >&2
-      echo "  offending statement (whitespace stripped): $stmt" >&2
-      echo >&2
-      echo "Fix: .map_err(|e| e.to_string())? right after .await, matching" \
-        "the real, compiling subscription_entity fn in" \
-        "autumn-harvest/examples/long_lived_entity_deadline.rs." >&2
-      bad=1
-    fi
-  done <<<"$statements"
-
-  return "$bad"
+  ' "autumn-harvest/examples/long_lived_entity_deadline.rs"
 }
 
 status=0
-check_file "docs/getting-started/07-reliability-knobs.md" \
-  "the deadline-aware checkpoint example" || status=1
-check_file "autumn-harvest/examples/long_lived_entity_deadline.rs" \
-  "the module-doc illustration" || status=1
+
+md_code="$(extract_md_block)"
+if [ -z "$md_code" ]; then
+  echo "docs/getting-started/07-reliability-knobs.md: could not find the" \
+    "subscription_entity checkpoint example (looked for its" \
+    "#[workflow(execution_timeout = \"24h\")] attribute line); has the" \
+    "chapter been restructured? Update this guard to match." >&2
+  status=1
+else
+  compile_check "docs/getting-started/07-reliability-knobs.md's checkpoint example" \
+    "$md_code" || status=1
+fi
+
+rs_code="$(extract_rs_doc_comment_block)"
+if [ -z "$rs_code" ]; then
+  echo "autumn-harvest/examples/long_lived_entity_deadline.rs: could not" \
+    "find its \`\`\`rust,ignore\`\`\` module-doc illustration; has it moved?" \
+    "Update this guard to match." >&2
+  status=1
+else
+  compile_check "long_lived_entity_deadline.rs's module-doc illustration" \
+    "$rs_code" || status=1
+fi
 
 if [ "$status" -eq 0 ]; then
-  echo "OK: both continue_as_new checkpoint examples map_err right after '.await'."
+  echo "OK: both continue_as_new checkpoint examples compile against the real autumn-harvest crate."
 fi
 exit "$status"
