@@ -250,6 +250,7 @@ pub struct RedisDispatch {
     publish_script: Arc<Script>,
     promote_script: Arc<Script>,
     requeue_script: Arc<Script>,
+    ack_marker_script: Arc<Script>,
     /// Queues whose consumer group this process already created.
     ensured: Arc<Mutex<HashSet<String>>>,
     /// Unix milliseconds of the last promotion pass driven by a read.
@@ -296,6 +297,7 @@ impl RedisDispatch {
             publish_script: Arc::new(Script::new(PUBLISH_LUA)),
             promote_script: Arc::new(Script::new(PROMOTE_MARKED_LUA)),
             requeue_script: Arc::new(Script::new(REQUEUE_LUA)),
+            ack_marker_script: Arc::new(Script::new(ACK_MARKER_LUA)),
             ensured: Arc::new(Mutex::new(HashSet::new())),
             last_promote_ms: Arc::new(AtomicI64::new(0)),
             last_recover_ms: Arc::new(AtomicI64::new(0)),
@@ -922,9 +924,17 @@ impl RedisDispatch {
             .ignore()
             .xdel(&key, &[entry_id])
             .ignore()
-            .del(self.marker_key(&lease.queue_name, lease.task_id))
-            .ignore()
             .query_async::<()>(&mut conn)
+            .await?;
+        // A separate, conditional call (Codex review, issue #1429). See
+        // `ACK_MARKER_LUA`'s own doc comment for why an unconditional `DEL`
+        // here would risk deleting a *different*, still-live entry's marker.
+        let _: i64 = self
+            .ack_marker_script
+            .prepare_invoke()
+            .key(self.marker_key(&lease.queue_name, lease.task_id))
+            .arg(entry_id)
+            .invoke_async(&mut conn)
             .await?;
         Ok(())
     }
@@ -953,15 +963,17 @@ impl RedisDispatch {
     /// batch (issue #1429).
     ///
     /// Same shape as [`Self::ack_inner`], batched into one atomic pipeline
-    /// per queue. `XACK`/`XDEL`/the marker delete for one queue all share
-    /// that queue's hash tag. A stream, delayed set and marker from a
-    /// DIFFERENT queue carry a different tag by design (issue #1429's own
-    /// per-queue hash-tag split). One `MULTI`/`EXEC` spanning two queues'
-    /// keys would therefore fail `CROSSSLOT` on a real Cluster the moment
-    /// this crate's client becomes Cluster-aware. That is exactly the
-    /// failure the hash tags exist to remove. Grouping by queue first,
-    /// mirroring [`Self::release_many_inner`]/[`Self::requeue_batch`], keeps
-    /// every pipeline's keys inside one queue's tag.
+    /// per queue for `XACK`/`XDEL`, plus one [`ACK_MARKER_LUA`] call per
+    /// queue for the marker cleanup. `XACK`/`XDEL`/the marker for one queue
+    /// all share that queue's hash tag. A stream, delayed set and marker
+    /// from a DIFFERENT queue carry a different tag by design (issue
+    /// #1429's own per-queue hash-tag split). One `MULTI`/`EXEC` spanning
+    /// two queues' keys would therefore fail `CROSSSLOT` on a real Cluster
+    /// the moment this crate's client becomes Cluster-aware. That is
+    /// exactly the failure the hash tags exist to remove. Grouping by
+    /// queue first, mirroring [`Self::release_many_inner`]/
+    /// [`Self::requeue_batch`], keeps every call's keys inside one queue's
+    /// tag.
     ///
     /// One queue's pipeline failing must not abort the rest of this batch
     /// (Codex review, issue #1429). [`Self::requeue_batch`] already
@@ -987,16 +999,29 @@ impl RedisDispatch {
             let key = self.stream_key(queue);
             let mut pipe = redis::pipe();
             pipe.atomic();
-            for lease in batch {
+            for lease in &batch {
                 let entry_id = handle_entry_id(&lease.handle);
                 pipe.xack(&key, &self.config.consumer_group, &[entry_id])
                     .ignore()
                     .xdel(&key, &[entry_id])
-                    .ignore()
-                    .del(self.marker_key(queue, lease.task_id))
                     .ignore();
             }
             if let Err(error) = pipe.query_async::<()>(&mut conn).await {
+                first_error.get_or_insert(error);
+            }
+
+            // A separate, conditional call (Codex review, issue #1429). See
+            // `ACK_MARKER_LUA`'s own doc comment for why an unconditional
+            // `DEL` here would risk deleting a *different*, still-live
+            // entry's marker.
+            let mut invocation = self.ack_marker_script.prepare_invoke();
+            for lease in &batch {
+                invocation.key(self.marker_key(queue, lease.task_id));
+            }
+            for lease in &batch {
+                invocation.arg(handle_entry_id(&lease.handle));
+            }
+            if let Err(error) = invocation.invoke_async::<i64>(&mut conn).await {
                 first_error.get_or_insert(error);
             }
         }
@@ -1529,6 +1554,47 @@ end
 return promoted
 ";
 
+/// Lua script that deletes a dedupe marker only if it still names the entry
+/// being acked (Codex review, issue #1429).
+///
+/// Keys:
+/// - `KEYS[1..]`: one dedupe marker per acked lease.
+///
+/// Arguments:
+/// - `ARGV[1..]`: the entry id `KEYS`'s matching marker must still name, in
+///   the same order as `KEYS`.
+///
+/// `ack`/`ack_many` defer the marker delete until after the claimed task
+/// has already been spawned. That is issue #1312's connection-release
+/// ordering, and the batching this defers across an entire read's worth of
+/// leases widens it. A fast-completing task can re-pend and republish the
+/// same task id before its own lease is acked. That overwrites the marker
+/// to name the fresh publish. An unconditional `DEL` there would then
+/// delete a marker naming a *different*, still-live entry. `PUBLISH_LUA`'s
+/// own intact check would never see that loss, so the reconcile sweep
+/// republishes a duplicate. Deleting only when the marker still names the
+/// entry being acked closes that gap. An overwritten marker is left alone,
+/// exactly like the pattern `PUBLISH_LUA` and `PROMOTE_MARKED_LUA` already
+/// use to decide whether a marker is still intact.
+const ACK_MARKER_LUA: &str = r"
+local n = #KEYS
+for i = 1, n do
+    local marker = KEYS[i]
+    local expected = ARGV[i]
+    local held = redis.call('GET', marker)
+    if held then
+        local sep = string.find(held, '|', 1, true)
+        if sep then
+            local at = string.sub(held, sep + 1)
+            if at == expected then
+                redis.call('DEL', marker)
+            end
+        end
+    end
+end
+return n
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1566,6 +1632,11 @@ mod tests {
     #[test]
     fn promote_script_compiles() {
         let _ = Script::new(PROMOTE_MARKED_LUA);
+    }
+
+    #[test]
+    fn ack_marker_script_compiles() {
+        let _ = Script::new(ACK_MARKER_LUA);
     }
 
     #[test]

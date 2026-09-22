@@ -476,6 +476,73 @@ async fn ack_deletes_the_marker_so_a_republish_is_delivered() {
     assert_eq!(again[0].task_id, task_id);
 }
 
+/// Acking a stale lease must not delete a marker a fresher entry now owns
+/// (Codex review, issue #1429).
+///
+/// A batched worker defers a lease's ack until after its task has already
+/// been spawned. A fast-completing task can re-pend and republish the same
+/// task id before that stale lease is acked. That overwrites the marker to
+/// name the fresh entry. Acking the stale lease afterward must not delete
+/// that marker. Doing so would leave the fresh entry undetected by a later
+/// publish's own intact check, producing a duplicate.
+#[tokio::test(flavor = "multi_thread")]
+async fn acking_a_stale_lease_leaves_a_fresher_entrys_marker_intact() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["acked".to_string()];
+    let task_id = Uuid::new_v4();
+    let stale_due = Utc::now();
+
+    fixture
+        .dispatch
+        .publish(&[hint("acked", task_id, stale_due)])
+        .await
+        .expect("publish");
+    let stale = read(&fixture, &queues, 10).await;
+    assert_eq!(stale.len(), 1);
+
+    // Simulates the fast-completing task's re-pend: republishing before the
+    // stale lease above is acked, at a due time distinct from the first
+    // publish. The old marker then reads as not intact, so this writes a
+    // fresh entry and overwrites the marker to name it.
+    let fresh_due = stale_due + chrono::Duration::milliseconds(1);
+    fixture
+        .dispatch
+        .publish(&[hint("acked", task_id, fresh_due)])
+        .await
+        .expect("republish before the stale lease is acked");
+    let fresh = read(&fixture, &queues, 10).await;
+    assert_eq!(fresh.len(), 1, "the republish delivers a fresh entry");
+    assert_ne!(
+        fresh[0].handle, stale[0].handle,
+        "the fresh lease must be a different stream entry from the stale one"
+    );
+
+    fixture
+        .dispatch
+        .ack(&stale[0])
+        .await
+        .expect("ack the stale lease");
+    assert!(
+        fixture.marker_exists("acked", task_id).await,
+        "acking the stale lease must not delete the fresh entry's marker"
+    );
+
+    // A republish at the fresh entry's own due time now reads the marker as
+    // intact and skips, proving it still guards against a duplicate.
+    fixture
+        .dispatch
+        .publish(&[hint("acked", task_id, fresh_due)])
+        .await
+        .expect("publish at the fresh entry's due time");
+    assert_eq!(
+        fixture.stream_len("acked").await,
+        1,
+        "the fresh entry's marker must have prevented a duplicate"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn maintain_recovers_an_unacked_lease_after_the_visibility_timeout() {
     let Some(fixture) = try_start(Duration::from_millis(300)).await else {
