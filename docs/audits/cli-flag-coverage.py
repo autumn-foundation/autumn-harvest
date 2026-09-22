@@ -57,6 +57,27 @@ _link_check_spec = importlib.util.spec_from_file_location(
 _link_check = importlib.util.module_from_spec(_link_check_spec)
 _link_check_spec.loader.exec_module(_link_check)
 corpus_files = _link_check.corpus_files
+compute_corpus_reachable = _link_check.compute_corpus_reachable
+
+DOCS_ROOT = REPO_ROOT / "docs"
+
+
+def graded_corpus_files():
+    """The same file set corpus-link-check.py's orphan scan grades: pages
+    under docs/, reachable from the real corpus (a process-artifact page —
+    docs/plans/, docs/rnd/, etc. — counts only if something actually links
+    to it). Deliberately narrower than `corpus_files()` itself, which also
+    returns README.md/CHANGELOG.md/RELEASE_NOTES.md as link SOURCES — those
+    are the front door (Onramp's territory, per corpus-link-check.py's own
+    docstring), not part of the reference corpus this script's "coverage"
+    question is about. A flag documented only in README's CLI walkthrough
+    (`--to-event`, found in review) is a real answer for a reader who opens
+    README, but is invisible to anyone who searches docs/ itself — treating
+    it as "documented" here would hide that gap instead of surfacing it, so
+    that mention doesn't count."""
+    all_files = corpus_files()
+    reachable = compute_corpus_reachable(all_files)
+    return [p for p in all_files if p.is_relative_to(DOCS_ROOT) and p in reachable]
 
 
 def flag_mention_re(flag: str) -> re.Pattern:
@@ -75,7 +96,7 @@ def main():
 
     cli_flags, _cli_env_vars = extract_cli_ground_truth()
 
-    files = corpus_files()
+    files = graded_corpus_files()
     corpus_text = "\n".join(
         p.read_text(encoding="utf-8", errors="replace") for p in files
     )

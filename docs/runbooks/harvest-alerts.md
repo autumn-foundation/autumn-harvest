@@ -646,7 +646,7 @@ from `harvest dlq list`, or from a bug report — with `--dead-letter-id`
 
 ```bash
 harvest dlq redrive \
-  --dead-letter-id 8f14e2,a93c07 \
+  --dead-letter-id 8f14e2c1-4b3a-4d9e-9a2f-6c1d0b5e7f31,a93c0752-1e6d-4a8b-8f0c-2d9b7a4e1c56 \
   --reason "stripe rate-limit cleared, incident-1234"
 ```
 
