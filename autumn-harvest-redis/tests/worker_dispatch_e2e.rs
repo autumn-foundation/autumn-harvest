@@ -441,8 +441,15 @@ impl RedisProbe {
     }
 
     /// Delete every key under this fixture's prefix, and nothing else.
+    ///
+    /// A dispatch key nests its queue's hash tag (`{prefix:dispatch:queue}`,
+    /// issue #1429), so it starts with a literal `{` rather than with the
+    /// prefix text. A plain `prefix:*` glob does not match it. Scan the
+    /// hash-tagged namespace too, mirroring `marker_keys` above, so this
+    /// still reaches every key a Redis-loss simulation must clear.
     async fn wipe_prefix(&self) {
-        let keys = self.keys(&format!("{}:*", self.prefix)).await;
+        let mut keys = self.keys(&format!("{}:*", self.prefix)).await;
+        keys.extend(self.keys(&format!("{{{}:*", self.prefix)).await);
         if keys.is_empty() {
             return;
         }
