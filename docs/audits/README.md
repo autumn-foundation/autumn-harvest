@@ -17,6 +17,7 @@ to wire into CI as a gate.
 | `openapi-response-coverage.py` | The API contract against the handlers it describes: every `StatusCode::` a handler or the helpers it calls returns is declared for that route, every request-body field that is mandatory on the wire is marked required, every field serde accepts is documented, and every query key a hand-rolled parser matches is documented | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `comment-hygiene.py` | Comment defects across every `*.rs`: commented-out code, unreferenced TODOs, narrative asides, blank block edges (all gated at zero), plus review-round archaeology, contractions and over-long sentences (ratcheted against the merge base, so a change may not add one to a file it touches) | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `audit-catalog-coverage.py` | Every `*.py` script in `docs/audits/` has a row in this table | Yes — `.github/workflows/ci.yml`, `lint` job |
+| `shard-weight-drift.py` | `test-db-linux` per-shard test-count weight, computed the way `run-suites.sh`'s own `row_ordinal % SEMAPHORE_SHARD_COUNT` actually assigns rows to shards; flags any shard carrying 2+ heavy suites | Yes — `.github/workflows/ci.yml`, `lint` job, **report-only** (always exits 0; see the script's own docstring for why it does not yet gate) |
 
 ## Comment hygiene: the two tiers
 

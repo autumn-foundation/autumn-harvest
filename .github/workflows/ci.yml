@@ -536,6 +536,14 @@ jobs:
             python3 docs/audits/comment-hygiene.py
           fi
 
+      # Folio corpus harness: test-db-linux per-shard weight drift report
+      # (see docs/audits/shard-weight-drift.py). Report-only (always exits
+      # 0): the script's own docstring explains why gating now would redden
+      # every open PR on a pre-existing collision this step cannot itself
+      # fix. Pure Python stdlib, no deps, no network, no cargo build.
+      - name: Shard-weight drift report (docs/audits/shard-weight-drift.py)
+        run: python3 docs/audits/shard-weight-drift.py
+
   test:
     name: Test (${{ matrix.os }})
     needs: [lint, changes]
