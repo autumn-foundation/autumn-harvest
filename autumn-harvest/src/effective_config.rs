@@ -101,8 +101,16 @@ pub struct DispatchConfigView {
     pub installed: bool,
     /// The channel endpoint, credential-free. `None` when dispatch is off.
     pub endpoint: Option<String>,
-    /// Prefix for every key the channel owns.
+    /// Prefix for every key the channel owns, for a single-shard install.
+    /// `None` on a multi-shard install, which has one prefix per shard; see
+    /// [`key_prefixes`](Self::key_prefixes) instead.
     pub key_prefix: Option<String>,
+    /// One key-family prefix per shard, for a multi-shard install (issue
+    /// #1429 review). `None` on a single-shard install, which reports its
+    /// one prefix through [`key_prefix`](Self::key_prefix) instead. A
+    /// multi-shard install has no single key family for
+    /// `/admin/config` to report under `key_prefix` alone.
+    pub key_prefixes: Option<Vec<String>>,
     /// Redis Streams consumer group the workers join.
     pub consumer_group: Option<String>,
     /// Time a delivered reference may stay unacked before recovery.
@@ -1124,6 +1132,7 @@ mod tests {
             installed: true,
             endpoint: Some("redis://dbhost:6379".to_string()),
             key_prefix: Some("harvest".to_string()),
+            key_prefixes: None,
             consumer_group: Some("harvest_workers".to_string()),
             visibility_timeout_ms: Some(60_000),
             poll_interval_ms: Some(20),
@@ -1149,6 +1158,7 @@ mod tests {
             installed: false,
             endpoint: None,
             key_prefix: None,
+            key_prefixes: None,
             consumer_group: None,
             visibility_timeout_ms: None,
             poll_interval_ms: None,
@@ -1163,6 +1173,7 @@ mod tests {
                 installed: false,
                 endpoint: None,
                 key_prefix: None,
+                key_prefixes: None,
                 consumer_group: None,
                 visibility_timeout_ms: None,
                 poll_interval_ms: None,

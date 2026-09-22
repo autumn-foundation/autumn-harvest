@@ -1108,30 +1108,38 @@ impl HarvestRunner {
         // partial install here — cut short by a shard connect failure —
         // therefore fails startup, rather than leaving some shards silently
         // uncovered.
-        let (dispatch_guard, dispatch_installed, dispatch_multi_shard, dispatch_shard) =
-            if dispatch_shards.len() > 1 {
-                let installed_shards =
-                    install_dispatch_channels_for_shards(config, &dispatch_shards).await?;
-                let installed = !installed_shards.is_empty();
-                (
-                    DispatchInstallGuard::new_shards(installed_shards),
-                    installed,
-                    installed,
-                    None,
-                )
-            } else {
-                let dispatch_shard = match dispatch_shards.as_slice() {
-                    [only] => Some(*only),
-                    _ => None,
-                };
-                let installed = install_dispatch_channel(config, dispatch_shard).await?;
-                (
-                    DispatchInstallGuard::new(installed),
-                    installed,
-                    false,
-                    dispatch_shard,
-                )
+        let (
+            dispatch_guard,
+            dispatch_installed,
+            dispatch_multi_shard,
+            dispatch_shard,
+            dispatch_installed_shards,
+        ) = if dispatch_shards.len() > 1 {
+            let installed_shards =
+                install_dispatch_channels_for_shards(config, &dispatch_shards).await?;
+            let installed = !installed_shards.is_empty();
+            let reported_shards = installed_shards.clone();
+            (
+                DispatchInstallGuard::new_shards(installed_shards),
+                installed,
+                installed,
+                None,
+                reported_shards,
+            )
+        } else {
+            let dispatch_shard = match dispatch_shards.as_slice() {
+                [only] => Some(*only),
+                _ => None,
             };
+            let installed = install_dispatch_channel(config, dispatch_shard).await?;
+            (
+                DispatchInstallGuard::new(installed),
+                installed,
+                false,
+                dispatch_shard,
+                Vec::new(),
+            )
+        };
 
         let worker = if config.worker_enabled {
             let worker = Worker::new(
@@ -1171,6 +1179,7 @@ impl HarvestRunner {
             &config.redis,
             dispatch_installed,
             dispatch_shard,
+            &dispatch_installed_shards,
         ));
 
         // A `Worker` already spawns its own copy of this sampler in
@@ -1551,17 +1560,32 @@ fn effective_dispatch_prefix(configured: &str, shard: Option<ShardId>) -> String
 /// operator comparing two shards' `/admin/config` output then sees the
 /// difference between their key families, not the one configured value the
 /// two processes share.
+///
+/// `multi_shards` names the shards a multi-shard install (issue #1429
+/// review) actually covers. A non-empty slice reports one prefix per shard
+/// under [`DispatchConfigView::key_prefixes`] and leaves `key_prefix` empty,
+/// since a multi-shard install has no single key family. An empty slice
+/// (the single-shard install) keeps the prior `key_prefix`-only shape,
+/// derived from `shard` alone.
 #[must_use]
 fn dispatch_config_view(
     redis: &HarvestRedisConfig,
     installed: bool,
     shard: Option<ShardId>,
+    multi_shards: &[ShardId],
 ) -> DispatchConfigView {
     let configured = redis.url.is_some();
     DispatchConfigView {
         installed,
         endpoint: redis.redacted_url(),
-        key_prefix: configured.then(|| effective_dispatch_prefix(&redis.key_prefix, shard)),
+        key_prefix: (configured && multi_shards.is_empty())
+            .then(|| effective_dispatch_prefix(&redis.key_prefix, shard)),
+        key_prefixes: (configured && !multi_shards.is_empty()).then(|| {
+            multi_shards
+                .iter()
+                .map(|shard| effective_dispatch_prefix(&redis.key_prefix, Some(*shard)))
+                .collect()
+        }),
         consumer_group: configured.then(|| redis.consumer_group.clone()),
         visibility_timeout_ms: configured.then_some(redis.visibility_timeout_ms),
         poll_interval_ms: configured.then_some(redis.poll_interval_ms),
@@ -1746,6 +1770,16 @@ async fn install_dispatch_channel(
 /// Returns the shards this call actually installed, so the caller's guard
 /// can unwind exactly those if a later startup step fails.
 ///
+/// Clears the single-shard slot (`dispatch::uninstall`) unconditionally on
+/// entry, alongside the per-shard slots this path owns (Codex review, issue
+/// #1429). A process that previously ran single-shard dispatch and now
+/// starts a multi-shard runtime without an intervening `stop()` would
+/// otherwise leave that slot's stale channel installed. `Worker::new`
+/// prioritizes a populated single-shard slot over per-shard coverage.
+/// `dispatch::installed().is_some()` gates which check it applies. So a
+/// stale entry there would reject the very multi-shard worker this call
+/// installs channels for.
+///
 /// # Errors
 ///
 /// Returns an error, naming the shard, the first time a shard's Redis
@@ -1758,6 +1792,8 @@ async fn install_dispatch_channels_for_shards(
     shards: &[ShardId],
 ) -> autumn_web::AutumnResult<Vec<ShardId>> {
     use std::time::Duration;
+
+    autumn_harvest::dispatch::uninstall();
 
     let (Some(url), Some(endpoint)) = (config.redis.url.as_deref(), config.redis.redacted_url())
     else {
@@ -1828,7 +1864,8 @@ async fn install_dispatch_channels_for_shards(
 }
 
 /// No per-shard dispatch channel exists without the `redis` cargo feature.
-/// Mirrors [`install_dispatch_channel`]'s no-feature stub.
+/// Mirrors [`install_dispatch_channel`]'s no-feature stub, including
+/// clearing both dispatch slots (issue #1429 review).
 ///
 /// # Errors
 ///
@@ -1839,6 +1876,7 @@ async fn install_dispatch_channels_for_shards(
     _config: &HarvestRuntimeConfig,
     _shards: &[ShardId],
 ) -> autumn_web::AutumnResult<Vec<ShardId>> {
+    autumn_harvest::dispatch::uninstall();
     autumn_harvest::dispatch::uninstall_all_shards();
     Ok(Vec::new())
 }
@@ -2448,6 +2486,45 @@ mod tests {
         );
     }
 
+    /// A multi-shard install reports one prefix per covered shard, not the
+    /// bare configured prefix (Codex review, issue #1429).
+    ///
+    /// `dispatch_shard` is `None` for a multi-shard install. `start` never
+    /// resolves one shard to represent the whole span. So applying
+    /// `effective_dispatch_prefix` to it alone would silently drop back to
+    /// the plain configured prefix and hide every shard's real key family
+    /// from `/admin/config`.
+    #[test]
+    fn a_multi_shard_install_reports_every_covered_prefix() {
+        let redis = super::HarvestRedisConfig {
+            url: Some("redis://example:6379".to_string()),
+            key_prefix: "harvest".to_string(),
+            ..super::HarvestRedisConfig::default()
+        };
+        let view =
+            super::dispatch_config_view(&redis, true, None, &[ShardId::new(1), ShardId::new(2)]);
+        assert_eq!(view.key_prefix, None);
+        assert_eq!(
+            view.key_prefixes,
+            Some(vec!["harvest:s1".to_string(), "harvest:s2".to_string()])
+        );
+    }
+
+    /// A single-shard install keeps reporting through `key_prefix` alone,
+    /// with `key_prefixes` empty — the shape every existing caller of
+    /// `/admin/config` already expects (issue #1429 review).
+    #[test]
+    fn a_single_shard_install_leaves_key_prefixes_empty() {
+        let redis = super::HarvestRedisConfig {
+            url: Some("redis://example:6379".to_string()),
+            key_prefix: "harvest".to_string(),
+            ..super::HarvestRedisConfig::default()
+        };
+        let view = super::dispatch_config_view(&redis, true, Some(ShardId::new(3)), &[]);
+        assert_eq!(view.key_prefix, Some("harvest:s3".to_string()));
+        assert_eq!(view.key_prefixes, None);
+    }
+
     /// `start` installs the process-global channel before it builds the
     /// worker. A later failure must leave no channel behind, or the next
     /// runtime in this process inherits one it never configured (issue #1312).
@@ -2759,6 +2836,51 @@ mod tests {
         assert!(
             autumn_harvest::dispatch::installed_for_shard(shard).is_none(),
             "a disabled start must clear the per-shard channel a previous runtime installed"
+        );
+    }
+
+    /// A multi-shard install clears a stale single-shard slot too (Codex
+    /// review, issue #1429).
+    ///
+    /// `Worker::new` treats a populated single-shard slot as authoritative
+    /// over per-shard coverage. A process that previously ran single-shard
+    /// dispatch, and now starts a multi-shard runtime with no intervening
+    /// `stop()`, would otherwise leave that stale slot in place. It would
+    /// then reject the very worker the fresh per-shard install was meant
+    /// to cover.
+    ///
+    /// `install_dispatch_channels_for_shards` clears the single-shard slot
+    /// unconditionally, as its very first statement, ahead of the
+    /// Redis-off/Redis-configured branch it then takes. This test exercises
+    /// the Redis-off branch, the only one this suite can drive without a
+    /// live Redis, matching every other test in this file. That already
+    /// proves the Redis-configured branch clears the slot too.
+    #[test]
+    fn entering_the_multi_shard_path_clears_the_single_shard_slot() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        assert!(
+            autumn_harvest::dispatch::installed().is_some(),
+            "the test fixture must install the single-shard slot"
+        );
+
+        let disabled_config = crate::config::HarvestRuntimeConfig::default();
+        assert!(disabled_config.redis.url.is_none());
+        block_on(super::install_dispatch_channels_for_shards(
+            &disabled_config,
+            &[ShardId::new(0), ShardId::new(1)],
+        ))
+        .expect("a disabled start must succeed");
+        assert!(
+            autumn_harvest::dispatch::installed().is_none(),
+            "entering the multi-shard install path must clear the stale single-shard slot"
         );
     }
 
