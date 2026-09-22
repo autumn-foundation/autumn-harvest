@@ -904,6 +904,14 @@ impl RedisDispatch {
     /// failure the hash tags exist to remove. Grouping by queue first,
     /// mirroring [`Self::release_many_inner`]/[`Self::requeue_batch`], keeps
     /// every pipeline's keys inside one queue's tag.
+    ///
+    /// One queue's pipeline failing must not abort the rest of this batch
+    /// (Codex review, issue #1429). [`Self::requeue_batch`] already
+    /// documents the same reasoning. A transient error on whichever queue
+    /// the `HashMap` happens to visit first would otherwise leave every
+    /// later queue's references stuck. They would stay acked in Postgres
+    /// but still pending in Redis, until visibility recovery. Every queue
+    /// is attempted; the first error, if any, is returned after the loop.
     async fn ack_many_inner(&self, leases: &[DispatchLease]) -> RedisAdapterResult<()> {
         if leases.is_empty() {
             return Ok(());
@@ -916,6 +924,7 @@ impl RedisDispatch {
                 .push(lease);
         }
         let mut conn = self.conn.clone();
+        let mut first_error = None;
         for (queue, batch) in by_queue {
             let key = self.stream_key(queue);
             let mut pipe = redis::pipe();
@@ -929,9 +938,11 @@ impl RedisDispatch {
                     .del(self.marker_key(queue, lease.task_id))
                     .ignore();
             }
-            pipe.query_async::<()>(&mut conn).await?;
+            if let Err(error) = pipe.query_async::<()>(&mut conn).await {
+                first_error.get_or_insert(error);
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), |error| Err(error.into()))
     }
 
     /// Give several leases back at once, each after its own delay

@@ -9015,7 +9015,15 @@ async fn process_mutex_releases_from_commands(
     // names a row no reader outside this transaction can see yet. The
     // buffering scope holds it until the commit, matching every other
     // transaction owner that calls `wake_workflow_task`.
-    let held_secs = crate::dispatch::buffered_settled(Box::pin(
+    //
+    // This call runs inside the worker's own outer `buffered` scope around
+    // the whole task body. So `buffered_settled` is a documented no-op
+    // passthrough here (Codex review, issue #1429). A rolled-back release
+    // transaction would otherwise leave its wake hint in the outer buffer,
+    // for `dispatch_task` to publish unconditionally regardless. Use
+    // `buffered_checkpoint` instead, matching the fix already applied to
+    // `ctx.run_transactional`'s own transactional-activity wake.
+    let held_secs = crate::dispatch::buffered_checkpoint(Box::pin(
         conn.transaction::<Vec<f64>, HarvestError, _>(async |conn| {
             let releases = releases.clone();
             let mut held = Vec::new();
