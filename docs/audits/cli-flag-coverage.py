@@ -33,7 +33,6 @@ Always exits 0.
 import argparse
 import importlib.util
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -50,6 +49,8 @@ _drift_spec = importlib.util.spec_from_file_location(
 _drift = importlib.util.module_from_spec(_drift_spec)
 _drift_spec.loader.exec_module(_drift)
 extract_cli_ground_truth = _drift.extract_cli_ground_truth
+mask_fenced = _drift.mask_fenced
+FLAG_TOKEN_RE = _drift.FLAG_TOKEN_RE
 
 _link_check_spec = importlib.util.spec_from_file_location(
     "corpus_link_check", Path(__file__).with_name("corpus-link-check.py")
@@ -80,13 +81,43 @@ def graded_corpus_files():
     return [p for p in all_files if p.is_relative_to(DOCS_ROOT) and p in reachable]
 
 
-def flag_mention_re(flag: str) -> re.Pattern:
-    # Word-boundary on both sides of the flag name (not just `\b`, which
-    # treats `-` as a boundary already and would let `--to-event-time` count
-    # as a mention of `--to-event`). Matched against raw file text, not just
-    # fenced code — a flag named in prose ("pass `--dry-run` to preview")
-    # answers the coverage question just as well as a runnable example.
-    return re.compile(rf"(?<![\w-])--{re.escape(flag)}(?![\w-])")
+def flags_documented_in(path: Path) -> set:
+    """Real `--flag` tokens this page credits as documented.
+
+    Outside fenced code — prose and reference tables — a bare `--flag`
+    mention counts on its own: this corpus's runbooks routinely document a
+    flag in an explanatory sentence or a table row ("`--dry-run` previews
+    without writing") without repeating a full runnable example every time,
+    and that answers a reader's question just as well.
+
+    Inside a fenced code block, a `--flag` mention counts only if the block
+    also contains the word `harvest` somewhere in it (not necessarily the
+    same line — a multi-line invocation may put `harvest workflow reset` on
+    one line and `--to-event` on a continuation). Found in review:
+    `docs/upgrading/0.5.0.md` shows a fenced ` ```bash ` block containing
+    only `diesel migration generate --version` — no mention of `harvest`
+    anywhere in that block — and an earlier version of this scan, which
+    matched `--flag` against raw page text with no fence-aware distinction,
+    credited that as documentation of harvest's own `--version`
+    (`#[command(version)]`): a false match on a different tool's homonymous
+    flag. A block that never says `harvest` is never a `harvest` example,
+    whatever flags happen to appear in it."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    masked_lines, blocks = mask_fenced(text.splitlines())
+    found = set()
+
+    prose_text = "\n".join(masked_lines)
+    for m in FLAG_TOKEN_RE.finditer(prose_text):
+        found.add(m.group(1))
+
+    for _lang, block_lines in blocks:
+        block_text = "\n".join(block_lines)
+        if "harvest" not in block_text:
+            continue
+        for m in FLAG_TOKEN_RE.finditer(block_text):
+            found.add(m.group(1))
+
+    return found
 
 
 def main():
@@ -97,13 +128,11 @@ def main():
     cli_flags, _cli_env_vars = extract_cli_ground_truth()
 
     files = graded_corpus_files()
-    corpus_text = "\n".join(
-        p.read_text(encoding="utf-8", errors="replace") for p in files
-    )
+    documented = set()
+    for p in files:
+        documented |= flags_documented_in(p)
 
-    undocumented = sorted(
-        f for f in cli_flags if not flag_mention_re(f).search(corpus_text)
-    )
+    undocumented = sorted(cli_flags - documented)
 
     if args.json:
         print(
