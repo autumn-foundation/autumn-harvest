@@ -8473,7 +8473,7 @@
       "headers": [
         {
           "name": "Last-Event-ID",
-          "type": "string",
+          "type": "integer",
           "required": false,
           "description": "harvest_events.id BIGSERIAL cursor. When present, the server replays events with id > n before entering live-tail mode."
         }

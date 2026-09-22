@@ -6841,7 +6841,7 @@
             "name": "Last-Event-ID",
             "required": false,
             "schema": {
-              "type": "string"
+              "type": "integer"
             }
           }
         ],
