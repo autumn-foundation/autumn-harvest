@@ -29230,10 +29230,18 @@ impl Worker {
                 crate::queue_fairness::weighted_queue_order(&pairs, &mut rand::thread_rng());
 
             for queue_name in &ordered {
-                let single_queue = std::slice::from_ref(queue_name);
+                // `claim_task_on_shard` takes `&[String]`. `ordered` now
+                // borrows its names from `self.config.queues` instead of
+                // cloning all of them up front (issue #515 Bolt follow-up).
+                // Building the one-element slice therefore needs one owned
+                // String here, instead of `std::slice::from_ref`. This only
+                // allocates for a queue actually tried, not for the whole
+                // permutation. A claim that succeeds on the first
+                // (typically highest-weight) queue never pays for the rest.
+                let single_queue = [(*queue_name).to_owned()];
                 match queue::claim_task_on_shard(
                     &mut conn,
-                    single_queue,
+                    &single_queue,
                     &self.config.worker_id,
                     &self.config.build_id,
                     self.config.priority_aging_secs,
