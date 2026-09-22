@@ -214,8 +214,8 @@ async fn weighted_claim_distribution_tracks_3_to_1_ratio() {
         let order = weighted_queue_order(&pairs, &mut rng);
 
         for queue_name in &order {
-            let single = std::slice::from_ref(queue_name);
-            let result = queue::claim_task(&mut conn, single, worker_id, "", None, &[], &[])
+            let single = [(*queue_name).to_owned()];
+            let result = queue::claim_task(&mut conn, &single, worker_id, "", None, &[], &[])
                 .await
                 .expect("claim_task");
 
@@ -297,8 +297,8 @@ async fn no_starvation_low_weight_queue_drains_to_completion() {
         let order = weighted_queue_order(&pairs, &mut rng);
 
         for queue_name in &order {
-            let single = std::slice::from_ref(queue_name);
-            let result = queue::claim_task(&mut conn, single, worker_id, "", None, &[], &[])
+            let single = [(*queue_name).to_owned()];
+            let result = queue::claim_task(&mut conn, &single, worker_id, "", None, &[], &[])
                 .await
                 .expect("claim_task");
             if let Some(task) = result {

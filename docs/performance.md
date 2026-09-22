@@ -1920,3 +1920,9 @@ standalone note rather than part of the claim-path attribution table above:
   `MATERIALIZED` CTE anti-joined by equality (`Nested Loop Anti Join` →
   `Hash Anti Join`; -97.8% buffers in the execution-heavy regime, a
   smaller but real win in the other two measured regimes, PR #1656).
+* [`docs/performance-queue-fairness.md`](performance-queue-fairness.md) —
+  `queue_fairness::weighted_queue_order`, the weighted-random queue-selection
+  step `Worker::poll_once` runs on every poll once an operator configures
+  `WorkerConfig::queue_weights` (issue #515), 53.72% of a 16-queue/20,000-poll
+  harness; a per-queue `String` clone eliminated by returning a borrowed
+  permutation instead (instructions -36.26%, allocations -76.18%).
