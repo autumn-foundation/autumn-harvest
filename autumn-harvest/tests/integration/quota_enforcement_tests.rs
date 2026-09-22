@@ -3733,22 +3733,27 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     .await;
 
     let reg = registry(vec![wf_info(source_wf, quota_trigger_source), target_info]);
-    // `build_runtime_worker` leaves `WorkerRuntimeConfig::sharded_pool` unset
-    // (`None`), which is fine for every OTHER test in this file -- none of
-    // them depend on the worker's own background outbox scanner resolving a
-    // target shard's pool. This test does: the "money" mechanism under test
-    // is the SAME-SHARD outbox retry, and `enforce_completion_triggers_outbox`
-    // needs `sharded_pool` (not just `shard_assignments`) to look up shard
-    // 0's connection pool at all -- with it `None`, every scanner tick hits
-    // the early "missing pool" branch and backs off without ever attempting
-    // the retry. A one-shot "immediate relay" spawn (triggered inline when
-    // the row is deferred) reads the separate `GLOBAL_SHARDED_POOL` static
-    // instead, so it can still succeed -- but only if it happens to run
-    // AFTER `mark_terminal` frees the blocker below, which is scheduling
-    // order, not a guarantee. Wiring the same `sharded_pool` into the
-    // worker's own config gives the scanner the retry path its own doc
-    // comment above describes, instead of leaving the test's pass rate
-    // riding on that race (issue #1685's Semaphore health-report series).
+    // `build_runtime_worker` leaves `WorkerRuntimeConfig::sharded_pool`
+    // unset (`None`). That is fine for every OTHER test in this file. None
+    // of them depend on the worker's own background outbox scanner
+    // resolving a target shard's pool.
+    //
+    // This test does. Its "money" mechanism is the SAME-SHARD outbox
+    // retry. `enforce_completion_triggers_outbox` needs `sharded_pool`, not
+    // just `shard_assignments`, to look up shard 0's connection pool at
+    // all. With it `None`, every scanner tick hits the early "missing
+    // pool" branch and backs off without ever attempting the retry.
+    //
+    // A one-shot "immediate relay" spawn fires inline when the row is
+    // deferred. It reads the separate `GLOBAL_SHARDED_POOL` static
+    // instead, so it can still succeed. But that depends on WHEN it runs.
+    // It only sees the freed slot if it happens to run AFTER
+    // `mark_terminal` below -- a scheduling order, not a guarantee.
+    //
+    // Wiring the same `sharded_pool` into the worker's own config gives
+    // the scanner the retry path its own doc comment above describes.
+    // That replaces the test's reliance on that race (issue #1685's
+    // Semaphore health-report series).
     let mut worker_cfg = runtime_config(
         "w-946-trigger-quota",
         2,
