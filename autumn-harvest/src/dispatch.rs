@@ -191,11 +191,20 @@ pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
     /// The default calls [`Self::ack`] once per lease, so an implementation
     /// with no batched path stays correct. An implementation that can dispose
     /// of a batch in one round trip should override this.
+    ///
+    /// One lease's `ack` failing must not skip the rest of the batch (Codex
+    /// review, issue #1429). The pre-batch worker path called `ack` once per
+    /// lease independently, so one lease's error never stranded a sibling
+    /// lease's reference pending until visibility recovery. Every lease is
+    /// attempted; the first error, if any, is returned after the loop.
     async fn ack_many(&self, leases: &[DispatchLease]) -> HarvestResult<()> {
+        let mut first_error = None;
         for lease in leases {
-            self.ack(lease).await?;
+            if let Err(error) = self.ack(lease).await {
+                first_error.get_or_insert(error);
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Give several references back at once, each after its own delay
@@ -203,11 +212,19 @@ pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
     ///
     /// The default calls [`Self::release`] once per lease. An implementation
     /// that can requeue a batch in one round trip should override this.
+    ///
+    /// One lease's `release` failing must not skip the rest of the batch,
+    /// for the same reason as [`Self::ack_many`]'s default above (Codex
+    /// review, issue #1429). Every lease is attempted; the first error, if
+    /// any, is returned after the loop.
     async fn release_many(&self, leases: &[(DispatchLease, Duration)]) -> HarvestResult<()> {
+        let mut first_error = None;
         for (lease, delay) in leases {
-            self.release(lease, *delay).await?;
+            if let Err(error) = self.release(lease, *delay).await {
+                first_error.get_or_insert(error);
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Promote due delayed references and recover references held by a
@@ -1623,6 +1640,111 @@ mod tests {
         expected.sort();
         assert_eq!(acked, expected);
         assert!(channel.is_drained());
+    }
+
+    /// Wraps [`MemoryDispatch`] and fails `ack`/`release` on one named
+    /// lease. `ack_many`'s and `release_many`'s trait-default sequential
+    /// loops then have something to fail partway through (Codex review,
+    /// issue #1429).
+    #[derive(Debug)]
+    struct FailOneLease {
+        inner: MemoryDispatch,
+        fails: Uuid,
+    }
+
+    #[async_trait]
+    impl TaskDispatch for FailOneLease {
+        async fn publish(&self, hints: &[DispatchHint]) -> HarvestResult<()> {
+            self.inner.publish(hints).await
+        }
+
+        async fn next(
+            &self,
+            queues: &[String],
+            consumer: &str,
+            max: usize,
+            wait: Duration,
+        ) -> HarvestResult<Vec<DispatchLease>> {
+            self.inner.next(queues, consumer, max, wait).await
+        }
+
+        async fn ack(&self, lease: &DispatchLease) -> HarvestResult<()> {
+            if lease.task_id == self.fails {
+                return Err(crate::error::HarvestError::Dispatch(
+                    "injected ack failure".to_string(),
+                ));
+            }
+            self.inner.ack(lease).await
+        }
+
+        async fn release(&self, lease: &DispatchLease, delay: Duration) -> HarvestResult<()> {
+            if lease.task_id == self.fails {
+                return Err(crate::error::HarvestError::Dispatch(
+                    "injected release failure".to_string(),
+                ));
+            }
+            self.inner.release(lease, delay).await
+        }
+
+        async fn maintain(&self, queues: &[String]) -> HarvestResult<DispatchMaintenance> {
+            self.inner.maintain(queues).await
+        }
+    }
+
+    #[tokio::test]
+    async fn ack_many_default_attempts_every_lease_despite_one_failure() {
+        let a = hint("q", Utc::now());
+        let b = hint("q", Utc::now());
+        let inner = MemoryDispatch::new();
+        inner
+            .publish(&[a.clone(), b.clone()])
+            .await
+            .expect("publish");
+        let leases = inner
+            .next(&queues(), "c", 8, Duration::from_millis(0))
+            .await
+            .expect("read");
+        assert_eq!(leases.len(), 2, "both entries are ready in one read");
+
+        let channel = FailOneLease {
+            inner,
+            fails: a.task_id,
+        };
+        let result = channel.ack_many(&leases).await;
+        assert!(result.is_err(), "the injected failure surfaces");
+        // `b` still got acked despite `a`'s failure (Codex review, issue
+        // #1429): the default loop attempts every lease rather than
+        // stopping at the first error.
+        assert_eq!(channel.inner.acked_ids(), vec![b.task_id]);
+    }
+
+    #[tokio::test]
+    async fn release_many_default_attempts_every_lease_despite_one_failure() {
+        let a = hint("q", Utc::now());
+        let b = hint("q", Utc::now());
+        let inner = MemoryDispatch::new();
+        inner
+            .publish(&[a.clone(), b.clone()])
+            .await
+            .expect("publish");
+        let leases = inner
+            .next(&queues(), "c", 8, Duration::from_millis(0))
+            .await
+            .expect("read");
+        assert_eq!(leases.len(), 2, "both entries are ready in one read");
+        let delay = Duration::from_millis(5);
+        let batch: Vec<(DispatchLease, Duration)> =
+            leases.into_iter().map(|lease| (lease, delay)).collect();
+
+        let channel = FailOneLease {
+            inner,
+            fails: a.task_id,
+        };
+        let result = channel.release_many(&batch).await;
+        assert!(result.is_err(), "the injected failure surfaces");
+        // `b` still got released despite `a`'s failure, the same guarantee
+        // as `ack_many_default_attempts_every_lease_despite_one_failure`.
+        assert_eq!(channel.inner.released_ids(), vec![b.task_id]);
     }
 
     #[tokio::test]

@@ -28154,7 +28154,7 @@ impl Worker {
             }
         };
 
-        self.dispatch_leases(pool, shard, installed, leases, shard_count)
+        self.dispatch_leases(pool, shard, installed, state, leases, shard_count)
             .await
     }
 
@@ -28168,6 +28168,7 @@ impl Worker {
         pool: &DbPool,
         shard: Option<crate::types::ShardId>,
         installed: &crate::dispatch::InstalledDispatch,
+        state: &mut DispatchLoopState,
         leases: Vec<crate::dispatch::DispatchLease>,
         shard_count: usize,
     ) -> u32 {
@@ -28228,11 +28229,27 @@ impl Worker {
                 ReferenceDisposition::Handled => {}
             }
         }
-        if !to_ack.is_empty() {
-            let _ = dispatch_call(installed.channel.ack_many(&to_ack), "ack").await;
+        // A failed batched call is still self-healing. A stuck ack costs one
+        // redelivery; a stuck release costs one visibility-timeout wait. So
+        // neither error changes what this call returns. But swallowing it
+        // silently, with no log at all, was strictly worse than the
+        // per-lease path it replaced (Codex review, issue #1429). An ACL
+        // may permit reads but deny writes, or one queue's key may carry
+        // the wrong type. Either would then stay invisible until an
+        // operator noticed the redelivery rate. `log_dispatch_error`
+        // restores that visibility,
+        // throttled the same way a read/maintain/reconcile failure already
+        // is.
+        if !to_ack.is_empty()
+            && let Err(error) = dispatch_call(installed.channel.ack_many(&to_ack), "ack").await
+        {
+            self.log_dispatch_error(state, &error, "dispatch batched ack failed");
         }
-        if !to_release.is_empty() {
-            let _ = dispatch_call(installed.channel.release_many(&to_release), "release").await;
+        if !to_release.is_empty()
+            && let Err(error) =
+                dispatch_call(installed.channel.release_many(&to_release), "release").await
+        {
+            self.log_dispatch_error(state, &error, "dispatch batched release failed");
         }
         dispatched
     }
@@ -28557,6 +28574,25 @@ impl Worker {
             "release",
         )
         .await;
+    }
+
+    /// Log a channel error at most once per [`DISPATCH_ERROR_LOG_INTERVAL`].
+    ///
+    /// A channel that is down fails on every iteration, so an unthrottled log
+    /// would bury the rest of the worker's output.
+    fn log_dispatch_error(
+        &self,
+        state: &mut DispatchLoopState,
+        error: &HarvestError,
+        message: &'static str,
+    ) {
+        if state.may_log_error() {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "{message}"
+            );
+        }
     }
 
     /// The single-pool poll loop.

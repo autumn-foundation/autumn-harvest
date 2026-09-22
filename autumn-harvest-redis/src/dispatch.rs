@@ -684,6 +684,87 @@ impl RedisDispatch {
         Ok(())
     }
 
+    /// Read every queue in `ordered`, one single-key call each. It runs a
+    /// non-blocking pass first. Only if nothing was ready does it then run
+    /// a blocking one, on `ordered`'s leader.
+    ///
+    /// Extracted from [`Self::next_inner`] to keep that function's line
+    /// count under clippy's `too_many_lines` threshold (issue #1429).
+    ///
+    /// One queue's read failing must not discard entries an earlier queue
+    /// in this same pass already claimed into this consumer's PEL (Codex
+    /// review, issue #1429). Propagating the error immediately would drop
+    /// those entries on the floor. They would then sit stranded, invisible
+    /// to the caller, until visibility recovery reclaims them — a real
+    /// latency cost this batching should not add. Every queue is
+    /// attempted, mirroring the same attempt-every-queue-and-keep-going
+    /// shape `ack_many_inner` and `requeue_batch` already use. The error
+    /// returns only when nothing at all was read. So a genuine channel
+    /// outage still surfaces, and drives the caller into degraded mode,
+    /// rather than reading as a quiet empty batch.
+    async fn read_across_queues(
+        &self,
+        queues: &[String],
+        ordered: &[String],
+        consumer: &str,
+        count: usize,
+        wait: Duration,
+    ) -> RedisAdapterResult<StreamReadReply> {
+        let mut reply = StreamReadReply::default();
+        let mut any_ready = false;
+        let mut first_error = None;
+        for key in ordered {
+            match self
+                .read_with_heal(
+                    queues,
+                    std::slice::from_ref(key),
+                    consumer,
+                    count,
+                    Duration::ZERO,
+                )
+                .await
+            {
+                Ok(one) => {
+                    if one.keys.iter().any(|stream| !stream.ids.is_empty()) {
+                        any_ready = true;
+                    }
+                    reply.keys.extend(one.keys);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        queue = %key,
+                        error = %error,
+                        "dispatch read failed for one queue in a multi-queue pass"
+                    );
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if !any_ready
+            && !wait.is_zero()
+            && let Some(first) = ordered.first()
+        {
+            match self
+                .read_with_heal(queues, std::slice::from_ref(first), consumer, count, wait)
+                .await
+            {
+                Ok(blocked) => {
+                    if blocked.keys.iter().any(|stream| !stream.ids.is_empty()) {
+                        any_ready = true;
+                    }
+                    reply.keys.extend(blocked.keys);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if !any_ready && let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(reply)
+    }
+
     async fn next_inner(
         &self,
         queues: &[String],
@@ -713,32 +794,9 @@ impl RedisDispatch {
         // own rotation leads with. `ordered` rotates every call, so
         // blocking fairness matches the round-robin already used to decide
         // which queue's `COUNT` fills the batch first.
-        let mut reply = StreamReadReply::default();
-        let mut any_ready = false;
-        for key in &ordered {
-            let one = self
-                .read_with_heal(
-                    queues,
-                    std::slice::from_ref(key),
-                    consumer,
-                    count,
-                    Duration::ZERO,
-                )
-                .await?;
-            if one.keys.iter().any(|stream| !stream.ids.is_empty()) {
-                any_ready = true;
-            }
-            reply.keys.extend(one.keys);
-        }
-        if !any_ready
-            && !wait.is_zero()
-            && let Some(first) = ordered.first()
-        {
-            let blocked = self
-                .read_with_heal(queues, std::slice::from_ref(first), consumer, count, wait)
-                .await?;
-            reply.keys.extend(blocked.keys);
-        }
+        let reply = self
+            .read_across_queues(queues, &ordered, consumer, count, wait)
+            .await?;
 
         let mut candidates = Vec::new();
         let mut malformed = Vec::new();
