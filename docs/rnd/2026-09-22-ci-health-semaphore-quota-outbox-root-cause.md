@@ -4,8 +4,13 @@
 # `WorkerRuntimeConfig`, so the background scanner that is supposed to
 # retry a quota-deferred outbox row could never resolve a target shard's
 # connection pool and could never succeed. The test only ever passed on a
-# separate, undocumented one-shot race. A new, unrelated flake in the same
-# file (confirmed, not fixed) is recorded at the end for the next session.
+# separate, undocumented one-shot race. **Corrected post-review (Codex on
+# this PR):** an earlier draft over-claimed this fix also explains PR
+# #1697's OTHER panic site (the already-30s source-completion wait) --
+# it does not; that remains a distinct, unexplained, still-open flake,
+# retracted explicitly below rather than left standing. A second new,
+# unrelated flake in the same file (confirmed, not fixed) is recorded at
+# the end for the next session.
 
 **Status:** fix shipped this session, against
 `autumn-harvest/tests/integration/quota_enforcement_tests.rs` only — no
@@ -154,15 +159,25 @@ then there is **no fallback that can ever work**, because the scanner that
 exists specifically to retry a deferred row can never resolve a pool at
 all. The test then burns out its full 10s deadline deterministically.
 
-This also explains the *other* panic site PR #1697 hit (the already-`30s`
-first wait, `Elapsed(())` at `wait_for_execution_state_with_timeout`): that
-panic is not a second, unrelated flake needing its own timeout bump. Once
-the one-shot spawn loses its race, the trigger's target is durably stuck
-QuotaBlocked with no working retry path, so **any later assertion in the
-SAME test process that depends on state downstream of that target** can, in
-principle, also stall past whatever bound it carries — the specific site
-that panics first is a function of exactly when in the test's timeline the
-one-shot race is lost, not two independent defects.
+**Correction (post-review, Codex on this PR).** An earlier draft of this
+paragraph claimed this also explains the *other* panic site PR #1697 hit
+(the already-`30s` first wait, `Elapsed(())` at
+`wait_for_execution_state_with_timeout`, watching the SOURCE reach
+`COMPLETED`). Wrong, and worth retracting explicitly rather than leaving it
+to mislead the next reader: `evaluate_triggers_for_execution`'s
+`QuotaExceeded` arm inserts the outbox row and `continue`s — it never
+returns an `Err` that could roll back or stall the source's own terminal
+transaction, and its own comment says so directly ("deferring the start to
+the outbox for retry rather than blocking the source execution's own
+completion"). The source's transition to `COMPLETED` does not read the
+target's quota state, the outbox table, or `sharded_pool` at all, so a
+fix to the scanner's pool resolution cannot affect how long that wait
+takes. **That panic site remains unexplained and is not fixed by this
+session's change.** It is a real, separate, still-open flake candidate:
+whatever makes the worker's own decision cycle for the SOURCE (claim the
+task, run the trivial handler, persist `WorkflowCompleted`, evaluate
+triggers inline, commit) occasionally exceed 30s under load. Carried
+forward for the next session, not closed here.
 
 ## 🔧 Treatment
 
