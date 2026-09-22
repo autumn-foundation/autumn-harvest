@@ -34,20 +34,43 @@ script is that accounting, run automatically instead of by hand:
 1. Read the manifest exactly as `run-suites.sh`'s `records()` does (strip
    comment and blank lines), keep `linux`-osclass rows in order, and
    number them the way `do_run`'s `row_ordinal` does.
-2. Resolve each row to the test file it runs: an `autumn-harvest`/
-   `integration` row with a filter names a module under
-   `autumn-harvest/tests/integration/<filter>.rs`; every other row names
-   `<crate>/tests/<target>.rs` directly.
+2. Resolve each row to what it actually runs. Every crate/target other than
+   `autumn-harvest`/`integration` has its own dedicated binary, so a row
+   there names `<crate>/tests/<target>.rs` directly. `autumn-harvest`/
+   `integration` rows all share ONE binary (`tests/integration/mod.rs`
+   declares every module), and `run-suites.sh` passes each row's filter to
+   libtest with no `--exact` — a SUBSTRING match against every test in
+   that whole binary, not just "the file the filter looks like it names".
+   `crate_integration_test_index()` builds the qualified-name index this
+   needs once; `integration_row_weight()` substring-matches each row
+   against it. **Correction (Codex review, this harness's own fourth PR
+   round):** an earlier version resolved a row to a single guessed file and
+   counted only that file's own tests, undercounting any row whose filter
+   also matches a test elsewhere — e.g. `nd_block` was reported as 10 (only
+   `nd_block_tests.rs`), but 9 more tests elsewhere (`retry_clock_skew_tests`,
+   `dag_compensation_tests`, `event_partitioning_tests`, `mutex_tests`,
+   `claim_budget_tests`, `replayer_tests`) also match the substring, for a
+   real weight of 19. See `enumerate_qualified_tests()`'s docstring for the
+   full mechanism. Checked against every one of the 91
+   `autumn-harvest`/`integration` rows in today's manifest: `nd_block` is
+   the ONLY one this changes — none of the seven heavy collisions below
+   shifted.
 3. Weigh each row by counting only the `#[test]`/`#[tokio::test]` functions
    that actually compile and run for THAT row's enabled feature set (the
    crate's own defaults, since `run-suites.sh` never passes
    `--no-default-features` for `linux` rows, plus whatever the manifest's
    `feats` column adds) and are not `#[ignore]`d (never run — `run-suites.sh`
-   passes no `--ignored`/`--include-ignored`). See `test_weight()`'s own
-   docstring for three rounds of Codex-review corrections to this counting:
-   an indentation/plain-`#[test]` undercount, a multi-line-attribute
-   undercount, an `#[ignore]` overcount, and a `cfg(feature = ...)` overcount,
-   in that order. Every number in this docstring reflects all four fixes.
+   passes no `--ignored`/`--include-ignored`). Feature-gating on an
+   `autumn-harvest`/`integration` test can live in three places, all
+   honored: `tests/integration/mod.rs`'s own `#[cfg(...)] mod X;`
+   declaration (`parse_mod_rs_gates()` — where MOST of it actually is, 199
+   declarations, most gated on `db`), a file's own `#![cfg(...)]` inner
+   attribute gating the whole file, and a `#[cfg(...)]` on an individual
+   test or the `mod { ... }` block containing several. See `test_weight()`'s
+   own docstring for three further rounds of Codex-review corrections to
+   this counting: an indentation/plain-`#[test]` undercount, a
+   multi-line-attribute undercount, and an `#[ignore]` overcount. Every
+   number in this docstring reflects all fixes, this section's included.
 4. Read `SEMAPHORE_SHARD_COUNT` out of the `test-db-linux` job block in
    `ci.yml` (not hand-copied), and report each shard's total weight plus
    any shard carrying more than one row at or above HEAVY_THRESHOLD.
@@ -134,7 +157,7 @@ HEAVY_THRESHOLD_DEFAULT = 30
 TEST_ATTR_RE = re.compile(r"^\s*#\[(?:tokio::test|test)\b")
 IGNORE_ATTR_RE = re.compile(r"^\s*#\[ignore\b")
 ATTR_LINE_RE = re.compile(r"^\s*#\[")
-FN_LINE_RE = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s")
+FN_LINE_RE = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)")
 COMMENT_OR_BLANK_RE = re.compile(r"^\s*(#|$)")
 # `#[cfg(...)]` gates one item (typically the next `mod` or `fn`); `#![cfg(...)]`
 # is an inner attribute gating the item it appears INSIDE (here, always the
@@ -144,7 +167,7 @@ COMMENT_OR_BLANK_RE = re.compile(r"^\s*(#|$)")
 # files that use `cfg(feature`).
 CFG_ATTR_RE = re.compile(r"^\s*#\[cfg\((.*)\)\]\s*$")
 CFG_INNER_ATTR_RE = re.compile(r"^\s*#!\[cfg\((.*)\)\]\s*$")
-MOD_OPEN_RE = re.compile(r"^\s*(?:pub\s+)?mod\s+\w+\s*\{")
+MOD_OPEN_RE = re.compile(r"^\s*(?:pub\s+)?mod\s+(\w+)\s*\{")
 FEATURE_RE = re.compile(r'feature\s*=\s*"([^"]+)"')
 
 
@@ -166,23 +189,13 @@ def linux_rows_in_order(records):
     return [r for r in records if r[0] == "linux"]
 
 
-def resolve_test_file(crate, target, filt):
-    if crate == "autumn-harvest" and target == "integration" and filt != "-":
-        integration_dir = REPO_ROOT / "autumn-harvest" / "tests" / "integration"
-        direct = integration_dir / f"{filt}.rs"
-        if direct.exists():
-            return direct
-        # A handful of manifest filters are a cargo-test substring filter
-        # against test NAMES, shorter than the module's own file stem (e.g.
-        # filter "admission_gate_authoritative" selects module file
-        # "admission_gate_authoritative_tests.rs"), rather than the module
-        # name itself. Fall back to the "_tests" spelling before giving up.
-        suffixed = integration_dir / f"{filt}_tests.rs"
-        if suffixed.exists():
-            return suffixed
-        return direct
-    if crate == "autumn-harvest" and target == "integration" and filt == "-":
-        return REPO_ROOT / "autumn-harvest" / "tests" / "integration.rs"
+def resolve_test_file(crate, target):
+    """The dedicated test binary source for a `linux` row's `crate`/`target`
+    — every crate/target other than `autumn-harvest`/`integration`, which
+    `weigh_rows()` never routes here: that target's tests are compiled into
+    ONE shared binary (`tests/integration/mod.rs`), so a manifest row there
+    is weighed by substring-matching `crate_integration_test_index()`
+    instead (see `integration_row_weight()`), not by resolving one file."""
     return REPO_ROOT / crate / "tests" / f"{target}.rs"
 
 
@@ -400,6 +413,204 @@ def test_weight(path, enabled_features=frozenset()):
     return count
 
 
+MOD_RS_PATH = REPO_ROOT / "autumn-harvest" / "tests" / "integration" / "mod.rs"
+MOD_DECL_RE = re.compile(r"^\s*(?:pub\s+)?mod\s+(\w+)\s*;")
+
+
+def enumerate_qualified_tests(path):
+    """Like `test_weight()`, but returns every non-`#[ignore]`d test's
+    libtest-style qualified name (`<mod>::<nested_mod>::<fn_name>`, WITHOUT
+    the file stem — the caller prepends that, since `mod.rs`'s own `mod X;`
+    name is what libtest actually uses as the top path segment, and it can
+    differ from the file's stem in principle even though it never does in
+    today's corpus) alongside the tuple of `cfg(...)` conditions that must
+    ALL hold for it to exist (the file's own `#![cfg(...)]`, if any, plus
+    every enclosing `#[cfg(...)] mod { ... }`, plus its own item-level
+    `#[cfg(...)]`).
+
+    **Why this exists, separately from `test_weight()` (Codex review, this
+    harness's own fourth PR round):** `.github/ci/run-suites.sh:121-129`
+    passes a manifest row's `filter` column to libtest as a plain positional
+    arg, with no `--exact` — cargo/libtest's default is a SUBSTRING match
+    against every test's qualified name in the WHOLE `integration` binary,
+    not just the one file `resolve_test_file()` guesses from the filter
+    text. A row's real weight is however many qualified names in the ENTIRE
+    binary contain its filter as a substring, which can be more than the
+    "file it looks like it names" carries. Concretely: the manifest's
+    `nd_block` row was reported as 10 (the ordinary per-file count of
+    `nd_block_tests.rs`), but `retry_clock_skew_tests.rs`,
+    `dag_compensation_tests.rs`, and `event_partitioning_tests.rs` each
+    carry a test whose name also contains the substring `nd_block`
+    (`requeue_workflow_task_nd_blocked_...`, `..._never_nd_blocks`,
+    `..._dropped_and_blocked`), so the row's real weight is higher.
+    `crate_integration_test_index()` below builds the qualified-name index
+    this substring match needs; `resolve_test_file()`'s single-file guess
+    is no longer used to WEIGH an `autumn-harvest`/`integration` row (see
+    `weigh_rows()`), only to label it in output.
+
+    Structurally this is the same forward scan as `test_weight()` — see
+    that function's docstring for the attribute/bracket/brace mechanics,
+    which are identical here — extended to also track the STACK of
+    enclosing `mod name { ... }` names (for the qualified path) and to
+    collect results instead of only counting them.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return None
+    file_gate = []
+    for line in lines[:5]:
+        inner = CFG_INNER_ATTR_RE.match(line)
+        if inner:
+            file_gate.append(inner.group(1))
+    results = []
+    pending_test = False
+    pending_ignore = False
+    pending_cfgs = []
+    bracket_depth = 0
+    brace_depth = 0
+    scope_stack = []  # list of (depth_to_pop_at, mod_name, conditions_tuple)
+
+    def active_conditions():
+        conds = list(file_gate)
+        for _depth, _name, mod_conds in scope_stack:
+            conds.extend(mod_conds)
+        return conds
+
+    for line in lines:
+        delta = line.count("{") - line.count("}")
+        if bracket_depth > 0:
+            bracket_depth += line.count("[") + line.count("(")
+            bracket_depth -= line.count("]") + line.count(")")
+            brace_depth += delta
+            while scope_stack and brace_depth <= scope_stack[-1][0]:
+                scope_stack.pop()
+            continue
+        if ATTR_LINE_RE.match(line):
+            if TEST_ATTR_RE.match(line):
+                pending_test = True
+            if IGNORE_ATTR_RE.match(line):
+                pending_ignore = True
+            cfg_match = CFG_ATTR_RE.match(line)
+            if cfg_match:
+                pending_cfgs.append(cfg_match.group(1))
+            bracket_depth = line.count("[") + line.count("(")
+            bracket_depth -= line.count("]") + line.count(")")
+            brace_depth += delta
+            while scope_stack and brace_depth <= scope_stack[-1][0]:
+                scope_stack.pop()
+            continue
+        mod_match = MOD_OPEN_RE.match(line)
+        if mod_match:
+            scope_stack.append((brace_depth, mod_match.group(1), tuple(pending_cfgs)))
+            pending_test = False
+            pending_ignore = False
+            pending_cfgs = []
+            brace_depth += delta
+            continue
+        fn_match = FN_LINE_RE.match(line)
+        if fn_match:
+            if pending_test and not pending_ignore:
+                conditions = tuple(active_conditions()) + tuple(pending_cfgs)
+                mod_path = [name for _depth, name, _c in scope_stack]
+                qualified = "::".join(mod_path + [fn_match.group(1)])
+                results.append((qualified, conditions))
+            pending_test = False
+            pending_ignore = False
+            pending_cfgs = []
+            brace_depth += delta
+            while scope_stack and brace_depth <= scope_stack[-1][0]:
+                scope_stack.pop()
+            continue
+        brace_depth += delta
+        while scope_stack and brace_depth <= scope_stack[-1][0]:
+            scope_stack.pop()
+        stripped = line.strip()
+        if stripped == "" or stripped.startswith("//"):
+            continue
+        pending_test = False
+        pending_ignore = False
+        pending_cfgs = []
+    return results
+
+
+def parse_mod_rs_gates():
+    """Every `mod X;` declaration in `tests/integration/mod.rs`, with the
+    `cfg(...)` condition(s) (if any) immediately preceding it — this is
+    WHERE most feature-gating on an integration test file actually lives
+    (199 `mod` declarations, the large majority individually
+    `#[cfg(feature = "db")]`-gated; a handful gate on `testing`, `chaos`,
+    `debugger`, or `wasm-activities` instead), not inside the files
+    themselves. A file can ALSO carry its own internal
+    `#![cfg(...)]`/`#[cfg(...)]` gates (see `enumerate_qualified_tests()`);
+    both apply, ANDed together, in `crate_integration_test_index()`.
+    """
+    gates = {}
+    pending_cfgs = []
+    for line in MOD_RS_PATH.read_text(encoding="utf-8").splitlines():
+        cfg_match = CFG_ATTR_RE.match(line)
+        if cfg_match:
+            pending_cfgs.append(cfg_match.group(1))
+            continue
+        mod_match = MOD_DECL_RE.match(line)
+        if mod_match:
+            gates[mod_match.group(1)] = tuple(pending_cfgs)
+            pending_cfgs = []
+            continue
+        stripped = line.strip()
+        if stripped == "" or stripped.startswith("//"):
+            continue
+        pending_cfgs = []
+    return gates
+
+
+_INTEGRATION_TEST_INDEX_CACHE = None
+
+
+def crate_integration_test_index():
+    """The full `(qualified_name, conditions)` list for EVERY test in the
+    `autumn-harvest`/`integration` binary, across every file `mod.rs`
+    declares — computed once (module-level cache; this function has no
+    arguments, since the raw structural scan does not depend on which
+    features end up enabled, only the later per-row filter does).
+    `qualified_name` includes the `mod.rs`-declared module name as its
+    first segment (matching `enumerate_qualified_tests()`'s file-stem-less
+    output), and `conditions` prepends `mod.rs`'s own gate on that
+    `mod X;` line to the file's internal ones.
+    """
+    global _INTEGRATION_TEST_INDEX_CACHE
+    if _INTEGRATION_TEST_INDEX_CACHE is not None:
+        return _INTEGRATION_TEST_INDEX_CACHE
+    mod_gates = parse_mod_rs_gates()
+    index = []
+    for mod_name, mod_conditions in mod_gates.items():
+        path = MOD_RS_PATH.parent / f"{mod_name}.rs"
+        tests = enumerate_qualified_tests(path)
+        if tests is None:
+            continue
+        for qualified, conditions in tests:
+            index.append(
+                (f"{mod_name}::{qualified}", mod_conditions + conditions)
+            )
+    _INTEGRATION_TEST_INDEX_CACHE = index
+    return index
+
+
+def integration_row_weight(filt, enabled_features):
+    """An `autumn-harvest`/`integration` row's real weight: the count of
+    qualified names in `crate_integration_test_index()` that (a) are
+    enabled under `enabled_features` and (b) contain `filt` as a substring
+    — matching `run-suites.sh`'s un-`--exact`'d libtest invocation exactly
+    (see `enumerate_qualified_tests()`'s docstring for why a per-file guess
+    undercounts this)."""
+    return sum(
+        1
+        for qualified, conditions in crate_integration_test_index()
+        if filt in qualified
+        and all(cfg_is_enabled(c, enabled_features) for c in conditions)
+    )
+
+
 def read_shard_count():
     """Extract SEMAPHORE_SHARD_COUNT from the test-db-linux job block only —
     test-nodb declares the same env var name with a different value (4), so
@@ -416,13 +627,25 @@ def weigh_rows(linux_rows):
     weights = []
     unresolved = []
     for ordinal, (_os, crate, target, feats, filt) in enumerate(linux_rows):
-        path = resolve_test_file(crate, target, filt)
         label = row_label(crate, target, filt)
         enabled = enabled_features_for_row(crate, feats)
-        weight = test_weight(path, enabled)
-        if weight is None:
-            unresolved.append((ordinal, label, path))
-            weight = 0
+        # autumn-harvest/integration rows share ONE binary, and
+        # run-suites.sh's filter is a libtest SUBSTRING match against every
+        # test in it (no --exact) -- weighing by "the one file the filter
+        # looks like it names" undercounts whenever the substring also
+        # matches tests elsewhere (see integration_row_weight()'s
+        # docstring). Every other crate/target has its own dedicated
+        # binary per row and, in today's manifest, always filt == "-" (no
+        # filter at all), so the simpler per-file count remains correct
+        # and cheaper there.
+        if crate == "autumn-harvest" and target == "integration":
+            weight = integration_row_weight(filt, enabled)
+        else:
+            path = resolve_test_file(crate, target)
+            weight = test_weight(path, enabled)
+            if weight is None:
+                unresolved.append((ordinal, label, path))
+                weight = 0
         weights.append((ordinal, label, weight))
     return weights, unresolved
 
@@ -601,6 +824,69 @@ async fn only_if_db_enabled() {}
         "debugger",
     }
     assert enabled_features_for_row("autumn-harvest-plugin", "-") == set()
+
+    # enumerate_qualified_tests: qualified paths (mod-name-prefixed, no file
+    # stem — the caller adds that) and their cfg conditions, for a nested
+    # cfg'd mod plus a plain top-level test.
+    enum_fixture_rs = """\
+#[tokio::test]
+async fn top_level() {}
+
+#[cfg(feature = "testing")]
+mod nested {
+    #[tokio::test]
+    async fn inner() {}
+}
+
+#[cfg(feature = "chaos")]
+#[tokio::test]
+async fn item_gated() {}
+
+#[ignore = "not a CI assertion"]
+#[tokio::test]
+async fn skipped() {}
+"""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".rs", delete=False
+    ) as tmp:
+        tmp.write(enum_fixture_rs)
+        enum_path = Path(tmp.name)
+    try:
+        results = dict(enumerate_qualified_tests(enum_path))
+    finally:
+        enum_path.unlink()
+    assert set(results) == {"top_level", "nested::inner", "item_gated"}, results
+    assert results["top_level"] == ()
+    assert results["nested::inner"] == ('feature = "testing"',)
+    assert results["item_gated"] == ('feature = "chaos"',)
+    assert enumerate_qualified_tests(Path("/nonexistent/x.rs")) is None
+
+    # parse_mod_rs_gates: a fixture matching mod.rs's real shape (a bare
+    # mod, a gated one, an all(...)-gated one).
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".rs", delete=False
+    ) as tmp:
+        tmp.write(
+            "mod plain_mod;\n"
+            '#[cfg(feature = "db")]\n'
+            "mod db_mod;\n"
+            '#[cfg(all(feature = "db", feature = "testing"))]\n'
+            "mod both_mod;\n"
+        )
+        mod_rs_fixture = Path(tmp.name)
+    global MOD_RS_PATH
+    orig_mod_rs = MOD_RS_PATH
+    MOD_RS_PATH = mod_rs_fixture
+    try:
+        gates = parse_mod_rs_gates()
+    finally:
+        MOD_RS_PATH = orig_mod_rs
+        mod_rs_fixture.unlink()
+    assert gates == {
+        "plain_mod": (),
+        "db_mod": ('feature = "db"',),
+        "both_mod": ('all(feature = "db", feature = "testing")',),
+    }, gates
 
     print("self-test: ok")
 
