@@ -178,7 +178,11 @@ POST /api/harvest/workflows/{execution_id}/reset
 ```
 
 Reset to an event index before the divergence (`event_index` in the
-diagnostic), which forks a fresh run from the compatible prefix.
+diagnostic), which forks a fresh run from the compatible prefix. The full
+request body (`reset_to_event_id`, required `reason` and `operator_id`,
+`signal_reapply`) is in `docs/api-contract.json` under this path; the worked
+CLI walkthrough — dry-run first, then commit — is
+[README.md § Resetting a workflow after a bad deploy](../../README.md#resetting-a-workflow-after-a-bad-deploy).
 
 ## Prevention (complementary, not replaced by this safety net)
 
