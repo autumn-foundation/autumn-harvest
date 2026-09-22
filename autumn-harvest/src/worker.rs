@@ -23830,7 +23830,20 @@ fn spawn_queue_depth_sampler(
             // single-pool path that skipped the sample on read failure (#522).
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -23944,7 +23957,20 @@ fn spawn_concurrency_sampler(
             // doesn't under-report concurrency during a storage outage (#522).
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -24054,7 +24080,20 @@ fn spawn_rate_limit_sampler(
             // doesn't under-report available tokens during a storage outage (#522).
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -24137,7 +24176,15 @@ fn spawn_dlq_depth_sampler(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            let mut conn = match pool.get().await {
+            // Selected against `cancel` (issue #1426). See the comment
+            // above `spawn_worker_heartbeat`'s own `pool.get()` call for
+            // why an unselected acquisition here can park shutdown
+            // forever.
+            let get_result = tokio::select! {
+                () = cancel.cancelled() => break,
+                result = pool.get() => result,
+            };
+            let mut conn = match get_result {
                 Ok(conn) => conn,
                 Err(error) => {
                     tracing::debug!(
@@ -24207,7 +24254,20 @@ fn spawn_queue_pause_sampler(
             let mut read_failed = false;
 
             for pool in &pools {
-                let Ok(mut conn) = pool.get().await else {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let Ok(mut conn) = get_result else {
                     read_failed = true;
                     continue;
                 };
@@ -24483,19 +24543,27 @@ fn spawn_replication_sampler(
             }
 
             for (shard_id, shard_pool) in &targets {
-                if sample_one_shard(
+                match sample_one_shard(
                     *shard_id,
                     shard_pool,
                     &telemetry,
                     watermark_retain,
                     interval,
                     &slot_prefix,
+                    &cancel,
                 )
                 .await
-                    == ShardSample::Fenced
                 {
-                    cancel.cancel();
-                    return;
+                    ShardSample::Fenced => {
+                        cancel.cancel();
+                        return;
+                    }
+                    // Issue #1426: the loop received a cancellation signal
+                    // while acquiring this shard's connection. Abandon the
+                    // remaining targets this tick rather than keep probing
+                    // them one by one against an already-cancelled token.
+                    ShardSample::Cancelled => break,
+                    ShardSample::Continue => {}
                 }
             }
         }
@@ -24511,6 +24579,10 @@ enum ShardSample {
     /// This worker has lost write authority for the shard. The caller stops
     /// the **whole** worker — see `spawn_replication_sampler`.
     Fenced,
+    /// The loop received a cancellation signal while acquiring this
+    /// shard's connection (issue #1426). The caller stops sampling the
+    /// remaining targets this tick.
+    Cancelled,
 }
 
 /// One shard's DR sample: self-fence check, watermark beat, gauges.
@@ -24518,7 +24590,12 @@ enum ShardSample {
 /// Split out of the sampler loop only because that loop outgrew the line
 /// budget; the ordering commentary that matters lives here, with the steps it
 /// describes.
+///
+/// The cancel-aware acquisition added for issue #1426 pushed this function
+/// itself past the same line limit. The ordering commentary above still
+/// argues against splitting it further.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 async fn sample_one_shard(
     shard_id: crate::types::ShardId,
     shard_pool: &DbPool,
@@ -24526,9 +24603,19 @@ async fn sample_one_shard(
     watermark_retain: Duration,
     sample_interval: Duration,
     slot_prefix: &str,
+    cancel: &CancellationToken,
 ) -> ShardSample {
     let shard_u16 = u16::try_from(shard_id.as_i32()).unwrap_or(0);
-    let Ok(mut conn) = shard_pool.get().await else {
+    // Selected against `cancel` (issue #1426): an unselected `pool.get()`
+    // here can park shutdown forever.
+    let get_result = tokio::select! {
+        () = cancel.cancelled() => None,
+        result = shard_pool.get() => Some(result),
+    };
+    let Some(get_result) = get_result else {
+        return ShardSample::Cancelled;
+    };
+    let Ok(mut conn) = get_result else {
         // A pool that cannot be reached is already covered by the worker's own
         // liveness signals; a DR sample is not worth a second alarm for the
         // same condition.
@@ -24708,7 +24795,15 @@ fn spawn_stranded_work_sampler(
                 // (queue, required_capabilities, ...) so coverage can honour the
                 // same eligibility claim_task enforces (issue #522 review).
                 let mut demands: Vec<crate::queue::ClaimablePendingDemand> = {
-                    let mut conn = match shard_pool.get().await {
+                    // Selected against `cancel` (issue #1426): an unselected
+                    // `pool.get()` here can park shutdown forever. Cancellation
+                    // abandons the remaining shards this tick, same as the
+                    // multi-pool samplers above.
+                    let get_result = tokio::select! {
+                        () = cancel.cancelled() => break,
+                        result = shard_pool.get() => result,
+                    };
+                    let mut conn = match get_result {
                         Ok(conn) => conn,
                         Err(error) => {
                             tracing::debug!(
@@ -24755,7 +24850,13 @@ fn spawn_stranded_work_sampler(
                 // collapsed to queue names) so the capability check below can see
                 // each worker's polled queues *and* labels.
                 let covering_workers: Vec<crate::workers::WorkerRow> = {
-                    let Ok(mut conn) = shard_pool.get().await else {
+                    // Selected against `cancel` (issue #1426); see the demands
+                    // acquisition above.
+                    let get_result = tokio::select! {
+                        () = cancel.cancelled() => break,
+                        result = shard_pool.get() => result,
+                    };
+                    let Ok(mut conn) = get_result else {
                         continue;
                     };
                     let filters = crate::workers::WorkerFilters {
@@ -24783,7 +24884,13 @@ fn spawn_stranded_work_sampler(
                 // claim_task enforces. On load failure fall back to an empty set
                 // (exact-match / legacy-worker rules still apply).
                 let compat_set = {
-                    let Ok(mut conn) = shard_pool.get().await else {
+                    // Selected against `cancel` (issue #1426); see the demands
+                    // acquisition above.
+                    let get_result = tokio::select! {
+                        () = cancel.cancelled() => break,
+                        result = shard_pool.get() => result,
+                    };
+                    let Ok(mut conn) = get_result else {
                         continue;
                     };
                     crate::build_routing::load_compat_set(&mut conn)
@@ -25074,7 +25181,15 @@ fn spawn_pause_auto_resumer(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            match pool.get().await {
+            // Selected against `cancel` (issue #1426). See the comment
+            // above `spawn_worker_heartbeat`'s own `pool.get()` call for
+            // why an unselected acquisition here can park shutdown
+            // forever.
+            let get_result = tokio::select! {
+                () = cancel.cancelled() => break,
+                result = pool.get() => result,
+            };
+            match get_result {
                 Ok(mut conn) => {
                     match crate::execution::auto_resume_expired_pauses(
                         &mut conn,
@@ -25150,7 +25265,20 @@ fn spawn_history_oversized_sampler(
             // (#522).
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -25427,7 +25555,20 @@ fn spawn_workflow_active_sampler(
             let mut per_shard: Vec<Vec<(String, ActiveWorkflowState, u64)>> = Vec::new();
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
