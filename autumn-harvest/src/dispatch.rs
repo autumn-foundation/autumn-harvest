@@ -458,6 +458,36 @@ where
     outcome
 }
 
+/// Same contract as [`buffered_settled`], but hands a committed `f`'s hints
+/// to the background publisher instead of awaiting the channel inline
+/// (Codex review, issue #1429).
+///
+/// `buffered_settled` is right for a caller that processes one row and then
+/// waits, such as a worker's own dispatch loop. A caller that instead loops
+/// over many rows in one sweep pays that same await once per row. That can
+/// cost up to `DISPATCH_CALL_TIMEOUT` per call when the channel is slow,
+/// stalling the sweep even though Postgres already committed. Reconciliation
+/// is the durability fallback regardless. This uses [`publish_in_background`].
+/// That is the same non-blocking, bounded-queue path [`record_hint`] falls
+/// back to outside a scope. So the sweep moves on to its next row
+/// immediately after commit.
+///
+/// # Errors
+///
+/// Returns the result of `f` unchanged.
+pub async fn buffered_settled_in_background<T, E, F>(f: F) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    let (outcome, hints) = buffered(f).await;
+    if outcome.is_ok() {
+        for hint in hints {
+            publish_in_background(hint);
+        }
+    }
+    outcome
+}
+
 /// Run `f` and tie its own hints to its own outcome, nested or not (Codex
 /// review, issue #1429).
 ///

@@ -746,8 +746,11 @@ async fn a_read_across_two_queues_returns_at_most_the_requested_count() {
         }
     }
 
-    // `COUNT` bounds one stream, so a read over two queues can return four
-    // entries for a caller that asked for three. The surplus goes back.
+    // Each queue's `COUNT` is sized from the batch's remaining capacity
+    // (issue #1429). This read still honours the cap of three: the first
+    // queue visited takes up to all three, leaving only what is left for
+    // the second. Whichever queue that leaves an entry unclaimed, it stays
+    // in its stream for a later read to pick up.
     let leases = read(&fixture, &queues, 3).await;
     assert_eq!(leases.len(), 3, "the read must honour the caller's cap");
     assert_eq!(
@@ -768,58 +771,55 @@ async fn a_read_across_two_queues_returns_at_most_the_requested_count() {
     assert_eq!(seen, published, "every reference must be delivered once");
 }
 
+/// A single busy queue's read is sized from the full remaining batch
+/// capacity, not an equal `max / queue_count` split (Codex review, issue
+/// #1429).
+///
+/// Before this fix, `per_stream_count` divided the cap evenly across every
+/// configured queue, regardless of which ones actually had work. A worker
+/// serving many mostly idle queues would then throttle its one busy queue
+/// to `max / N` per read. Filling one batch needed roughly `N` such reads,
+/// each visiting every queue: about `N²` commands for what one full-budget
+/// read now does. This also means a same-call surplus across queues, the
+/// kind `a_capped_read_favors_the_higher_priority_candidates` used to
+/// exercise, no longer normally arises. The busy queue processed first now
+/// consumes the whole cap before a second queue is ever visited. The
+/// priority sort-and-split in `next_inner` stays as a defensive
+/// fallback regardless.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_capped_read_favors_the_higher_priority_candidates() {
-    // Issue #1429. Priority is still best effort under one FIFO stream. A
-    // read sized exactly to one queue's ready backlog never holds more
-    // candidates than the cap. `COUNT` on the Redis side enforces that
-    // limit, so there is nothing to favor in that case.
-    // The favoring only has candidates to choose from when a read spans
-    // queues. Their combined `COUNT` ceiling (`per_stream_count`, rounded up
-    // per queue) then hands back more than the caller's cap. That is the
-    // same surplus
-    // `a_read_across_two_queues_returns_at_most_the_requested_count`
-    // exercises. This case pins that once such a surplus exists, the ones
-    // actually delivered are the highest-priority candidates. The rest are
-    // requeued, rather than picked by arrival order.
+async fn a_busy_queue_gets_the_full_budget_among_idle_peers() {
     let Some(fixture) = try_start(Duration::from_secs(60)).await else {
         return;
     };
-    let queues = vec!["priority-a".to_string(), "priority-b".to_string()];
+    let queues = vec![
+        "busy".to_string(),
+        "idle-a".to_string(),
+        "idle-b".to_string(),
+        "idle-c".to_string(),
+    ];
+    let mut published = Vec::new();
+    for _ in 0..4 {
+        let task_id = Uuid::new_v4();
+        published.push(task_id);
+        fixture
+            .dispatch
+            .publish(&[hint("busy", task_id, Utc::now())])
+            .await
+            .expect("publish");
+    }
 
-    let mut low_1 = hint("priority-a", Uuid::new_v4(), Utc::now());
-    low_1.priority = 0;
-    let mut low_2 = hint("priority-a", Uuid::new_v4(), Utc::now());
-    low_2.priority = 0;
-    let mut high_1 = hint("priority-b", Uuid::new_v4(), Utc::now());
-    high_1.priority = 5;
-    let mut high_2 = hint("priority-b", Uuid::new_v4(), Utc::now());
-    high_2.priority = 5;
-    fixture
-        .dispatch
-        .publish(&[low_1.clone(), low_2.clone(), high_1.clone(), high_2.clone()])
-        .await
-        .expect("publish");
-
-    // `per_stream_count(3, 2)` rounds up to `COUNT 2` per queue. This read
-    // can therefore see all 4 published entries in one call, a surplus of 1
-    // over the cap of 3.
-    let leases = read(&fixture, &queues, 3).await;
-    assert_eq!(leases.len(), 3, "the read must honour the caller's cap");
-    let delivered: std::collections::HashSet<Uuid> =
-        leases.iter().map(|lease| lease.task_id).collect();
-    assert!(
-        delivered.contains(&high_1.task_id) && delivered.contains(&high_2.task_id),
-        "both priority-5 references must be delivered before any priority-0 one: {delivered:?}"
-    );
-
-    let rest = read(&fixture, &queues, 10).await;
+    // Four idle peer queues no longer throttle "busy"'s own read to
+    // `4 / 4 == 1` per call. One call now delivers all four.
+    let leases = read(&fixture, &queues, 4).await;
     assert_eq!(
-        rest.len(),
-        1,
-        "the one surplus low-priority reference is requeued"
+        leases.len(),
+        4,
+        "the busy queue's read must not be capped by its idle peers"
     );
-    assert!(rest[0].task_id == low_1.task_id || rest[0].task_id == low_2.task_id);
+    let mut delivered: Vec<Uuid> = leases.iter().map(|lease| lease.task_id).collect();
+    delivered.sort_unstable();
+    published.sort_unstable();
+    assert_eq!(delivered, published);
 }
 
 #[tokio::test(flavor = "multi_thread")]

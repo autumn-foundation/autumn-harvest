@@ -693,6 +693,16 @@ impl RedisDispatch {
     /// Extracted from [`Self::next_inner`] to keep that function's line
     /// count under clippy's `too_many_lines` threshold (issue #1429).
     ///
+    /// Each queue's `COUNT` is sized from the batch capacity `max` still
+    /// left, not an equal `max / ordered.len()` split (Codex review, issue
+    /// #1429). An even split throttles a single busy queue among many idle
+    /// ones to `max / N`, even though every one of `max`'s slots is free.
+    /// Filling a batch then needs roughly `N` such reads, each visiting
+    /// every queue: about `N²` commands where a single full-budget read
+    /// would do. Sizing from the remaining capacity lets one queue's first
+    /// read fill the whole batch. The loop then stops early once it does,
+    /// still visiting the rest only when an earlier queue came up short.
+    ///
     /// One queue's read failing must not discard entries an earlier queue
     /// in this same pass already claimed into this consumer's PEL (Codex
     /// review, issue #1429). Propagating the error immediately would drop
@@ -709,26 +719,32 @@ impl RedisDispatch {
         queues: &[String],
         ordered: &[String],
         consumer: &str,
-        count: usize,
+        max: usize,
         wait: Duration,
     ) -> RedisAdapterResult<StreamReadReply> {
         let mut reply = StreamReadReply::default();
         let mut any_ready = false;
         let mut first_error = None;
+        let mut remaining = max.max(1);
         for key in ordered {
+            if remaining == 0 {
+                break;
+            }
             match self
                 .read_with_heal(
                     queues,
                     std::slice::from_ref(key),
                     consumer,
-                    count,
+                    remaining,
                     Duration::ZERO,
                 )
                 .await
             {
                 Ok(one) => {
-                    if one.keys.iter().any(|stream| !stream.ids.is_empty()) {
+                    let delivered: usize = one.keys.iter().map(|stream| stream.ids.len()).sum();
+                    if delivered > 0 {
                         any_ready = true;
+                        remaining = remaining.saturating_sub(delivered);
                     }
                     reply.keys.extend(one.keys);
                 }
@@ -747,7 +763,13 @@ impl RedisDispatch {
             && let Some(first) = ordered.first()
         {
             match self
-                .read_with_heal(queues, std::slice::from_ref(first), consumer, count, wait)
+                .read_with_heal(
+                    queues,
+                    std::slice::from_ref(first),
+                    consumer,
+                    remaining,
+                    wait,
+                )
                 .await
             {
                 Ok(blocked) => {
@@ -775,13 +797,12 @@ impl RedisDispatch {
         wait: Duration,
     ) -> RedisAdapterResult<Vec<DispatchLease>> {
         let keys: Vec<String> = queues.iter().map(|queue| self.stream_key(queue)).collect();
-        // `COUNT` bounds one stream, not the whole read. Sizing it per stream
-        // keeps the read close to `max` entries in total. The order rotates
-        // per call, so the queue that fills the batch changes. No queue
-        // therefore starves behind a busy peer.
+        // The order rotates per call, so the queue that fills the batch
+        // changes. No queue therefore starves behind a busy peer.
+        // `read_across_queues` sizes each queue's own `COUNT` from `max`
+        // itself, not a fixed even split (see its own doc comment).
         let offset = usize::try_from(self.reads.fetch_add(1, Ordering::Relaxed)).unwrap_or(0);
         let ordered = rotate(&keys, offset);
-        let count = per_stream_count(max, ordered.len());
 
         // One queue's stream carries its own hash tag (issue #1429). So a
         // single multi-key `XREADGROUP` across several queues crosses Redis
@@ -797,7 +818,7 @@ impl RedisDispatch {
         // blocking fairness matches the round-robin already used to decide
         // which queue's `COUNT` fills the batch first.
         let reply = self
-            .read_across_queues(queues, &ordered, consumer, count, wait)
+            .read_across_queues(queues, &ordered, consumer, max, wait)
             .await?;
 
         let mut candidates = Vec::new();
@@ -830,12 +851,12 @@ impl RedisDispatch {
         // Priority is best effort under dispatch (issue #1429). One FIFO
         // stream per queue carries no priority order on its own. `COUNT`
         // also caps what Redis returns per stream before this call ever sees
-        // a candidate. A read sized to exactly one queue's ready backlog
-        // therefore has nothing to sort. A read that spans queues can still
-        // hold more candidates than `max`, because `per_stream_count` rounds
-        // each queue's `COUNT` up. A stable sort by priority (descending),
-        // before the split, then favors the highest-priority candidates
-        // among that surplus for the leases this call actually claims. It
+        // a candidate. `read_across_queues` sizes each queue's `COUNT` from
+        // the batch's remaining capacity, so a normal read no longer
+        // intentionally exceeds `max`. This split is kept as a defensive
+        // fallback regardless. A stable sort by priority (descending)
+        // favors the highest-priority candidates among whatever this read
+        // did collect, for the leases this call actually claims. It
         // requeues the rest. Ties keep arrival order, since the sort is
         // stable, so this never starves same-priority work. The reconcile
         // sweep's own `(priority DESC, scheduled_at ASC)` publish order is
@@ -1007,7 +1028,14 @@ impl RedisDispatch {
                     .ignore();
             }
             if let Err(error) = pipe.query_async::<()>(&mut conn).await {
+                // Skip this queue's marker cleanup when its XACK/XDEL pipe
+                // itself failed (Codex review, issue #1429). The entry is
+                // then still pending, unacked. Deleting its marker here
+                // would let the reconcile sweep republish a duplicate ahead
+                // of the entry's own eventual visibility-timeout recovery.
+                // That recovery redelivers the very same duplicate again.
                 first_error.get_or_insert(error);
+                continue;
             }
 
             // A separate, conditional call (Codex review, issue #1429). See
@@ -1287,14 +1315,6 @@ fn validate_queue_name(queue_name: &str) -> RedisAdapterResult<()> {
         return Err(RedisAdapterError::InvalidQueueName(queue_name.to_string()));
     }
     Ok(())
-}
-
-/// `COUNT` for one stream of a read that wants `max` entries in total.
-fn per_stream_count(max: usize, queues: usize) -> usize {
-    if queues == 0 {
-        return max.max(1);
-    }
-    max.div_ceil(queues).max(1)
 }
 
 /// `items`, rotated left by `offset` positions.
@@ -1865,15 +1885,6 @@ mod tests {
             !is_nogroup(&other),
             "a transport failure must not trigger a group heal"
         );
-    }
-
-    #[test]
-    fn a_read_is_sized_per_stream() {
-        assert_eq!(per_stream_count(64, 1), 64);
-        assert_eq!(per_stream_count(64, 4), 16);
-        assert_eq!(per_stream_count(3, 2), 2, "the split rounds up");
-        assert_eq!(per_stream_count(1, 8), 1, "a stream always reads one");
-        assert_eq!(per_stream_count(0, 0), 1, "no queue still reads one");
     }
 
     #[test]

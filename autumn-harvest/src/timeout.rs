@@ -3190,8 +3190,12 @@ pub async fn enforce_external_signals_outbox(
 
         // The terminal-event append below can raise a dispatch hint through
         // `wake_workflow_task` (issue #1429). The scope ties its publish to
-        // this step transaction's commit.
-        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = crate::dispatch::buffered_settled(Box::pin(conn
+        // this step transaction's commit. This loop claims one outbox row
+        // per iteration. A synchronous per-row publish (`buffered_settled`)
+        // would pay a Redis round trip once per row. It would stall the
+        // sweep when the channel is slow (Codex review, issue #1429). Hand
+        // hints to the background publisher instead.
+        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = crate::dispatch::buffered_settled_in_background(Box::pin(conn
             .transaction::<Option<(bool, Option<i64>)>, HarvestError, _>(async |conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
@@ -3701,8 +3705,12 @@ pub async fn enforce_external_cancels_outbox(
 
         // The terminal-event append below can raise a dispatch hint through
         // `wake_workflow_task` (issue #1429). The scope ties its publish to
-        // this step transaction's commit.
-        let step_res: Result<Option<CancelStepOutcome>, HarvestError> = crate::dispatch::buffered_settled(Box::pin(conn
+        // this step transaction's commit. This loop claims one outbox row
+        // per iteration. A synchronous per-row publish (`buffered_settled`)
+        // would pay a Redis round trip once per row. It would stall the
+        // sweep when the channel is slow (Codex review, issue #1429). Hand
+        // hints to the background publisher instead.
+        let step_res: Result<Option<CancelStepOutcome>, HarvestError> = crate::dispatch::buffered_settled_in_background(Box::pin(conn
             .transaction::<Option<CancelStepOutcome>, HarvestError, _>(async |conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
@@ -4365,8 +4373,12 @@ pub async fn enforce_external_awaits_outbox(
 
         // The terminal-event append below can raise a dispatch hint through
         // `wake_workflow_task` (issue #1429). The scope ties its publish to
-        // this step transaction's commit.
-        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = crate::dispatch::buffered_settled(Box::pin(conn
+        // this step transaction's commit. This loop claims one outbox row
+        // per iteration. A synchronous per-row publish (`buffered_settled`)
+        // would pay a Redis round trip once per row. It would stall the
+        // sweep when the channel is slow (Codex review, issue #1429). Hand
+        // hints to the background publisher instead.
+        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = crate::dispatch::buffered_settled_in_background(Box::pin(conn
             .transaction::<Option<(bool, Option<i64>)>, HarvestError, _>(async |conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
