@@ -3741,7 +3741,20 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     // WHOLE persist transaction -- including the source's own
     // `WorkflowCompleted` append -- leaving it stuck RUNNING forever with no
     // error ever recorded.
-    wait_for_execution_state(&url, source, "COMPLETED").await;
+    //
+    // This step also runs the target's inline admission attempt, its quota
+    // check, and the outbox fallback insert, all inside the same
+    // terminal-sealing transaction as the source's own commit. That is more
+    // work than the 10s default budgets for under a busy CI runner, the
+    // same reason `wait_for_execution_state_with_timeout`'s own doc comment
+    // gives.
+    wait_for_execution_state_with_timeout(
+        &url,
+        source,
+        "COMPLETED",
+        std::time::Duration::from_secs(20),
+    )
+    .await;
 
     #[derive(diesel::QueryableByName)]
     struct OutboxCount {
