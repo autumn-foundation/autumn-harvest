@@ -28051,7 +28051,9 @@ impl Worker {
         }
 
         if DispatchLoopState::due(&mut state.reconciled, settings.reconcile_interval)
-            && !self.run_dispatch_reconcile(pool, installed, state).await
+            && !self
+                .run_dispatch_reconcile(pool, installed, state, shard_count)
+                .await
         {
             return self.drain_postgres(pool, shard, shard_count).await;
         }
@@ -28121,7 +28123,7 @@ impl Worker {
             }
         };
 
-        self.dispatch_leases(pool, shard, installed, state, leases)
+        self.dispatch_leases(pool, shard, installed, state, leases, shard_count)
             .await
     }
 
@@ -28137,6 +28139,7 @@ impl Worker {
         installed: &crate::dispatch::InstalledDispatch,
         state: &mut DispatchLoopState,
         leases: Vec<crate::dispatch::DispatchLease>,
+        shard_count: usize,
     ) -> u32 {
         let mut dispatched = 0u32;
         // Leases this iteration gives straight back with no claim attempt
@@ -28177,7 +28180,15 @@ impl Worker {
                 None => None,
             };
             if self
-                .consume_reference(pool, shard, installed, state, lease, reservation)
+                .consume_reference(
+                    pool,
+                    shard,
+                    installed,
+                    state,
+                    lease,
+                    reservation,
+                    shard_count,
+                )
                 .await
             {
                 dispatched += 1;
@@ -28207,9 +28218,17 @@ impl Worker {
     /// timeout. One claim per call is a throughput collapse, not a fallback.
     ///
     /// `shard_count` follows [`dispatch_read_block`] (Codex review, issue
-    /// #1429). The closing wait is capped the same way the channel read is.
-    /// So one shard's degraded-mode fallback does not park a multi-shard
-    /// round-robin behind it for a full `poll_interval`.
+    /// #1429). The closing wait is capped the same way the channel read
+    /// is. So one shard's degraded-mode fallback does not park a
+    /// multi-shard round-robin behind it for a full `poll_interval`. The
+    /// connection wait is bounded too, the same bound `poll_once`'s
+    /// sibling branches already use. More than one also caps the drain
+    /// loop itself at one claim. Unbounded draining of a large or
+    /// continuously-refilled backlog on one degraded shard would otherwise
+    /// starve every later shard's turn. That holds for as long as that
+    /// backlog kept it busy, which the closing-wait cap alone does not
+    /// prevent. `1` (single shard) keeps draining the whole backlog before
+    /// its wait, unchanged.
     ///
     /// Returns how many tasks were dispatched (`poll_once` claims at most one
     /// per call, so this is the number of loop iterations that claimed).
@@ -28224,7 +28243,7 @@ impl Worker {
             if !self
                 .poll_once(
                     pool,
-                    shard_acquire_bound(false, self.config.poll_interval),
+                    shard_acquire_bound(shard_count > 1, self.config.poll_interval),
                     shard,
                 )
                 .await
@@ -28232,6 +28251,9 @@ impl Worker {
                 break;
             }
             dispatched += 1;
+            if shard_count > 1 {
+                break;
+            }
         }
         let wait = dispatch_read_block(shard_count, self.config.poll_interval);
         tokio::select! {
@@ -28287,6 +28309,12 @@ impl Worker {
     /// takes one lease per `ack` and per `release`, so a batched disposal for
     /// the whole read would need a trait change. That is a follow-up, not a
     /// change this path can make on its own.
+    ///
+    /// `shard_count` follows [`dispatch_read_block`] (Codex review, issue
+    /// #1429). More than one bounds the pool-connection wait, the same
+    /// bound `poll_once`'s sibling branches already use. So an exhausted
+    /// pool on this shard cannot strand the round-robin's other shards.
+    #[allow(clippy::too_many_arguments)]
     async fn consume_reference(
         &self,
         pool: &DbPool,
@@ -28295,10 +28323,11 @@ impl Worker {
         state: &mut DispatchLoopState,
         lease: crate::dispatch::DispatchLease,
         reservation: Option<DispatchReservation>,
+        shard_count: usize,
     ) -> bool {
         let mut conn = match acquire_shard_conn(
             pool,
-            shard_acquire_bound(false, self.config.poll_interval),
+            shard_acquire_bound(shard_count > 1, self.config.poll_interval),
         )
         .await
         {
@@ -28409,15 +28438,21 @@ impl Worker {
     /// Returns `false` when a channel call failed, so the caller can enter
     /// degraded mode. A database failure returns `true`: the database is not
     /// the channel, and the Postgres claim path cannot help with it.
+    ///
+    /// `shard_count` follows [`dispatch_read_block`] (Codex review, issue
+    /// #1429). More than one bounds the pool-connection wait, the same
+    /// bound `poll_once`'s sibling branches already use. So an exhausted
+    /// pool on this shard cannot strand the round-robin's other shards.
     async fn run_dispatch_reconcile(
         &self,
         pool: &DbPool,
         installed: &crate::dispatch::InstalledDispatch,
         state: &mut DispatchLoopState,
+        shard_count: usize,
     ) -> bool {
         let mut conn = match acquire_shard_conn(
             pool,
-            shard_acquire_bound(false, self.config.poll_interval),
+            shard_acquire_bound(shard_count > 1, self.config.poll_interval),
         )
         .await
         {

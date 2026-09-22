@@ -15323,13 +15323,14 @@ impl ActivityContext {
                 format!("transactional activity failed to acquire DB connection: {e}")
             })?;
 
-        // Issue #1429: `wake_workflow_task` below raises a dispatch hint. The
-        // buffering scope ties the publish to this transaction's own commit.
-        // It is nesting-safe: a no-op passthrough when the caller's task
-        // body already holds an outer scope. This is tighter than relying
-        // only on that outer scope, which does not distinguish this
-        // transaction's own rollback from the task body's overall outcome.
-        let result = crate::dispatch::buffered_settled(Box::pin(
+        // Issue #1429 (Codex review): `wake_workflow_task` below raises a
+        // dispatch hint. `buffered_checkpoint` ties its publish to this
+        // transaction's own commit, even when nested inside the worker's
+        // outer buffering scope. A plain `buffered_settled` call degrades
+        // to a no-op passthrough when nested. So a nested transaction's
+        // hint would flush with the outer task's outcome, instead of this
+        // transaction's own.
+        let result = crate::dispatch::buffered_checkpoint(Box::pin(
             conn.transaction::<T, TxError, _>(async |conn| {
                 // Run user domain writes.
                 let user_result = f(conn).await.map_err(TxError::User)?;

@@ -441,6 +441,50 @@ where
     outcome
 }
 
+/// Run `f` and tie its own hints to its own outcome, nested or not (Codex
+/// review, issue #1429).
+///
+/// `f` owns a nested transaction (typically a SAVEPOINT) inside an already
+/// active scope: a worker's outer [`buffered`] call around the whole task
+/// body, for example. [`buffered_settled`] cannot make that guarantee
+/// there. Nested, `buffered` is a documented no-op passthrough. So a hint
+/// `f` raises lands in the *outer* buffer and is flushed with the outer
+/// task's own outcome, not `f`'s. A `wake_workflow_task` call whose own
+/// transaction then fails to commit still gets its hint published, because
+/// the outer task around it went on to succeed.
+///
+/// This checkpoints the active buffer's length before `f` runs. Only if
+/// `f` fails, it truncates back to that length. That is exactly the
+/// hints `f` itself raised, never a sibling call's hints recorded earlier
+/// in the same enclosing scope. A committed `f` leaves its hints in place
+/// for the enclosing scope to flush later, alongside everything else.
+/// When no scope is active yet, this opens one and settles it against
+/// `f`'s own outcome, identically to [`buffered_settled`].
+///
+/// # Errors
+///
+/// Returns the result of `f` unchanged.
+pub async fn buffered_checkpoint<T, E, F>(f: F) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    if !scope_active() {
+        return buffered_settled(f).await;
+    }
+    let mark = HINT_BUFFER
+        .try_with(|buffer| lock(buffer).len())
+        .unwrap_or(0);
+    let outcome = f.await;
+    if outcome.is_err() {
+        let _ = HINT_BUFFER.try_with(|buffer| {
+            let mut guard = lock(buffer);
+            let mark = mark.min(guard.len());
+            guard.truncate(mark);
+        });
+    }
+    outcome
+}
+
 /// Publish `hints` on the installed channel now.
 ///
 /// Errors are logged and dropped. The reconcile sweep in the worker is the
@@ -1429,6 +1473,95 @@ mod tests {
         .await;
 
         assert_eq!(outer, vec![one]);
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_discards_only_its_own_hints_on_error_when_nested() {
+        // Codex review, issue #1429. `buffered_settled` degrades to a no-op
+        // passthrough when nested. So a nested owner's own failure could
+        // not stop its hint from riding out with the enclosing scope. This
+        // is the guarantee `buffered_checkpoint` adds.
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let sibling = hint("q", Utc::now());
+        let failed = hint("q", Utc::now());
+        let sibling_inner = sibling.clone();
+        let failed_inner = failed.clone();
+        let ((), outer) = buffered(async move {
+            // A sibling call earlier in the same enclosing scope.
+            record_hint(sibling_inner);
+
+            let outcome = buffered_checkpoint(async move {
+                record_hint(failed_inner);
+                Err::<(), &str>("commit failed")
+            })
+            .await;
+            assert!(outcome.is_err());
+        })
+        .await;
+
+        assert_eq!(
+            outer,
+            vec![sibling],
+            "the failed checkpoint's own hint is gone; the sibling's is not"
+        );
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_keeps_its_hints_on_success_when_nested() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        let observed = Arc::clone(&channel);
+        let ((), outer) = buffered(async move {
+            let outcome = buffered_checkpoint(async move {
+                record_hint(inner);
+                Ok::<(), &str>(())
+            })
+            .await;
+            assert!(outcome.is_ok());
+            assert!(
+                observed.published_ids().is_empty(),
+                "a nested checkpoint must not publish before the enclosing scope flushes"
+            );
+        })
+        .await;
+
+        assert_eq!(outer, vec![one]);
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_matches_buffered_settled_when_not_nested() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let committed = hint("q", Utc::now());
+        let inner = committed.clone();
+        let outcome = buffered_checkpoint(async move {
+            record_hint(inner);
+            Ok::<(), &str>(())
+        })
+        .await;
+        assert!(outcome.is_ok());
+        assert_eq!(channel.published_ids(), vec![committed.task_id]);
         uninstall();
     }
 
