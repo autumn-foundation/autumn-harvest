@@ -10300,6 +10300,12 @@ mod tests {
             sql.contains("false"),
             "wake_requested must bind to false: {sql}"
         );
+        // scheduled_at is computed DB-side from clock_timestamp(), immune to
+        // host/DB clock skew (issue #1389) -- never a Rust-computed timestamp.
+        assert!(
+            sql.contains("clock_timestamp() + make_interval"),
+            "scheduled_at must be DB-computed, not host-computed: {sql}"
+        );
         // Restricted to claimed (RUNNING) workflow rows.
         assert!(sql.contains("\"task_type\""), "{sql}");
         assert!(sql.contains("\"state\""), "{sql}");
