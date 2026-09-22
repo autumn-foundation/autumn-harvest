@@ -461,7 +461,7 @@
         {
           "name": "after",
           "in": "query",
-          "type": "integer",
+          "type": "string",
           "required": false,
           "description": "Exclusive cursor anchor (harvest_events.id). Opaque \u2014 treat as a string; absent means start from the first event."
         },

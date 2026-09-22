@@ -10291,7 +10291,7 @@
             "name": "after",
             "required": false,
             "schema": {
-              "type": "integer"
+              "type": "string"
             }
           },
           {
