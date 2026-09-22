@@ -58,8 +58,12 @@ oversubscription is directly comparable.
 
 ```sh
 # 8x CPU oversubscription: 32 busy `yes` loops pinned across 4 cores,
-# load average settles around 30+.
-for i in $(seq 1 32); do yes > /dev/null & done
+# load average settles around 30+. Capture the PIDs and trap them to a
+# cleanup on exit -- this snippet is standalone, so nothing later cleans
+# up for it the way the full script in "Reproduce" below does for itself.
+STRESS_PIDS=()
+for i in $(seq 1 32); do yes > /dev/null & STRESS_PIDS+=("$!"); done
+trap 'kill "${STRESS_PIDS[@]}" 2>/dev/null' EXIT
 
 export HARVEST_TEST_DATABASE_URL="postgres://harvest:harvest@127.0.0.1:5432/harvest_test"
 for i in $(seq 1 20); do
