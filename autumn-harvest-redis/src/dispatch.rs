@@ -699,9 +699,46 @@ impl RedisDispatch {
         let offset = usize::try_from(self.reads.fetch_add(1, Ordering::Relaxed)).unwrap_or(0);
         let ordered = rotate(&keys, offset);
         let count = per_stream_count(max, ordered.len());
-        let reply = self
-            .read_with_heal(queues, &ordered, consumer, count, wait)
-            .await?;
+
+        // One queue's stream carries its own hash tag (issue #1429). So a
+        // single multi-key `XREADGROUP` across several queues crosses Redis
+        // Cluster slots (Codex review). Read each queue's stream in its own
+        // call instead, which stays inside one slot no matter how many
+        // queues this worker serves.
+        //
+        // A first, non-blocking pass over every queue costs one fast round
+        // trip per queue. It finds an already-ready entry immediately,
+        // without paying `wait` once per queue. Only when that pass finds
+        // nothing does this call block, and only on the queue this call's
+        // own rotation leads with. `ordered` rotates every call, so
+        // blocking fairness matches the round-robin already used to decide
+        // which queue's `COUNT` fills the batch first.
+        let mut reply = StreamReadReply::default();
+        let mut any_ready = false;
+        for key in &ordered {
+            let one = self
+                .read_with_heal(
+                    queues,
+                    std::slice::from_ref(key),
+                    consumer,
+                    count,
+                    Duration::ZERO,
+                )
+                .await?;
+            if one.keys.iter().any(|stream| !stream.ids.is_empty()) {
+                any_ready = true;
+            }
+            reply.keys.extend(one.keys);
+        }
+        if !any_ready
+            && !wait.is_zero()
+            && let Some(first) = ordered.first()
+        {
+            let blocked = self
+                .read_with_heal(queues, std::slice::from_ref(first), consumer, count, wait)
+                .await?;
+            reply.keys.extend(blocked.keys);
+        }
 
         let mut candidates = Vec::new();
         let mut malformed = Vec::new();

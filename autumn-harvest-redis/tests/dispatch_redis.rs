@@ -587,6 +587,56 @@ async fn a_blocking_read_returns_early_when_an_entry_arrives() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_multi_queue_blocking_read_still_delivers_an_arrival_on_either_queue() {
+    // Issue #1429, Codex review: a multi-queue read no longer combines every
+    // queue's stream into one blocking `XREADGROUP` (that crossed Redis
+    // Cluster slots). It blocks on only the queue this call's own rotation
+    // leads with, and reads every other queue non-blocking. A caller's own
+    // poll loop calls `next` repeatedly. It still picks up an arrival on any
+    // queue within a small bounded number of calls, regardless of which
+    // queue led this call's rotation.
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["multi-a".to_string(), "multi-b".to_string()];
+    // Prime both consumer groups so neither read hits NOGROUP mid-test.
+    assert!(read(&fixture, &queues, 10).await.is_empty());
+
+    let task_id = Uuid::new_v4();
+    let publisher = fixture.dispatch.clone();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        publisher
+            .publish(&[hint("multi-b", task_id, Utc::now())])
+            .await
+            .expect("publish");
+    });
+
+    let started = Instant::now();
+    let mut leases = Vec::new();
+    while leases.is_empty() && started.elapsed() < Duration::from_secs(5) {
+        leases = fixture
+            .dispatch
+            .next(&queues, "consumer-1", 10, Duration::from_millis(300))
+            .await
+            .expect("next");
+    }
+    handle.await.expect("publisher");
+
+    assert_eq!(
+        leases.len(),
+        1,
+        "the arrival on either queue must still be delivered"
+    );
+    assert_eq!(leases[0].task_id, task_id);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "delivery must stay within a small bounded number of poll calls (elapsed {:?})",
+        started.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_deleted_consumer_group_self_heals() {
     let Some(fixture) = try_start(Duration::from_secs(60)).await else {
         return;

@@ -26055,6 +26055,29 @@ fn reference_outcome(
     ))
 }
 
+/// What one lease still owes the channel after
+/// [`Worker::consume_reference`] decides its outcome, carrying the lease
+/// back to its caller for that.
+///
+/// [`Worker::dispatch_leases`] collects these across a whole read.
+/// It settles them in one `ack_many`/`release_many` call, instead of
+/// one channel round trip per lease (Codex review, issue #1429).
+#[derive(Debug, PartialEq, Eq)]
+enum ReferenceDisposition {
+    /// Claimed and dispatched. The lease still owes an `ack`.
+    Dispatched(crate::dispatch::DispatchLease),
+    /// Not claimed; the row is already terminal. The lease owes an `ack`.
+    AlreadyTerminal(crate::dispatch::DispatchLease),
+    /// Not claimed and retryable. The lease owes a `release` after this
+    /// delay.
+    Retry(crate::dispatch::DispatchLease, Duration),
+    /// [`Worker::retry_reference`] already disposed of this lease, on a
+    /// pool or probe failure. That path is a single lease's own error
+    /// recovery, not the common claim path this batches. Nothing left
+    /// for the caller to settle.
+    Handled,
+}
+
 impl Worker {
     /// Create a new worker from validated config and a handler registry.
     ///
@@ -28123,7 +28146,7 @@ impl Worker {
             }
         };
 
-        self.dispatch_leases(pool, shard, installed, state, leases, shard_count)
+        self.dispatch_leases(pool, shard, installed, leases, shard_count)
             .await
     }
 
@@ -28137,7 +28160,6 @@ impl Worker {
         pool: &DbPool,
         shard: Option<crate::types::ShardId>,
         installed: &crate::dispatch::InstalledDispatch,
-        state: &mut DispatchLoopState,
         leases: Vec<crate::dispatch::DispatchLease>,
         shard_count: usize,
     ) -> u32 {
@@ -28149,6 +28171,12 @@ impl Worker {
         // duplicated one. One `release_many` call replaces one `release` call
         // per such lease (issue #1429).
         let mut to_release: Vec<(crate::dispatch::DispatchLease, Duration)> = Vec::new();
+        // Leases `consume_reference` claimed and dispatched, or found already
+        // terminal. One `ack_many` call replaces one `ack` call per such
+        // lease (Codex review, issue #1429). A normal batch used to pay up to
+        // `DISPATCH_READ_MAX` separate acknowledgement round trips, despite
+        // `ack_many` already existing on the trait.
+        let mut to_ack: Vec<crate::dispatch::DispatchLease> = Vec::new();
         let mut leases = leases.into_iter();
         while let Some(lease) = leases.next() {
             if self.shutdown.is_cancelled() {
@@ -28179,20 +28207,21 @@ impl Worker {
                 }
                 None => None,
             };
-            if self
-                .consume_reference(
-                    pool,
-                    shard,
-                    installed,
-                    state,
-                    lease,
-                    reservation,
-                    shard_count,
-                )
+            match self
+                .consume_reference(pool, shard, installed, lease, reservation, shard_count)
                 .await
             {
-                dispatched += 1;
+                ReferenceDisposition::Dispatched(lease) => {
+                    dispatched += 1;
+                    to_ack.push(lease);
+                }
+                ReferenceDisposition::AlreadyTerminal(lease) => to_ack.push(lease),
+                ReferenceDisposition::Retry(lease, delay) => to_release.push((lease, delay)),
+                ReferenceDisposition::Handled => {}
             }
+        }
+        if !to_ack.is_empty() {
+            let _ = dispatch_call(installed.channel.ack_many(&to_ack), "ack").await;
         }
         if !to_release.is_empty() {
             let _ = dispatch_call(installed.channel.release_many(&to_release), "release").await;
@@ -28301,30 +28330,24 @@ impl Worker {
         }
     }
 
-    /// Claim the row one reference names, then ack or release the reference.
+    /// Claim the row one reference names, then say what its caller still
+    /// owes it.
     ///
-    /// Returns `true` when the row was claimed and dispatched.
-    ///
-    /// One reference is disposed of per call. [`crate::dispatch::TaskDispatch`]
-    /// takes one lease per `ack` and per `release`, so a batched disposal for
-    /// the whole read would need a trait change. That is a follow-up, not a
-    /// change this path can make on its own.
+    /// Returns the disposition [`Worker::dispatch_leases`] settles.
     ///
     /// `shard_count` follows [`dispatch_read_block`] (Codex review, issue
     /// #1429). More than one bounds the pool-connection wait, the same
     /// bound `poll_once`'s sibling branches already use. So an exhausted
     /// pool on this shard cannot strand the round-robin's other shards.
-    #[allow(clippy::too_many_arguments)]
     async fn consume_reference(
         &self,
         pool: &DbPool,
         shard: Option<crate::types::ShardId>,
         installed: &crate::dispatch::InstalledDispatch,
-        state: &mut DispatchLoopState,
         lease: crate::dispatch::DispatchLease,
         reservation: Option<DispatchReservation>,
         shard_count: usize,
-    ) -> bool {
+    ) -> ReferenceDisposition {
         let mut conn = match acquire_shard_conn(
             pool,
             shard_acquire_bound(shard_count > 1, self.config.poll_interval),
@@ -28337,7 +28360,7 @@ impl Worker {
                 // The pool is unavailable, not the row, so give the reference
                 // straight back and let the next iteration try again.
                 self.retry_reference(installed, &lease).await;
-                return false;
+                return ReferenceDisposition::Handled;
             }
         };
 
@@ -28362,17 +28385,13 @@ impl Worker {
                 // pending list; recovery redelivers it, the row reads
                 // `RUNNING`, and the redelivered reference is acked.
                 //
-                // The pool connection goes back before the ack. The ack is a
-                // round trip to the channel. Holding a connection across it
-                // would keep one connection busy per in-flight reference, for a
-                // call the database has no part in (issue #1312 review).
+                // The pool connection goes back before the caller's batched
+                // ack. The ack is a round trip to the channel. Holding a
+                // connection across it would keep one connection busy per
+                // in-flight reference, for a call the database has no part
+                // in (issue #1312 review).
                 drop(conn);
                 chaos_point!(DISPATCH_AFTER_CLAIM_BEFORE_ACK);
-                if let Err(error) = dispatch_call(installed.channel.ack(&lease), "ack").await {
-                    // The claim is durable either way. A failed ack costs one
-                    // redelivery, which finds the row `RUNNING` and acks.
-                    self.log_dispatch_error(state, &error, "dispatch ack failed after a claim");
-                }
                 tracing::debug!(
                     task_id = %task.id,
                     task_type = %task.task_type,
@@ -28380,7 +28399,7 @@ impl Worker {
                     "claimed task (dispatch)"
                 );
                 self.dispatch_task(task, pool, reservation);
-                true
+                ReferenceDisposition::Dispatched(lease)
             }
             Ok(None) => {
                 let probe = match queue::dispatch_probe(&mut conn, lease.task_id).await {
@@ -28389,7 +28408,7 @@ impl Worker {
                         tracing::warn!(error = %error, task_id = %lease.task_id, "dispatch probe failed");
                         drop(conn);
                         self.retry_reference(installed, &lease).await;
-                        return false;
+                        return ReferenceDisposition::Handled;
                     }
                 };
                 let outcome = reference_outcome(
@@ -28398,27 +28417,19 @@ impl Worker {
                     chrono::Utc::now(),
                     &installed.settings,
                 );
-                // Same reason as the claimed arm: the disposal is a channel
-                // round trip, so the connection goes back first.
+                // Same reason as the claimed arm: disposal is a channel round
+                // trip the caller batches, so the connection goes back first.
                 drop(conn);
-                let result = match outcome {
-                    ReferenceOutcome::Ack => {
-                        dispatch_call(installed.channel.ack(&lease), "ack").await
-                    }
-                    ReferenceOutcome::Release(delay) => {
-                        dispatch_call(installed.channel.release(&lease, delay), "release").await
-                    }
-                };
-                if let Err(error) = result {
-                    self.log_dispatch_error(state, &error, "dispatch reference disposal failed");
+                match outcome {
+                    ReferenceOutcome::Ack => ReferenceDisposition::AlreadyTerminal(lease),
+                    ReferenceOutcome::Release(delay) => ReferenceDisposition::Retry(lease, delay),
                 }
-                false
             }
             Err(error) => {
                 tracing::error!(error = %error, task_id = %lease.task_id, "failed to claim a dispatched task");
                 drop(conn);
                 self.retry_reference(installed, &lease).await;
-                false
+                ReferenceDisposition::Handled
             }
         }
     }
@@ -28538,25 +28549,6 @@ impl Worker {
             "release",
         )
         .await;
-    }
-
-    /// Log a channel error at most once per [`DISPATCH_ERROR_LOG_INTERVAL`].
-    ///
-    /// A channel that is down fails on every iteration, so an unthrottled log
-    /// would bury the rest of the worker's output.
-    fn log_dispatch_error(
-        &self,
-        state: &mut DispatchLoopState,
-        error: &HarvestError,
-        message: &'static str,
-    ) {
-        if state.may_log_error() {
-            tracing::warn!(
-                worker_id = %self.config.worker_id,
-                error = %error,
-                "{message}"
-            );
-        }
     }
 
     /// The single-pool poll loop.

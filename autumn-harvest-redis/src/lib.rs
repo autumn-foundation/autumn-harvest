@@ -76,11 +76,14 @@
 //!   #1429). A queue's stream, delayed set, payload hash and markers all
 //!   carry the same `{prefix:dispatch:queue}` tag. The multi-key scripts
 //!   (`PUBLISH_LUA`, `REQUEUE_LUA`, `PROMOTE_MARKED_LUA`) therefore stay in
-//!   one Redis Cluster slot. This crate still connects with a single-node
+//!   one Redis Cluster slot. The dispatch read (`next`) does too: it reads
+//!   one queue's stream per call, never combining several queues into one
+//!   multi-key `XREADGROUP` (Codex review, issue #1429). This crate still
+//!   connects with a single-node
 //!   [`redis::Client`]/[`ConnectionManager`](redis::aio::ConnectionManager),
 //!   not a cluster-aware client. It does not yet follow `MOVED`/`ASK`
-//!   redirects across a multi-node Cluster deployment. The hash tags remove
-//!   the `CROSSSLOT` failure. A cluster-aware client is a separate follow-up.
+//!   redirects across a multi-node Cluster deployment. A cluster-aware
+//!   client is a separate follow-up.
 //! - **Upgrading from a pre-#1429 deployment leaves old keys behind.** Every
 //!   dispatch key moved from `{prefix}:dispatch:{queue}...` to the tagged
 //!   `{prefix:dispatch:queue}...` form above. No code reads the old,
