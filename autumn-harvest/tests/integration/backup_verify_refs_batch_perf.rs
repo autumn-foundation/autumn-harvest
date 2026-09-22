@@ -9,25 +9,25 @@
 //! reference — `n` round trips for `n` references pointing at one target
 //! shard.
 //!
-//! This is the exact class of query the sibling completion-trigger-fire
-//! path (`adjudicate_trigger_fires`, issue #1401) was already rewritten to
-//! avoid, and for the documented reason: "One query per fire ... would make
-//! a routine restore drill issue up to two round trips per row." That
-//! reasoning applies unchanged to `adjudicate_refs` — it was simply never
-//! carried over when #1401 landed.
+//! The sibling completion-trigger-fire path (`adjudicate_trigger_fires`,
+//! issue #1401) was already rewritten to avoid this exact query class. Its
+//! own comment states the reason: "One query per fire ... would make a
+//! routine restore drill issue up to two round trips per row." That
+//! reasoning applies unchanged here. It was simply never carried over to
+//! `adjudicate_refs` when #1401 landed.
 //!
-//! The fix batches the state lookup with the same `= ANY($1)` shape and the
-//! same `WORKFLOW_KEY_LOOKUP_CHUNK` (1,000-row) bound `adjudicate_refs`'s
-//! sibling already uses, so a whole-shard batch cannot hold an unbounded
-//! request or result set in memory either.
+//! The fix batches the state lookup with the same `= ANY($1)` shape
+//! `adjudicate_refs`'s sibling already uses. It keeps the same
+//! `WORKFLOW_KEY_LOOKUP_CHUNK` (1,000-row) bound, so a whole-shard batch
+//! still cannot hold an unbounded request or result set in memory.
 //!
 //! Evidence here is `pg_stat_statements` call counts, driven end-to-end
-//! through the public `verify_restore` entry point against two real,
-//! freshly-migrated shard databases — not a direct call to the private
-//! `adjudicate_refs` helper. This harness follows the same shape as
-//! `child_fanout_batch_perf.rs`: a fresh, uniquely-named database per
-//! measurement, `pg_stat_statements` reset immediately before the measured
-//! call and snapshotted immediately after it.
+//! through the public `verify_restore` entry point. Two real,
+//! freshly-migrated shard databases back it, not a direct call to the
+//! private `adjudicate_refs` helper. This harness follows the same shape as
+//! `child_fanout_batch_perf.rs`. Each measurement gets a fresh,
+//! uniquely-named database. `pg_stat_statements` resets immediately before
+//! the measured call, and it is snapshotted immediately after.
 
 use autumn_harvest::backup_verify::{ShardTarget, VerifyOptions, verify_restore};
 use autumn_harvest::testing::WorkflowReplayer;
@@ -192,15 +192,16 @@ async fn append_event(
     .expect("append event");
 }
 
-/// How many awaited-child references the fixture seeds. Comfortably inside
-/// `VerifyOptions::default().probe_limit` (1,000) and `WORKFLOW_KEY_LOOKUP_CHUNK`
-/// (1,000), so the whole fixture lands in one owner-shard batch either way —
-/// this measures the per-reference round-trip count, not chunking behavior.
+/// How many awaited-child references the fixture seeds. This stays
+/// comfortably inside `VerifyOptions::default().probe_limit` (1,000) and
+/// `WORKFLOW_KEY_LOOKUP_CHUNK` (1,000). The whole fixture lands in one
+/// owner-shard batch either way, so this measures the per-reference
+/// round-trip count, not chunking behavior.
 const REF_COUNT: i64 = 500;
 
 /// End-to-end: `N` parents on shard 0 each await one distinct, live child on
-/// shard 1. Every child exists and is `RUNNING`, so every reference takes the
-/// clean `(AwaitedChild, Some(_))` branch in `adjudicate_refs` — no
+/// shard 1. Every child exists and is `RUNNING`. So every reference takes
+/// the clean `(AwaitedChild, Some(_))` branch in `adjudicate_refs` — no
 /// `retention_summary_exists` or `effect_verdict` calls to muddy the count.
 /// This isolates exactly the state lookup the fix targets.
 #[tokio::test]
@@ -285,16 +286,20 @@ async fn awaited_child_batch_resolves_with_bounded_state_lookup_calls() {
         "select id, state from harvest_workflow_executions where id = any($1)",
     );
 
-    // RED: characterizes the current, unfixed behavior. Measured on this
-    // machine: `SELECT state FROM harvest_workflow_executions WHERE id = $1`
-    // -- calls: 500, exactly `REF_COUNT`. That is one round trip per
-    // reference. No batched `= ANY($1)` statement exists yet.
+    // GREEN: the fixed shape. The whole REF_COUNT-wide batch resolves in one
+    // `= ANY($1)` round trip. REF_COUNT is well under the 1,000-row chunk
+    // bound. The old per-row statement is never issued at all. Measured on
+    // this machine: before the fix, `SELECT state FROM
+    // harvest_workflow_executions WHERE id = $1` had calls: 500 (one per
+    // reference). After the fix, it has calls: 0.
     assert_eq!(
-        per_row_calls, REF_COUNT,
-        "adjudicate_refs currently issues one `WHERE id = $1` round trip per reference: {rows:#?}"
+        per_row_calls, 0,
+        "the per-reference `WHERE id = $1` state lookup must not be issued once the batch fix \
+         is in place: {rows:#?}"
     );
     assert_eq!(
-        batched_calls, 0,
-        "no batched `= ANY($1)` state lookup exists yet: {rows:#?}"
+        batched_calls, 1,
+        "a {REF_COUNT}-reference batch, under the 1,000-row chunk bound, must resolve its \
+         state lookup in exactly one `= ANY($1)` round trip: {rows:#?}"
     );
 }

@@ -3132,34 +3132,80 @@ mod probes {
             .collect())
     }
 
-    /// Look up each reference's target on its owning shard and bucket the
+    /// One execution id's state, matched via `= ANY($1)` (issue #1717,
+    /// mirroring the completion-trigger-fire batching `matching_workflow_executions`
+    /// already established for issue #1401).
+    #[derive(diesel::QueryableByName)]
+    struct ExecutionStateRow {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+        #[diesel(sql_type = Text)]
+        state: String,
+    }
+
+    /// Which of the given execution ids exist, and their state, in ONE round
+    /// trip (issue #1717).
+    ///
+    /// The caller chunks at [`WORKFLOW_KEY_LOOKUP_CHUNK`] -- this function
+    /// does not chunk internally, matching [`matching_workflow_keys`]'s own
+    /// contract.
+    async fn matching_execution_states(
+        conn: &mut AsyncPgConnection,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, String>, diesel::result::Error> {
+        let rows: Vec<ExecutionStateRow> = diesel::sql_query(
+            "SELECT id, state FROM harvest_workflow_executions WHERE id = ANY($1)",
+        )
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
+        .load(conn)
+        .await?;
+        Ok(rows.into_iter().map(|r| (r.id, r.state)).collect())
+    }
+
+    /// Look up every reference's target on its owning shard and bucket the
     /// verdict. Split out of `resolve_refs` so the per-shard connection
     /// handling and the per-reference verdict logic stay separately readable.
+    ///
+    /// The state lookup itself is batched, `= ANY($1)` per
+    /// [`WORKFLOW_KEY_LOOKUP_CHUNK`]-sized chunk of `owned`, not one
+    /// `WHERE id = $1` round trip per reference (issue #1717). A restore
+    /// drill's cross-shard reference set can reach into the thousands for a
+    /// busy fan-out workflow. `adjudicate_trigger_fires` was already
+    /// rewritten to avoid this exact query class, for issue #1401. That fix
+    /// was never carried over to this, its older sibling. Chunking (rather
+    /// than one whole-shard batch) bounds request and result-set size the
+    /// same way it does there.
     async fn adjudicate_refs(conn: &mut AsyncPgConnection, owned: &[&PendingRef]) -> RefBuckets {
         let mut out = RefBuckets::default();
-        for r in owned {
-            // `.optional()` is load-bearing: `get_result` returns
-            // `Err(NotFound)` for zero rows AND `Err(DatabaseError)` for a
-            // real failure. Collapsing both with `.ok()` would make a
-            // transient query error read as "this execution is absent" --
-            // an Incoherent verdict (exit 1, "do not start workers") on a
-            // perfectly good restore -- and, for a recorded terminal, read
-            // as ordinary retention, hiding a genuine rollback.
-            let looked_up =
-                diesel::sql_query("SELECT state FROM harvest_workflow_executions WHERE id = $1")
-                    .bind::<diesel::sql_types::Uuid, _>(r.target)
-                    .get_result::<StateRow>(conn)
-                    .await
-                    .optional();
 
-            let state: Option<String> = match looked_up {
-                Ok(row) => row.map(|row| row.state),
+        // A chunk-level failure marks every reference in that chunk as a
+        // lookup error rather than aborting the whole batch, mirroring
+        // `adjudicate_trigger_fire_chunk`'s per-chunk error handling.
+        let mut states: std::collections::HashMap<Uuid, String> = std::collections::HashMap::new();
+        let mut lookup_failed: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        for chunk in owned.chunks(WORKFLOW_KEY_LOOKUP_CHUNK) {
+            let ids: Vec<Uuid> = chunk.iter().map(|r| r.target).collect();
+            match matching_execution_states(conn, &ids).await {
+                Ok(found) => states.extend(found),
                 Err(e) => {
-                    out.lookup_errors
-                        .push(format!("{} lookup failed: {e}", r.target));
-                    continue;
+                    for r in chunk {
+                        out.lookup_errors
+                            .push(format!("{} lookup failed: {e}", r.target));
+                        lookup_failed.insert(r.target);
+                    }
                 }
-            };
+            }
+        }
+
+        for r in owned {
+            if lookup_failed.contains(&r.target) {
+                continue;
+            }
+            // Absent from `states` means zero rows matched -- the batched
+            // equivalent of the old `.optional()` `None` branch. A chunk-level
+            // `Err` was already recorded above and is skipped here, so this
+            // loop only ever sees "found, with a state" or "genuinely absent".
+            let state: Option<String> = states.get(&r.target).cloned();
 
             match (&r.kind, state) {
                 (RefKind::AwaitedChild, None) => {
