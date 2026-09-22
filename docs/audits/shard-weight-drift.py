@@ -38,15 +38,16 @@ script is that accounting, run automatically instead of by hand:
    `integration` row with a filter names a module under
    `autumn-harvest/tests/integration/<filter>.rs`; every other row names
    `<crate>/tests/<target>.rs` directly.
-3. Weigh each row by its file's runnable-test attribute count: `#[test]`
-   and `#[tokio::test]` (matching every argument variant, e.g.
-   `#[tokio::test(flavor = "multi_thread")]`, any indentation, since a
-   nested-module test is indented, and excluding any test also carrying
-   `#[ignore]` — see `test_weight()`'s own docstring for two rounds of
-   Codex-review corrections to this counting: an indentation/plain-`#[test]`
-   undercount, a multi-line-attribute undercount, and an `#[ignore]`
-   overcount, in that order. Every number in this docstring reflects all
-   three fixes.
+3. Weigh each row by counting only the `#[test]`/`#[tokio::test]` functions
+   that actually compile and run for THAT row's enabled feature set (the
+   crate's own defaults, since `run-suites.sh` never passes
+   `--no-default-features` for `linux` rows, plus whatever the manifest's
+   `feats` column adds) and are not `#[ignore]`d (never run — `run-suites.sh`
+   passes no `--ignored`/`--include-ignored`). See `test_weight()`'s own
+   docstring for three rounds of Codex-review corrections to this counting:
+   an indentation/plain-`#[test]` undercount, a multi-line-attribute
+   undercount, an `#[ignore]` overcount, and a `cfg(feature = ...)` overcount,
+   in that order. Every number in this docstring reflects all four fixes.
 4. Read `SEMAPHORE_SHARD_COUNT` out of the `test-db-linux` job block in
    `ci.yml` (not hand-copied), and report each shard's total weight plus
    any shard carrying more than one row at or above HEAVY_THRESHOLD.
@@ -135,6 +136,16 @@ IGNORE_ATTR_RE = re.compile(r"^\s*#\[ignore\b")
 ATTR_LINE_RE = re.compile(r"^\s*#\[")
 FN_LINE_RE = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s")
 COMMENT_OR_BLANK_RE = re.compile(r"^\s*(#|$)")
+# `#[cfg(...)]` gates one item (typically the next `mod` or `fn`); `#![cfg(...)]`
+# is an inner attribute gating the item it appears INSIDE (here, always the
+# whole file, since every occurrence in this corpus is the first line of a
+# `tests/integration/*.rs` module file). Both are single-line in every
+# instance this corpus has today (checked against the 5 "linux"-reachable
+# files that use `cfg(feature`).
+CFG_ATTR_RE = re.compile(r"^\s*#\[cfg\((.*)\)\]\s*$")
+CFG_INNER_ATTR_RE = re.compile(r"^\s*#!\[cfg\((.*)\)\]\s*$")
+MOD_OPEN_RE = re.compile(r"^\s*(?:pub\s+)?mod\s+\w+\s*\{")
+FEATURE_RE = re.compile(r'feature\s*=\s*"([^"]+)"')
 
 
 def parse_manifest_records(text):
@@ -175,29 +186,129 @@ def resolve_test_file(crate, target, filt):
     return REPO_ROOT / crate / "tests" / f"{target}.rs"
 
 
+_DEFAULT_FEATURES_CACHE = {}
+
+
+def crate_default_features(crate):
+    """Read `default = [...]` out of `<crate>/Cargo.toml`'s `[features]`
+    table (not hand-copied — a crate's defaults can change independently of
+    this script). No `default` key, or no `[features]` table at all, means
+    an empty default set, matching Cargo's own behavior."""
+    if crate in _DEFAULT_FEATURES_CACHE:
+        return _DEFAULT_FEATURES_CACHE[crate]
+    path = REPO_ROOT / crate / "Cargo.toml"
+    features = set()
+    try:
+        text = path.read_text(encoding="utf-8")
+        match = re.search(r'^default\s*=\s*\[([^\]]*)\]', text, re.MULTILINE)
+        if match:
+            features = {
+                f.strip().strip('"') for f in match.group(1).split(",") if f.strip()
+            }
+    except FileNotFoundError:
+        pass
+    _DEFAULT_FEATURES_CACHE[crate] = features
+    return features
+
+
+def enabled_features_for_row(crate, feats):
+    """The feature set active for a `linux`-osclass row's `cargo test`
+    invocation: `run-suites.sh`'s `do_run` never passes
+    `--no-default-features` for `linux` rows (only a specific `allos` case
+    does), so a row's enabled set is always the crate's own defaults, PLUS
+    whatever the manifest's `feats` column adds via `--features`.
+
+    KNOWN LIMITATION: this is a plain set union, not a full dependency-graph
+    walk of `[features]` — if some feature X the manifest row requests
+    itself implies a different feature Y transitively (`X = ["Y", ...]` in
+    `Cargo.toml`) without Y being named directly in either the row's
+    `feats` column or the crate's `default` list, Y is not detected as
+    enabled here. None of the features actually gating a test in a
+    `linux`-reachable file today (`db`, `testing`) hit that gap — `db` is
+    always in `autumn-harvest`'s own default set, and every row gating on
+    `testing` either lists it directly in `feats` or doesn't have it
+    enabled at all (checked by hand against today's 5 affected files)."""
+    features = set(crate_default_features(crate))
+    if feats != "-":
+        features |= {f.strip() for f in feats.split(",") if f.strip()}
+    return features
+
+
+def cfg_is_enabled(condition, enabled_features):
+    """Evaluate a `cfg(...)`/`cfg!(...)`'s inner condition text against a
+    row's enabled feature set. Handles only the forms actually present in
+    this corpus today (checked by hand): a bare `feature = "X"`, an
+    `all(feature = "A", feature = "B", ...)` (AND — no `any(feature = ...)`
+    combination appears anywhere in the corpus), and `test`/`unix`/
+    `target_os = "linux"` (always true — CI's Docker-backed shard runs on
+    `ubuntu-latest`) / `not(unix)` (always false there). Anything else is
+    treated as enabled (fail open): an unrecognized condition should not
+    silently make this script UNDER-count a test that really does run,
+    which was the failure mode of every correction so far in this file's
+    history — over-counting is the newly-introduced risk this leaves open,
+    and is why this function's coverage is documented rather than silent.
+    """
+    condition = condition.strip()
+    if condition in ("test", "unix") or condition == 'target_os = "linux"':
+        return True
+    if condition == "not(unix)":
+        return False
+    if condition.startswith("all(") and condition.endswith(")"):
+        inner = condition[len("all(") : -1]
+        return all(feat in enabled_features for feat in FEATURE_RE.findall(inner))
+    single = FEATURE_RE.fullmatch(condition)
+    if single:
+        return single.group(1) in enabled_features
+    return True
+
+
 def row_label(crate, target, filt):
     if crate == "autumn-harvest" and target == "integration" and filt != "-":
         return f"{crate}/{target} -- {filt}"
     return f"{crate}/{target}"
 
 
-def test_weight(path):
-    """Count runnable `#[test]`/`#[tokio::test]` functions in `path`,
-    excluding any carrying `#[ignore]` — `run-suites.sh` invokes plain
+def test_weight(path, enabled_features=frozenset()):
+    """Count runnable `#[test]`/`#[tokio::test]` functions in `path` that
+    actually run under `enabled_features` — `run-suites.sh` invokes plain
     `cargo test` with no `--ignored`/`--include-ignored`, so an `#[ignore]`d
-    test never actually executes in CI and should not count toward a shard's
-    real workload. Caught by Codex review on this harness's own first PR:
-    `claim_budget_tests.rs` carries 7 `#[ignore]`d one-shot evidence
-    generators (documented in the file itself as "not a repeatable CI
-    assertion"), inflating its counted weight from 29 (what actually runs)
-    to 36 and fabricating a heavy-suite collision that direct log evidence
-    does not support.
+    test never executes, and a test gated behind a `cfg(feature = "X")` not
+    in this row's enabled set never even compiles in. Both are excluded.
+
+    **Three corrections, all from Codex review on this harness's PRs, each
+    the exact opposite failure mode of undercounting the module docstring
+    already covers — this function counts too MUCH unless corrected:**
+
+    1. `#[ignore]`: `claim_budget_tests.rs` carries 7 `#[ignore]`d one-shot
+       evidence generators (documented in the file itself as "not a
+       repeatable CI assertion"), inflating its weight from 29 (what
+       actually runs) to 36 and fabricating a heavy-suite collision direct
+       log evidence does not support.
+    2. `cfg(feature = ...)`: `retry_after_tests.rs`'s `replay_tests` module
+       is `#[cfg(feature = "testing")]`, but its manifest row requests no
+       extra features (`feats` column is `-`) and `autumn-harvest`'s own
+       defaults don't include `testing` — so its 1 test never compiles for
+       that row, and the file's real weight is 6, not the 7 a plain
+       attribute count finds.
+    3. `#![cfg(...)]` (an inner attribute, gating the enclosing item — here,
+       always the whole file, since every occurrence in this corpus is a
+       file's first line): `claim_budget_tests.rs` and
+       `quota_history_bytes_perf_tests.rs` both open with
+       `#![cfg(feature = "db")]`. `db` is one of `autumn-harvest`'s own
+       default features, so this is always true for every `linux` row today
+       (`run-suites.sh` never passes `--no-default-features` there) — a
+       currently-inert case, kept correct anyway rather than assumed.
 
     Attributes stack directly above their `fn`/`async fn` line with no
     blank line between (a leading `///` doc-comment block may sit above the
     attribute stack, but never inside it), so a small forward scan — collect
     contiguous `#[...]` lines, decide on the next `fn` line, then reset — is
-    accurate without a full Rust parser.
+    accurate without a full Rust parser. A `#[cfg(...)]` directly above a
+    `mod name {` gates every test inside that module until its closing
+    brace: tracked with a running `{`/`}` depth count (checked, not
+    assumed, against every "linux"-reachable file using `cfg(feature` in
+    today's corpus — none nests a cfg'd `mod` inside another, so a single
+    stack level suffices, but the code stacks correctly regardless).
 
     An attribute can span multiple physical lines two different ways in this
     corpus: a bracketed argument list broken across lines
@@ -220,29 +331,63 @@ def test_weight(path):
         lines = path.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
         return None
+    for line in lines[:5]:
+        inner = CFG_INNER_ATTR_RE.match(line)
+        if inner and not cfg_is_enabled(inner.group(1), enabled_features):
+            return 0
     count = 0
     pending_test = False
     pending_ignore = False
+    pending_cfgs = []
     bracket_depth = 0
+    brace_depth = 0
+    scope_stack = []  # list of (depth_to_pop_at, enabled)
     for line in lines:
+        delta = line.count("{") - line.count("}")
         if bracket_depth > 0:
             bracket_depth += line.count("[") + line.count("(")
             bracket_depth -= line.count("]") + line.count(")")
+            brace_depth += delta
+            while scope_stack and brace_depth <= scope_stack[-1][0]:
+                scope_stack.pop()
             continue
         if ATTR_LINE_RE.match(line):
             if TEST_ATTR_RE.match(line):
                 pending_test = True
             if IGNORE_ATTR_RE.match(line):
                 pending_ignore = True
+            cfg_match = CFG_ATTR_RE.match(line)
+            if cfg_match:
+                pending_cfgs.append(cfg_match.group(1))
             bracket_depth = line.count("[") + line.count("(")
             bracket_depth -= line.count("]") + line.count(")")
+            brace_depth += delta
+            while scope_stack and brace_depth <= scope_stack[-1][0]:
+                scope_stack.pop()
+            continue
+        if MOD_OPEN_RE.match(line):
+            enabled = all(cfg_is_enabled(c, enabled_features) for c in pending_cfgs)
+            scope_stack.append((brace_depth, enabled))
+            pending_test = False
+            pending_ignore = False
+            pending_cfgs = []
+            brace_depth += delta
             continue
         if FN_LINE_RE.match(line):
-            if pending_test and not pending_ignore:
+            scope_enabled = all(enabled for _depth, enabled in scope_stack)
+            item_enabled = all(cfg_is_enabled(c, enabled_features) for c in pending_cfgs)
+            if pending_test and not pending_ignore and scope_enabled and item_enabled:
                 count += 1
             pending_test = False
             pending_ignore = False
+            pending_cfgs = []
+            brace_depth += delta
+            while scope_stack and brace_depth <= scope_stack[-1][0]:
+                scope_stack.pop()
             continue
+        brace_depth += delta
+        while scope_stack and brace_depth <= scope_stack[-1][0]:
+            scope_stack.pop()
         stripped = line.strip()
         if stripped == "" or stripped.startswith("//"):
             continue
@@ -251,6 +396,7 @@ def test_weight(path):
         # misattributing it to a later, unrelated fn.
         pending_test = False
         pending_ignore = False
+        pending_cfgs = []
     return count
 
 
@@ -269,10 +415,11 @@ def read_shard_count():
 def weigh_rows(linux_rows):
     weights = []
     unresolved = []
-    for ordinal, (_os, crate, target, _feats, filt) in enumerate(linux_rows):
+    for ordinal, (_os, crate, target, feats, filt) in enumerate(linux_rows):
         path = resolve_test_file(crate, target, filt)
         label = row_label(crate, target, filt)
-        weight = test_weight(path)
+        enabled = enabled_features_for_row(crate, feats)
+        weight = test_weight(path, enabled)
         if weight is None:
             unresolved.append((ordinal, label, path))
             weight = 0
@@ -373,6 +520,87 @@ fn not_a_test() {}
         tmp_path.unlink()
     assert weight == 3, f"expected 3 runnable tests (excluding the ignored one), got {weight}"
     assert test_weight(Path("/nonexistent/path/does/not/exist.rs")) is None
+
+    # cfg(feature = ...) gating: a plain test, a #[cfg]'d mod block (gates
+    # every test inside until its closing brace), and an item-level
+    # #[cfg] directly on one test — each checked both with and without the
+    # gating feature enabled, matching retry_after_tests.rs's real shape.
+    cfg_fixture_rs = """\
+#[tokio::test]
+async fn always_runs() {}
+
+#[cfg(feature = "testing")]
+mod gated_mod {
+    #[tokio::test]
+    async fn inside_gated_mod() {}
+}
+
+#[cfg(feature = "chaos")]
+#[tokio::test]
+async fn item_level_gated() {}
+
+#[cfg(all(feature = "testing", feature = "db"))]
+#[tokio::test]
+async fn needs_both_features() {}
+"""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".rs", delete=False
+    ) as tmp:
+        tmp.write(cfg_fixture_rs)
+        cfg_path = Path(tmp.name)
+    try:
+        assert test_weight(cfg_path, frozenset()) == 1, "only always_runs, nothing gated on"
+        assert test_weight(cfg_path, frozenset({"testing"})) == 2, (
+            "always_runs + inside_gated_mod, needs_both_features still needs db too"
+        )
+        assert test_weight(cfg_path, frozenset({"testing", "db"})) == 3, (
+            "always_runs + inside_gated_mod + needs_both_features"
+        )
+        assert test_weight(cfg_path, frozenset({"chaos"})) == 2, (
+            "always_runs + item_level_gated"
+        )
+    finally:
+        cfg_path.unlink()
+
+    # #![cfg(...)] inner attribute: gates the WHOLE file (every occurrence in
+    # the real corpus is a file's first line), unlike the outer `#[cfg(...)]`
+    # forms above which gate only the next item.
+    inner_cfg_fixture_rs = """\
+#![cfg(feature = "db")]
+
+#[tokio::test]
+async fn only_if_db_enabled() {}
+"""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".rs", delete=False
+    ) as tmp:
+        tmp.write(inner_cfg_fixture_rs)
+        inner_path = Path(tmp.name)
+    try:
+        assert test_weight(inner_path, frozenset()) == 0, "whole file excluded, db not enabled"
+        assert test_weight(inner_path, frozenset({"db"})) == 1
+    finally:
+        inner_path.unlink()
+
+    assert cfg_is_enabled('feature = "testing"', {"testing"}) is True
+    assert cfg_is_enabled('feature = "testing"', set()) is False
+    assert cfg_is_enabled('all(feature = "a", feature = "b")', {"a", "b"}) is True
+    assert cfg_is_enabled('all(feature = "a", feature = "b")', {"a"}) is False
+    assert cfg_is_enabled("test", set()) is True
+    assert cfg_is_enabled("unix", set()) is True
+    assert cfg_is_enabled("not(unix)", set()) is False
+
+    assert enabled_features_for_row("autumn-harvest", "-") == {
+        "db",
+        "unified-dag-execution",
+    }
+    assert enabled_features_for_row("autumn-harvest", "testing,debugger") == {
+        "db",
+        "unified-dag-execution",
+        "testing",
+        "debugger",
+    }
+    assert enabled_features_for_row("autumn-harvest-plugin", "-") == set()
 
     print("self-test: ok")
 

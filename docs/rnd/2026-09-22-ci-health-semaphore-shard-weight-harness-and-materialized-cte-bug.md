@@ -120,6 +120,23 @@ also carry a real collision today, just a different one
 (`admission_gate_authoritative`/`shard_rebalance_db_tests`), not the one
 that report meant.
 
+**Fifth correction (Codex review, same PR).** While fixing the `#[ignore]`
+overcount, a related gap surfaced: the script also did not honor
+`cfg(feature = ...)` gates, so a test compiled only under a feature the
+row's manifest entry never requests was still counted as if it ran.
+Concretely: `retry_after_tests.rs`'s `replay_tests` module is
+`#[cfg(feature = "testing")]`, its manifest row requests no extra features
+(the `feats` column is `-`), and `autumn-harvest`'s own default features
+(`db`, `unified-dag-execution`) don't include `testing` — so that module's
+1 test never compiles for this row, and the file's real weight is 6, not
+the 7 a plain attribute count finds. `test_weight()` now takes the row's
+resolved feature set (crate defaults, plus whatever `feats` adds) and
+evaluates each test's `cfg(feature = ...)` — including a `cfg`'d `mod`
+wrapping several tests at once, and a `#![cfg(...)]` inner attribute gating
+a whole file — against it. This changed only `retry_after_tests`' own
+weight (7→6, shard 9, not part of any heavy collision); none of the seven
+collisions in the table above shifted.
+
 **A sweep of `SEMAPHORE_SHARD_COUNT` from 9 through 24 finds no value with
 zero heavy-suite (≥30 tests) collisions** — every count in that range has
 at least 4 shards each carrying 2+ heavy suites (re-run after all three
@@ -348,7 +365,7 @@ Carried forward, in priority order:
 - **Harness:** self-test passes; full run against today's manifest resolves
   all 151 `linux` rows (5 rows needed a `_tests`-suffix fallback the first
   version of the script missed — fixed and re-verified) and reproduces the
-  seven collisions above. **Corrected four times post-review (Codex, this
+  seven collisions above. **Corrected five times post-review (Codex, this
   PR):** the weight regex undercounted indented and plain `#[test]`
   attributes (`worker_session_tests` 0→15, `hot_code_swap_tests` 40→79 in
   two further steps below); a bracketed multi-line `#[allow(...)]` attribute
@@ -356,11 +373,16 @@ Carried forward, in priority order:
   `hot_code_swap_tests` again (79→77 at that point); `#[ignore]`d tests
   (never run by `run-suites.sh`, which passes no `--ignored` flag) were
   counted anyway, overcounting `claim_budget_tests` (36→29, dropping it out
-  of shard 7's heavy set); and the first draft named only 2 of the 7
-  collisions the script's own output shows. All four fixed, re-run, and the
-  corrected numbers are what this report now carries throughout. `--sweep`
-  output (N=9..24, re-run after every fix: still no collision-free N, best
-  case N=19 at 4 colliding shards) archived in the script's own docstring.
+  of shard 7's heavy set); `cfg(feature = ...)` gates (including a cfg'd
+  `mod` and a `#![cfg(...)]` whole-file inner attribute) were not honored,
+  overcounting `retry_after_tests` (7→6, no heavy-set change); and the
+  first draft named only 2 of the 7 collisions the script's own output
+  shows. All five fixed, re-run, and cross-checked against a raw-grep
+  sanity bound for every one of the 151 resolved rows (0 out-of-bound
+  results) — the corrected numbers are what this report now carries
+  throughout. `--sweep` output (N=9..24, re-run after every fix: still no
+  collision-free N, best case N=19 at 4 colliding shards) archived in the
+  script's own docstring.
 - **Item 2:** 1 occurrence this window, 4th cumulative — a count, not yet a
   rate; the ≥20x bar this role requires is still unmet.
 - **Item 4:** 1 run, 8/11 shards — worse than the 09-21 report's 6/11 on the
