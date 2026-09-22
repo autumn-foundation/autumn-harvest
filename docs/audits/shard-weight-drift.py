@@ -40,15 +40,13 @@ script is that accounting, run automatically instead of by hand:
    `<crate>/tests/<target>.rs` directly.
 3. Weigh each row by its file's runnable-test attribute count: `#[test]`
    and `#[tokio::test]` (matching every argument variant, e.g.
-   `#[tokio::test(flavor = "multi_thread")]`, and any indentation, since a
-   nested-module test is indented). **Correction (Codex review, this
-   harness's own first PR):** the first version of this script matched
-   only column-0 `#[tokio::test`, silently undercounting every indented
-   test and every plain `#[test]` — e.g. `worker_session_tests.rs` weighed
-   0 (its 12 tests are all indented) and `hot_code_swap_tests.rs` weighed
-   40 instead of 79 (missing 38 plain `#[test]`s and 1 indented
-   `#[tokio::test]`). Fixed; every number in this docstring reflects the
-   corrected regex.
+   `#[tokio::test(flavor = "multi_thread")]`, any indentation, since a
+   nested-module test is indented, and excluding any test also carrying
+   `#[ignore]` — see `test_weight()`'s own docstring for two rounds of
+   Codex-review corrections to this counting: an indentation/plain-`#[test]`
+   undercount, a multi-line-attribute undercount, and an `#[ignore]`
+   overcount, in that order. Every number in this docstring reflects all
+   three fixes.
 4. Read `SEMAPHORE_SHARD_COUNT` out of the `test-db-linux` job block in
    `ci.yml` (not hand-copied), and report each shard's total weight plus
    any shard carrying more than one row at or above HEAVY_THRESHOLD.
@@ -69,8 +67,18 @@ full set, from this script's own output:
 | 2  | `capability_miss_tests` (13, 46), `cross_region_dr_tests` (79, 31) |
 | 3  | `pacing_override_integration` (113, 46), `workflow_rerun_integration` (146, 68) |
 | 6  | `admission_gate_authoritative` (6, 34), `shard_rebalance_db_tests` (83, 111) |
-| 7  | `audit_export_tests` (7, 88), `claim_budget_tests` (18, 36), `event_partitioning_tests` (29, 155) |
+| 7  | `audit_export_tests` (7, 88), `event_partitioning_tests` (29, 155) |
 | 10 | `queue_pause_tests` (43, 44), `hot_code_swap_tests` (76, 79), `stall_diagnosis_integration` (131, 76) |
+
+Shard 7 also runs `claim_budget_tests` (ordinal 18) — the same
+`SEMAPHORE_SHARD_COUNT`-apart pattern as its two listed neighbors — but at a
+corrected weight of 29 (7 of its 36 matched attributes are `#[ignore]`d
+one-shot evidence generators that never run in CI) it falls just under
+HEAVY_THRESHOLD, so shard 7 is a genuine two-suite heavy collision, not
+three. **Correction (Codex review, this harness's own second PR round):**
+an earlier version of this table listed `claim_budget_tests` as shard 7's
+third heavy member at its uncorrected weight of 36; fixed once the
+`#[ignore]` exclusion above landed.
 
 Shards 0 and 7 remain the two worst by both row count and total weight, and
 shard 0's `integration_e2e`/`quota_enforcement_tests` pair is the only one a
@@ -108,6 +116,7 @@ prints the N=9..24 collision sweep this docstring's findings came from.
 import argparse
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -121,7 +130,10 @@ HEAVY_THRESHOLD_DEFAULT = 30
 # undercounted every indented test and every plain `#[test]` — caught by
 # Codex review on this harness's own first PR (see the module docstring's
 # "correction" note below for the concrete files this changed).
-TOKIO_TEST_RE = re.compile(r"^\s*#\[(?:tokio::test|test)\b", re.MULTILINE)
+TEST_ATTR_RE = re.compile(r"^\s*#\[(?:tokio::test|test)\b")
+IGNORE_ATTR_RE = re.compile(r"^\s*#\[ignore\b")
+ATTR_LINE_RE = re.compile(r"^\s*#\[")
+FN_LINE_RE = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s")
 COMMENT_OR_BLANK_RE = re.compile(r"^\s*(#|$)")
 
 
@@ -170,10 +182,76 @@ def row_label(crate, target, filt):
 
 
 def test_weight(path):
+    """Count runnable `#[test]`/`#[tokio::test]` functions in `path`,
+    excluding any carrying `#[ignore]` — `run-suites.sh` invokes plain
+    `cargo test` with no `--ignored`/`--include-ignored`, so an `#[ignore]`d
+    test never actually executes in CI and should not count toward a shard's
+    real workload. Caught by Codex review on this harness's own first PR:
+    `claim_budget_tests.rs` carries 7 `#[ignore]`d one-shot evidence
+    generators (documented in the file itself as "not a repeatable CI
+    assertion"), inflating its counted weight from 29 (what actually runs)
+    to 36 and fabricating a heavy-suite collision that direct log evidence
+    does not support.
+
+    Attributes stack directly above their `fn`/`async fn` line with no
+    blank line between (a leading `///` doc-comment block may sit above the
+    attribute stack, but never inside it), so a small forward scan — collect
+    contiguous `#[...]` lines, decide on the next `fn` line, then reset — is
+    accurate without a full Rust parser.
+
+    An attribute can span multiple physical lines two different ways in this
+    corpus: a bracketed argument list broken across lines
+    (`#[allow(\n    clippy::too_many_lines,\n)]`), and a string literal
+    continued with a trailing `\` (`#[ignore = "...\` /
+    `            ...script.sh"]`). Both are tracked the same way, by a
+    running count of unmatched `[`/`(` vs `]`/`)` on the attribute's own
+    text: the first case is unbalanced until its closing `)]`; the second is
+    unbalanced from the opening `#[`'s `[` until the closing `]` on the
+    string's continuation line (the backslash itself needs no special
+    handling — it is just a character to the bracket count). **Correction
+    (Codex review, this harness's own second PR round):** an earlier version
+    tracked only the trailing-backslash form, which mis-closed a bracketed
+    `#[allow(...)]` spanning multiple lines at its first line and lost the
+    pending test attribute before reaching `fn` — undercounting
+    `hot_code_swap_tests.rs` by 2 real tests (79 vs. the correct 77, once
+    also corrected for `#[ignore]` per this function's other fix).
+    """
     try:
-        return len(TOKIO_TEST_RE.findall(path.read_text(encoding="utf-8")))
+        lines = path.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
         return None
+    count = 0
+    pending_test = False
+    pending_ignore = False
+    bracket_depth = 0
+    for line in lines:
+        if bracket_depth > 0:
+            bracket_depth += line.count("[") + line.count("(")
+            bracket_depth -= line.count("]") + line.count(")")
+            continue
+        if ATTR_LINE_RE.match(line):
+            if TEST_ATTR_RE.match(line):
+                pending_test = True
+            if IGNORE_ATTR_RE.match(line):
+                pending_ignore = True
+            bracket_depth = line.count("[") + line.count("(")
+            bracket_depth -= line.count("]") + line.count(")")
+            continue
+        if FN_LINE_RE.match(line):
+            if pending_test and not pending_ignore:
+                count += 1
+            pending_test = False
+            pending_ignore = False
+            continue
+        stripped = line.strip()
+        if stripped == "" or stripped.startswith("//"):
+            continue
+        # Any other code line between attributes and a fn would be unusual;
+        # treat it as ending the pending attribute stack rather than
+        # misattributing it to a later, unrelated fn.
+        pending_test = False
+        pending_ignore = False
+    return count
 
 
 def read_shard_count():
@@ -253,6 +331,49 @@ linux        crate-b  suite_x      -  -
     assert row_label("autumn-harvest-plugin", "ui_integration", "-") == (
         "autumn-harvest-plugin/ui_integration"
     )
+
+    # test_weight: plain #[test], indented #[tokio::test], an #[ignore]d one
+    # (with a backslash-continued reason string, matching the real corpus's
+    # shape), and a doc comment sitting above an attribute stack — none of
+    # which should confuse the scan.
+    fixture_rs = """\
+/// Some doc comment.
+#[test]
+fn plain_test() {}
+
+mod nested {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nested_test() {}
+}
+
+/// `#[ignore]`d on purpose: a one-shot evidence generator.
+#[tokio::test]
+#[ignore = "evidence generator, not a CI assertion -- run via \\
+            some/script.sh"]
+#[allow(clippy::too_many_lines)]
+async fn ignored_test() {}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    clippy::needless_return
+)]
+async fn multiline_bracketed_attr_test() {}
+
+fn not_a_test() {}
+"""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".rs", delete=False
+    ) as tmp:
+        tmp.write(fixture_rs)
+        tmp_path = Path(tmp.name)
+    try:
+        weight = test_weight(tmp_path)
+    finally:
+        tmp_path.unlink()
+    assert weight == 3, f"expected 3 runnable tests (excluding the ignored one), got {weight}"
+    assert test_weight(Path("/nonexistent/path/does/not/exist.rs")) is None
+
     print("self-test: ok")
 
 

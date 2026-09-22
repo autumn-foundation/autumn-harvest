@@ -42,24 +42,48 @@ Running it against today's manifest (151 `linux` rows, `SEMAPHORE_SHARD_COUNT
 = 11`, both read out of the actual files rather than hand-copied):
 
 ```
-shard 0: total= 418  top=integration_e2e(120), api_scheduler_integration(80), backup_verify_tests(57)
-shard 7: total= 435  top=event_partitioning_tests(155), audit_export_tests(88), claim_budget_tests(36)
+shard 0: total= 417  top=integration_e2e(120), api_scheduler_integration(80), backup_verify_tests(57)
+shard 7: total= 426  top=event_partitioning_tests(155), audit_export_tests(88), claim_budget_tests(29)
 ```
 
-**Correction (Codex review on this PR):** the first version of this report
-and the script it ships weighed each row by column-0 `^#\[tokio::test` only,
-silently missing every indented test (nested-module tests) and every plain
-`#[test]`. Two examples Codex's review cited directly: `worker_session_tests`
-weighed 0 (its 12 tests are all indented) and `hot_code_swap_tests` weighed
-40 instead of 79 (missing 38 plain `#[test]`s and one indented
+**Correction (Codex review on this PR, three rounds).** First, the initial
+version of this report and the script it ships weighed each row by column-0
+`^#\[tokio::test` only, silently missing every indented test (nested-module
+tests) and every plain `#[test]`. Two examples Codex's review cited
+directly: `worker_session_tests` weighed 0 (its 12 tests are all indented,
+plus 3 plain `#[test]`s) and `hot_code_swap_tests` weighed 40 instead of a
+then-computed 79 (missing 38 plain `#[test]`s and one indented
 `#[tokio::test]`). Fixed to match `#[test]`/`#[tokio::test]` with optional
-leading whitespace; every weight number in this report reflects the
-corrected count (`integration_e2e` moved 118→120,
-`event_partitioning_tests` 148→155, `audit_export_tests` 87→88,
-`claim_budget_tests` 34→36, `hot_code_swap_tests` 40→79 — see the diffs
-above and below).
+leading whitespace.
 
-**Second correction (Codex review, same PR):** the first version of this
+Second, a follow-up Codex round on the fix itself caught that a bracketed
+multi-line attribute (`#[allow(\n    clippy::too_many_lines,\n)]`, as
+opposed to the corpus's other multi-line form, a string continued with a
+trailing `\`) broke the same forward scan a different way: the scanner saw
+a non-attribute, non-`fn` line before reaching the closing `)]` and dropped
+the pending test attribute. This undercounted `hot_code_swap_tests` by 2
+(79→77 at that point). Fixed with a running open/close bracket count
+spanning both multi-line forms uniformly, rather than a backslash-only
+check.
+
+Third, the same Codex round separately caught that `run-suites.sh` invokes
+plain `cargo test` with no `--ignored`/`--include-ignored`, so a test
+carrying `#[ignore]` never actually executes in CI and should not count
+toward a shard's real workload — but the script counted it anyway.
+Concretely: `claim_budget_tests.rs` carries 7 `#[ignore]`d one-shot evidence
+generators (the file's own comments call them "not a repeatable CI
+assertion"), so its real weight is 29, not the 36 every earlier draft of
+this report used. Fixed by tracking each test attribute's adjacent
+`#[ignore]` attribute during the same scan.
+
+All three fixes together move the specific numbers this report cites:
+`integration_e2e` 118→120, `event_partitioning_tests` 148→155,
+`audit_export_tests` 87→88, `hot_code_swap_tests` 40→79,
+`claim_budget_tests` 34→**29** (net down, the only one of these five that
+moved down — the `#[ignore]` exclusion outweighs the indentation fix here).
+Every weight number in this report now reflects all three fixes.
+
+**Fourth correction (Codex review, same PR):** the first version of this
 report also singled out only two of the collisions the script itself
 reports, which read as if they were the whole finding. Under today's
 `SEMAPHORE_SHARD_COUNT = 11`, the harness finds **seven** shards carrying
@@ -73,12 +97,19 @@ them is a genuine `SEMAPHORE_SHARD_COUNT`-apart-ordinal collision:
 | 2  | `capability_miss_tests` (13, 46), `cross_region_dr_tests` (79, 31) |
 | 3  | `pacing_override_integration` (113, 46), `workflow_rerun_integration` (146, 68) |
 | 6  | `admission_gate_authoritative` (6, 34), `shard_rebalance_db_tests` (83, 111) |
-| 7  | `audit_export_tests` (7, 88), `claim_budget_tests` (18, 36), `event_partitioning_tests` (29, 155) |
+| 7  | `audit_export_tests` (7, 88), `event_partitioning_tests` (29, 155) |
 | 10 | `queue_pause_tests` (43, 44), `hot_code_swap_tests` (76, 79), `stall_diagnosis_integration` (131, 76) |
+
+Shard 7 also runs `claim_budget_tests` (ordinal 18) — the same
+`SEMAPHORE_SHARD_COUNT`-apart pattern as its two listed neighbors — but at
+its corrected weight of 29 it falls just under the heavy threshold, so
+shard 7 is a genuine two-suite heavy collision, not three (an earlier draft
+of this table, before the `#[ignore]` fix, listed it as a third member at
+its uncorrected weight of 36).
 
 Of these, only shard 0's `integration_e2e`/`quota_enforcement_tests` pair was
 already known (the 09-21 report). Shards 0 and 7 remain the two worst by
-both row count and total weight — shard 7's three-way stack
+both row count and total weight — shard 7's stack
 (`event_partitioning_tests` is the single heaviest row in the entire
 manifest) is worse than shard 0's — but the other five collisions (shards 1,
 2, 3, 6, 10) are new to this script and were not called out in the first
@@ -90,10 +121,11 @@ also carry a real collision today, just a different one
 that report meant.
 
 **A sweep of `SEMAPHORE_SHARD_COUNT` from 9 through 24 finds no value with
-zero heavy-suite (≥30 tests) collisions** — every count in that range stacks
-at least 5 heavy rows somewhere (re-run after both corrections above), and
-*which* rows collide changes unpredictably with the count (see the script's
-own docstring for the full table). The 2026 issue #1267 fix picked 11 by
+zero heavy-suite (≥30 tests) collisions** — every count in that range has
+at least 4 shards each carrying 2+ heavy suites (re-run after all three
+corrections above; N=19 is the best case found, still 4), and *which* rows
+collide changes unpredictably with the count (see the script's own
+docstring for the full table). The 2026 issue #1267 fix picked 11 by
 comparing spread across a handful of candidate counts, but did not check for
 multi-suite stacking specifically, and — per the correction above — used the
 wrong row-ordinal scheme to do it. **Bumping the count again would very
@@ -316,14 +348,19 @@ Carried forward, in priority order:
 - **Harness:** self-test passes; full run against today's manifest resolves
   all 151 `linux` rows (5 rows needed a `_tests`-suffix fallback the first
   version of the script missed — fixed and re-verified) and reproduces the
-  seven collisions above. **Corrected twice post-review (Codex, this PR):**
-  first, the weight regex undercounted indented and plain `#[test]`
-  attributes (`worker_session_tests` 0→12, `hot_code_swap_tests` 40→79,
-  every other weight in this report shifted accordingly); second, the first
-  draft named only 2 of the 7 collisions the script's own output shows.
-  Both fixed, re-run, and the corrected numbers are what this report now
-  carries throughout. `--sweep` output (N=9..24, re-run after both fixes:
-  still no collision-free N) archived in the script's own docstring.
+  seven collisions above. **Corrected four times post-review (Codex, this
+  PR):** the weight regex undercounted indented and plain `#[test]`
+  attributes (`worker_session_tests` 0→15, `hot_code_swap_tests` 40→79 in
+  two further steps below); a bracketed multi-line `#[allow(...)]` attribute
+  broke the same scan a different way, undercounting
+  `hot_code_swap_tests` again (79→77 at that point); `#[ignore]`d tests
+  (never run by `run-suites.sh`, which passes no `--ignored` flag) were
+  counted anyway, overcounting `claim_budget_tests` (36→29, dropping it out
+  of shard 7's heavy set); and the first draft named only 2 of the 7
+  collisions the script's own output shows. All four fixed, re-run, and the
+  corrected numbers are what this report now carries throughout. `--sweep`
+  output (N=9..24, re-run after every fix: still no collision-free N, best
+  case N=19 at 4 colliding shards) archived in the script's own docstring.
 - **Item 2:** 1 occurrence this window, 4th cumulative — a count, not yet a
   rate; the ≥20x bar this role requires is still unmet.
 - **Item 4:** 1 run, 8/11 shards — worse than the 09-21 report's 6/11 on the
