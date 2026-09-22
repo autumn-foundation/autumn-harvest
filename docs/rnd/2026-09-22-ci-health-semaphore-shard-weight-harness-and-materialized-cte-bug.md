@@ -42,43 +42,69 @@ Running it against today's manifest (151 `linux` rows, `SEMAPHORE_SHARD_COUNT
 = 11`, both read out of the actual files rather than hand-copied):
 
 ```
-shard 0: total= 416  top=integration_e2e(118), api_scheduler_integration(80), backup_verify_tests(57)
-shard 7: total= 408  top=event_partitioning_tests(148), audit_export_tests(87), claim_budget_tests(34)
+shard 0: total= 418  top=integration_e2e(120), api_scheduler_integration(80), backup_verify_tests(57)
+shard 7: total= 435  top=event_partitioning_tests(155), audit_export_tests(88), claim_budget_tests(36)
 ```
 
-Two findings, one already known and reconfirmed, one new:
+**Correction (Codex review on this PR):** the first version of this report
+and the script it ships weighed each row by column-0 `^#\[tokio::test` only,
+silently missing every indented test (nested-module tests) and every plain
+`#[test]`. Two examples Codex's review cited directly: `worker_session_tests`
+weighed 0 (its 12 tests are all indented) and `hot_code_swap_tests` weighed
+40 instead of 79 (missing 38 plain `#[test]`s and one indented
+`#[tokio::test]`). Fixed to match `#[test]`/`#[tokio::test]` with optional
+leading whitespace; every weight number in this report reflects the
+corrected count (`integration_e2e` moved 118→120,
+`event_partitioning_tests` 148→155, `audit_export_tests` 87→88,
+`claim_budget_tests` 34→36, `hot_code_swap_tests` 40→79 — see the diffs
+above and below).
 
-1. **`integration_e2e` (ordinal 33) / `quota_enforcement_tests` (ordinal
-   44)** — 11 apart, both on shard 0. This is the 09-21 report's own
-   finding, reconfirmed under the corrected ordinal scheme (it lands on
-   shard 0 here, not shard 10 — the shard *number* changes, the collision
-   does not).
-2. **New: `audit_export_tests` (ordinal 7), `claim_budget_tests` (ordinal
-   18), `event_partitioning_tests` (ordinal 29)** — each exactly 11 apart,
-   all three on shard 7. `event_partitioning_tests` is the single heaviest
-   row in the entire manifest (148 `#[tokio::test]`s); the 09-21 report
-   placed it on "shard 6" using the whole-file line count, which is exactly
-   the discrepancy paragraph 2 above describes. **No prior report in this
-   series identified this second collision.** Shard 7 is not merely
-   imbalanced — three of the manifest's heaviest rows are stacked on it,
-   worse than shard 0's pairing.
+**Second correction (Codex review, same PR):** the first version of this
+report also singled out only two of the collisions the script itself
+reports, which read as if they were the whole finding. Under today's
+`SEMAPHORE_SHARD_COUNT = 11`, the harness finds **seven** shards carrying
+2+ suites at or above the 30-test heavy threshold, not two — every one of
+them is a genuine `SEMAPHORE_SHARD_COUNT`-apart-ordinal collision:
+
+| Shard | Colliding rows (ordinal, weight) |
+|---|---|
+| 0  | `integration_e2e` (33, 120), `quota_enforcement_tests` (44, 47), `backup_verify_tests` (77, 57), `api_scheduler_integration` (88, 80), `interface_schema_integration` (110, 31) |
+| 1  | `transactional_start_tests` (67, 36), `codec_rotation_db_tests` (78, 56) |
+| 2  | `capability_miss_tests` (13, 46), `cross_region_dr_tests` (79, 31) |
+| 3  | `pacing_override_integration` (113, 46), `workflow_rerun_integration` (146, 68) |
+| 6  | `admission_gate_authoritative` (6, 34), `shard_rebalance_db_tests` (83, 111) |
+| 7  | `audit_export_tests` (7, 88), `claim_budget_tests` (18, 36), `event_partitioning_tests` (29, 155) |
+| 10 | `queue_pause_tests` (43, 44), `hot_code_swap_tests` (76, 79), `stall_diagnosis_integration` (131, 76) |
+
+Of these, only shard 0's `integration_e2e`/`quota_enforcement_tests` pair was
+already known (the 09-21 report). Shards 0 and 7 remain the two worst by
+both row count and total weight — shard 7's three-way stack
+(`event_partitioning_tests` is the single heaviest row in the entire
+manifest) is worse than shard 0's — but the other five collisions (shards 1,
+2, 3, 6, 10) are new to this script and were not called out in the first
+version of this report. The 09-21 report's own manifest-wide check placed
+`event_partitioning_tests` on "shard 6" (using the whole-file line count,
+the discrepancy the paragraph above describes) — coincidentally shard 6 does
+also carry a real collision today, just a different one
+(`admission_gate_authoritative`/`shard_rebalance_db_tests`), not the one
+that report meant.
 
 **A sweep of `SEMAPHORE_SHARD_COUNT` from 9 through 24 finds no value with
 zero heavy-suite (≥30 tests) collisions** — every count in that range stacks
-at least 4 heavy rows somewhere, and *which* rows collide changes
-unpredictably with the count (see the script's own docstring for the full
-table). The 2026 issue #1267 fix picked 11 by comparing spread across a
-handful of candidate counts, but did not check for multi-suite stacking
-specifically, and — per the correction above — used the wrong row-ordinal
-scheme to do it. **Bumping the count again would very likely just relocate
-today's collision to a new shard, not remove the failure mode**: with ~20
-rows at or above the heavy threshold and single- or low-double-digit shard
-counts, pigeonhole makes some stacking unavoidable under a modulo
-assignment. The real fix is a weight-aware assignment (e.g. greedy
-longest-processing-time bin-packing) replacing `row_ordinal % N`, which this
-session did not attempt — it would change `run-suites.sh`'s sharding
-algorithm itself, a bigger, harder-to-validate-without-live-CI change than
-one session should make unilaterally.
+at least 5 heavy rows somewhere (re-run after both corrections above), and
+*which* rows collide changes unpredictably with the count (see the script's
+own docstring for the full table). The 2026 issue #1267 fix picked 11 by
+comparing spread across a handful of candidate counts, but did not check for
+multi-suite stacking specifically, and — per the correction above — used the
+wrong row-ordinal scheme to do it. **Bumping the count again would very
+likely just relocate today's collisions to new shards, not remove the
+failure mode**: with ~20 rows at or above the heavy threshold and single- or
+low-double-digit shard counts, pigeonhole makes some stacking unavoidable
+under a modulo assignment. The real fix is a weight-aware assignment (e.g.
+greedy longest-processing-time bin-packing) replacing `row_ordinal % N`,
+which this session did not attempt — it would change `run-suites.sh`'s
+sharding algorithm itself, a bigger, harder-to-validate-without-live-CI
+change than one session should make unilaterally.
 
 **What this session shipped instead:** `docs/audits/shard-weight-drift.py`,
 wired into the ungated `lint` job, **report-only** (always exits 0 — gating
@@ -120,7 +146,7 @@ or a rerun on the same branch, and the cascade widened rather than resolved.
 
 **Shard 0** (the harness-confirmed `integration_e2e`/`quota_enforcement_tests`
 collision shard) shows both suites failing, and not narrowly: `integration_e2e`
-alone has roughly 60 of its ~118 tests fail, spanning entirely unrelated
+alone has roughly 60 of its ~120 tests fail, spanning entirely unrelated
 categories (activity retry, claim-task sticky routing, concurrency caps,
 search attributes, worker completion, schedule baselines). The great majority
 panic at the identical `integration_e2e.rs:1383:6` site, in linear sequence
@@ -131,8 +157,9 @@ might suggest at first read; the full backtraces print together only because
 finishes). `quota_enforcement_tests`, which runs immediately after on the
 same shard, then *also* cascades for another ~4 minutes once it starts.
 
-**Shard 9** — the *lightest* shard under today's manifest (harness total: 68,
-no suite above the heavy threshold) — also failed in this same run, with a
+**Shard 9** — the *lightest* shard under today's manifest (harness total:
+100, no suite above the heavy threshold) — also failed in this same run,
+with a
 **new, previously undocumented failure signature**: `workflow_retry_tests`
 (3 of 18 tests) — `workflow_retry_carries_chain_deadline_verbatim`,
 `workflow_retry_inherits_predecessor_start_source`,
@@ -288,9 +315,15 @@ Carried forward, in priority order:
 
 - **Harness:** self-test passes; full run against today's manifest resolves
   all 151 `linux` rows (5 rows needed a `_tests`-suffix fallback the first
-  version of the script missed — fixed and re-verified) and reproduces both
-  collisions above. `--sweep` output (N=9..24) archived in the script's own
-  docstring.
+  version of the script missed — fixed and re-verified) and reproduces the
+  seven collisions above. **Corrected twice post-review (Codex, this PR):**
+  first, the weight regex undercounted indented and plain `#[test]`
+  attributes (`worker_session_tests` 0→12, `hot_code_swap_tests` 40→79,
+  every other weight in this report shifted accordingly); second, the first
+  draft named only 2 of the 7 collisions the script's own output shows.
+  Both fixed, re-run, and the corrected numbers are what this report now
+  carries throughout. `--sweep` output (N=9..24, re-run after both fixes:
+  still no collision-free N) archived in the script's own docstring.
 - **Item 2:** 1 occurrence this window, 4th cumulative — a count, not yet a
   rate; the ≥20x bar this role requires is still unmet.
 - **Item 4:** 1 run, 8/11 shards — worse than the 09-21 report's 6/11 on the
@@ -329,7 +362,7 @@ curl -sS -o shard0_cascade.log '<signed logs_url for shard-0 job>'
 grep -c "\.\.\. FAILED$" shard0_cascade.log   # integration_e2e portion
 grep -n "panicked at" shard0_cascade.log | sort | uniq -c -f2 | sort -rn | head
 # -> the overwhelming majority at integration_e2e.rs:1383:6
-# shard 9 (lightest shard, harness total=68):
+# shard 9 (lightest shard, harness total=100):
 curl -sS -o shard9.log '<signed logs_url for shard-9 job>'
 grep -n "panicked at\|test result" shard9.log
 # -> workflow_retry_tests.rs:606:5, 3/18 failed, a NEW signature; and,

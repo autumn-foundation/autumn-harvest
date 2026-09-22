@@ -38,23 +38,47 @@ script is that accounting, run automatically instead of by hand:
    `integration` row with a filter names a module under
    `autumn-harvest/tests/integration/<filter>.rs`; every other row names
    `<crate>/tests/<target>.rs` directly.
-3. Weigh each row by its file's `#[tokio::test` attribute count (matching
-   every argument variant, e.g. `#[tokio::test(flavor = "multi_thread")]`
-   — a bare-spelling-only grep undercounts, the same mistake the 09-21
-   report's own first pass made and then corrected).
+3. Weigh each row by its file's runnable-test attribute count: `#[test]`
+   and `#[tokio::test]` (matching every argument variant, e.g.
+   `#[tokio::test(flavor = "multi_thread")]`, and any indentation, since a
+   nested-module test is indented). **Correction (Codex review, this
+   harness's own first PR):** the first version of this script matched
+   only column-0 `#[tokio::test`, silently undercounting every indented
+   test and every plain `#[test]` — e.g. `worker_session_tests.rs` weighed
+   0 (its 12 tests are all indented) and `hot_code_swap_tests.rs` weighed
+   40 instead of 79 (missing 38 plain `#[test]`s and 1 indented
+   `#[tokio::test]`). Fixed; every number in this docstring reflects the
+   corrected regex.
 4. Read `SEMAPHORE_SHARD_COUNT` out of the `test-db-linux` job block in
    `ci.yml` (not hand-copied), and report each shard's total weight plus
    any shard carrying more than one row at or above HEAVY_THRESHOLD.
 
-A run against today's manifest (2026-09-22) finds the reported
-`integration_e2e`/`quota_enforcement_tests` collision still live, AND a
-second, not-previously-reported one: `audit_export_tests` (ordinal 7),
-`claim_budget_tests` (ordinal 18) and `event_partitioning_tests` (ordinal
-29) are each exactly 11 apart and all land on the same shard — three heavy
-suites stacked, not two. (The 09-21 report's own manifest-wide check
-placed `event_partitioning_tests` on a different shard; that placement
-used the whole-file line count above, not the `linux`-only one, which is
-the same discrepancy this docstring's third paragraph describes.)
+A run against today's manifest (2026-09-22) finds **seven** shards, not one,
+carrying 2+ suites at or above HEAVY_THRESHOLD under today's
+`SEMAPHORE_SHARD_COUNT = 11` — every one of them is a genuine
+`SEMAPHORE_SHARD_COUNT`-apart-ordinal collision, not just the two this
+docstring's earlier drafts singled out for narrative reasons. **Correction
+(Codex review):** naming only two here read as if they were the only ones
+the script finds, which is not what a run of the script itself shows.  The
+full set, from this script's own output:
+
+| Shard | Colliding rows (ordinal, weight) |
+|---|---|
+| 0  | `integration_e2e` (33, 120), `quota_enforcement_tests` (44, 47), `backup_verify_tests` (77, 57), `api_scheduler_integration` (88, 80), `interface_schema_integration` (110, 31) |
+| 1  | `transactional_start_tests` (67, 36), `codec_rotation_db_tests` (78, 56) |
+| 2  | `capability_miss_tests` (13, 46), `cross_region_dr_tests` (79, 31) |
+| 3  | `pacing_override_integration` (113, 46), `workflow_rerun_integration` (146, 68) |
+| 6  | `admission_gate_authoritative` (6, 34), `shard_rebalance_db_tests` (83, 111) |
+| 7  | `audit_export_tests` (7, 88), `claim_budget_tests` (18, 36), `event_partitioning_tests` (29, 155) |
+| 10 | `queue_pause_tests` (43, 44), `hot_code_swap_tests` (76, 79), `stall_diagnosis_integration` (131, 76) |
+
+Shards 0 and 7 remain the two worst by both row count and total weight, and
+shard 0's `integration_e2e`/`quota_enforcement_tests` pair is the only one a
+prior report in this series (09-21) had already found — the other six are
+new to this script. (That same 09-21 report's own manifest-wide check placed
+`event_partitioning_tests` on "shard 6"; that placement used the whole-file
+line count described above, not the `linux`-only one, which is the same
+discrepancy this docstring's third paragraph describes.)
 
 A sweep of `SEMAPHORE_SHARD_COUNT` from 9 through 24 finds NO value with
 zero heavy-suite collisions: today's manifest carries roughly twenty rows
@@ -70,9 +94,10 @@ pre-existing structural property nobody caused and this script cannot fix
 (the real fix is either a weight-aware assignment in `run-suites.sh`,
 replacing the modulo scheme, or a periodic re-simulation before each
 `SEMAPHORE_SHARD_COUNT` change — a bigger decision than one CI-health
-session's single, unreviewed pass should gate on unilaterally). Once the
-underlying assignment is fixed, flip EXIT_ON_COLLISION below to enforce it
-staying fixed.
+session's single, unreviewed pass should gate on unilaterally). `main()`
+below always `return`s 0; once the underlying assignment is fixed, change
+that to fail when `heavy_collisions` is non-empty, so the invariant cannot
+silently drift again.
 
 Usage:
     python3 docs/audits/shard-weight-drift.py [--threshold N] [--sweep]
@@ -90,7 +115,13 @@ MANIFEST = REPO_ROOT / ".github" / "ci" / "integration-suites.txt"
 CI_YAML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 HEAVY_THRESHOLD_DEFAULT = 30
-TOKIO_TEST_RE = re.compile(r"^#\[tokio::test", re.MULTILINE)
+# Optional leading whitespace (nested-module tests are indented) and either
+# `#[test]` or `#[tokio::test...]` (any argument variant). An earlier version
+# anchored to column 0 and matched only `#[tokio::test`, which silently
+# undercounted every indented test and every plain `#[test]` — caught by
+# Codex review on this harness's own first PR (see the module docstring's
+# "correction" note below for the concrete files this changed).
+TOKIO_TEST_RE = re.compile(r"^\s*#\[(?:tokio::test|test)\b", re.MULTILINE)
 COMMENT_OR_BLANK_RE = re.compile(r"^\s*(#|$)")
 
 
