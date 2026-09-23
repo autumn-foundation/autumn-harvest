@@ -11,16 +11,25 @@ every report in this series has hit). Continues the series from
 landed on `claude/fix-shard-0-collision-rebalance-1685`, not yet merged to
 `trunk-dev`, so it is not in this session's tree).
 
-**Corrected after Codex review on this PR:** the first draft claimed the
-`QuotaExceeded` arm "never" propagates `Err`/rolls back the source's
-transaction, having stopped reading `completion_trigger.rs` right before the
-outbox-row insert; that insert's own `.map_err(...)?` can in fact propagate
-and roll back, which is a real, previously-ruled-out candidate mechanism —
-corrected inline below. The first draft also called the six branches
-"unrelated"/"independent" based only on an open-PR-listing check, which
-cannot establish that; downgraded to "differently-named," with the actual
-diff check left for the next session. Both corrections are inline at the
-point each applies, matching this series' convention.
+**Corrected across two Codex review rounds on this PR.** First round: the
+first draft claimed the `QuotaExceeded` arm "never" propagates `Err`/rolls
+back the source's transaction, having stopped reading `completion_trigger.rs`
+right before the outbox-row insert (that insert's own `.map_err(...)?` can in
+fact propagate and roll back — restored as a candidate mechanism); and it
+called the six branches "unrelated"/"independent" based only on an
+open-PR-listing check, which cannot establish that (downgraded to
+"differently-named"). Second round, on the corrected draft: Codex caught that
+the "pool exhaustion" example named for the insert-error mechanism is
+impossible for this specific insert (it runs on an already-acquired
+connection, no new pool checkout) — removed, replaced with the DB-error
+causes that connection can actually hit; and that the independence
+correction's own admission ("no SHA/diff check done") undercut the
+still-unverified claim that all 6 occurrences ran at the new 30s timeout
+bound rather than the old 10s one. This session then fetched and checked each
+occurrence's actual commit: 5 of 6 confirmed at the 30s bound, 1
+(`gallant-dijkstra-a83hyy`) confirmed still on the old 10s bound. All four
+corrections are inline at the point each applies, matching this series'
+convention.
 
 ## 🎯 Verdict path
 
@@ -54,24 +63,40 @@ its fix would also explain this panic: `evaluate_triggers_for_execution`'s
 `QuotaExceeded` arm never touches the source's own terminal commit *on its
 success path* — confirmed this session by reading `completion_trigger.rs:
 2078-2100`, the tracing call and metrics record before the outbox insert.
-**Correction (post-review, Codex on this PR):** an earlier draft of this
-report stopped reading at line 2100 and claimed "no `Err`/`?` propagation out
-of the source's transaction" outright. That is wrong: continuing to line
-2121, the outbox-row insert itself ends `.map_err(crate::error::database_error)?`
-(`completion_trigger.rs:2101-2122`). A database error on *that* insert — a
-transient pool exhaustion, a constraint violation, a connection drop — does
-propagate `?` out of this function, and per the function's own doc comment
-(the whole arm "runs INLINE inside the SOURCE execution's own terminal
-transaction"), that would roll back the source's `WorkflowCompleted` append
-along with it, reproducing exactly the pre-fix symptom this test guards
-against. So #1706's fix landing will not close this on the arm's *ordinary*
-path (confirmed unchanged), but a rare error on the outbox insert itself is
-a real, undismissed candidate mechanism this report had wrongly ruled out —
-not confirmed either way this session (no worker-level logging or DB-error
+**Correction (post-review, Codex on this PR, two rounds).** First: an earlier
+draft of this report stopped reading at line 2100 and claimed "no `Err`/`?`
+propagation out of the source's transaction" outright. That is wrong:
+continuing to line 2121, the outbox-row insert itself ends
+`.map_err(crate::error::database_error)?` (`completion_trigger.rs:2101-2122`).
+A database error on *that* insert does propagate `?` out of this function,
+and per the function's own doc comment (the whole arm "runs INLINE inside the
+SOURCE execution's own terminal transaction"), that would roll back the
+source's `WorkflowCompleted` append along with it, reproducing exactly the
+pre-fix symptom this test guards against.
+
+Second: that correction's own first draft listed "transient pool exhaustion"
+as an example cause of such an error. Also wrong, per a second Codex round —
+`evaluate_triggers_for_execution_collecting_with_codecs` receives an
+**already-acquired** `&mut AsyncPgConnection` (confirmed by reading its
+signature, `completion_trigger.rs:1487-1488`); the outbox insert runs on that
+same connection, inside the already-open transaction, and never checks out a
+new connection from the pool. So pool exhaustion cannot be this specific
+insert's error — it could only affect an *earlier* step (acquiring the
+connection this function is handed, before it's ever called), a different
+diagnosis branch entirely. The insert can still fail from an error on the
+existing connection: a constraint violation, a dropped connection mid-query,
+a statement timeout, or a serialization/deadlock error under concurrent
+write load.
+
+So #1706's fix landing will not close this on the arm's *ordinary* path
+(confirmed unchanged), but a rare error on the outbox insert itself — from
+one of the connection-local causes above, not pool exhaustion — is a real,
+undismissed candidate mechanism this report had wrongly ruled out. Not
+confirmed either way this session (no worker-level logging or DB-error
 telemetry available to check whether any of the 6 occurrences actually hit
 this insert's error path), added to the diagnosis below.
 
-### Widened census: 4 more, completely independent branches hit the identical panic site in the same ~26-hour window
+### Widened census: 4 more branches hit the identical panic site in the same ~26-hour window
 
 Sampling `Test DB (linux, shard 0)` failures from today's `ci.yml` window
 (90 `pull_request`/`completed` runs since the 09-21 report's cutoff,
@@ -95,28 +120,61 @@ thread 'quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target
 workflow should reach expected state within timeout: Elapsed(())
 ```
 
-reached from `quota_enforcement_tests.rs`'s `wait_for_execution_state_with_timeout(&url, source, "COMPLETED", Duration::from_secs(30))`
-call (the test's own doc comment names this "the money assertion: the source
-reaches COMPLETED even though its trigger's target is at quota cap").
+reached from `quota_enforcement_tests.rs`'s call to wait for the source's
+`COMPLETED` state — at a 30s bound for 5 of the 6 occurrences, and, per a
+correction below, the original 10s bound for the 6th.
 
 Six occurrences, six different branches, spanning 2026-09-22T07:15Z through
 2026-09-23T09:00Z — **26 hours**. **Correction (post-review, Codex on this
-PR):** an earlier draft called these six branches' failures independent
-because none of the four new ones has an open PR touching
-`quota_enforcement_tests.rs`, `completion_trigger.rs`, or `execution.rs`.
-That is too weak a check to support "no shared diff" — an open-PR listing
-says nothing about a branch with no PR yet, a branch sharing commits with
-another via a common base, or a change to worker/queue/shard/test-setup code
-outside those three named files. This session did not diff each of the six
-branches' actual tested SHA against `trunk-dev` or against each other, so
-the independence claim is **downgraded**: six occurrences on six
-differently-named branches, not confirmed to carry unrelated diffs. This is
-still a real rate increase from the prior report's 3 total occurrences (2 of
-one signature, 1 of this one) spread across 6 days, and the two PRs (#1706,
-#1707) are independently confirmed not to touch this path (read directly,
-not inferred from branch naming) — but the four additional branches' own
-diffs are an open question the next session should check
-(`git diff trunk-dev...<branch>` for each) before repeating "independent" as
+PR, two rounds).** First round: an earlier draft called these six branches'
+failures independent because none of the four new ones has an open PR
+touching `quota_enforcement_tests.rs`, `completion_trigger.rs`, or
+`execution.rs`. That is too weak a check to support "no shared diff" — an
+open-PR listing says nothing about a branch with no PR yet, a branch sharing
+commits with another via a common base, or a change to worker/queue/shard/
+test-setup code outside those three named files.
+
+Second round, in direct response to that correction's own admission: Codex
+correctly pointed out that without a SHA check, the report could not even
+support its claim that all 6 occurrences hit the new 30s bound rather than
+the old 10s one. This session then fetched each of the 6 runs' actual tested
+commit and checked ancestry against `56bc205` (the timeout-widening commit)
+directly:
+
+```
+git fetch origin <head_sha>:refs/tmp/<head_sha>   # per run, then:
+git merge-base --is-ancestor 56bc205 <head_sha> && echo YES || echo NO
+```
+
+5 of 6 (`b554b1e6` / PR #1706, `e591ee64` / PR #1707, `79f7d6a4` /
+`trusting-ritchie-nml6ud`, `5d77d70e` / `confident-babbage-sl0122`,
+`afb756be` / `cool-noether-7dejjb`) do contain `56bc205` and so ran the new
+30s bound. The 6th, `58abe747` (`gallant-dijkstra-a83hyy`, run
+`35658767845`), does **not** — `git merge-base 56bc205 58abe747` returns a
+common ancestor several commits back
+(`3d460681`), and that branch's own checked-out copy of
+`quota_enforcement_tests.rs` at that SHA still reads the pre-widen
+`wait_for_execution_state(&url, source, "COMPLETED").await` (the file's
+plain 10s-default helper), confirmed by `git show 58abe747:...`. That
+occurrence's timestamp (2026-09-22T19:29:31Z, after `56bc205` merged) placed
+it in the post-widen window by clock time alone, which an earlier draft
+relied on implicitly — a stale branch that hadn't merged `trunk-dev` recently
+can still run on old code long after a fix lands elsewhere, exactly the gap
+Codex's comment named.
+
+This is a **correction, not a retraction**: 5 of 6 occurrences are now
+directly confirmed at the new 30s bound (not merely timestamped after the
+merge), which is if anything stronger support for "the widen didn't help"
+than the original unverified claim — and the 6th occurrence, at the old 10s
+bound, is consistent with this being the same longstanding flake this
+series has tracked since before the widen shipped. The open-PR-based
+independence claim remains downgraded regardless: six occurrences on six
+differently-named branches, not confirmed to carry otherwise-unrelated
+diffs. The two PRs (#1706, #1707) are independently confirmed not to touch
+this path (read directly, not inferred from branch naming); the four
+additional branches' own full diffs against `trunk-dev` (beyond the one
+file checked above) remain an open question for the next session
+(`git diff trunk-dev...<branch>` for each) before "independent" is used as
 a settled fact.
 
 **Not claimed as 100%.** Two `Test DB (linux, shard 0)` runs in roughly the
@@ -145,11 +203,12 @@ no assertion, no test logic, no product code in the same hunk.
 
 **This is exactly the "raised timeout as a fix" pattern this role's charter
 bans**, applied here to a flake that was observed but not diagnosed at the
-time. The evidence this session gathered shows it did not work: every one of
-the 6 occurrences above happened *after* this widen shipped (the first one,
-`35652570063`, is ~12 hours after the merge), at the *new*, 3x-larger, 30
-second bound. A timeout that is already 3x the file's own default and still
-loses this often is strong evidence against "the runner is just slow" and for
+time. The evidence this session gathered shows it did not work: 5 of the 6
+occurrences above are confirmed (by direct SHA ancestry check, not
+timestamp — see the correction above) to have run *at* the new, 3x-larger,
+30-second bound and still lost. A timeout that is already 3x the file's own
+default and still loses this often is strong evidence against "the runner is
+just slow" and for
 either a genuine hang (the source workflow's terminal transaction never
 actually commits under some condition) or unbounded queueing (the worker's
 dispatch loop never picks the task up) — both mechanism categories this
@@ -240,10 +299,12 @@ timeout-bump theater, the exact pattern this role exists to stop.
    hunks against what this test's worker path actually calls, to check
    (not assume) the commit message's "unrelated" claim.
 4. Check whether any of the 6 occurrences hit the outbox-insert error path
-   named in Diagnosis (`completion_trigger.rs:2101-2122`'s `.map_err(...)?`)
-   rather than a pure hang — Postgres server logs or connection-pool
-   exhaustion metrics around each occurrence's timestamp, if retained, would
-   settle it directly; this session had neither.
+   named in Diagnosis (`completion_trigger.rs:2101-2122`'s `.map_err(...)?`
+   — a constraint violation, statement timeout, dropped connection, or
+   serialization/deadlock error on the connection already in hand, not pool
+   exhaustion, per the second correction above) rather than a pure hang —
+   Postgres server-side error logs around each occurrence's timestamp, if
+   retained, would settle it directly; this session had none.
 5. Diff each of the 4 additional branches (`trusting-ritchie-nml6ud`,
    `gallant-dijkstra-a83hyy`, `confident-babbage-sl0122`, `cool-noether-7dejjb`)
    against `trunk-dev` before repeating this report's "independent branches"
@@ -259,11 +320,13 @@ timeout-bump theater, the exact pattern this role exists to stop.
 
 - **Before:** none — no rerun protocol executed.
 - **Symptom count:** 6 confirmed occurrences of the identical panic
-  (`integration_e2e.rs:1383:6`, reached from this test's 30s
-  `wait_for_execution_state_with_timeout` for the source's `COMPLETED`
-  state), across 6 independent branches, 2026-09-22T07:15Z–2026-09-23T09:00Z.
-  Up from 1 occurrence of this specific site in the 09-21 report (which found
-  it alongside 2 occurrences of a different signature on the same test).
+  (`integration_e2e.rs:1383:6`, reached from this test's wait for the
+  source's `COMPLETED` state — the 30s bound for 5 of the 6, confirmed by
+  SHA ancestry against `56bc205`, and the original 10s bound for the 6th),
+  across 6 differently-named branches, not confirmed independent beyond
+  that, 2026-09-22T07:15Z–2026-09-23T09:00Z. Up from 1 occurrence of this
+  specific site in the 09-21 report (which found it alongside 2 occurrences
+  of a different signature on the same test).
   2 clean shard-0 passes bound the same window, so this is intermittent, not
   deterministic, and this count is a sample of convenience, not a rerun-rate.
 - **After:** N/A — no fix attempted.
@@ -331,7 +394,24 @@ git show 56bc205 -- autumn-harvest/tests/integration/quota_enforcement_tests.rs
 #    from trunk-dev in this PR -- the flake predates and is unrelated to the
 #    fire-verify work here."
 
-# Ruling out #1706's own mechanism as the cause (same-shard QuotaExceeded
-# arm never aborts the source's transaction):
-sed -n '2078,2100p' autumn-harvest/src/completion_trigger.rs
+# #1706's own mechanism (same-shard QuotaExceeded arm) on its happy path
+# never aborts the source's transaction -- but the outbox insert right after
+# it can, on a DB error (Codex review correction, see Diagnosis):
+sed -n '2078,2122p' autumn-harvest/src/completion_trigger.rs
+grep -n "fn evaluate_triggers_for_execution_collecting_with_codecs" -A2 autumn-harvest/src/completion_trigger.rs
+# -> conn: &'a mut diesel_async::AsyncPgConnection -- already-acquired, no
+#    new pool checkout happens inside this function, so a DB error on the
+#    outbox insert is not "pool exhaustion" (Codex's 2nd-round correction).
+
+# SHA-ancestry verification (Codex's correction: timestamps alone don't
+# prove a branch ran the widened 30s bound):
+for sha in <run's head_sha>; do
+  git fetch origin "$sha:refs/tmp/$sha"
+  git merge-base --is-ancestor 56bc205 "$sha" && echo "$sha: post-widen (30s)" || echo "$sha: pre-widen (10s)"
+done
+# -> 5 of 6 (b554b1e6/#1706, e591ee64/#1707, 79f7d6a4/trusting-ritchie,
+#    5d77d70e/confident-babbage, afb756be/cool-noether): post-widen.
+#    58abe747/gallant-dijkstra-a83hyy: pre-widen -- confirmed directly:
+git show 58abe747:autumn-harvest/tests/integration/quota_enforcement_tests.rs | grep -n "wait_for_execution_state(&url, source"
+# -> still the plain 10s-default call, not wait_for_execution_state_with_timeout
 ```
