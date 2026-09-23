@@ -90,7 +90,17 @@ impl CriticalPathAnalyzer {
             };
         }
 
-        let mut distances = vec![Duration::ZERO; tasks.len()];
+        // Nanoseconds, not `Duration`: distances accumulate across levels.
+        // Comparing already-saturated `Duration` values loses information.
+        // Two branches that both overflow to `Duration::MAX` would then
+        // tie. Predecessor selection would keep whichever was visited
+        // first, instead of the true longest path (review finding on PR
+        // #1711, `critical_path.rs`). `u128` nanoseconds holds the exact
+        // sum with no realistic overflow risk. It takes roughly 1.8e10
+        // chained `Duration::MAX` tasks to reach `u128::MAX`, and
+        // `saturating_add` below covers even that case. Only the final
+        // reported `total_duration` saturates down to `Duration`.
+        let mut distances = vec![0u128; tasks.len()];
         let mut predecessors = vec![None; tasks.len()];
         // A node is a sink only when no other node names it as an upstream.
         // Sink detection folds into the main DP loop below, instead of
@@ -233,7 +243,7 @@ impl CriticalPathAnalyzer {
                 });
 
                 // Find the maximum distance among upstreams
-                let mut max_upstream_dist = Duration::ZERO;
+                let mut max_upstream_dist: u128 = 0;
                 let mut best_pred = None;
 
                 for &up_idx in &task.upstreams {
@@ -248,21 +258,13 @@ impl CriticalPathAnalyzer {
                     }
                 }
 
-                // Use saturating_add, not `+`. A caller-supplied
-                // `start_to_close` is an arbitrary `Duration` (issue: Snag
-                // boundary repro). `Duration::add` panics on overflow
-                // unconditionally. This differs from primitive-integer `+`,
-                // which panics only when `overflow-checks` is on. A long
-                // chain of large-but-plausible timeouts, or a single
-                // `Duration::MAX` value, must degrade to a saturated total,
-                // not crash the analysis.
-                distances[task_index] = max_upstream_dist.saturating_add(duration);
+                distances[task_index] = max_upstream_dist.saturating_add(duration.as_nanos());
                 predecessors[task_index] = best_pred;
             }
         }
 
         // Find the sink node with the maximum total distance
-        let mut max_dist = Duration::ZERO;
+        let mut max_dist: u128 = 0;
         let mut end_node = None;
 
         for (i, &dist) in distances.iter().enumerate() {
@@ -288,10 +290,28 @@ impl CriticalPathAnalyzer {
             .collect();
 
         CriticalPathResult {
-            total_duration: max_dist,
+            total_duration: nanos_to_duration_saturating(max_dist),
             path_indices,
             path_names,
         }
+    }
+}
+
+/// Convert an accumulated nanosecond total to a `Duration`, saturating at
+/// `Duration::MAX` instead of overflowing. Only the final reported total
+/// saturates; the DP loop above compares exact `u128` nanoseconds so a
+/// saturated intermediate value can never corrupt the longest-path choice.
+const fn nanos_to_duration_saturating(nanos: u128) -> Duration {
+    const MAX_NANOS: u128 = u64::MAX as u128 * 1_000_000_000 + 999_999_999;
+    if nanos >= MAX_NANOS {
+        Duration::MAX
+    } else {
+        // The `nanos >= MAX_NANOS` guard above proves `nanos / 1_000_000_000`
+        // fits in `u64`.
+        #[allow(clippy::cast_possible_truncation)]
+        let secs = (nanos / 1_000_000_000) as u64;
+        let subsec_nanos = (nanos % 1_000_000_000) as u32;
+        Duration::new(secs, subsec_nanos)
     }
 }
 
@@ -413,5 +433,57 @@ mod tests {
             "saturated, not panicked"
         );
         assert_eq!(result.path_indices, vec![0, 1]);
+    }
+
+    fn activity_e() {}
+    fn activity_f() {}
+
+    /// Review finding on PR #1711 (`critical_path.rs:259`). Saturating each
+    /// intermediate `Duration` before comparing can tie two branches with
+    /// different true totals at `Duration::MAX`. Predecessor selection then
+    /// keeps whichever was visited first, not the actually-longer branch.
+    /// Two converging branches both overflow a `Duration` sum, but branch
+    /// `mid2`'s exact nanosecond total is larger than `mid1`'s. `analyze`
+    /// must still pick `mid2` as the critical path.
+    #[test]
+    fn test_saturated_branches_keep_correct_ordering() {
+        let mut builder = DagBuilder::new();
+        let root = builder.activity(activity_a).start_to_close(Duration::ZERO);
+
+        let branch1 = builder
+            .activity(activity_b)
+            .start_to_close(Duration::MAX)
+            .upstream(&root);
+        let mid1 = builder
+            .activity(activity_c)
+            .start_to_close(Duration::from_secs(1))
+            .upstream(&branch1);
+
+        let branch2 = builder
+            .activity(activity_d)
+            .start_to_close(Duration::new(u64::MAX - 5, 0))
+            .upstream(&root);
+        let mid2 = builder
+            .activity(activity_e)
+            .start_to_close(Duration::from_secs(10))
+            .upstream(&branch2);
+
+        let _end = builder
+            .activity(activity_f)
+            .start_to_close(Duration::ZERO)
+            .upstream(&mid1)
+            .upstream(&mid2);
+
+        let dag = builder.build().unwrap();
+        let analyzer = CriticalPathAnalyzer::new(dag);
+        let result = analyzer.analyze();
+
+        assert_eq!(result.total_duration, Duration::MAX);
+        assert_eq!(
+            result.path_indices,
+            vec![0, 3, 4, 5],
+            "critical path must run through mid2 (branch2's descendant), \
+             the branch with the larger exact total, not mid1"
+        );
     }
 }
