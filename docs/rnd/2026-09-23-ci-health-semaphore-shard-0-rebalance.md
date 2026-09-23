@@ -65,12 +65,33 @@
 # for the slowest shard, roughly ~30% by a rough estimate calibrated
 # against real job timings -- not the 52.6% test-weight-ratio figure,
 # which was never a time percentage. See "🔍 Seventh correction".
+#
+# SIXTH UPDATE, same session, and the actual headline: the
+# `quota_enforcement_tests` SOURCE-completion hang this whole report treats
+# as unexplained IS NOW EXPLAINED AND FIXED. A later commit on this same
+# branch (`f63634b`, cherry-picked here from #1713) found the real root
+# cause: `integration_e2e.rs`'s test-schema bundle was missing migration
+# `20260920215812_harvest_completion_trigger_fires_target`, so every
+# testcontainers-provisioned test database lacked a column
+# `completion_trigger.rs` writes inside the SAME transaction that marks a
+# source workflow COMPLETED. The failed write rolled back the source's own
+# completion, every time -- exactly this hang, on every shard, on every PR.
+# Verified 15/15 clean (previously failed immediately, every attempt) plus
+# 47/47, 14/14, and 57/57 across the affected suites; see #1713's own
+# description for the full writeup. Everything below the "Status" line was
+# written before that fix landed and describes the hang as an open mystery
+# investigated by shard placement alone -- read it as the historical record
+# of that (now-closed) investigation, not as the current state.
 
-**Status:** fix shipped this session, `.github/workflows/ci.yml` only (shard
-count + matrix list + comment). No test code, no manifest reordering (the
-manifest's sort-order is itself guarded by `ci_run_coverage.rs`, so this
-session did not touch it). Prompted directly by a user report that CI was
-failing widely across concurrent PRs right now, not by routine census.
+**Status:** the shard-rebalance fix (below) shipped first, touching only
+`.github/workflows/ci.yml`. A second, unrelated fix later landed on this
+same branch (see the "SIXTH UPDATE" above): `f63634b` adds one missing
+migration to `integration_e2e.rs`'s test-schema bundle, which is the actual
+root cause of the `quota_enforcement_tests` hang this report spent six
+correction rounds investigating without finding. No manifest reordering
+(the manifest's sort-order is itself guarded by `ci_run_coverage.rs`, so
+this session did not touch it). Prompted directly by a user report that CI
+was failing widely across concurrent PRs right now, not by routine census.
 
 ## 🎯 Trigger
 
