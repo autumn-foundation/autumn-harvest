@@ -1,4 +1,4 @@
-# 🚦 Semaphore CI health — `completion_trigger_defers_to_outbox_when_target_quota_exceeded`'s SOURCE-completion wait has gone from 2 occurrences in 3 hours (09-21) to 6 more identical-signature occurrences in 26 hours, on 6 differently-named branches, and the 30s timeout widen that shipped for it (PR #1673, 09-21) did not fix it
+# 🚦 Semaphore CI health — `completion_trigger_defers_to_outbox_when_target_quota_exceeded`'s SOURCE-completion wait has 2 prior occurrences (09-21) plus 6 more identical-signature occurrences in this session's 26-hour window, on 6 differently-named branches, and the 30s timeout widen that shipped for it (PR #1673, 09-21) did not fix it
 
 **Status:** health report — no PR opened against `ci.yml`, `quota_enforcement_tests.rs`,
 or `completion_trigger.rs`. This role's hard gate (a located problem, a named
@@ -11,7 +11,7 @@ every report in this series has hit). Continues the series from
 landed on `claude/fix-shard-0-collision-rebalance-1685`, not yet merged to
 `trunk-dev`, so it is not in this session's tree).
 
-**Corrected across nine Codex review rounds on this PR.** First round: the
+**Corrected across ten Codex review rounds on this PR.** First round: the
 first draft claimed the `QuotaExceeded` arm "never" propagates `Err`/rolls
 back the source's transaction, having stopped reading `completion_trigger.rs`
 right before the outbox-row insert (that insert's own `.map_err(...)?` can in
@@ -113,8 +113,21 @@ all. Corrected: the *gap* between the two rows is unchanged at 11 (same as
 the 09-21 report); each row individually shifted by 1; and a 1-row shift
 applied to a gap already sitting at 11 is exactly enough to carry the
 collision's remainder from 10 to 0 (`10 + 1 ≡ 0 mod 11`), which is why it
-moved from shard 10 to shard 0. All corrections are inline at the point
-each applies, matching this series' convention.
+moved from shard 10 to shard 0.
+
+**Tenth round, two more findings.** First: the title's "2 occurrences in
+3 hours" compared an inter-occurrence *spacing* (how far apart the two
+09-21 events happened to land) against this report's *census-window*
+duration (26 hours) — not comparable denominators, and the 09-21 report's
+own actual census window was closer to 28 hours. Corrected to state the
+prior occurrences and this session's window separately, without implying a
+rate comparison between them. Second: the SHA-ancestry check for the 5
+"post-widen" occurrences only proved `56bc205` was in each branch's
+history, not that a later commit hadn't reverted the specific line — this
+session then directly inspected `quota_enforcement_tests.rs` at all 5 SHAs
+and confirmed the literal 30s call is present in each, strengthening rather
+than changing the conclusion. All corrections are inline at the point each
+applies, matching this series' convention.
 
 ## 🎯 Verdict path
 
@@ -245,9 +258,20 @@ git merge-base --is-ancestor 56bc205 <head_sha> && echo YES || echo NO
 
 5 of 6 (`b554b1e6` / PR #1706, `e591ee64` / PR #1707, `79f7d6a4` /
 `trusting-ritchie-nml6ud`, `5d77d70e` / `confident-babbage-sl0122`,
-`afb756be` / `cool-noether-7dejjb`) do contain `56bc205` and so ran the new
-30s bound. The 6th, `58abe747` (`gallant-dijkstra-a83hyy`, run
-`35658767845`), does **not** — `git merge-base 56bc205 58abe747` returns a
+`afb756be` / `cool-noether-7dejjb`) do contain `56bc205`. **Correction
+(post-review, Codex on this PR, a third round):** an earlier draft stopped
+at that ancestry check for these 5, which only proves the commit is in the
+branch's history — a later commit on any of them could still have reverted
+or altered that one line, same as the 09-21 report's own item 2 correction
+found for a different assertion. This session then went further and
+directly inspected `quota_enforcement_tests.rs` at all 5 SHAs (`git show
+<sha>:autumn-harvest/tests/integration/quota_enforcement_tests.rs | grep
+Duration::from_secs\(30\)`), not just checked ancestry: all 5 have the
+literal `wait_for_execution_state_with_timeout(..., Duration::from_secs(30))`
+call at the same line the widen introduced, confirming the 30s bound
+directly rather than inferring it. The 6th, `58abe747`
+(`gallant-dijkstra-a83hyy`, run `35658767845`), does **not** contain
+`56bc205` — `git merge-base 56bc205 58abe747` returns a
 common ancestor several commits back
 (`3d460681`), and that branch's own checked-out copy of
 `quota_enforcement_tests.rs` at that SHA still reads the pre-widen
@@ -676,6 +700,15 @@ for sha in <run's head_sha>; do
 done
 # -> 5 of 6 (b554b1e6/#1706, e591ee64/#1707, 79f7d6a4/trusting-ritchie,
 #    5d77d70e/confident-babbage, afb756be/cool-noether): post-widen.
+
+# Codex's follow-up correction: ancestry alone doesn't prove the line
+# wasn't later reverted on any of those 5 branches -- inspect the file
+# directly at each SHA instead of just checking history:
+for sha in 79f7d6a4686ace44ebf641aca72a48c0f21e3e01 5d77d70e4e6d4f8a895887a915173d4d3e20bf6b afb756be400848647085ef1acf89c73123bd0be5 b554b1e6a56248df6fe1778edaea52900ce2e04e e591ee6470330a2e41f4ccc336d2d676297e98f3; do
+  git show "$sha:autumn-harvest/tests/integration/quota_enforcement_tests.rs" | grep -n "Duration::from_secs(30)"
+done
+# -> all 5 have the literal 30s call at the same site the widen introduced,
+#    confirmed directly, not inferred from ancestry.
 #    58abe747/gallant-dijkstra-a83hyy: pre-widen -- confirmed directly:
 git show 58abe747:autumn-harvest/tests/integration/quota_enforcement_tests.rs | grep -n "wait_for_execution_state(&url, source"
 # -> still the plain 10s-default call, not wait_for_execution_state_with_timeout
