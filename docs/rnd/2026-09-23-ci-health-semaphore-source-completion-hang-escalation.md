@@ -11,7 +11,7 @@ every report in this series has hit). Continues the series from
 landed on `claude/fix-shard-0-collision-rebalance-1685`, not yet merged to
 `trunk-dev`, so it is not in this session's tree).
 
-**Corrected across seventeen Codex review rounds on this PR.** First round: the
+**Corrected across eighteen Codex review rounds on this PR.** First round: the
 first draft claimed the `QuotaExceeded` arm "never" propagates `Err`/rolls
 back the source's transaction, having stopped reading `completion_trigger.rs`
 right before the outbox-row insert (that insert's own `.map_err(...)?` can in
@@ -196,7 +196,18 @@ the same rows (33, 44), and each SHA's own `ci.yml` sets
 `SEMAPHORE_SHARD_COUNT: "11"` — so the collision holds at every one of the
 5 individually. This strengthens rather than undermines the claim, but it
 was unverified before this round; the report now cites the per-SHA check
-instead of the current-tree computation alone. All corrections are inline
+instead of the current-tree computation alone.
+
+**Eighteenth round.** The timing-correlation retraction over-corrected into
+an unsupported inverse claim: "the flake predates the merge... so there is
+no spike-after-merge pattern to explain." Predating `56bc205` proves the
+commit did not *originate* the flake, but not that it left the flake's
+*rate* unchanged — 2 occurrences before and 6 after is also consistent
+with an unrelated pre-existing flake whose frequency rose afterward, and
+this report has no comparable pre/post execution counts to tell that apart
+from no change. Corrected to retract only the timing-origin claim, stating
+plainly that no rate correlation can be determined either way from this
+session's evidence. All corrections are inline
 at the point each applies, matching this series' convention.
 
 ## 🎯 Verdict path
@@ -595,10 +606,16 @@ candidate space:
   documented for this exact signature — `35563198153`
   (2026-09-21T05:04:24Z) and `35576291757` (2026-09-21T08:07:53Z) — happened
   11-14 hours *before* `56bc205` merged, the same day. The flake predates the
-  merge by this report's own evidence, so there is no spike-after-merge
-  pattern to explain. Retracted as a candidate; `56bc205`'s only confirmed
+  merge by this report's own evidence, so `56bc205` did not originate it —
+  but predating the merge does not by itself rule out the merge changing the
+  flake's *rate*: 2 occurrences before and 6 after is also consistent with an
+  unrelated pre-existing flake whose frequency rose afterward, and this
+  report has no comparable pre/post execution counts to distinguish that
+  from no rate change at all. Retracted as a *timing-origin* candidate, with
+  no rate-correlation claim substituted in its place — this session cannot
+  determine one either way. `56bc205`'s only confirmed
   connection to this test remains the timeout widen itself (which this
-  report separately shows did not fix the flake). Whether `56bc205`'s
+  report separately shows did not eliminate the flake). Whether `56bc205`'s
   `execution.rs` or other `completion_trigger.rs` changes touch a code path
   this test's worker also exercises is still unchecked, but not for a timing
   reason — `git show 56bc205 -- autumn-harvest/src/execution.rs` and diff
