@@ -252,8 +252,11 @@ async fn claimed_batch_prelocks_bucket_keys_with_bounded_round_trips() {
         }
     }
 
-    let backlog_before =
-        scalar_i64(&mut conn, "SELECT COUNT(*) AS n FROM harvest_start_throttle").await;
+    let backlog_before = scalar_i64(
+        &mut conn,
+        "SELECT COUNT(*) AS n FROM harvest_start_throttle",
+    )
+    .await;
     assert_eq!(
         backlog_before,
         N_KEYS + HOT_KEYS * (HOT_DEPTH - 1),
@@ -276,7 +279,11 @@ async fn claimed_batch_prelocks_bucket_keys_with_bounded_round_trips() {
         "a fully-admissible 1,000-key backlog should fill the claimed batch to the scanner's \
          own per-tick cap"
     );
-    let backlog_after = scalar_i64(&mut conn, "SELECT COUNT(*) AS n FROM harvest_start_throttle").await;
+    let backlog_after = scalar_i64(
+        &mut conn,
+        "SELECT COUNT(*) AS n FROM harvest_start_throttle",
+    )
+    .await;
     assert_eq!(
         backlog_after,
         backlog_before - THROTTLE_FIRE_BATCH_SIZE,

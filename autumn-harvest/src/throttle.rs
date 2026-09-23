@@ -1512,19 +1512,33 @@ async fn order_due_rows_for_deadlock_free_firing(
 /// re-acquires the SAME already-held row lock. Postgres row locks are
 /// re-entrant within one session. It still does the actual
 /// debit-if-available check then, unchanged.
+///
+/// One round trip locks the whole batch. An earlier cut issued one
+/// `FOR UPDATE` statement per distinct bucket key -- a claimed batch of
+/// [`THROTTLE_FIRE_BATCH_SIZE`] rows from that many tenants paid that many
+/// extra round trips every scanner tick. `ORDER BY key` on the batched
+/// query preserves the sorted-order requirement above: Postgres plans a
+/// `LockRows` node above the `Sort`, so rows lock in the sorted order the
+/// query returns them, not in scan order. Confirmed by `EXPLAIN (ANALYZE,
+/// BUFFERS)` on this exact shape (`docs/perf-artifacts/rate-limit-bucket-
+/// prelock-batch/`).
 #[cfg(feature = "db")]
 async fn pre_lock_rate_limit_buckets_for_claimed_batch(
     conn: &mut diesel_async::AsyncPgConnection,
     due_rows: &[FireDueRow],
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
-    for bucket_key in collect_distinct_bucket_keys(due_rows) {
-        diesel::sql_query("SELECT key FROM harvest_rate_limit_buckets WHERE key = $1 FOR UPDATE")
-            .bind::<diesel::sql_types::Text, _>(&bucket_key)
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
+    let bucket_keys: Vec<String> = collect_distinct_bucket_keys(due_rows).into_iter().collect();
+    if bucket_keys.is_empty() {
+        return Ok(());
     }
+    diesel::sql_query(
+        "SELECT key FROM harvest_rate_limit_buckets WHERE key = ANY($1) ORDER BY key FOR UPDATE",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&bucket_keys)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
     Ok(())
 }
 
