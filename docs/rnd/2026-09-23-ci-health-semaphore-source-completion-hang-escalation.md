@@ -1,4 +1,4 @@
-# 🚦 Semaphore CI health — `completion_trigger_defers_to_outbox_when_target_quota_exceeded`'s SOURCE-completion wait has 2 prior occurrences (09-21) plus 6 more identical-signature occurrences in this session's 26-hour window, on 6 differently-named branches, and the 30s timeout widen that shipped for it (PR #1673, 09-21) did not fix it
+# 🚦 Semaphore CI health — `completion_trigger_defers_to_outbox_when_target_quota_exceeded`'s SOURCE-completion wait has 2 prior occurrences (09-21) plus 6 more identical-signature occurrences found in this session's ~46-hour census, on 6 differently-named branches, and the 30s timeout widen that shipped for it (PR #1673, 09-21) did not fix it
 
 **Status:** health report — no PR opened against `ci.yml`, `quota_enforcement_tests.rs`,
 or `completion_trigger.rs`. This role's hard gate (a located problem, a named
@@ -11,7 +11,7 @@ every report in this series has hit). Continues the series from
 landed on `claude/fix-shard-0-collision-rebalance-1685`, not yet merged to
 `trunk-dev`, so it is not in this session's tree).
 
-**Corrected across eleven Codex review rounds on this PR.** First round: the
+**Corrected across twelve Codex review rounds on this PR.** First round: the
 first draft claimed the `QuotaExceeded` arm "never" propagates `Err`/rolls
 back the source's transaction, having stopped reading `completion_trigger.rs`
 right before the outbox-row insert (that insert's own `.map_err(...)?` can in
@@ -134,9 +134,19 @@ touch this path," stated without qualification. Narrowed to what is
 actually confirmed — neither PR's diff touches the `QuotaExceeded` arm or
 the test itself — while restating, consistent with round five, that
 neither PR's broader effects (the newly-activated background scanner for
-#1706, shard composition for #1707) are ruled out as rate-changers. All
-corrections are inline at the point each applies, matching this series'
-convention.
+#1706, shard composition for #1707) are ruled out as rate-changers.
+
+**Twelfth round.** The same denominator mistake round ten found in the
+09-21 report's own numbers turned out to also be present in this report's
+own: "this session's 26-hour window" conflated the *spread* between the
+first and last of the 6 fresh occurrences (2026-09-22T07:15Z to
+2026-09-23T09:00Z, 26 hours) with the actual *census window* sampled (the
+09-21 report's cutoff, 2026-09-21T10:18:51Z, through the latest run in the
+sampled page, 2026-09-23T08:07:06Z — computed directly from the saved API
+response, ~46 hours). Corrected throughout: the title, the census-section
+heading, and the occurrence-spread sentence now distinguish the two
+figures instead of calling both "26 hours." All corrections are inline at
+the point each applies, matching this series' convention.
 
 ## 🎯 Verdict path
 
@@ -215,11 +225,13 @@ confirmed either way this session (no worker-level logging or DB-error
 telemetry available to check whether any of the 6 occurrences actually hit
 this insert's error path), added to the diagnosis below.
 
-### Widened census: 4 more branches hit the identical panic site in the same ~26-hour window
+### Widened census: 4 more branches hit the identical panic site in the same sampled window
 
-Sampling `Test DB (linux, shard 0)` failures from today's `ci.yml` window
-(90 `pull_request`/`completed` runs since the 09-21 report's cutoff,
-2026-09-21T10:18:51Z: 61 cancelled, 26 failure, 3 success), every
+Sampling `Test DB (linux, shard 0)` failures from today's `ci.yml` census
+window (90 `pull_request`/`completed` runs since the 09-21 report's cutoff,
+2026-09-21T10:18:51Z, through the latest run in the sampled page,
+2026-09-23T08:07:06Z — **~46 hours**: 61 cancelled, 26 failure, 3 success),
+every
 shard-0 failure checked — 4 more beyond the two PRs above, chosen for having
 no obvious own-diff compile/lint signature in the run summary — resolves to
 the **exact same test, exact same panic site**:
@@ -243,9 +255,12 @@ reached from `quota_enforcement_tests.rs`'s call to wait for the source's
 `COMPLETED` state — at a 30s bound for 5 of the 6 occurrences, and, per a
 correction below, the original 10s bound for the 6th.
 
-Six occurrences, six different branches, spanning 2026-09-22T07:15Z through
-2026-09-23T09:00Z — **26 hours**. **Correction (post-review, Codex on this
-PR, two rounds).** First round: an earlier draft called these six branches'
+Six occurrences, six different branches, with the occurrences themselves
+spanning 2026-09-22T07:15Z through 2026-09-23T09:00Z (a **26-hour spread
+between the first and last occurrence** — not the same thing as the census
+window they were found in, see the correction two sections below).
+**Correction (post-review, Codex on this PR, two rounds).** First round: an
+earlier draft called these six branches'
 failures independent because none of the four new ones has an open PR
 touching `quota_enforcement_tests.rs`, `completion_trigger.rs`, or
 `execution.rs`. That is too weak a check to support "no shared diff" — an
