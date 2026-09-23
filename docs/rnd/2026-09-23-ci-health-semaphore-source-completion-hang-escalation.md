@@ -11,7 +11,7 @@ every report in this series has hit). Continues the series from
 landed on `claude/fix-shard-0-collision-rebalance-1685`, not yet merged to
 `trunk-dev`, so it is not in this session's tree).
 
-**Corrected across ten Codex review rounds on this PR.** First round: the
+**Corrected across eleven Codex review rounds on this PR.** First round: the
 first draft claimed the `QuotaExceeded` arm "never" propagates `Err`/rolls
 back the source's transaction, having stopped reading `completion_trigger.rs`
 right before the outbox-row insert (that insert's own `.map_err(...)?` can in
@@ -126,8 +126,17 @@ rate comparison between them. Second: the SHA-ancestry check for the 5
 history, not that a later commit hadn't reverted the specific line — this
 session then directly inspected `quota_enforcement_tests.rs` at all 5 SHAs
 and confirmed the literal 30s call is present in each, strengthening rather
-than changing the conclusion. All corrections are inline at the point each
-applies, matching this series' convention.
+than changing the conclusion.
+
+**Eleventh round.** A leftover sentence from before round five's softening
+still said the two PRs (#1706, #1707) "are independently confirmed not to
+touch this path," stated without qualification. Narrowed to what is
+actually confirmed — neither PR's diff touches the `QuotaExceeded` arm or
+the test itself — while restating, consistent with round five, that
+neither PR's broader effects (the newly-activated background scanner for
+#1706, shard composition for #1707) are ruled out as rate-changers. All
+corrections are inline at the point each applies, matching this series'
+convention.
 
 ## 🎯 Verdict path
 
@@ -291,8 +300,20 @@ bound, is consistent with this being the same longstanding flake this
 series has tracked since before the widen shipped. The open-PR-based
 independence claim remains downgraded regardless: six occurrences on six
 differently-named branches, not confirmed to carry otherwise-unrelated
-diffs. The two PRs (#1706, #1707) are independently confirmed not to touch
-this path (read directly, not inferred from branch naming); the four
+diffs. **Correction (post-review, Codex on this PR):** an earlier draft of
+this paragraph said the two PRs (#1706, #1707) "are independently confirmed
+not to touch this path," a claim that survived even after this report's own
+later section narrows it. What is actually confirmed (read directly, not
+inferred from branch naming) is narrower: neither PR's diff touches the
+`QuotaExceeded` arm or the test itself. That does **not** establish either
+PR is unaffected — #1706 activates a previously-dormant background-scanner
+code path (new DB work every poll tick) and #1707 changes shard
+composition, and with runner slowness still an open candidate, either
+change could plausibly shift worker-startup or task-claim timing without
+touching the terminal arm at all. Restated at the confidence this session
+actually has: the panic predates both PRs (ruling out either as the *sole*
+cause), but whether either PR *changes the rate* is unresolved, matching
+the priority list's item below — not settled by this paragraph. The four
 additional branches' own full diffs against `trunk-dev` (beyond the one
 file checked above) remain an open question for the next session
 (`git diff trunk-dev...<branch>` for each) before "independent" is used as
