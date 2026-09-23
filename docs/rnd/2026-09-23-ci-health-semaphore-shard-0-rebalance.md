@@ -17,10 +17,11 @@
 # `quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded`
 # hung again -- identical panic site, identical signature -- on `Test DB
 # (linux, shard 4)` under the NEW 20-shard layout, where this session's own
-# harness run confirmed it lands **completely isolated**, no other heavy
-# suite on that shard at all. Shard load/collision is now confirmed NOT
-# the cause of this specific hang. See the "🔬 Live CI result" section
-# near the end for the full writeup.
+# harness run confirmed it lands free of any OTHER heavy (>=30-test) suite
+# (shard 4 still runs seven smaller suites). Corrected post-review (Codex):
+# one occurrence rules out heavy-suite COLLISION as a necessary condition,
+# not shard load in general -- see the "🔬 Live CI result" section near
+# the end for the full, corrected writeup.
 
 **Status:** fix shipped this session, `.github/workflows/ci.yml` only (shard
 count + matrix list + comment). No test code, no manifest reordering (the
@@ -232,19 +233,34 @@ above), shard 4 carries `quota_enforcement_tests` **completely isolated**
 unmodified test code the 2026-09-22 report already investigated, now on a
 shard purpose-built to rule out collision as a factor.
 
-**This confirms, as directly as a live CI run can, that shard load and
-suite collisions are not the cause of this hang.** The correlation with
-shard 0 that motivated this whole PR was real (shard 0 did carry a
-confirmed collision) but coincidental to the actual mechanism, not causal
-to it -- consistent with, and now reinforcing, PR #1703's own companion
-report finding a cascade that hit even the manifest's *lightest* shard.
+**Correction (post-review, Codex on this PR).** An earlier draft of this
+paragraph claimed this "confirms shard load and suite collisions are not
+the cause." Overstated for an n=1 observation, and Codex's review said so
+directly: shard 4 still runs seven other (sub-30-test) suites -- it is
+isolated from *heavy-suite collision* specifically, not from all load, and
+one recurrence at weight 115 cannot establish that shard load is
+non-causal or non-contributory in general, only that a heavy-suite
+collision is not a *necessary* condition for the hang. Restated at the
+confidence this evidence actually supports: **this specific run rules out
+the heavy-suite-collision hypothesis that motivated this PR** -- the
+mechanism this report and PR #1706's report chased is not "two large
+suites contending on one shard." It does not rule out load-sensitivity or
+probabilistic causes more broadly (a lightly-loaded shard could still
+carry *some*, lower, probability of triggering whatever this is), and it
+does not establish what the real mechanism is. The correlation with shard
+0 that motivated this whole PR was real (shard 0 did carry a confirmed
+collision) but this result weakens confidence that the collision itself
+was the operative cause, rather than a coincidental correlate -- consistent
+with, and adding to, PR #1703's own companion report finding a cascade
+that hit even the manifest's *lightest* shard.
 
 **What this means going forward:** this PR's shard rebalance remains a
 valid, measured CI-cost improvement (worst-shard load down ~42%) and is
-being kept for that reason alone. It is retracted as any kind of
-mitigation for `quota_enforcement_tests`'s hang. The hang itself is
-unexplained, reproduces on isolated shards under normal (not elevated)
-load, and needs a fundamentally different investigation than anything
+being kept for that reason alone. It is downgraded from "credible
+contributor" to "hypothesis weakened by direct evidence, not fully
+ruled out" as a mitigation for `quota_enforcement_tests`'s hang. The hang
+itself is unexplained, reproduces on a shard free of heavy-suite
+collisions, and needs a fundamentally different investigation than anything
 tried across this report, the 2026-09-22 report, or PR #1703's own
 session -- something in the worker's decision-cycle path itself
 (`evaluate_triggers_for_execution` and everything upstream of it up to
