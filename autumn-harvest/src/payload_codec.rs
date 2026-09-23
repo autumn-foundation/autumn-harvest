@@ -1188,11 +1188,25 @@ impl PayloadCodecs {
         // output carried; it is unique to WorkflowStarted among event variants.
         for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
             if let Some(payload) = data.get_mut(key) {
-                if encode {
-                    *payload = self.encode_payload(payload)?;
+                // `transform_event_data` already owns the whole event tree:
+                // `root: &mut Value` is an owned `Value` at every call
+                // site. `payload` is therefore already owned data, not a
+                // borrow into something a caller still needs afterward.
+                // `mem::take` moves it out, leaving `Value::Null` behind.
+                // This lets `encode_payload_owned`/`decode_payload_owned`
+                // hand the unchanged value straight back on the common
+                // (non-envelope) fast path. It avoids cloning the whole
+                // JSON tree just to produce a copy of data already in
+                // hand. If encoding or decoding fails, `?` returns before
+                // the `Null` placeholder is ever observed. The caller
+                // discards the whole partially-transformed `value` along
+                // with the error (see `encode_event`/`decode_event`).
+                let owned = std::mem::take(payload);
+                *payload = if encode {
+                    self.encode_payload_owned(owned)?
                 } else {
-                    *payload = self.decode_payload(payload)?;
-                }
+                    self.decode_payload_owned(owned)?
+                };
             }
         }
         Ok(())
@@ -1286,6 +1300,42 @@ impl PayloadCodecs {
             return Ok(payload.clone());
         }
         let raw = serde_json::to_vec(payload)?;
+        let encoded = codec
+            .encode(&raw)
+            .map_err(|e| HarvestError::Config(e.to_string()))?;
+        Ok(Self::envelope(
+            codec.codec_id(),
+            key_id.as_deref().unwrap_or(CODEC_LEGACY_KEY_ID),
+            &encoded,
+            // Reaching this point with the identity codec is only possible
+            // via the escape case above (the non-colliding case already
+            // returned). Force nesting even though the key id is legacy, so
+            // the escaped value is unambiguously an envelope — see
+            // `encode_payload`'s doc.
+            is_identity,
+        ))
+    }
+
+    /// [`PayloadCodecs::encode_payload`], taking `payload` by value.
+    ///
+    /// [`PayloadCodecs::transform_event_data`] already owns the whole event
+    /// tree it walks. Its per-field call here hands over ownership (via
+    /// `std::mem::take`) instead of borrowing. The identity fast path
+    /// below can then return the value it was already given. It avoids
+    /// cloning it, on the hot write path every event append runs.
+    ///
+    /// Deliberately **not** implemented by cloning into
+    /// [`PayloadCodecs::encode_payload`]. That would add a full-payload
+    /// clone to the non-identity (real-codec) slow path. The borrowing
+    /// version never paid that cost (Codex review on PR #1710). The two
+    /// stay independent so neither path regresses the other.
+    fn encode_payload_owned(&self, payload: Value) -> HarvestResult<Value> {
+        let (key_id, codec) = self.active_codec();
+        let is_identity = codec.codec_id() == "identity";
+        if is_identity && !payload_or_a_descendant_is_a_codec_envelope(&payload) {
+            return Ok(payload);
+        }
+        let raw = serde_json::to_vec(&payload)?;
         let encoded = codec
             .encode(&raw)
             .map_err(|e| HarvestError::Config(e.to_string()))?;
@@ -1458,6 +1508,33 @@ impl PayloadCodecs {
     pub fn decode_payload(&self, payload: &Value) -> HarvestResult<Value> {
         let Some(parts) = codec_envelope_parts(payload) else {
             return Ok(payload.clone());
+        };
+        let decoded = self.decode_envelope_bytes(&parts)?;
+        Ok(serde_json::from_slice(&decoded)?)
+    }
+
+    /// [`PayloadCodecs::decode_payload`], taking `payload` by value.
+    ///
+    /// [`PayloadCodecs::transform_event_data`] already owns the whole event
+    /// tree it walks. Its per-field call here hands over ownership (via
+    /// `std::mem::take`) instead of borrowing. The not-an-envelope fast
+    /// path below can then return the value it was already given. It
+    /// avoids cloning it, once per payload-bearing field of every event,
+    /// on the hot read/replay path every history load runs.
+    ///
+    /// Deliberately **not** implemented by cloning into
+    /// [`PayloadCodecs::decode_payload`]. That would add a full-envelope
+    /// clone, including its base64 ciphertext, to the codec-envelope slow
+    /// path. The borrowing version never paid that cost. It decodes
+    /// straight from the borrow.
+    ///
+    /// Codex review on PR #1710 flagged this: the production
+    /// continue-as-new carryover path in `worker.rs` calls the borrowing
+    /// version on a real envelope. The two stay independent so neither
+    /// path regresses the other.
+    fn decode_payload_owned(&self, payload: Value) -> HarvestResult<Value> {
+        let Some(parts) = codec_envelope_parts(&payload) else {
+            return Ok(payload);
         };
         let decoded = self.decode_envelope_bytes(&parts)?;
         Ok(serde_json::from_slice(&decoded)?)
