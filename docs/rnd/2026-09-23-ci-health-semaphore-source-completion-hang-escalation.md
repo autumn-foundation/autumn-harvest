@@ -1,4 +1,4 @@
-# 🚦 Semaphore CI health — `completion_trigger_defers_to_outbox_when_target_quota_exceeded`'s SOURCE-completion wait has gone from 1 occurrence in 6 days to 6 confirmed identical-signature occurrences in 26 hours, on 6 unrelated branches, and the 30s timeout widen that shipped for it (PR #1673, 09-21) did not fix it
+# 🚦 Semaphore CI health — `completion_trigger_defers_to_outbox_when_target_quota_exceeded`'s SOURCE-completion wait has gone from 1 occurrence in 6 days to 6 confirmed identical-signature occurrences in 26 hours, on 6 differently-named branches, and the 30s timeout widen that shipped for it (PR #1673, 09-21) did not fix it
 
 **Status:** health report — no PR opened against `ci.yml`, `quota_enforcement_tests.rs`,
 or `completion_trigger.rs`. This role's hard gate (a located problem, a named
@@ -10,6 +10,17 @@ every report in this series has hit). Continues the series from
 `docs/rnd/2026-09-23-ci-health-semaphore-shard-0-rebalance.md` (the latter
 landed on `claude/fix-shard-0-collision-rebalance-1685`, not yet merged to
 `trunk-dev`, so it is not in this session's tree).
+
+**Corrected after Codex review on this PR:** the first draft claimed the
+`QuotaExceeded` arm "never" propagates `Err`/rolls back the source's
+transaction, having stopped reading `completion_trigger.rs` right before the
+outbox-row insert; that insert's own `.map_err(...)?` can in fact propagate
+and roll back, which is a real, previously-ruled-out candidate mechanism —
+corrected inline below. The first draft also called the six branches
+"unrelated"/"independent" based only on an open-PR-listing check, which
+cannot establish that; downgraded to "differently-named," with the actual
+diff check left for the next session. Both corrections are inline at the
+point each applies, matching this series' convention.
 
 ## 🎯 Verdict path
 
@@ -40,11 +51,25 @@ commits — still fail `quota_enforcement_tests`:
 
 PR #1706's own description already retracted an earlier draft's claim that
 its fix would also explain this panic: `evaluate_triggers_for_execution`'s
-`QuotaExceeded` arm never touches the source's own terminal commit (confirmed
-again this session by reading `completion_trigger.rs:2078-2100` directly —
-the arm defers to the outbox and falls through; no `Err`/`?` propagation out
-of the source's transaction). So this is **not** the bug #1706 fixes, and
-#1706's fix landing will not close it.
+`QuotaExceeded` arm never touches the source's own terminal commit *on its
+success path* — confirmed this session by reading `completion_trigger.rs:
+2078-2100`, the tracing call and metrics record before the outbox insert.
+**Correction (post-review, Codex on this PR):** an earlier draft of this
+report stopped reading at line 2100 and claimed "no `Err`/`?` propagation out
+of the source's transaction" outright. That is wrong: continuing to line
+2121, the outbox-row insert itself ends `.map_err(crate::error::database_error)?`
+(`completion_trigger.rs:2101-2122`). A database error on *that* insert — a
+transient pool exhaustion, a constraint violation, a connection drop — does
+propagate `?` out of this function, and per the function's own doc comment
+(the whole arm "runs INLINE inside the SOURCE execution's own terminal
+transaction"), that would roll back the source's `WorkflowCompleted` append
+along with it, reproducing exactly the pre-fix symptom this test guards
+against. So #1706's fix landing will not close this on the arm's *ordinary*
+path (confirmed unchanged), but a rare error on the outbox insert itself is
+a real, undismissed candidate mechanism this report had wrongly ruled out —
+not confirmed either way this session (no worker-level logging or DB-error
+telemetry available to check whether any of the 6 occurrences actually hit
+this insert's error path), added to the diagnosis below.
 
 ### Widened census: 4 more, completely independent branches hit the identical panic site in the same ~26-hour window
 
@@ -74,13 +99,25 @@ reached from `quota_enforcement_tests.rs`'s `wait_for_execution_state_with_timeo
 call (the test's own doc comment names this "the money assertion: the source
 reaches COMPLETED even though its trigger's target is at quota cap").
 
-Six occurrences, six different branches, no shared diff between them (checked
-each branch name against this session's open-PR listing; none of the four new
-ones has an open PR touching `quota_enforcement_tests.rs`,
-`completion_trigger.rs`, or `execution.rs`), spanning 2026-09-22T07:15Z
-through 2026-09-23T09:00Z — **26 hours**. This is a real rate increase from
-the prior report's 3 total occurrences (2 of one signature, 1 of this one)
-spread across 6 days.
+Six occurrences, six different branches, spanning 2026-09-22T07:15Z through
+2026-09-23T09:00Z — **26 hours**. **Correction (post-review, Codex on this
+PR):** an earlier draft called these six branches' failures independent
+because none of the four new ones has an open PR touching
+`quota_enforcement_tests.rs`, `completion_trigger.rs`, or `execution.rs`.
+That is too weak a check to support "no shared diff" — an open-PR listing
+says nothing about a branch with no PR yet, a branch sharing commits with
+another via a common base, or a change to worker/queue/shard/test-setup code
+outside those three named files. This session did not diff each of the six
+branches' actual tested SHA against `trunk-dev` or against each other, so
+the independence claim is **downgraded**: six occurrences on six
+differently-named branches, not confirmed to carry unrelated diffs. This is
+still a real rate increase from the prior report's 3 total occurrences (2 of
+one signature, 1 of this one) spread across 6 days, and the two PRs (#1706,
+#1707) are independently confirmed not to touch this path (read directly,
+not inferred from branch naming) — but the four additional branches' own
+diffs are an open question the next session should check
+(`git diff trunk-dev...<branch>` for each) before repeating "independent" as
+a settled fact.
 
 **Not claimed as 100%.** Two `Test DB (linux, shard 0)` runs in roughly the
 same window passed cleanly: `35695812531` (2026-09-22T06:39Z, ~35 minutes
@@ -127,14 +164,25 @@ not obtain worker-level tracing or a live repro (no Docker), so it cannot
 render that verdict. What this session *did* establish, narrowing the
 candidate space:
 
-- **Not `#1706`'s mechanism.** Confirmed by re-reading
-  `completion_trigger.rs:2078-2100`: the same-shard `QuotaExceeded` arm falls
-  through to the outbox and metrics recording: it never returns `Err` or
-  otherwise aborts the source's own terminal transaction. Whatever is
-  blocking the source from reaching `COMPLETED` is not this documented
-  pre-fix bug reintroduced verbatim — if it were, the panic would be
-  immediate and deterministic (a permanently-stuck `RUNNING` row), not an
-  intermittent ~1-in-a-few-branches timeout.
+- **Not `#1706`'s mechanism on the arm's ordinary path — but a related,
+  undismissed candidate survives review.** The same-shard `QuotaExceeded`
+  arm's happy path (`completion_trigger.rs:2078-2100`) falls through to the
+  outbox and metrics recording without touching the source's transaction.
+  **Correction (post-review, Codex on this PR):** an earlier draft of this
+  report stopped there and claimed the whole arm never propagates `Err`.
+  Wrong — the outbox-row insert immediately after
+  (`completion_trigger.rs:2101-2122`) ends `.map_err(crate::error::database_error)?`,
+  and per the arm's own doc comment this whole block runs inline inside the
+  source's terminal transaction. A database error on that specific insert
+  (pool exhaustion, a dropped connection, a constraint violation under
+  concurrent load) would propagate and roll back the source's own
+  `WorkflowCompleted` append — the exact pre-fix symptom this test exists to
+  catch, on a narrower trigger than the original bug (an insert-time error,
+  not every quota-exceeded evaluation). Not confirmed as what actually
+  happened in any of the 6 occurrences (no DB-error telemetry captured), but
+  it is a concrete, previously-unconsidered mechanism the next session
+  should check for (e.g. Postgres logs or connection-pool metrics around
+  each occurrence's timestamp) before assuming a pure hang.
 - **Not "CI is just slow."** The bound is already 30s, 3x this file's normal
   10s default, deliberately widened for this exact assertion, and still
   loses regularly. The test's own doc comment says the entire decision cycle
@@ -167,7 +215,7 @@ candidate space:
 ## 🔧 Treatment
 
 None. Per the hard gate, this is correctly a health report, not a fix PR:
-no rerun-rate measurement (no Docker), no named mechanism (three candidates
+no rerun-rate measurement (no Docker), no named mechanism (four candidates
 above, none confirmed), no test-vs-product verdict, no before/after
 measurement. **Explicitly not recommended:** widening the timeout further.
 It is already at 3x default, was widened once for this exact flake nine
@@ -191,7 +239,17 @@ timeout-bump theater, the exact pattern this role exists to stop.
 3. Diff `56bc205`'s `execution.rs` and remaining `completion_trigger.rs`
    hunks against what this test's worker path actually calls, to check
    (not assume) the commit message's "unrelated" claim.
-4. Both #1706 and #1707 are otherwise complete, reviewed multiple times, and
+4. Check whether any of the 6 occurrences hit the outbox-insert error path
+   named in Diagnosis (`completion_trigger.rs:2101-2122`'s `.map_err(...)?`)
+   rather than a pure hang — Postgres server logs or connection-pool
+   exhaustion metrics around each occurrence's timestamp, if retained, would
+   settle it directly; this session had neither.
+5. Diff each of the 4 additional branches (`trusting-ritchie-nml6ud`,
+   `gallant-dijkstra-a83hyy`, `confident-babbage-sl0122`, `cool-noether-7dejjb`)
+   against `trunk-dev` before repeating this report's "independent branches"
+   framing as settled — this session checked only the open-PR listing, which
+   Codex review on this PR correctly flagged as too weak to support that claim.
+6. Both #1706 and #1707 are otherwise complete, reviewed multiple times, and
    blocked on this same shared, pre-existing flake — neither PR's own diff
    caused it (checked above for #1706; #1707 touches only `ci.yml`'s shard
    count). Whoever merges either should not treat this test's continued
