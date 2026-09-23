@@ -1,4 +1,7 @@
 #![cfg(feature = "db")]
+// Test-code style lints (consistent with throttle_tests.rs and the other perf
+// harnesses in this directory).
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 //! Ledger performance fix:
 //! `throttle::pre_lock_rate_limit_buckets_for_claimed_batch`'s per-bucket-key
 //! `FOR UPDATE` N+1 (issue #1230 Finding 2).
