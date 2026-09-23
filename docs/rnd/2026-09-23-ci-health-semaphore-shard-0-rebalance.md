@@ -1,10 +1,15 @@
 # 🚦 Semaphore CI health — shard 0's `integration_e2e`/`quota_enforcement_tests`
 # collision drifted back AND grew a third member (`backup_verify_tests`);
-# rebalanced from 11 to 17 shards. This is a confirmed, measured fix for
-# the load imbalance, offered as a credible but NOT proven contributor to
-# the still-unexplained `quota_enforcement_tests` hang the 2026-09-22
-# report (`ci-health-semaphore-quota-outbox-root-cause.md`) tracks
-# separately -- see that report for the hang's own mechanism, still open.
+# rebalanced from 11 to 17 shards. Corrected post-review (Codex on this
+# PR): shard 0 is not actually the single heaviest shard by test-weight --
+# a SEPARATE, previously-unnoticed four-way collision on shard 7 is worse
+# (323 vs shard 0's 268) -- but the rebalance fixes both at once, and shard
+# 0 still uniquely carries a fixed extra pass no weight metric captures.
+# This is a confirmed, measured fix for the load imbalance, offered as a
+# credible but NOT proven contributor to the still-unexplained
+# `quota_enforcement_tests` hang the 2026-09-22 report
+# (`ci-health-semaphore-quota-outbox-root-cause.md`) tracks separately --
+# see that report for the hang's own mechanism, still open.
 
 **Status:** fix shipped this session, `.github/workflows/ci.yml` only (shard
 count + matrix list + comment). No test code, no manifest reordering (the
@@ -89,25 +94,57 @@ EOF
 ...
 ```
 
-At the current count (11), shard 0 carries **323** combined
-`#[tokio::test]`-weight; every other shard carries 33-149. At 17 shards,
-the worst shard carries 174 -- roughly half -- and no single shard collides
-two suites above a combined ~154. 17 was picked purely by this simulation,
-the same method issue #1267 used to pick 11, scanning every count from 11
-through 24 and taking the smallest resulting max-shard weight; no other
-count in that range came close (the next-best, 20, still left the worst
-shard at 189).
+**Correction (post-review, Codex on this PR).** An earlier draft of this
+section misread its own simulation output and reported shard 0 as the
+run's single heaviest shard at 323. Wrong: printing the FULL per-shard
+breakdown (not just the collision members) shows shard 0 actually totals
+**268** (`118 + 47 + 57` from the three named suites, plus smaller rows).
+**323 belongs to shard 7** -- a separate, previously-unnoticed collision of
+`event_partitioning_tests` (148), `audit_export_tests` (87),
+`claim_budget_tests` (34), and `shard_placement_by_id_tests` (29). Shard 1
+(154) and shard 6 (190, `shard_rebalance_db_tests` at 111 plus
+`claim_batched_tests`) also exceed what an earlier draft called "every
+other shard's 33-149" ceiling. The corrected full breakdown at 11 shards:
 
-**Also newly noted, independent of the manifest drift:** shard 0 alone
-carries an *unconditional* extra step, `Integration suites (partitioned
+```
+shard 0:  268  (integration_e2e 118, quota_enforcement_tests 47, backup_verify_tests 57, + smaller)
+shard 1:  154  (codec_rotation_db_tests 56, transactional_start_tests 36, + smaller)
+shard 2:  138  (capability_miss_tests 46, cross_region_dr_tests 31, + smaller)
+shard 3:   64
+shard 4:   74
+shard 5:  129
+shard 6:  190  (shard_rebalance_db_tests 111, claim_batched_tests 23, + smaller)
+shard 7:  323  (event_partitioning_tests 148, audit_export_tests 87, claim_budget_tests 34, shard_placement_by_id_tests 29)
+shard 8:   96
+shard 9:   33
+shard 10: 130  (hot_code_swap_tests 40, queue_pause_tests 35, + smaller)
+```
+
+This matters for the causal story: shard 0 is **not** the single heaviest
+shard by raw test-weight, so "it is the heaviest shard" cannot be the
+whole explanation for why failures keep naming shard 0 specifically rather
+than shard 7. What is still true and still confirmed: shard 0 carries a
+real, three-way collision of large suites (a regression of issue #1267's
+own fix), and shard 0 alone -- regardless of test-weight -- carries an
+*unconditional* extra step, `Integration suites (partitioned
 harvest_events layout)` (`if: ... && matrix.shard == 0`), re-running ~9
 more manifest rows (~6 more minutes, per that step's own comment) against
 `HARVEST_TEST_PARTITIONED=1`. That step is not manifest-row-driven and does
 not move when the shard-count changes -- it is *always* shard 0's own extra
-cost on top of whatever manifest weight lands there. Combined with the
-weight-drift above, shard 0 was structurally the heaviest-loaded and
-longest-running shard in the whole matrix by a wide margin, independent of
-and in addition to the collision.
+cost, on top of whatever manifest weight lands there, and it is not
+captured by the test-weight metric at all. Whether that fixed extra cost
+alone (rather than raw weight) is what makes shard 0 specifically prone to
+the hang is not established either -- shard 7 carries no such extra step
+despite carrying more raw test-weight, which is itself a data point against
+a pure-weight explanation and worth the next session's attention.
+
+The rebalance below fixes **both** collisions (shard 0's three-way and
+shard 7's four-way) at once, since it changes the modulus every row's
+shard assignment is computed from. 17 was picked purely by the max-shard
+simulation, the same method issue #1267 used to pick 11, scanning every
+count from 11 through 24 and taking the smallest resulting max-shard
+weight; no other count in that range came close (the next-best, 20, still
+left the worst shard at 189).
 
 ## 🧭 What this fix is, and is NOT, claimed to be
 
@@ -149,12 +186,15 @@ touched.
 
 ## 📊 Measurement
 
-Before: shard 0 at 323 combined `#[tokio::test]`-weight (11 shards), the
-heaviest by a wide margin, carrying `integration_e2e` (118),
-`quota_enforcement_tests` (47), and `backup_verify_tests` (57), plus the
-fixed extra `linuxpart` pass. After: 17 shards, worst shard at 174; the
-three named suites land on three different shards (16, 10, 9 respectively)
-under the new modulus, no two combining above ~154 anywhere in the matrix.
+Before (11 shards): the matrix's heaviest shard is shard 7 at 323 combined
+`#[tokio::test]`-weight (a four-way collision, corrected above -- not
+shard 0, which totals 268 from its own three-way collision of
+`integration_e2e` 118, `quota_enforcement_tests` 47, and
+`backup_verify_tests` 57, plus the fixed extra `linuxpart` pass no other
+shard carries). After (17 shards): worst shard at 174; both collisions are
+broken up -- the three shard-0 suites land on three different shards (16,
+10, 9), and shard 7's four suites likewise separate -- no two combining
+above ~154 anywhere in the matrix.
 No before/after wall-clock timing obtained this session (would need a live
 CI run of both configurations, and 17 shards is itself the fix under test
 in the PR carrying this change) -- the weight simulation is the same proxy
