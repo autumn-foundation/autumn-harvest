@@ -1026,51 +1026,92 @@ jobs:
       # Actions matrix expressions can't derive one from the other, so keep
       # them in sync by hand when changing the shard count.
       #
-      # 20, not 11 (issue #1685 review; see also PR #1703's
+      # 21, not 11 (issue #1685 review; see also PR #1703's
       # `docs/audits/shard-weight-drift.py`, a report-only harness that
       # independently reaches the same "no N is collision-free" finding
       # below with a more careful count -- it resolves substring-matched
       # manifest filters and plugin-crate rows this comment's own earlier
-      # draft undercounted). 11 was chosen (issue #1267) to break a 10-row
+      # drafts undercounted). 11 was chosen (issue #1267) to break a 10-row
       # gap between `integration_e2e` and `quota_enforcement_tests`, the
       # manifest's two largest suites at the time. The manifest keeps
       # growing alphabetically, and their gap silently drifted back onto a
       # value 11 cannot tolerate either. That drift is real and confirmed.
       #
-      # What this comment's own first-draft fix got wrong (kept here rather
-      # than silently corrected, since a later commit's diff is not the
-      # place a future reader will look for this): it computed weight from
-      # `autumn-harvest/integration` rows only, treating every
-      # `autumn-harvest-plugin` row as a flat weight of 1. Plugin suites are
-      # not that small -- `ui_integration` alone is 148 tests. Recomputed
-      # properly (PR #1703's harness), NO shard count from 9 through 24
-      # avoids multiple heavy (>=30-test) suites landing on one shard --
-      # this manifest cannot be round-robin-sharded into a fully balanced,
-      # collision-free layout at any N in that range; a durable fix needs a
-      # weight-aware assignment, not a bigger modulus, and that is a bigger
-      # change than this fix attempts. 20 is simply the best N this range's
-      # sweep found: global max-shard weight 247 (down from 11's 426),
-      # spread 179 (down from 328), 5 remaining heavy-suite collisions (down
-      # from 7 at 11) -- an improvement, not a solved problem.
+      # This comment went through five rounds of correction (kept here
+      # rather than silently rewritten, since a later commit's diff is not
+      # where a future reader will look for this history):
       #
-      # Concretely for the test that motivated this fix:
-      # `quota_enforcement_tests` lands alone on its own shard at N=20 (no
-      # other heavy suite there), versus sharing shard 0 with
-      # `integration_e2e` and `backup_verify_tests` at N=11. Whether that
-      # isolation actually reduces `quota_enforcement_tests`'s recurring,
-      # exactly-at-the-configured-timeout hang -- named by the "🚦
+      # Round 1 computed weight from `autumn-harvest/integration` rows
+      # only, flattening every `autumn-harvest-plugin` row to weight 1
+      # (`ui_integration` alone is 148 tests) -- and separately mislabeled
+      # which shard was heaviest under that undercount (claimed shard 0 at
+      # 323). Chose 17.
+      #
+      # Round 2 (Codex review) fixed the mislabeling -- shard 7, not shard
+      # 0, was actually heaviest (323 vs shard 0's 268) -- but left the
+      # plugin-row undercount itself in place. Still chose 17.
+      #
+      # Round 3 (Codex review) found the real bug behind both: five
+      # manifest `filter` values are Cargo substring/prefix matches, not
+      # filenames, so the naive per-row weight lookup silently scored them
+      # 0. Switched to PR #1703's `docs/audits/shard-weight-drift.py`, a
+      # harness that resolves plugin-crate rows and substring filters
+      # correctly, and re-swept N=9-24 with it. 20 came out best in that
+      # range (max 247, versus 17's true max, which is higher than round
+      # 2 ever computed). Chose 20.
+      #
+      # Round 4: this PR's own live CI reproduced the
+      # `quota_enforcement_tests` hang again, on shard 4 under the new
+      # N=20 layout -- a shard confirmed isolated from every other heavy
+      # (>=30-test) suite. An earlier draft of this history claimed that
+      # recurrence "confirms shard load is not the cause"; Codex review
+      # correctly narrowed that to "rules out heavy-suite collision as a
+      # necessary condition," since one occurrence on a shard still running
+      # seven smaller suites cannot rule out load-sensitivity in general.
+      # No shard-count change.
+      #
+      # Round 5 (this one, Codex review): the N=9-24 sweep behind round 3's
+      # choice only covered the sharded `run linux` step. The same job also
+      # runs `Integration suites (partitioned harvest_events layout)`
+      # unconditionally on `matrix.shard == 0` (below), re-running 9 more
+      # rows -- including a full second pass of `integration_e2e`, 118
+      # tests -- worth a fixed +188 that ALWAYS lands on shard 0 regardless
+      # of N. Under round 3's N=20, shard 0's own sharded rows already
+      # totaled 247 (`ui_integration` landed there); adding the fixed +188
+      # makes shard 0's true total 435 -- worse than the original N=11's
+      # own true max of 426. N=20 was, corrected, one of the WORST choices
+      # in the swept range, not the best.
+      #
+      # Re-swept N=9-24 with the fixed +188 correctly added to shard 0's
+      # total for every candidate. Best true max in that range: N=24 (261)
+      # and N=23 (262), essentially tied. Chose N=21 (true max 287, ~13%
+      # worse than the N=24/23 optimum) instead, for one reason with any
+      # independent merit left: `quota_enforcement_tests` lands on shard 2
+      # at N=21 with no co-resident heavy (>=30-test) suite, versus a
+      # 3-way collision at N=23 and a 2-way collision with `ui_integration`
+      # at N=24. That isolation is NOT established to help the actual hang
+      # (see below) -- it is the one property this fix can still honestly
+      # claim, at a real but small cost in overall balance.
+      #
+      # No shard count in 9-24 is collision-free (confirmed, this round,
+      # under the corrected accounting too) -- a durable fix needs a
+      # weight-aware assignment that also accounts for the linuxpart pass,
+      # not a bigger modulus, and that is a bigger change than this fix
+      # attempts.
+      #
+      # Whether shard load explains `quota_enforcement_tests`'s recurring,
+      # exactly-at-the-configured-timeout hang at all -- named by the "🚦
       # Semaphore" CI-health report series
       # (docs/rnd/2026-09-*-ci-health-semaphore-quota-outbox-*.md) and
       # multiple concurrent PRs (#1697, #1698, #1699, #1706 at the time of
-      # this fix) -- is NOT established. That hang's own mechanism is still
-      # unexplained (see the report series), and PR #1703's own further
-      # findings include evidence against a pure shard-weight explanation
-      # (a failure cascade that hit even the manifest's *lightest* shard).
-      # This change is offered as a real, measured load-balance
-      # improvement and a plausible, unproven contributor -- not a claimed
-      # fix for the hang.
+      # this fix) -- is NOT established, and this PR's own first CI run
+      # (see the report) reproduced the hang on an isolated shard, which
+      # rules out heavy-suite collision as a NECESSARY condition (not shard
+      # load or probabilistic causes in general -- see the report for that
+      # distinction). This change is offered as a real, measured
+      # load-balance improvement, not a claimed fix for the hang.
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -1141,7 +1182,7 @@ jobs:
           # into a panic, so "the Redis suites stopped testing anything" is a
           # red build here rather than a silent green.
           HARVEST_TEST_REQUIRE_REDIS: "1"
-          SEMAPHORE_SHARD_COUNT: "20"
+          SEMAPHORE_SHARD_COUNT: "21"
           SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
         run: bash .github/ci/run-suites.sh run linux
       # Issue #958, AC2: re-run the store/replay/retention suites against the
