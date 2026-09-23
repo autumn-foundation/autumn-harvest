@@ -1034,22 +1034,29 @@ jobs:
       # third large one (`backup_verify_tests`), were back on one shard
       # (shard 0, row-ordinal % 11 == 0 for all three) -- confirmed via the
       # same `#[tokio::test]`-count-per-row weight simulation issue #1267
-      # used, showing shard 0 at 323 combined test-weight against every
-      # other shard's 33-149. Independently, `Test DB (linux, shard 0)`
-      # is the shard the "🚦 Semaphore" CI-health report series
-      # (docs/rnd/2026-09-*-ci-health-semaphore-quota-outbox-*.md) and
-      # multiple concurrent PRs (#1697, #1698, #1699, #1706 at the time of
-      # this fix) most often name for `quota_enforcement_tests`'s recurring,
-      # exactly-at-the-configured-timeout hang. That hang's own mechanism is
-      # not fully root-caused (see the report series), so this is not
-      # claimed as a proven fix for it -- but shard 0 carrying triple the
-      # heaviest-suite weight of most other shards, PLUS the unconditional
+      # used, showing shard 0 at 268 combined test-weight. That is NOT the
+      # matrix's heaviest shard -- shard 7 independently collides FOUR large
+      # suites (`event_partitioning_tests`/`audit_export_tests`/
+      # `claim_budget_tests`/`shard_placement_by_id_tests`) for 323, and
+      # shards 1/6 also run well above the rest. Since shard 0 is not
+      # actually the heaviest shard by this metric, raw test-weight alone
+      # cannot be the whole explanation for why `Test DB (linux, shard 0)`
+      # specifically -- not shard 7 -- is the shard the "🚦 Semaphore"
+      # CI-health report series (docs/rnd/2026-09-*-ci-health-semaphore-
+      # quota-outbox-*.md) and multiple concurrent PRs (#1697, #1698,
+      # #1699, #1706 at the time of this fix) name for
+      # `quota_enforcement_tests`'s recurring, exactly-at-the-configured-
+      # timeout hang. That hang's own mechanism is not fully root-caused
+      # (see the report series), so this is not claimed as a proven fix for
+      # it -- but shard 0's confirmed collision, PLUS the unconditional
       # extra "linuxpart" pass below (`matrix.shard == 0`, another ~6
-      # minutes no other shard carries), is a confirmed, measured regression
-      # worth fixing on its own, and a credible contributor to a hang that
-      # correlates with exactly this shard. 17 was picked the same way 11
-      # was: simulating per-shard weight for every count from 11 to 24 and
-      # picking the smallest resulting max-shard weight (174, down from
+      # minutes no test-weight metric captures and no other shard carries),
+      # is a confirmed, measured regression worth fixing on its own, and a
+      # credible (not proven) contributor to a hang that keeps correlating
+      # with exactly this shard. 17 fixes both shard 0's and shard 7's
+      # collisions at once: picked the same way 11 was, simulating
+      # per-shard weight for every count from 11 to 24 and picking the
+      # smallest resulting max-shard weight (174, down from
       # 323 -- every other tested count in that range stayed above 180).
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
