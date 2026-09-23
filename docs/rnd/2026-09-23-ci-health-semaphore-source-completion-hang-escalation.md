@@ -11,7 +11,7 @@ every report in this series has hit). Continues the series from
 landed on `claude/fix-shard-0-collision-rebalance-1685`, not yet merged to
 `trunk-dev`, so it is not in this session's tree).
 
-**Corrected across sixteen Codex review rounds on this PR.** First round: the
+**Corrected across seventeen Codex review rounds on this PR.** First round: the
 first draft claimed the `QuotaExceeded` arm "never" propagates `Err`/rolls
 back the source's transaction, having stopped reading `completion_trigger.rs`
 right before the outbox-row insert (that insert's own `.map_err(...)?` can in
@@ -184,8 +184,20 @@ Reproduce section's inline comment on the one genuine clean pass still
 said "SHA ancestry check (below) confirms pre-widen," the exact
 ancestry-only wording round fifteen's finding had just retired for that
 same SHA one section up — corrected to point at the direct file check
-instead. All corrections are inline at the point each applies, matching
-this series' convention.
+instead.
+
+**Seventeenth round.** The "5 of 6 occurrences co-occur with the current
+11-shard collision" claim was computed only from the current `trunk-dev`
+checkout's manifest, not verified at each of those 5 branches' own
+revisions — a branch-local manifest or shard-count change on any of them
+could have invalidated it. Checked directly: `.github/ci/integration-suites.txt`
+at each of the 5 SHAs has `integration_e2e`/`quota_enforcement_tests` at
+the same rows (33, 44), and each SHA's own `ci.yml` sets
+`SEMAPHORE_SHARD_COUNT: "11"` — so the collision holds at every one of the
+5 individually. This strengthens rather than undermines the claim, but it
+was unverified before this round; the report now cites the per-SHA check
+instead of the current-tree computation alone. All corrections are inline
+at the point each applies, matching this series' convention.
 
 ## 🎯 Verdict path
 
@@ -451,10 +463,21 @@ that PR's own explicit design goal of separating them. So that occurrence is
 not explained by this collision at all — if anything it is evidence
 *against* the collision being the flake's cause: PR #1707's rebalance
 already isolates `quota_enforcement_tests` from `integration_e2e`, and the
-SOURCE-completion panic still fired. Restated at the confidence this
-evidence actually supports: 5 of 6 occurrences co-occur with the current
-11-shard collision (consistent with, not proven caused by, that shard's
-outsized duration — sequential execution still rules out literal
+SOURCE-completion panic still fired. **Correction (post-review, Codex on
+this PR):** the "5 of 6 co-occur" claim below was computed only from the
+current `trunk-dev` checkout's manifest, not verified at each of those 5
+branches' own revisions — a branch-local manifest or shard-count change on
+any of them would invalidate it. Checked directly: `.github/ci/integration-suites.txt`
+at each of the 5 SHAs (`b554b1e6`/#1706, `79f7d6a4`/trusting-ritchie,
+`5d77d70e`/confident-babbage, `afb756be`/cool-noether, `58abe747`/gallant-dijkstra)
+has `integration_e2e` and `quota_enforcement_tests` at the same rows (33,
+44) as the current checkout, and each SHA's own `ci.yml` sets
+`SEMAPHORE_SHARD_COUNT: "11"` — so `33 % 11 = 44 % 11 = 0` holds at every
+one of the 5 individually, not merely assumed from the current tree.
+Restated at the confidence this evidence actually supports: 5 of 6
+occurrences co-occur with the 11-shard collision, verified at each of
+those 5 SHAs directly (consistent with, not proven caused by, that
+shard's outsized duration — sequential execution still rules out literal
 concurrent contention, per the 09-21 report); the 6th occurred with the
 collision already fixed, which weakens rather than strengthens the case that
 the collision explains this flake.
@@ -770,6 +793,17 @@ grep -n "quota_enforcement_tests::completion_trigger_defers_to_outbox_when_targe
 # 5 of the 6 occurrences:
 awk '$1=="linux"{print c": "$0; c++}' .github/ci/integration-suites.txt | grep -n "integration_e2e\|quota_enforcement_tests"
 python3 -c "print(33 % 11, 44 % 11)"   # -> 0 0
+
+# Codex's correction: the above only checked the current trunk-dev tree,
+# not each of the 5 branches' own revisions. Verify directly at each SHA:
+for sha in b554b1e6a56248df6fe1778edaea52900ce2e04e 79f7d6a4686ace44ebf641aca72a48c0f21e3e01 5d77d70e4e6d4f8a895887a915173d4d3e20bf6b afb756be400848647085ef1acf89c73123bd0be5 58abe747; do
+  echo "=== $sha ==="
+  git show "$sha:.github/ci/integration-suites.txt" | awk '$1=="linux"{print c": "$0; c++}' | grep -n "integration_e2e\|quota_enforcement_tests"
+  git show "$sha:.github/workflows/ci.yml" | grep "SEMAPHORE_SHARD_COUNT" | tail -1
+done
+# -> all 5 have integration_e2e/quota_enforcement_tests at rows 33/44 and
+#    SEMAPHORE_SHARD_COUNT: "11" at their own revision -- 33 % 11 = 44 % 11
+#    = 0 holds individually, not just in the current checkout.
 
 # PR #1707's own 21-shard layout does NOT collide these two suites --
 # confirmed, correcting an earlier draft's "every occurrence" overclaim:
