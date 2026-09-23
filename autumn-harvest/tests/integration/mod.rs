@@ -245,6 +245,8 @@ mod telemetry_span_tests;
 #[cfg(feature = "db")]
 mod terminal_write_ownership_tests;
 #[cfg(feature = "db")]
+mod throttle_bucket_prelock_batch_perf;
+#[cfg(feature = "db")]
 mod throttle_tests;
 #[cfg(feature = "db")]
 mod transactional_activity_tests;
