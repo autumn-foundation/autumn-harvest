@@ -11,7 +11,7 @@ every report in this series has hit). Continues the series from
 landed on `claude/fix-shard-0-collision-rebalance-1685`, not yet merged to
 `trunk-dev`, so it is not in this session's tree).
 
-**Corrected across six Codex review rounds on this PR.** First round: the
+**Corrected across seven Codex review rounds on this PR.** First round: the
 first draft claimed the `QuotaExceeded` arm "never" propagates `Err`/rolls
 back the source's transaction, having stopped reading `completion_trigger.rs`
 right before the outbox-row insert (that insert's own `.map_err(...)?` can in
@@ -85,8 +85,18 @@ just slow" survived in the timeout section (a duplicate of the claim round
 five corrected in Diagnosis) — swept and reconciled with the corrected
 position: three mechanism candidates (product hang, runner slowness,
 unbounded queueing) remain open, none favored by the widen-didn't-help
-evidence alone. All corrections are inline at the point each applies,
-matching this series' convention.
+evidence alone.
+
+**Seventh round.** The Treatment section's own recommendation against
+further widening still called it "pure timeout-bump theater," a claim of
+proven futility this report's own corrected Diagnosis no longer supports —
+runner slowness is a live candidate, and if it is the real mechanism a
+larger bound could genuinely help. Corrected to the actual reason this role
+rejects an unmeasured widen: not that the evidence proves it useless, but
+that this role's own hard gate requires a same-commit rerun rate before and
+after before touching the timeout at all — which neither the first widen
+nor any further one has had. All corrections are inline at the point each
+applies, matching this series' convention.
 
 ## 🎯 Verdict path
 
@@ -444,11 +454,21 @@ None. Per the hard gate, this is correctly a health report, not a fix PR:
 no rerun-rate measurement (no Docker), no named mechanism (four candidates
 above, none confirmed), no test-vs-product verdict, no before/after
 measurement. **Explicitly not recommended:** widening the timeout further.
-It is already at 3x default, was widened once for this exact flake already
-(citing a single observed occurrence at the time), and 5 of the 6 fresh
-occurrences this report found happened at that new, larger bound — a 4th
-widen would be pure timeout-bump theater, the exact pattern this role exists
-to stop.
+**Correction (post-review, Codex on this PR):** an earlier draft called this
+"pure timeout-bump theater" and implied the evidence proves a widen
+couldn't help. That overclaims what this report established — runner
+slowness (worker startup, task-claim latency) is a live, undismissed
+candidate per the correction above, and if that turns out to be the actual
+mechanism, a larger bound could genuinely mitigate the symptom, not just
+mask it. The reason to reject an unmeasured widen is this role's own hard
+gate, not proof of futility: it is already at 3x default, was widened once
+for this exact flake already on a single observed occurrence with no
+rerun-rate behind it, and 5 of the 6 fresh occurrences this report found
+still happened at that new, larger bound — evidence that the first widen
+wasn't justified by measurement, not evidence that no bound would help.
+Any further change to this timeout needs the same thing the first one
+skipped: a same-commit rerun rate before and after, on the actual runner
+class this flakes on.
 
 **Priority for the next session with Docker or live-CI-dispatch access:**
 
