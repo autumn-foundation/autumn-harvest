@@ -359,34 +359,40 @@ PGPASSWORD=harvest psql -U harvest -h 127.0.0.1 -d harvest_test \
   -f target/debug/build/autumn-harvest-*/out/all_migrations_bundle.sql
 export HARVEST_TEST_DATABASE_URL="postgres://harvest:harvest@127.0.0.1:5432/harvest_test"
 
-# CPU oversubscription (8x on a 4-core box). Capture the PIDs -- the
-# no-stress section below needs these actually stopped, not just
-# outlived, or its own "no stress needed" claim does not hold.
-STRESS_PIDS=()
-for i in $(seq 1 32); do yes > /dev/null & STRESS_PIDS+=("$!"); done
+# CPU oversubscription (8x on a 4-core box), in a subshell with its own
+# EXIT trap -- the individual `cargo test` runs below are EXPECTED to fail
+# some of the time (that is the flake being measured), so under a caller's
+# `set -e` the first failing run would exit the shell before the plain
+# `kill` at the end ever ran, leaving all 32 `yes` processes running. The
+# subshell's own `EXIT` trap fires regardless of how or when the block
+# exits, and `|| true` on each loop keeps a single failing iteration from
+# aborting the rest of the campaign under `set -e`.
+(
+  STRESS_PIDS=()
+  for i in $(seq 1 32); do yes > /dev/null & STRESS_PIDS+=("$!"); done
+  trap 'kill "${STRESS_PIDS[@]}" 2>/dev/null' EXIT
 
-# Reproduce the pre-fix flake (run against trunk-dev HEAD, before this
-# session's fix, to confirm the failure rate below still holds):
-for i in $(seq 1 20); do
-  cargo test -p autumn-harvest --test integration -- \
-    completion_trigger_defers_to_outbox_when_target_quota_exceeded \
-    --test-threads=1
-done
-# -> ~5/20 failures, "target row was never created by the outbox retry;
-#    last count was 1", ~11-12s each.
+  # Reproduce the pre-fix flake (run against trunk-dev HEAD, before this
+  # session's fix, to confirm the failure rate below still holds):
+  for i in $(seq 1 20); do
+    cargo test -p autumn-harvest --test integration -- \
+      completion_trigger_defers_to_outbox_when_target_quota_exceeded \
+      --test-threads=1 || true
+  done
+  # -> ~5/20 failures, "target row was never created by the outbox retry;
+  #    last count was 1", ~11-12s each.
 
-# Confirm the fix (after this session's change):
-for i in $(seq 1 40); do
-  cargo test -p autumn-harvest --test integration -- \
-    completion_trigger_defers_to_outbox_when_target_quota_exceeded \
-    --test-threads=1
-done
-# -> 0/40 failures (this session's own run; a second 30-run batch also
-#    0/30, 70/70 total).
-
-# Stop the CPU burners before anything claiming "no stress needed" --
-# otherwise they are still running underneath it and that claim is false.
-kill "${STRESS_PIDS[@]}" 2>/dev/null
+  # Confirm the fix (after this session's change):
+  for i in $(seq 1 40); do
+    cargo test -p autumn-harvest --test integration -- \
+      completion_trigger_defers_to_outbox_when_target_quota_exceeded \
+      --test-threads=1 || true
+  done
+  # -> 0/40 failures (this session's own run; a second 30-run batch also
+  #    0/30, 70/70 total).
+)
+# The CPU burners are stopped here, by the subshell's own EXIT trap -- so
+# anything claiming "no stress needed" below actually runs unstressed.
 
 # The unrelated, pre-existing full-module flake (no stress needed):
 for i in 1 2 3; do
