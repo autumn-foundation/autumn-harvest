@@ -1037,7 +1037,7 @@ jobs:
       # growing alphabetically, and their gap silently drifted back onto a
       # value 11 cannot tolerate either. That drift is real and confirmed.
       #
-      # This comment went through six rounds of correction (kept here
+      # This comment went through seven rounds of correction (kept here
       # rather than silently rewritten, since a later commit's diff is not
       # where a future reader will look for this history):
       #
@@ -1110,6 +1110,17 @@ jobs:
       # remains the best option that also keeps `quota_enforcement_tests`
       # isolated (checked directly: N=18, the next lower true-max candidate
       # that also isolates it, is 316, still worse than N=21's 287).
+      #
+      # Round 7 (Codex review): round 6's isolation check above named only
+      # N=18 and N=20 as the other isolating candidates. Testing every
+      # N=9-24 directly against the harness's own heavy-collision function,
+      # rather than the two that had already come up in conversation, finds
+      # THREE more: N=9, N=10, N=14 all isolate `quota_enforcement_tests`
+      # too. None beats N=21 (their true maxima are 472, 520, and 429 --
+      # all worse than 287), so the shipped shard count does not change.
+      # Only the claim of an exhaustive check was wrong; it is exhaustive
+      # now (see the report's "🔍 Sixth correction" for the full N=9-24
+      # isolation table).
       #
       # No shard count in 9-24 is collision-free (confirmed, this round,
       # under the corrected accounting too) -- a durable fix needs a

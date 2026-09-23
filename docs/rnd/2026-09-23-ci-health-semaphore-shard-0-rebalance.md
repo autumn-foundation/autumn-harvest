@@ -1,8 +1,8 @@
 # 🚦 Semaphore CI health — shard 0's `integration_e2e`/`quota_enforcement_tests`
 # collision drifted back; rebalanced from 11 to 21 shards for a real,
 # measured (not eliminated) load-balance improvement: true worst-case
-# shard weight down from 605 to 287 (52.6%). Corrected FIVE times
-# post-review (Codex on this PR). The two most recent rounds both concern
+# shard weight down from 605 to 287 (52.6%). Corrected SIX times
+# post-review (Codex on this PR). The three most recent rounds all concern
 # a fixed +188 test-weight cost that always lands on shard 0 regardless of
 # shard count, which earlier sweeps omitted entirely: first correcting for
 # it (flipping the earlier N=20 pick from "best in range" to one of the
@@ -39,6 +39,14 @@
 # worse than N=11 (605) -- the SECOND UPDATE's central claim was wrong. The
 # N=21 choice is unaffected; only the comparison baseline was. See "🔍
 # Fifth correction" for the complete, re-run N=9-24 sweep.
+#
+# FOURTH UPDATE, same session: Codex review caught that the fifth
+# correction's own isolation check -- "does a better isolating option than
+# N=21 exist" -- tested only two other candidates (N=18, N=20) instead of
+# every N in the swept range. It missed three more isolating candidates
+# (N=9, N=10, N=14). None of them beat N=21 (true max 287 stays lowest of
+# all six), so the shipped configuration is unchanged -- only the claim of
+# having checked exhaustively was wrong. See "🔍 Sixth correction".
 
 **Status:** fix shipped this session, `.github/workflows/ci.yml` only (shard
 count + matrix list + comment). No test code, no manifest reordering (the
@@ -451,14 +459,10 @@ numbers elsewhere were wrong. N=21 (287) is the third-best value in the
 *entire* range, not just among a handful of hand-picked candidates.
 
 **Does a better isolating option than N=21 exist in this full range?**
-Checked directly rather than assumed: `quota_enforcement_tests` lands
-isolated (no co-resident row >=30 tests) at N=18 (shard 8: `quota_enforcement_tests`
-47 + `shard_placement_by_id_tests` 29 + `dag_compensation` 28 -- neither
-co-resident suite reaches the heavy threshold) and at N=20 (shard 4, as
-the live-CI section above already found), in addition to N=21. Of these
-three isolating options, N=21's true max (287) is the lowest (N=18: 316,
-N=20: 435) -- N=21 remains the right choice, now for a verified reason
-rather than an assumed one.
+The paragraph originally here checked only N=18 and N=20 against N=21 and
+called that exhaustive. It was not -- see "🔍 Sixth correction" below for
+the complete answer (six isolating candidates, not three). N=21 still
+wins; the omission was in how that was shown, not in the choice itself.
 
 **Corrected measurement.** True worst-case shard-0-inclusive max: N=11
 (unmodified) = 605, N=21 (shipped) = 287 -- a **52.6% reduction**, not the
@@ -466,3 +470,48 @@ rather than an assumed one.
 even more overstated ~42% from before the linuxpart bug was found at all).
 No shard count in 9-24 is collision-free, with or without either
 correction's accounting.
+
+## 🔍 Sixth correction: three isolating candidates, not six, was wrong too
+
+Codex review caught that the fifth correction's isolation check itself was
+incomplete: it tested only N=18 and N=20 against N=21 (the three
+candidates that had already come up in this session's narrative) rather
+than checking every N in the swept range for whether `quota_enforcement_tests`
+lands isolated. Checked properly this time -- computing shard membership
+for every N=9..24 directly from the harness's own `shard_report()`
+function (not re-deriving it by hand), and testing whether
+`quota_enforcement_tests`'s shard appears in that function's own
+`heavy_collisions` list:
+
+```
+N= 9  shard= 8  isolated=True   sharded_total=266  true_max=472
+N=10  shard= 4  isolated=True   sharded_total=183  true_max=520
+N=11  shard= 0  isolated=False  sharded_total=417  true_max=605
+N=12  shard= 8  isolated=False  sharded_total=302  true_max=348
+N=13  shard= 5  isolated=False  sharded_total=302  true_max=367
+N=14  shard= 2  isolated=True   sharded_total=129  true_max=429
+N=15  shard=14  isolated=False  sharded_total=271  true_max=311
+N=16  shard=12  isolated=False  sharded_total=354  true_max=354
+N=17  shard=10  isolated=False  sharded_total=254  true_max=318
+N=18  shard= 8  isolated=True   sharded_total=160  true_max=316
+N=19  shard= 6  isolated=False  sharded_total=168  true_max=384
+N=20  shard= 4  isolated=True   sharded_total=115  true_max=435
+N=21  shard= 2  isolated=True   sharded_total=109  true_max=287
+N=22  shard= 0  isolated=False  sharded_total=211  true_max=399
+N=23  shard=21  isolated=False  sharded_total=173  true_max=262
+N=24  shard=20  isolated=False  sharded_total=247  true_max=261
+```
+
+Six candidates isolate `quota_enforcement_tests`, not three: N=9, N=10,
+N=14, N=18, N=20, and N=21. The fifth correction's omission of N=9, N=10,
+and N=14 did not change the outcome -- their true maxima (472, 520, 429)
+are all worse than N=21's 287, so N=21 remains the lowest-true-max
+isolating option across the complete range -- but "checked directly rather
+than assumed" was not an accurate description of a check that skipped
+half the candidates. It is now: every N in the swept range has been
+tested, not a hand-picked subset.
+
+**This does not change the shipped configuration.** `SEMAPHORE_SHARD_COUNT`
+stays `"21"`. It changes only how confidently this report can claim N=21
+is the best isolating option -- from "checked three, best of those" to
+"checked all sixteen, best of all of them."
