@@ -30,10 +30,10 @@ Opt in to the same deploy-time check by declaring what the workflow dispatches:
 ```rust
 #[workflow(activities = [send_email, charge_card], children = [generate_report])]
 async fn onboarding(ctx: &WorkflowContext, user_id: i64) -> Result<(), String> {
-    ctx.execute_activity::<_, ()>(&send_email_info(), user_id)
+    ctx.execute_activity::<_, serde_json::Value>(&send_email_info(), user_id)
         .await
         .map_err(|e| e.to_string())?;
-    ctx.execute_activity::<_, ()>(&charge_card_info(), user_id)
+    ctx.execute_activity::<_, serde_json::Value>(&charge_card_info(), user_id)
         .await
         .map_err(|e| e.to_string())?;
     let _: Report = ctx
