@@ -248,7 +248,15 @@ impl CriticalPathAnalyzer {
                     }
                 }
 
-                distances[task_index] = max_upstream_dist + duration;
+                // Use saturating_add, not `+`. A caller-supplied
+                // `start_to_close` is an arbitrary `Duration` (issue: Snag
+                // boundary repro). `Duration::add` panics on overflow
+                // unconditionally. This differs from primitive-integer `+`,
+                // which panics only when `overflow-checks` is on. A long
+                // chain of large-but-plausible timeouts, or a single
+                // `Duration::MAX` value, must degrade to a saturated total,
+                // not crash the analysis.
+                distances[task_index] = max_upstream_dist.saturating_add(duration);
                 predecessors[task_index] = best_pred;
             }
         }
@@ -378,5 +386,32 @@ mod tests {
         let result = analyzer.analyze();
 
         assert_eq!(result.total_duration, Duration::from_secs(42));
+    }
+
+    /// Snag boundary repro: a caller-supplied `start_to_close` of
+    /// `Duration::MAX` on an upstream task used to panic. The DP loop added
+    /// the next task's own duration on top and overflowed. `Duration::add`
+    /// is unconditional, unlike bare integer `+`, which panics only when
+    /// `overflow-checks` is on. `analyze` must degrade to a saturated total
+    /// instead of crashing.
+    #[test]
+    fn test_start_to_close_max_duration_does_not_panic() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(activity_a).start_to_close(Duration::MAX);
+        let _b = builder
+            .activity(activity_b)
+            .start_to_close(Duration::from_secs(1))
+            .upstream(&a);
+        let dag = builder.build().unwrap();
+
+        let analyzer = CriticalPathAnalyzer::new(dag);
+        let result = analyzer.analyze();
+
+        assert_eq!(
+            result.total_duration,
+            Duration::MAX,
+            "saturated, not panicked"
+        );
+        assert_eq!(result.path_indices, vec![0, 1]);
     }
 }
