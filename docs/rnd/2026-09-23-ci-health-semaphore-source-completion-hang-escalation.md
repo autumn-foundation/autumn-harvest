@@ -1,4 +1,4 @@
-# 🚦 Semaphore CI health — `completion_trigger_defers_to_outbox_when_target_quota_exceeded`'s SOURCE-completion wait has gone from 2 occurrences in 6 days to 6 more identical-signature occurrences in 26 hours, on 6 differently-named branches, and the 30s timeout widen that shipped for it (PR #1673, 09-21) did not fix it
+# 🚦 Semaphore CI health — `completion_trigger_defers_to_outbox_when_target_quota_exceeded`'s SOURCE-completion wait has gone from 2 occurrences in 3 hours (09-21) to 6 more identical-signature occurrences in 26 hours, on 6 differently-named branches, and the 30s timeout widen that shipped for it (PR #1673, 09-21) did not fix it
 
 **Status:** health report — no PR opened against `ci.yml`, `quota_enforcement_tests.rs`,
 or `completion_trigger.rs`. This role's hard gate (a located problem, a named
@@ -11,7 +11,7 @@ every report in this series has hit). Continues the series from
 landed on `claude/fix-shard-0-collision-rebalance-1685`, not yet merged to
 `trunk-dev`, so it is not in this session's tree).
 
-**Corrected across seven Codex review rounds on this PR.** First round: the
+**Corrected across eight Codex review rounds on this PR.** First round: the
 first draft claimed the `QuotaExceeded` arm "never" propagates `Err`/rolls
 back the source's transaction, having stopped reading `completion_trigger.rs`
 right before the outbox-row insert (that insert's own `.map_err(...)?` can in
@@ -95,7 +95,15 @@ larger bound could genuinely help. Corrected to the actual reason this role
 rejects an unmeasured widen: not that the evidence proves it useless, but
 that this role's own hard gate requires a same-commit rerun rate before and
 after before touching the timeout at all — which neither the first widen
-nor any further one has had. All corrections are inline at the point each
+nor any further one has had.
+
+**Eighth round.** The headline's "2 occurrences in 6 days" carried the
+6-day figure over from the *other* panic signature on this same test (the
+outbox-retry-loop one, 2 occurrences 6 days apart per the 09-16/09-21
+reports) without checking it against this signature's own timeline. This
+report's own corrected data (both prior SOURCE-completion occurrences on
+2026-09-21, at 05:04 and 08:07 UTC) puts them about 3 hours apart, not 6
+days — corrected in the title. All corrections are inline at the point each
 applies, matching this series' convention.
 
 ## 🎯 Verdict path
