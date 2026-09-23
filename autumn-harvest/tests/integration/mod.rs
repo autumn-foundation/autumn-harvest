@@ -23,6 +23,8 @@ mod audit_tests;
 mod auto_heartbeat_tests;
 mod awaitables_tests;
 #[cfg(all(feature = "db", feature = "testing"))]
+mod backup_verify_refs_batch_perf;
+#[cfg(all(feature = "db", feature = "testing"))]
 mod backup_verify_tests;
 #[cfg(feature = "db")]
 mod batch_executor_pool_exhaustion_tests;
