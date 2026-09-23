@@ -11,7 +11,7 @@ every report in this series has hit). Continues the series from
 landed on `claude/fix-shard-0-collision-rebalance-1685`, not yet merged to
 `trunk-dev`, so it is not in this session's tree).
 
-**Corrected across eight Codex review rounds on this PR.** First round: the
+**Corrected across nine Codex review rounds on this PR.** First round: the
 first draft claimed the `QuotaExceeded` arm "never" propagates `Err`/rolls
 back the source's transaction, having stopped reading `completion_trigger.rs`
 right before the outbox-row insert (that insert's own `.map_err(...)?` can in
@@ -103,8 +103,18 @@ outbox-retry-loop one, 2 occurrences 6 days apart per the 09-16/09-21
 reports) without checking it against this signature's own timeline. This
 report's own corrected data (both prior SOURCE-completion occurrences on
 2026-09-21, at 05:04 and 08:07 UTC) puts them about 3 hours apart, not 6
-days — corrected in the title. All corrections are inline at the point each
-applies, matching this series' convention.
+days — corrected in the title.
+
+**Ninth round.** The shard-collision paragraph's own arithmetic was wrong:
+it said both manifest row numbers "shifted by exactly 11" since the 09-21
+report, but `32→33` and `43→44` is a shift of 1 each, not 11 — a shift of 11
+would leave each row's `mod 11` unchanged and couldn't move the collision at
+all. Corrected: the *gap* between the two rows is unchanged at 11 (same as
+the 09-21 report); each row individually shifted by 1; and a 1-row shift
+applied to a gap already sitting at 11 is exactly enough to carry the
+collision's remainder from 10 to 0 (`10 + 1 ≡ 0 mod 11`), which is why it
+moved from shard 10 to shard 0. All corrections are inline at the point
+each applies, matching this series' convention.
 
 ## 🎯 Verdict path
 
@@ -308,13 +318,20 @@ comment on this point — then corrected again by a second Codex comment.**
 `quota_enforcement_tests` (`43 % 11 = 10` at the time). Checked directly
 against today's manifest: `quota_enforcement_tests` is now row 44 among
 `linux`-osclass rows (`awk '$1=="linux"{print c": "$0; c++}' .github/ci/integration-suites.txt`),
-and `integration_e2e` is row 33 — `44 % 11 = 0` and `33 % 11 = 0`. The
-manifest gap between them is still 11 rows (unchanged from the 09-21
-report's finding), but both row numbers shifted by exactly 11 since then
-(the manifest grew), moving the collision from shard 10 to shard 0 — the
-same tracked, already-being-fixed defect PR #1707 targets (its own title:
-"Rebalance test-db-linux from 11 to 21 shards" /
-`fix-shard-0-collision-rebalance-1685`).
+and `integration_e2e` is row 33 — `44 % 11 = 0` and `33 % 11 = 0`. **Correction
+(post-review, Codex on this PR):** an earlier draft said both row numbers
+"shifted by exactly 11" since the 09-21 report. Wrong arithmetic — 32→33 and
+43→44 is a shift of **1** row each (the manifest gained one row ahead of
+both), not 11; a shift of 11 would leave each row's `mod 11` unchanged and
+couldn't move the collision at all. What's actually unchanged is the *gap*
+between the two rows (`44 - 33 = 11`, same as the 09-21 report's `43 - 32 =
+11`) — and a 1-row shift, applied to a value already sitting at gap 11
+(the one distance 11-way sharding can't tolerate), is exactly enough to
+carry the collision from remainder 10 (`32 % 11`) to remainder 0 (`33 % 11`,
+since `10 + 1 ≡ 0 mod 11`). So: gap unchanged at 11, each row individually
+shifted by 1, collision moved from shard 10 to shard 0 — the same tracked,
+already-being-fixed defect PR #1707 targets (its own title: "Rebalance
+test-db-linux from 11 to 21 shards" / `fix-shard-0-collision-rebalance-1685`).
 
 **Correction:** an earlier draft of this paragraph said "every occurrence…
 landed on the shard carrying both heavy suites," which is wrong for the 6th.
