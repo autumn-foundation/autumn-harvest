@@ -11,7 +11,7 @@ every report in this series has hit). Continues the series from
 landed on `claude/fix-shard-0-collision-rebalance-1685`, not yet merged to
 `trunk-dev`, so it is not in this session's tree).
 
-**Corrected across five Codex review rounds on this PR.** First round: the
+**Corrected across six Codex review rounds on this PR.** First round: the
 first draft claimed the `QuotaExceeded` arm "never" propagates `Err`/rolls
 back the source's transaction, having stopped reading `completion_trigger.rs`
 right before the outbox-row insert (that insert's own `.map_err(...)?` can in
@@ -68,8 +68,25 @@ rate* — #1706 specifically activates a previously-dormant background-scanner
 code path that is new DB work on every poll tick, unexamined as a possible
 load contributor to this other test. Softened to "unresolved," with a
 same-commit rerun comparison (PR vs. its own base) named as the way to
-settle it. All corrections are inline at the point each applies, matching
-this series' convention.
+settle it.
+
+**Sixth round, two more findings.** First: the insert-error mechanism
+(restored in round one) was overstated as directly reproducing a
+30-second-stuck failure. Reading `worker.rs` (~29567-29610), a clean `Err`
+from a workflow task's `process_task` resets the claim via
+`reset_timed_out_workflow_task` so the row retries — the same path measured
+elsewhere in that file at "0 wedges in 16 runs" for a transient deadlock. A
+one-off insert error would retry and likely succeed well inside 30s; for
+this mechanism to explain the actual failures, the error would need to
+recur across retries or the reset path itself would need to fail — neither
+checked. Narrowed in both places this report describes the mechanism.
+Second: a stray, uncorrected copy of "strong evidence against the runner is
+just slow" survived in the timeout section (a duplicate of the claim round
+five corrected in Diagnosis) — swept and reconciled with the corrected
+position: three mechanism candidates (product hang, runner slowness,
+unbounded queueing) remain open, none favored by the widen-didn't-help
+evidence alone. All corrections are inline at the point each applies,
+matching this series' convention.
 
 ## 🎯 Verdict path
 
@@ -111,8 +128,20 @@ continuing to line 2121, the outbox-row insert itself ends
 A database error on *that* insert does propagate `?` out of this function,
 and per the function's own doc comment (the whole arm "runs INLINE inside the
 SOURCE execution's own terminal transaction"), that would roll back the
-source's `WorkflowCompleted` append along with it, reproducing exactly the
-pre-fix symptom this test guards against.
+source's `WorkflowCompleted` append along with it. **Correction (post-review,
+Codex on this PR, a third round): that alone does not reproduce a 30-second
+stuck failure**, and an earlier draft overstated it as doing so. Reading
+`worker.rs` (~29567-29610): a clean `Err` from `process_task` on a workflow
+task does not wedge it — `reset_timed_out_workflow_task` resets the claim so
+the row stays retryable, the same recovery path already measured (per that
+code's own comment) to turn a transient Postgres deadlock into "0 wedges in
+16 runs" by retrying. A single transient insert error would, by that same
+mechanism, retry and very likely succeed well inside 30s, not produce this
+test's specific failure. For this mechanism to actually explain a 30-second
+timeout, the error would need to recur across retries (a non-transient
+condition — a broken constraint, not a one-off deadlock) or the reset/reclaim
+path itself would need to be slow or fail, neither of which this session
+checked. Narrowed accordingly in Diagnosis below.
 
 Second: that correction's own first draft listed "transient pool exhaustion"
 as an example cause of such an error. Also wrong, per a second Codex round —
@@ -304,13 +333,19 @@ bans**, applied here to a flake that was observed but not diagnosed at the
 time. The evidence this session gathered shows it did not work: 5 of the 6
 occurrences above are confirmed (by direct SHA ancestry check, not
 timestamp — see the correction above) to have run *at* the new, 3x-larger,
-30-second bound and still lost. A timeout that is already 3x the file's own
-default and still loses this often is strong evidence against "the runner is
-just slow" and for
-either a genuine hang (the source workflow's terminal transaction never
-actually commits under some condition) or unbounded queueing (the worker's
-dispatch loop never picks the task up) — both mechanism categories this
-role's hard gate requires naming, and neither confirmed yet.
+30-second bound and still lost. **Correction (post-review, Codex on this
+PR):** an earlier draft of this paragraph called that "strong evidence
+against 'the runner is just slow.'" That does not survive this report's own
+later correction (in Diagnosis, below): the 30s clock starts right after the
+worker is spawned but the source workflow is already enqueued by then, so
+the clock also covers worker startup and task-claim latency, not only the
+synchronous trigger-evaluation cycle — a resource-starved runner remains a
+live, undismissed candidate alongside a genuine product-side hang or
+unbounded queueing (the worker's dispatch loop never picks the task up).
+What the widen-didn't-help evidence *does* establish is narrower but still
+real: whatever is consuming the 30s, it is not simply "the decision cycle
+needs slightly more than 10s" — three candidate mechanisms remain open, not
+one favored over the others by this evidence.
 
 ## 🔍 Diagnosis
 
@@ -342,12 +377,24 @@ candidate space:
   1487-1488`) with no new pool checkout, so pool exhaustion cannot be *this
   insert's* error — corrected to the causes that connection can actually hit
   (a constraint violation, a dropped connection, a statement timeout, or a
-  serialization/deadlock error under concurrent write load). Not confirmed
-  as what actually happened in any of the 6 occurrences (no DB-error
-  telemetry captured), but it is a concrete, previously-unconsidered
-  mechanism the next session should check for (e.g. Postgres server-side
-  error logs around each occurrence's timestamp) before assuming a pure
-  hang.
+  serialization/deadlock error under concurrent write load). **A third
+  round narrowed the claim further:** a database error here does not by
+  itself reproduce a 30-second-stuck failure. Reading `worker.rs`
+  (~29567-29610), a clean `Err` from `process_task` on a workflow task
+  triggers `reset_timed_out_workflow_task`, releasing the claim so the row
+  retries — the same recovery path that code's own comment measures at
+  "0 wedges in 16 runs" for a transient Postgres deadlock. A one-off insert
+  error would, by that mechanism, retry and very likely succeed well inside
+  30s. For this to explain the actual 30-second failures, the error would
+  need to recur across retries (a persistent condition, not a one-off), or
+  the reset/reclaim path itself would need to be slow or fail — neither
+  checked this session. Not confirmed as what happened in any of the 6
+  occurrences (no DB-error telemetry captured), and now a narrower,
+  harder-to-satisfy candidate than the first two drafts of this bullet
+  claimed — but still open. The next session should check for a *recurring*
+  or *reset-path* failure specifically (e.g. Postgres server-side error logs
+  and `harvest_task_queue` state transitions around each occurrence's
+  timestamp), not just any transient DB error, before assuming a pure hang.
 - **"CI is just slow" is weakened but not ruled out — corrected back from an
   overclaim.** An earlier draft of this bullet said the bound is 3x default
   and "still loses regularly," treating that as evidence against runner
