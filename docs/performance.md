@@ -1926,3 +1926,11 @@ standalone note rather than part of the claim-path attribution table above:
   `WorkerConfig::queue_weights` (issue #515), 53.72% of a 16-queue/20,000-poll
   harness; a per-queue `String` clone eliminated by returning a borrowed
   permutation instead (instructions -36.26%, allocations -76.18%).
+* [`docs/performance-payload-codec-owned-transform.md`](performance-payload-codec-owned-transform.md)
+  — `payload_codec::{encode_payload, decode_payload}`'s identity-codec fast
+  path, run once per payload-bearing field of every workflow event ever
+  appended or replayed (`store.rs`'s `encode_event`/`decode_event`), 52.05%
+  of a 454,000-event-round-trip harness's allocation blocks; a redundant
+  `serde_json::Value` clone eliminated by taking the field by value
+  (`std::mem::take`) instead of borrowing it from the event tree the caller
+  already owns (instructions -36.89%, allocation blocks -52.05%).

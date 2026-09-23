@@ -28,3 +28,16 @@ for pp in pps:
         tgt_b += tb; tgt_bk += tbk
 print(tgt_b / total_b, tgt_bk / total_bk)
 PY
+
+--- AFTER (encode_payload_owned/decode_payload_owned + mem::take fix) ---
+
+  total: 3,466,617,478 bytes in 19,875,976 blocks
+
+Delta vs. before:
+  Ir (callgrind, --branch-sim=no --cache-sim=no): 21,222,464,061 -> 13,393,996,412  (-36.89%)
+  dhat bytes:   5,864,636,320 -> 3,466,617,478  (-40.89%)
+  dhat blocks: 41,447,698 -> 19,875,976  (-52.05%)
+
+The block/byte deltas match the before-side attribution above almost
+exactly (52.05% / 40.89%), confirming the fix removed exactly the
+allocations it targeted and nothing else.

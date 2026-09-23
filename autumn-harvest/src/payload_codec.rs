@@ -1188,11 +1188,25 @@ impl PayloadCodecs {
         // output carried; it is unique to WorkflowStarted among event variants.
         for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
             if let Some(payload) = data.get_mut(key) {
-                if encode {
-                    *payload = self.encode_payload(payload)?;
+                // `transform_event_data` already owns the whole event tree
+                // (`root: &mut Value` on an owned `Value` at every call
+                // site), so `payload` itself is already owned data, not a
+                // borrow into something a caller still needs afterward.
+                // `mem::take` moves it out (leaving `Value::Null` behind)
+                // so `encode_payload_owned`/`decode_payload_owned` can hand
+                // the unchanged value straight back on the common
+                // (non-envelope) fast path instead of cloning the whole
+                // JSON tree just to produce a copy of data already in
+                // hand. If encoding/decoding fails, `?` returns before the
+                // `Null` placeholder is ever observed: the caller discards
+                // the whole partially-transformed `value` along with the
+                // error (see `encode_event`/`decode_event`).
+                let owned = std::mem::take(payload);
+                *payload = if encode {
+                    self.encode_payload_owned(owned)?
                 } else {
-                    *payload = self.decode_payload(payload)?;
-                }
+                    self.decode_payload_owned(owned)?
+                };
             }
         }
         Ok(())
@@ -1280,12 +1294,23 @@ impl PayloadCodecs {
     ///
     /// [`HarvestError`] when serialization or the codec's `encode` fails.
     pub fn encode_payload(&self, payload: &Value) -> HarvestResult<Value> {
+        self.encode_payload_owned(payload.clone())
+    }
+
+    /// [`PayloadCodecs::encode_payload`], taking `payload` by value.
+    ///
+    /// [`PayloadCodecs::transform_event_data`] already owns the whole event
+    /// tree it walks, so its per-field call here hands over ownership
+    /// (via `std::mem::take`) instead of borrowing -- letting the identity
+    /// fast path below return the value it was already given instead of
+    /// cloning it, on the hot write path every event append runs.
+    fn encode_payload_owned(&self, payload: Value) -> HarvestResult<Value> {
         let (key_id, codec) = self.active_codec();
         let is_identity = codec.codec_id() == "identity";
-        if is_identity && !payload_or_a_descendant_is_a_codec_envelope(payload) {
-            return Ok(payload.clone());
+        if is_identity && !payload_or_a_descendant_is_a_codec_envelope(&payload) {
+            return Ok(payload);
         }
-        let raw = serde_json::to_vec(payload)?;
+        let raw = serde_json::to_vec(&payload)?;
         let encoded = codec
             .encode(&raw)
             .map_err(|e| HarvestError::Config(e.to_string()))?;
@@ -1456,8 +1481,20 @@ impl PayloadCodecs {
     /// - [`HarvestError`] on invalid base64, a codec `decode` failure, or
     ///   plaintext that is not valid JSON.
     pub fn decode_payload(&self, payload: &Value) -> HarvestResult<Value> {
-        let Some(parts) = codec_envelope_parts(payload) else {
-            return Ok(payload.clone());
+        self.decode_payload_owned(payload.clone())
+    }
+
+    /// [`PayloadCodecs::decode_payload`], taking `payload` by value.
+    ///
+    /// [`PayloadCodecs::transform_event_data`] already owns the whole event
+    /// tree it walks, so its per-field call here hands over ownership
+    /// (via `std::mem::take`) instead of borrowing -- letting the
+    /// not-an-envelope fast path below return the value it was already
+    /// given instead of cloning it, on the hot read/replay path every
+    /// history load runs, once per payload-bearing field of every event.
+    fn decode_payload_owned(&self, payload: Value) -> HarvestResult<Value> {
+        let Some(parts) = codec_envelope_parts(&payload) else {
+            return Ok(payload);
         };
         let decoded = self.decode_envelope_bytes(&parts)?;
         Ok(serde_json::from_slice(&decoded)?)
