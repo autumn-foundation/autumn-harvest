@@ -11,7 +11,7 @@ every report in this series has hit). Continues the series from
 landed on `claude/fix-shard-0-collision-rebalance-1685`, not yet merged to
 `trunk-dev`, so it is not in this session's tree).
 
-**Corrected across twelve Codex review rounds on this PR.** First round: the
+**Corrected across thirteen Codex review rounds on this PR.** First round: the
 first draft claimed the `QuotaExceeded` arm "never" propagates `Err`/rolls
 back the source's transaction, having stopped reading `completion_trigger.rs`
 right before the outbox-row insert (that insert's own `.map_err(...)?` can in
@@ -145,7 +145,14 @@ first and last of the 6 fresh occurrences (2026-09-22T07:15Z to
 sampled page, 2026-09-23T08:07:06Z — computed directly from the saved API
 response, ~46 hours). Corrected throughout: the title, the census-section
 heading, and the occurrence-spread sentence now distinguish the two
-figures instead of calling both "26 hours." All corrections are inline at
+figures instead of calling both "26 hours."
+
+**Thirteenth round.** Treatment said the timeout widen was based on "a
+single observed occurrence." Checked directly against the widening
+commit's own message: it says the assertion "failed this assertion twice
+at the 10s default" — two occurrences, matching this report's own
+corrected timeline. Corrected to state two occurrences, still with no
+measured rate behind either. All corrections are inline at
 the point each applies, matching this series' convention.
 
 ## 🎯 Verdict path
@@ -547,10 +554,18 @@ candidate per the correction above, and if that turns out to be the actual
 mechanism, a larger bound could genuinely mitigate the symptom, not just
 mask it. The reason to reject an unmeasured widen is this role's own hard
 gate, not proof of futility: it is already at 3x default, was widened once
-for this exact flake already on a single observed occurrence with no
-rerun-rate behind it, and 5 of the 6 fresh occurrences this report found
-still happened at that new, larger bound — evidence that the first widen
-wasn't justified by measurement, not evidence that no bound would help.
+for this exact flake already. **Correction (post-review, Codex on this
+PR):** an earlier draft said that widen cited "a single observed
+occurrence." Checked directly against the widening commit's own message
+(`git log -1 --format=%B 56bc205`): *"Test DB (linux, shard 10) has failed
+this assertion twice at the 10s default, with 43 other tests in the same
+run passing"* — two occurrences, not one, consistent with this report's own
+corrected timeline (`35563198153`, `35576291757`, both before the merge).
+No rerun rate stood behind either of those two occurrences, and 5 of the 6
+fresh occurrences this report found still happened at that new, larger
+bound — evidence that the first widen wasn't justified by a *measured
+rate* (two raw occurrences is not a rate), not evidence that no bound
+would help.
 Any further change to this timeout needs the same thing the first one
 skipped: a same-commit rerun rate before and after, on the actual runner
 class this flakes on.
