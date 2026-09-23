@@ -854,45 +854,15 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { |e| e.to_string() }
     };
 
-    let dispatch = if param_names.is_empty() {
-        quote! {
-            let result = #fn_name(ctx).await;
-            result.map_err(#encode_err)
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v)
-                        .map_err(|e| e.to_string())
-                })
-        }
-    } else if param_names.len() == 1 {
-        let name = &param_names[0];
-        quote! {
-            let #name = ::autumn_harvest::serde_json::from_value(input)
-                .map_err(|e| e.to_string())?;
-            let result = #fn_name(ctx, #name).await;
-            result.map_err(#encode_err)
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v)
-                        .map_err(|e| e.to_string())
-                })
-        }
-    } else {
-        // Multiple params: expect input to be a JSON array [arg1, arg2, ...]
-        let indices = (0..param_names.len()).map(syn::Index::from);
-        let names = param_names.clone();
-        quote! {
-            let args: ::autumn_harvest::serde_json::Value = input;
-            #(
-                let #names = ::autumn_harvest::serde_json::from_value(args[#indices].clone())
-                    .map_err(|e| e.to_string())?;
-            )*
-            let result = #fn_name(ctx, #(#names),*).await;
-            result.map_err(#encode_err)
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v)
-                        .map_err(|e| e.to_string())
-                })
-        }
-    };
+    let dispatch = crate::attr_util::build_handler_dispatch(
+        fn_name,
+        &param_names,
+        &format_ident!("input"),
+        &format_ident!("args"),
+        &quote! { ctx },
+        &quote! { .await },
+        &encode_err,
+    );
 
     // Emit execution_timeout as Option<Duration> using the task_duration helper.
     let execution_timeout_expr = attrs.execution_timeout.as_deref().map_or_else(

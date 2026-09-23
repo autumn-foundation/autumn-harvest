@@ -122,7 +122,15 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input_type_hint = crate::attr_util::arg_type_hint(&params);
     let output_type_hint = crate::extract_ok_type_hint(&func.sig.output);
 
-    let dispatch = build_query_dispatch(fn_name, &param_names);
+    let dispatch = crate::attr_util::build_handler_dispatch(
+        fn_name,
+        &param_names,
+        &format_ident!("args"),
+        &format_ident!("__args"),
+        &quote! { ctx },
+        &TokenStream::new(),
+        &quote! { |e| e.to_string() },
+    );
 
     let parsed_path = match crate::parse_and_validate_workflow_path(
         &workflow_name,
@@ -227,44 +235,6 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn build_query_dispatch(fn_name: &syn::Ident, param_names: &[&syn::Ident]) -> TokenStream {
-    if param_names.is_empty() {
-        quote! {
-            let result = #fn_name(ctx);
-            result.map_err(|e| e.to_string())
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
-                })
-        }
-    } else if param_names.len() == 1 {
-        let name = &param_names[0];
-        quote! {
-            let #name = ::autumn_harvest::serde_json::from_value(args)
-                .map_err(|e| e.to_string())?;
-            let result = #fn_name(ctx, #name);
-            result.map_err(|e| e.to_string())
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
-                })
-        }
-    } else {
-        let indices = (0..param_names.len()).map(syn::Index::from);
-        let names = param_names.to_owned();
-        quote! {
-            let __args: ::autumn_harvest::serde_json::Value = args;
-            #(
-                let #names = ::autumn_harvest::serde_json::from_value(__args[#indices].clone())
-                    .map_err(|e| e.to_string())?;
-            )*
-            let result = #fn_name(ctx, #(#names),*);
-            result.map_err(|e| e.to_string())
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
-                })
-        }
-    }
-}
 
 // ── Characterization tests ──────────────────────────────────────────────────
 //

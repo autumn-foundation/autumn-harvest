@@ -1,6 +1,9 @@
 //! Small parsing helpers shared across the `#[workflow(...)]`, `#[update(...)]`,
 //! and sibling attribute-macro argument parsers.
 
+use proc_macro2::TokenStream;
+use quote::quote;
+
 /// Compile-time validator for the runtime `task_duration()` string format
 /// (`"30s"`, `"5m"`, `"1h"`, `"1h30m"`, ...): digits followed by one of
 /// `s`/`m`/`h`/`d`, optionally space-separated, with no overflow and no
@@ -146,6 +149,78 @@ pub fn arg_type_hint(params: &[&syn::FnArg]) -> String {
         })
         .collect();
     format!("({})", parts.join(", "))
+}
+
+/// Decode a handler's non-`ctx` parameters by arity (0/1/N), invoke the
+/// handler, and encode the `Ok` value to JSON, mapping the `Err` value
+/// through `encode_err`.
+///
+/// `query.rs`'s `build_query_dispatch`, `update.rs`'s `build_update_dispatch`,
+/// and the inline `dispatch` in `workflow.rs`/`activity.rs` each hand-mirrored
+/// this exact three-arm body (issue #1632). `workflow.rs` and `activity.rs`
+/// were byte-identical already; `query.rs`/`update.rs` differed from them and
+/// from each other only in how the handler is invoked and how its error is
+/// encoded, both of which vary by what the caller's own signature looks like,
+/// not by which macro is calling.
+///
+/// - `args_ident`: the companion fn's JSON-value parameter (`args` for
+///   query/update, `input` for workflow/activity).
+/// - `multi_args_binding`: the local name the N-arity branch rebinds
+///   `args_ident` to before indexing it. Kept separate from `args_ident`
+///   because query/update already bind a parameter named `args`; rebinding
+///   to `args` again would shadow it, so those two sites use `__args`, while
+///   workflow/activity's parameter is named `input` and rebind to `args`.
+/// - `ctx_expr`: how the caller passes its context (`ctx`, or update's
+///   `ctx.as_ref()`).
+/// - `await_tokens`: empty for query's sync handlers, `.await` elsewhere.
+/// - `encode_err`: the handler-error encoder already computed by the caller
+///   (`|e| e.to_string()` for query/update; a typed-failure encoder or the
+///   same fallback for workflow/activity).
+#[allow(clippy::too_many_arguments)]
+pub fn build_handler_dispatch(
+    fn_name: &syn::Ident,
+    param_names: &[&syn::Ident],
+    args_ident: &syn::Ident,
+    multi_args_binding: &syn::Ident,
+    ctx_expr: &TokenStream,
+    await_tokens: &TokenStream,
+    encode_err: &TokenStream,
+) -> TokenStream {
+    if param_names.is_empty() {
+        quote! {
+            let result = #fn_name(#ctx_expr) #await_tokens;
+            result.map_err(#encode_err)
+                .and_then(|v| {
+                    ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
+                })
+        }
+    } else if param_names.len() == 1 {
+        let name = &param_names[0];
+        quote! {
+            let #name = ::autumn_harvest::serde_json::from_value(#args_ident)
+                .map_err(|e| e.to_string())?;
+            let result = #fn_name(#ctx_expr, #name) #await_tokens;
+            result.map_err(#encode_err)
+                .and_then(|v| {
+                    ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
+                })
+        }
+    } else {
+        let indices = (0..param_names.len()).map(syn::Index::from);
+        let names = param_names.to_owned();
+        quote! {
+            let #multi_args_binding: ::autumn_harvest::serde_json::Value = #args_ident;
+            #(
+                let #names = ::autumn_harvest::serde_json::from_value(#multi_args_binding[#indices].clone())
+                    .map_err(|e| e.to_string())?;
+            )*
+            let result = #fn_name(#ctx_expr, #(#names),*) #await_tokens;
+            result.map_err(#encode_err)
+                .and_then(|v| {
+                    ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
+                })
+        }
+    }
 }
 
 #[cfg(test)]
