@@ -11,7 +11,7 @@ every report in this series has hit). Continues the series from
 landed on `claude/fix-shard-0-collision-rebalance-1685`, not yet merged to
 `trunk-dev`, so it is not in this session's tree).
 
-**Corrected across four Codex review rounds on this PR.** First round: the
+**Corrected across five Codex review rounds on this PR.** First round: the
 first draft claimed the `QuotaExceeded` arm "never" propagates `Err`/rolls
 back the source's transaction, having stopped reading `completion_trigger.rs`
 right before the outbox-row insert (that insert's own `.map_err(...)?` can in
@@ -52,9 +52,24 @@ day — retracted as a candidate. And the shard-0-collision paragraph's
 checked against PR #1707's own occurrence under *its own* proposed
 21-shard layout, where the two suites land on different shards (`44 % 21 =
 2` vs `33 % 21 = 12`) — that occurrence is not explained by the collision,
-if anything weakening rather than strengthening it as a candidate. All
-corrections are inline at the point each applies, matching this series'
-convention.
+if anything weakening rather than strengthening it as a candidate.
+
+**Fifth round, two more findings.** This report's "not CI is just slow"
+argument assumed the 30s wait covers only the synchronous trigger-evaluation
+cycle; Codex pointed out the test's own source shows the wait starts right
+after the worker is spawned, and the source workflow was already enqueued
+*before* that — so the clock also covers worker startup and task-claim
+latency, which a CPU-starved runner could plausibly consume on its own.
+Runner slowness is restored as an open candidate, not downgraded. And this
+report's advice that mergers "should not treat [the test's] continued
+redness as a regression introduced by" PR #1706 or #1707 overreached: predating
+both PRs rules out either being the *sole* cause, not either *changing the
+rate* — #1706 specifically activates a previously-dormant background-scanner
+code path that is new DB work on every poll tick, unexamined as a possible
+load contributor to this other test. Softened to "unresolved," with a
+same-commit rerun comparison (PR vs. its own base) named as the way to
+settle it. All corrections are inline at the point each applies, matching
+this series' convention.
 
 ## 🎯 Verdict path
 
@@ -333,13 +348,23 @@ candidate space:
   mechanism the next session should check for (e.g. Postgres server-side
   error logs around each occurrence's timestamp) before assuming a pure
   hang.
-- **Not "CI is just slow."** The bound is already 30s, 3x this file's normal
-  10s default, deliberately widened for this exact assertion, and still
-  loses regularly. The test's own doc comment says the entire decision cycle
-  (quota check, outbox insert, source terminal commit) happens synchronously
-  inside one worker task with no background-timer dependency — so 30s is a
-  very large multiple of the expected sub-second path if the mechanism is
-  working as designed.
+- **"CI is just slow" is weakened but not ruled out — corrected back from an
+  overclaim.** An earlier draft of this bullet said the bound is 3x default
+  and "still loses regularly," treating that as evidence against runner
+  slowness. **Correction (post-review, Codex on this PR):** the test's own
+  source code (`quota_enforcement_tests.rs:3726-3729`) shows `source` is
+  enqueued via `start_root` — a direct DB insert — *before* the worker is
+  even built and spawned; only then does `wait_for_execution_state_with_timeout`
+  start its 30s clock. So that clock covers worker startup and this task's
+  claim latency, not only the synchronous trigger-evaluation cycle this
+  report's earlier draft described as the whole budget. Under a genuinely
+  CPU-starved runner, slow worker startup or delayed task claim could by
+  itself consume a meaningful share of 30s, independent of anything in
+  `completion_trigger.rs`. This does not favor runner slowness over a
+  product-side hang — it only means this report cannot use "30s is way more
+  than the decision cycle needs" to rule slowness out. Both remain open,
+  undismissed candidates; no timing or tracing data from any of the 6
+  occurrences exists to weigh between them.
 - **No timing correlation with PR #1673 — retracted.** **Correction
   (post-review, Codex on this PR):** an earlier draft of this bullet said the
   occurrence spike "begins shortly after `56bc205` merged" (2026-09-21T19:18Z),
@@ -407,10 +432,25 @@ to stop.
    framing as settled — this session checked only the open-PR listing, which
    Codex review on this PR correctly flagged as too weak to support that claim.
 6. Both #1706 and #1707 are otherwise complete, reviewed multiple times, and
-   blocked on this same shared, pre-existing flake — neither PR's own diff
-   caused it (checked above for #1706; #1707 touches only `ci.yml`'s shard
-   count). Whoever merges either should not treat this test's continued
-   redness as a regression introduced by that PR.
+   blocked on this same panic, which is confirmed to **predate** both PRs
+   (occurrences on `trunk-dev`-based branches with neither PR's diff, before
+   either PR existed). **Correction (post-review, Codex on this PR):** an
+   earlier draft of this item told mergers not to treat the redness as a
+   regression introduced by either PR. That overreaches what this session
+   checked. Predating the PRs rules out either PR being the *sole* cause; it
+   does not rule out either PR *changing the rate*. #1706 specifically
+   activates a previously-dormant code path (`enforce_completion_triggers_outbox`
+   now finds a real `sharded_pool` instead of no-op'ing on a missing one),
+   which is new DB work on every poll tick that did not happen before —
+   unexamined as a possible contributor to load/timing on this *other*
+   test. #1707 changes shard composition and total shard duration by
+   design. Neither was compared against its own base under equivalent
+   conditions (e.g. a same-commit rerun count on the PR vs. on `trunk-dev`
+   at the PR's parent commit) — this session did not do that comparison, so
+   it cannot rule a rate change in or out. Mergers should treat this as
+   **unresolved**, not cleared: the panic is not *new* to either PR, but
+   whether either PR makes it *worse* is an open question the next session
+   should check with a rerun comparison, not assume away.
 
 ## 📊 Measurement
 
