@@ -11,7 +11,7 @@ every report in this series has hit). Continues the series from
 landed on `claude/fix-shard-0-collision-rebalance-1685`, not yet merged to
 `trunk-dev`, so it is not in this session's tree).
 
-**Corrected across thirteen Codex review rounds on this PR.** First round: the
+**Corrected across fourteen Codex review rounds on this PR.** First round: the
 first draft claimed the `QuotaExceeded` arm "never" propagates `Err`/rolls
 back the source's transaction, having stopped reading `completion_trigger.rs`
 right before the outbox-row insert (that insert's own `.map_err(...)?` can in
@@ -152,8 +152,21 @@ single observed occurrence." Checked directly against the widening
 commit's own message: it says the assertion "failed this assertion twice
 at the 10s default" — two occurrences, matching this report's own
 corrected timeline. Corrected to state two occurrences, still with no
-measured rate behind either. All corrections are inline at
-the point each applies, matching this series' convention.
+measured rate behind either.
+
+**Fourteenth round, two more findings.** First: the timeout-widen analysis
+said the evidence this session gathered "shows it did not work," but 5 raw
+post-widen failures only prove the widen did not *eliminate* the symptom —
+this report has no comparable before/after execution count, so it cannot
+support a stronger claim than that. Corrected to say the widen did not
+eliminate the flake, not that it was ineffective. Second: the Measurement
+section's own symptom count still credited the 5 post-widen SHAs' 30s bound
+to "SHA ancestry against `56bc205`" alone, the exact method round ten had
+already shown cannot rule out a later revert — the direct `git show`
+file-content check from round ten is the one that actually establishes the
+bound at each SHA, so the Measurement section now cites that check instead.
+All corrections are inline at the point each applies, matching this
+series' convention.
 
 ## 🎯 Verdict path
 
@@ -432,11 +445,20 @@ no assertion, no test logic, no product code in the same hunk.
 
 **This is exactly the "raised timeout as a fix" pattern this role's charter
 bans**, applied here to a flake that was observed but not diagnosed at the
-time. The evidence this session gathered shows it did not work: 5 of the 6
-occurrences above are confirmed (by direct SHA ancestry check, not
-timestamp — see the correction above) to have run *at* the new, 3x-larger,
-30-second bound and still lost. **Correction (post-review, Codex on this
-PR):** an earlier draft of this paragraph called that "strong evidence
+time. **Correction (post-review, Codex on this PR, two rounds).** First:
+an earlier draft said the evidence shows the widen "did not work." That
+overstates what 5 raw failures at the new bound establish: they show the
+30s widen did not *eliminate* the symptom, not that it provided zero
+benefit — this report has no comparable before/after execution count or
+rate, only raw occurrences from a sample of convenience, and its own
+Treatment section already says a same-commit rerun rate is the only thing
+that could actually settle whether the widen reduced the frequency.
+Restated at the confidence this evidence supports: 5 of the 6
+occurrences above are confirmed (directly, via `git show` at each SHA, not
+merely by ancestry — see the correction earlier in this section) to have run
+*at* the new, 3x-larger, 30-second bound and still lost, so the widen did
+not eliminate the flake. Second: an earlier draft of this paragraph called
+that "strong evidence
 against 'the runner is just slow.'" That does not survive this report's own
 later correction (in Diagnosis, below): the 30s clock starts right after the
 worker is spawned but the source workflow is already enqueued by then, so
@@ -624,9 +646,12 @@ class this flakes on.
 - **Before:** none — no rerun protocol executed.
 - **Symptom count:** 6 confirmed occurrences of the identical panic
   (`integration_e2e.rs:1383:6`, reached from this test's wait for the
-  source's `COMPLETED` state — the 30s bound for 5 of the 6, confirmed by
-  SHA ancestry against `56bc205`, and the original 10s bound for the 6th),
-  across 6 differently-named branches, not confirmed independent beyond
+  source's `COMPLETED` state — the 30s bound for 5 of the 6, confirmed
+  directly by inspecting `quota_enforcement_tests.rs` at each of those 5
+  SHAs (not merely by `56bc205` ancestry, which a later revert could have
+  survived — see the correction in the census section), and the original
+  10s bound for the 6th), across 6 differently-named branches, not
+  confirmed independent beyond
   that, 2026-09-22T07:15Z–2026-09-23T09:00Z. **Correction (post-review,
   Codex on this PR):** up from **2**, not 1, occurrences of this specific
   site in the 09-21 report — that report's item 2 (run `35576291757`) and,
