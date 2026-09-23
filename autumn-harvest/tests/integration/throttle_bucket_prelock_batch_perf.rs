@@ -7,26 +7,28 @@
 //! `FOR UPDATE` N+1 (issue #1230 Finding 2).
 //!
 //! The start-throttle scanner's claim-and-fire loop pre-locks every distinct
-//! rate-limit-bucket row a claimed batch references, in sorted order, before
-//! firing any row -- a deliberate deadlock-freedom measure (see the doc
-//! comment on `pre_lock_rate_limit_buckets_for_claimed_batch`). The
-//! pre-fix shape issued one `SELECT key FROM harvest_rate_limit_buckets
+//! rate-limit-bucket row a claimed batch references. It locks in sorted
+//! order, before firing any row -- a deliberate deadlock-freedom measure
+//! (see the doc comment on `pre_lock_rate_limit_buckets_for_claimed_batch`).
+//! The pre-fix shape issued one `SELECT key FROM harvest_rate_limit_buckets
 //! WHERE key = $1 FOR UPDATE` round trip PER distinct bucket key in the
-//! batch, instead of a single `= ANY($1)` statement -- an N+1 that runs on
-//! every scanner tick that finds ready work, not on a rare path.
+//! batch, instead of a single `= ANY($1)` statement. This N+1 runs on every
+//! scanner tick that finds ready work, not on a rare path.
 //!
 //! This harness drives that scanner tick end to end through the public
-//! `throttle::fire_due_throttled_starts` entry point, against a
-//! production-shaped fixture: 1,000 distinct tenant bucket keys (realistic
-//! multi-tenant cardinality) with skewed backlog depth (200 "hot" tenants
-//! carrying a 5-deep backlog, 800 "normal" tenants carrying 1 row each --
-//! 1,800 pending rows total), all with fully-refilled buckets so a full
-//! `THROTTLE_FIRE_BATCH_SIZE`-row batch is admissible and claims exactly
-//! 100 distinct bucket keys (the worst case for this N+1: as many round
-//! trips as the batch size allows). Evidence is `pg_stat_statements` call
-//! counts, captured immediately before and after the measured tick, exactly
-//! as `backup_verify_refs_batch_perf.rs` / `child_fanout_batch_perf.rs` do
-//! it. Each run gets a fresh, uniquely-named database.
+//! `throttle::fire_due_throttled_starts` entry point. The fixture is
+//! production-shaped: 1,000 distinct tenant bucket keys (realistic
+//! multi-tenant cardinality) with skewed backlog depth. 200 "hot" tenants
+//! carry a 5-deep backlog, 800 "normal" tenants carry 1 row each -- 1,800
+//! pending rows total. Every bucket is fully refilled. A full
+//! `THROTTLE_FIRE_BATCH_SIZE`-row batch is therefore admissible. It claims
+//! exactly 100 distinct bucket keys -- the worst case for this N+1, as
+//! many round trips as the batch size allows. Evidence is
+//! `pg_stat_statements` call counts, captured immediately before and after
+//! the measured tick. This
+//! matches how `backup_verify_refs_batch_perf.rs` and
+//! `child_fanout_batch_perf.rs` capture theirs. Each run gets a fresh,
+//! uniquely-named database.
 
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::throttle::{THROTTLE_FIRE_BATCH_SIZE, bucket_key, fire_due_throttled_starts};
@@ -202,8 +204,9 @@ struct NoopMetrics;
 impl MetricsRecorder for NoopMetrics {}
 
 /// 1,000 distinct tenant bucket keys. 200 "hot" tenants carry a 5-deep
-/// backlog, 800 "normal" tenants carry 1 row each -- 1,800 pending rows,
-/// production-shaped cardinality skew for a busy multi-tenant deployment.
+/// backlog, 800 "normal" tenants carry 1 row each -- 1,800 pending rows
+/// total. This is production-shaped cardinality skew for a busy
+/// multi-tenant deployment.
 const N_KEYS: i64 = 1_000;
 const HOT_KEYS: i64 = 200;
 const HOT_DEPTH: i64 = 5;
@@ -221,11 +224,12 @@ async fn claimed_batch_prelocks_bucket_keys_with_bounded_round_trips() {
     // Every key's FIRST (rn=1, earliest `deferred_at`) row lands strictly in
     // key-index order: key 0's is the oldest, key 999's is the youngest.
     // `selected` in the scanner's claim query orders by `(rn ASC, deferred_at
-    // ASC)`, so the earliest THROTTLE_FIRE_BATCH_SIZE=100 rn=1 rows -- keys
-    // 0..99 -- are exactly what the claimed batch takes: 100 distinct bucket
-    // keys, the worst case for this N+1. Extra backlog rows (hot-tenant
-    // depth 2..5) get `deferred_at` far in the future of every rn=1 row, so
-    // they never displace a distinct key out of the claimed batch.
+    // ASC)`. The earliest THROTTLE_FIRE_BATCH_SIZE=100 rn=1 rows are keys
+    // 0..99. That is exactly what the claimed batch takes: 100 distinct
+    // bucket keys, the worst case for this N+1. Extra backlog rows
+    // (hot-tenant depth 2..5) get `deferred_at` far in the future of every
+    // rn=1 row. They never displace a distinct key out of the claimed
+    // batch.
     let base = Utc::now() - ChronoDuration::hours(2);
     for i in 0..N_KEYS {
         let throttle_key = format!("tenant-{i}");
@@ -273,10 +277,10 @@ async fn claimed_batch_prelocks_bucket_keys_with_bounded_round_trips() {
         .await
         .expect("fire_due_throttled_starts");
 
-    // Functional correctness first: the claimed batch hits the scanner's own
-    // per-tick cap, and every fired row's own bucket had ample tokens, so
-    // every claimed row actually starts (none is re-deferred for lack of a
-    // token).
+    // Functional correctness first: the claimed batch hits the scanner's
+    // own per-tick cap. Every fired row's own bucket had ample tokens, so
+    // every claimed row actually starts. None is re-deferred for lack of a
+    // token.
     assert_eq!(
         fired, THROTTLE_FIRE_BATCH_SIZE as usize,
         "a fully-admissible 1,000-key backlog should fill the claimed batch to the scanner's \

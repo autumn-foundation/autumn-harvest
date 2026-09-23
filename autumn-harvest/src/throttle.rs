@@ -1514,14 +1514,15 @@ async fn order_due_rows_for_deadlock_free_firing(
 /// debit-if-available check then, unchanged.
 ///
 /// One round trip locks the whole batch. An earlier cut issued one
-/// `FOR UPDATE` statement per distinct bucket key -- a claimed batch of
-/// [`THROTTLE_FIRE_BATCH_SIZE`] rows from that many tenants paid that many
-/// extra round trips every scanner tick. `ORDER BY key` on the batched
-/// query preserves the sorted-order requirement above: Postgres plans a
-/// `LockRows` node above the `Sort`, so rows lock in the sorted order the
-/// query returns them, not in scan order. Confirmed by `EXPLAIN (ANALYZE,
-/// BUFFERS)` on this exact shape (`docs/perf-artifacts/rate-limit-bucket-
-/// prelock-batch/`).
+/// `FOR UPDATE` statement per distinct bucket key. A claimed batch of
+/// [`THROTTLE_FIRE_BATCH_SIZE`] rows from that many tenants paid that
+/// many extra round trips on every scanner tick.
+///
+/// `ORDER BY key` on the batched query preserves the sorted-order
+/// requirement above. Postgres plans a `LockRows` node above the `Sort`.
+/// Rows lock in the sorted order the query returns them, not in scan
+/// order. `EXPLAIN (ANALYZE, BUFFERS)` on this exact shape confirms this
+/// (`docs/perf-artifacts/rate-limit-bucket-prelock-batch/`).
 #[cfg(feature = "db")]
 async fn pre_lock_rate_limit_buckets_for_claimed_batch(
     conn: &mut diesel_async::AsyncPgConnection,
