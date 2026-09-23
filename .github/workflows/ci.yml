@@ -1026,19 +1026,33 @@ jobs:
       # Actions matrix expressions can't derive one from the other, so keep
       # them in sync by hand when changing the shard count.
       #
-      # 11, not 10 (issue #1267 review). `row_ordinal % 10` put
-      # `integration_e2e` and `quota_enforcement_tests` on one shard. These
-      # are the manifest's two largest, most wall-clock-timeout-shaped
-      # suites. Their manifest positions are exactly 10 apart, so the old
-      # count always collided them. That shard ran ~35 min against 18-28 min
-      # for every other shard. CI-health flake reports name it most often
-      # (docs/rnd/2026-09-0{4,8,11}-ci-health-semaphore*.md). 11 shares no
-      # factor with the 10-row gap, so it cannot reproduce the collision.
-      # Chosen over 12/13/14 by simulating per-shard test weight
-      # (`#[tokio::test]` count per manifest row) and picking the smallest
-      # max-min spread.
+      # 17, not 11 (issue #1685 review). 11 was chosen (issue #1267) to break
+      # a 10-row gap between `integration_e2e` and `quota_enforcement_tests`,
+      # the manifest's two largest suites at the time. The manifest keeps
+      # growing alphabetically, and their gap silently drifted back onto a
+      # value 11 cannot tolerate either: by 2026-09-22 both suites, PLUS a
+      # third large one (`backup_verify_tests`), were back on one shard
+      # (shard 0, row-ordinal % 11 == 0 for all three) -- confirmed via the
+      # same `#[tokio::test]`-count-per-row weight simulation issue #1267
+      # used, showing shard 0 at 323 combined test-weight against every
+      # other shard's 33-149. Independently, `Test DB (linux, shard 0)`
+      # is the shard the "🚦 Semaphore" CI-health report series
+      # (docs/rnd/2026-09-*-ci-health-semaphore-quota-outbox-*.md) and
+      # multiple concurrent PRs (#1697, #1698, #1699, #1706 at the time of
+      # this fix) most often name for `quota_enforcement_tests`'s recurring,
+      # exactly-at-the-configured-timeout hang. That hang's own mechanism is
+      # not fully root-caused (see the report series), so this is not
+      # claimed as a proven fix for it -- but shard 0 carrying triple the
+      # heaviest-suite weight of most other shards, PLUS the unconditional
+      # extra "linuxpart" pass below (`matrix.shard == 0`, another ~6
+      # minutes no other shard carries), is a confirmed, measured regression
+      # worth fixing on its own, and a credible contributor to a hang that
+      # correlates with exactly this shard. 17 was picked the same way 11
+      # was: simulating per-shard weight for every count from 11 to 24 and
+      # picking the smallest resulting max-shard weight (174, down from
+      # 323 -- every other tested count in that range stayed above 180).
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -1109,7 +1123,7 @@ jobs:
           # into a panic, so "the Redis suites stopped testing anything" is a
           # red build here rather than a silent green.
           HARVEST_TEST_REQUIRE_REDIS: "1"
-          SEMAPHORE_SHARD_COUNT: "11"
+          SEMAPHORE_SHARD_COUNT: "17"
           SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
         run: bash .github/ci/run-suites.sh run linux
       # Issue #958, AC2: re-run the store/replay/retention suites against the
