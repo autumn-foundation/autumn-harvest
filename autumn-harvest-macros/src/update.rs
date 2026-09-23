@@ -672,3 +672,78 @@ mod signature_validation_characterization_tests {
         );
     }
 }
+
+// ── Characterization tests: dispatch codegen ────────────────────────────────
+//
+// Issue #1632 (Echo findings) documents `build_update_dispatch`'s arity-keyed
+// body as one decision, hand-mirrored across `query.rs`/`update.rs`/
+// `workflow.rs`/`activity.rs`. Pins the exact generated body at arity 0/1/N
+// before a follow-up commit moves the shared shape to a parameterized
+// `attr_util::build_handler_dispatch`. See `workflow.rs`'s identically-named
+// module for the sibling non-`ctx.as_ref()` sites.
+#[cfg(test)]
+mod dispatch_characterization_tests {
+    use super::update_macro;
+    use quote::quote;
+
+    /// Isolate the `async move { ... }` dispatch body. Mirrors
+    /// `workflow.rs`'s `extract_dispatch_body`.
+    fn extract_dispatch_body(full: &str) -> String {
+        let marker = "Box :: pin (async move {";
+        let start = full
+            .find(marker)
+            .unwrap_or_else(|| panic!("no dispatch marker in generated output:\n{full}"))
+            + marker.len();
+        let mut depth = 1i32;
+        let bytes = full.as_bytes();
+        let mut i = start;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] as char {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        full[start..i - 1].trim().to_string()
+    }
+
+    fn generate(item: proc_macro2::TokenStream) -> String {
+        let attr = quote! { workflow = "MyWorkflow" };
+        update_macro(attr, item).to_string()
+    }
+
+    const UPDATE_DISPATCH_0: &str = "let result = my_update (ctx . as_ref ()) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const UPDATE_DISPATCH_1: &str = "let n = :: autumn_harvest :: serde_json :: from_value (args) . map_err (| e | e . to_string ()) ? ; let result = my_update (ctx . as_ref () , n) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const UPDATE_DISPATCH_N: &str = "let __args : :: autumn_harvest :: serde_json :: Value = args ; let a = :: autumn_harvest :: serde_json :: from_value (__args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (__args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_update (ctx . as_ref () , a , b) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+
+    #[test]
+    fn zero_params_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_update(ctx: &WorkflowContext) -> Result<u32, String> {
+                Ok(1)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), UPDATE_DISPATCH_0);
+    }
+
+    #[test]
+    fn one_param_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_update(ctx: &WorkflowContext, n: u32) -> Result<u32, String> {
+                Ok(n)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), UPDATE_DISPATCH_1);
+    }
+
+    #[test]
+    fn multi_param_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_update(ctx: &WorkflowContext, a: u32, b: u32) -> Result<u32, String> {
+                Ok(a + b)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), UPDATE_DISPATCH_N);
+    }
+}
