@@ -1,4 +1,4 @@
-# 🚦 Semaphore CI health — `completion_trigger_defers_to_outbox_when_target_quota_exceeded`'s SOURCE-completion wait has gone from 1 occurrence in 6 days to 6 confirmed identical-signature occurrences in 26 hours, on 6 differently-named branches, and the 30s timeout widen that shipped for it (PR #1673, 09-21) did not fix it
+# 🚦 Semaphore CI health — `completion_trigger_defers_to_outbox_when_target_quota_exceeded`'s SOURCE-completion wait has gone from 2 occurrences in 6 days to 6 more identical-signature occurrences in 26 hours, on 6 differently-named branches, and the 30s timeout widen that shipped for it (PR #1673, 09-21) did not fix it
 
 **Status:** health report — no PR opened against `ci.yml`, `quota_enforcement_tests.rs`,
 or `completion_trigger.rs`. This role's hard gate (a located problem, a named
@@ -11,7 +11,7 @@ every report in this series has hit). Continues the series from
 landed on `claude/fix-shard-0-collision-rebalance-1685`, not yet merged to
 `trunk-dev`, so it is not in this session's tree).
 
-**Corrected across two Codex review rounds on this PR.** First round: the
+**Corrected across three Codex review rounds on this PR.** First round: the
 first draft claimed the `QuotaExceeded` arm "never" propagates `Err`/rolls
 back the source's transaction, having stopped reading `completion_trigger.rs`
 right before the outbox-row insert (that insert's own `.map_err(...)?` can in
@@ -27,9 +27,19 @@ correction's own admission ("no SHA/diff check done") undercut the
 still-unverified claim that all 6 occurrences ran at the new 30s timeout
 bound rather than the old 10s one. This session then fetched and checked each
 occurrence's actual commit: 5 of 6 confirmed at the 30s bound, 1
-(`gallant-dijkstra-a83hyy`) confirmed still on the old 10s bound. All four
-corrections are inline at the point each applies, matching this series'
-convention.
+(`gallant-dijkstra-a83hyy`) confirmed still on the old 10s bound. **Third
+round, on that correction:** Codex caught that this report's "2 clean
+passes bound the window, so it's intermittent" claim compared against two
+runs whose own diffs were never checked either — checking them directly
+found something worse than "unverified": both were **docs-only PRs whose
+test steps never ran at all**, so they were never real passes to begin with.
+Retracted, and replaced with the one genuine clean execution this session
+could find (pre-widen). The same pass, re-checking directly caught a second
+thing this report had gotten wrong on its own, unprompted: the 09-21
+report's baseline for this signature is 2 occurrences, not 1 (a second one,
+in that report's own item 4 cascade, was missed by every earlier draft of
+this report too) — corrected throughout. All corrections are inline at the
+point each applies, matching this series' convention.
 
 ## 🎯 Verdict path
 
@@ -177,17 +187,61 @@ file checked above) remain an open question for the next session
 (`git diff trunk-dev...<branch>` for each) before "independent" is used as
 a settled fact.
 
-**Not claimed as 100%.** Two `Test DB (linux, shard 0)` runs in roughly the
-same window passed cleanly: `35695812531` (2026-09-22T06:39Z, ~35 minutes
-*before* the first of the six failures above) and `35826846700`
-(2026-09-23T06:27Z, sandwiched between the `confident-babbage-sl0122` and
-`cool-noether-7dejjb` failures). So this is intermittent, not deterministic —
-but every shard-0 failure this session sampled in the window resolves to this
-one signature, and none of the six sampled shard-0 failures showed a
-different one. This is a sample of convenience (failures picked by browsing
-the run list, not a uniform draw over all shard-0 executions), not a formal
-rerun-rate — the ≥20x same-commit protocol this role's hard gate requires is
-still not runnable here (no Docker).
+**Correction (post-review, Codex on this PR): the two "clean passes" this
+report cited were never real executions of this test.** An earlier draft
+claimed two `Test DB (linux, shard 0)` runs — `35695812531` and
+`35826846700` — "passed cleanly" in the same window, offered as evidence
+this is intermittent rather than deterministic. Codex questioned comparing
+against unverified revisions; checking directly (each run's own "Detect
+non-docs changes" job log) shows both are **docs-only PRs**:
+`35695812531` changed only `docs/audits/README.md`,
+`docs/audits/cli-flag-coverage.py`, and two files under `docs/runbooks/`;
+`35826846700` changed only `README.md`. Per `ci.yml`'s own docs-only design
+(every expensive step in `Test DB (linux, shard 0)` is gated on
+`needs.changes.outputs.code == 'true'`), neither run ever executed
+`cargo test`, let alone `quota_enforcement_tests` — both jobs report
+`success` because every step inside them was skipped, exactly the "a
+skipped job still reports success" behavior `ci.yml`'s own header comment
+documents as intentional (for branch-protection purposes, not as a
+pass/fail signal for the suite itself). **Both citations are retracted.**
+
+Searching further, this session found one **genuine** clean execution:
+run `35640952522` (`claude/zealous-cannon-dsvx8a`, job `106479562749`,
+`Test DB (linux, shard 0)`, 2026-09-21T19:32:50Z) — a real, non-skipped run
+whose log shows `quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded ... ok`
+among 41 other tests in the same suite, all passing. Checked against
+`56bc205` the same way as the six failures: this run's SHA (`12f8e939`)
+predates the widen (pre-widen, 10s bound). So the honest count from this
+session's checking is: **1 confirmed clean pass (pre-widen, 10s bound), 6
+confirmed failures (5 post-widen at 30s, 1 pre-widen at 10s), 0 confirmed
+clean passes at the 30s bound** — this session did not find one. That is
+weaker support for "intermittent" than the retracted claim implied, and it
+leaves open whether the 30s bound has passed this test at all recently; the
+next session should look specifically for a genuine (non-skipped) pass at
+the 30s bound before repeating an intermittency claim. This remains a
+sample of convenience, not a formal rerun-rate — the ≥20x same-commit
+protocol this role's hard gate requires is still not runnable here
+(no Docker).
+
+**One more thing this correction surfaced, independent of Codex's
+comment:** every failure and the one genuine pass in this section landed on
+`Test DB (linux, shard 0)` specifically, never shard 10 — which is where
+the 09-21 report's own shard-collision finding placed
+`quota_enforcement_tests` (`43 % 11 = 10` at the time). Checked directly
+against today's manifest: `quota_enforcement_tests` is now row 44 among
+`linux`-osclass rows (`awk '$1=="linux"{print c": "$0; c++}' .github/ci/integration-suites.txt`),
+and `integration_e2e` is row 33 — `44 % 11 = 0` and `33 % 11 = 0`. The
+manifest gap between them is still 11 rows (unchanged from the 09-21
+report's finding), but both row numbers shifted by exactly 11 since then
+(the manifest grew), moving the collision from shard 10 to shard 0. This is
+the same tracked, already-being-fixed defect PR #1707 targets (its own
+title: "Rebalance test-db-linux from 11 to 21 shards" /
+`fix-shard-0-collision-rebalance-1685`) — not a new finding, but this
+session's own census independently reproduces it: every occurrence this
+report found landed on the shard currently carrying both of the manifest's
+heaviest suites, consistent with (though, per the 09-21 report's own
+sequential-execution finding, not proven to be caused by) that shard's
+outsized total duration.
 
 ### The 30-second timeout widen (PR #1673, merged 2026-09-21T19:18Z UTC) did not fix this, and its own commit message says the flake was already known and deliberately not root-caused
 
@@ -277,10 +331,11 @@ None. Per the hard gate, this is correctly a health report, not a fix PR:
 no rerun-rate measurement (no Docker), no named mechanism (four candidates
 above, none confirmed), no test-vs-product verdict, no before/after
 measurement. **Explicitly not recommended:** widening the timeout further.
-It is already at 3x default, was widened once for this exact flake nine
-occurrences ago (1 at the time, now 7 across both this and the prior
-report), and did not change the outcome — a 4th widen would be pure
-timeout-bump theater, the exact pattern this role exists to stop.
+It is already at 3x default, was widened once for this exact flake already
+(citing a single observed occurrence at the time), and 5 of the 6 fresh
+occurrences this report found happened at that new, larger bound — a 4th
+widen would be pure timeout-bump theater, the exact pattern this role exists
+to stop.
 
 **Priority for the next session with Docker or live-CI-dispatch access:**
 
@@ -324,11 +379,20 @@ timeout-bump theater, the exact pattern this role exists to stop.
   source's `COMPLETED` state — the 30s bound for 5 of the 6, confirmed by
   SHA ancestry against `56bc205`, and the original 10s bound for the 6th),
   across 6 differently-named branches, not confirmed independent beyond
-  that, 2026-09-22T07:15Z–2026-09-23T09:00Z. Up from 1 occurrence of this
-  specific site in the 09-21 report (which found it alongside 2 occurrences
-  of a different signature on the same test).
-  2 clean shard-0 passes bound the same window, so this is intermittent, not
-  deterministic, and this count is a sample of convenience, not a rerun-rate.
+  that, 2026-09-22T07:15Z–2026-09-23T09:00Z. **Correction (post-review,
+  Codex on this PR):** up from **2**, not 1, occurrences of this specific
+  site in the 09-21 report — that report's item 2 (run `35576291757`) and,
+  missed by an earlier draft of this report, its item 4 (run `35563198153`'s
+  shard-10 cascade, which the 09-21 report itself names as including "the
+  exact test item 2 tracks... `completion_trigger_defers_to_outbox_when_target_quota_exceeded`"
+  among its ~70 failures at the identical `integration_e2e.rs:1383:6` site).
+  8 total confirmed occurrences across both reports, not 7.
+  **Correction (post-review, Codex on this PR, second round):** the "2
+  clean shard-0 passes" bounding the window were retracted — both were
+  docs-only PRs whose test steps never ran (see the census section above).
+  This session found exactly 1 genuine clean pass (pre-widen, 10s bound) and
+  0 genuine clean passes at the 30s bound. This count remains a sample of
+  convenience, not a formal rerun-rate.
 - **After:** N/A — no fix attempted.
 - **Revert check:** N/A — no fix attempted.
 - **Ledger:** no quarantine ledger exists in this repository (checked again).
@@ -380,9 +444,29 @@ print(len(window), Counter(r['conclusion'] for r in window))
 #   35835324763 (job 107108884704) claude/cool-noether-7dejjb
 # -> all 4: identical panic, integration_e2e.rs:1383:6
 
-# The 2 clean shard-0 passes bounding the window (ruling out determinism):
-# actions_list(method="list_workflow_jobs", resource_id=35695812531) -> "Test DB (linux, shard 0)" success, 2026-09-22T06:39Z
-# actions_list(method="list_workflow_jobs", resource_id=35826846700) -> "Test DB (linux, shard 0)" success, 2026-09-23T06:27Z
+# RETRACTED (Codex review correction): the two "clean shard-0 passes" this
+# report first cited were docs-only PRs whose test steps never ran --
+# confirmed by reading each run's own "Detect non-docs changes" job log for
+# its changed-files list, not just its conclusion:
+# get_job_logs(job_id=106642535687) -> Changed files: docs/audits/README.md,
+#   docs/audits/cli-flag-coverage.py, docs/runbooks/harvest-alerts.md,
+#   docs/runbooks/nondeterminism-block.md (run 35695812531)
+# get_job_logs(job_id=107070415376) -> Changed files: README.md
+#   (run 35826846700)
+# Both match ci.yml's docs-only filter, so needs.changes.outputs.code=false
+# and every step in "Test DB (linux, shard 0)" was skipped -- "success"
+# there means "skipped cleanly," not "ran and passed."
+
+# The one GENUINE clean pass this session found instead:
+# get_job_logs(job_id=106479562749, return_content=true) -> full log shows
+grep -n "quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded" zealous_cannon_shard0.log
+# -> "... ok" at 2026-09-21T19:32:50Z (run 35640952522, shard 0, a real
+#    non-skipped execution). SHA ancestry check (below) confirms pre-widen.
+
+# The shard-0 manifest collision this session's own census reproduces
+# (same defect PR #1707 already targets, now at shard 0 not shard 10):
+awk '$1=="linux"{print c": "$0; c++}' .github/ci/integration-suites.txt | grep -n "integration_e2e\|quota_enforcement_tests"
+python3 -c "print(33 % 11, 44 % 11)"   # -> 0 0
 
 # The timeout widen and its own commit message disclaiming a fix:
 git log -S "A wider bound than the usual 10s default" --oneline -- autumn-harvest/tests/integration/quota_enforcement_tests.rs
