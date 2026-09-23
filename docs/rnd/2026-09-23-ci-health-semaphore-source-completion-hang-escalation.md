@@ -11,7 +11,7 @@ every report in this series has hit). Continues the series from
 landed on `claude/fix-shard-0-collision-rebalance-1685`, not yet merged to
 `trunk-dev`, so it is not in this session's tree).
 
-**Corrected across fourteen Codex review rounds on this PR.** First round: the
+**Corrected across fifteen Codex review rounds on this PR.** First round: the
 first draft claimed the `QuotaExceeded` arm "never" propagates `Err`/rolls
 back the source's transaction, having stopped reading `completion_trigger.rs`
 right before the outbox-row insert (that insert's own `.map_err(...)?` can in
@@ -165,6 +165,15 @@ to "SHA ancestry against `56bc205`" alone, the exact method round ten had
 already shown cannot rule out a later revert — the direct `git show`
 file-content check from round ten is the one that actually establishes the
 bound at each SHA, so the Measurement section now cites that check instead.
+
+**Fifteenth round.** The one genuine clean pass's pre-widen bound
+(`12f8e939`) was still attributed to ancestry against `56bc205` — the same
+weaker method round ten's finding had already retired for the 5 failure
+SHAs, just not swept here. Directly inspected the file at `12f8e939`
+instead: the test still calls the plain `wait_for_execution_state` (10s
+default), matching `56bc205`'s own diff of exactly that line. Corrected
+the census section and Reproduce to cite the direct check rather than
+ancestry, consistent with how the 5 failure SHAs are already handled.
 All corrections are inline at the point each applies, matching this
 series' convention.
 
@@ -376,10 +385,17 @@ Searching further, this session found one **genuine** clean execution:
 run `35640952522` (`claude/zealous-cannon-dsvx8a`, job `106479562749`,
 `Test DB (linux, shard 0)`, 2026-09-21T19:32:50Z) — a real, non-skipped run
 whose log shows `quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded ... ok`
-among 41 other tests in the same suite, all passing. Checked against
-`56bc205` the same way as the six failures: this run's SHA (`12f8e939`)
-predates the widen (pre-widen, 10s bound). So the honest count from this
-session's checking is: **1 confirmed clean pass (pre-widen, 10s bound), 6
+among 41 other tests in the same suite, all passing. This run's SHA
+(`12f8e939`) predates the widening commit, but — per the correction above
+this pass, ancestry alone cannot rule out a later revert — so this session
+directly inspected the file at that SHA instead: at `12f8e939` the test
+still calls the plain `wait_for_execution_state(&url, source,
+"COMPLETED")`, which `integration_e2e.rs`'s own definition at that
+revision delegates to a hardcoded `Duration::from_secs(10)`; `56bc205`'s
+own diff shows that exact line is what it later replaced with the 30s
+`wait_for_execution_state_with_timeout` call. Confirmed pre-widen, 10s
+bound, by file content rather than by ancestry. So the honest count from
+this session's checking is: **1 confirmed clean pass (pre-widen, 10s bound), 6
 confirmed failures (5 post-widen at 30s, 1 pre-widen at 10s), 0 confirmed
 clean passes at the 30s bound** — this session did not find one. That is
 weaker support for "intermittent" than the retracted claim implied, and it
@@ -788,4 +804,9 @@ done
 #    58abe747/gallant-dijkstra-a83hyy: pre-widen -- confirmed directly:
 git show 58abe747:autumn-harvest/tests/integration/quota_enforcement_tests.rs | grep -n "wait_for_execution_state(&url, source"
 # -> still the plain 10s-default call, not wait_for_execution_state_with_timeout
+
+# The one genuine clean pass (12f8e939, run 35640952522): same direct check,
+# not ancestry alone (Codex's 3rd correction on this method):
+git show 12f8e939:autumn-harvest/tests/integration/quota_enforcement_tests.rs | grep -n "wait_for_execution_state(&url, source"
+# -> still the plain 10s-default call, confirming pre-widen by file content.
 ```
