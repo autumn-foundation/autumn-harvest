@@ -158,18 +158,19 @@ pub fn arg_type_hint(params: &[&syn::FnArg]) -> String {
 /// `query.rs`'s `build_query_dispatch`, `update.rs`'s `build_update_dispatch`,
 /// and the inline `dispatch` in `workflow.rs`/`activity.rs` each hand-mirrored
 /// this exact three-arm body (issue #1632). `workflow.rs` and `activity.rs`
-/// were byte-identical already; `query.rs`/`update.rs` differed from them and
-/// from each other only in how the handler is invoked and how its error is
-/// encoded, both of which vary by what the caller's own signature looks like,
-/// not by which macro is calling.
+/// were byte-identical already. `query.rs`/`update.rs` differed from them
+/// and from each other only in how the handler is invoked and how its error
+/// is encoded. Both vary by what the caller's own signature looks like, not
+/// by which macro is calling.
 ///
 /// - `args_ident`: the companion fn's JSON-value parameter (`args` for
 ///   query/update, `input` for workflow/activity).
 /// - `multi_args_binding`: the local name the N-arity branch rebinds
 ///   `args_ident` to before indexing it. Kept separate from `args_ident`
-///   because query/update already bind a parameter named `args`; rebinding
-///   to `args` again would shadow it, so those two sites use `__args`, while
-///   workflow/activity's parameter is named `input` and rebind to `args`.
+///   because query/update already bind a parameter named `args`.
+///   Rebinding to `args` again would shadow it, so those two sites use
+///   `__args`. workflow/activity's parameter is named `input`, so it
+///   rebinds to `args` instead.
 /// - `ctx_expr`: how the caller passes its context (`ctx`, or update's
 ///   `ctx.as_ref()`).
 /// - `await_tokens`: empty for query's sync handlers, `.await` elsewhere.
