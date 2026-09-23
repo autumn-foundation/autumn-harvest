@@ -267,6 +267,26 @@ jobs:
         # matching stand-in text. See
         # scripts/check-continue-as-new-checkpoint-example.sh.
         run: ./scripts/check-continue-as-new-checkpoint-example.sh
+      - name: Check operations chapter's preflight declared-deps example
+        # Guards two real, reproduced-live compile failures an Onramp
+        # clean-room pass found in chapter 10's flagship
+        # "Catching a forgotten registration before rollout" example: (1)
+        # `ctx.execute_activity(...).await?` and the spawn_child_workflow
+        # call below it are `HarvestResult<_>`, but the workflow returns
+        # `Result<_, String>` with no `From<HarvestError> for String` --
+        # same defect class as chapter 7's continue_as_new example (PR
+        # #1700); (2) even with `.map_err(...)` added, execute_activity's
+        # generic output type is left unconstrained by a discarded bare
+        # statement, which current stable rustc denies by default on every
+        # edition (`dependency_on_unit_never_type_fallback`), confirmed
+        # live against a standalone edition-2021 crate matching chapter 1's
+        # own pinned tutorial edition. Neither is a syntax error, so
+        # doc-snippet-syntax.py's rustfmt-only check passes this block
+        # clean. This actually compiles the pinned block with `cargo check`
+        # rather than pattern-matching stand-in text, matching the sibling
+        # guards above. See
+        # scripts/check-preflight-declared-deps-example.sh.
+        run: ./scripts/check-preflight-declared-deps-example.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest
