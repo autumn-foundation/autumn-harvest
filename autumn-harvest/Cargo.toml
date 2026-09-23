@@ -498,5 +498,15 @@ name = "activity_wait_resolution_profile"
 required-features = ["db"]
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `payload_codec::PayloadCodecs::{encode_event, decode_event}` -- the
+# codec transform `store.rs` runs on every workflow-event append and every
+# history read / replay load, for every payload-bearing field of every
+# event. No feature requirement: `payload_codec.rs` is pure and unconditional
+# (no DB access). See `benches/payload_codec_profile.rs`.
+[[bench]]
+name = "payload_codec_profile"
+harness = false
+
 [lints]
 workspace = true
