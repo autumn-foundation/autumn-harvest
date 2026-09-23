@@ -675,7 +675,7 @@ impl SqliteRuntime {
                         Some((prior_exec, prior_state)),
                     ) => {
                         if prior_state == "FAILED" {
-                            store::seal_execution(&tx, prior_exec, SEALED_STATE)?;
+                            cancel_and_seal_prior(&tx, prior_exec, &prior_state)?;
                             insert_fresh_execution(&tx, workflow_name, Some(id), input)?
                         } else {
                             StartOutcome {
