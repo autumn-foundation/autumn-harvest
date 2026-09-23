@@ -1,0 +1,5 @@
+                                                        query                                                         | calls | rows | shared_blks_hit | shared_blks_read | wal_bytes 
+----------------------------------------------------------------------------------------------------------------------+-------+------+-----------------+------------------+-----------
+ PREPARE batch_lock(text[]) AS SELECT key FROM harvest_rate_limit_buckets WHERE key = ANY($1) ORDER BY key FOR UPDATE |     1 |  100 |             505 |                0 |      5400
+(1 row)
+

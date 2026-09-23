@@ -1,0 +1,5 @@
+                                query                                 | calls | rows | shared_blks_hit | shared_blks_read | shared_blks_dirtied | temp_blks_read | temp_blks_written | wal_bytes 
+----------------------------------------------------------------------+-------+------+-----------------+------------------+---------------------+----------------+-------------------+-----------
+ SELECT key FROM harvest_rate_limit_buckets WHERE key = $1 FOR UPDATE |   100 |  100 |             500 |                0 |                   0 |              0 |                 0 |      5400
+(1 row)
+

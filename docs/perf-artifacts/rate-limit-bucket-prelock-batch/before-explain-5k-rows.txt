@@ -1,0 +1,18 @@
+BEGIN
+                                                                                QUERY PLAN                                                                                
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ LockRows  (cost=0.28..8.31 rows=1 width=47) (actual time=0.062..0.064 rows=1 loops=1)
+   Output: key, ctid
+   Buffers: shared hit=5
+   ->  Index Scan using harvest_rate_limit_buckets_pkey on public.harvest_rate_limit_buckets  (cost=0.28..8.30 rows=1 width=47) (actual time=0.028..0.028 rows=1 loops=1)
+         Output: key, ctid
+         Index Cond: ((harvest_rate_limit_buckets.key)::text = 'start-throttle:throttled_flow:tenant-0'::text)
+         Buffers: shared hit=3
+ Query Identifier: 4061244114900148264
+ Planning:
+   Buffers: shared hit=64
+ Planning Time: 0.402 ms
+ Execution Time: 0.110 ms
+(12 rows)
+
+ROLLBACK
