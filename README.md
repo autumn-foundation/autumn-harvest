@@ -321,9 +321,13 @@ for a compile-checked polling loop that works with and without the `db` feature.
 | [`autumn-harvest-redis`](autumn-harvest-redis/) | Optional Redis Streams dispatch channel — carries references to claimable rows; Postgres stays the source of truth |
 | [`autumn-harvest-sqlite`](autumn-harvest-sqlite/) | Optional SQLite storage backend for single-process and embedded deployments |
 
-Use `autumn-harvest-plugin` if you're building an Autumn app. Use the bare
-`autumn-harvest` crate if you want to embed the engine in another framework or
-a non-web context.
+Use `autumn-harvest-plugin` if you're building an Autumn app. To embed the
+engine in another framework or a non-web context, mount
+`autumn-harvest-plugin`'s `harvest_api_router`/`harvest_ui_router` on your own
+server, as [`examples/standalone-runner`](examples/standalone-runner/) does.
+The bare `autumn-harvest` crate has no HTTP surface by itself — no management
+API, no Vantage UI, no metrics endpoint, no webhooks — it is the executor and
+storage layer that `autumn-harvest-plugin` wraps.
 
 ## CLI
 
