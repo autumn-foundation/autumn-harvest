@@ -11,7 +11,7 @@ every report in this series has hit). Continues the series from
 landed on `claude/fix-shard-0-collision-rebalance-1685`, not yet merged to
 `trunk-dev`, so it is not in this session's tree).
 
-**Corrected across fifteen Codex review rounds on this PR.** First round: the
+**Corrected across sixteen Codex review rounds on this PR.** First round: the
 first draft claimed the `QuotaExceeded` arm "never" propagates `Err`/rolls
 back the source's transaction, having stopped reading `completion_trigger.rs`
 right before the outbox-row insert (that insert's own `.map_err(...)?` can in
@@ -174,8 +174,18 @@ instead: the test still calls the plain `wait_for_execution_state` (10s
 default), matching `56bc205`'s own diff of exactly that line. Corrected
 the census section and Reproduce to cite the direct check rather than
 ancestry, consistent with how the 5 failure SHAs are already handled.
-All corrections are inline at the point each applies, matching this
-series' convention.
+
+**Sixteenth round, two more findings.** First: a second, near-duplicate
+instance of the "the widen didn't help" overclaim (round fourteen's finding
+softened one copy but missed this one) survived in the paragraph
+correcting the SHA-ancestry-to-direct-check method — reworded to "did not
+eliminate the flake," with the same epistemic-limits caveat. Second: the
+Reproduce section's inline comment on the one genuine clean pass still
+said "SHA ancestry check (below) confirms pre-widen," the exact
+ancestry-only wording round fifteen's finding had just retired for that
+same SHA one section up — corrected to point at the direct file check
+instead. All corrections are inline at the point each applies, matching
+this series' convention.
 
 ## 🎯 Verdict path
 
@@ -338,8 +348,10 @@ Codex's comment named.
 
 This is a **correction, not a retraction**: 5 of 6 occurrences are now
 directly confirmed at the new 30s bound (not merely timestamped after the
-merge), which is if anything stronger support for "the widen didn't help"
-than the original unverified claim — and the 6th occurrence, at the old 10s
+merge), which is if anything stronger support for "the widen did not
+eliminate the flake" than the original unverified claim (this report has
+no before/after execution count, so it cannot say more than that) — and
+the 6th occurrence, at the old 10s
 bound, is consistent with this being the same longstanding flake this
 series has tracked since before the widen shipped. The open-PR-based
 independence claim remains downgraded regardless: six occurrences on six
@@ -750,7 +762,8 @@ print(len(window), Counter(r['conclusion'] for r in window))
 # get_job_logs(job_id=106479562749, return_content=true) -> full log shows
 grep -n "quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded" zealous_cannon_shard0.log
 # -> "... ok" at 2026-09-21T19:32:50Z (run 35640952522, shard 0, a real
-#    non-skipped execution). SHA ancestry check (below) confirms pre-widen.
+#    non-skipped execution). Direct file check (below), not ancestry alone,
+#    confirms pre-widen.
 
 # The shard-0 manifest collision under the CURRENT 11-shard layout (same
 # defect PR #1707 already targets, now at shard 0 not shard 10) -- true for
