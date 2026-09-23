@@ -1523,6 +1523,14 @@ async fn order_due_rows_for_deadlock_free_firing(
 /// Rows lock in the sorted order the query returns them, not in scan
 /// order. `EXPLAIN (ANALYZE, BUFFERS)` on this exact shape confirms this
 /// (`docs/perf-artifacts/rate-limit-bucket-prelock-batch/`).
+///
+/// `COLLATE "C"` pins that order to a plain byte comparison. Rust's
+/// `BTreeSet<String>` -- [`collect_distinct_bucket_keys`]'s own type --
+/// always sorts by byte value, never by locale. A database with a
+/// locale-aware collation (`en_US.UTF-8` and similar) would otherwise
+/// lock in a different order. A peer still running the pre-fix per-key
+/// loop locks in Rust's byte order. During a rolling upgrade that
+/// mismatch reopens the same ABBA hazard this function exists to close.
 #[cfg(feature = "db")]
 async fn pre_lock_rate_limit_buckets_for_claimed_batch(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -1534,7 +1542,8 @@ async fn pre_lock_rate_limit_buckets_for_claimed_batch(
         return Ok(());
     }
     diesel::sql_query(
-        "SELECT key FROM harvest_rate_limit_buckets WHERE key = ANY($1) ORDER BY key FOR UPDATE",
+        "SELECT key FROM harvest_rate_limit_buckets WHERE key = ANY($1) \
+         ORDER BY key COLLATE \"C\" FOR UPDATE",
     )
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&bucket_keys)
     .execute(conn)

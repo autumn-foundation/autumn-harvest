@@ -304,7 +304,8 @@ async fn claimed_batch_prelocks_bucket_keys_with_bounded_round_trips() {
     );
     let batched_lock_calls = calls_containing(
         &rows,
-        "select key from harvest_rate_limit_buckets where key = any($1) order by key for update",
+        "select key from harvest_rate_limit_buckets where key = any($1) order by key \
+         collate \"c\" for update",
     );
 
     // GREEN: the fixed shape. The whole 100-distinct-key claimed batch

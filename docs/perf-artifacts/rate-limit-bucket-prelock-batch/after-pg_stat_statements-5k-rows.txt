@@ -1,5 +1,5 @@
-                                                        query                                                         | calls | rows | shared_blks_hit | shared_blks_read | shared_blks_dirtied | temp_blks_read | temp_blks_written | wal_bytes 
-----------------------------------------------------------------------------------------------------------------------+-------+------+-----------------+------------------+---------------------+----------------+-------------------+-----------
- PREPARE batch_lock(text[]) AS SELECT key FROM harvest_rate_limit_buckets WHERE key = ANY($1) ORDER BY key FOR UPDATE |     1 |  100 |             290 |                0 |                   0 |              0 |                 0 |      5400
+                                                              query                                                               | calls | rows | shared_blks_hit | shared_blks_read | wal_bytes 
+----------------------------------------------------------------------------------------------------------------------------------+-------+------+-----------------+------------------+-----------
+ PREPARE batch_lock(text[]) AS SELECT key FROM harvest_rate_limit_buckets WHERE key = ANY($1) ORDER BY key COLLATE "C" FOR UPDATE |     1 |  100 |             190 |                0 |      5400
 (1 row)
 
