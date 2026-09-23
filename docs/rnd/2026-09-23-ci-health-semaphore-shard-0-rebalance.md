@@ -1,16 +1,24 @@
 # 🚦 Semaphore CI health — shard 0's `integration_e2e`/`quota_enforcement_tests`
 # collision drifted back; rebalanced from 11 to 21 shards for a real,
-# measured (not eliminated) load-balance improvement: true worst-case
-# shard weight down from 605 to 287 (52.6%). Corrected SIX times
-# post-review (Codex on this PR). The three most recent rounds all concern
-# a fixed +188 test-weight cost that always lands on shard 0 regardless of
-# shard count, which earlier sweeps omitted entirely: first correcting for
-# it (flipping the earlier N=20 pick from "best in range" to one of the
-# worst), then finding that correction's own N=11 baseline (426) was never
-# actually re-derived and was off by nearly 200 (true value 605). This fix
-# is a real, partial improvement, not a solved sharding problem, and not a
-# proven fix for the `quota_enforcement_tests` hang tracked separately in
+# measured (not eliminated) WALL-CLOCK LATENCY improvement for the
+# slowest shard, conditional on available runner concurrency -- estimated
+# ~30% (NOT the 52.6% test-weight-ratio figure below; that number ignores
+# fixed per-job overhead and should not be read as a time percentage).
+# This almost certainly INCREASES total CI compute cost (ten more matrix
+# jobs, each paying its own checkout/toolchain/cache/Docker-pull
+# overhead) -- see "🔍 Seventh correction" for why this is a latency
+# change, not a cost improvement, despite this file's own earlier
+# language repeatedly calling it one. Corrected SEVEN times post-review
+# (Codex on this PR). This fix is a real, partial improvement, not a
+# solved sharding problem, and not a proven fix for the
+# `quota_enforcement_tests` hang tracked separately in
 # `ci-health-semaphore-quota-outbox-root-cause.md`.
+#
+# For the record, since this file keeps every superseded number rather
+# than deleting it: the earlier headline figure was "true worst-case
+# shard weight down from 605 to 287 (52.6%)" -- a real, correctly-computed
+# TEST-WEIGHT ratio, just not a wall-clock time ratio, and not adjusted
+# for the extra fixed overhead ten more jobs cost on every single run.
 #
 # UPDATE, same session, this PR's own first live CI run: the falsifiable
 # prediction below came true almost immediately.
@@ -47,6 +55,16 @@
 # (N=9, N=10, N=14). None of them beat N=21 (true max 287 stays lowest of
 # all six), so the shipped configuration is unchanged -- only the claim of
 # having checked exhaustively was wrong. See "🔍 Sixth correction".
+#
+# FIFTH UPDATE, same session: Codex review caught the biggest framing
+# error yet -- this report called itself a "CI-cost improvement"
+# throughout without ever accounting for the fixed per-job setup cost
+# (checkout, toolchain, cache, four Docker pulls) that ten additional
+# shards now pay on every single run. Total compute cost almost certainly
+# goes UP, not down. The genuine benefit is worst-case wall-clock latency
+# for the slowest shard, roughly ~30% by a rough estimate calibrated
+# against real job timings -- not the 52.6% test-weight-ratio figure,
+# which was never a time percentage. See "🔍 Seventh correction".
 
 **Status:** fix shipped this session, `.github/workflows/ci.yml` only (shard
 count + matrix list + comment). No test code, no manifest reordering (the
@@ -225,23 +243,39 @@ harness locally against PR #1703's branch, not from committing a copy.
 
 ## 📊 Measurement
 
-Before (11 shards, true max including the always-on-shard-0 `linuxpart`
-cost, from the complete N=9-24 sweep in "🔍 Fifth correction"): shard-0-
-inclusive max **605**, 7 shards with heavy-suite collisions. After (21
-shards, same accounting): true max **287** (a 52.6% reduction), and
+**Read this section together with "🔍 Seventh correction" -- the figures
+below are test-*weight* ratios, not time or cost ratios.** Before (11
+shards, true max including the always-on-shard-0 `linuxpart` cost, from
+the complete N=9-24 sweep in "🔍 Fifth correction"): shard-0-inclusive max
+**605**, 7 shards with heavy-suite collisions. After (21 shards, same
+accounting): true max **287** (a 52.6% *weight* reduction), and
 `quota_enforcement_tests` moves from a 3-way collision to isolation. No N
 in the swept range (9-24) is collision-free; N=21 is not even the
-lowest-max option (N=23/24 are, at 261-262) -- of the three candidates in
-that range that also isolate `quota_enforcement_tests` (N=18, N=20, N=21),
-N=21 has the lowest true max. No before/after wall-clock timing obtained
-this session (would need a live CI run of both configurations) -- the
-weight simulation is the same proxy issue #1267's own fix relied on
-without independent timing verification either. This report's numbers
-went through five correction rounds before landing here (see the header
-and "🔍 Fifth correction"); treat any single figure in isolation with
-appropriate caution and prefer the fifth-correction section's table as
-the source of truth -- it supersedes the fourth correction's table, which
-itself superseded the original (uncorrected) sweep.
+lowest-max option (N=23/24 are, at 261-262) -- of the six candidates in
+that range that also isolate `quota_enforcement_tests` (N=9, N=10, N=14,
+N=18, N=20, N=21), N=21 has the lowest true max (see "🔍 Sixth
+correction" for the full table).
+
+**Translated to wall-clock and cost (rough estimates, calibrated against
+real job timings, not a live measurement of this exact change):** the
+slowest shard's wall time drops by roughly **~30%** (~37.7 min to ~26.5
+min), not 52.6%, because a ~16-minute fixed per-job setup cost does not
+shrink along with the test weight. Total CI compute cost per run likely
+*increases* by roughly 100-200 runner-minutes (ten more jobs, each paying
+that same fixed cost) -- this change trades more total compute for less
+latency on the critical path, conditional on the runner pool having spare
+concurrency for the extra jobs (unverified this session). No live
+before/after wall-clock timing of both configurations was obtained this
+session; every number in this paragraph and the previous one is a model
+fit against ten job timings from an unrelated PR's run, not a controlled
+experiment.
+
+This report's numbers went through seven correction rounds before
+landing here (see the header, "🔍 Fifth correction", "🔍 Sixth
+correction", and "🔍 Seventh correction"); treat any single figure in
+isolation with appropriate caution and prefer the seventh-correction
+section as the most current framing -- it does not overturn the fifth or
+sixth corrections' numbers, only how those numbers should be read.
 
 ## 🔬 Reproduce
 
@@ -515,3 +549,72 @@ tested, not a hand-picked subset.
 stays `"21"`. It changes only how confidently this report can claim N=21
 is the best isolating option -- from "checked three, best of those" to
 "checked all sixteen, best of all of them."
+
+## 🔍 Seventh correction: this was never a "CI-cost improvement"
+
+Codex review caught something none of the previous six rounds questioned:
+every number in this report measures test-*weight* redistribution across
+shards, and every mention of "improvement" or "reduction" implicitly
+treated a lower worst-case weight as a lower CI cost. Ten more shards
+means ten more `test-db-linux` matrix jobs on every code-bearing run, and
+each job pays its own fixed setup cost regardless of how many tests it
+runs: `actions/checkout`, Rust toolchain install, `rust-cache` restore,
+the disk-pruning step, and four sequential `docker pull`s (with retries)
+for the Postgres/Redis images every DB-backed suite needs. The 151
+manifest rows themselves are unchanged -- rebalancing only moves which
+shard runs which subset of them. **Total GitHub Actions runner-minutes
+consumed per CI run almost certainly goes up, not down**, and this report
+never measured that number.
+
+A rough estimate, calibrated against real job timings rather than
+guessed: fitting `duration = fixed_overhead + rate * weight` to ten
+`Test DB (linux, shard N)` jobs' actual start/end timestamps from PR
+#1706's N=11 run (a real CI run, not this PR's own, so unaffected by this
+PR's changes) gives `fixed_overhead ~= 985s` (~16.4 min) and
+`rate ~= 2.1s` per weight unit. This fit is noisy -- two shards of very
+different weight (296 and 426) finished within four seconds of each other
+in that data, so treat both constants as order-of-magnitude, not precise:
+
+```
+fixed_overhead ~= 16 min/job (order of magnitude; could plausibly be
+                  anywhere from ~10 to ~20 min given the fit's noise)
+extra jobs (11 -> 21 shards): +10
+extra fixed-overhead cost per CI run: ~160 minutes of runner-minutes
+  (10 jobs * ~16 min each) -- a real, recurring cost this report never
+  weighed against the benefit
+```
+
+**The wall-clock benefit is real but much smaller than "52.6%" suggests,
+once fixed overhead is included.** That 52.6% figure (605 -> 287) is a
+pure test-weight ratio; it does not account for the ~16-minute fixed
+component that both the old and new worst shard pay identically. Applying
+the fitted model to the worst shard specifically: old worst shard
+(weight 605) ~= 37.7 min wall time; new worst shard (weight 287) ~= 26.5
+min. That is a **~30% wall-clock reduction for the slowest shard**, not
+52.6% -- still a real improvement, but roughly half the size the headline
+number implied, because the fixed setup cost does not shrink along with
+the test weight.
+
+**This also assumes GitHub Actions has enough concurrent-runner capacity
+to run all 21 shards (plus every other job in this workflow and whatever
+else is running concurrently in the repo/org) at once.** If the account's
+actual concurrency ceiling is lower than that, some of the 10 new shards
+queue for a runner slot instead of starting immediately, which would
+reduce or eliminate the wall-clock benefit entirely while still paying
+the extra fixed-overhead cost. This session did not check the org's
+actual GitHub Actions concurrency limit and has no basis to claim the
+benefit is guaranteed rather than conditional on available capacity.
+
+**Corrected framing.** This change is a **worst-case wall-clock latency
+improvement for the slowest shard, conditional on available runner
+concurrency** -- not a CI-cost improvement. It very likely *increases*
+total runner-minutes consumed per run by something on the order of 100-200
+minutes (a rough estimate, not a measurement), in exchange for an
+estimated ~30% reduction in the slowest shard's own wall time (also a
+rough estimate, not a live-CI measurement). Every prior mention in this
+report and in `ci.yml`'s own comment describing this as a "CI-cost"
+improvement, or citing the weight-ratio percentage as if it were a
+time-ratio percentage, should be read with this correction applied. The
+shipped configuration (`SEMAPHORE_SHARD_COUNT: "21"`) is unchanged --
+this correction is entirely about how the change should be described and
+weighed, not about which number to ship.

@@ -1037,7 +1037,7 @@ jobs:
       # growing alphabetically, and their gap silently drifted back onto a
       # value 11 cannot tolerate either. That drift is real and confirmed.
       #
-      # This comment went through seven rounds of correction (kept here
+      # This comment went through eight rounds of correction (kept here
       # rather than silently rewritten, since a later commit's diff is not
       # where a future reader will look for this history):
       #
@@ -1128,6 +1128,27 @@ jobs:
       # not a bigger modulus, and that is a bigger change than this fix
       # attempts.
       #
+      # Round 8 (Codex review): every round above measured test-WEIGHT
+      # redistribution and called the result a "CI-cost improvement." It
+      # isn't one. Ten more matrix jobs (11 -> 21) each pay their own fixed
+      # setup cost -- checkout, toolchain install, `rust-cache` restore,
+      # disk pruning, four Docker pulls -- regardless of how many tests
+      # they run; the 151 manifest rows are only redistributed, not
+      # reduced. Total GitHub Actions runner-minutes per run almost
+      # certainly goes UP, not down. Fitting `duration = fixed + rate *
+      # weight` against ten real `Test DB (linux, shard N)` job timings
+      # (from an unrelated PR's N=11 run, so uncontaminated by this PR's
+      # own changes) gives a rough fixed cost of ~16 min/job -- noisy, but
+      # not negligible: ~160 extra runner-minutes per CI run for the ten
+      # new jobs. The wall-clock benefit for the slowest shard specifically
+      # is real but smaller than the weight ratio implies once that fixed
+      # cost is included: ~30% (about 37.7 -> 26.5 min by the same fit),
+      # not 52.6%. That benefit also assumes the runner pool has spare
+      # concurrency for the extra jobs -- unverified this session; a
+      # constrained pool could queue the new shards and erode or eliminate
+      # the latency win while still paying the extra fixed cost. See the
+      # report's "🔍 Seventh correction" for the full derivation.
+      #
       # Whether shard load explains `quota_enforcement_tests`'s recurring,
       # exactly-at-the-configured-timeout hang at all -- named by the "🚦
       # Semaphore" CI-health report series
@@ -1138,7 +1159,9 @@ jobs:
       # rules out heavy-suite collision as a NECESSARY condition (not shard
       # load or probabilistic causes in general -- see the report for that
       # distinction). This change is offered as a real, measured
-      # load-balance improvement, not a claimed fix for the hang.
+      # worst-case wall-clock latency improvement for the slowest shard,
+      # traded against higher total compute cost -- not a CI-cost
+      # improvement, and not a claimed fix for the hang.
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     runs-on: ubuntu-latest
