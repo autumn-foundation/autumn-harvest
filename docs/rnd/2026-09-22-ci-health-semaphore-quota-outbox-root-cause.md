@@ -7,18 +7,30 @@
 # separate, undocumented one-shot race. **Corrected post-review (Codex on
 # this PR):** an earlier draft over-claimed this fix also explains PR
 # #1697's OTHER panic site (the already-30s source-completion wait) --
-# it does not; that remains a distinct, unexplained, still-open flake,
-# retracted explicitly below rather than left standing. A second new,
-# unrelated flake in the same file (confirmed, not fixed) is recorded at
-# the end for the next session.
+# it does not; that remained a distinct, unexplained flake at the time,
+# retracted explicitly below rather than left standing. **UPDATE (Codex
+# review, a later PR on this branch): that source-completion panic is now
+# explained and fixed too.** #1713 (cherry-picked here as `8292b07`) found
+# it: `integration_e2e.rs`'s testcontainers schema bundle was missing
+# migration `20260920215812_harvest_completion_trigger_fires_target`, so
+# every Docker-backed test database lacked a column `completion_trigger.rs`
+# writes inside the SAME transaction that completes the source workflow --
+# rolling back the source's own completion on every attempt. That is a
+# second, independent fix in this PR's history, not something this
+# report's own outbox-scanner fix explains; see `8292b07`'s commit message
+# and #1713 for the full writeup. A second, separate flake in the same file
+# is recorded further below, corrected in place rather than left standing.
 
-**Status:** fix shipped this session, against
-`autumn-harvest/tests/integration/quota_enforcement_tests.rs` only — no
-`ci.yml`, timeout-constant, or sharding-manifest change. Continues the
-series from `docs/rnd/2026-09-21-ci-health-semaphore-quota-outbox-recurrence.md`
-and closes out issue #1685's own recommendation ("whoever next has Docker
-available in-session should point the ≥20x rerun campaign at the
-outbox-retry-loop panic specifically").
+**Status:** two fixes shipped on this branch. This session's own fix
+touches `autumn-harvest/tests/integration/quota_enforcement_tests.rs` only
+— no `ci.yml`, timeout-constant, or sharding-manifest change — and closes
+out issue #1685's own recommendation ("whoever next has Docker available
+in-session should point the ≥20x rerun campaign at the outbox-retry-loop
+panic specifically"), continuing the series from
+`docs/rnd/2026-09-21-ci-health-semaphore-quota-outbox-recurrence.md`. A
+second, later, unrelated fix (`8292b07`, cherry-picked from #1713) closes
+the source-completion panic this report originally left open -- see the
+UPDATE above.
 
 ## 🎯 Starting point
 
@@ -58,19 +70,24 @@ oversubscription is directly comparable.
 
 ```sh
 # 8x CPU oversubscription: 32 busy `yes` loops pinned across 4 cores,
-# load average settles around 30+. Capture the PIDs and trap them to a
-# cleanup on exit -- this snippet is standalone, so nothing later cleans
-# up for it the way the full script in "Reproduce" below does for itself.
-STRESS_PIDS=()
-for i in $(seq 1 32); do yes > /dev/null & STRESS_PIDS+=("$!"); done
-trap 'kill "${STRESS_PIDS[@]}" 2>/dev/null' EXIT
+# load average settles around 30+. Run the whole block in a subshell with
+# its OWN `EXIT` trap -- pasted into an existing interactive shell, a bare
+# top-level `trap ... EXIT` only fires when that shell itself later exits,
+# leaving all 32 `yes` processes saturating the host in the meantime. The
+# subshell's `EXIT` fires the moment this block finishes, regardless of
+# how the surrounding shell is used afterward.
+(
+  STRESS_PIDS=()
+  for i in $(seq 1 32); do yes > /dev/null & STRESS_PIDS+=("$!"); done
+  trap 'kill "${STRESS_PIDS[@]}" 2>/dev/null' EXIT
 
-export HARVEST_TEST_DATABASE_URL="postgres://harvest:harvest@127.0.0.1:5432/harvest_test"
-for i in $(seq 1 20); do
-  cargo test -p autumn-harvest --test integration -- \
-    completion_trigger_defers_to_outbox_when_target_quota_exceeded \
-    --test-threads=1
-done
+  export HARVEST_TEST_DATABASE_URL="postgres://harvest:harvest@127.0.0.1:5432/harvest_test"
+  for i in $(seq 1 20); do
+    cargo test -p autumn-harvest --test integration -- \
+      completion_trigger_defers_to_outbox_when_target_quota_exceeded \
+      --test-threads=1
+  done
+)
 ```
 
 Against `trunk-dev` HEAD (before this session's fix), this reproduced the
@@ -176,12 +193,16 @@ the outbox for retry rather than blocking the source execution's own
 completion"). The source's transition to `COMPLETED` does not read the
 target's quota state, the outbox table, or `sharded_pool` at all, so a
 fix to the scanner's pool resolution cannot affect how long that wait
-takes. **That panic site remains unexplained and is not fixed by this
-session's change.** It is a real, separate, still-open flake candidate:
-whatever makes the worker's own decision cycle for the SOURCE (claim the
-task, run the trivial handler, persist `WorkflowCompleted`, evaluate
-triggers inline, commit) occasionally exceed 30s under load. Carried
-forward for the next session, not closed here.
+takes. **That panic site was not fixed by this session's change** -- it
+needed a different fix, found later on this same branch. **Update (Codex
+review, a later PR on this branch): it is no longer unexplained.** #1713
+(cherry-picked here as `8292b07`) found it: a missing migration in
+`integration_e2e.rs`'s testcontainers schema meant `harvest_completion_trigger_fires`
+was missing columns `completion_trigger.rs` writes inside the source's own
+completion transaction, so that insert's failure rolled the whole
+transaction back on every Docker-backed attempt -- not a worker
+decision-cycle timing issue at all. See `8292b07`'s commit message and
+#1713 for the full writeup.
 
 **A live occurrence landed on this PR's own CI while this correction was
 being written** (`Test DB (linux, shard 0)`, commit `4ce17a5`, run
@@ -266,33 +287,61 @@ touching PR #1697 from this session — different branch, different
 author-of-record — but flagging this for whoever reviews it next, so the
 widen is not miscredited as the actual fix.
 
-## ⚠️ A second, separate, confirmed flake in the same file — NOT fixed this session
+## ⚠️ A second, separate flake in the same file — status corrected below
 
-Running the **whole** `quota_enforcement_tests` module the way real CI does
-(`cargo test -p autumn-harvest --test integration -- quota_enforcement_tests
---test-threads=1`, all ~58 tests, one shared database, matching the
-manifest row `linux autumn-harvest integration - quota_enforcement_tests`)
-fails **deterministically** — 3 of 3 local reproductions, **zero CPU stress
-needed** — on `quota_blocked_outbox_retry_row_is_not_starved_by_a_flood_of_fresh_rows`
+**Correction (Codex review, a later PR on this same branch): "the way real
+CI does it" below is wrong, and it matters.** This section's reproduction
+used `HARVEST_TEST_DATABASE_URL` pointing at ONE persistent local database
+for the whole module run, so every test in the module really did share one
+database and could leak rows into a later test. Real CI does not run this
+way: `setup_test_database_url_or_env()` starts a **fresh testcontainer per
+test function** whenever `HARVEST_TEST_DATABASE_URL` is unset (CI's actual
+mode — `.github/workflows/ci.yml` never sets it), regardless of
+`--test-threads`. So real CI never shares one database across the module,
+and the row-leakage hypothesis below cannot be the CI-observed mechanism —
+it is, at most, an artifact specific to this local persistent-database
+reproduction style, not a CI-shaped flake. Confirmed independently: a later
+PR on this branch (#1713, cherry-picked here as `8292b07`) ran this exact
+full module via testcontainers — every test its own fresh database — and
+got **47/47 passing**, including
+`quota_blocked_outbox_retry_row_is_not_starved_by_a_flood_of_fresh_rows`,
+the specific test this section reported failing deterministically. That
+fix (a missing migration in `integration_e2e.rs`'s test-schema bundle) is
+unrelated to the row-leakage hypothesis below, so its passing does not
+confirm or refute that hypothesis either way -- it only confirms this
+module does not fail under CI's real per-test-isolated-container model.
+
+The original text is kept below for the record, with this correction
+governing how to read it:
+
+Running the **whole** `quota_enforcement_tests` module against a shared
+persistent database (`cargo test -p autumn-harvest --test integration --
+quota_enforcement_tests --test-threads=1` with `HARVEST_TEST_DATABASE_URL`
+set, all ~58 tests, one shared database) fails **deterministically** — 3 of
+3 local reproductions, **zero CPU stress needed** — on
+`quota_blocked_outbox_retry_row_is_not_starved_by_a_flood_of_fresh_rows`
 (and, in one of the three runs, two additional `quota_blocked_outbox_*`
 tests failed instead/also). **Confirmed present on unmodified `trunk-dev`
 HEAD** (verified by stashing this session's fix and re-running the same
 full-module command 3x before restoring it) — this is not caused by, or
-related to, the fix above.
+related to, the fix above, and (per the correction above) not established
+to reproduce under CI's actual per-test-container model either.
 
 Not root-caused to this report's own confidence bar (that would need its
 own instrumented investigation), but the shape is suspicious and worth a
-named candidate for the next session: several `quota_blocked_outbox_*`
+named candidate for the next session investigating THIS specific
+reproduction mode: several `quota_blocked_outbox_*`
 tests in this same file (`quota_blocked_outbox_never_attempted_rows_outrank_expired_quota_retries`
 is one concrete example) insert dozens of rows directly into
 `harvest_completion_trigger_outbox` targeting shard 0, backed by a quota
 blocker that is deliberately **never freed** for the rest of the test — and
 never delete those rows before the test function returns. Under
-`--test-threads=1`, every test in the module shares one process and one
-database for the module's whole run. A later, alphabetically-sorted test in
-the same module (`completion_trigger_defers_to_outbox_when_target_quota_exceeded`
-sorts BEFORE all of these by alphabetical test order — confirmed via
-`cargo test --list`, so it is not itself exposed to this — but several
+`--test-threads=1` with a shared persistent database, every test in the
+module shares one process and one database for the module's whole run. A
+later, alphabetically-sorted test in the same module
+(`completion_trigger_defers_to_outbox_when_target_quota_exceeded` sorts
+BEFORE all of these by alphabetical test order — confirmed via `cargo test
+--list`, so it is not itself exposed to this — but several
 `quota_blocked_outbox_*` tests sort near each other and could plausibly
 crowd one another's `OUTBOX_CLAIM_BATCH_LIMIT`/`OUTBOX_RETRY_RESERVED_SLOTS`
 budgets) is a concrete, testable hypothesis for the next session, not a
