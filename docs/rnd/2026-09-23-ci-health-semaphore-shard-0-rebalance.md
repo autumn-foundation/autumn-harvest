@@ -1,12 +1,15 @@
 # 🚦 Semaphore CI health — shard 0's `integration_e2e`/`quota_enforcement_tests`
 # collision drifted back; rebalanced from 11 to 21 shards for a real,
-# measured (not eliminated) load-balance improvement. Corrected FOUR times
-# post-review (Codex on this PR), most recently after discovering the
-# weight sweep itself never accounted for a fixed +188 cost that always
-# lands on shard 0 regardless of shard count -- which flips the earlier
-# N=20 pick from "best in range" to one of the worst. This fix is a real,
-# partial improvement, not a solved sharding problem, and not a proven fix
-# for the `quota_enforcement_tests` hang tracked separately in
+# measured (not eliminated) load-balance improvement: true worst-case
+# shard weight down from 605 to 287 (52.6%). Corrected FIVE times
+# post-review (Codex on this PR). The two most recent rounds both concern
+# a fixed +188 test-weight cost that always lands on shard 0 regardless of
+# shard count, which earlier sweeps omitted entirely: first correcting for
+# it (flipping the earlier N=20 pick from "best in range" to one of the
+# worst), then finding that correction's own N=11 baseline (426) was never
+# actually re-derived and was off by nearly 200 (true value 605). This fix
+# is a real, partial improvement, not a solved sharding problem, and not a
+# proven fix for the `quota_enforcement_tests` hang tracked separately in
 # `ci-health-semaphore-quota-outbox-root-cause.md`.
 #
 # UPDATE, same session, this PR's own first live CI run: the falsifiable
@@ -27,6 +30,15 @@
 # on shard 0. Correcting for it flips N=20's true shard-0 total to 435,
 # worse than the original N=11's 426. See "🔍 Fourth correction" below for
 # the re-swept numbers and the final N=21 choice.
+#
+# THIRD UPDATE, same session: Codex review caught that the SECOND UPDATE's
+# own "426" for N=11 was carried over from the pre-correction sweep without
+# re-deriving it -- it was shard 7's total, not shard 0's, and not shard
+# 0's total with the fixed pass added either. Actually run: shard 0 alone
+# totals 417 at N=11 before the fixed pass, 605 after. N=20 (435) is NOT
+# worse than N=11 (605) -- the SECOND UPDATE's central claim was wrong. The
+# N=21 choice is unaffected; only the comparison baseline was. See "🔍
+# Fifth correction" for the complete, re-run N=9-24 sweep.
 
 **Status:** fix shipped this session, `.github/workflows/ci.yml` only (shard
 count + matrix list + comment). No test code, no manifest reordering (the
@@ -206,20 +218,22 @@ harness locally against PR #1703's branch, not from committing a copy.
 ## 📊 Measurement
 
 Before (11 shards, true max including the always-on-shard-0 `linuxpart`
-cost): shard-0-inclusive max 426, 7 shards with heavy-suite collisions.
-After (21 shards, same accounting): true max 287 (~33% reduction), and
+cost, from the complete N=9-24 sweep in "🔍 Fifth correction"): shard-0-
+inclusive max **605**, 7 shards with heavy-suite collisions. After (21
+shards, same accounting): true max **287** (a 52.6% reduction), and
 `quota_enforcement_tests` moves from a 3-way collision to isolation. No N
 in the swept range (9-24) is collision-free; N=21 is not even the
-lowest-max option (N=23/24 are, at 261-262) -- it is chosen specifically
-to preserve `quota_enforcement_tests`'s isolation, at a ~10-13% cost
-against the true optimum. No before/after wall-clock timing obtained this
-session (would need a live CI run of both configurations) -- the weight
-simulation is the same proxy issue #1267's own fix relied on without
-independent timing verification either. This report's numbers went through
-four correction rounds before landing here (see the header and "🔍 Fourth
-correction"); treat any single figure in isolation with appropriate
-caution and prefer the fourth-correction section's table as the source of
-truth.
+lowest-max option (N=23/24 are, at 261-262) -- of the three candidates in
+that range that also isolate `quota_enforcement_tests` (N=18, N=20, N=21),
+N=21 has the lowest true max. No before/after wall-clock timing obtained
+this session (would need a live CI run of both configurations) -- the
+weight simulation is the same proxy issue #1267's own fix relied on
+without independent timing verification either. This report's numbers
+went through five correction rounds before landing here (see the header
+and "🔍 Fifth correction"); treat any single figure in isolation with
+appropriate caution and prefer the fifth-correction section's table as
+the source of truth -- it supersedes the fourth correction's table, which
+itself superseded the original (uncorrected) sweep.
 
 ## 🔬 Reproduce
 
@@ -358,29 +372,97 @@ N=23  true_max= 262
 N=24  true_max= 261
 ```
 
-(Table abridged to the values this report actually needed to compare;
-full N=9..24 output is reproducible with the commands in "🔬 Reproduce"
-plus the `linuxpart` addition above.)
+**This table is itself wrong -- see "🔍 Fifth correction" below.** It was
+hand-computed by adding +188 to each candidate's already-known shard-0
+total without re-running the harness at N=9, N=11, or N=17 specifically,
+and the N=11 figure in particular is wrong in a way that flips this
+section's central claim (that N=20 was worse than doing nothing). Kept
+here, like every other superseded table in this file, to show what this
+session believed before the correction, not to be relied on.
 
-N=23 and N=24 are the true optimum in the swept range, essentially tied.
-This report does not ship either. At N=23, `quota_enforcement_tests` lands
-in a 3-way collision with `pacing_override_integration` and
+N=23 and N=24 looked, at this point, like the true optimum in the swept
+range, essentially tied -- this part holds up under the fifth correction's
+actual full sweep, so the conclusion below is still right, just for a
+different reason than "N=20 was worse than N=11." This report does not
+ship either 23 or 24. At N=23, `quota_enforcement_tests` lands in a 3-way
+collision with `pacing_override_integration` and
 `transactional_start_tests`; at N=24, it collides 2-way with
 `ui_integration`. At N=21, it lands alone on shard 2 with no co-resident
 heavy suite -- the same isolation property this report claimed (wrongly,
-on the numbers) for N=20 earlier. Trading a true max of 287 for that
-isolation, versus 261-262 without it, is a ~10-13% cost. This report
-chooses to pay it, on the same reasoning as the original N=20 pick: the
-one thing this rebalance can independently justify is keeping
+on the numbers) for N=20 earlier. This report chooses to pay the cost of
+N=21 over the true optimum, on the same reasoning as the original N=20
+pick: the one thing this rebalance can independently justify is keeping
 `quota_enforcement_tests` off a shard with another heavy suite, since that
 collision is what prompted this PR in the first place, even though (per
 the live CI result above) the collision is no longer believed to be the
 hang's cause. A future session with a weight-aware assignment algorithm,
-rather than a single modulus, could likely do better than either number.
+rather than a single modulus, could likely do better than any of these.
 
 **Final shipped configuration:** `SEMAPHORE_SHARD_COUNT: "21"`,
-`test-db-linux`'s `matrix.shard` extended to 21 entries (`[0..20]`). True
-worst-case shard-0-inclusive max: 287, down from N=11's 426 (~33%
-reduction, not the ~42% this report claimed for N=20 before this
-correction). No shard count in 9-24 is collision-free, with or without the
-linuxpart correction.
+`test-db-linux`'s `matrix.shard` extended to 21 entries (`[0..20]`). See
+"🔍 Fifth correction" for the true, harness-verified before/after numbers
+-- the ones in this section (287 down from 426, ~33%) are superseded.
+
+## 🔍 Fifth correction: the N=11 baseline itself was never re-run
+
+Codex review, on this same PR, caught what the fourth correction missed:
+its own N=11 figure (426) was carried over from the *original* sweep --
+the one that predates the linuxpart fix entirely -- without checking
+whether 426 was even shard 0's number at N=11, let alone shard 0's number
+*with* the fixed pass added. It was not: at N=11, 426 is shard 7's total.
+Actually running the harness at N=11 (not hand-extrapolating) finds shard
+0 alone already totals **417** on the sharded rows -- almost the old
+"max" by itself, before the fixed pass is even added. With the fixed
++188: shard 0's true total at N=11 is **605**.
+
+That retracts the fourth correction's central claim. N=20's corrected
+true max (435) is not worse than N=11's -- it is better (435 < 605); the
+fourth correction's "N=20 was one of the worst choices" was simply wrong,
+built on a baseline nobody had re-derived.
+
+This time, rather than hand-adjusting individual figures again, the full
+N=9-24 range was re-swept mechanically (see "🔬 Reproduce" for the exact
+loop), reading each shard's total directly from the harness rather than
+computing shard 0's number once and assuming the rest:
+
+```
+N= 9  shard0=197 (+188=385)  other_max=472  true_max=472
+N=10  shard0=332 (+188=520)  other_max=454  true_max=520
+N=11  shard0=417 (+188=605)  other_max=426  true_max=605   <- worst in range
+N=12  shard0=160 (+188=348)  other_max=348  true_max=348
+N=13  shard0=179 (+188=367)  other_max=346  true_max=367
+N=14  shard0=241 (+188=429)  other_max=337  true_max=429
+N=15  shard0=123 (+188=311)  other_max=306  true_max=311
+N=16  shard0=117 (+188=305)  other_max=354  true_max=354
+N=17  shard0= 81 (+188=269)  other_max=318  true_max=318
+N=18  shard0=128 (+188=316)  other_max=295  true_max=316
+N=19  shard0=144 (+188=332)  other_max=384  true_max=384
+N=20  shard0=247 (+188=435)  other_max=243  true_max=435
+N=21  shard0= 82 (+188=270)  other_max=287  true_max=287
+N=22  shard0=211 (+188=399)  other_max=311  true_max=399
+N=23  shard0= 73 (+188=261)  other_max=262  true_max=262
+N=24  shard0= 73 (+188=261)  other_max=253  true_max=261   <- best in range
+```
+
+This is a complete sweep, not a spot check -- every N from 9 to 24 is
+listed. N=24 (261) and N=23 (262) remain the true optimum, confirming the
+fourth correction's conclusion on that point even though its supporting
+numbers elsewhere were wrong. N=21 (287) is the third-best value in the
+*entire* range, not just among a handful of hand-picked candidates.
+
+**Does a better isolating option than N=21 exist in this full range?**
+Checked directly rather than assumed: `quota_enforcement_tests` lands
+isolated (no co-resident row >=30 tests) at N=18 (shard 8: `quota_enforcement_tests`
+47 + `shard_placement_by_id_tests` 29 + `dag_compensation` 28 -- neither
+co-resident suite reaches the heavy threshold) and at N=20 (shard 4, as
+the live-CI section above already found), in addition to N=21. Of these
+three isolating options, N=21's true max (287) is the lowest (N=18: 316,
+N=20: 435) -- N=21 remains the right choice, now for a verified reason
+rather than an assumed one.
+
+**Corrected measurement.** True worst-case shard-0-inclusive max: N=11
+(unmodified) = 605, N=21 (shipped) = 287 -- a **52.6% reduction**, not the
+~33% the fourth correction claimed (which itself had already corrected an
+even more overstated ~42% from before the linuxpart bug was found at all).
+No shard count in 9-24 is collision-free, with or without either
+correction's accounting.

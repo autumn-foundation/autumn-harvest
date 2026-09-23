@@ -1037,7 +1037,7 @@ jobs:
       # growing alphabetically, and their gap silently drifted back onto a
       # value 11 cannot tolerate either. That drift is real and confirmed.
       #
-      # This comment went through five rounds of correction (kept here
+      # This comment went through six rounds of correction (kept here
       # rather than silently rewritten, since a later commit's diff is not
       # where a future reader will look for this history):
       #
@@ -1092,6 +1092,24 @@ jobs:
       # at N=24. That isolation is NOT established to help the actual hang
       # (see below) -- it is the one property this fix can still honestly
       # claim, at a real but small cost in overall balance.
+      #
+      # Round 6 (Codex review): round 5's own "426" figure for N=11 was
+      # never re-derived with the same +188 addition -- it was carried over
+      # from the ORIGINAL (pre-linuxpart-fix) sweep, where 426 was a
+      # different shard's total (shard 7), not shard 0's. Actually running
+      # the harness at N=11 finds shard 0 alone already totals 417 on the
+      # sharded rows -- nearly the old "max" by itself, before the fixed
+      # pass is even added. With it: shard 0's true total at N=11 is 605,
+      # not 426. That retracts round 5's claim that N=20 (435) was worse
+      # than doing nothing: N=20 is still better than N=11, just not the
+      # best available. Full corrected sweep (all of N=9-24, not a spot
+      # check): true max ranges from N=24's 261 (best) through N=11's 605
+      # (worst); N=21's 287 is third-best overall, ~53% below the true
+      # N=11 baseline (605), not the ~13%-worse-than-optimum framing round
+      # 5 gave in isolation. The N=21 choice itself is unchanged -- it
+      # remains the best option that also keeps `quota_enforcement_tests`
+      # isolated (checked directly: N=18, the next lower true-max candidate
+      # that also isolates it, is 316, still worse than N=21's 287).
       #
       # No shard count in 9-24 is collision-free (confirmed, this round,
       # under the corrected accounting too) -- a durable fix needs a
