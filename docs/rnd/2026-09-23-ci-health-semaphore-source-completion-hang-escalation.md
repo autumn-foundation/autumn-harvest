@@ -11,7 +11,7 @@ every report in this series has hit). Continues the series from
 landed on `claude/fix-shard-0-collision-rebalance-1685`, not yet merged to
 `trunk-dev`, so it is not in this session's tree).
 
-**Corrected across three Codex review rounds on this PR.** First round: the
+**Corrected across four Codex review rounds on this PR.** First round: the
 first draft claimed the `QuotaExceeded` arm "never" propagates `Err`/rolls
 back the source's transaction, having stopped reading `completion_trigger.rs`
 right before the outbox-row insert (that insert's own `.map_err(...)?` can in
@@ -38,8 +38,23 @@ could find (pre-widen). The same pass, re-checking directly caught a second
 thing this report had gotten wrong on its own, unprompted: the 09-21
 report's baseline for this signature is 2 occurrences, not 1 (a second one,
 in that report's own item 4 cascade, was missed by every earlier draft of
-this report too) — corrected throughout. All corrections are inline at the
-point each applies, matching this series' convention.
+this report too) — corrected throughout.
+
+**Fourth round, on that correction, three more findings.** A "pool
+exhaustion" mention survived in a second, near-duplicate Diagnosis bullet
+that the second round's sweep had missed — removed there too. The
+corrected 2-occurrence baseline (from round three) then exposed that this
+report's "spike begins shortly after `56bc205` merged" timing-correlation
+claim was already contradicted by its own evidence: both of those 09-21
+occurrences happened 11-14 hours *before* `56bc205` merged, the same
+day — retracted as a candidate. And the shard-0-collision paragraph's
+"every occurrence landed on the shard carrying both heavy suites" claim was
+checked against PR #1707's own occurrence under *its own* proposed
+21-shard layout, where the two suites land on different shards (`44 % 21 =
+2` vs `33 % 21 = 12`) — that occurrence is not explained by the collision,
+if anything weakening rather than strengthening it as a candidate. All
+corrections are inline at the point each applies, matching this series'
+convention.
 
 ## 🎯 Verdict path
 
@@ -223,25 +238,39 @@ sample of convenience, not a formal rerun-rate — the ≥20x same-commit
 protocol this role's hard gate requires is still not runnable here
 (no Docker).
 
-**One more thing this correction surfaced, independent of Codex's
-comment:** every failure and the one genuine pass in this section landed on
-`Test DB (linux, shard 0)` specifically, never shard 10 — which is where
-the 09-21 report's own shard-collision finding placed
+**One more thing this correction surfaced, independent of Codex's first
+comment on this point — then corrected again by a second Codex comment.**
+5 of the 6 failures plus the one genuine pass landed on
+`Test DB (linux, shard 0)` under the current 11-shard layout, never shard
+10 — which is where the 09-21 report's own shard-collision finding placed
 `quota_enforcement_tests` (`43 % 11 = 10` at the time). Checked directly
 against today's manifest: `quota_enforcement_tests` is now row 44 among
 `linux`-osclass rows (`awk '$1=="linux"{print c": "$0; c++}' .github/ci/integration-suites.txt`),
 and `integration_e2e` is row 33 — `44 % 11 = 0` and `33 % 11 = 0`. The
 manifest gap between them is still 11 rows (unchanged from the 09-21
 report's finding), but both row numbers shifted by exactly 11 since then
-(the manifest grew), moving the collision from shard 10 to shard 0. This is
-the same tracked, already-being-fixed defect PR #1707 targets (its own
-title: "Rebalance test-db-linux from 11 to 21 shards" /
-`fix-shard-0-collision-rebalance-1685`) — not a new finding, but this
-session's own census independently reproduces it: every occurrence this
-report found landed on the shard currently carrying both of the manifest's
-heaviest suites, consistent with (though, per the 09-21 report's own
-sequential-execution finding, not proven to be caused by) that shard's
-outsized total duration.
+(the manifest grew), moving the collision from shard 10 to shard 0 — the
+same tracked, already-being-fixed defect PR #1707 targets (its own title:
+"Rebalance test-db-linux from 11 to 21 shards" /
+`fix-shard-0-collision-rebalance-1685`).
+
+**Correction:** an earlier draft of this paragraph said "every occurrence…
+landed on the shard carrying both heavy suites," which is wrong for the 6th.
+PR #1707's own occurrence (`35813687699`) ran under *its own* proposed
+21-shard layout, not the current 11-shard one: `44 % 21 = 2` for
+`quota_enforcement_tests`, `33 % 21 = 12` for `integration_e2e` — **different
+shards**, matching the table above (`Test DB (linux, shard 2)`) and matching
+that PR's own explicit design goal of separating them. So that occurrence is
+not explained by this collision at all — if anything it is evidence
+*against* the collision being the flake's cause: PR #1707's rebalance
+already isolates `quota_enforcement_tests` from `integration_e2e`, and the
+SOURCE-completion panic still fired. Restated at the confidence this
+evidence actually supports: 5 of 6 occurrences co-occur with the current
+11-shard collision (consistent with, not proven caused by, that shard's
+outsized duration — sequential execution still rules out literal
+concurrent contention, per the 09-21 report); the 6th occurred with the
+collision already fixed, which weakens rather than strengthens the case that
+the collision explains this flake.
 
 ### The 30-second timeout widen (PR #1673, merged 2026-09-21T19:18Z UTC) did not fix this, and its own commit message says the flake was already known and deliberately not root-caused
 
@@ -281,21 +310,29 @@ candidate space:
   undismissed candidate survives review.** The same-shard `QuotaExceeded`
   arm's happy path (`completion_trigger.rs:2078-2100`) falls through to the
   outbox and metrics recording without touching the source's transaction.
-  **Correction (post-review, Codex on this PR):** an earlier draft of this
-  report stopped there and claimed the whole arm never propagates `Err`.
-  Wrong — the outbox-row insert immediately after
-  (`completion_trigger.rs:2101-2122`) ends `.map_err(crate::error::database_error)?`,
-  and per the arm's own doc comment this whole block runs inline inside the
-  source's terminal transaction. A database error on that specific insert
-  (pool exhaustion, a dropped connection, a constraint violation under
-  concurrent load) would propagate and roll back the source's own
-  `WorkflowCompleted` append — the exact pre-fix symptom this test exists to
-  catch, on a narrower trigger than the original bug (an insert-time error,
-  not every quota-exceeded evaluation). Not confirmed as what actually
-  happened in any of the 6 occurrences (no DB-error telemetry captured), but
-  it is a concrete, previously-unconsidered mechanism the next session
-  should check for (e.g. Postgres logs or connection-pool metrics around
-  each occurrence's timestamp) before assuming a pure hang.
+  **Correction (post-review, Codex on this PR, two rounds — this bullet had
+  the same error as the census section above and was missed in the first
+  sweep).** An earlier draft of this report stopped at line 2100 and claimed
+  the whole arm never propagates `Err`. Wrong — the outbox-row insert
+  immediately after (`completion_trigger.rs:2101-2122`) ends
+  `.map_err(crate::error::database_error)?`, and per the arm's own doc
+  comment this whole block runs inline inside the source's terminal
+  transaction. A database error on that specific insert would propagate and
+  roll back the source's own `WorkflowCompleted` append — the exact pre-fix
+  symptom this test exists to catch, on a narrower trigger than the original
+  bug (an insert-time error, not every quota-exceeded evaluation). A second
+  round then caught that "pool exhaustion" was still listed here as an
+  example cause, unchanged from the first mistake: this insert runs on an
+  already-acquired `&mut AsyncPgConnection` (`completion_trigger.rs:
+  1487-1488`) with no new pool checkout, so pool exhaustion cannot be *this
+  insert's* error — corrected to the causes that connection can actually hit
+  (a constraint violation, a dropped connection, a statement timeout, or a
+  serialization/deadlock error under concurrent write load). Not confirmed
+  as what actually happened in any of the 6 occurrences (no DB-error
+  telemetry captured), but it is a concrete, previously-unconsidered
+  mechanism the next session should check for (e.g. Postgres server-side
+  error logs around each occurrence's timestamp) before assuming a pure
+  hang.
 - **Not "CI is just slow."** The bound is already 30s, 3x this file's normal
   10s default, deliberately widened for this exact assertion, and still
   loses regularly. The test's own doc comment says the entire decision cycle
@@ -303,20 +340,24 @@ candidate space:
   inside one worker task with no background-timer dependency — so 30s is a
   very large multiple of the expected sub-second path if the mechanism is
   working as designed.
-- **Timing correlation with PR #1673, not established as causal.** The
-  spike in occurrences (0 confirmed in this series between 09-16 and 09-21,
-  now 6 in 26 hours) begins shortly after `56bc205` merged
-  (2026-09-21T19:18Z), which also touched `completion_trigger.rs` (168 lines,
-  for the *cross-shard* fire-verification path in `backup_verify.rs`) and
-  `execution.rs` (27 lines). The commit message asserts the same-shard
-  quota-exceeded-to-outbox path used by this test is unchanged, and this
-  session's own read of that path (above) is consistent with that claim.
-  Whether the `execution.rs` or other `completion_trigger.rs` changes in that
-  PR touch a code path this test's worker also exercises (e.g. shared
-  connection-pool or transaction-commit machinery) is **not checked this
-  session** — a concrete, cheap next step: `git show 56bc205 --
-  autumn-harvest/src/execution.rs` and diff against what the source
-  workflow's terminal-commit path actually calls.
+- **No timing correlation with PR #1673 — retracted.** **Correction
+  (post-review, Codex on this PR):** an earlier draft of this bullet said the
+  occurrence spike "begins shortly after `56bc205` merged" (2026-09-21T19:18Z),
+  framing that commit as a timing suspect. That does not survive this
+  report's own corrected baseline: 2 of the occurrences this series has
+  documented for this exact signature — `35563198153`
+  (2026-09-21T05:04:24Z) and `35576291757` (2026-09-21T08:07:53Z) — happened
+  11-14 hours *before* `56bc205` merged, the same day. The flake predates the
+  merge by this report's own evidence, so there is no spike-after-merge
+  pattern to explain. Retracted as a candidate; `56bc205`'s only confirmed
+  connection to this test remains the timeout widen itself (which this
+  report separately shows did not fix the flake). Whether `56bc205`'s
+  `execution.rs` or other `completion_trigger.rs` changes touch a code path
+  this test's worker also exercises is still unchecked, but not for a timing
+  reason — `git show 56bc205 -- autumn-harvest/src/execution.rs` and diff
+  against what the source workflow's terminal-commit path actually calls
+  remains a cheap, independent thing to check if the outbox-insert-error
+  candidate above needs ruling in or out.
 - **Not investigated this session, for lack of Docker:** whether the source
   workflow's task is even being dispatched at all during the hang (a queue
   visibility/claim bug) versus dispatched-and-stuck (a transaction or lock
@@ -463,10 +504,18 @@ grep -n "quota_enforcement_tests::completion_trigger_defers_to_outbox_when_targe
 # -> "... ok" at 2026-09-21T19:32:50Z (run 35640952522, shard 0, a real
 #    non-skipped execution). SHA ancestry check (below) confirms pre-widen.
 
-# The shard-0 manifest collision this session's own census reproduces
-# (same defect PR #1707 already targets, now at shard 0 not shard 10):
+# The shard-0 manifest collision under the CURRENT 11-shard layout (same
+# defect PR #1707 already targets, now at shard 0 not shard 10) -- true for
+# 5 of the 6 occurrences:
 awk '$1=="linux"{print c": "$0; c++}' .github/ci/integration-suites.txt | grep -n "integration_e2e\|quota_enforcement_tests"
 python3 -c "print(33 % 11, 44 % 11)"   # -> 0 0
+
+# PR #1707's own 21-shard layout does NOT collide these two suites --
+# confirmed, correcting an earlier draft's "every occurrence" overclaim:
+python3 -c "print('quota_enforcement_tests:', 44 % 21, ' integration_e2e:', 33 % 21)"
+# -> 2 12 -- different shards, matching that run's own "Test DB (linux,
+#    shard 2)" job name. The 6th occurrence is not explained by this
+#    collision.
 
 # The timeout widen and its own commit message disclaiming a fix:
 git log -S "A wider bound than the usual 10s default" --oneline -- autumn-harvest/tests/integration/quota_enforcement_tests.rs
