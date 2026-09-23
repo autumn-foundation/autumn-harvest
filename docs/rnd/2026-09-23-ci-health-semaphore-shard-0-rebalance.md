@@ -11,6 +11,16 @@
 # fix is a real, partial improvement, not a solved sharding problem, and
 # not a proven fix for the `quota_enforcement_tests` hang tracked
 # separately in `ci-health-semaphore-quota-outbox-root-cause.md`.
+#
+# UPDATE, same session, this PR's own first live CI run: the falsifiable
+# prediction below came true almost immediately.
+# `quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded`
+# hung again -- identical panic site, identical signature -- on `Test DB
+# (linux, shard 4)` under the NEW 20-shard layout, where this session's own
+# harness run confirmed it lands **completely isolated**, no other heavy
+# suite on that shard at all. Shard load/collision is now confirmed NOT
+# the cause of this specific hang. See the "🔬 Live CI result" section
+# near the end for the full writeup.
 
 **Status:** fix shipped this session, `.github/workflows/ci.yml` only (shard
 count + matrix list + comment). No test code, no manifest reordering (the
@@ -201,3 +211,48 @@ python3 docs/audits/shard-weight-drift.py --self-test   # -> self-test: ok
 python3 docs/audits/shard-weight-drift.py --sweep        # -> the N=9..24 table
 rm docs/audits/shard-weight-drift.py   # do not commit this copy
 ```
+
+## 🔬 Live CI result: the falsifiable prediction came true
+
+This report's own "What this fix is NOT claimed to be" section said: *"If
+`quota_enforcement_tests` keeps hanging on whichever shard it lands on
+after this rebalance, that is real evidence against any shard-load
+correlation, and the next session should look elsewhere."* This PR's own
+first CI run answered that question before the PR even finished review.
+
+`Test DB (linux, shard 4)` (run `35807566215`, commit `7eed00e`, this PR's
+own branch) failed: `quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded`
+panicked at the identical site, `integration_e2e.rs:1383:6` (the
+SOURCE-completion wait), the same signature every prior occurrence has
+shown. Per this session's own `shard-weight-drift.py` run at N=20 (see
+above), shard 4 carries `quota_enforcement_tests` **completely isolated**
+-- no other heavy suite, total shard weight 115, nowhere near the matrix's
+247 maximum. This PR's own manifest change does not touch
+`quota_enforcement_tests.rs` at all, so this run exercises the SAME
+unmodified test code the 2026-09-22 report already investigated, now on a
+shard purpose-built to rule out collision as a factor.
+
+**This confirms, as directly as a live CI run can, that shard load and
+suite collisions are not the cause of this hang.** The correlation with
+shard 0 that motivated this whole PR was real (shard 0 did carry a
+confirmed collision) but coincidental to the actual mechanism, not causal
+to it -- consistent with, and now reinforcing, PR #1703's own companion
+report finding a cascade that hit even the manifest's *lightest* shard.
+
+**What this means going forward:** this PR's shard rebalance remains a
+valid, measured CI-cost improvement (worst-shard load down ~42%) and is
+being kept for that reason alone. It is retracted as any kind of
+mitigation for `quota_enforcement_tests`'s hang. The hang itself is
+unexplained, reproduces on isolated shards under normal (not elevated)
+load, and needs a fundamentally different investigation than anything
+tried across this report, the 2026-09-22 report, or PR #1703's own
+session -- something in the worker's decision-cycle path itself
+(`evaluate_triggers_for_execution` and everything upstream of it up to
+task claim), or an environment difference this session's local
+reproduction never exercised (CI's `testcontainers`-managed, freshly
+started-per-suite Postgres container, versus every local reproduction
+attempt across this whole report series, which used a persistent,
+already-migrated Postgres via `HARVEST_TEST_DATABASE_URL` -- a materially
+different code path through `setup_test_database_url_or_env()` that no
+session has yet tried to reproduce locally with an actual Docker
+container in the loop).
