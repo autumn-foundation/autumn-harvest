@@ -344,18 +344,18 @@ const INIT_SQL: &str = concat!(
     include_str!("../../migrations/20260920215812_harvest_completion_trigger_fires_target/up.sql"),
     "\n",
     // issue #1402: timer_fires_at column on harvest_task_queue. REQUIRED, not
-    // optional -- `queue::reschedule_task`'s changeset names this column
-    // unconditionally, and the repend queries that clear it
-    // (`primary_repend_workflow_task_query`,
+    // optional. `queue::reschedule_task`'s changeset names this column
+    // unconditionally. The repend queries that clear it --
+    // `primary_repend_workflow_task_query`,
     // `release_suspended_workflow_claim_query`, and the three backoff-retry
-    // requeue queries) do too. Without it every one of those writes fails
+    // requeue queries -- do too. Without it, every one of those writes fails
     // with `column "timer_fires_at" of relation "harvest_task_queue" does
-    // not exist`, in the same silent-rollback, retried-forever, eventual-
-    // timeout shape as the #1685/#1596/#1317 gaps above -- this is that
-    // same omission class, caught the same way. A local run with
-    // `HARVEST_TEST_DATABASE_URL` set does not catch this gap; that path
-    // migrates from the full `migrations/` directory, not from this
-    // deliberately partial bundle.
+    // not exist`. That failure takes the same silent-rollback,
+    // retried-forever, eventual-timeout shape as the #1685/#1596/#1317 gaps
+    // above. It is the same omission class, caught the same way. A local
+    // run with `HARVEST_TEST_DATABASE_URL` set does not catch this gap;
+    // that path migrates from the full `migrations/` directory, not from
+    // this deliberately partial bundle.
     include_str!("../../migrations/20260921011505_harvest_task_queue_timer_fires_at/up.sql")
 );
 
