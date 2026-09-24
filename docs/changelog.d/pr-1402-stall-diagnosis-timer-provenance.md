@@ -117,3 +117,22 @@ narrower cost that draft was chasing — a genuinely short timer's own
 `created_at`-to-`fires_at` gap landing inside the veto's slack after a
 same-reason drift — is accepted as the lesser failure mode and is now
 pinned by its own test.
+
+**CI-red root cause (this PR's own bug, not infra flake).** `chain_timeout_tests`,
+`workflow_retry_tests`, `rate_limit_key_tests`, and other suites that build
+their Postgres container from `integration_e2e.rs`'s hand-rolled `INIT_SQL`
+bundle failed intermittently across shards — `column "timer_fires_at" of
+relation "harvest_task_queue" does not exist` on one test, and worker-driven
+timeouts on the rest, because `reschedule_task`'s changeset and the repend
+queries that clear the marker all name the column unconditionally. This is
+the exact same omission class as issues #1685/#1596/#1317, already
+documented in that file: a new migration's columns are invisible to a
+throwaway testcontainers database until its `include_str!` is added to
+`INIT_SQL` by hand, and a local run against an already-migrated
+`HARVEST_TEST_DATABASE_URL` database never surfaces the gap. Fixed by adding
+`20260921011505_harvest_task_queue_timer_fires_at` to the bundle. Verified
+by concatenating `INIT_SQL`'s own file list exactly as the Rust `concat!`
+does, applying it to a fresh database, and confirming both a clean apply and
+the column's presence — then re-running the previously-failing
+`chain_timeout_tests::pause_resume_shifts_run_deadline_but_not_chain_deadline`
+against that database.
