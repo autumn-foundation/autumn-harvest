@@ -1833,6 +1833,11 @@ standalone note rather than part of the claim-path attribution table above:
 * [`docs/performance-quota-history-bytes.md`](performance-quota-history-bytes.md)
   — measuring the `history_bytes` admission check's cost claim (issue #946
   AC7); partially inaccurate claim, no fix identified.
+* [`docs/performance-quota-reconcile-candidate-scan.md`](performance-quota-reconcile-candidate-scan.md)
+  — `reconcile_quota_keys_from` candidate-scan cost under mixed-deployment
+  skew (issue #1226 follow-up); confirms the scaling risk is a permanent
+  per-tick cost, not a rollout expense, and diagnoses a planner
+  cardinality misestimate as the cause. No fix ships in this pass.
 * [`docs/performance-codec-rotation-reencrypt.md`](performance-codec-rotation-reencrypt.md)
   — skipping a JSON round-trip in the codec-key-rotation re-encryption sweep
   (issue #948).
