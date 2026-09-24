@@ -2642,6 +2642,18 @@ pub struct WorkflowContext {
     /// and by embedders that run several topologies in one process, so
     /// placement never depends on mutating a process global.
     shard_router: Option<crate::shard::ShardRouter>,
+    /// The shard the parent row lives on RIGHT NOW (issue #1405). Read live
+    /// from the execution row's `shard_id` column at context construction,
+    /// the same pattern as `deadline_at`. `self.exec_id.shard()` names
+    /// where this run was MINTED, not where a rebalanced run lives today.
+    ///
+    /// Used only to place a `ParentShard` child (the default) on the row's
+    /// true current shard. `None` -- the replayer / test-env paths that carry
+    /// no live row -- falls back to `self.exec_id.shard()`, the pre-#1405
+    /// behaviour. A fresh dispatch never reaches this during pure replay: a
+    /// history-matched child spawn reuses its recorded `child_id` and never
+    /// mints (see [`Self::mint_child_id`]).
+    current_shard_id: Option<crate::types::ShardId>,
     /// Monotonically increasing counter for naming `ctx.race()` markers
     /// (issue #600). Each `race()` call increments this once so each race has
     /// stable, unique `race:{seq}` / `race_winner:{seq}` marker names across
@@ -3341,6 +3353,7 @@ impl WorkflowContext {
             history_policy,
             execution_timeout: None,
             deadline_at: None,
+            current_shard_id: None,
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
@@ -3495,6 +3508,7 @@ impl WorkflowContext {
             history_policy: WorkflowHistoryPolicy::default(),
             execution_timeout: None,
             deadline_at: None,
+            current_shard_id: None,
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
@@ -3564,6 +3578,7 @@ impl WorkflowContext {
             history_policy: WorkflowHistoryPolicy::default(),
             execution_timeout: None,
             deadline_at: None,
+            current_shard_id: None,
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
@@ -3850,6 +3865,21 @@ impl WorkflowContext {
     #[must_use]
     pub const fn with_deadline(mut self, deadline_at: Option<DateTime<Utc>>) -> Self {
         self.deadline_at = deadline_at;
+        self
+    }
+
+    /// Set the shard the parent row lives on right now (issue #1405).
+    ///
+    /// Threaded by the executor from the loaded execution row's `shard_id`
+    /// column, mirroring [`with_deadline`](Self::with_deadline). Used to
+    /// place a `ParentShard` child on the row's true current shard rather
+    /// than the origin bits encoded in `self.exec_id`.
+    #[must_use]
+    pub const fn with_current_shard_id(
+        mut self,
+        current_shard_id: Option<crate::types::ShardId>,
+    ) -> Self {
+        self.current_shard_id = current_shard_id;
         self
     }
 
@@ -7388,6 +7418,14 @@ impl WorkflowContext {
     /// never touches the router, so a deployment that never opts in is
     /// byte-for-byte unchanged.
     ///
+    /// `parent_shard` is the row's CURRENT shard (issue #1405), not the
+    /// origin bits `self.exec_id` encodes. A rebalanced parent's child must
+    /// land where the parent actually lives. Otherwise `worker.rs` classifies
+    /// it as cross-shard against the parent's live residence and silently
+    /// relays it onto the stale origin shard instead. Falls back to
+    /// `self.exec_id.shard()` only when no live shard was threaded in, the
+    /// replayer / test-env paths' pre-#1405 behaviour.
+    ///
     /// Only ever called on a **fresh dispatch**. A replay reuses the `child_id`
     /// recorded in `ChildWorkflowStarted`, so placement is decided exactly once
     /// in a child's lifetime and the parent's history replays identically
@@ -7407,7 +7445,9 @@ impl WorkflowContext {
         workflow_name: &str,
         seq: u32,
     ) -> HarvestResult<ExecutionId> {
-        let parent_shard = self.exec_id.shard();
+        let parent_shard = self
+            .current_shard_id
+            .unwrap_or_else(|| self.exec_id.shard());
         if placement.is_parent_shard() {
             return Ok(ExecutionId::new_for_shard(parent_shard));
         }
@@ -11333,9 +11373,14 @@ impl WorkflowContext {
                             to_dispatch.push(RaceDispatch {
                                 index,
                                 activity_id: None,
-                                // Inherit the parent's shard (issue #697 AC4) --
-                                // same rationale as the plain awaited-child path.
-                                child_id: Some(ExecutionId::new_for_shard(self.exec_id.shard())),
+                                // Inherit the parent's CURRENT shard (issue
+                                // #697 AC4, #1405) -- same rationale as
+                                // `mint_child_id`, not the origin bits
+                                // `self.exec_id` encodes.
+                                child_id: Some(ExecutionId::new_for_shard(
+                                    self.current_shard_id
+                                        .unwrap_or_else(|| self.exec_id.shard()),
+                                )),
                                 timer_id: None,
                                 is_new: true,
                             });
@@ -12732,6 +12777,11 @@ impl WorkflowContext {
         // unlike the workflow body and query handlers — never sees them.
         let execution_timeout = self.execution_timeout;
         let deadline_at = self.deadline_at;
+        // Issue #1405: inherit the parent's current shard, mirroring
+        // deadline_at above. A child spawned from an update handler then
+        // also places on the row's true residence. It does not fall back
+        // to the origin bits `new_for_handler` would otherwise leave unset.
+        let current_shard_id = self.current_shard_id;
         // Carryover is frozen in WorkflowStarted, so a handler on a scheduled workflow
         // must observe the same last_completion_result/last_error as the workflow body
         // (issue #488).
@@ -12766,6 +12816,8 @@ impl WorkflowContext {
                 // Issue #772 (Codex P2): inherit the parent's deadline budget.
                 inner.execution_timeout = execution_timeout;
                 inner.deadline_at = deadline_at;
+                // Issue #1405: inherit the parent's current shard.
+                inner.current_shard_id = current_shard_id;
                 // Issue #698: inherit the spawning parent's execution id.
                 inner.parent_execution_id = parent_execution_id;
             }
@@ -12841,6 +12893,8 @@ impl WorkflowContext {
                 // `ctx.deadline()` works inside the handler.
                 inner.execution_timeout = self.execution_timeout;
                 inner.deadline_at = self.deadline_at;
+                // Issue #1405: inherit the parent's current shard.
+                inner.current_shard_id = self.current_shard_id;
                 // Issue #698: inherit the spawning parent's execution id so
                 // `ctx.info().parent_execution_id` is visible inside the handler.
                 inner.parent_execution_id = self.parent_execution_id;
@@ -21137,6 +21191,48 @@ mod tests {
         );
     }
 
+    /// Issue #1405: a parent minted on ORIGIN shard 7 has since been
+    /// rebalanced to shard 12. It must place a `ParentShard` child on 12,
+    /// its CURRENT residence, not on 7, the id's stale origin bits.
+    ///
+    /// A child placed on 7 does not fail closed. `worker.rs`'s
+    /// `child_target_shard` classifies placement by comparing the id's
+    /// encoded bits against the parent's LIVE shard. A mismatch reads as a
+    /// genuine cross-shard placement. It relays the child onto shard 7
+    /// through the ordinary cross-shard-child path. Shard 7 is a normal,
+    /// healthy shard, simply not where this parent lives any more, so the
+    /// relay succeeds. It silently creates the row there. The failure is
+    /// silent misplacement, not an unresolvable id.
+    #[tokio::test]
+    async fn awaited_child_workflow_inherits_the_parents_current_shard_not_its_origin() {
+        let origin_shard = ShardId::new(7);
+        let current_shard = ShardId::new(12);
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new_for_shard(origin_shard),
+            started_history(),
+        )
+        .with_current_shard_id(Some(current_shard));
+
+        let fut = ctx.spawn_child_workflow_raw("process_order", serde_json::json!({"sku": "book"}));
+        let mut fut = Box::pin(fut);
+        let waker = std::task::Waker::noop();
+        let mut poll_cx = std::task::Context::from_waker(waker);
+        assert!(
+            std::future::Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
+            "a fresh awaited child must suspend on its result channel"
+        );
+
+        let cmds = ctx.drain_commands();
+        let WorkflowCommand::StartChildWorkflow { child_id, .. } = &cmds[0] else {
+            panic!("expected StartChildWorkflow, got {cmds:?}");
+        };
+        assert_eq!(
+            child_id.shard(),
+            current_shard,
+            "a child must inherit the parent's CURRENT shard (issue #1405), not its origin"
+        );
+    }
+
     /// AC4 (issue #697): the `ctx.race()` child-workflow branch mints its own
     /// `ExecutionId` and must inherit the parent's shard for the same reason
     /// the plain awaited path does.
@@ -21175,6 +21271,51 @@ mod tests {
                 child_id.shard(),
                 parent_shard,
                 "a raced child must inherit the parent's shard (issue #697 AC4)"
+            );
+        }
+    }
+
+    /// Issue #1405: `race()`'s child-workflow branch mints its own
+    /// `ExecutionId` inline, separately from [`mint_child_id`]. It must also
+    /// place on the parent's CURRENT shard, not the origin bits encoded in
+    /// `self.exec_id`.
+    #[tokio::test]
+    async fn race_child_workflow_branch_inherits_the_parents_current_shard_not_its_origin() {
+        let origin_shard = ShardId::new(11);
+        let current_shard = ShardId::new(21);
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new_for_shard(origin_shard),
+            started_history(),
+        )
+        .with_current_shard_id(Some(current_shard));
+
+        let fut = ctx
+            .race()
+            .child_workflow_raw("leg_a", serde_json::json!({}))
+            .child_workflow_raw("leg_b", serde_json::json!({}))
+            .run();
+        let mut fut = Box::pin(fut);
+        let waker = std::task::Waker::noop();
+        let mut poll_cx = std::task::Context::from_waker(waker);
+        assert!(
+            std::future::Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
+            "a fresh child race must suspend awaiting its branches"
+        );
+
+        let started: Vec<ExecutionId> = ctx
+            .drain_commands()
+            .iter()
+            .filter_map(|c| match c {
+                WorkflowCommand::StartChildWorkflow { child_id, .. } => Some(*child_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started.len(), 2, "both race branches must be dispatched");
+        for child_id in started {
+            assert_eq!(
+                child_id.shard(),
+                current_shard,
+                "a raced child must inherit the parent's CURRENT shard (issue #1405), not its origin"
             );
         }
     }

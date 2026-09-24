@@ -43268,7 +43268,11 @@ async fn send_stream_end(
     tx: &mut futures::channel::mpsc::Sender<
         Result<axum::response::sse::Event, std::convert::Infallible>,
     >,
-    last_id: i64,
+    // `event_id`, not `harvest_events.id` (issue #1405): the cursor a
+    // reconnecting client's `Last-Event-ID` must carry, stable across a
+    // shard migration. `None` when no event was ever observed for this
+    // stream (mirrors the pre-#1405 `-1` sentinel's "nothing to report").
+    last_event_id: Option<i32>,
     event_derived_state: &str,
 ) {
     use futures::SinkExt as _;
@@ -43277,7 +43281,7 @@ async fn send_stream_end(
     let end_data = stream_end_payload(exec_id, &reason);
     let _ = tx
         .send(Ok(axum::response::sse::Event::default()
-            .id(last_id.to_string())
+            .id(last_event_id.map_or_else(String::new, |id| id.to_string()))
             .event("stream-end")
             .data(end_data)))
         .await;
@@ -43365,14 +43369,17 @@ mod stream_end_payload_tests {
 ///
 /// SSE wire format:
 /// ```text
-/// id: <harvest_events.id BIGSERIAL>
+/// id: <harvest_events.event_id, per-execution monotonic>
 /// event: <WorkflowEvent::type_name()>
 /// data: <JSON event value>
 ///
 /// ```
 ///
-/// Resume: send `Last-Event-ID: <id>` to replay events with `id > n` before
-/// switching to live-tail mode.
+/// Resume: send `Last-Event-ID: <event_id>` to replay events after it before
+/// switching to live-tail mode. The cursor is `event_id` (issue #1405), not
+/// the shard-local `harvest_events.id`. A shard-rebalance migration copies
+/// `event_id` byte-for-byte but never `id`. A cursor keyed on `id` means
+/// nothing once the execution has moved shards.
 ///
 /// Keepalive: `: ping\n\n` comments every `sse_keepalive_interval` (default 15 s).
 ///
@@ -43410,25 +43417,37 @@ async fn stream_execution_events(
     // both the backfill and live loops build frames through sse_frame_data.
     let decoder = read_path_decoder(&api_state, session).await;
 
-    // Extract Last-Event-ID for resume (harvest_events.id BIGSERIAL cursor).
-    // An absent header means "start from the beginning" (cursor = -1).
-    // A present but non-parseable value is a client error → 400.
-    let last_row_id: i64 = match headers.get("last-event-id").and_then(|v| v.to_str().ok()) {
-        None => -1,
-        Some(s) => match s.parse::<i64>() {
-            Ok(n) => n,
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "invalid_last_event_id",
-                        "message": "Last-Event-ID must be a valid i64"
-                    })),
-                )
-                    .into_response();
-            }
-        },
-    };
+    // Extract Last-Event-ID for resume. The wire cursor is `event_id`
+    // (issue #1405). This is the per-execution monotonic value. A shard
+    // migration carries it byte-for-byte. The cursor is NOT
+    // `harvest_events.id`, a shard-local BIGSERIAL. A migration deliberately
+    // does not copy that column. An absent header means "start from the
+    // beginning". A present but non-parseable value is a client error → 400.
+    //
+    // Known rolling-deployment edge case: a client holding an OLD, row-id
+    // cursor from before this change parses fine here. Both are plain
+    // integers, so it is silently read as an event_id. Usually no event_id
+    // matches, so the client gets one full replay and self-heals from
+    // there. On a low-traffic shard the stale number can coincidentally
+    // match a real event_id, giving a wrong-but-bounded backfill instead.
+    // One reconnect during a rollout; every later one is correct.
+    let last_event_id: Option<i32> =
+        match headers.get("last-event-id").and_then(|v| v.to_str().ok()) {
+            None => None,
+            Some(s) => match s.parse::<i32>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "invalid_last_event_id",
+                            "message": "Last-Event-ID must be a valid i32"
+                        })),
+                    )
+                        .into_response();
+                }
+            },
+        };
 
     // Get a pooled connection and verify the execution exists BEFORE
     // resolving the LISTEN/NOTIFY URL. `execution.shard_id` is this row's
@@ -43445,6 +43464,28 @@ async fn stream_execution_events(
         Err(e) => return map_error(e).into_response(),
     };
     let shard = ShardId::new(execution.shard_id);
+
+    // Translate the wire cursor to a `harvest_events.id` on `conn`'s shard
+    // (issue #1405). A cursor from BEFORE a migration names an `event_id`.
+    // That event may now live on a different shard than it did when the
+    // client last saw it. Only this connection's own `id` sequence is
+    // meaningful to the backfill query below. Falls open to -1 (from the
+    // start, bounded by the buffer-depth cap below) when no cursor was
+    // sent. It also falls open on `Ok(None)`, when the cursor names no
+    // event on this shard.
+    //
+    // A real `Err` is a different case (Codex review, P2): the connection
+    // is still usable but the lookup itself failed. The response has not
+    // started yet at this point, so return the database error instead of
+    // masking it as "no cursor". Silently falling open here would resend
+    // the client its full history, not merely miss a resume optimization.
+    let last_row_id: i64 = match last_event_id {
+        Some(event_id) => match store::row_id_for_event_id(&mut conn, exec_id, event_id).await {
+            Ok(row_id) => row_id.unwrap_or(-1),
+            Err(e) => return map_error(e).into_response(),
+        },
+        None => -1,
+    };
 
     // NOTE: a not-configured URL here is `HarvestError::Config` → 400 via
     // `map_error`. That latent misclassification (server misconfig should be
@@ -43480,7 +43521,7 @@ async fn stream_execution_events(
 
     // Slow-consumer check: if reconnecting client is too far behind, return 409
     if backfill.len() > buffer_depth {
-        let drop_id = backfill.last().map_or(last_row_id, |r| r.id);
+        let drop_id = backfill.last().map_or(last_event_id, |r| Some(r.event_id));
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -43559,32 +43600,43 @@ async fn stream_execution_events(
         // read-path payload decoding is active (issue #608).
 
         // Helper: flush a slice of DB rows into the SSE channel.
-        // Returns the last `row.id` seen and the first terminal state name found,
-        // or breaks early if the channel is full / dropped.
+        // Returns the last `row.id`/`row.event_id` actually SENT and the
+        // first terminal state name found, or breaks early if the channel
+        // is full / dropped. `cur_last_seen_event_id` tracks in step with
+        // `cur_last_seen`. Both update only after a row is sent. A
+        // caller-side `rows.last()` read (Codex review) would report a row
+        // this call never sent, when `try_send` fails partway through.
+        // That would hand a reconnecting client a cursor past events it
+        // never received.
         // Using a macro-style closure here because closures can't easily `break 'notify`.
-        // We use a boolean return: (last_id, terminal_state, should_break).
+        // We use a boolean return: (last_id, last_event_id, terminal_state, should_break).
         let send_rows =
             |rows: &[autumn_harvest::models::HarvestEvent],
              mut cur_last_seen: i64,
+             mut cur_last_seen_event_id: Option<i32>,
              tx: &mut futures::channel::mpsc::Sender<Result<Event, std::convert::Infallible>>|
-             -> (i64, Option<&'static str>, bool) {
+             -> (i64, Option<i32>, Option<&'static str>, bool) {
                 let mut found_terminal: Option<&'static str> = None;
                 for row in rows {
                     let sse_event = Event::default()
-                        .id(row.id.to_string())
+                        // `event_id`, not the shard-local `id` (issue #1405):
+                        // this is what a client reconnecting with
+                        // `Last-Event-ID` after a migration must send back.
+                        .id(row.event_id.to_string())
                         .event(row.event_type.as_str())
                         .data(sse_frame_data(&row.event_data, decoder.as_ref()));
                     if tx.try_send(Ok(sse_event)).is_err() {
-                        return (cur_last_seen, None, true);
+                        return (cur_last_seen, cur_last_seen_event_id, None, true);
                     }
                     cur_last_seen = row.id;
+                    cur_last_seen_event_id = Some(row.event_id);
                     if is_terminal_event_type(&row.event_type) {
                         found_terminal = Some(terminal_event_type_to_state(&row.event_type));
                     } else if row.event_type == "WorkflowRedriven" {
                         found_terminal = None;
                     }
                 }
-                (cur_last_seen, found_terminal, false)
+                (cur_last_seen, cur_last_seen_event_id, found_terminal, false)
             };
 
         // ── 1. Send backfill events (events already committed before this request) ──
@@ -43593,7 +43645,9 @@ async fn stream_execution_events(
         let mut backfill_terminal: Option<&'static str> = None;
         for row in &backfill {
             let sse_event = Event::default()
-                .id(row.id.to_string())
+                // `event_id`, not the shard-local `id` (issue #1405): see
+                // `send_rows` above.
+                .id(row.event_id.to_string())
                 .event(row.event_type.as_str())
                 .data(sse_frame_data(&row.event_data, decoder.as_ref()));
             if tx.send(Ok(sse_event)).await.is_err() {
@@ -43640,8 +43694,12 @@ async fn stream_execution_events(
         // here so it still reads the right shard after that loop exits.
         let mut listener_shard = shard;
         if let Some(state) = effective_terminal {
-            let last_id = backfill.last().map_or(last_row_id, |r| r.id);
-            send_stream_end(&api_clone, exec_id, &mut tx, last_id, state).await;
+            // Falls back to the client's own translated cursor, not `None`,
+            // when backfill was empty (issue #1405). An empty backfill means
+            // nothing NEW was found. It does not mean no event_id is known.
+            // This mirrors the same fallback below.
+            let last_event_id_seen = backfill.last().map(|r| r.event_id).or(last_event_id);
+            send_stream_end(&api_clone, exec_id, &mut tx, last_event_id_seen, state).await;
         } else {
             // ── 3. Live-tail: LISTEN/NOTIFY loop ─────────────────────────────
             let mut last_seen_id = backfill.last().map_or(last_row_id, |r| r.id);
@@ -43649,7 +43707,15 @@ async fn stream_execution_events(
             // review, P1 follow-up): kept in step with it below, purely so
             // the shard-rebind block can translate the cursor. See
             // `store::row_id_for_event_id`.
-            let mut last_seen_event_id: Option<i32> = backfill.last().map(|r| r.event_id);
+            //
+            // Falls back to the client's own translated cursor, not `None`,
+            // when backfill was empty (issue #1405). An empty backfill means
+            // the cursor was already caught up. It does not mean no
+            // event_id is known. `None` here would reset a migration that
+            // lands mid-stream with zero new events to -1 (from the start)
+            // on its next rebind. That would replay the whole history.
+            let mut last_seen_event_id: Option<i32> =
+                backfill.last().map(|r| r.event_id).or(last_event_id);
             let mut listener = listener;
             let buf_limit = i64::try_from(api_clone.sse_buffer_depth()).ok();
 
@@ -43748,17 +43814,15 @@ async fn stream_execution_events(
                             Err(_) => continue,
                         };
 
-                        let (new_id, terminal_state, should_break) =
-                            send_rows(&new_rows, last_seen_id, &mut tx);
+                        let (new_id, new_event_id, terminal_state, should_break) =
+                            send_rows(&new_rows, last_seen_id, last_seen_event_id, &mut tx);
                         last_seen_id = new_id;
-                        if let Some(row) = new_rows.last() {
-                            last_seen_event_id = Some(row.event_id);
-                        }
+                        last_seen_event_id = new_event_id;
 
                         if should_break {
                             let err_data = serde_json::json!({
                                 "error": "slow_consumer",
-                                "drop_after_event_id": last_seen_id,
+                                "drop_after_event_id": last_seen_event_id,
                             })
                             .to_string();
                             let _ = tx.try_send(Ok(Event::default()
@@ -43768,8 +43832,14 @@ async fn stream_execution_events(
                         }
 
                         if let Some(state) = terminal_state {
-                            send_stream_end(&api_clone, exec_id, &mut tx, last_seen_id, state)
-                                .await;
+                            send_stream_end(
+                                &api_clone,
+                                exec_id,
+                                &mut tx,
+                                last_seen_event_id,
+                                state,
+                            )
+                            .await;
                             break 'notify;
                         }
                     }
@@ -43794,16 +43864,14 @@ async fn stream_execution_events(
                         else {
                             continue 'notify;
                         };
-                        let (new_id, terminal_state, should_break) =
-                            send_rows(&missed, last_seen_id, &mut tx);
+                        let (new_id, new_event_id, terminal_state, should_break) =
+                            send_rows(&missed, last_seen_id, last_seen_event_id, &mut tx);
                         last_seen_id = new_id;
-                        if let Some(row) = missed.last() {
-                            last_seen_event_id = Some(row.event_id);
-                        }
+                        last_seen_event_id = new_event_id;
                         if should_break {
                             let err_data = serde_json::json!({
                                 "error": "slow_consumer",
-                                "drop_after_event_id": last_seen_id,
+                                "drop_after_event_id": last_seen_event_id,
                             })
                             .to_string();
                             let _ = tx.try_send(Ok(Event::default()
@@ -43812,8 +43880,14 @@ async fn stream_execution_events(
                             break 'notify;
                         }
                         if let Some(state) = terminal_state {
-                            send_stream_end(&api_clone, exec_id, &mut tx, last_seen_id, state)
-                                .await;
+                            send_stream_end(
+                                &api_clone,
+                                exec_id,
+                                &mut tx,
+                                last_seen_event_id,
+                                state,
+                            )
+                            .await;
                             break 'notify;
                         }
                     }
@@ -43847,16 +43921,14 @@ async fn stream_execution_events(
                         else {
                             continue 'notify;
                         };
-                        let (new_id, terminal_state, should_break) =
-                            send_rows(&missed, last_seen_id, &mut tx);
+                        let (new_id, new_event_id, terminal_state, should_break) =
+                            send_rows(&missed, last_seen_id, last_seen_event_id, &mut tx);
                         last_seen_id = new_id;
-                        if let Some(row) = missed.last() {
-                            last_seen_event_id = Some(row.event_id);
-                        }
+                        last_seen_event_id = new_event_id;
                         if should_break {
                             let err_data = serde_json::json!({
                                 "error": "slow_consumer",
-                                "drop_after_event_id": last_seen_id,
+                                "drop_after_event_id": last_seen_event_id,
                             })
                             .to_string();
                             let _ = tx.try_send(Ok(Event::default()
@@ -43865,8 +43937,14 @@ async fn stream_execution_events(
                             break 'notify;
                         }
                         if let Some(state) = terminal_state {
-                            send_stream_end(&api_clone, exec_id, &mut tx, last_seen_id, state)
-                                .await;
+                            send_stream_end(
+                                &api_clone,
+                                exec_id,
+                                &mut tx,
+                                last_seen_event_id,
+                                state,
+                            )
+                            .await;
                             break 'notify;
                         }
                     }

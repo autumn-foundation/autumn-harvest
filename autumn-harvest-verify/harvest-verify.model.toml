@@ -1587,6 +1587,10 @@ path = "with_current_details_cap"
 receiver = "WorkflowContext"
 reason = "context.rs:3758; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
 [[non_sink]]
+path = "with_current_shard_id"
+receiver = "WorkflowContext"
+reason = "context.rs:3878; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
 path = "with_deadline"
 receiver = "WorkflowContext"
 reason = "context.rs:3851; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
