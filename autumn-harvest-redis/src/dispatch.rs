@@ -80,7 +80,7 @@ use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::streams::{
     StreamClaimReply, StreamPendingCountReply, StreamReadOptions, StreamReadReply,
 };
-use redis::{AsyncCommands, RedisError, Script};
+use redis::{AsyncCommands, FromRedisValue, RedisError, Script};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -1290,6 +1290,17 @@ impl RedisDispatch {
     /// across every queue (issue #1429). `XCLAIM` and the requeue still run
     /// per queue with idle entries. Their reply shapes and payloads are
     /// per-queue, so only a queue actually holding idle work pays for them.
+    ///
+    /// The scan reads each queue's raw reply through `req_packed_commands`
+    /// rather than `Pipeline::query_async` (Codex review, issue #1429).
+    /// This pipe is not a Redis transaction. Each `XPENDING` still runs
+    /// independently server-side. But `query_async`'s typed decode treats
+    /// any single command erroring (a wrong-typed key, an ACL denial) as a
+    /// failure of the whole call. That discards every other queue's own
+    /// reply too, not just the broken queue's. A single persistently bad
+    /// queue would then silently disable visibility recovery for every
+    /// queue this worker serves. One queue's `XPENDING` failing here costs
+    /// only that queue's own recovery this pass.
     async fn recover_queues(&self, queues: &[String]) -> RedisAdapterResult<usize> {
         if queues.is_empty() {
             return Ok(0);
@@ -1297,12 +1308,29 @@ impl RedisDispatch {
         self.ensure_groups(queues, false).await?;
         let mut conn = self.conn.clone();
         let visibility_ms = self.visibility_ms();
-        let pendings: Vec<StreamPendingCountReply> =
-            self.pending_pipeline(queues).query_async(&mut conn).await?;
+        let pipe = self.pending_pipeline(queues);
+        let replies: Vec<redis::Value> =
+            redis::aio::ConnectionLike::req_packed_commands(&mut conn, &pipe, 0, queues.len())
+                .await?;
 
         let mut total = 0;
-        for (queue, pending) in queues.iter().zip(pendings.iter()) {
-            let idle = Self::idle_entry_ids(pending, visibility_ms);
+        for (queue, value) in queues.iter().zip(replies) {
+            let pending = match value
+                .extract_error()
+                .and_then(StreamPendingCountReply::from_owned_redis_value)
+            {
+                Ok(pending) => pending,
+                Err(error) => {
+                    tracing::warn!(
+                        queue = %queue,
+                        error = %error,
+                        "XPENDING failed for one queue during recovery; the rest of this pass \
+                         still runs"
+                    );
+                    continue;
+                }
+            };
+            let idle = Self::idle_entry_ids(&pending, visibility_ms);
             total += self.recover_idle_entries(queue, &idle).await?;
         }
         Ok(total)

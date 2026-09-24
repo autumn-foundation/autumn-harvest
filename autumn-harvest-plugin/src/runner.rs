@@ -1690,16 +1690,20 @@ const DISPATCH_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// fallback covers the running state only. The message names the endpoint in
 /// credential-free form.
 ///
-/// Clears both dispatch slots unconditionally on entry, the single-shard
-/// mirror of [`install_dispatch_channels_for_shards`]'s own fix (Codex
-/// review, issue #1429). A process may have previously run a multi-shard
-/// install and now start this single-shard one with no intervening
-/// `stop()`. `run_poll_loop` prioritizes an installed per-shard channel for
-/// its polled shard over the freshly installed global one (see its own
-/// `per_shard_installed` check). A stale per-shard slot left behind would
-/// then keep this new runner consuming from the old endpoint or key
-/// prefix. `/admin/config` would report the newly installed global
-/// channel instead.
+/// Clears the per-shard slot unconditionally on entry (Codex review, issue
+/// #1429). A process may have previously run a multi-shard install and now
+/// start this single-shard one with no intervening `stop()`. `run_poll_loop`
+/// prioritizes an installed per-shard channel for its polled shard over the
+/// freshly installed global one (see its own `per_shard_installed` check).
+/// A stale per-shard slot left behind would then keep this new runner
+/// consuming from the old endpoint or key prefix. `/admin/config` would
+/// report the newly installed global channel instead.
+///
+/// This function only ever holds one connection attempt. Unlike
+/// [`install_dispatch_channels_for_shards`] it has no multi-shard partial
+/// failure to guard against. A failed connect here leaves the single-shard
+/// slot exactly as it was, since only the redis-off branch and the success
+/// path below ever touch it.
 #[cfg(feature = "redis")]
 async fn install_dispatch_channel(
     config: &HarvestRuntimeConfig,
@@ -1783,13 +1787,21 @@ async fn install_dispatch_channel(
 /// Returns the shards this call actually installed, so the caller's guard
 /// can unwind exactly those if a later startup step fails.
 ///
-/// Clears both dispatch slots unconditionally on entry, before installing
-/// anything (Codex review, issue #1429). It clears `dispatch::uninstall`
-/// (the single-shard slot) and `dispatch::uninstall_all_shards` (every
-/// per-shard slot, not only the shards this call is about to reinstall). A
-/// process may have previously run single-shard dispatch, or a differently
-/// shaped multi-shard install. Starting this one with no intervening
-/// `stop()` would otherwise leave a stale channel installed either way:
+/// Connects every shard's channel first, into a local list, before touching
+/// either dispatch slot (Codex review, issue #1429 follow-up). An earlier
+/// version cleared both slots unconditionally on entry, then connected
+/// shards one at a time. A connection failure partway through that loop
+/// left this runtime with neither topology installed. The old channels were
+/// already cleared, and the new ones never finished connecting. Every shard
+/// then silently fell back to the Postgres claim path, instead of failing
+/// startup. Connecting first means a failure here leaves both slots exactly
+/// as this call found them.
+///
+/// Only once every shard in `shards` has connected does this function clear
+/// both slots and install each connected channel. That clear still needs to
+/// run unconditionally. A process may have previously run single-shard
+/// dispatch, or a differently shaped multi-shard install, with no
+/// intervening `stop()`:
 ///
 /// - A stale single-shard slot: `Worker::new` prioritizes a populated
 ///   single-shard slot over per-shard coverage.
@@ -1804,9 +1816,9 @@ async fn install_dispatch_channel(
 /// # Errors
 ///
 /// Returns an error, naming the shard, the first time a shard's Redis
-/// endpoint cannot be reached. Shards already installed earlier in this call
-/// stay installed; the caller's guard unwinds them along with the rest of
-/// startup if it never reaches `commit`.
+/// endpoint cannot be reached. Neither dispatch slot is touched on this
+/// path. The caller's guard has nothing to unwind, and the runtime keeps
+/// whatever topology, if any, it had before this call.
 #[cfg(feature = "redis")]
 async fn install_dispatch_channels_for_shards(
     config: &HarvestRuntimeConfig,
@@ -1814,28 +1826,20 @@ async fn install_dispatch_channels_for_shards(
 ) -> autumn_web::AutumnResult<Vec<ShardId>> {
     use std::time::Duration;
 
-    // Clears both slots unconditionally, before either branch below (Codex
-    // review, issue #1429). `uninstall_all_shards` alone left a shard from
-    // an earlier, differently-shaped multi-shard install behind, when this
-    // call's own `shards` no longer names it. `installed_for_shard` would
-    // then still return that stale channel. A later worker singly assigned
-    // to it could pass its coverage check against a namespace this runtime
-    // no longer owns. `uninstall` alone left the single-shard slot behind
-    // on the same kind of unannounced topology switch. See the doc
-    // comment above for that half of this fix.
-    autumn_harvest::dispatch::uninstall();
-    autumn_harvest::dispatch::uninstall_all_shards();
-
     let (Some(url), Some(endpoint)) = (config.redis.url.as_deref(), config.redis.redacted_url())
     else {
-        // Redis is off for this start. Both slots are already clear, above.
+        // Redis is off for this start. Clear both slots, as before: a
+        // channel a previous runtime installed (issue #1312) must not
+        // outlive this process turning Redis off.
+        autumn_harvest::dispatch::uninstall();
+        autumn_harvest::dispatch::uninstall_all_shards();
         return Ok(Vec::new());
     };
 
-    let mut installed_shards = Vec::with_capacity(shards.len());
+    let mut connected = Vec::with_capacity(shards.len());
     for &shard in shards {
         let key_prefix = effective_dispatch_prefix(&config.redis.key_prefix, Some(shard));
-        let channel = match autumn_harvest_redis::RedisDispatch::connect(
+        let channel = autumn_harvest_redis::RedisDispatch::connect(
             url,
             autumn_harvest_redis::RedisDispatchConfig {
                 key_prefix: key_prefix.clone(),
@@ -1845,25 +1849,23 @@ async fn install_dispatch_channels_for_shards(
             },
         )
         .await
-        {
-            Ok(channel) => channel,
-            Err(error) => {
-                // A shard earlier in this loop already installed (issue
-                // #1429 review). This function's own `Err` return skips the
-                // caller's `DispatchInstallGuard`, which only ever wraps the
-                // `Vec` this call returns. So on this path it never exists
-                // to unwind those shards. Uninstall every per-shard slot
-                // here instead, matching the guard's own "clear everything,
-                // not just this call's list" cleanup shape.
-                autumn_harvest::dispatch::uninstall_all_shards();
-                return Err(AutumnError::service_unavailable_msg(format!(
-                    "failed to connect the Redis dispatch channel for shard {} at {endpoint}: \
-                     {error}",
-                    shard.as_i32()
-                )));
-            }
-        };
+        .map_err(|error| {
+            AutumnError::service_unavailable_msg(format!(
+                "failed to connect the Redis dispatch channel for shard {} at {endpoint}: \
+                 {error}",
+                shard.as_i32()
+            ))
+        })?;
+        connected.push((shard, key_prefix, channel));
+    }
 
+    // Every shard connected. Clear both slots, then install: see the doc
+    // comment above for why the clear still runs unconditionally here.
+    autumn_harvest::dispatch::uninstall();
+    autumn_harvest::dispatch::uninstall_all_shards();
+
+    let mut installed_shards = Vec::with_capacity(connected.len());
+    for (shard, key_prefix, channel) in connected {
         autumn_harvest::dispatch::install_for_shard(
             shard,
             Arc::new(channel),
@@ -2919,11 +2921,12 @@ mod tests {
     /// to cover.
     ///
     /// `install_dispatch_channels_for_shards` clears the single-shard slot
-    /// unconditionally, as its very first statement, ahead of the
-    /// Redis-off/Redis-configured branch it then takes. This test exercises
-    /// the Redis-off branch, the only one this suite can drive without a
-    /// live Redis, matching every other test in this file. That already
-    /// proves the Redis-configured branch clears the slot too.
+    /// unconditionally on the Redis-off branch, before returning. This test
+    /// exercises that branch, the only one this suite can drive without a
+    /// live Redis. The Redis-configured branch clears both slots too, but
+    /// only after every shard connects — see
+    /// `a_shard_connect_failure_leaves_existing_channels_untouched` for that
+    /// branch's own coverage.
     #[test]
     fn entering_the_multi_shard_path_clears_the_single_shard_slot() {
         let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
@@ -2991,6 +2994,70 @@ mod tests {
         assert!(
             autumn_harvest::dispatch::installed_for_shard(stale_shard).is_none(),
             "reinstalling for a new shard span must clear a shard the new span no longer names"
+        );
+    }
+
+    /// A shard that fails to connect leaves every existing channel exactly
+    /// as this call found it (Codex review, issue #1429 follow-up).
+    ///
+    /// An earlier version cleared both dispatch slots unconditionally on
+    /// entry, then connected shards one at a time. A connect failure
+    /// partway through that loop left this runtime with no channels at
+    /// all: the old topology was already cleared, and the new one never
+    /// finished installing. The fix connects every shard into a local list
+    /// first, and only clears and installs once every shard has succeeded.
+    /// This test drives a single shard whose Redis endpoint cannot be
+    /// reached, and checks that a channel installed before the call is
+    /// still there after it fails.
+    #[test]
+    fn a_shard_connect_failure_leaves_existing_channels_untouched() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        let other_shard = ShardId::new(7);
+        autumn_harvest::dispatch::install_for_shard(
+            other_shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        // A black-holed address: `RedisDispatch::connect` fails after its
+        // own connect timeout, never after a fast refusal, so this proves
+        // the failure path rather than a config-validation shortcut.
+        let config = crate::config::HarvestRuntimeConfig {
+            redis: super::HarvestRedisConfig {
+                url: Some("redis://10.255.255.1:6379".to_string()),
+                ..super::HarvestRedisConfig::default()
+            },
+            ..crate::config::HarvestRuntimeConfig::default()
+        };
+
+        let result = block_on(super::install_dispatch_channels_for_shards(
+            &config,
+            &[ShardId::new(0)],
+        ));
+        assert!(
+            result.is_err(),
+            "an unreachable Redis endpoint must fail the call"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed().is_some(),
+            "a failed connect must not clear the pre-existing single-shard channel"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(other_shard).is_some(),
+            "a failed connect must not clear a pre-existing per-shard channel for another shard"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(ShardId::new(0)).is_none(),
+            "the shard whose connect failed must not end up with a channel installed"
         );
     }
 

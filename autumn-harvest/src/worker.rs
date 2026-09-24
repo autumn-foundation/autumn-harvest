@@ -26099,11 +26099,30 @@ async fn dispatch_call_with_timeout<T>(
     })
 }
 
-/// The deadline for a batched multi-queue channel call, scaled by how many
-/// distinct queues it touches (Codex review, issue #1429). See
-/// [`dispatch_call_with_timeout`] for why a flat deadline is not enough.
-fn dispatch_batch_timeout(distinct_queues: usize) -> Duration {
-    DISPATCH_CALL_TIMEOUT.saturating_mul(u32::try_from(distinct_queues.max(1)).unwrap_or(u32::MAX))
+/// The deadline for a batched multi-queue channel call (Codex review, issue
+/// #1429). It scales by how many distinct queues the call touches. It also
+/// scales by how many sequential round trips the channel makes per queue.
+/// See [`dispatch_call_with_timeout`] for why a flat deadline is not
+/// enough.
+///
+/// `round_trips_per_queue` must match the channel call this bounds.
+/// `ack_many_inner` does two round trips per queue: an `XACK`/`XDEL`
+/// pipeline, then a separate marker-cleanup script. An earlier round of
+/// this fix sized the deadline for only one round trip, unconditionally.
+/// That left latency around half `DISPATCH_CALL_TIMEOUT` per round trip
+/// free to cancel the call partway through a lap. That gap is exactly the
+/// failure mode this deadline exists to close. `release_many_inner` /
+/// `requeue_batch` and the dispatch read's own non-blocking pass are one
+/// round trip per queue.
+fn dispatch_batch_timeout(distinct_queues: usize, round_trips_per_queue: usize) -> Duration {
+    DISPATCH_CALL_TIMEOUT.saturating_mul(
+        u32::try_from(
+            distinct_queues
+                .max(1)
+                .saturating_mul(round_trips_per_queue.max(1)),
+        )
+        .unwrap_or(u32::MAX),
+    )
 }
 
 /// Per-shard block duration for a dispatch-channel read during multi-shard
@@ -28552,7 +28571,7 @@ impl Worker {
         // path. It sits pending until visibility recovery, not just
         // delayed. The shutdown arm gives a stopping worker its exit
         // without waiting out the read.
-        let read_timeout = block_for + dispatch_batch_timeout(self.config.queues.len());
+        let read_timeout = block_for + dispatch_batch_timeout(self.config.queues.len(), 1);
         let read = tokio::select! {
             () = self.shutdown.cancelled() => return 0,
             result = tokio::time::timeout(
@@ -28705,7 +28724,9 @@ impl Worker {
         // is.
         if !to_ack.is_empty() {
             let queues: HashSet<&str> = to_ack.iter().map(|l| l.queue_name.as_str()).collect();
-            let timeout = dispatch_batch_timeout(queues.len());
+            // Two round trips per queue: `ack_many_inner`'s XACK/XDEL
+            // pipeline, then its separate marker-cleanup script.
+            let timeout = dispatch_batch_timeout(queues.len(), 2);
             if let Err(error) =
                 dispatch_call_with_timeout(installed.channel.ack_many(&to_ack), "ack", timeout)
                     .await
@@ -28718,7 +28739,7 @@ impl Worker {
                 .iter()
                 .map(|(lease, _)| lease.queue_name.as_str())
                 .collect();
-            let timeout = dispatch_batch_timeout(queues.len());
+            let timeout = dispatch_batch_timeout(queues.len(), 1);
             if let Err(error) = dispatch_call_with_timeout(
                 installed.channel.release_many(&to_release),
                 "release",
@@ -42414,20 +42435,32 @@ mod tests {
         );
     }
 
-    /// A single-queue batch keeps the flat deadline unchanged; an N-queue
-    /// batch gets N times the per-queue budget (Codex review, issue #1429).
+    /// A single-queue, single-round-trip batch keeps the flat deadline
+    /// unchanged. An N-queue batch gets N times the per-queue budget. A
+    /// call needing several round trips per queue gets that multiplier
+    /// too (Codex review, issue #1429).
     #[test]
     fn dispatch_batch_timeout_scales_with_distinct_queue_count() {
         assert_eq!(
-            dispatch_batch_timeout(1),
+            dispatch_batch_timeout(1, 1),
             DISPATCH_CALL_TIMEOUT,
-            "a single-queue batch must not regress the flat deadline"
+            "a single-queue, single-round-trip batch must not regress the flat deadline"
         );
-        assert_eq!(dispatch_batch_timeout(3), DISPATCH_CALL_TIMEOUT * 3);
+        assert_eq!(dispatch_batch_timeout(3, 1), DISPATCH_CALL_TIMEOUT * 3);
         assert_eq!(
-            dispatch_batch_timeout(0),
+            dispatch_batch_timeout(0, 1),
             DISPATCH_CALL_TIMEOUT,
             "an empty batch still gets at least one queue's worth of budget"
+        );
+        assert_eq!(
+            dispatch_batch_timeout(3, 2),
+            DISPATCH_CALL_TIMEOUT * 6,
+            "ack_many's two round trips per queue must both be budgeted"
+        );
+        assert_eq!(
+            dispatch_batch_timeout(3, 0),
+            DISPATCH_CALL_TIMEOUT * 3,
+            "a call still makes at least one round trip per queue"
         );
     }
 
@@ -42445,7 +42478,7 @@ mod tests {
             tokio::time::sleep(DISPATCH_CALL_TIMEOUT + Duration::from_secs(1)).await;
             Ok::<(), HarvestError>(())
         };
-        let result = dispatch_call_with_timeout(call, "test", dispatch_batch_timeout(3)).await;
+        let result = dispatch_call_with_timeout(call, "test", dispatch_batch_timeout(3, 1)).await;
         assert!(
             result.is_ok(),
             "a 3-queue budget must cover a call past the flat one-queue deadline"
