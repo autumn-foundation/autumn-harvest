@@ -3003,11 +3003,11 @@ mod tests {
     /// An earlier version cleared both dispatch slots unconditionally on
     /// entry, then connected shards one at a time. A connect failure
     /// partway through that loop left this runtime with no channels at
-    /// all: the old topology was already cleared, and the new one never
+    /// all. The old topology was already cleared, and the new one never
     /// finished installing. The fix connects every shard into a local list
     /// first, and only clears and installs once every shard has succeeded.
     /// This test drives a single shard whose Redis endpoint cannot be
-    /// reached, and checks that a channel installed before the call is
+    /// reached. It checks that a channel installed before the call is
     /// still there after it fails.
     #[test]
     fn a_shard_connect_failure_leaves_existing_channels_untouched() {
@@ -3029,8 +3029,8 @@ mod tests {
         );
 
         // A black-holed address: `RedisDispatch::connect` fails after its
-        // own connect timeout, never after a fast refusal, so this proves
-        // the failure path rather than a config-validation shortcut.
+        // own connect timeout, never after a fast refusal. This proves the
+        // failure path rather than a config-validation shortcut.
         let config = crate::config::HarvestRuntimeConfig {
             redis: super::HarvestRedisConfig {
                 url: Some("redis://10.255.255.1:6379".to_string()),

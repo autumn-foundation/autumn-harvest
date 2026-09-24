@@ -701,9 +701,9 @@ async fn maintain_recovers_unacked_leases_across_several_queues_in_one_pass() {
 #[tokio::test(flavor = "multi_thread")]
 async fn one_queues_broken_pending_scan_does_not_block_its_siblings_recovery() {
     // Issue #1429 review: `recover_queues` reads its pipelined `XPENDING`
-    // scan through `req_packed_commands` instead of `Pipeline::query_async`,
-    // so one queue's reply erroring does not collapse the whole call into a
-    // single `Err`. This pins that behavior end to end: a queue whose
+    // scan through `req_packed_commands` instead of `Pipeline::query_async`.
+    // One queue's reply erroring does not collapse the whole call into a
+    // single `Err`. This pins that behavior end to end. A queue whose
     // stream key has the wrong type for `XPENDING` must not stop a sibling
     // queue's idle entry from recovering in the same pass.
     let Some(fixture) = try_start(Duration::from_millis(300)).await else {
@@ -730,9 +730,9 @@ async fn one_queues_broken_pending_scan_does_not_block_its_siblings_recovery() {
 
     // Overwrite "broken"'s stream key with a plain string, after the
     // consumer group already claimed its entry above. `XPENDING` against a
-    // wrong-typed key fails with a `WRONGTYPE` error, the same class of
-    // per-queue failure a wrong-typed key or an ACL denial would produce
-    // in production.
+    // wrong-typed key fails with a `WRONGTYPE` error. That is the same
+    // class of per-queue failure a wrong-typed key or an ACL denial would
+    // produce in production.
     let mut raw = fixture.raw.clone();
     let _: () = redis::cmd("SET")
         .arg(fixture.stream_key("broken"))
@@ -753,7 +753,11 @@ async fn one_queues_broken_pending_scan_does_not_block_its_siblings_recovery() {
     assert_eq!(fixture.pending_count("healthy").await, 0);
 
     let again = read(&fixture, &["healthy".to_string()], 10).await;
-    assert_eq!(again.len(), 1, "the healthy queue's entry is delivered again");
+    assert_eq!(
+        again.len(),
+        1,
+        "the healthy queue's entry is delivered again"
+    );
     assert_eq!(again[0].task_id, healthy_task);
     assert_eq!(again[0].redeliveries, 1);
 }
