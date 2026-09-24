@@ -12,7 +12,7 @@ keywords = ["workflow", "durable", "postgres", "orchestration", "autumn"]
 categories = ["asynchronous", "database"]
 
 [features]
-default = ["db", "unified-dag-execution"]
+default = ["db", "unified-dag-execution", "tls"]
 unified-dag-execution = ["autumn-harvest-macros/unified-dag-execution"]
 db = [
     "dep:deadpool",
@@ -20,6 +20,15 @@ db = [
     "dep:diesel-async",
     "dep:diesel_migrations",
     "dep:tokio-postgres",
+]
+# Verified TLS for LISTEN/NOTIFY connections whose DSN sets `sslmode=require`
+# (issue #1717). Uses rustls with the `ring` provider and the platform trust
+# store. Without this feature, such a DSN gets a clear configuration error.
+tls = [
+    "db",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:tokio-postgres-rustls",
 ]
 testing = []
 # Time-travel replay debugger (issue #949): a stepping/diff API over the existing
@@ -98,6 +107,12 @@ diesel_migrations = { workspace = true, optional = true }
 # 0.7.18 is the first release with the RUSTSEC advisory fix; pin the floor so a
 # downstream lockfile can't silently resolve back to a vulnerable 0.7.x.
 tokio-postgres = { version = "0.7.18", optional = true }
+# The `tls` feature. These are the versions the CLI already uses for
+# `harvest migrate` (issue #1240), so the lockfile gets no new crate.
+# `default-features = false` keeps `aws-lc-rs` out of the build.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+tokio-postgres-rustls = { version = "0.13", optional = true }
 # 0.24.6 is the first non-yanked 0.24.x release; pin the floor for the same
 # reason as tokio-postgres above (a downstream lockfile shouldn't be able to
 # freshly resolve the yanked 0.24.5).

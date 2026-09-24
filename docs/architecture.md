@@ -128,7 +128,7 @@ The `harvest_events` table is the exception: its `id` column is `BIGSERIAL i64` 
 
 **2. `db` feature gates all Diesel code**
 
-`schema.rs` and `models.rs` are compiled only when `features = ["db"]`. `default = ["db"]`, so it compiles in by default. Tests on Windows run `--no-default-features` to avoid OpenSSL dependency. CI tests the `db` feature on Linux.
+`schema.rs` and `models.rs` are compiled only when `features = ["db"]`. `default = ["db", "unified-dag-execution", "tls"]`, so it compiles in by default. `tls` adds rustls for LISTEN/NOTIFY connections with `sslmode=require` (issue #1717). Tests on Windows run `--no-default-features` to avoid OpenSSL dependency. CI tests the `db` feature on Linux.
 
 **3. Adjacently-tagged event JSON**
 
@@ -204,7 +204,7 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `replay.rs` | 2 | Deterministic replay engine: `HistoryMatcher` walks event history, detects non-determinism |
 | `executor.rs` | 2 | Workflow executor: `run_workflow` drives replay + live execution, handles suspension |
 | `queue.rs` | 2 | Postgres task queue: `enqueue`, `claim` (FOR UPDATE SKIP LOCKED), `complete`, `fail` |
-| `notify.rs` | 2 | LISTEN/NOTIFY wrapper: `Listener` (async stream), `Notifier` (pg_notify), channel naming |
+| `notify.rs` | 2 | LISTEN/NOTIFY wrapper: `Listener` (async stream), `Notifier` (pg_notify), channel naming. `sslmode=require` selects verified TLS (issue #1717). |
 | `dispatch.rs` | 3.x | Task dispatch channel seam (issue #1312): `TaskDispatch` trait (`publish`/`next`/`ack`/`release`/`maintain`), `DispatchHint` (task id, queue, `scheduled_at`, priority, shard), `DispatchLease`, `DispatchMaintenance`, `DispatchSettings` (`poll_interval`, `reconcile_interval`, `reconcile_batch`, `release_backoff_cap`) and the process-global `install`/`installed`/`uninstall`. The channel carries references to claimable `harvest_task_queue` rows; Postgres stays the source of truth, and a worker still claims the named row with the full claim predicate. It is a latency and throughput optimization, never a durability store: the worker's reconcile sweep republishes every due `PENDING` row the channel does not hold. No new event variant, no migration. The Redis Streams implementation lives in `autumn-harvest-redis`; see [`docs/operations/redis-dispatch.md`](operations/redis-dispatch.md). |
 | `worker.rs` | 2 | Worker runtime: poll loop, semaphore-bounded concurrent dispatch, graceful shutdown |
 | `workers.rs` | 4 | Worker fleet registry: `register_worker`, `heartbeat_worker`, `transition_status`, `list_workers`, `get_worker`, `fleet_health`, `spawn_worker_heartbeat` |

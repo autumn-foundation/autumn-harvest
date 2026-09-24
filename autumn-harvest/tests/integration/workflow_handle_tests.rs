@@ -677,3 +677,106 @@ async fn handle_cancel_seals_cancelled() {
     assert_eq!(outcome.state, "CANCELLED");
     assert!(outcome.newly_cancelled);
 }
+
+// ── Issue #1717: TLS listeners and the polling fallback ──────────────────
+
+/// A notification URL that refuses every connection.
+const UNREACHABLE_NOTIFY_URL: &str = "postgres://postgres:postgres@127.0.0.1:1/postgres";
+
+/// Start a running workflow and complete it after a short delay.
+///
+/// The client notifies through `notify_url`, not through `database_url`.
+async fn complete_later_with_notify_url(
+    notify_url: &str,
+) -> (
+    autumn_harvest::WorkflowHandle,
+    tokio::task::JoinHandle<()>,
+    Option<ContainerAsync<Postgres>>,
+) {
+    let (database_url, container) = setup_isolated_database_url().await;
+    let pool = build_pool(&database_url);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("postgres connection");
+    let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let started = start_running_workflow(&mut conn, exec_id).await;
+    let handle = WorkflowHandleClient::single(pool, notify_url).handle(started.exec_id);
+    let completer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        mark_completed(&mut conn, exec_id).await;
+    });
+    (handle, completer, container)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn result_raw_polls_when_the_listener_cannot_connect() {
+    let (handle, completer, _container) =
+        complete_later_with_notify_url(UNREACHABLE_NOTIFY_URL).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(10), handle.result_raw())
+        .await
+        .expect("polling must see the completion")
+        .expect("a dead listener must not fail the wait");
+
+    assert_eq!(result, serde_json::json!({"ok": true}));
+    completer.await.expect("completer should not panic");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn result_raw_with_timeout_polls_when_the_listener_cannot_connect() {
+    let (handle, completer, _container) =
+        complete_later_with_notify_url(UNREACHABLE_NOTIFY_URL).await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        handle.result_raw_with_timeout(Duration::from_secs(10)),
+    )
+    .await
+    .expect("the wait must end")
+    .expect("a dead listener must not fail the wait");
+
+    assert_eq!(result, serde_json::json!({"ok": true}));
+    completer.await.expect("completer should not panic");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn result_snapshot_with_wait_polls_when_the_listener_cannot_connect() {
+    let (handle, completer, _container) =
+        complete_later_with_notify_url(UNREACHABLE_NOTIFY_URL).await;
+
+    let snapshot = tokio::time::timeout(
+        Duration::from_secs(20),
+        handle.result_snapshot_with_wait(Duration::from_secs(10)),
+    )
+    .await
+    .expect("the wait must end")
+    .expect("a dead listener must not fail the wait")
+    .expect("polling must see the completion");
+
+    assert_eq!(snapshot.state, WorkflowResultState::Completed);
+    completer.await.expect("completer should not panic");
+}
+
+/// A failed `sslmode=require` listener must name the TLS cause.
+///
+/// `tokio_postgres` shows only "error performing TLS handshake". The cause is
+/// in `source()`. The unit test `sslmode_require_starts_a_tls_handshake` in
+/// `notify.rs` proves that `require` selects the rustls connector.
+#[tokio::test]
+async fn listener_with_sslmode_require_names_the_tls_cause() {
+    let (database_url, _container) = setup_isolated_database_url().await;
+    let separator = if database_url.contains('?') { '&' } else { '?' };
+    let require_url = format!("{database_url}{separator}sslmode=require");
+
+    let Err(error) = autumn_harvest::notify::WorkflowEventListener::connect(&require_url).await
+    else {
+        // The server has a trusted certificate. No failure to inspect.
+        return;
+    };
+    let message = error.to_string();
+
+    assert!(
+        message.contains("server does not support TLS") || message.contains("certificate"),
+        "the error must name the TLS cause: {message}"
+    );
+}
