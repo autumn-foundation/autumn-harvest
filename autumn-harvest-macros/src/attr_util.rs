@@ -190,7 +190,10 @@ mod param_idents_tests {
     fn typed_ident_params_are_collected_in_order() {
         let owned = params_from("a: u32, b: bool");
         let refs: Vec<_> = owned.iter().collect();
-        let names: Vec<String> = param_idents(&refs).iter().map(ToString::to_string).collect();
+        let names: Vec<String> = param_idents(&refs)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         assert_eq!(names, vec!["a", "b"]);
     }
 
@@ -201,7 +204,10 @@ mod param_idents_tests {
     fn non_ident_pattern_is_silently_dropped() {
         let owned = params_from("(a, b): (u32, u32), c: bool");
         let refs: Vec<_> = owned.iter().collect();
-        let names: Vec<String> = param_idents(&refs).iter().map(ToString::to_string).collect();
+        let names: Vec<String> = param_idents(&refs)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         assert_eq!(names, vec!["c"]);
     }
 }
