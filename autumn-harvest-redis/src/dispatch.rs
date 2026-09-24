@@ -802,7 +802,13 @@ impl RedisDispatch {
                 };
                 let key = &ordered[rotation % ordered.len()];
                 match self
-                    .read_with_heal(queues, std::slice::from_ref(key), consumer, remaining, slice)
+                    .read_with_heal(
+                        queues,
+                        std::slice::from_ref(key),
+                        consumer,
+                        remaining,
+                        slice,
+                    )
                     .await
                 {
                     Ok(blocked) => {
