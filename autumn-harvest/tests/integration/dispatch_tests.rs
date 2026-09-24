@@ -1552,18 +1552,18 @@ async fn a_workflow_reference_waits_for_a_workflow_permit() {
 /// `consume_reference`, for every workflow-kind lease regardless of outcome.
 /// A terminal row's redelivered reference is never actually claimed
 /// (`ReferenceDisposition::AlreadyTerminal`), yet it still spent the share.
-/// With `share_workflow` at 1, that alone exhausted it, so a genuinely
-/// claimable workflow reference right behind it in the same batch failed
-/// `dispatch_kind_within_share` and went back to `to_release`, even with a
-/// free workflow permit sitting right there. The share is only meant to
-/// bound what this shard actually dispatches, so only
+/// With `share_workflow` at 1, that alone exhausted it. A genuinely
+/// claimable workflow reference right behind it in the same batch then
+/// failed `dispatch_kind_within_share`. It went back to `to_release`,
+/// even with a free workflow permit sitting right there. The share is
+/// only meant to bound what this shard actually dispatches, so only
 /// `ReferenceDisposition::Dispatched` may spend it now.
 ///
 /// This publishes a terminal row's reference and a claimable one together,
 /// in that order, in one batch. The claimable one must never appear in
-/// `released_ids`: under the old code it always would, since exhausting the
-/// share sent it back for a later poll to pick up instead of claiming it on
-/// the spot.
+/// `released_ids`. Under the old code it always would. Exhausting the
+/// share sent it back for a later poll, instead of claiming it on the
+/// spot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stale_reference_does_not_spend_a_sibling_lease_share() {
     let _serial = DISPATCH_SERIAL.lock().await;

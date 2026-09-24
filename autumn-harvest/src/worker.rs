@@ -26564,12 +26564,18 @@ impl Worker {
                 .map_or(0, crate::shard::ShardedDbPool::len);
             #[cfg(not(feature = "db"))]
             let pool_shards = 0;
+            // A direct embedder may install both the global slot and a
+            // complete set of per-shard channels (Codex review, issue
+            // #1429). `install_for_shard`'s own doc comment says the
+            // global slot stays untouched, so that combination is a
+            // supported state, not stale runner state. The multi-shard
+            // poll loop only ever reads the per-shard pair regardless. A
+            // wide span is covered whenever either condition holds on its
+            // own, not only when the global slot's span is one.
             let single_shard_channel = crate::dispatch::installed().is_some();
-            let covered = if single_shard_channel {
-                dispatch_allowed_for_span(shard_count, pool_shards)
-            } else {
-                per_shard_dispatch_covers(&config.shard_assignments)
-            };
+            let covered = (single_shard_channel
+                && dispatch_allowed_for_span(shard_count, pool_shards))
+                || per_shard_dispatch_covers(&config.shard_assignments);
             if !covered {
                 return Err(HarvestError::Config(format!(
                     "a dispatch channel is installed and this worker spans \
@@ -28533,12 +28539,24 @@ impl Worker {
 
         // The read blocks for `block_for` (contract C4 for a single shard;
         // capped by `dispatch_read_block` when round-robining several). Its
-        // cap is that wait plus the call timeout. The shutdown arm gives a
-        // stopping worker its exit without waiting out the read.
+        // cap is that wait plus a call timeout scaled by queue count
+        // (Codex review, issue #1429), same as
+        // [`dispatch_batch_timeout`]/[`dispatch_call_with_timeout`].
+        // A channel read across many queues does at least one round trip
+        // per queue before its own blocking phase even starts. See
+        // `read_across_queues`'s doc comment. A flat call timeout sized
+        // for one round trip can then fire before that pass alone
+        // finishes. `tokio::time::timeout` drops the whole future on
+        // expiry. An entry the read had already claimed from an earlier
+        // queue then never reaches the channel's own requeue-on-drop
+        // path. It sits pending until visibility recovery, not just
+        // delayed. The shutdown arm gives a stopping worker its exit
+        // without waiting out the read.
+        let read_timeout = block_for + dispatch_batch_timeout(self.config.queues.len());
         let read = tokio::select! {
             () = self.shutdown.cancelled() => return 0,
             result = tokio::time::timeout(
-                block_for + DISPATCH_CALL_TIMEOUT,
+                read_timeout,
                 installed.channel.next(
                     &self.config.queues,
                     &self.config.worker_id,
@@ -28559,8 +28577,7 @@ impl Worker {
             }
             Err(_) => {
                 let error = HarvestError::Dispatch(format!(
-                    "dispatch read did not answer within {:?}",
-                    block_for + DISPATCH_CALL_TIMEOUT
+                    "dispatch read did not answer within {read_timeout:?}"
                 ));
                 self.enter_degraded(state, &error, "dispatch read timed out", settings);
                 return self.drain_postgres(pool, shard, shard_count).await;
@@ -31109,6 +31126,17 @@ pub(crate) fn under_provisioned_shard_pools(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes every test below that installs or uninstalls a dispatch
+    /// channel, global or per-shard (Codex review, issue #1429).
+    ///
+    /// `crate::dispatch`'s install state is process-global, so two such
+    /// tests running concurrently (`cargo test`'s default) can see each
+    /// other's channel. `a_fully_covered_multi_shard_runtime_is_accepted_alongside_a_global_channel`
+    /// installing per-shard channels while `the_sharded_runtime_rejection_reads_as_one_sentence`
+    /// checks a global-only install, for example, turns an expected
+    /// rejection into a spurious acceptance.
+    static DISPATCH_INSTALL_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Pins [`NEW_WORKFLOW_EXECUTION_COLUMNS`], and therefore
     /// [`ROWS_PER_EXECUTION_INSERT_CHUNK`], to `NewWorkflowExecution`'s real
@@ -42466,6 +42494,9 @@ mod tests {
     #[cfg(feature = "testing")]
     #[test]
     fn per_shard_dispatch_requires_full_coverage() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::dispatch::uninstall_all_shards();
 
         let shard_a = crate::types::ShardId::new(1);
@@ -42635,6 +42666,9 @@ mod tests {
     #[cfg(feature = "testing")]
     #[test]
     fn the_sharded_runtime_rejection_reads_as_one_sentence() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
         let channel = Arc::new(crate::dispatch::MemoryDispatch::new());
         crate::dispatch::install(
@@ -42665,6 +42699,9 @@ mod tests {
     #[cfg(feature = "testing")]
     #[test]
     fn a_fully_covered_multi_shard_runtime_is_accepted() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::dispatch::uninstall_all_shards();
         let shard_0 = crate::types::ShardId::new(0);
         let shard_1 = crate::types::ShardId::new(1);
@@ -42687,6 +42724,54 @@ mod tests {
         assert!(
             result.is_ok(),
             "full per-shard coverage must accept a multi-shard runtime, got {:?}",
+            result.err()
+        );
+    }
+
+    /// A multi-shard runtime with full per-shard coverage is accepted even
+    /// when a global channel also happens to be installed (Codex review,
+    /// issue #1429).
+    ///
+    /// `install_for_shard`'s own doc comment says it leaves the
+    /// independent global slot untouched, so a caller can hold both at
+    /// once. `run_poll_loop_multi` only ever reads the per-shard pair.
+    /// The global slot's own span (here, wider than one) must not veto
+    /// coverage this worker never uses it for.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_fully_covered_multi_shard_runtime_is_accepted_alongside_a_global_channel() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::dispatch::uninstall_all_shards();
+        let shard_0 = crate::types::ShardId::new(0);
+        let shard_1 = crate::types::ShardId::new(1);
+        for shard in [shard_0, shard_1] {
+            crate::dispatch::install_for_shard(
+                shard,
+                Arc::new(crate::dispatch::MemoryDispatch::new()),
+                crate::dispatch::DispatchSettings::default(),
+            );
+        }
+        crate::dispatch::install(
+            Arc::new(crate::dispatch::MemoryDispatch::new())
+                as Arc<dyn crate::dispatch::TaskDispatch>,
+            crate::dispatch::DispatchSettings::default(),
+        );
+
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let config = WorkerRuntimeConfig {
+            shard_assignments: vec![shard_0, shard_1],
+            ..default_runtime_config()
+        };
+        let result = Worker::new(config, registry);
+        crate::dispatch::uninstall();
+        crate::dispatch::uninstall_all_shards();
+
+        assert!(
+            result.is_ok(),
+            "full per-shard coverage must accept a multi-shard runtime even \
+             with a global channel also installed, got {:?}",
             result.err()
         );
     }

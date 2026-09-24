@@ -1087,84 +1087,94 @@ async fn commit_workflow_execution_timeout(
     // `wake_parent_for_child_timeout` below raises a dispatch hint (issue
     // #1429). The scope ties its publish to this transaction's commit, so
     // a reader never probes a parent row before it is visible.
-    crate::dispatch::buffered_settled(Box::pin(conn.transaction::<(
+    //
+    // `enforce_workflow_execution_timeouts` calls this once per expired
+    // execution in its own sweep loop (Codex review, issue #1429). A
+    // synchronous per-row publish (`buffered_settled`) would pay a Redis
+    // round trip once per row. It would stall the sweep when the channel
+    // is slow, even though Postgres already committed. Hand hints to the
+    // background publisher instead, the same fix already applied to the
+    // outbox sweeps in this file.
+    crate::dispatch::buffered_settled_in_background(Box::pin(conn.transaction::<(
         bool,
         Vec<crate::completion_trigger::DeferredTriggerStart>,
         Vec<(ExecutionId, String)>,
         Vec<crate::execution::StartCancelledRun>,
-    ), HarvestError, _>(async |conn| {
-        let timeout_event = timeout_event.clone();
-        let error_msg = error_msg.to_owned();
-        // Re-check state under lock to guard against concurrent completion.
-        let current_state: Option<String> = harvest_workflow_executions::table
-            .find(exec_id.as_uuid())
-            .for_update()
-            .select(harvest_workflow_executions::state)
-            .first(conn)
+    ), HarvestError, _>(
+        async |conn| {
+            let timeout_event = timeout_event.clone();
+            let error_msg = error_msg.to_owned();
+            // Re-check state under lock to guard against concurrent completion.
+            let current_state: Option<String> = harvest_workflow_executions::table
+                .find(exec_id.as_uuid())
+                .for_update()
+                .select(harvest_workflow_executions::state)
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+
+            match current_state.as_deref() {
+                Some("RUNNING") => {}
+                _ => return Ok((false, Vec::new(), Vec::new(), Vec::new())),
+            }
+
+            store::append_single_event(conn, exec_id, timeout_event).await?;
+            update_workflow_execution_timed_out(conn, exec_id, &error_msg).await?;
+
+            let _rows = diesel::update(
+                harvest_task_queue::table
+                    .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
+                    .filter(
+                        harvest_task_queue::state
+                            .eq("PENDING")
+                            .or(harvest_task_queue::state.eq("RUNNING")),
+                    ),
+            )
+            .set((
+                harvest_task_queue::state.eq("FAILED"),
+                harvest_task_queue::error.eq(Some(&error_msg)),
+                harvest_task_queue::completed_at.eq(Some(Utc::now())),
+            ))
+            .execute(conn)
             .await
-            .optional()
             .map_err(crate::error::database_error)?;
 
-        match current_state.as_deref() {
-            Some("RUNNING") => {}
-            _ => return Ok((false, Vec::new(), Vec::new(), Vec::new())),
-        }
-
-        store::append_single_event(conn, exec_id, timeout_event).await?;
-        update_workflow_execution_timed_out(conn, exec_id, &error_msg).await?;
-
-        let _rows = diesel::update(
-            harvest_task_queue::table
-                .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
-                .filter(
-                    harvest_task_queue::state
-                        .eq("PENDING")
-                        .or(harvest_task_queue::state.eq("RUNNING")),
-                ),
-        )
-        .set((
-            harvest_task_queue::state.eq("FAILED"),
-            harvest_task_queue::error.eq(Some(&error_msg)),
-            harvest_task_queue::completed_at.eq(Some(Utc::now())),
-        ))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-        if let Some(parent_uuid) = parent_uuid {
-            wake_parent_for_child_timeout(
-                conn,
-                execution_id_from_uuid(parent_uuid),
-                exec_id,
-                &error_msg,
-            )
-            .await?;
-        }
-
-        // Issue #1243: neither this cascade nor `timeout_event`
-        // (`WorkflowExecutionTimedOut`) carries a payload-bearing field.
-        // `enforce_workflow_execution_timeouts` also has no configured
-        // registry threaded through its many test call sites. Identity is
-        // exact here, not a shortcut.
-        let (mut deferred, closed_children) =
-            apply_parent_close_cascade(conn, exec_id, &crate::store::DEFAULT_PAYLOAD_CODECS)
+            if let Some(parent_uuid) = parent_uuid {
+                wake_parent_for_child_timeout(
+                    conn,
+                    execution_id_from_uuid(parent_uuid),
+                    exec_id,
+                    &error_msg,
+                )
                 .await?;
-        let mut pending_cancel_metrics = Vec::new();
-        // Issue #1243: same identity-registry rationale as this function's
-        // `apply_parent_close_cascade` call above.
-        let triggers =
-            crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
-                conn,
-                exec_id,
-                crate::completion_trigger::TerminalState::TimedOut,
-                metrics,
-                &mut pending_cancel_metrics,
-                &crate::store::DEFAULT_PAYLOAD_CODECS,
-            )
-            .await?;
-        deferred.extend(triggers);
-        Ok((true, deferred, closed_children, pending_cancel_metrics))
-    })))
+            }
+
+            // Issue #1243: neither this cascade nor `timeout_event`
+            // (`WorkflowExecutionTimedOut`) carries a payload-bearing field.
+            // `enforce_workflow_execution_timeouts` also has no configured
+            // registry threaded through its many test call sites. Identity is
+            // exact here, not a shortcut.
+            let (mut deferred, closed_children) =
+                apply_parent_close_cascade(conn, exec_id, &crate::store::DEFAULT_PAYLOAD_CODECS)
+                    .await?;
+            let mut pending_cancel_metrics = Vec::new();
+            // Issue #1243: same identity-registry rationale as this function's
+            // `apply_parent_close_cascade` call above.
+            let triggers =
+                crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
+                    conn,
+                    exec_id,
+                    crate::completion_trigger::TerminalState::TimedOut,
+                    metrics,
+                    &mut pending_cancel_metrics,
+                    &crate::store::DEFAULT_PAYLOAD_CODECS,
+                )
+                .await?;
+            deferred.extend(triggers);
+            Ok((true, deferred, closed_children, pending_cancel_metrics))
+        },
+    )))
     .await
 }
 
@@ -1203,8 +1213,16 @@ async fn enforce_activity_timeout(
     let mut tx = conn.build_transaction().read_committed();
     // `wake_workflow_task` below raises a dispatch hint (issue #1429). The
     // scope ties its publish to this transaction's commit.
-    let enforced = crate::dispatch::buffered_settled(Box::pin(tx.run::<bool, HarvestError, _>(
-        async |conn| {
+    //
+    // `enforce_timeouts_once_on_conn_shard` calls this once per timed-out
+    // activity task in its own sweep loop (Codex review, issue #1429). A
+    // synchronous per-row publish (`buffered_settled`) would pay a Redis
+    // round trip once per row. It would stall the sweep when the channel
+    // is slow, even though Postgres already committed. Hand hints to the
+    // background publisher instead, the same fix already applied to the
+    // outbox sweeps in this file.
+    let enforced = crate::dispatch::buffered_settled_in_background(Box::pin(
+        tx.run::<bool, HarvestError, _>(async |conn| {
             let error = error.clone();
 
             // Authoritative QUEUE-pause re-check (issue #619). The scan predicate
@@ -1410,8 +1428,8 @@ async fn enforce_activity_timeout(
             queue::fail_task(conn, task.id, &error).await?;
             queue::wake_workflow_task(conn, exec_id).await?;
             Ok(true)
-        },
-    )))
+        }),
+    ))
     .await?;
 
     // Circuit breaker (issue #369): a start-to-close / heartbeat timeout against
@@ -1803,8 +1821,13 @@ async fn enforce_workflow_timeout(
     let mut tx = conn.build_transaction().read_committed();
     // `wake_parent_for_child_timeout` below raises a dispatch hint (issue
     // #1429). The scope ties its publish to this transaction's commit.
-    let enforced =
-        crate::dispatch::buffered_settled(Box::pin(tx.run::<_, HarvestError, _>(async |conn| {
+    //
+    // `enforce_timeouts_once_on_conn_shard` calls this once per timed-out
+    // workflow task in its own sweep loop, the same reason
+    // `enforce_activity_timeout` above switched (Codex review, issue
+    // #1429).
+    let enforced = crate::dispatch::buffered_settled_in_background(Box::pin(
+        tx.run::<_, HarvestError, _>(async |conn| {
             // Authoritative QUEUE-pause re-check (issue #619), the exact mirror of
             // the one in `enforce_activity_timeout` — see that function for the full
             // rationale on why an advisory lock (not a bare re-read) is required and
@@ -1915,8 +1938,9 @@ async fn enforce_workflow_timeout(
                 closed_children,
                 pending_cancel_metrics,
             )))
-        })))
-        .await?;
+        }),
+    ))
+    .await?;
 
     // Suppressed by a queue pause: nothing was written, so there is nothing to
     // cascade, no handler check to run, and no schedule failure to count.
