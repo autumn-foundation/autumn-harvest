@@ -8,6 +8,23 @@ holds — see below — and used the reclaimed capability to independently
 reproduce both the failure and the fix already proposed in open PR #1713,
 without merging or otherwise altering it.
 
+**Corrected across one Codex review round on this PR, three findings.**
+First: the opening claim that `HARVEST_TEST_DATABASE_URL` bypasses Docker
+for "every DB-backed test in this crate" overstated the fallback's
+reach — one of `integration_e2e.rs`'s three setup helpers
+(`setup_test_database_url()`) starts a testcontainer unconditionally and
+never reads that variable; only the two helpers this report's own target
+test actually uses do. Narrowed throughout. Second: this report's claim
+that a branch lacked PR #1713's fix rested on `git merge-base
+--is-ancestor` against the fix commit's SHA alone, which cannot rule out an
+equivalent fix landing under a different commit — checked the branch's own
+tree content directly instead (still missing). Third: this report's
+`CREATE TABLE`-only inspection of the unpatched schema wrongly claimed the
+`outcome` column was also missing; a later `ALTER TABLE` elsewhere in the
+same bundle adds it. Corrected: the unpatched schema is missing exactly
+`target_shard`/`target_workflow_name`, not `outcome`. All three corrected
+inline, matching this series' convention.
+
 ## 🎯 Verdict path
 
 Same verdict path as the whole series: `ci.yml`'s `pull_request` trigger
@@ -27,11 +44,28 @@ brings it up without systemd (this container has no PID 1 init, confirmed by
 `systemctl` failing with "Host is down" — `pg_ctlcluster` does not need it).
 
 That, combined with a fact this series had already documented but not
-connected — `HARVEST_TEST_DATABASE_URL` lets every DB-backed test in this
-crate run against **any** reachable Postgres, bypassing testcontainers
-entirely — means the rerun protocol this role's hard gate requires does not
-actually need Docker in this repository. It needs a Postgres server and the
-right schema on it, and this sandbox can produce both.
+connected — `HARVEST_TEST_DATABASE_URL` lets a DB-backed test in this crate
+run against **any** reachable Postgres, bypassing testcontainers entirely —
+means the rerun protocol this role's hard gate requires does not actually
+need Docker for at least some tests in this repository. It needs a Postgres
+server, the right schema on it, and a test that checks the env var, and this
+sandbox can produce all three for the specific test this report targets.
+
+**Correction (post-review, Codex on this PR).** An earlier draft of the
+paragraph above said "every DB-backed test in this crate," which overstates
+the fallback's reach. `integration_e2e.rs` defines three setup helpers, not
+one: `setup_test_database_url()` (`integration_e2e.rs:512-518`) starts a
+testcontainer **unconditionally** and never reads
+`HARVEST_TEST_DATABASE_URL` at all; only `setup_test_db()`
+(`integration_e2e.rs:478-484`) and `setup_test_database_url_or_env()`
+(`integration_e2e.rs:538-543`, the one
+`quota_enforcement_tests.rs`'s target test actually calls, confirmed by
+reading its `setup_db()` at line 3656) check the env var first. Any test in
+this crate that calls the Docker-only helper directly, or transitively
+through a caller that does, still requires Docker — this report's claim is
+correctly scoped only to tests reachable through one of the two
+env-var-aware helpers, which is the specific path this report's own rerun
+protocol exercised.
 
 **The one thing this path cannot do** is exercise the testcontainers
 provisioning code path itself. That matters here specifically because this
@@ -65,11 +99,23 @@ workflow should reach expected state within timeout: Elapsed(())
 
 Confirmed this branch does not carry PR #1713's fix:
 `git merge-base --is-ancestor f63634b8893d2b946e8cee716456aa44ddaa82c8
-origin/claude/cool-noether-dymixg` → not an ancestor. This is the 9th
-confirmed occurrence of this exact signature across the series (8 from the
-09-23 report, plus this one) — not a new independent data point weakening
-the diagnosis, just the expected result of an unmerged fix on a still-affected
-base.
+origin/claude/cool-noether-dymixg` → not an ancestor. **Correction
+(post-review, Codex on this PR):** an earlier draft stopped at that ancestry
+check, which only proves this one commit is absent — a cherry-pick, squash,
+or independently-written equivalent edit could carry the same fix under a
+different SHA, the same class of gap this series' 09-23 report already
+found and corrected for a different ancestry check. Read the branch's own
+tree directly instead: `git show
+origin/claude/cool-noether-dymixg:autumn-harvest/tests/integration/integration_e2e.rs`
+shows the `INIT_SQL` bundle ending at the same last migration
+(`20260920014641_harvest_staging_vacated_by`) as the unpatched dump this
+report tested against, with no `include_str!` for
+`20260920215812_harvest_completion_trigger_fires_target` anywhere in the
+file — confirmed missing by content, not merely by commit ancestry. This is
+the 9th confirmed occurrence of this exact signature across the series (8
+from the 09-23 report, plus this one) — not a new independent data point
+weakening the diagnosis, just the expected result of an unmerged fix on a
+still-affected base.
 
 ## 🔍 Diagnosis — independently reproduced, not merely re-read
 
@@ -100,13 +146,28 @@ log.
 2. **The current, unpatched `INIT_SQL`, dumped and inspected directly.**
    Added a temporary `#[test]` to `integration_e2e.rs` that wrote the
    constant to disk (reverted before this commit — it is not part of the fix
-   and is not this report's contribution), confirming: `CREATE TABLE
-   harvest_completion_trigger_fires (source_exec_id UUID NOT NULL, trigger_id
+   and is not this report's contribution), confirming the table's `CREATE
+   TABLE` statement declares only `source_exec_id UUID NOT NULL, trigger_id
    UUID NOT NULL, fired_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY
-   (source_exec_id, trigger_id));` — no `outcome`, no `target_shard`, no
-   `target_workflow_name`. Applying this exact SQL to a real Postgres and
-   attempting the insert `completion_trigger.rs` makes reproduces the precise
-   error PR #1713 names: `ERROR: column "target_shard" of relation
+   (source_exec_id, trigger_id)`, with no `target_shard`/`target_workflow_name`.
+   **Correction (post-review, Codex on this PR):** an earlier draft of this
+   bullet, and of the Reproduce section's `sed` command, said the table has
+   no `outcome` column either. That is wrong — the `CREATE TABLE` statement
+   alone lacks it, but migration `20260708000001_harvest_completion_trigger_condition`
+   (already in the unpatched bundle) issues a later `ALTER TABLE
+   harvest_completion_trigger_fires ADD COLUMN outcome TEXT NULL`, confirmed
+   directly at `/tmp/semaphore_init_sql_unpatched.sql:972`. The `sed` command
+   this report used to inspect the table (`sed -n
+   '/CREATE TABLE .../, /);/p'`) stops at the `CREATE TABLE` statement's own
+   closing `);` and so cannot see a later `ALTER TABLE` — it understates
+   nothing about `target_shard`/`target_workflow_name` (no migration adds
+   those columns anywhere in the unpatched bundle, confirmed by grepping the
+   whole dump, not just the `CREATE TABLE` block), but it cannot support a
+   claim about `outcome`. Corrected: the unpatched schema is missing exactly
+   `target_shard` and `target_workflow_name`, not `outcome`. Applying this
+   exact SQL to a real Postgres and attempting the insert
+   `completion_trigger.rs` makes reproduces the precise error PR #1713
+   names: `ERROR: column "target_shard" of relation
    "harvest_completion_trigger_fires" does not exist`.
 3. **The test itself, run against both schemas, on this sandbox's local
    Postgres (no Docker, no testcontainers) — see Measurement.**
@@ -228,9 +289,15 @@ cargo test -p autumn-harvest --test integration --features db \
   integration_e2e::semaphore_scratch_dump_init_sql -- --exact
 git checkout -- autumn-harvest/tests/integration/integration_e2e.rs   # revert the probe
 
-# Confirm the exact table shape PR #1713 describes -- no target_shard column:
+# Confirm the CREATE TABLE statement's own columns -- this alone is NOT the
+# final table shape (see the Diagnosis correction on `outcome` above): a
+# later ALTER TABLE elsewhere in the bundle adds `outcome`. Grep the WHOLE
+# dump, not just the CREATE TABLE block, to confirm what's actually missing:
 sed -n '/CREATE TABLE harvest_completion_trigger_fires/,/);/p' /tmp/semaphore_init_sql_unpatched.sql
-# -> source_exec_id, trigger_id, fired_at only
+# -> source_exec_id, trigger_id, fired_at only (outcome added later, below)
+grep -n "harvest_completion_trigger_fires" /tmp/semaphore_init_sql_unpatched.sql
+# -> CREATE TABLE (above) plus one ALTER TABLE ... ADD COLUMN outcome TEXT NULL;
+#    no target_shard/target_workflow_name ALTER anywhere in the file
 
 # Build two throwaway databases: current (unpatched) and PR #1713's fix applied as SQL.
 su postgres -c "psql -c 'CREATE DATABASE semaphore_unpatched OWNER postgres;'"
