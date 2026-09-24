@@ -1876,7 +1876,9 @@ pub async fn fire_due_throttled_starts_with_codecs(
 
     let mut fired_count = 0usize;
     match sharded_pool {
-        Some(sp) if !shard_assignments.is_empty() => {
+        // A single assigned shard falls through to `conn`, the caller's own
+        // connection to that shard. See `connect_to_shard` for why.
+        Some(sp) if shard_assignments.len() > 1 => {
             for shard in shard_assignments {
                 let Some(mut shard_conn) = crate::shard::connect_to_shard(
                     sp,
