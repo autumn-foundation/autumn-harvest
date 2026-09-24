@@ -27674,7 +27674,7 @@ impl Worker {
         let timeout_checkers: Vec<_> = shard_pools_for_monitors
             .iter()
             .map(|(shard_pool, shard)| {
-                crate::timeout::spawn_timeout_checker_for_shard(
+                crate::timeout::spawn_timeout_checker_on_shard_pool(
                     shard_pool.clone(),
                     self.shutdown.clone(),
                     self.config.poll_interval,
@@ -27685,6 +27685,9 @@ impl Worker {
                     self.registry.circuit_breakers(),
                     self.config.max_workflow_history_events,
                     worker_stale_secs,
+                    *shard,
+                    // `shard_pool` is this shard's own pool: see how
+                    // `shard_pools_for_monitors` pairs them above.
                     *shard,
                     self.registry.payload_codecs().clone(),
                     self.config.codec_rotation_batch_size,

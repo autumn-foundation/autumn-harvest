@@ -1898,15 +1898,6 @@ pub(crate) type ShardConn = deadpool::managed::Object<
 /// fired and committed before a later shard's connection fails. This
 /// preserves that order.
 ///
-/// Do not call this for the shard the caller's own connection already
-/// belongs to. The per-shard timeout checker calls these scanners with that
-/// connection checked out and `shard_assignments == [its own shard]`. A
-/// second `pool.get()` against the same pool is then a hold-and-wait.
-/// Harvest configures no deadpool acquisition timeout. Once that pool is
-/// exhausted, the wait never ends, and it wedges the whole timeout pass.
-/// A single assigned shard must run on the caller's own connection instead
-/// (issue #1426 follow-up).
-///
 /// # Errors
 /// Returns [`HarvestError::Database`](crate::error::HarvestError::Database)
 /// for a connect failure under [`ShardConnectError::Abort`].
@@ -1930,6 +1921,71 @@ pub(crate) async fn connect_to_shard(
             ShardConnectError::Abort => Err(crate::error::HarvestError::Database(e.to_string())),
         },
     }
+}
+
+/// A connection to one shard: the caller's own, or one checked out for it.
+#[cfg(feature = "db")]
+pub(crate) enum ShardConnRef<'a> {
+    Caller(&'a mut AsyncPgConnection),
+    // Boxed: a pooled connection is far larger than a borrow.
+    Pooled(Box<ShardConn>),
+}
+
+#[cfg(feature = "db")]
+impl std::ops::Deref for ShardConnRef<'_> {
+    type Target = AsyncPgConnection;
+
+    fn deref(&self) -> &AsyncPgConnection {
+        match self {
+            Self::Caller(conn) => conn,
+            Self::Pooled(conn) => conn,
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+impl std::ops::DerefMut for ShardConnRef<'_> {
+    fn deref_mut(&mut self) -> &mut AsyncPgConnection {
+        match self {
+            Self::Caller(conn) => conn,
+            Self::Pooled(conn) => conn,
+        }
+    }
+}
+
+/// [`connect_to_shard`], but reuse `conn` when it already belongs to `shard`.
+///
+/// `conn_shard` names the shard `conn` came from. Only a caller that checked
+/// `conn` out of that shard's own pool may pass `Some`. Every other caller
+/// passes `None` and gets [`connect_to_shard`] unchanged. Nothing here infers
+/// the shard from `conn` or from the assignment list.
+///
+/// The per-shard timeout checker is the caller this exists for. It holds
+/// `conn` for the whole pass, and its scanners visit that same shard. A
+/// second `pool.get()` on that pool is then a hold-and-wait. Harvest
+/// configures no deadpool acquisition timeout. Once the pool is exhausted,
+/// the wait never ends, and it wedges the whole pass (issue #1426
+/// follow-up).
+///
+/// # Errors
+/// Same as [`connect_to_shard`].
+#[cfg(feature = "db")]
+pub(crate) async fn connect_or_reuse<'a>(
+    conn: &'a mut AsyncPgConnection,
+    conn_shard: Option<ShardId>,
+    sharded_pool: &ShardedDbPool,
+    shard: ShardId,
+    log_tag: &str,
+    on_connect_error: ShardConnectError,
+) -> crate::error::HarvestResult<Option<ShardConnRef<'a>>> {
+    if conn_shard == Some(shard) && sharded_pool.exact_pool_for(shard).is_some() {
+        return Ok(Some(ShardConnRef::Caller(conn)));
+    }
+    Ok(
+        connect_to_shard(sharded_pool, shard, log_tag, on_connect_error)
+            .await?
+            .map(|c| ShardConnRef::Pooled(Box::new(c))),
+    )
 }
 
 #[cfg(test)]
