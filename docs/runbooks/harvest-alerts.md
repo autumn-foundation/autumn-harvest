@@ -640,6 +640,16 @@ harvest dlq redrive \
   --max 500 --reason "stripe rate-limit cleared, incident-1234"
 ```
 
+Redrive specific rows instead of a filter when you already have their ids —
+from `harvest dlq list`, or from a bug report — with `--dead-letter-id`
+(repeatable, or comma-separated):
+
+```bash
+harvest dlq redrive \
+  --dead-letter-id 8f14e2c1-4b3a-4d9e-9a2f-6c1d0b5e7f31,a93c0752-1e6d-4a8b-8f0c-2d9b7a4e1c56 \
+  --reason "stripe rate-limit cleared, incident-1234"
+```
+
 The response distinguishes `matched` (total filtered), `redriven`,
 `skipped`, and `failed`. Read it:
 

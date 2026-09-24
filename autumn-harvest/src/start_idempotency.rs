@@ -730,6 +730,23 @@ mod db_impl {
         sharded_pool: &Option<crate::shard::ShardedDbPool>,
         shard_assignments: &[crate::types::ShardId],
     ) -> HarvestResult<usize> {
+        sweep_expired_start_idempotency_on_conn_shard(
+            conn,
+            None,
+            sharded_pool.as_ref(),
+            shard_assignments,
+        )
+        .await
+    }
+
+    /// [`sweep_expired_start_idempotency`] for a caller that knows `conn`'s
+    /// shard. See [`crate::shard::connect_or_reuse`].
+    pub async fn sweep_expired_start_idempotency_on_conn_shard(
+        conn: &mut AsyncPgConnection,
+        conn_shard: Option<crate::types::ShardId>,
+        sharded_pool: Option<&crate::shard::ShardedDbPool>,
+        shard_assignments: &[crate::types::ShardId],
+    ) -> HarvestResult<usize> {
         async fn purge_on_conn(
             conn: &mut AsyncPgConnection,
             shard_id: i32,
@@ -767,17 +784,17 @@ mod db_impl {
         match sharded_pool {
             Some(sp) if !shard_assignments.is_empty() => {
                 for shard in shard_assignments {
-                    let Some(pool) = sp.exact_pool_for(*shard).cloned() else {
+                    let Some(mut shard_conn) = crate::shard::connect_or_reuse(
+                        conn,
+                        conn_shard,
+                        sp,
+                        *shard,
+                        "start_idempotency",
+                        crate::shard::ShardConnectError::LogAndSkip,
+                    )
+                    .await?
+                    else {
                         continue;
-                    };
-                    let mut shard_conn = match pool.get().await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::error!(
-                                "[start_idempotency] failed to get connection to shard {shard:?}: {e:?}"
-                            );
-                            continue;
-                        }
                     };
                     total += purge_on_conn(&mut shard_conn, shard.as_i32(), window_secs).await?;
                 }
@@ -790,6 +807,8 @@ mod db_impl {
     }
 }
 
+#[cfg(feature = "db")]
+pub(crate) use db_impl::sweep_expired_start_idempotency_on_conn_shard;
 #[cfg(feature = "db")]
 pub use db_impl::{
     lookup_live_start_idempotency_claim, purge_expired_start_idempotency,

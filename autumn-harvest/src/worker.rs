@@ -1214,6 +1214,214 @@ impl HandlerRegistry {
                 per.max(self.max_activity_input_bytes)
             })
     }
+
+    /// Resolve the declared `execution_timeout`/`sla`/ceiling for a
+    /// scheduler-initiated start of `name` (issue #1412).
+    ///
+    /// `name` is a registered workflow's own name. `name` can also be a
+    /// DAG's shadow `WorkflowInfo` name (`DagInfo::as_workflow_info`
+    /// registers a DAG under its own name). One lookup covers both kinds.
+    ///
+    /// Returns raw declared values. This function clamps nothing. A caller
+    /// applies the ceiling to `execution_timeout` itself. A caller also
+    /// clamps `sla` to `execution_timeout` itself, when needed. Behavior
+    /// does not change from before this extraction. This function
+    /// centralizes the lookup only, not the downstream policy.
+    ///
+    /// Every field is `None` when `name` is not registered and the
+    /// registry declares no fleet-wide ceiling.
+    #[must_use]
+    pub fn resolve_dispatch_deadline(&self, name: &str) -> DispatchDeadline {
+        let info = self.workflows.get(name);
+        let execution_timeout = info
+            .and_then(|info| info.execution_timeout)
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        let sla = info
+            .and_then(|info| info.sla)
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        let max_execution_timeout_ceiling = self
+            .max_workflow_execution_timeout
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        DispatchDeadline {
+            execution_timeout,
+            sla,
+            max_execution_timeout_ceiling,
+        }
+    }
+}
+
+/// Return type of [`HandlerRegistry::resolve_dispatch_deadline`] (issue #1412).
+///
+/// A named struct, not a same-typed tuple. A caller cannot silently
+/// transpose `execution_timeout`/`sla`/the ceiling at a new call site — a
+/// mismatched field name fails to compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchDeadline {
+    pub execution_timeout: Option<chrono::Duration>,
+    pub sla: Option<chrono::Duration>,
+    pub max_execution_timeout_ceiling: Option<chrono::Duration>,
+}
+
+#[cfg(test)]
+mod resolve_dispatch_deadline_tests {
+    use super::*;
+
+    /// Build a bare `WorkflowInfo` with only the deadline fields set.
+    fn deadline_info_fixture(
+        name: &'static str,
+        execution_timeout: Option<std::time::Duration>,
+        sla: Option<std::time::Duration>,
+    ) -> WorkflowInfo {
+        WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
+            mcp: false,
+            name,
+            module: "tests",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout,
+            chain_execution_timeout: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            sla,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }
+    }
+
+    #[test]
+    fn unregistered_name_resolves_to_none() {
+        let registry = HandlerRegistry::new(vec![], vec![]);
+        assert_eq!(
+            registry.resolve_dispatch_deadline("no_such_workflow"),
+            DispatchDeadline {
+                execution_timeout: None,
+                sla: None,
+                max_execution_timeout_ceiling: None,
+            }
+        );
+    }
+
+    #[test]
+    fn declared_values_are_propagated_raw() {
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "wf",
+                Some(std::time::Duration::from_secs(60)),
+                Some(std::time::Duration::from_secs(30)),
+            )],
+            vec![],
+        );
+        assert_eq!(
+            registry.resolve_dispatch_deadline("wf"),
+            DispatchDeadline {
+                execution_timeout: Some(chrono::Duration::seconds(60)),
+                sla: Some(chrono::Duration::seconds(30)),
+                max_execution_timeout_ceiling: None,
+            }
+        );
+    }
+
+    #[test]
+    fn undeclared_values_resolve_to_none() {
+        let registry = HandlerRegistry::new(vec![deadline_info_fixture("wf", None, None)], vec![]);
+        assert_eq!(
+            registry.resolve_dispatch_deadline("wf"),
+            DispatchDeadline {
+                execution_timeout: None,
+                sla: None,
+                max_execution_timeout_ceiling: None,
+            }
+        );
+    }
+
+    #[test]
+    fn ceiling_is_read_from_the_registry_regardless_of_name() {
+        let registry = HandlerRegistry::new(vec![], vec![])
+            .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600)));
+        assert_eq!(
+            registry.resolve_dispatch_deadline("no_such_workflow"),
+            DispatchDeadline {
+                execution_timeout: None,
+                sla: None,
+                max_execution_timeout_ceiling: Some(chrono::Duration::seconds(3600)),
+            }
+        );
+    }
+
+    #[test]
+    fn ceiling_is_never_applied_to_the_declared_value_here() {
+        // resolve_dispatch_deadline returns raw declared values; clamping
+        // against the ceiling is each call site's own concern, unchanged
+        // from before this extraction (issue #1412).
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "wf",
+                Some(std::time::Duration::from_secs(7200)),
+                None,
+            )],
+            vec![],
+        )
+        .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600)));
+        assert_eq!(
+            registry.resolve_dispatch_deadline("wf"),
+            DispatchDeadline {
+                execution_timeout: Some(chrono::Duration::seconds(7200)),
+                sla: None,
+                max_execution_timeout_ceiling: Some(chrono::Duration::seconds(3600)),
+            }
+        );
+    }
+
+    /// A DAG's shadow `WorkflowInfo` resolves through the exact same code
+    /// path as a plain `#[workflow]` (issue #1412). `DagInfo::as_workflow_info`
+    /// propagates `execution_timeout`/`sla` verbatim onto that shadow entry,
+    /// and `HandlerRegistry::new` indexes it into `self.workflows` under the
+    /// DAG's own name like any other `WorkflowInfo`.
+    #[test]
+    fn dag_shadow_workflow_info_resolves_like_a_plain_workflow() {
+        let dag = crate::info::DagInfo {
+            name: "my_dag",
+            module: "tests",
+            schedule: None,
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: |_| {},
+            workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+            jitter: std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+            execution_timeout: Some(std::time::Duration::from_secs(120)),
+            sla: Some(std::time::Duration::from_secs(90)),
+        };
+        let shadow_workflow_info = dag
+            .as_workflow_info()
+            .expect("workflow_handler is Some, so as_workflow_info must be Some");
+        let registry = HandlerRegistry::new(vec![shadow_workflow_info], vec![]);
+        assert_eq!(
+            registry.resolve_dispatch_deadline("my_dag"),
+            DispatchDeadline {
+                execution_timeout: Some(chrono::Duration::seconds(120)),
+                sla: Some(chrono::Duration::seconds(90)),
+                max_execution_timeout_ceiling: None,
+            }
+        );
+    }
 }
 
 impl std::fmt::Debug for HandlerRegistry {
@@ -23830,7 +24038,20 @@ fn spawn_queue_depth_sampler(
             // single-pool path that skipped the sample on read failure (#522).
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -23944,7 +24165,20 @@ fn spawn_concurrency_sampler(
             // doesn't under-report concurrency during a storage outage (#522).
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -24054,7 +24288,20 @@ fn spawn_rate_limit_sampler(
             // doesn't under-report available tokens during a storage outage (#522).
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -24137,7 +24384,15 @@ fn spawn_dlq_depth_sampler(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            let mut conn = match pool.get().await {
+            // Selected against `cancel` (issue #1426). See the comment
+            // above `spawn_worker_heartbeat`'s own `pool.get()` call for
+            // why an unselected acquisition here can park shutdown
+            // forever.
+            let get_result = tokio::select! {
+                () = cancel.cancelled() => break,
+                result = pool.get() => result,
+            };
+            let mut conn = match get_result {
                 Ok(conn) => conn,
                 Err(error) => {
                     tracing::debug!(
@@ -24207,7 +24462,20 @@ fn spawn_queue_pause_sampler(
             let mut read_failed = false;
 
             for pool in &pools {
-                let Ok(mut conn) = pool.get().await else {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let Ok(mut conn) = get_result else {
                     read_failed = true;
                     continue;
                 };
@@ -24483,19 +24751,27 @@ fn spawn_replication_sampler(
             }
 
             for (shard_id, shard_pool) in &targets {
-                if sample_one_shard(
+                match sample_one_shard(
                     *shard_id,
                     shard_pool,
                     &telemetry,
                     watermark_retain,
                     interval,
                     &slot_prefix,
+                    &cancel,
                 )
                 .await
-                    == ShardSample::Fenced
                 {
-                    cancel.cancel();
-                    return;
+                    ShardSample::Fenced => {
+                        cancel.cancel();
+                        return;
+                    }
+                    // Issue #1426: the loop received a cancellation signal
+                    // while acquiring this shard's connection. Abandon the
+                    // remaining targets this tick rather than keep probing
+                    // them one by one against an already-cancelled token.
+                    ShardSample::Cancelled => break,
+                    ShardSample::Continue => {}
                 }
             }
         }
@@ -24511,6 +24787,10 @@ enum ShardSample {
     /// This worker has lost write authority for the shard. The caller stops
     /// the **whole** worker — see `spawn_replication_sampler`.
     Fenced,
+    /// The loop received a cancellation signal while acquiring this
+    /// shard's connection (issue #1426). The caller stops sampling the
+    /// remaining targets this tick.
+    Cancelled,
 }
 
 /// One shard's DR sample: self-fence check, watermark beat, gauges.
@@ -24518,7 +24798,12 @@ enum ShardSample {
 /// Split out of the sampler loop only because that loop outgrew the line
 /// budget; the ordering commentary that matters lives here, with the steps it
 /// describes.
+///
+/// The cancel-aware acquisition added for issue #1426 pushed this function
+/// itself past the same line limit. The ordering commentary above still
+/// argues against splitting it further.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 async fn sample_one_shard(
     shard_id: crate::types::ShardId,
     shard_pool: &DbPool,
@@ -24526,9 +24811,19 @@ async fn sample_one_shard(
     watermark_retain: Duration,
     sample_interval: Duration,
     slot_prefix: &str,
+    cancel: &CancellationToken,
 ) -> ShardSample {
     let shard_u16 = u16::try_from(shard_id.as_i32()).unwrap_or(0);
-    let Ok(mut conn) = shard_pool.get().await else {
+    // Selected against `cancel` (issue #1426): an unselected `pool.get()`
+    // here can park shutdown forever.
+    let get_result = tokio::select! {
+        () = cancel.cancelled() => None,
+        result = shard_pool.get() => Some(result),
+    };
+    let Some(get_result) = get_result else {
+        return ShardSample::Cancelled;
+    };
+    let Ok(mut conn) = get_result else {
         // A pool that cannot be reached is already covered by the worker's own
         // liveness signals; a DR sample is not worth a second alarm for the
         // same condition.
@@ -24708,7 +25003,15 @@ fn spawn_stranded_work_sampler(
                 // (queue, required_capabilities, ...) so coverage can honour the
                 // same eligibility claim_task enforces (issue #522 review).
                 let mut demands: Vec<crate::queue::ClaimablePendingDemand> = {
-                    let mut conn = match shard_pool.get().await {
+                    // Selected against `cancel` (issue #1426): an unselected
+                    // `pool.get()` here can park shutdown forever. Cancellation
+                    // abandons the remaining shards this tick, same as the
+                    // multi-pool samplers above.
+                    let get_result = tokio::select! {
+                        () = cancel.cancelled() => break,
+                        result = shard_pool.get() => result,
+                    };
+                    let mut conn = match get_result {
                         Ok(conn) => conn,
                         Err(error) => {
                             tracing::debug!(
@@ -24755,7 +25058,13 @@ fn spawn_stranded_work_sampler(
                 // collapsed to queue names) so the capability check below can see
                 // each worker's polled queues *and* labels.
                 let covering_workers: Vec<crate::workers::WorkerRow> = {
-                    let Ok(mut conn) = shard_pool.get().await else {
+                    // Selected against `cancel` (issue #1426); see the demands
+                    // acquisition above.
+                    let get_result = tokio::select! {
+                        () = cancel.cancelled() => break,
+                        result = shard_pool.get() => result,
+                    };
+                    let Ok(mut conn) = get_result else {
                         continue;
                     };
                     let filters = crate::workers::WorkerFilters {
@@ -24783,7 +25092,13 @@ fn spawn_stranded_work_sampler(
                 // claim_task enforces. On load failure fall back to an empty set
                 // (exact-match / legacy-worker rules still apply).
                 let compat_set = {
-                    let Ok(mut conn) = shard_pool.get().await else {
+                    // Selected against `cancel` (issue #1426); see the demands
+                    // acquisition above.
+                    let get_result = tokio::select! {
+                        () = cancel.cancelled() => break,
+                        result = shard_pool.get() => result,
+                    };
+                    let Ok(mut conn) = get_result else {
                         continue;
                     };
                     crate::build_routing::load_compat_set(&mut conn)
@@ -25074,7 +25389,15 @@ fn spawn_pause_auto_resumer(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            match pool.get().await {
+            // Selected against `cancel` (issue #1426). See the comment
+            // above `spawn_worker_heartbeat`'s own `pool.get()` call for
+            // why an unselected acquisition here can park shutdown
+            // forever.
+            let get_result = tokio::select! {
+                () = cancel.cancelled() => break,
+                result = pool.get() => result,
+            };
+            match get_result {
                 Ok(mut conn) => {
                     match crate::execution::auto_resume_expired_pauses(
                         &mut conn,
@@ -25150,7 +25473,20 @@ fn spawn_history_oversized_sampler(
             // (#522).
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -25427,7 +25763,20 @@ fn spawn_workflow_active_sampler(
             let mut per_shard: Vec<Vec<(String, ActiveWorkflowState, u64)>> = Vec::new();
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -27325,7 +27674,7 @@ impl Worker {
         let timeout_checkers: Vec<_> = shard_pools_for_monitors
             .iter()
             .map(|(shard_pool, shard)| {
-                crate::timeout::spawn_timeout_checker_for_shard(
+                crate::timeout::spawn_timeout_checker_on_shard_pool(
                     shard_pool.clone(),
                     self.shutdown.clone(),
                     self.config.poll_interval,
@@ -27336,6 +27685,9 @@ impl Worker {
                     self.registry.circuit_breakers(),
                     self.config.max_workflow_history_events,
                     worker_stale_secs,
+                    *shard,
+                    // `shard_pool` is this shard's own pool: see how
+                    // `shard_pools_for_monitors` pairs them above.
                     *shard,
                     self.registry.payload_codecs().clone(),
                     self.config.codec_rotation_batch_size,
@@ -28881,10 +29233,18 @@ impl Worker {
                 crate::queue_fairness::weighted_queue_order(&pairs, &mut rand::thread_rng());
 
             for queue_name in &ordered {
-                let single_queue = std::slice::from_ref(queue_name);
+                // `claim_task_on_shard` takes `&[String]`. `ordered` now
+                // borrows its names from `self.config.queues` instead of
+                // cloning all of them up front (issue #515 Bolt follow-up).
+                // Building the one-element slice therefore needs one owned
+                // String here, instead of `std::slice::from_ref`. This only
+                // allocates for a queue actually tried, not for the whole
+                // permutation. A claim that succeeds on the first
+                // (typically highest-weight) queue never pays for the rest.
+                let single_queue = [(*queue_name).to_owned()];
                 match queue::claim_task_on_shard(
                     &mut conn,
-                    single_queue,
+                    &single_queue,
                     &self.config.worker_id,
                     &self.config.build_id,
                     self.config.priority_aging_secs,
