@@ -312,6 +312,13 @@ diesel::table! {
         /// a mismatch means the evidence belongs to a frontier now behind us.
         /// `NULL` = none recorded yet, which reads as a mismatch.
         capability_miss_handler -> Nullable<Text>,
+        /// The `fires_at` of the durable timer this row is armed for (issue
+        /// #1402). Set only by `queue::reschedule_task`. Survives a later
+        /// `scheduled_at` drift with the same wake reason (a queue-pause
+        /// resume credit, an orphan reclaim, a capability-miss release).
+        /// `NULL` when no timer owns this row, or once a different wake
+        /// reason repends it.
+        timer_fires_at -> Nullable<Timestamptz>,
     }
 }
 

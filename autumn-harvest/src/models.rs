@@ -571,6 +571,12 @@ pub struct TaskQueueItem {
     /// `0 -> 1` and a mismatch resets to `1` — the same row either way.
     #[serde(default)]
     pub capability_miss_handler: Option<String>,
+    /// The `fires_at` of the durable timer this row is armed for (issue
+    /// #1402). Set only by `queue::reschedule_task`. Survives a later
+    /// `scheduled_at` drift with the same wake reason. `NULL` when no timer
+    /// owns this row, or once a different wake reason repends it.
+    #[serde(default)]
+    pub timer_fires_at: Option<DateTime<Utc>>,
 }
 
 /// Insert struct for enqueuing a new task.
