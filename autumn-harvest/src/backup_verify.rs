@@ -2994,23 +2994,64 @@ mod probes {
         retention_unproven: Vec<String>,
     }
 
-    /// Does a `harvest_execution_summaries` row prove retention collected
-    /// `target`? `Ok(false)` means the absence is unexplained: it could still
-    /// be retention (summaries are opt-in, issue #752), but nothing here
-    /// proves it.
-    async fn retention_summary_exists(
+    /// Which of the given execution ids have a `harvest_execution_summaries`
+    /// row, in ONE round trip (issue #1704 follow-up).
+    ///
+    /// Proves retention collected a target: absence from the returned set
+    /// means the absence is unexplained. It could still be retention
+    /// (summaries are opt-in, issue #752), but nothing here proves it.
+    ///
+    /// Mirrors [`matching_execution_states`]'s `= ANY($1)` shape, a few
+    /// lines above it in this same file. `adjudicate_refs`'s state lookup
+    /// was batched for issue #1704; this lookup, its sibling in the same
+    /// function, was left per-reference until now. The caller chunks at
+    /// [`WORKFLOW_KEY_LOOKUP_CHUNK`] -- this function does not chunk
+    /// internally, matching every other batched lookup in this file.
+    async fn matching_retention_summaries(
         conn: &mut AsyncPgConnection,
-        target: Uuid,
-    ) -> Result<bool, diesel::result::Error> {
-        let row: ExistsRow = diesel::sql_query(
-            "SELECT EXISTS ( \
-                 SELECT 1 FROM harvest_execution_summaries WHERE execution_id = $1 \
-               ) AS present",
+        targets: &[Uuid],
+    ) -> Result<std::collections::HashSet<Uuid>, diesel::result::Error> {
+        #[derive(diesel::QueryableByName)]
+        struct ExecutionIdRow {
+            #[diesel(sql_type = diesel::sql_types::Uuid)]
+            execution_id: Uuid,
+        }
+        let rows: Vec<ExecutionIdRow> = diesel::sql_query(
+            "SELECT execution_id FROM harvest_execution_summaries WHERE execution_id = ANY($1)",
         )
-        .bind::<diesel::sql_types::Uuid, _>(target)
-        .get_result(conn)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(targets)
+        .load(conn)
         .await?;
-        Ok(row.present)
+        Ok(rows.into_iter().map(|r| r.execution_id).collect())
+    }
+
+    /// One chunk's retention-summary proof, pre-fetched in a single batch
+    /// call (issue #1704 follow-up).
+    ///
+    /// Targets are exactly the references [`adjudicate_refs`]'s retention
+    /// branch will look at: a `ChildTerminalRecorded` or
+    /// `ExternalEffectDelivered` kind, absent from `states`. Split out of
+    /// `adjudicate_refs` to keep that function's own line count under
+    /// clippy's `too_many_lines` bound; the split changes no behavior.
+    async fn retention_present_for_chunk(
+        conn: &mut AsyncPgConnection,
+        chunk: &[&PendingRef],
+        states: &std::collections::HashMap<Uuid, String>,
+    ) -> Result<std::collections::HashSet<Uuid>, diesel::result::Error> {
+        let targets: Vec<Uuid> = chunk
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.kind,
+                    RefKind::ChildTerminalRecorded | RefKind::ExternalEffectDelivered(_)
+                ) && !states.contains_key(&r.target)
+            })
+            .map(|r| r.target)
+            .collect();
+        if targets.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        matching_retention_summaries(conn, &targets).await
     }
 
     /// One `(workflow_name, workflow_id)` business key, matched against a
@@ -3180,6 +3221,14 @@ mod probes {
     /// follow-up). Otherwise the chunk bound would cap round-trip size only.
     /// It would not bound the aggregate map this function holds for the
     /// whole reference set.
+    ///
+    /// The retention-summary proof a few lines below is batched the same way
+    /// (issue #1704 follow-up): every reference in the chunk whose target row
+    /// is absent is resolved by one shared `= ANY($1)` call to
+    /// [`matching_retention_summaries`], not one `EXISTS` round trip per such
+    /// reference. A restore drill against a backup old enough for retention
+    /// to have already run makes this branch the common case, not an edge
+    /// case, for a `ChildTerminalRecorded` reference set.
     async fn adjudicate_refs(conn: &mut AsyncPgConnection, owned: &[&PendingRef]) -> RefBuckets {
         let mut out = RefBuckets::default();
 
@@ -3198,6 +3247,11 @@ mod probes {
                     continue;
                 }
             };
+
+            // Pre-resolve retention-summary proof for the whole chunk before
+            // the per-reference match below, so that match only ever reads
+            // an already-fetched set -- never awaits a query of its own.
+            let retention_present = retention_present_for_chunk(conn, chunk, &states).await;
 
             for r in chunk {
                 // Absent from `states` means zero rows matched -- the batched
@@ -3233,9 +3287,9 @@ mod probes {
                     (
                         RefKind::ChildTerminalRecorded | RefKind::ExternalEffectDelivered(_),
                         None,
-                    ) => match retention_summary_exists(conn, r.target).await {
-                        Ok(true) => {}
-                        Ok(false) => out.retention_unproven.push(format!(
+                    ) => match &retention_present {
+                        Ok(present) if present.contains(&r.target) => {}
+                        Ok(_) => out.retention_unproven.push(format!(
                             "{} (referenced by {} on shard {}; absent with no \
                              retention summary on shard {})",
                             r.target, r.source_exec, r.source_shard, r.owner_shard
