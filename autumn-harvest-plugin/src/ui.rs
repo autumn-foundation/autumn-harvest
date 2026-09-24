@@ -413,6 +413,57 @@ pub(crate) struct BuildRoutingListParams {
     /// When set, filter tables to entries related to this build ID.
     #[serde(default)]
     build_id: Option<String>,
+    // The six `set_policy_*`/`compat_*` fields below carry a rejected
+    // submission's entered values and error text back through the redirect.
+    // Issue #1687 fixed this data-loss gap on the workflow detail page.
+    // This applies the same fix to the sibling forms it did not touch.
+    // Before this, a validation failure or a partial-shard failure
+    // re-rendered both forms empty. That discarded every field the operator
+    // had already typed, behind one generic top-of-page flash.
+    /// Error text for the "Set Build Policy" form, if its last submission failed.
+    #[serde(default)]
+    set_policy_error: Option<String>,
+    #[serde(default)]
+    set_policy_queue_name: Option<String>,
+    #[serde(default)]
+    set_policy_build_id: Option<String>,
+    #[serde(default)]
+    set_policy_deployment_name: Option<String>,
+    /// Error text for the "Declare Compatibility" form, if its last submission failed.
+    #[serde(default)]
+    compat_error: Option<String>,
+    #[serde(default)]
+    compat_build_id: Option<String>,
+    #[serde(default)]
+    compat_compatible_with: Option<String>,
+}
+
+/// Entered values and error text echoed back into the build-routing action
+/// forms after a rejected submission. `None` on a field means render it
+/// empty, matching a fresh page load — see `BuildRoutingListParams` above.
+#[derive(Debug, Default)]
+struct BuildRoutingActionEcho {
+    set_policy_error: Option<String>,
+    set_policy_queue_name: Option<String>,
+    set_policy_build_id: Option<String>,
+    set_policy_deployment_name: Option<String>,
+    compat_error: Option<String>,
+    compat_build_id: Option<String>,
+    compat_compatible_with: Option<String>,
+}
+
+impl From<&BuildRoutingListParams> for BuildRoutingActionEcho {
+    fn from(params: &BuildRoutingListParams) -> Self {
+        Self {
+            set_policy_error: params.set_policy_error.clone(),
+            set_policy_queue_name: params.set_policy_queue_name.clone(),
+            set_policy_build_id: params.set_policy_build_id.clone(),
+            set_policy_deployment_name: params.set_policy_deployment_name.clone(),
+            compat_error: params.compat_error.clone(),
+            compat_build_id: params.compat_build_id.clone(),
+            compat_compatible_with: params.compat_compatible_with.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -7738,6 +7789,7 @@ async fn list_build_routing_ui(
         reachability
     };
 
+    let action_echo = BuildRoutingActionEcho::from(&params);
     Ok(render_build_routing_page(
         &filtered_policies,
         &filtered_compat,
@@ -7748,6 +7800,7 @@ async fn list_build_routing_ui(
         is_multi_shard,
         params.flash.as_deref(),
         build_id_filter,
+        &action_echo,
     ))
 }
 
@@ -7757,12 +7810,16 @@ async fn build_routing_set_policy_ui(
 ) -> Result<axum::response::Response, AutumnError> {
     let queue_name = form.queue_name.trim().to_string();
     let build_id = form.build_id.trim().to_string();
+    let deployment_name_raw = form.deployment_name.clone().unwrap_or_default();
     if queue_name.is_empty() || build_id.is_empty() {
-        let flash = url_encode("queue_name and build_id must not be empty");
-        return Ok(
-            axum::response::Redirect::to(&format!("../build-routing?flash={flash}"))
-                .into_response(),
+        let error = url_encode("queue_name and build_id must not be empty");
+        let redirect_url = format!(
+            "../build-routing?set_policy_error={error}&set_policy_queue_name={}&set_policy_build_id={}&set_policy_deployment_name={}",
+            url_encode(&queue_name),
+            url_encode(&build_id),
+            url_encode(&deployment_name_raw),
         );
+        return Ok(axum::response::Redirect::to(&redirect_url).into_response());
     }
     let pool = api_state.storage_pool().map_err(map_error)?;
     let deployment_name = form.deployment_name.as_deref().filter(|s| !s.is_empty());
@@ -7813,21 +7870,30 @@ async fn build_routing_set_policy_ui(
         )
         .await;
     }
-    let flash = if shard_errors.is_empty() {
-        match last_policy {
+    if shard_errors.is_empty() {
+        let flash = match last_policy {
             Some(p) => url_encode(&format!(
                 "Build policy for queue '{}' set to '{}'",
                 p.queue_name, p.build_id
             )),
             None => url_encode("No shards configured"),
-        }
-    } else {
-        url_encode(&format!(
-            "Partial failure setting build policy: {}",
-            shard_errors.join("; ")
-        ))
-    };
-    Ok(axum::response::Redirect::to(&format!("../build-routing?flash={flash}")).into_response())
+        };
+        return Ok(
+            axum::response::Redirect::to(&format!("../build-routing?flash={flash}"))
+                .into_response(),
+        );
+    }
+    let error = url_encode(&format!(
+        "Partial failure setting build policy: {}",
+        shard_errors.join("; ")
+    ));
+    let redirect_url = format!(
+        "../build-routing?set_policy_error={error}&set_policy_queue_name={}&set_policy_build_id={}&set_policy_deployment_name={}",
+        url_encode(&queue_name),
+        url_encode(&build_id),
+        url_encode(&deployment_name_raw),
+    );
+    Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
 
 async fn build_routing_declare_compat_ui(
@@ -7837,11 +7903,13 @@ async fn build_routing_declare_compat_ui(
     let build_id = form.build_id.trim().to_string();
     let compatible_with = form.compatible_with.trim().to_string();
     if build_id.is_empty() || compatible_with.is_empty() {
-        let flash = url_encode("build_id and compatible_with must not be empty");
-        return Ok(
-            axum::response::Redirect::to(&format!("../build-routing?flash={flash}"))
-                .into_response(),
+        let error = url_encode("build_id and compatible_with must not be empty");
+        let redirect_url = format!(
+            "../build-routing?compat_error={error}&compat_build_id={}&compat_compatible_with={}",
+            url_encode(&build_id),
+            url_encode(&compatible_with),
         );
+        return Ok(axum::response::Redirect::to(&redirect_url).into_response());
     }
     let pool = api_state.storage_pool().map_err(map_error)?;
     // Fan out to all shards so load_compat_set() on each shard picks up the declaration.
@@ -7891,21 +7959,29 @@ async fn build_routing_declare_compat_ui(
         )
         .await;
     }
-    let flash = if shard_errors.is_empty() {
-        match last_entry {
+    if shard_errors.is_empty() {
+        let flash = match last_entry {
             Some(e) => url_encode(&format!(
                 "Declared: '{}' compatible with '{}'",
                 e.build_id, e.compatible_with
             )),
             None => url_encode("No shards configured"),
-        }
-    } else {
-        url_encode(&format!(
-            "Partial failure declaring compat: {}",
-            shard_errors.join("; ")
-        ))
-    };
-    Ok(axum::response::Redirect::to(&format!("../build-routing?flash={flash}")).into_response())
+        };
+        return Ok(
+            axum::response::Redirect::to(&format!("../build-routing?flash={flash}"))
+                .into_response(),
+        );
+    }
+    let error = url_encode(&format!(
+        "Partial failure declaring compat: {}",
+        shard_errors.join("; ")
+    ));
+    let redirect_url = format!(
+        "../build-routing?compat_error={error}&compat_build_id={}&compat_compatible_with={}",
+        url_encode(&build_id),
+        url_encode(&compatible_with),
+    );
+    Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
 
 async fn build_routing_revoke_compat_ui(
@@ -8147,10 +8223,18 @@ fn render_compat_card(all_compat: &[BuildCompatEntry]) -> Markup {
     }
 }
 
-fn render_build_routing_action_forms() -> Markup {
+fn render_build_routing_action_forms(echo: &BuildRoutingActionEcho) -> Markup {
     let input_style = "display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
     let btn_style = "background:#2563eb;color:#fff;border:0;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer;align-self:flex-start";
     let label_style = "font-size:12px;color:#94a3b8";
+    let set_policy_queue_name = echo.set_policy_queue_name.as_deref().unwrap_or_default();
+    let set_policy_build_id = echo.set_policy_build_id.as_deref().unwrap_or_default();
+    let set_policy_deployment_name = echo
+        .set_policy_deployment_name
+        .as_deref()
+        .unwrap_or_default();
+    let compat_build_id = echo.compat_build_id.as_deref().unwrap_or_default();
+    let compat_compatible_with = echo.compat_compatible_with.as_deref().unwrap_or_default();
     html! {
         div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px" {
             div.card {
@@ -8159,16 +8243,19 @@ fn render_build_routing_action_forms() -> Markup {
                     "Sets which build ID is assigned to new workflow starts on a queue. "
                     "Does not affect in-flight executions."
                 }
+                @if let Some(error) = &echo.set_policy_error {
+                    p.field-error role="alert" style="margin:0 0 10px" { (error) }
+                }
                 form method="post" action="build-routing/set-policy"
                       style="display:flex;flex-direction:column;gap:10px" {
                     label style=(label_style) { "Queue name"
-                        input type="text" name="queue_name" required placeholder="e.g. default" style=(input_style);
+                        input type="text" name="queue_name" required placeholder="e.g. default" style=(input_style) value=(set_policy_queue_name);
                     }
                     label style=(label_style) { "Build ID"
-                        input type="text" name="build_id" required placeholder="e.g. sha-abc123" style=(input_style);
+                        input type="text" name="build_id" required placeholder="e.g. sha-abc123" style=(input_style) value=(set_policy_build_id);
                     }
                     label style=(label_style) { "Deployment name (optional)"
-                        input type="text" name="deployment_name" placeholder="e.g. prod-v2" style=(input_style);
+                        input type="text" name="deployment_name" placeholder="e.g. prod-v2" style=(input_style) value=(set_policy_deployment_name);
                     }
                     button type="submit" style=(btn_style)
                         onclick="return confirm('Set build policy? New executions on this queue will use the specified build ID.')" {
@@ -8183,13 +8270,16 @@ fn render_build_routing_action_forms() -> Markup {
                     " can safely replay histories assigned to build " strong { "B" }
                     ". Only declare after replay tests confirm safety."
                 }
+                @if let Some(error) = &echo.compat_error {
+                    p.field-error role="alert" style="margin:0 0 10px" { (error) }
+                }
                 form method="post" action="build-routing/declare-compat"
                       style="display:flex;flex-direction:column;gap:10px" {
                     label style=(label_style) { "Worker build (A)"
-                        input type="text" name="build_id" required placeholder="e.g. sha-new" style=(input_style);
+                        input type="text" name="build_id" required placeholder="e.g. sha-new" style=(input_style) value=(compat_build_id);
                     }
                     label style=(label_style) { "Compatible with (B)"
-                        input type="text" name="compatible_with" required placeholder="e.g. sha-old" style=(input_style);
+                        input type="text" name="compatible_with" required placeholder="e.g. sha-old" style=(input_style) value=(compat_compatible_with);
                     }
                     button type="submit" style=(btn_style)
                         onclick="return confirm('Declare compatibility? Ensure replay tests have confirmed the new build can handle histories from the old build.')" {
@@ -8212,6 +8302,7 @@ fn render_build_routing_page(
     is_multi_shard: bool,
     flash: Option<&str>,
     build_id_filter: Option<&str>,
+    action_echo: &BuildRoutingActionEcho,
 ) -> Markup {
     let is_empty = policies.is_empty() && reachability.is_empty() && all_compat.is_empty();
 
@@ -8292,7 +8383,7 @@ fn render_build_routing_page(
             (render_compat_card(all_compat))
         }
 
-        (render_build_routing_action_forms())
+        (render_build_routing_action_forms(action_echo))
     };
 
     layout_build_routing("Build Routing · Vantage", &body, None)
@@ -14995,8 +15086,19 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_empty_state_shows_docs_link() {
-        let html = render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None)
-            .into_string();
+        let html = render_build_routing_page(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            None,
+            None,
+            &BuildRoutingActionEcho::default(),
+        )
+        .into_string();
         assert!(
             html.contains("No build routing configured") || html.contains("No build policies"),
             "empty state must show a 'no policies' message"
@@ -15019,8 +15121,19 @@ mod tests {
             target_build_id: None,
             ramp_percent: None,
         };
-        let html = render_build_routing_page(&[policy], &[], &[], &[], &[], &[], false, None, None)
-            .into_string();
+        let html = render_build_routing_page(
+            &[policy],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            None,
+            None,
+            &BuildRoutingActionEcho::default(),
+        )
+        .into_string();
         assert!(html.contains("test-queue"), "must show queue name");
         assert!(html.contains("abc123"), "must show build_id");
         assert!(html.contains("prod-v2"), "must show deployment name");
@@ -15036,8 +15149,19 @@ mod tests {
             stale_workers: 1,
             safe_to_retire: false,
         };
-        let html = render_build_routing_page(&[], &[], &[reach], &[], &[], &[], false, None, None)
-            .into_string();
+        let html = render_build_routing_page(
+            &[],
+            &[],
+            &[reach],
+            &[],
+            &[],
+            &[],
+            false,
+            None,
+            None,
+            &BuildRoutingActionEcho::default(),
+        )
+        .into_string();
         assert!(html.contains("sha-old"), "must show build_id");
         assert!(html.contains("42"), "must show open_executions count");
         assert!(
@@ -15056,8 +15180,19 @@ mod tests {
             stale_workers: 0,
             safe_to_retire: true,
         };
-        let html = render_build_routing_page(&[], &[], &[reach], &[], &[], &[], false, None, None)
-            .into_string();
+        let html = render_build_routing_page(
+            &[],
+            &[],
+            &[reach],
+            &[],
+            &[],
+            &[],
+            false,
+            None,
+            None,
+            &BuildRoutingActionEcho::default(),
+        )
+        .into_string();
         assert!(
             html.contains("Retire"),
             "retire button must appear when safe_to_retire"
@@ -15076,8 +15211,19 @@ mod tests {
             compatible_with: "sha-old".to_string(),
             declared_at: chrono::Utc::now(),
         };
-        let html = render_build_routing_page(&[], &[entry], &[], &[], &[], &[], false, None, None)
-            .into_string();
+        let html = render_build_routing_page(
+            &[],
+            &[entry],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            None,
+            None,
+            &BuildRoutingActionEcho::default(),
+        )
+        .into_string();
         assert!(
             html.contains("sha-new"),
             "must show worker build in compat table"
@@ -15104,6 +15250,7 @@ mod tests {
             false,
             Some("Policy updated"),
             None,
+            &BuildRoutingActionEcho::default(),
         )
         .into_string();
         assert!(
@@ -15114,8 +15261,19 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_has_set_policy_form() {
-        let html = render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None)
-            .into_string();
+        let html = render_build_routing_page(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            None,
+            None,
+            &BuildRoutingActionEcho::default(),
+        )
+        .into_string();
         assert!(
             html.contains("set-policy"),
             "page must include Set Policy form action"
@@ -15132,8 +15290,19 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_has_declare_compat_form() {
-        let html = render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None)
-            .into_string();
+        let html = render_build_routing_page(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            None,
+            None,
+            &BuildRoutingActionEcho::default(),
+        )
+        .into_string();
         assert!(
             html.contains("declare-compat"),
             "page must include Declare Compat form action"
@@ -15141,6 +15310,81 @@ mod tests {
         assert!(
             html.contains("compatible_with"),
             "Declare Compat form must include compatible_with field"
+        );
+    }
+
+    /// Wayfinder error-path fix — issue #1687's sibling gap on this page.
+    /// `build_routing_set_policy_ui` and `build_routing_declare_compat_ui`
+    /// used to redirect on every failure with only a flash message. A
+    /// rejected submission then redisplayed both forms empty. Both handlers
+    /// now carry the entered values and an inline error back through the
+    /// redirect's query params, which `list_build_routing_ui` turns into a
+    /// `BuildRoutingActionEcho`.
+    #[test]
+    fn render_build_routing_page_set_policy_error_echoes_entered_values() {
+        let echo = BuildRoutingActionEcho {
+            set_policy_error: Some("queue_name and build_id must not be empty".to_string()),
+            set_policy_queue_name: Some("payment_workflow".to_string()),
+            set_policy_build_id: Some(String::new()),
+            set_policy_deployment_name: Some("prod-v2".to_string()),
+            ..BuildRoutingActionEcho::default()
+        };
+        let html =
+            render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None, &echo)
+                .into_string();
+        assert!(
+            html.contains("queue_name and build_id must not be empty"),
+            "Set Policy error must render inline: {html}"
+        );
+        assert!(
+            html.contains(r#"name="queue_name" required placeholder="e.g. default" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px" value="payment_workflow""#),
+            "Set Policy form must re-fill the entered queue name: {html}"
+        );
+        assert!(
+            html.contains("prod-v2"),
+            "Set Policy form must re-fill the entered deployment name: {html}"
+        );
+    }
+
+    #[test]
+    fn render_build_routing_page_compat_error_echoes_entered_values() {
+        let echo = BuildRoutingActionEcho {
+            compat_error: Some("build_id and compatible_with must not be empty".to_string()),
+            compat_build_id: Some("sha-new123".to_string()),
+            compat_compatible_with: Some(String::new()),
+            ..BuildRoutingActionEcho::default()
+        };
+        let html =
+            render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None, &echo)
+                .into_string();
+        assert!(
+            html.contains("build_id and compatible_with must not be empty"),
+            "Declare Compat error must render inline: {html}"
+        );
+        assert!(
+            html.contains("sha-new123"),
+            "Declare Compat form must re-fill the entered build id: {html}"
+        );
+    }
+
+    #[test]
+    fn render_build_routing_page_no_error_leaves_action_forms_blank() {
+        let html = render_build_routing_page(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            None,
+            None,
+            &BuildRoutingActionEcho::default(),
+        )
+        .into_string();
+        assert!(
+            !html.contains(r#"class="field-error""#),
+            "a fresh page load must not render a stale action-form error: {html}"
         );
     }
 
