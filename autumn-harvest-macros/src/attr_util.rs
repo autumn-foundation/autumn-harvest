@@ -148,6 +148,70 @@ pub fn arg_type_hint(params: &[&syn::FnArg]) -> String {
     format!("({})", parts.join(", "))
 }
 
+/// Identifiers of every parameter, dropping the leading `ctx` and any
+/// parameter whose pattern is not a bare identifier.
+///
+/// `activity.rs`, `query.rs`, `signal.rs`, `update.rs`, and `workflow.rs`
+/// each hard-coded this exact filter to build the args their generated
+/// dispatch code deserializes into. All five already call
+/// [`arg_type_hint`] on the same `params` slice this takes, so the two
+/// helpers share one calling convention.
+pub fn param_idents<'a>(params: &'a [&syn::FnArg]) -> Vec<&'a syn::Ident> {
+    params
+        .iter()
+        .filter_map(|arg| {
+            if let syn::FnArg::Typed(pt) = arg
+                && let syn::Pat::Ident(ident) = &*pt.pat
+            {
+                return Some(&ident.ident);
+            }
+            None
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod param_idents_tests {
+    use super::param_idents;
+
+    fn params_from(sig: &str) -> Vec<syn::FnArg> {
+        let f: syn::ItemFn = syn::parse_str(&format!("fn f({sig}) {{}}")).unwrap();
+        f.sig.inputs.into_iter().collect()
+    }
+
+    #[test]
+    fn no_params_yields_no_idents() {
+        let owned = params_from("");
+        let refs: Vec<_> = owned.iter().collect();
+        assert_eq!(param_idents(&refs), Vec::<&syn::Ident>::new());
+    }
+
+    #[test]
+    fn typed_ident_params_are_collected_in_order() {
+        let owned = params_from("a: u32, b: bool");
+        let refs: Vec<_> = owned.iter().collect();
+        let names: Vec<String> = param_idents(&refs)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    /// A non-ident pattern (destructuring, `_`) is silently dropped, not an
+    /// error. This matches every pre-extraction copy's behavior exactly --
+    /// none of the five rejected such a parameter at macro-expansion time.
+    #[test]
+    fn non_ident_pattern_is_silently_dropped() {
+        let owned = params_from("(a, b): (u32, u32), c: bool");
+        let refs: Vec<_> = owned.iter().collect();
+        let names: Vec<String> = param_idents(&refs)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(names, vec!["c"]);
+    }
+}
+
 #[cfg(test)]
 mod arg_type_hint_tests {
     use super::arg_type_hint;

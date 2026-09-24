@@ -464,17 +464,7 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let params: Vec<_> = input_fn.sig.inputs.iter().skip(1).collect();
-    let param_names: Vec<_> = params
-        .iter()
-        .filter_map(|arg| {
-            if let syn::FnArg::Typed(pat) = arg
-                && let syn::Pat::Ident(ident) = pat.pat.as_ref()
-            {
-                return Some(&ident.ident);
-            }
-            None
-        })
-        .collect();
+    let param_names: Vec<_> = crate::attr_util::param_idents(&params);
 
     // Encode the activity's error.
     //
