@@ -582,6 +582,13 @@ type FiredDebounce = (
 /// #1230 Finding 2 review). See
 /// [`order_due_rows_for_deadlock_free_firing`]'s doc comment for the full
 /// history.
+///
+/// Sibling of `throttle.rs`'s copy of this function (clone class, tracked
+/// in issue #1695). It differs only in the one field name `FireDueRow`
+/// forces to differ (`last_input` here, `input` there).
+/// `docs/audits/quota-lock-ordering-sync.py` normalizes that one field and
+/// gates CI on the rest staying byte-identical. A fix here must land in
+/// both files in the same change.
 #[cfg(feature = "db")]
 fn resolve_row_quota_lock_key(
     row: &FireDueRow,
@@ -599,6 +606,11 @@ fn resolve_row_quota_lock_key(
 /// [`crate::completion_trigger::GLOBAL_WORKFLOW_METADATA`] in one read, for
 /// [`order_due_rows_for_deadlock_free_firing`] to resolve an entire batch
 /// against. One read per batch, not one per row.
+///
+/// Sibling of `throttle.rs`'s copy of this function (issue #1230 Finding 2
+/// clone class, tracked in issue #1695). `docs/audits/quota-lock-ordering-sync.py`
+/// gates CI on the two copies staying byte-identical. A fix here must land
+/// in both files in the same change.
 #[cfg(feature = "db")]
 fn snapshot_quota_policies() -> std::collections::HashMap<String, crate::quota::QuotaPolicy> {
     crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
@@ -701,6 +713,11 @@ fn snapshot_quota_policies() -> std::collections::HashMap<String, crate::quota::
 /// None of them took the shared mutex (review). Splitting the map out as
 /// an explicit argument removes the shared global from the tested code
 /// path entirely. So there is nothing left to race.
+///
+/// Sibling of `throttle.rs`'s copy of this function (issue #1230 Finding 2
+/// clone class, tracked in issue #1695). `docs/audits/quota-lock-ordering-sync.py`
+/// gates CI on the two copies staying byte-identical. A fix here must land
+/// in both files in the same change.
 #[cfg(feature = "db")]
 async fn order_due_rows_for_deadlock_free_firing(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -727,6 +744,11 @@ async fn order_due_rows_for_deadlock_free_firing(
 /// [`order_rows_by_quota_lock_id`]'s sort and the lock
 /// [`crate::quota::lock_quota_key`] will actually take (Codex review,
 /// issue #1230 Finding 2 follow-up).
+///
+/// Sibling of `throttle.rs`'s copy of this function (issue #1230 Finding 2
+/// clone class, tracked in issue #1695). `docs/audits/quota-lock-ordering-sync.py`
+/// gates CI on the two copies staying byte-identical. A fix here must land
+/// in both files in the same change.
 #[cfg(feature = "db")]
 async fn resolve_quota_lock_ids(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -792,6 +814,11 @@ async fn resolve_quota_lock_ids(
 /// exactly the ABBA cycle this ordering exists to close. Sorting the
 /// id itself cannot have that failure mode. A colliding pair simply
 /// compares equal, like same-key rows already do.
+///
+/// Sibling of `throttle.rs`'s copy of this function (issue #1230 Finding 2
+/// clone class, tracked in issue #1695). `docs/audits/quota-lock-ordering-sync.py`
+/// gates CI on the two copies staying byte-identical. A fix here must land
+/// in both files in the same change.
 #[cfg(feature = "db")]
 fn order_rows_by_quota_lock_id(
     due_rows: Vec<FireDueRow>,

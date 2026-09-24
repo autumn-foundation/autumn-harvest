@@ -18,6 +18,7 @@ to wire into CI as a gate.
 | `cli-flag-coverage.py` | The inverse of `config-cli-drift.py`: real `harvest` CLI `--flags`, extracted the same way, that no page in the corpus mentions at all — a coverage-matrix report for manual triage, not a gate (see the script's own docstring for why) | No — report-only; run manually as Folio triage input |
 | `comment-hygiene.py` | Comment defects across every `*.rs`: commented-out code, unreferenced TODOs, narrative asides, blank block edges (all gated at zero), plus review-round archaeology, contractions and over-long sentences (ratcheted against the merge base, so a change may not add one to a file it touches) | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `audit-catalog-coverage.py` | Every `*.py` script in `docs/audits/` has a row in this table | Yes — `.github/workflows/ci.yml`, `lint` job |
+| `quota-lock-ordering-sync.py` | Five functions (`resolve_quota_lock_ids`, `order_rows_by_quota_lock_id`, `snapshot_quota_policies`, `order_due_rows_for_deadlock_free_firing`, `resolve_row_quota_lock_key`) stay byte-identical between `autumn-harvest/src/debounce.rs` and `autumn-harvest/src/throttle.rs`, modulo one normalized field name, and each scanner's `fire_due_on_conn` still calls the ordering wrapper before its firing loop — a clone class (issue #1230 Finding 2) an Echo duplication survey (issue #1695) found below the project's merge bar (2 instances, no missed-fix defect on record), linked instead of merged | Yes — `.github/workflows/ci.yml`, `lint` job |
 
 ## Comment hygiene: the two tiers
 
