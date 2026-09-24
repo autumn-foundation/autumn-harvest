@@ -1162,6 +1162,18 @@ impl RedisDispatch {
     /// Builds every entry's fresh reference and due time up front. It then
     /// makes one [`Self::requeue_batch`] call: one round trip per distinct
     /// queue in the batch, not one per lease.
+    ///
+    /// One lease's delay failing to convert must not skip the rest of the
+    /// batch (Codex review, issue #1429 follow-up). An oversized
+    /// `poll_interval`/`release_backoff_cap` on a direct embedder's
+    /// `DispatchSettings` can make one lease's `std::time::Duration` land
+    /// outside what `chrono::Duration` can represent. The `?` this used to
+    /// return on would abort before [`Self::requeue_batch`] ever ran.
+    /// Every other, unrelated lease in the batch then stayed pending until
+    /// visibility recovery, the exact blast radius this PR's own
+    /// `ack_many`/`requeue_batch` fixes closed elsewhere. Every lease
+    /// with a convertible delay is still requeued; the first conversion
+    /// error, if any, is returned after that call.
     async fn release_many_inner(
         &self,
         leases: &[(DispatchLease, Duration)],
@@ -1171,6 +1183,7 @@ impl RedisDispatch {
         }
         let now = Utc::now();
         let mut entries = Vec::with_capacity(leases.len());
+        let mut first_error = None;
         for (lease, delay) in leases {
             // The handle carries the payload (contract C2), so no read-back
             // is needed and the priority survives the release.
@@ -1178,12 +1191,19 @@ impl RedisDispatch {
                 .and_then(|payload| serde_json::from_str::<DispatchRef>(payload).ok())
                 .unwrap_or_else(|| DispatchRef::from_lease(lease));
             reference.redeliveries = lease.redeliveries.saturating_add(1);
-            let chrono_delay = chrono::Duration::from_std(*delay).map_err(|err| {
-                RedisAdapterError::DurationOutOfRange(format!("release delay: {err}"))
-            })?;
-            entries.push((lease.handle.clone(), reference, now + chrono_delay));
+            match chrono::Duration::from_std(*delay) {
+                Ok(chrono_delay) => {
+                    entries.push((lease.handle.clone(), reference, now + chrono_delay));
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| {
+                        RedisAdapterError::DurationOutOfRange(format!("release delay: {error}"))
+                    });
+                }
+            }
         }
-        self.requeue_batch(&entries).await
+        let batch_result = self.requeue_batch(&entries).await;
+        first_error.map_or(batch_result, Err)
     }
 
     /// One `XPENDING` per queue, in one pipeline (issue #1429).

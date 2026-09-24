@@ -434,6 +434,71 @@ async fn release_with_delay_hides_the_entry_and_counts_a_redelivery() {
     assert_eq!(again[0].redeliveries, 1, "release counts one redelivery");
 }
 
+/// One lease's delay overflowing `chrono::Duration` must not skip its
+/// siblings' release in the same batch (Codex review, issue #1429
+/// follow-up).
+///
+/// `release_many_inner` used to build every entry's due time with a `?` on
+/// the `chrono::Duration::from_std` conversion. One out-of-range delay
+/// then aborted the whole call before `requeue_batch` ever ran, and every
+/// other, unrelated lease in the batch stayed pending until visibility
+/// recovery. This drives a batch with one ordinary lease and one whose delay
+/// `chrono::Duration` cannot represent, and asserts the ordinary lease
+/// still gets released.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leases_invalid_release_delay_does_not_block_its_siblings() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["healthy".to_string(), "overflow".to_string()];
+    let healthy_task = Uuid::new_v4();
+    let overflow_task = Uuid::new_v4();
+
+    fixture
+        .dispatch
+        .publish(&[hint("healthy", healthy_task, Utc::now())])
+        .await
+        .expect("publish healthy");
+    fixture
+        .dispatch
+        .publish(&[hint("overflow", overflow_task, Utc::now())])
+        .await
+        .expect("publish overflow");
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 2);
+    let healthy_lease = leases
+        .iter()
+        .find(|lease| lease.task_id == healthy_task)
+        .cloned()
+        .expect("healthy lease");
+    let overflow_lease = leases
+        .iter()
+        .find(|lease| lease.task_id == overflow_task)
+        .cloned()
+        .expect("overflow lease");
+
+    let result = fixture
+        .dispatch
+        .release_many(&[
+            (healthy_lease, Duration::from_millis(50)),
+            (overflow_lease, Duration::MAX),
+        ])
+        .await;
+    assert!(
+        result.is_err(),
+        "an out-of-range delay must still surface as an error"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let again = read(&fixture, &["healthy".to_string()], 10).await;
+    assert_eq!(
+        again.len(),
+        1,
+        "the healthy lease's release must not be skipped by its sibling's bad delay"
+    );
+    assert_eq!(again[0].task_id, healthy_task);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ack_deletes_the_marker_so_a_republish_is_delivered() {
     let Some(fixture) = try_start(Duration::from_secs(60)).await else {
