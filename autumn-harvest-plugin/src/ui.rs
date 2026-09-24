@@ -1225,32 +1225,43 @@ fn render_dag_retry_confirm(
                 button type="submit" class="btn reset" { "Confirm retry" }
             }
         },
-        Err(failure) => html! {
-            div class="banner Warning" { (failure.human_message()) }
-            // Codex review (issue #1723): the refreshed dry run this
-            // function's caller re-runs for redisplay can itself fail. That
-            // is exactly what happens in the race this fix targets, where a
-            // competing retry has already sealed the source run. Dropping
-            // `reason` here on that second failure would silently repeat the
-            // very bug this fix exists to close.
-            //
-            // Only shown when `commit_error` is `Some`. On the plain
-            // first-visit `GET` failure, nothing has been submitted yet, so
-            // `reason` is just the auto-generated default, not the
-            // operator's own input.
-            @if commit_error.is_some() {
+        Err(dry_run_failure) => {
+            let dry_run_message = dry_run_failure.human_message();
+            html! {
+                div class="banner Warning" { (dry_run_message) }
+                // Codex review (issue #1723): the refreshed dry run this
+                // function's caller re-runs for redisplay can itself fail.
+                // That is exactly what happens in the race this fix targets,
+                // where a competing retry has already sealed the source run.
+                // Dropping `reason` here on that second failure would
+                // silently repeat the very bug this fix exists to close.
+                //
+                // Only shown when `commit_error` is `Some`. On the plain
+                // first-visit `GET` failure, nothing has been submitted yet,
+                // so `reason` is just the auto-generated default, not the
+                // operator's own input.
+                @if let Some(error) = commit_error {
+                    p {
+                        "Your submitted reason (preserved, but this run can \
+                         no longer be retried from here): "
+                        code { (reason) }
+                    }
+                    // Codex review (issue #1723): the banner above is the
+                    // *refreshed* dry run's own failure, not necessarily what
+                    // the operator's actual commit attempt failed with. Show
+                    // the original commit failure too, when it differs, so a
+                    // divergent diagnosis is never silently dropped.
+                    @if error != dry_run_message {
+                        p { "The retry attempt itself failed with: " (error) }
+                    }
+                }
                 p {
-                    "Your submitted reason (preserved, but this run can no \
-                     longer be retried from here): "
-                    code { (reason) }
+                    a class="back" href=(dag_detail_relative_url(dag_name, run_exec_id, None)) {
+                        "← Back to run"
+                    }
                 }
             }
-            p {
-                a class="back" href=(dag_detail_relative_url(dag_name, run_exec_id, None)) {
-                    "← Back to run"
-                }
-            }
-        },
+        }
     };
     layout_dag_detail(
         &format!("Retry DAG {dag_name} · Vantage"),
@@ -15967,6 +15978,36 @@ mod tests {
             markup.contains("retrying after upstream API fix, ticket JIRA-4521"),
             "the operator's submitted reason must survive even when the \
              redisplay's own fresh dry run also fails: {markup}"
+        );
+    }
+
+    // Codex review (issue #1723): the banner shows the *refreshed* dry run's
+    // own failure, which is not necessarily what the operator's actual
+    // commit attempt failed with. When the two diagnoses differ, both must
+    // reach the operator, not just the redisplay's own fresh failure.
+    #[test]
+    fn render_dag_retry_confirm_shows_original_commit_error_when_it_differs_from_the_refreshed_dry_run()
+     {
+        let refreshed_failure =
+            DagRetryFailure::StateConflict("DAG run terminated by a competing retry".to_string());
+        let markup = render_dag_retry_confirm(
+            "graph_linear",
+            "source-run",
+            "step_b",
+            "retrying after upstream API fix, ticket JIRA-4521",
+            Some("node step_b already retried by another operator"),
+            Err(refreshed_failure),
+        )
+        .into_string();
+        assert!(
+            markup.contains("DAG run terminated by a competing retry"),
+            "the refreshed dry run's own failure must still show: {markup}"
+        );
+        assert!(
+            markup.contains("node step_b already retried by another operator"),
+            "a diverging original commit failure must not be silently \
+             dropped in favour of the refreshed dry run's own message: \
+             {markup}"
         );
     }
 
