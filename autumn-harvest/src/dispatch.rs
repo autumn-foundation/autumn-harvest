@@ -531,13 +531,25 @@ where
 /// transaction then fails to commit still gets its hint published, because
 /// the outer task around it went on to succeed.
 ///
-/// This checkpoints the active buffer's length before `f` runs. Only if
-/// `f` fails, it truncates back to that length. That is exactly the
-/// hints `f` itself raised, never a sibling call's hints recorded earlier
-/// in the same enclosing scope. A committed `f` leaves its hints in place
-/// for the enclosing scope to flush later, alongside everything else.
-/// When no scope is active yet, this opens one and settles it against
-/// `f`'s own outcome, identically to [`buffered_settled`].
+/// This runs `f` against a fresh, private buffer nested inside the active
+/// scope, then merges that buffer into the enclosing one only when `f`
+/// succeeds. When no scope is active yet, this opens one and settles it
+/// against `f`'s own outcome, identically to [`buffered_settled`].
+///
+/// A length checkpoint on the *shared* enclosing buffer cannot isolate two
+/// sibling `run_transactional` calls an activity joins concurrently — say
+/// with `tokio::join!`. `run_transactional` takes `&self` and pools its
+/// own connection per call, so this interleaving is supported (Codex
+/// review, issue #1429). Both calls would capture the same checkpoint
+/// before either transaction finishes. A later rollback would then
+/// truncate away an earlier sibling's already-committed hint, not just its
+/// own. `tokio::task_local!`'s `.scope()` sets its ambient value only for
+/// the span it wraps, even under concurrent polling on the same task. So
+/// nesting a private buffer per call gives each one its own hints
+/// regardless of interleaving. Only this call's own successful outcome
+/// then merges them into whichever buffer is ambient once the nested scope
+/// ends. That is the enclosing scope normally, or a still-more-tightly
+/// nested `buffered_checkpoint` call when `f` itself calls one.
 ///
 /// # Errors
 ///
@@ -549,16 +561,12 @@ where
     if !scope_active() {
         return buffered_settled(f).await;
     }
-    let mark = HINT_BUFFER
-        .try_with(|buffer| lock(buffer).len())
-        .unwrap_or(0);
-    let outcome = f.await;
-    if outcome.is_err() {
-        let _ = HINT_BUFFER.try_with(|buffer| {
-            let mut guard = lock(buffer);
-            let mark = mark.min(guard.len());
-            guard.truncate(mark);
-        });
+    let inner: Arc<Mutex<Vec<DispatchHint>>> = Arc::new(Mutex::new(Vec::new()));
+    let handle = Arc::clone(&inner);
+    let outcome = HINT_BUFFER.scope(inner, f).await;
+    if outcome.is_ok() {
+        let hints = std::mem::take(&mut *lock(&handle));
+        let _ = HINT_BUFFER.try_with(|buffer| lock(buffer).extend(hints));
     }
     outcome
 }
@@ -1640,6 +1648,70 @@ mod tests {
         .await;
         assert!(outcome.is_ok());
         assert_eq!(channel.published_ids(), vec![committed.task_id]);
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn concurrent_checkpoints_do_not_clobber_each_others_hints() {
+        // Codex review, issue #1429. `run_transactional` takes `&self` and
+        // pools its own connection per call, so an activity can join two
+        // calls concurrently. A length checkpoint on the shared enclosing
+        // buffer cannot isolate them. Both capture the same checkpoint
+        // before either pushes a hint, so a later rollback truncates away
+        // an earlier sibling's already-committed hint too. Forcing that
+        // exact interleaving here reproduces the bug against the old
+        // checkpoint-and-truncate implementation. See
+        // `buffered_checkpoint`'s own doc comment.
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let committed = hint("q", Utc::now());
+        let committed_inner = committed.clone();
+        let rolled_back = hint("q", Utc::now());
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let (committed_tx, committed_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let ((), outer) = buffered(async move {
+            let succeeding = async move {
+                // Wait until the failing sibling has entered its own
+                // checkpoint, while the buffer is still empty, before
+                // this one pushes anything.
+                ready_rx.await.unwrap();
+                let outcome = buffered_checkpoint(async move {
+                    record_hint(committed_inner);
+                    Ok::<(), &str>(())
+                })
+                .await;
+                assert!(outcome.is_ok());
+                committed_tx.send(()).unwrap();
+            };
+            let failing = async move {
+                let outcome = buffered_checkpoint(async move {
+                    // Signal readiness, then wait for the sibling to push
+                    // and commit its own hint before this one pushes and
+                    // fails.
+                    ready_tx.send(()).unwrap();
+                    committed_rx.await.unwrap();
+                    record_hint(rolled_back);
+                    Err::<(), &str>("commit failed")
+                })
+                .await;
+                assert!(outcome.is_err());
+            };
+            tokio::join!(succeeding, failing);
+        })
+        .await;
+
+        assert_eq!(
+            outer,
+            vec![committed],
+            "a concurrent sibling's rollback must not discard this call's committed hint"
+        );
         uninstall();
     }
 

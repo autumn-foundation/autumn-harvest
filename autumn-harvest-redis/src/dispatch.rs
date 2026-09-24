@@ -124,9 +124,20 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// the next call's scan finds it.
 ///
 /// Capping each queue's blocking slice to this value, and cycling the
-/// rotation across the remaining `wait` budget, bounds that latency to about
-/// `QUEUE_BLOCK_SLICE * ordered.len()` instead. A single-queue rotation
-/// leaves `wait` undivided. There is no sibling queue to starve.
+/// rotation across the remaining `wait` budget, bounds that latency. It
+/// stays about `QUEUE_BLOCK_SLICE * ordered.len()` when there is budget to
+/// spare. A single-queue rotation leaves `wait` undivided. There is no
+/// sibling queue to starve.
+///
+/// This cap alone does not fit a lap with more than `wait /
+/// QUEUE_BLOCK_SLICE` queues (Codex review, issue #1429). The deadline
+/// would pass before the rotation reached every queue once. The tail
+/// queues would then never get a blocking slice at all, in this call or
+/// the next, since the rotation always restarts at 0. `read_across_queues`
+/// therefore shrinks each slice below this cap when the current lap needs
+/// it to. It divides the budget still left by the queues still left in
+/// the lap. Every queue then gets one blocking look within the same
+/// `wait`, regardless of how many queues are configured.
 const QUEUE_BLOCK_SLICE: Duration = Duration::from_millis(200);
 
 /// Separator between the entry id and the payload inside a lease handle.
@@ -598,8 +609,11 @@ impl RedisDispatch {
     ///
     /// The delivered entry is acked and deleted first, so the pending entries
     /// list never holds a reference the worker no longer owns. The marker is
-    /// rewritten, not deleted. The row is still un-claimed, so a republish of
-    /// the same `scheduled_at` stays a no-op until the new entry is delivered.
+    /// rewritten, not deleted, when it still names the entry being requeued.
+    /// The row is still un-claimed, so a republish of the same `scheduled_at`
+    /// stays a no-op until the new entry is delivered. See [`REQUEUE_LUA`]'s
+    /// own doc comment for when the marker no longer names the entry, and why
+    /// the rewrite is skipped there instead.
     ///
     /// `due` moves the delivery time only. `reference.scheduled_at` keeps the
     /// row's due time, which is what contract C1 compares against.
@@ -795,12 +809,19 @@ impl RedisDispatch {
                 // A lone queue leaves `wait` undivided: there is no sibling
                 // to starve, so this stays the original single-call block
                 // (see `QUEUE_BLOCK_SLICE`'s doc comment).
+                //
+                // A lap with more queues than `wait / QUEUE_BLOCK_SLICE`
+                // needs a smaller share per queue (Codex review, issue
+                // #1429). See `QUEUE_BLOCK_SLICE`'s own doc comment.
+                let lap_position = rotation % ordered.len();
+                let queues_left_in_lap = ordered.len() - lap_position;
                 let slice = if ordered.len() > 1 {
-                    budget.min(QUEUE_BLOCK_SLICE)
+                    let fair_share = budget / u32::try_from(queues_left_in_lap).unwrap_or(1);
+                    fair_share.min(QUEUE_BLOCK_SLICE)
                 } else {
                     budget
                 };
-                let key = &ordered[rotation % ordered.len()];
+                let key = &ordered[lap_position];
                 match self
                     .read_with_heal(
                         queues,
@@ -1547,6 +1568,22 @@ return written
 /// a reference the worker gave back. The marker then names the new location, so
 /// a republish can verify it. See [`PUBLISH_LUA`] for why that matters. Returns
 /// the number of entries handled.
+///
+/// The marker write is skipped, along with the requeue itself, when the
+/// marker no longer names this entry (Codex review, issue #1429). A batched
+/// worker defers a lease's ack until after its task has already been
+/// spawned, the same ordering [`ACK_MARKER_LUA`]'s own doc comment
+/// describes. A fast-completing task can re-pend and republish the same
+/// task id before that stale lease is ever settled. If the deferred ack
+/// then fails outright rather than merely running late, the stale entry is
+/// never acked at all. It sits in the pending entries list until this
+/// script's caller — visibility recovery — claims it. That happens long
+/// after the fresh entry already claimed the marker. An unconditional
+/// overwrite here would then publish a stray duplicate. It would also
+/// steal the marker back from the fresh entry, exactly like an
+/// unconditional marker `DEL` would in `ack`. The stale entry is still
+/// acked and deleted either way, so the pending entries list never keeps a
+/// reference no worker owns.
 const REQUEUE_LUA: &str = r"
 local stream = KEYS[1]
 local delayed = KEYS[2]
@@ -1566,15 +1603,25 @@ for i = 1, count do
     idx = idx + 5
     redis.call('XACK', stream, group, entry_id)
     redis.call('XDEL', stream, entry_id)
-    if due <= now then
-        redis.call('ZREM', delayed, task_id)
-        redis.call('HDEL', payloads, task_id)
-        local id = redis.call('XADD', stream, '*', 'payload', payload)
-        redis.call('SET', marker, scheduled .. '|' .. id, 'EX', ttl)
-    else
-        redis.call('ZADD', delayed, due, task_id)
-        redis.call('HSET', payloads, task_id, payload)
-        redis.call('SET', marker, scheduled .. '|delayed', 'EX', ttl)
+    local held = redis.call('GET', marker)
+    local held_at = false
+    if held then
+        local sep = string.find(held, '|', 1, true)
+        if sep then
+            held_at = string.sub(held, sep + 1)
+        end
+    end
+    if held_at == entry_id then
+        if due <= now then
+            redis.call('ZREM', delayed, task_id)
+            redis.call('HDEL', payloads, task_id)
+            local id = redis.call('XADD', stream, '*', 'payload', payload)
+            redis.call('SET', marker, scheduled .. '|' .. id, 'EX', ttl)
+        else
+            redis.call('ZADD', delayed, due, task_id)
+            redis.call('HSET', payloads, task_id, payload)
+            redis.call('SET', marker, scheduled .. '|delayed', 'EX', ttl)
+        end
     end
 end
 return count

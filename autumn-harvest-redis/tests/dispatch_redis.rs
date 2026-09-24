@@ -543,6 +543,87 @@ async fn acking_a_stale_lease_leaves_a_fresher_entrys_marker_intact() {
     );
 }
 
+/// Recovering a stale, unacked lease must not clobber a fresher entry's
+/// marker (Codex review, issue #1429).
+///
+/// Same republish-before-settling setup as
+/// `acking_a_stale_lease_leaves_a_fresher_entrys_marker_intact`, but the
+/// stale lease's deferred ack fails outright instead of merely running
+/// late. It is then never acked at all. It sits in the pending entries
+/// list until visibility recovery claims it, long after the fresh entry
+/// already claimed the marker. Recovery must see that fresher marker and
+/// skip both the duplicate publish and the overwrite, exactly like a stale
+/// ack must. The fresh entry is left undelivered rather than read. It then
+/// never enters the pending entries list itself, so only the stale lease
+/// is there for recovery to find.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovering_a_stale_lease_leaves_a_fresher_entrys_marker_intact() {
+    let Some(fixture) = try_start(Duration::from_millis(300)).await else {
+        return;
+    };
+    let queues = vec!["recovered-stale".to_string()];
+    let task_id = Uuid::new_v4();
+    let stale_due = Utc::now();
+
+    fixture
+        .dispatch
+        .publish(&[hint("recovered-stale", task_id, stale_due)])
+        .await
+        .expect("publish");
+    let stale = read(&fixture, &queues, 10).await;
+    assert_eq!(stale.len(), 1);
+
+    // Simulates the fast-completing task's re-pend: republishing before the
+    // stale lease is ever settled, at a due time distinct from the first
+    // publish. The old marker then reads as not intact, so this writes a
+    // fresh entry and overwrites the marker to name it. Left undelivered
+    // here, so it never enters the pending entries list itself -- only the
+    // stale lease read above does. Recovery's `XPENDING` scan must see
+    // just that one idle entry.
+    let fresh_due = stale_due + chrono::Duration::milliseconds(1);
+    fixture
+        .dispatch
+        .publish(&[hint("recovered-stale", task_id, fresh_due)])
+        .await
+        .expect("republish before the stale lease is settled");
+    assert_eq!(
+        fixture.stream_len("recovered-stale").await,
+        2,
+        "the republish must add a fresh entry alongside the still-pending stale one"
+    );
+
+    // The stale lease's own deferred ack never runs -- it sits pending
+    // until visibility recovery claims it.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let counts = fixture.dispatch.maintain(&queues).await.expect("maintain");
+    assert_eq!(counts.recovered, 1, "the stale entry is still cleared out");
+    assert_eq!(fixture.pending_count("recovered-stale").await, 0);
+
+    assert_eq!(
+        fixture.stream_len("recovered-stale").await,
+        1,
+        "recovering the stale lease must not add a duplicate entry"
+    );
+    assert!(
+        fixture.marker_exists("recovered-stale", task_id).await,
+        "recovering the stale lease must not delete the fresh entry's marker"
+    );
+
+    // A republish at the fresh entry's own due time now reads the marker
+    // as intact and skips. That proves it still names the fresh entry, not
+    // a recovery-created duplicate.
+    fixture
+        .dispatch
+        .publish(&[hint("recovered-stale", task_id, fresh_due)])
+        .await
+        .expect("publish at the fresh entry's due time");
+    assert_eq!(
+        fixture.stream_len("recovered-stale").await,
+        1,
+        "the fresh entry's marker must have prevented a duplicate"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn maintain_recovers_an_unacked_lease_after_the_visibility_timeout() {
     let Some(fixture) = try_start(Duration::from_millis(300)).await else {
@@ -952,6 +1033,68 @@ async fn a_non_leader_queue_is_not_starved_behind_the_leaders_full_wait() {
         elapsed < wait / 2,
         "a non-leader queue's arrival must not wait out the leader's full \
          block; elapsed was {elapsed:?} against a {wait:?} wait"
+    );
+}
+
+/// A queue near the tail of a long rotation must still get a blocking
+/// look within the same `wait` (Codex review, issue #1429). That must
+/// hold however many queues are configured.
+///
+/// A fixed per-queue blocking slice does not fit a lap with more queues
+/// than `wait / QUEUE_BLOCK_SLICE`. The deadline passes before the
+/// rotation reaches a queue near the tail. The rotation always restarts
+/// at 0 on the next call. That queue would then never get a blocking
+/// slice at all, not just a delayed one. `read_across_queues` instead
+/// divides the budget still left by the queues still left in the lap. So
+/// every queue gets one blocking look inside the same `wait`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queue_near_the_tail_of_a_long_rotation_still_gets_a_blocking_look() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    // 20 queues at a fixed 200ms slice each would need 4s to reach the
+    // last one, more than this test's 3s wait. First call's rotation
+    // offset is 0, so `ordered` keeps this declaration order.
+    let queues: Vec<String> = (0..20).map(|i| format!("tail-{i}")).collect();
+    let wait = Duration::from_secs(3);
+    let tail_queue = queues.last().cloned().expect("at least one queue");
+
+    let dispatch = fixture.dispatch.clone();
+    let read_queues = queues.clone();
+    let handle = tokio::spawn(async move {
+        let started = Instant::now();
+        let leases = dispatch
+            .next(&read_queues, "consumer-1", 1, wait)
+            .await
+            .expect("next");
+        (started.elapsed(), leases)
+    });
+
+    // Give the read time to start blocking before publishing to the tail
+    // queue, so this exercises the rotation rather than the initial
+    // non-blocking pass.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    fixture
+        .dispatch
+        .publish(&[hint(&tail_queue, Uuid::new_v4(), Utc::now())])
+        .await
+        .expect("publish");
+
+    let (elapsed, leases) = handle.await.expect("join");
+    assert_eq!(
+        leases.len(),
+        1,
+        "the read must find the entry published on the tail queue"
+    );
+    assert_eq!(leases[0].queue_name, tail_queue);
+    // `wait` only bounds the blocking phase. The initial non-blocking pass
+    // over all 20 queues runs before that budget starts, adding its own
+    // round-trip time. So this leaves it a margin on top of `wait`.
+    let generous_bound = wait + Duration::from_secs(1);
+    assert!(
+        elapsed < generous_bound,
+        "a tail queue's arrival must surface within the same wait, not a \
+         later call; elapsed was {elapsed:?} against a {generous_bound:?} bound"
     );
 }
 
