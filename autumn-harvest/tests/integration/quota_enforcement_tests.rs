@@ -3777,6 +3777,14 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     // that happens before this point. That can push the 10s default past
     // its budget under a resource-constrained runner, the same way
     // `wait_for_execution_state_with_timeout`'s own doc comment describes.
+    //
+    // A separate, pre-existing issue, unrelated to this bound: this test
+    // has been seen to fail on one specific CI shard. It times out at
+    // whatever bound is configured, with no variance. That matches a
+    // genuine stall, not a slow-but-progressing run. It reproduces on
+    // trunk-dev at a commit this branch never touched. Widening this
+    // number further does not fix that. It needs its own investigation.
+    // This stays at #1673's own value rather than guessing higher.
     wait_for_execution_state_with_timeout(
         &url,
         source,
