@@ -6724,7 +6724,7 @@
     },
     "/executions/{exec_id}/events/stream": {
       "get": {
-        "description": "Server-Sent Events stream of WorkflowEvent history for one execution. Emits every newly persisted event as id/event/data SSE messages. Resume via Last-Event-ID header. Closes with event:stream-end on terminal state. Keepalive :ping comments every 15 s (default). Returns 409 Conflict when Last-Event-ID implies more than buffer_depth events to replay (slow consumer).",
+        "description": "Server-Sent Events stream of WorkflowEvent history for one execution. Emits every newly persisted event as id/event/data SSE messages, id being the per-execution event_id (issue #1405). Resume via Last-Event-ID header. Closes with event:stream-end on terminal state. Keepalive :ping comments every 15 s (default). Returns 409 Conflict when Last-Event-ID implies more than buffer_depth events to replay (slow consumer).",
         "operationId": "get_executions_by_exec_id_events_stream",
         "parameters": [
           {
@@ -6737,7 +6737,7 @@
             }
           },
           {
-            "description": "harvest_events.id BIGSERIAL cursor. When present, the server replays events with id > n before entering live-tail mode.",
+            "description": "event_id cursor (per-execution monotonic, issue #1405), NOT harvest_events.id. When present, the server replays events after it before entering live-tail mode. Stable across a shard-rebalance migration.",
             "in": "header",
             "name": "Last-Event-ID",
             "required": false,
@@ -6756,7 +6756,7 @@
                 }
               }
             },
-            "description": "Content-Type: text/event-stream. Each SSE message carries id (BIGSERIAL), event (WorkflowEvent type name), and data (JSON event value). A final event:stream-end message signals terminal execution state. Returns 409 Conflict with {error:slow_consumer, drop_after_event_id} when the client is too far behind."
+            "description": "Content-Type: text/event-stream. Each SSE message carries id (event_id, per-execution monotonic), event (WorkflowEvent type name), and data (JSON event value). A final event:stream-end message signals terminal execution state. Returns 409 Conflict with {error:slow_consumer, drop_after_event_id} when the client is too far behind."
           },
           "400": {
             "description": "Invalid execution ID."

@@ -57,13 +57,13 @@ GET /executions/{exec_id}/events/stream
 Each event arrives as a standard SSE block:
 
 ```
-id: <harvest_events.id BIGSERIAL>
+id: <event_id, per-execution monotonic>
 event: <WorkflowEvent type name>
 data: <JSON event payload>
 
 ```
 
-- `id` is the row-level `BIGSERIAL` primary key of `harvest_events`, **not** the per-execution sequential event ID. It is monotonically increasing across all executions on the shard and is safe to use as a resume cursor.
+- `id` is `harvest_events.event_id` (issue #1405), the per-execution sequential event ID — **not** `harvest_events.id`, the row-level `BIGSERIAL` primary key. A shard-rebalance migration copies `event_id` byte-for-byte but never `id`, so `event_id` is the field safe to use as a resume cursor across a migration. It is monotonic within one execution, starting at 0.
 - `event` is the adjacently-tagged type string (`ActivityScheduled`, `SignalReceived`, etc.). New `WorkflowEvent` variants land in the stream automatically without client changes.
 - `data` is the `data` inner object of the adjacently-tagged JSON envelope `{"type":"…","data":{…}}` stored in `harvest_events.event_data`.
 
@@ -83,7 +83,7 @@ Keepalive comments prevent reverse proxies and load balancers from killing idle 
 When the execution reaches a terminal state (`Completed`, `Failed`, `Cancelled`, `TimedOut`, `ResetTerminated`), the server sends a final event block then closes the stream:
 
 ```
-id: <last_row_id>
+id: <last_event_id>
 event: stream-end
 data: {"reason":"completed","execution_id":"<exec_id>","state":"COMPLETED"}
 
@@ -109,13 +109,16 @@ The client may reconnect immediately with `Last-Event-ID: <n>` to resume from wh
 
 The browser `EventSource` API sends `Last-Event-ID` automatically on reconnect. Curl and custom clients must set it explicitly.
 
+The cursor is `event_id` (issue #1405), not `harvest_events.id`. `id` is a shard-local `BIGSERIAL` a shard-rebalance migration does not copy, so a cursor keyed on it means nothing once an execution has moved shards.
+
 When the server receives `Last-Event-ID: <n>`:
 
-1. It queries `harvest_events` for all rows with `id > n` for this execution (the backfill).
-2. It sends the backfill rows over the stream in ascending `id` order.
-3. It then enters live-tail mode, forwarding new events via LISTEN/NOTIFY.
+1. It translates `n` (an `event_id`) to the connection's own `harvest_events.id`, following a migration's forwarding pointer if the execution has moved shards.
+2. It queries `harvest_events` for all rows after that translated cursor for this execution (the backfill).
+3. It sends the backfill rows over the stream in ascending `event_id` order.
+4. It then enters live-tail mode, forwarding new events via LISTEN/NOTIFY.
 
-A client that drops mid-stream and reconnects with the last `id` it saw will receive every event exactly once with no gaps.
+A client that drops mid-stream and reconnects with the last `event_id` it saw will receive every event exactly once with no gaps, including across a shard migration.
 
 **First connection** (no `Last-Event-ID`): the server starts from the beginning — all existing events are backfilled, then live-tail begins.
 
@@ -123,7 +126,7 @@ A client that drops mid-stream and reconnects with the last `id` it saw will rec
 
 ### Sharding
 
-The endpoint resolves `exec_id.shard()` and subscribes to that shard's Postgres LISTEN/NOTIFY channel. Cross-shard fan-out is not required in v1; one stream always maps to one shard.
+The endpoint resolves the execution row's CURRENT shard (its live residence, following any migration's forwarding pointer — issue #1317), not the shard encoded in `exec_id`'s bits. It subscribes to that shard's Postgres LISTEN/NOTIFY channel, and rebinds mid-stream if the execution migrates while the stream is open. Cross-shard fan-out is not required in v1; one stream always maps to one shard at a time.
 
 ---
 

@@ -3822,7 +3822,14 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     // start the target.
     mark_terminal(&mut conn, blocker, "CANCELLED").await;
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // A wider bound than the usual 10s default (issue #1685's Semaphore
+    // health-report series, tracked as this test's recurring "outbox-retry
+    // timeout" flake). The sweep runs on the worker's background
+    // timeout-checker loop, not on a dedicated fast path, so it shares CPU
+    // with every other in-flight decision cycle. That leaves the 10s
+    // default too tight under a busy CI runner, the same margin problem
+    // `wait_for_execution_state_with_timeout`'s own doc comment describes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let n = count_rows(&mut conn, target_row_count_sql, &[target_wf]).await;
         if n == 2 {
