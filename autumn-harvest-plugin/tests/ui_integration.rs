@@ -6982,37 +6982,71 @@ async fn ui_dag_retry_error_renders_human_message() {
 /// This exercises the actual HTTP handler with a `reason` field. A `ui.rs`
 /// unit test cannot reach that field on its own. The field lives on the
 /// caller of `dag_retry_commit_redirect`, not on that function itself.
+///
+/// Seeds a genuinely retryable (`FAILED`) run and confirms the form
+/// renders with the editable `reason` field. It then flips the run
+/// `COMPLETED` directly in the database, before submitting the captured
+/// form.
+///
+/// This is the real operator path a reviewer on this PR asked for. The
+/// confirm page's dry run races a concurrent change to the run, exactly
+/// as issue #1723 describes.
 #[tokio::test]
 async fn ui_dag_retry_error_drops_submitted_reason() {
     let (url, _c) = setup_test_database_url().await;
     let app = build_dag957_ui_app(&url, true, vec![]);
 
-    // A COMPLETED run cannot be retried (409, "DAG run succeeded ...") --
-    // the same genuine-failure precondition as `ui_dag_retry_error_renders_human_message`.
-    let ia = autumn_harvest::ActivityExecId::new();
+    let (ia, ib) = (
+        autumn_harvest::ActivityExecId::new(),
+        autumn_harvest::ActivityExecId::new(),
+    );
     let events = vec![
         dag957_sched("dag957_step_a", ia),
         dag957_started(ia),
         dag957_completed(ia),
-        autumn_harvest::WorkflowEvent::WorkflowCompleted {
-            output: Value::Null,
-        },
+        dag957_sched("dag957_step_b", ib),
+        dag957_started(ib),
+        dag957_failed(ib),
+        autumn_harvest::WorkflowEvent::workflow_failed("dag failed"),
     ];
     let exec_id = dag957_seed_run(
         &url,
         "dag957_linear",
         "graph-reason-dropped",
         events,
-        "COMPLETED",
+        "FAILED",
     )
     .await;
 
+    // The confirm page renders the editable form for this still-open run --
+    // this is the page the operator actually sees and types into.
+    let (status, html) = fetch_html(
+        &app,
+        &format!("/dags/dag957_linear/runs/{exec_id}/retry?from_node=dag957_step_b"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "confirm page must render: {html}");
+    assert!(html.contains("reason"), "reason field must be present");
+
+    // Race: something completes the run between the confirm GET and the
+    // operator's Confirm click (e.g. another operator's fresh start, or an
+    // automatic recovery). The operator's browser still has the form open.
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+        .await
+        .expect("connect to flip run state");
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set(harvest_workflow_executions::state.eq("COMPLETED"))
+        .execute(&mut conn)
+        .await
+        .expect("simulate the race by completing the run underneath the open form");
+
+    // The operator submits the form exactly as it was rendered.
     let submitted_reason = "retrying after upstream API fix, ticket JIRA-4521";
     let (status, headers, _body) = post_form(
         &app,
         &format!("/dags/dag957_linear/runs/{exec_id}/retry"),
         format!(
-            "from_node=dag957_step_a&reason={}",
+            "from_node=dag957_step_b&reason={}",
             url_encode_test(submitted_reason)
         ),
     )
