@@ -47,6 +47,8 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+#[cfg(all(feature = "db", feature = "testing"))]
+use uuid::Uuid;
 
 /// Maximum number of sample identifiers retained per [`Finding`].
 ///
@@ -210,6 +212,12 @@ pub enum FindingClass {
     /// so this is the newly deployed handler erroring where the live run had
     /// not — resuming it fails the run immediately.
     ReplayWorkflowFailed,
+    /// The source shard confirms a cross-shard completion-trigger relay
+    /// delivered (issue #1401). The target execution is absent, and the
+    /// target shard's restore point predates the fire. The target shard
+    /// cannot hold the triggered workflow. The loss is provable, not merely
+    /// likely.
+    CompletionTriggerFireLost,
 
     // ── Advisory: operator judgement ────────────────────────────────────────
     /// A caller recorded an external *signal* as delivered and the target's
@@ -254,11 +262,16 @@ pub enum FindingClass {
     /// cross-shard break. A retention summary is durable proof of the first.
     /// Without one, a silent pass would hide the second (issue #1205).
     RetentionUnproven,
+    /// The source shard confirms a cross-shard completion-trigger relay
+    /// delivered (issue #1401). The target execution is absent. The target
+    /// shard's restore point does not rule out ordinary retention. Ordinary
+    /// retention and a lost fire cannot be told apart from here.
+    CompletionTriggerFireUnproven,
 }
 
 impl FindingClass {
     /// Every class, in a stable order. Used by tests and by the runbook table.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 27] = [
         Self::DeadWorkerRunningTask,
         Self::TimedOutTask,
         Self::WorkflowDeadlineExpired,
@@ -276,6 +289,7 @@ impl FindingClass {
         Self::ExternalEffectRolledBack,
         Self::ReplayDivergence,
         Self::ReplayWorkflowFailed,
+        Self::CompletionTriggerFireLost,
         Self::ExternalEffectUnverifiable,
         Self::RestorePointSkew,
         Self::ReplaySkippedNoHandler,
@@ -284,6 +298,7 @@ impl FindingClass {
         Self::WorkflowIdTargetUnchecked,
         Self::ProbeFailed,
         Self::RetentionUnproven,
+        Self::CompletionTriggerFireUnproven,
     ];
 
     /// The fixed severity of this class.
@@ -311,7 +326,8 @@ impl FindingClass {
             | Self::ChildTerminalRolledBack
             | Self::ExternalEffectRolledBack
             | Self::ReplayDivergence
-            | Self::ReplayWorkflowFailed => FindingSeverity::Incoherent,
+            | Self::ReplayWorkflowFailed
+            | Self::CompletionTriggerFireLost => FindingSeverity::Incoherent,
 
             Self::ExternalEffectUnverifiable
             | Self::RestorePointSkew
@@ -320,7 +336,9 @@ impl FindingClass {
             | Self::UninspectedShardReference
             | Self::WorkflowIdTargetUnchecked => FindingSeverity::Advisory,
 
-            Self::ProbeFailed | Self::RetentionUnproven => FindingSeverity::Undetermined,
+            Self::ProbeFailed | Self::RetentionUnproven | Self::CompletionTriggerFireUnproven => {
+                FindingSeverity::Undetermined
+            }
         }
     }
 
@@ -353,6 +371,8 @@ impl FindingClass {
             Self::WorkflowIdTargetUnchecked => "workflow_id_target_unchecked",
             Self::ProbeFailed => "probe_failed",
             Self::RetentionUnproven => "retention_unproven",
+            Self::CompletionTriggerFireLost => "completion_trigger_fire_lost",
+            Self::CompletionTriggerFireUnproven => "completion_trigger_fire_unproven",
         }
     }
 
@@ -441,6 +461,17 @@ impl FindingClass {
                 "a recorded child terminal or delivered effect targets an absent \
                  execution with no retention summary on record; retention and a \
                  pre-creation rollback cannot be told apart from here"
+            }
+            Self::CompletionTriggerFireLost => {
+                "the source shard confirms a completion-trigger relay delivered, but \
+                 the target shard's restore point predates the fire, so the target \
+                 execution cannot be in that snapshot -- a lost cross-shard relay \
+                 (issue #1401)"
+            }
+            Self::CompletionTriggerFireUnproven => {
+                "the source shard confirms a completion-trigger relay delivered, but \
+                 the target execution is absent and the target shard's restore point \
+                 does not rule out ordinary retention (issue #1401)"
             }
         }
     }
@@ -839,6 +870,236 @@ pub fn compute_skew(latest: impl IntoIterator<Item = Option<DateTime<Utc>>>) -> 
     Some((last - first).num_seconds().abs())
 }
 
+// ── Completion-trigger fire routing and adjudication (pure) ────────────────
+//
+// `completion_trigger.rs::relay_gate_checked_start` relays a completion
+// trigger across two shards. It uses two independent transactions. The
+// source deletes its outbox row only after the target start commits. Or, an
+// any-state existence check finds the target already there. A restore can
+// skew the two shards to different points in time. This can leave the
+// source shard confirming a delivery the target shard never received
+// (issue #1401).
+
+/// One completion-trigger fire the source shard recorded as delivered
+/// (`harvest_completion_trigger_fires.outcome IS NULL`).
+///
+/// `target_shard` is `Some` when the fires row itself recorded the shard
+/// the relay resolved at fire time (issue #1401 migration). It is `None`
+/// for a fire predating that migration, in which case
+/// [`route_trigger_fires`] falls back to re-deriving it.
+#[cfg(all(feature = "db", feature = "testing"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedFire {
+    source_exec_id: Uuid,
+    trigger_id: Uuid,
+    fired_at: DateTime<Utc>,
+    target_workflow_name: String,
+    target_shard: Option<i32>,
+}
+
+/// A [`ResolvedFire`] resolved to a concrete target shard, pending
+/// adjudication. `target_shard == source_shard` for a RECORDED same-shard
+/// fire (Codex follow-up x14/x15). The trigger fire and the target start
+/// commit atomically in that case. A restore containing the fire
+/// necessarily contains the target's initial creation too. That fact
+/// changes what adjudication means, not whether it happens.
+/// `resolve_trigger_fires` routes such a fire to
+/// `probes::adjudicate_same_shard_fires` instead of the cross-shard path,
+/// since ordinary absence carries no relay-loss signal for it.
+#[cfg(all(feature = "db", feature = "testing"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingTriggerFire {
+    source_shard: i32,
+    source_exec_id: Uuid,
+    trigger_id: Uuid,
+    target_workflow_name: String,
+    target_workflow_id: String,
+    target_shard: i32,
+    fired_at: DateTime<Utc>,
+}
+
+/// Route each fire to its target shard and drop the same-shard ones.
+///
+/// `target_workflow_id` replicates `completion_trigger.rs` exactly:
+/// `format!("completion-trigger-{trigger_id}-{source_exec_id}")`.
+///
+/// The target shard PREFERS `fire.target_shard` -- the shard the relay
+/// itself resolved and persisted at fire time (issue #1401 migration).
+/// That is the historical fact, not a reconstruction, so it is immune to a
+/// shard drain or rebalance that happened after the fire.
+///
+/// For a fire predating that migration (`target_shard: None`), this falls
+/// back to `router.pick_for_new_workflow(target_workflow_name,
+/// target_workflow_id)`. This is the same rendezvous hash the live relay
+/// used, re-derived rather than read.
+///
+/// `router` must cover every shard the live fleet can route to for that
+/// fallback to be trustworthy. A router built from a partial fleet can
+/// pick a different shard than production did. This is the same "supply
+/// every shard" assumption the event-reference scan already carries (see
+/// [`FindingClass::UninspectedShardReference`]).
+///
+/// The fallback also cannot see a HISTORICAL shard drain: readable, not
+/// writable, at fire time but not now. This is the same
+/// placement-vs-location caveat `shard::external_target_owning_shard`
+/// documents. It is a residual limitation for pre-migration data only.
+///
+/// A RECORDED same-shard fire (`fire.target_shard == Some(source_shard)`)
+/// is still adjudicated, not dropped outright (Codex follow-up x14). The
+/// atomic-commit fact only proves the target was CREATED there. A shard
+/// rebalance after the fire can move the live row elsewhere. It leaves a
+/// `MIGRATED` seal under the same business key on `source_shard` -- the
+/// same forwarding-seal shape `probes::matching_workflow_executions`
+/// already guards against for cross-shard fires. Routing it through
+/// `pending` like any other fire, with `target_shard` equal to
+/// `source_shard`, gets it that same protection for free.
+///
+/// A RE-DERIVED pick that happens to equal `source_shard` is different
+/// (issue #1401, Codex follow-up). The same historical-drain blind spot
+/// can point the fallback at the wrong CROSS-shard target. It can just as
+/// easily land the pick on `source_shard` by coincidence. That would
+/// silently drop a fire that was actually lost. Unlike the RECORDED case,
+/// this pick is not a historical fact, so adjudicating it against
+/// `source_shard` would not even be checking the right place. Such a fire
+/// goes to `uncertain` instead of being silently skipped or adjudicated
+/// against a shard pick this function cannot vouch for.
+#[cfg(all(feature = "db", feature = "testing"))]
+struct RoutedTriggerFires {
+    pending: Vec<PendingTriggerFire>,
+    /// A pre-migration fire whose re-derived shard landed on its own
+    /// source shard -- a same-shard conclusion this function cannot
+    /// trust. Sample identifiers, for a [`FindingClass::CompletionTriggerFireUnproven`].
+    /// Bounded at [`MAX_FINDING_SAMPLES`] as it accumulates; `uncertain_count`
+    /// stays exact regardless (issue #1401, Codex follow-up x3), mirroring
+    /// `TriggerFireBuckets`'s bounded sample lists.
+    uncertain: Vec<String>,
+    uncertain_count: u64,
+}
+
+#[cfg(all(feature = "db", feature = "testing"))]
+fn route_trigger_fires(
+    fires: Vec<(i32, ResolvedFire)>,
+    router: &crate::shard::ShardRouter,
+) -> RoutedTriggerFires {
+    let mut pending = Vec::new();
+    let mut uncertain = Vec::new();
+    let mut uncertain_count: u64 = 0;
+    for (source_shard, fire) in fires {
+        let target_workflow_id = format!(
+            "completion-trigger-{}-{}",
+            fire.trigger_id, fire.source_exec_id
+        );
+        let (target_shard, reconstructed) = match fire.target_shard {
+            Some(shard) => (shard, false),
+            None => (
+                router
+                    .pick_for_new_workflow(&fire.target_workflow_name, &target_workflow_id)
+                    .as_i32(),
+                true,
+            ),
+        };
+        if target_shard == source_shard && reconstructed {
+            if uncertain.len() < MAX_FINDING_SAMPLES {
+                uncertain.push(format!(
+                    "{target_workflow_id} (fired by {} on shard {source_shard}; \
+                     pre-migration fire, re-derived shard pick cannot be trusted to \
+                     rule out a cross-shard relay)",
+                    fire.source_exec_id
+                ));
+            }
+            uncertain_count += 1;
+            continue;
+        }
+        // A RECORDED same-shard fire (`target_shard == source_shard`,
+        // `!reconstructed`) falls through to here instead of being dropped
+        // (Codex follow-up x14). It still needs the MIGRATED-seal check
+        // below, in case the target has since rebalanced away.
+        pending.push(PendingTriggerFire {
+            source_shard,
+            source_exec_id: fire.source_exec_id,
+            trigger_id: fire.trigger_id,
+            target_workflow_name: fire.target_workflow_name,
+            target_workflow_id,
+            target_shard,
+            fired_at: fire.fired_at,
+        });
+    }
+    RoutedTriggerFires {
+        pending,
+        uncertain,
+        uncertain_count,
+    }
+}
+
+/// Is an absent completion-trigger target a PROVEN loss, given the target
+/// shard's own restore-point proxy?
+///
+/// The relay can only start the target AT OR AFTER `fired_at`. `fired_at`
+/// is set when the source recorded the fire, before any relay attempt. So a
+/// target shard whose newest event PREDATES `fired_at` cannot possibly
+/// contain the delivery, PROVIDED that newest-event timestamp itself is
+/// trustworthy.
+///
+/// `fired_at` and `target_latest_event_at` come from TWO DIFFERENT
+/// Postgres hosts' clocks in a multi-shard deployment (issue #1401, Codex
+/// follow-up). A raw `<` comparison would treat any clock skew between
+/// them as proof of loss. `max_skew_secs` is the same operator-configured
+/// tolerance [`FindingClass::RestorePointSkew`] already uses to flag
+/// excessive cross-shard skew. A gap smaller than that tolerance is never
+/// trusted as proof here either. The gap must exceed the skew bound the
+/// deployment already vouches for.
+///
+/// Otherwise, absence stays ambiguous: the target shard has progressed past
+/// `fired_at`, or carries no event to compare at all. It may be ordinary
+/// retention -- the run completed and was collected. The caller already
+/// checked for a `harvest_execution_summaries` row (durable proof) before
+/// reaching this function. This is the fallback for when no such row
+/// exists, resolved from the fire's own `fired_at` instead (issue #1401).
+/// This is the same evidentiary gap [`FindingClass::RetentionUnproven`]
+/// names for a recorded child terminal or delivered effect.
+///
+/// Residual limitation (issue #1401, Codex follow-up x2). A target that
+/// ran, completed, and was retention-collected with no other traffic on
+/// its shard afterward can itself have been the shard's newest event. Its
+/// deletion then pulls the visible newest-event timestamp back to before
+/// `fired_at`. This proxy then misreads a coherent restore as decisive
+/// loss.
+///
+/// `harvest_execution_summaries` (checked by the caller first) closes
+/// this -- but only within its OWN retention horizon.
+/// `retention::gc_execution_summaries` hard-deletes a non-migration-target
+/// summary once it ages past `summary_age`, while
+/// `harvest_completion_trigger_fires` has no cleanup path at all. So this
+/// gap is not just "summaries disabled": it recurs for every fire once it
+/// outlives its target's summary, even with summaries enabled. Closing it
+/// unconditionally needs a real durable restore-point marker, the exact
+/// durable-marker work issue #1401 explicitly chose not to require.
+#[cfg(all(feature = "db", feature = "testing"))]
+#[must_use]
+fn absence_is_decisive_loss(
+    fired_at: DateTime<Utc>,
+    target_latest_event_at: Option<DateTime<Utc>>,
+    max_skew_secs: i64,
+) -> bool {
+    // `VerifyOptions::max_skew_secs` is a public, unvalidated field (Codex
+    // follow-up x20). A negative value would flip this comparison's
+    // direction. A target shard AHEAD of `fired_at` would then read as
+    // decisive loss instead of proof of life. Floor it at zero: a
+    // negative tolerance means "no tolerance", not "invert the check".
+    let max_skew_secs = max_skew_secs.max(0);
+    // A very large positive value can still overflow `Duration::seconds`'s
+    // representable range and panic (Codex follow-up). That would abort
+    // the whole verify run instead of returning an undetermined report.
+    // Fall back to the largest representable tolerance instead. An
+    // out-of-range request means "tolerate anything." That is the safe
+    // reading of an unbounded skew allowance, not a crash.
+    let max_skew = chrono::Duration::try_seconds(max_skew_secs).unwrap_or(chrono::Duration::MAX);
+    matches!(
+        target_latest_event_at,
+        Some(latest) if fired_at - latest > max_skew
+    )
+}
+
 // ── Production-DSN guard ────────────────────────────────────────────────────
 
 /// True when `candidate` and `live` address the same Postgres database.
@@ -1173,7 +1434,7 @@ mod probes {
 
     use chrono::{DateTime, Utc};
     use diesel::OptionalExtension as _;
-    use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz};
+    use diesel::sql_types::{BigInt, Integer, Nullable, Text, Timestamptz};
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
     use uuid::Uuid;
 
@@ -1421,13 +1682,19 @@ mod probes {
         target: &ShardTarget,
         options: &VerifyOptions,
         replayer: &WorkflowReplayer,
-    ) -> (ShardVerifyReport, Vec<PendingRef>) {
+    ) -> (ShardVerifyReport, Vec<PendingRef>, Vec<super::ResolvedFire>) {
         let shard_id = target.shard_id;
         let dsn = redact_dsn(&target.dsn);
 
         let mut conn = match connect_read_only(&target.dsn).await {
             Ok(c) => c,
-            Err(e) => return (ShardVerifyReport::unreachable(shard_id, dsn, e), Vec::new()),
+            Err(e) => {
+                return (
+                    ShardVerifyReport::unreachable(shard_id, dsn, e),
+                    Vec::new(),
+                    Vec::new(),
+                );
+            }
         };
 
         let mut findings = Vec::new();
@@ -1669,6 +1936,21 @@ mod probes {
             Err(e) => soft_errors.push(e),
         }
 
+        // ── Completion-trigger fires this shard confirms it delivered ───────
+        let mut trigger_fires = Vec::new();
+        match collect_trigger_fires(&mut conn, limit).await {
+            Ok(collected) => {
+                trigger_fires = collected.fires;
+                if let Some(note) = collected.truncation {
+                    soft_errors.push(note);
+                }
+                if let Some(note) = collected.undecodable {
+                    soft_errors.push(note);
+                }
+            }
+            Err(e) => soft_errors.push(e),
+        }
+
         // ── Replay a bounded sample of non-terminal histories ───────────────
         let replay = match replay_sample(&mut conn, options, replayer, shard_id).await {
             Ok((summary, mut divergences)) => {
@@ -1707,6 +1989,7 @@ mod probes {
                 findings,
             },
             refs,
+            trigger_fires,
         )
     }
 
@@ -1731,6 +2014,235 @@ mod probes {
             refs: build_refs(scan, shard_id, default_shard),
             truncation,
             workflow_id_targets,
+            undecodable,
+        })
+    }
+
+    /// One row of the completion-trigger fire scan, before its target name
+    /// is resolved to a final value.
+    ///
+    /// `fire_target_workflow_name` is the name the fires row itself
+    /// recorded at relay time (issue #1401 migration).
+    /// `trigger_target_workflow_name` is the CURRENT name on the trigger
+    /// definition, a fallback for a fire predating that migration. See
+    /// [`collect_trigger_fires`].
+    #[derive(diesel::QueryableByName)]
+    struct TriggerFireRow {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        source_exec_id: Uuid,
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        trigger_id: Uuid,
+        #[diesel(sql_type = Timestamptz)]
+        fired_at: DateTime<Utc>,
+        #[diesel(sql_type = Nullable<Integer>)]
+        target_shard: Option<i32>,
+        #[diesel(sql_type = Nullable<Text>)]
+        fire_target_workflow_name: Option<String>,
+        #[diesel(sql_type = Nullable<Text>)]
+        trigger_target_workflow_name: Option<String>,
+    }
+
+    /// Cap on pages read scanning completion-trigger fires -- mirrors
+    /// [`MAX_REFERENCE_SCAN_PAGES`]. A runaway guard, not a tuning knob.
+    const MAX_TRIGGER_FIRE_SCAN_PAGES: usize = 1_000;
+
+    /// Scan this shard for completion-trigger fires it recorded as delivered
+    /// (issue #1401).
+    ///
+    /// `outcome IS NULL` alone is NOT proof of delivery. It is set the
+    /// moment the trigger fires, in the same transaction that inserts the
+    /// cross-shard outbox row. This is before any relay attempt. A fire
+    /// still waiting on the outbox scanner, or parked behind a
+    /// `QuotaExceeded` backoff, has `outcome IS NULL` too. Adjudicating it
+    /// as delivered would report an ordinary backlog as a lost relay.
+    ///
+    /// The actual "confirmed delivered" signal is `outcome IS NULL` AND no
+    /// `harvest_completion_trigger_outbox` row remains for this
+    /// `(source_exec_id, trigger_id)`. `relay_gate_checked_start` deletes
+    /// that row only after the target-shard start committed, or an
+    /// any-state existence check found the target already there. A
+    /// same-shard fire never had an outbox row at all -- it is filtered out
+    /// later by [`super::route_trigger_fires`], not here. A row with a
+    /// RESOLVED outcome (`condition_unmet`/`admission_blocked`) started
+    /// nothing on any shard, so it is excluded outright.
+    ///
+    /// **Residual gap for fires rejected before this fix shipped** (Codex
+    /// follow-up). `enforce_completion_triggers_outbox_with_codecs` now sets
+    /// `outcome = 'payload_too_large'` in the same transaction as the
+    /// outbox delete. A fire it permanently rejects is excluded above like
+    /// any other RESOLVED outcome. A fire an OLDER build rejected the same
+    /// way has `outcome IS NULL` and no outbox row instead, since that
+    /// write did not exist yet. This is the identical shape this scan
+    /// reads as a candidate for adjudication. Nothing durable records
+    /// which case applies. So this scan cannot tell a pre-fix rejection
+    /// from a genuinely lost relay after the fact. This is the same
+    /// category of unfixable-after-the-fact gap as the pre-migration
+    /// `target_shard`/`target_workflow_name` reconstruction documented on
+    /// [`route_trigger_fires`]. It is scoped to fires rejected before this
+    /// deploy, not to fires written before the migration.
+    ///
+    /// Each row stands alone. Unlike the event scan, no group spans more
+    /// than one row, so plain keyset pagination on the primary key
+    /// `(source_exec_id, trigger_id)` cannot split anything.
+    /// One page of [`scan_completion_trigger_fires`], keyset-paginated on
+    /// the fires table's own primary key `(source_exec_id, trigger_id)`.
+    async fn fetch_trigger_fire_page(
+        conn: &mut AsyncPgConnection,
+        page: i64,
+        cursor: Option<(Uuid, Uuid)>,
+    ) -> Result<Vec<TriggerFireRow>, String> {
+        let after = match cursor {
+            Some(_) => "AND (f.source_exec_id, f.trigger_id) > ($1, $2) ",
+            None => "",
+        };
+        let sql = format!(
+            "SELECT f.source_exec_id, f.trigger_id, f.fired_at, \
+                 f.target_shard, \
+                 f.target_workflow_name AS fire_target_workflow_name, \
+                 t.target_workflow_name AS trigger_target_workflow_name \
+             FROM harvest_completion_trigger_fires f \
+             LEFT JOIN harvest_completion_triggers t ON t.id = f.trigger_id \
+             WHERE f.outcome IS NULL \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM harvest_completion_trigger_outbox o \
+                 WHERE o.source_exec_id = f.source_exec_id \
+                   AND o.trigger_id = f.trigger_id \
+               ) \
+             {after}\
+             ORDER BY f.source_exec_id, f.trigger_id \
+             LIMIT {page}"
+        );
+        let query = diesel::sql_query(sql);
+        match cursor {
+            Some((exec, trig)) => {
+                query
+                    .bind::<diesel::sql_types::Uuid, _>(exec)
+                    .bind::<diesel::sql_types::Uuid, _>(trig)
+                    .load(conn)
+                    .await
+            }
+            None => query.load(conn).await,
+        }
+        .map_err(|e| format!("completion-trigger fire scan failed: {e}"))
+    }
+
+    async fn scan_completion_trigger_fires(
+        conn: &mut AsyncPgConnection,
+        limit: i64,
+    ) -> Result<(Vec<TriggerFireRow>, Option<String>), String> {
+        let page = limit.max(1);
+        let mut rows: Vec<TriggerFireRow> = Vec::new();
+        let mut cursor: Option<(Uuid, Uuid)> = None;
+
+        for _ in 0..MAX_TRIGGER_FIRE_SCAN_PAGES {
+            let loaded = fetch_trigger_fire_page(conn, page, cursor).await?;
+            let exhausted = i64::try_from(loaded.len()).unwrap_or(i64::MAX) < page;
+            if let Some(last) = loaded.last() {
+                cursor = Some((last.source_exec_id, last.trigger_id));
+            }
+            rows.extend(loaded);
+            if exhausted {
+                return Ok((rows, None));
+            }
+        }
+
+        // The budget ran out with the last page full (issue #1401, Codex
+        // follow-up x6). A qualifying-row count that is an exact multiple
+        // of `page` looks the same as genuine truncation. `len < page`
+        // never fires when every page, including the true last one, comes
+        // back full.
+        //
+        // A same-sized confirming PAGE just moves that boundary one page
+        // later (issue #1401, Codex follow-up x12). Any fixed-size fetch
+        // has a count where a full result is genuinely the end. An
+        // EXISTENCE probe does not: fetch at most one row past the cursor.
+        // Empty proves nothing remains, for any qualifying-row count. One
+        // row proves the opposite, just as certainly.
+        //
+        // That one confirmation row is deliberately NOT added to `rows`
+        // (Codex follow-up x21). Appending it, then unconditionally
+        // reporting truncation, made the truncation message lie exactly
+        // when the qualifying count was one row over budget. That row was
+        // in fact adjudicated, yet "the remainder was NOT adjudicated"
+        // still printed. Leaving it out keeps `rows.len()` and the
+        // message consistent in every case, at the cost of discarding one
+        // already-fetched row when truncation is genuine.
+        let confirmation = fetch_trigger_fire_page(conn, 1, cursor).await?;
+        if confirmation.is_empty() {
+            return Ok((rows, None));
+        }
+
+        let truncation = format!(
+            "completion-trigger fire scan hit its page ceiling after {} rows \
+             ({MAX_TRIGGER_FIRE_SCAN_PAGES} pages of probe_limit={page}); the \
+             remainder was NOT adjudicated (raise --probe-limit)",
+            rows.len()
+        );
+        Ok((rows, Some(truncation)))
+    }
+
+    /// What one shard's completion-trigger fire scan produced.
+    struct CollectedTriggerFires {
+        fires: Vec<super::ResolvedFire>,
+        truncation: Option<String>,
+        /// Fail-closed note when a fire names a trigger definition that no
+        /// longer exists, so its target could not be derived.
+        undecodable: Option<String>,
+    }
+
+    /// Scan and resolve this shard's completion-trigger fires.
+    ///
+    /// Split out of `verify_shard` to keep the scan and the per-row
+    /// resolution separately readable, mirroring `collect_refs`.
+    ///
+    /// Prefers `fire_target_workflow_name` (recorded at relay time, issue
+    /// #1401 migration) over `trigger_target_workflow_name` (the trigger
+    /// definition's CURRENT name, a fallback for a pre-migration fire).
+    /// Only a pre-migration fire whose trigger definition has since been
+    /// deleted has neither.
+    async fn collect_trigger_fires(
+        conn: &mut AsyncPgConnection,
+        limit: i64,
+    ) -> Result<CollectedTriggerFires, String> {
+        let (rows, truncation) = scan_completion_trigger_fires(conn, limit).await?;
+        let mut fires = Vec::with_capacity(rows.len());
+        // Bounded like `undecodable_samples` in `fold_reference_events`: a
+        // static trigger removed while fires still reference it can affect
+        // every row the scan admits, up to `limit`. The count stays exact;
+        // only the joined sample text is capped.
+        let mut missing_trigger_samples = Vec::new();
+        let mut missing_trigger_count: u64 = 0;
+        for row in rows {
+            if let Some(target_workflow_name) = row
+                .fire_target_workflow_name
+                .or(row.trigger_target_workflow_name)
+            {
+                fires.push(super::ResolvedFire {
+                    source_exec_id: row.source_exec_id,
+                    trigger_id: row.trigger_id,
+                    fired_at: row.fired_at,
+                    target_workflow_name,
+                    target_shard: row.target_shard,
+                });
+            } else {
+                if missing_trigger_samples.len() < MAX_FINDING_SAMPLES {
+                    missing_trigger_samples
+                        .push(format!("{}/{}", row.source_exec_id, row.trigger_id));
+                }
+                missing_trigger_count += 1;
+            }
+        }
+        let undecodable = (missing_trigger_count > 0).then(|| {
+            format!(
+                "{missing_trigger_count} completion-trigger fire(s) name a trigger \
+                 definition that no longer exists, so their target could not be \
+                 derived: {}",
+                missing_trigger_samples.join(", ")
+            )
+        });
+        Ok(CollectedTriggerFires {
+            fires,
+            truncation,
             undecodable,
         })
     }
@@ -2501,63 +3013,227 @@ mod probes {
         Ok(row.present)
     }
 
-    /// Look up each reference's target on its owning shard and bucket the
+    /// One `(workflow_name, workflow_id)` business key, matched against a
+    /// batch of candidates via `UNNEST` (issue #1401, Codex follow-up).
+    #[derive(diesel::QueryableByName)]
+    struct WorkflowKeyRow {
+        #[diesel(sql_type = Text)]
+        workflow_name: String,
+        #[diesel(sql_type = Text)]
+        workflow_id: String,
+    }
+
+    /// Cap on fires [`adjudicate_trigger_fires`] adjudicates per round trip
+    /// (issue #1401, Codex follow-up x2). `harvest_completion_trigger_fires`
+    /// has no cleanup path, and the preceding scan admits up to
+    /// [`MAX_TRIGGER_FIRE_SCAN_PAGES`] pages. A shard whose fires are ALL
+    /// confirmed-delivered can put every one of them in a single batch.
+    /// Unbounded, a 255-byte-name fleet at that scale turns one `UNNEST`
+    /// call into a hundreds-of-megabytes request. It would also hold every
+    /// name, id, and matched key in memory at once. Chunking the CALLER's
+    /// batch, not just the query, bounds both.
+    const WORKFLOW_KEY_LOOKUP_CHUNK: usize = 1_000;
+
+    /// One matched `harvest_workflow_executions` business key, along with
+    /// whether EVERY row under it is a `MIGRATED` forwarding seal (Codex
+    /// follow-up x13).
+    #[derive(diesel::QueryableByName)]
+    struct WorkflowExecutionMatchRow {
+        #[diesel(sql_type = Text)]
+        workflow_name: String,
+        #[diesel(sql_type = Text)]
+        workflow_id: String,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        all_migrated: bool,
+        /// The seal's forwarding shard, when `all_migrated`. A completion-
+        /// trigger target's business key is a one-time id (Codex follow-up
+        /// x16). In practice at most one row exists per key. `MAX` is a
+        /// deterministic pick if that assumption is ever violated. `NULL`
+        /// when `all_migrated` is false -- the caller never needs it then.
+        #[diesel(sql_type = Nullable<Integer>)]
+        migrated_to_shard: Option<i32>,
+    }
+
+    /// Like [`matching_workflow_keys`] against `harvest_workflow_executions`,
+    /// but distinguishes a genuine row from a `MIGRATED` forwarding seal.
+    ///
+    /// A completion-trigger fire's target shard is a historical fact
+    /// (persisted at relay time) or a reconstruction against CURRENT
+    /// topology (a pre-migration fire). Either way, it names the shard the
+    /// target STARTED on. A shard rebalance since then can move the live
+    /// row to a different shard. It leaves a `MIGRATED` seal behind under
+    /// the SAME business key -- present, but a forwarding pointer, not the
+    /// run. That seal proves the key was claimed. It does not prove the
+    /// runnable target survived THIS restore, since the actual row is not
+    /// on this shard's snapshot at all. UNLESS the reconciler already
+    /// observed the live copy reach a terminal state. That state is
+    /// `migrated_run_terminal_at IS NOT NULL` (Codex follow-up x17), and
+    /// is durable proof of delivery in its own right. Such a row then
+    /// counts as a genuine match here, not a seal still needing to be
+    /// chased. `all_migrated` is true only when every matched row under a
+    /// key is an UNRECONCILED seal. A key with at least one non-seal or
+    /// already-reconciled row (the common case) still reads as a genuine
+    /// match.
+    async fn matching_workflow_executions(
+        conn: &mut AsyncPgConnection,
+        names: &[String],
+        ids: &[String],
+    ) -> Result<Vec<WorkflowExecutionMatchRow>, diesel::result::Error> {
+        diesel::sql_query(
+            "SELECT e.workflow_name, e.workflow_id, \
+                 bool_and(e.state = 'MIGRATED' AND e.migrated_run_terminal_at IS NULL) \
+                   AS all_migrated, \
+                 MAX(e.migrated_to_shard) AS migrated_to_shard \
+             FROM harvest_workflow_executions e \
+             JOIN UNNEST($1::text[], $2::text[]) AS t(workflow_name, workflow_id) \
+               ON e.workflow_name = t.workflow_name AND e.workflow_id = t.workflow_id \
+             GROUP BY e.workflow_name, e.workflow_id",
+        )
+        .bind::<diesel::sql_types::Array<Text>, _>(names)
+        .bind::<diesel::sql_types::Array<Text>, _>(ids)
+        .load(conn)
+        .await
+    }
+
+    /// Which of the given business keys exist in `table_name`, in ONE
+    /// round trip.
+    ///
+    /// `table_name` is never caller input. Both call sites below pass a
+    /// fixed literal. String interpolation here carries no injection
+    /// surface, matching every other dynamic-SQL helper in this file.
+    ///
+    /// `UNNEST($1::text[], $2::text[])` pairs `names[i]` with `ids[i]`
+    /// positionally. The caller is responsible for keeping `names`/`ids`
+    /// within [`WORKFLOW_KEY_LOOKUP_CHUNK`] -- this function does not
+    /// chunk internally. A completion-trigger fire has no target execution
+    /// id to look up by -- it is minted only at start time. The business
+    /// key is the only handle this tool has for either
+    /// `harvest_workflow_executions` or `harvest_execution_summaries`.
+    /// Both are keyed here the same way.
+    async fn matching_workflow_keys(
+        conn: &mut AsyncPgConnection,
+        table_name: &str,
+        names: &[String],
+        ids: &[String],
+    ) -> Result<std::collections::HashSet<(String, String)>, diesel::result::Error> {
+        let rows: Vec<WorkflowKeyRow> = diesel::sql_query(format!(
+            "SELECT DISTINCT e.workflow_name, e.workflow_id \
+             FROM {table_name} e \
+             JOIN UNNEST($1::text[], $2::text[]) AS t(workflow_name, workflow_id) \
+               ON e.workflow_name = t.workflow_name AND e.workflow_id = t.workflow_id"
+        ))
+        .bind::<diesel::sql_types::Array<Text>, _>(names)
+        .bind::<diesel::sql_types::Array<Text>, _>(ids)
+        .load(conn)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.workflow_name, r.workflow_id))
+            .collect())
+    }
+
+    /// One execution id's state, matched via `= ANY($1)` (issue #1704,
+    /// mirroring the completion-trigger-fire batching `matching_workflow_executions`
+    /// already established for issue #1401).
+    #[derive(diesel::QueryableByName)]
+    struct ExecutionStateRow {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+        #[diesel(sql_type = Text)]
+        state: String,
+    }
+
+    /// Which of the given execution ids exist, and their state, in ONE round
+    /// trip (issue #1704).
+    ///
+    /// The caller chunks at [`WORKFLOW_KEY_LOOKUP_CHUNK`] -- this function
+    /// does not chunk internally, matching [`matching_workflow_keys`]'s own
+    /// contract.
+    async fn matching_execution_states(
+        conn: &mut AsyncPgConnection,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, String>, diesel::result::Error> {
+        let rows: Vec<ExecutionStateRow> = diesel::sql_query(
+            "SELECT id, state FROM harvest_workflow_executions WHERE id = ANY($1)",
+        )
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
+        .load(conn)
+        .await?;
+        Ok(rows.into_iter().map(|r| (r.id, r.state)).collect())
+    }
+
+    /// Look up every reference's target on its owning shard and bucket the
     /// verdict. Split out of `resolve_refs` so the per-shard connection
     /// handling and the per-reference verdict logic stay separately readable.
+    ///
+    /// The state lookup itself is batched, `= ANY($1)` per
+    /// [`WORKFLOW_KEY_LOOKUP_CHUNK`]-sized chunk of `owned`, not one
+    /// `WHERE id = $1` round trip per reference (issue #1704). A restore
+    /// drill's cross-shard reference set can reach into the thousands for a
+    /// busy fan-out workflow. `adjudicate_trigger_fires` was already
+    /// rewritten to avoid this exact query class, for issue #1401. That fix
+    /// was never carried over to this, its older sibling. Chunking (rather
+    /// than one whole-shard batch) bounds request and result-set size the
+    /// same way it does there. Each chunk's state map is adjudicated and
+    /// discarded before the next chunk's lookup starts. This matches how
+    /// `adjudicate_trigger_fires` discards its own per-chunk keys (Codex
+    /// follow-up). Otherwise the chunk bound would cap round-trip size only.
+    /// It would not bound the aggregate map this function holds for the
+    /// whole reference set.
     async fn adjudicate_refs(conn: &mut AsyncPgConnection, owned: &[&PendingRef]) -> RefBuckets {
         let mut out = RefBuckets::default();
-        for r in owned {
-            // `.optional()` is load-bearing: `get_result` returns
-            // `Err(NotFound)` for zero rows AND `Err(DatabaseError)` for a
-            // real failure. Collapsing both with `.ok()` would make a
-            // transient query error read as "this execution is absent" --
-            // an Incoherent verdict (exit 1, "do not start workers") on a
-            // perfectly good restore -- and, for a recorded terminal, read
-            // as ordinary retention, hiding a genuine rollback.
-            let looked_up =
-                diesel::sql_query("SELECT state FROM harvest_workflow_executions WHERE id = $1")
-                    .bind::<diesel::sql_types::Uuid, _>(r.target)
-                    .get_result::<StateRow>(conn)
-                    .await
-                    .optional();
 
-            let state: Option<String> = match looked_up {
-                Ok(row) => row.map(|row| row.state),
+        for chunk in owned.chunks(WORKFLOW_KEY_LOOKUP_CHUNK) {
+            let ids: Vec<Uuid> = chunk.iter().map(|r| r.target).collect();
+            // A chunk-level failure marks every reference in that chunk as a
+            // lookup error rather than aborting the whole batch, mirroring
+            // `adjudicate_trigger_fire_chunk`'s per-chunk error handling.
+            let states = match matching_execution_states(conn, &ids).await {
+                Ok(found) => found,
                 Err(e) => {
-                    out.lookup_errors
-                        .push(format!("{} lookup failed: {e}", r.target));
+                    for r in chunk {
+                        out.lookup_errors
+                            .push(format!("{} lookup failed: {e}", r.target));
+                    }
                     continue;
                 }
             };
 
-            match (&r.kind, state) {
-                (RefKind::AwaitedChild, None) => {
-                    out.missing_child.push(format!(
-                        "{} (awaited by {} on shard {})",
-                        r.target, r.source_exec, r.source_shard
-                    ));
-                }
-                (RefKind::ChildTerminalRecorded, Some(s))
-                    if !crate::erase::is_terminal_state(&s) =>
-                {
-                    out.rolled_back.push(format!(
-                        "{} is {s} on shard {} but {} on shard {} recorded its terminal",
-                        r.target, r.owner_shard, r.source_exec, r.source_shard
-                    ));
-                }
-                // A recorded child terminal whose execution row exists AND is
-                // itself terminal matches what the owner recorded -- clean.
-                (RefKind::ChildTerminalRecorded | RefKind::AwaitedChild, Some(_)) => {}
-                // The execution row is gone entirely. Ordinary retention is
-                // ONE explanation. A target shard restored to before the
-                // execution ever existed is another. This tool cannot tell
-                // them apart without a durable marker. A retention summary is
-                // that marker. Present, it proves retention and the
-                // reference stays silent exactly as before. Absent, the
-                // absence is reported rather than assumed benign (issue
-                // #1205).
-                (RefKind::ChildTerminalRecorded | RefKind::ExternalEffectDelivered(_), None) => {
-                    match retention_summary_exists(conn, r.target).await {
+            for r in chunk {
+                // Absent from `states` means zero rows matched -- the batched
+                // equivalent of the old `.optional()` `None` branch.
+                let state: Option<String> = states.get(&r.target).cloned();
+
+                match (&r.kind, state) {
+                    (RefKind::AwaitedChild, None) => {
+                        out.missing_child.push(format!(
+                            "{} (awaited by {} on shard {})",
+                            r.target, r.source_exec, r.source_shard
+                        ));
+                    }
+                    (RefKind::ChildTerminalRecorded, Some(s))
+                        if !crate::erase::is_terminal_state(&s) =>
+                    {
+                        out.rolled_back.push(format!(
+                            "{} is {s} on shard {} but {} on shard {} recorded its terminal",
+                            r.target, r.owner_shard, r.source_exec, r.source_shard
+                        ));
+                    }
+                    // A recorded child terminal whose execution row exists AND is
+                    // itself terminal matches what the owner recorded -- clean.
+                    (RefKind::ChildTerminalRecorded | RefKind::AwaitedChild, Some(_)) => {}
+                    // The execution row is gone entirely. Ordinary retention is
+                    // ONE explanation. A target shard restored to before the
+                    // execution ever existed is another. This tool cannot tell
+                    // them apart without a durable marker. A retention summary is
+                    // that marker. Present, it proves retention and the
+                    // reference stays silent exactly as before. Absent, the
+                    // absence is reported rather than assumed benign (issue
+                    // #1205).
+                    (
+                        RefKind::ChildTerminalRecorded | RefKind::ExternalEffectDelivered(_),
+                        None,
+                    ) => match retention_summary_exists(conn, r.target).await {
                         Ok(true) => {}
                         Ok(false) => out.retention_unproven.push(format!(
                             "{} (referenced by {} on shard {}; absent with no \
@@ -2567,43 +3243,43 @@ mod probes {
                         Err(e) => out
                             .lookup_errors
                             .push(format!("{} retention-summary lookup failed: {e}", r.target)),
+                    },
+                    (RefKind::ExternalTarget, None) => {
+                        out.missing_external.push(format!(
+                            "{} (requested by {} on shard {})",
+                            r.target, r.source_exec, r.source_shard
+                        ));
                     }
-                }
-                (RefKind::ExternalTarget, None) => {
-                    out.missing_external.push(format!(
-                        "{} (requested by {} on shard {})",
-                        r.target, r.source_exec, r.source_shard
-                    ));
-                }
-                (RefKind::ExternalTarget, Some(_)) => {
-                    out.pending_external.push(format!(
-                        "{} (requested by {} on shard {})",
-                        r.target, r.source_exec, r.source_shard
-                    ));
-                }
-                (RefKind::ExternalEffectDelivered(effect), Some(s)) => {
-                    match effect_verdict(conn, r.target, effect, &s).await {
-                        Ok(EffectVerdict::Survived) => {}
-                        Ok(EffectVerdict::Unverifiable) => {
-                            out.unverifiable_effect.push(format!(
-                                "{} unkeyed signal delivered by {} on shard {} cannot be \
+                    (RefKind::ExternalTarget, Some(_)) => {
+                        out.pending_external.push(format!(
+                            "{} (requested by {} on shard {})",
+                            r.target, r.source_exec, r.source_shard
+                        ));
+                    }
+                    (RefKind::ExternalEffectDelivered(effect), Some(s)) => {
+                        match effect_verdict(conn, r.target, effect, &s).await {
+                            Ok(EffectVerdict::Survived) => {}
+                            Ok(EffectVerdict::Unverifiable) => {
+                                out.unverifiable_effect.push(format!(
+                                    "{} unkeyed signal delivered by {} on shard {} cannot be \
                                  identified on shard {} (a signal of that name is present, \
                                  but the engine records no per-delivery identity)",
-                                r.target, r.source_exec, r.source_shard, r.owner_shard
-                            ));
-                        }
-                        Ok(EffectVerdict::Lost) => out.lost_effect.push(format!(
-                            "{} {} delivered by {} on shard {} left no trace on shard {} \
+                                    r.target, r.source_exec, r.source_shard, r.owner_shard
+                                ));
+                            }
+                            Ok(EffectVerdict::Lost) => out.lost_effect.push(format!(
+                                "{} {} delivered by {} on shard {} left no trace on shard {} \
                              (target is {s})",
-                            effect.label(),
-                            r.target,
-                            r.source_exec,
-                            r.source_shard,
-                            r.owner_shard
-                        )),
-                        Err(e) => out
-                            .lookup_errors
-                            .push(format!("{} effect check failed: {e}", r.target)),
+                                effect.label(),
+                                r.target,
+                                r.source_exec,
+                                r.source_shard,
+                                r.owner_shard
+                            )),
+                            Err(e) => out
+                                .lookup_errors
+                                .push(format!("{} effect check failed: {e}", r.target)),
+                        }
                     }
                 }
             }
@@ -2893,6 +3569,520 @@ mod probes {
         findings
     }
 
+    /// Verdict buckets for one target shard's pending completion-trigger fires.
+    ///
+    /// Each sample list is bounded at [`MAX_FINDING_SAMPLES`] as it
+    /// accumulates; the paired count stays exact regardless (issue #1401,
+    /// Codex follow-up), mirroring `fold_reference_events`'s
+    /// `undecodable_samples`/`undecodable_count` split.
+    #[derive(Default)]
+    struct TriggerFireBuckets {
+        lost: Vec<String>,
+        lost_count: u64,
+        unproven: Vec<String>,
+        unproven_count: u64,
+        lookup_errors: Vec<String>,
+        lookup_errors_count: u64,
+    }
+
+    impl TriggerFireBuckets {
+        fn push_lost(&mut self, sample: String) {
+            if self.lost.len() < MAX_FINDING_SAMPLES {
+                self.lost.push(sample);
+            }
+            self.lost_count += 1;
+        }
+
+        fn push_unproven(&mut self, sample: String) {
+            if self.unproven.len() < MAX_FINDING_SAMPLES {
+                self.unproven.push(sample);
+            }
+            self.unproven_count += 1;
+        }
+
+        fn push_lookup_error(&mut self, sample: String) {
+            if self.lookup_errors.len() < MAX_FINDING_SAMPLES {
+                self.lookup_errors.push(sample);
+            }
+            self.lookup_errors_count += 1;
+        }
+    }
+
+    /// Check every fire's target for existence and bucket the verdict.
+    /// Split out of `resolve_trigger_fires` so the per-shard connection
+    /// handling and the per-fire verdict logic stay separately readable,
+    /// mirroring `adjudicate_refs`.
+    ///
+    /// Chunked at [`WORKFLOW_KEY_LOOKUP_CHUNK`] fires per round trip, not
+    /// per-fire and not as one whole-shard batch (issue #1401, Codex
+    /// follow-up x2). `harvest_completion_trigger_fires` has no cleanup
+    /// path, and a busy fleet's confirmed-delivered fire count can reach
+    /// into the hundreds of thousands. One query per fire, plus a second
+    /// for every absent target, would make a routine restore drill issue
+    /// up to two round trips per row. A single whole-shard batch, at the
+    /// opposite extreme, would hold every fire's name and id in memory at
+    /// once alongside the full match set. Chunking discards each chunk's
+    /// temporary keys before starting the next.
+    async fn adjudicate_trigger_fires(
+        conn: &mut AsyncPgConnection,
+        owned: &[&super::PendingTriggerFire],
+        targets: &[ShardTarget],
+        latest_by_shard: &std::collections::BTreeMap<i32, Option<DateTime<Utc>>>,
+        max_skew_secs: i64,
+    ) -> TriggerFireBuckets {
+        let mut out = TriggerFireBuckets::default();
+        for chunk in owned.chunks(WORKFLOW_KEY_LOOKUP_CHUNK) {
+            adjudicate_trigger_fire_chunk(
+                conn,
+                chunk,
+                targets,
+                latest_by_shard,
+                max_skew_secs,
+                &mut out,
+            )
+            .await;
+        }
+        out
+    }
+
+    /// Adjudicate RECORDED same-shard fires (Codex follow-up x15).
+    /// `source_shard == target_shard`, so the trigger fire and the
+    /// target's initial creation share one transaction. A restore
+    /// containing the fire necessarily contains that creation too. There
+    /// is no cross-shard relay window to lose. Ordinary absence (no
+    /// `MIGRATED` seal) is never a relay loss the way it is for a
+    /// cross-shard fire. It is either a benign retention collection of a
+    /// completed run, or a target the engine legitimately never created
+    /// (an inline rejection such as `PayloadTooLarge`). Either way it is
+    /// silent here. A `MIGRATED`-seal-only match tries to confirm on its
+    /// forwarding shard first (Codex follow-up x16). Only an unconfirmed
+    /// seal is reported, as `completion_trigger_fire_unproven`: the live
+    /// run may have rebalanced to a shard this restore does not cover.
+    async fn adjudicate_same_shard_fires(
+        conn: &mut AsyncPgConnection,
+        owned: &[&super::PendingTriggerFire],
+        targets: &[ShardTarget],
+        out: &mut TriggerFireBuckets,
+    ) {
+        for chunk in owned.chunks(WORKFLOW_KEY_LOOKUP_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let names: Vec<String> = chunk
+                .iter()
+                .map(|f| f.target_workflow_name.clone())
+                .collect();
+            let ids: Vec<String> = chunk.iter().map(|f| f.target_workflow_id.clone()).collect();
+
+            let migrated_seal_only = match match_live_targets(conn, &names, &ids).await {
+                Ok((_, migrated_seal_only)) => migrated_seal_only,
+                Err(e) => {
+                    for fire in chunk {
+                        out.push_lookup_error(format!(
+                            "{} same-shard existence check failed: {e}",
+                            fire.target_workflow_id
+                        ));
+                    }
+                    continue;
+                }
+            };
+            let confirmed = confirm_migrated_seals(targets, &migrated_seal_only).await;
+
+            for fire in chunk {
+                let key = (
+                    fire.target_workflow_name.clone(),
+                    fire.target_workflow_id.clone(),
+                );
+                if migrated_seal_only.contains_key(&key) && !confirmed.contains(&key) {
+                    out.push_unproven(format!(
+                        "{} (fired by {} on shard {}) matches a MIGRATED forwarding \
+                         seal only on shard {}; the live run may have rebalanced to a \
+                         shard this restore does not cover",
+                        fire.target_workflow_id,
+                        fire.source_exec_id,
+                        fire.source_shard,
+                        fire.target_shard
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Match `chunk`'s targets against `harvest_workflow_executions`.
+    /// Split into keys backed by a genuine row and keys backed by
+    /// `MIGRATED` forwarding seals only (mapped to the seal's
+    /// `migrated_to_shard`). Split out of
+    /// [`adjudicate_trigger_fire_chunk`] to keep that function under the
+    /// line-count lint.
+    async fn match_live_targets(
+        conn: &mut AsyncPgConnection,
+        names: &[String],
+        ids: &[String],
+    ) -> Result<
+        (
+            std::collections::HashSet<(String, String)>,
+            std::collections::HashMap<(String, String), Option<i32>>,
+        ),
+        diesel::result::Error,
+    > {
+        let matches = matching_workflow_executions(conn, names, ids).await?;
+        let mut existing = std::collections::HashSet::new();
+        let mut migrated_seal_only = std::collections::HashMap::new();
+        for row in matches {
+            let key = (row.workflow_name, row.workflow_id);
+            if row.all_migrated {
+                migrated_seal_only.insert(key, row.migrated_to_shard);
+            } else {
+                existing.insert(key);
+            }
+        }
+        Ok((existing, migrated_seal_only))
+    }
+
+    /// Try to confirm each `MIGRATED`-seal-only key by following its
+    /// forwarding chain, one round trip per distinct shard per hop (Codex
+    /// follow-up x16/x18). `shard_rebalance.rs` explicitly supports A -> B
+    /// -> C chains. A destination that is ITSELF an unreconciled seal
+    /// keeps chasing its own `migrated_to_shard` rather than being
+    /// accepted on sight. Bounded at `targets.len()` hops. A legitimate
+    /// chain cannot revisit a shard, so needing more hops than shards
+    /// exist means a cycle, and this stops rather than looping forever.
+    ///
+    /// A destination row genuinely absent still proves delivery via
+    /// `harvest_execution_summaries` (Codex follow-up x19), mirroring the
+    /// ordinary absent-target path elsewhere in this module. A shard
+    /// outside the supplied `--shard` list, or unreachable, is left
+    /// unconfirmed at that hop. The caller keeps reporting the fire
+    /// `unproven`, same as before this function existed.
+    async fn confirm_migrated_seals(
+        targets: &[ShardTarget],
+        seals: &std::collections::HashMap<(String, String), Option<i32>>,
+    ) -> std::collections::HashSet<(String, String)> {
+        let mut confirmed = std::collections::HashSet::new();
+        let mut pending: std::collections::HashMap<(String, String), i32> = seals
+            .iter()
+            .filter_map(|(key, dest)| dest.map(|shard| (key.clone(), shard)))
+            .collect();
+
+        for _ in 0..targets.len().max(1) {
+            if pending.is_empty() {
+                break;
+            }
+            let mut by_shard: std::collections::BTreeMap<i32, Vec<(String, String)>> =
+                std::collections::BTreeMap::new();
+            for (key, shard) in &pending {
+                by_shard.entry(*shard).or_default().push(key.clone());
+            }
+
+            let mut next_pending = std::collections::HashMap::new();
+            for (dest_shard, keys) in by_shard {
+                let Some(target) = targets.iter().find(|t| t.shard_id == dest_shard) else {
+                    continue;
+                };
+                let Ok(mut dest_conn) = connect_read_only(&target.dsn).await else {
+                    continue;
+                };
+                let names: Vec<String> = keys.iter().map(|(n, _)| n.clone()).collect();
+                let ids: Vec<String> = keys.iter().map(|(_, i)| i.clone()).collect();
+
+                let Ok((existing, still_seals)) =
+                    match_live_targets(&mut dest_conn, &names, &ids).await
+                else {
+                    continue;
+                };
+                confirmed.extend(keys.iter().filter(|k| existing.contains(*k)).cloned());
+
+                let absent: Vec<(String, String)> = keys
+                    .into_iter()
+                    .filter(|k| !existing.contains(k) && !still_seals.contains_key(k))
+                    .collect();
+                if !absent.is_empty() {
+                    let absent_names: Vec<String> = absent.iter().map(|(n, _)| n.clone()).collect();
+                    let absent_ids: Vec<String> = absent.iter().map(|(_, i)| i.clone()).collect();
+                    if let Ok(retained) = matching_workflow_keys(
+                        &mut dest_conn,
+                        "harvest_execution_summaries",
+                        &absent_names,
+                        &absent_ids,
+                    )
+                    .await
+                    {
+                        confirmed.extend(retained);
+                    }
+                }
+
+                for (key, next_shard) in still_seals {
+                    if let Some(next_shard) = next_shard {
+                        next_pending.insert(key, next_shard);
+                    }
+                }
+            }
+            pending = next_pending;
+        }
+        confirmed
+    }
+
+    /// One bounded chunk of [`adjudicate_trigger_fires`]'s work, for
+    /// CROSS-shard fires only (`resolve_trigger_fires` routes same-shard
+    /// fires to [`adjudicate_same_shard_fires`] instead, Codex follow-up
+    /// x15). `chunk` is never larger than [`WORKFLOW_KEY_LOOKUP_CHUNK`], so
+    /// every vector built here is bounded the same way.
+    ///
+    /// [`match_live_targets`] checks the whole chunk in one query against
+    /// `harvest_workflow_executions`. A genuine match is the same
+    /// ANY-STATE existence check `relay_gate_checked_start` itself runs
+    /// before starting the target, read-only against a restored snapshot.
+    /// A key matched by `MIGRATED` seals only is neither delivered nor
+    /// absent. It tries to confirm on the seal's forwarding shard first
+    /// (Codex follow-up x16). An unconfirmed one goes straight to
+    /// `unproven`, skipping the retention/timestamp checks below (Codex
+    /// follow-up x13). Everything genuinely absent is checked in one more
+    /// query against `harvest_execution_summaries`. That retention/timestamp
+    /// fallback is calibrated for a CROSS-shard relay's delivery window --
+    /// it does not apply to a same-shard fire, which never has one.
+    async fn adjudicate_trigger_fire_chunk(
+        conn: &mut AsyncPgConnection,
+        chunk: &[&super::PendingTriggerFire],
+        targets: &[ShardTarget],
+        latest_by_shard: &std::collections::BTreeMap<i32, Option<DateTime<Utc>>>,
+        max_skew_secs: i64,
+        out: &mut TriggerFireBuckets,
+    ) {
+        if chunk.is_empty() {
+            return;
+        }
+
+        let names: Vec<String> = chunk
+            .iter()
+            .map(|f| f.target_workflow_name.clone())
+            .collect();
+        let ids: Vec<String> = chunk.iter().map(|f| f.target_workflow_id.clone()).collect();
+
+        let (existing, migrated_seal_only) = match match_live_targets(conn, &names, &ids).await {
+            Ok(sets) => sets,
+            Err(e) => {
+                for fire in chunk {
+                    out.push_lookup_error(format!(
+                        "{} existence check failed: {e}",
+                        fire.target_workflow_id
+                    ));
+                }
+                return;
+            }
+        };
+        let confirmed = confirm_migrated_seals(targets, &migrated_seal_only).await;
+
+        for fire in chunk {
+            let key = (
+                fire.target_workflow_name.clone(),
+                fire.target_workflow_id.clone(),
+            );
+            if migrated_seal_only.contains_key(&key) && !confirmed.contains(&key) {
+                out.push_unproven(format!(
+                    "{} (fired by {} on shard {}) matches a MIGRATED forwarding seal only \
+                     on shard {}; the live run may have rebalanced to a shard this \
+                     restore does not cover",
+                    fire.target_workflow_id,
+                    fire.source_exec_id,
+                    fire.source_shard,
+                    fire.target_shard
+                ));
+            }
+        }
+
+        let absent: Vec<&&super::PendingTriggerFire> = chunk
+            .iter()
+            .filter(|f| {
+                let key = (f.target_workflow_name.clone(), f.target_workflow_id.clone());
+                !existing.contains(&key) && !migrated_seal_only.contains_key(&key)
+            })
+            .collect();
+        if absent.is_empty() {
+            return;
+        }
+
+        let absent_names: Vec<String> = absent
+            .iter()
+            .map(|f| f.target_workflow_name.clone())
+            .collect();
+        let absent_ids: Vec<String> = absent
+            .iter()
+            .map(|f| f.target_workflow_id.clone())
+            .collect();
+
+        // The execution row is gone entirely for every fire in `absent`. A
+        // completed, retained run is one explanation; a genuinely lost
+        // relay is another. Check the durable marker FIRST. Proven
+        // retention stays silent regardless of what the timestamp
+        // heuristic below would otherwise conclude. This mirrors
+        // `RetentionUnproven` winning over a rolled-back verdict for
+        // child/external refs.
+        let retained = match matching_workflow_keys(
+            conn,
+            "harvest_execution_summaries",
+            &absent_names,
+            &absent_ids,
+        )
+        .await
+        {
+            Ok(keys) => keys,
+            Err(e) => {
+                for fire in absent {
+                    out.push_lookup_error(format!(
+                        "{} retention-summary lookup failed: {e}",
+                        fire.target_workflow_id
+                    ));
+                }
+                return;
+            }
+        };
+
+        for fire in absent {
+            if retained.contains(&(
+                fire.target_workflow_name.clone(),
+                fire.target_workflow_id.clone(),
+            )) {
+                continue;
+            }
+            let target_latest = latest_by_shard.get(&fire.target_shard).copied().flatten();
+            let sample = format!(
+                "{} (fired by {} on shard {} at {}) absent on shard {}",
+                fire.target_workflow_id,
+                fire.source_exec_id,
+                fire.source_shard,
+                fire.fired_at,
+                fire.target_shard
+            );
+            if super::absence_is_decisive_loss(fire.fired_at, target_latest, max_skew_secs) {
+                out.push_lost(sample);
+            } else {
+                out.push_unproven(sample);
+            }
+        }
+    }
+
+    /// Cross-shard adjudication for [`super::PendingTriggerFire`]s (issue
+    /// #1401). The source shard confirms the relay delivered. The target
+    /// execution is absent from the target shard's restored snapshot.
+    pub(super) async fn resolve_trigger_fires(
+        pending: &[super::PendingTriggerFire],
+        targets: &[ShardTarget],
+        shards: &[ShardVerifyReport],
+        max_skew_secs: i64,
+    ) -> Vec<Finding> {
+        use std::collections::BTreeSet;
+
+        let mut findings = Vec::new();
+        let known: BTreeSet<i32> = targets.iter().map(|t| t.shard_id).collect();
+
+        // Bounded like `TriggerFireBuckets`'s sample lists (issue #1401,
+        // Codex follow-up x4): an exact count, with the joined sample text
+        // capped at `MAX_FINDING_SAMPLES`. `pending` can hold up to the
+        // scan's one-million-fire ceiling per source shard.
+        let mut uninspected = Vec::new();
+        let mut uninspected_count: u64 = 0;
+        for p in pending {
+            if known.contains(&p.target_shard) {
+                continue;
+            }
+            if uninspected.len() < MAX_FINDING_SAMPLES {
+                uninspected.push(format!(
+                    "{} (fired by {} on shard {}) -> shard {}",
+                    p.target_workflow_id, p.source_exec_id, p.source_shard, p.target_shard
+                ));
+            }
+            uninspected_count += 1;
+        }
+        if uninspected_count > 0 {
+            findings.push(Finding::new(
+                FindingClass::UninspectedShardReference,
+                None,
+                uninspected_count,
+                uninspected,
+            ));
+        }
+
+        let latest_by_shard: std::collections::BTreeMap<i32, Option<DateTime<Utc>>> = shards
+            .iter()
+            .map(|s| (s.shard_id, s.latest_event_at))
+            .collect();
+
+        for target in targets {
+            let owned: Vec<&super::PendingTriggerFire> = pending
+                .iter()
+                .filter(|p| p.target_shard == target.shard_id)
+                .collect();
+            if owned.is_empty() {
+                continue;
+            }
+            // Same-shard fires (Codex follow-up x15) get a narrower check.
+            // Ordinary absence is never a relay loss for them, so they
+            // must not reach the cross-shard retention/timestamp fallback
+            // below. See `adjudicate_same_shard_fires`.
+            let (owned_same_shard, owned_cross_shard): (Vec<_>, Vec<_>) = owned
+                .into_iter()
+                .partition(|f| f.source_shard == f.target_shard);
+
+            // A SECOND, independent connection. `verify_shard` opened and
+            // dropped its own long before we got here. A failure now must
+            // still surface. Silently skipping would drop every
+            // completion-trigger check for this shard at exit 0.
+            let mut conn = match connect_read_only(&target.dsn).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    findings.push(Finding::new(
+                        FindingClass::ProbeFailed,
+                        Some(target.shard_id),
+                        1,
+                        vec![format!(
+                            "completion-trigger fire resolution could not connect to \
+                             shard {}: {e}",
+                            target.shard_id
+                        )],
+                    ));
+                    continue;
+                }
+            };
+
+            let mut buckets = adjudicate_trigger_fires(
+                &mut conn,
+                &owned_cross_shard,
+                targets,
+                &latest_by_shard,
+                max_skew_secs,
+            )
+            .await;
+            adjudicate_same_shard_fires(&mut conn, &owned_same_shard, targets, &mut buckets).await;
+            let TriggerFireBuckets {
+                lost,
+                lost_count,
+                unproven,
+                unproven_count,
+                lookup_errors,
+                lookup_errors_count,
+            } = buckets;
+
+            for (class, count, samples) in [
+                (FindingClass::CompletionTriggerFireLost, lost_count, lost),
+                (
+                    FindingClass::CompletionTriggerFireUnproven,
+                    unproven_count,
+                    unproven,
+                ),
+                (
+                    FindingClass::ProbeFailed,
+                    lookup_errors_count,
+                    lookup_errors,
+                ),
+            ] {
+                if count > 0 {
+                    findings.push(Finding::new(class, Some(target.shard_id), count, samples));
+                }
+            }
+        }
+        findings
+    }
+
     /// Assemble the full report: per-shard probes, then cross-shard resolution.
     pub(super) async fn run(
         targets: &[ShardTarget],
@@ -2901,13 +4091,45 @@ mod probes {
     ) -> RestoreVerifyReport {
         let mut shards = Vec::new();
         let mut refs = Vec::new();
+        let mut fires: Vec<(i32, super::ResolvedFire)> = Vec::new();
         for target in targets {
-            let (report, mut shard_refs) = verify_shard(target, options, replayer).await;
+            let (report, mut shard_refs, shard_fires) =
+                verify_shard(target, options, replayer).await;
             refs.append(&mut shard_refs);
+            fires.extend(shard_fires.into_iter().map(|f| (target.shard_id, f)));
             shards.push(report);
         }
 
         let mut cross_shard = resolve_refs(&refs, targets).await;
+
+        // Route and adjudicate completion-trigger fires (issue #1401). A
+        // router is built from the SUPPLIED shards only, so this depends on
+        // the same "supply every shard" convention as `UninspectedShardReference`.
+        let router_shards: Vec<ShardId> =
+            targets.iter().map(|t| ShardId::new(t.shard_id)).collect();
+        if !router_shards.is_empty() {
+            let router = crate::shard::ShardRouter::new(
+                router_shards.clone(),
+                router_shards,
+                ShardId::new(options.default_shard),
+            );
+            let super::RoutedTriggerFires {
+                pending,
+                uncertain,
+                uncertain_count,
+            } = super::route_trigger_fires(fires, &router);
+            let mut trigger_findings =
+                resolve_trigger_fires(&pending, targets, &shards, options.max_skew_secs).await;
+            cross_shard.append(&mut trigger_findings);
+            if uncertain_count > 0 {
+                cross_shard.push(Finding::new(
+                    FindingClass::CompletionTriggerFireUnproven,
+                    None,
+                    uncertain_count,
+                    uncertain,
+                ));
+            }
+        }
 
         // Guard the library entry point too, not only the CLI. `VerifyOptions`
         // is public and `default_shard` a plain field. A caller of
@@ -2930,15 +4152,18 @@ mod probes {
         }
 
         let skew = compute_skew(shards.iter().map(|s| s.latest_event_at));
+        // Floored at zero, same as `absence_is_decisive_loss`'s own copy
+        // of this tolerance (Codex follow-up x20). A negative
+        // `max_skew_secs` must not flag every nonzero skew.
+        let max_skew_secs = options.max_skew_secs.max(0);
         if let Some(secs) = skew
-            && secs > options.max_skew_secs
+            && secs > max_skew_secs
         {
             cross_shard.push(
                 Finding::new(FindingClass::RestorePointSkew, None, 1, Vec::new()).with_detail(
                     format!(
                         "newest-event timestamps differ by {secs}s across shards \
-                             (threshold {}s)",
-                        options.max_skew_secs
+                             (threshold {max_skew_secs}s)"
                     ),
                 ),
             );
@@ -3006,6 +4231,278 @@ mod tests {
                 "{outcome} must be adjudicated, not skipped"
             );
         }
+    }
+
+    // ─────────── completion-trigger fire routing (issue #1401) ───────────
+
+    #[cfg(all(feature = "db", feature = "testing"))]
+    fn two_shard_router() -> crate::shard::ShardRouter {
+        use crate::types::ShardId;
+        crate::shard::ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(0),
+        )
+    }
+
+    #[cfg(all(feature = "db", feature = "testing"))]
+    fn resolved_fire(target_workflow_name: &str) -> ResolvedFire {
+        ResolvedFire {
+            source_exec_id: Uuid::new_v4(),
+            trigger_id: Uuid::new_v4(),
+            fired_at: Utc::now(),
+            target_workflow_name: target_workflow_name.to_string(),
+            target_shard: None,
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
+    fn route_trigger_fires_derives_the_same_target_workflow_id_as_the_relay() {
+        let router = two_shard_router();
+        let fire = resolved_fire("child_flow");
+        let expected_id = format!(
+            "completion-trigger-{}-{}",
+            fire.trigger_id, fire.source_exec_id
+        );
+        let target_shard = router
+            .pick_for_new_workflow("child_flow", &expected_id)
+            .as_i32();
+        // Force cross-shard by picking a source different from the hash's
+        // pick: the id derivation must not depend on which shard is "source".
+        let source_shard = 1 - target_shard;
+
+        let routing = route_trigger_fires(vec![(source_shard, fire)], &router);
+
+        assert_eq!(routing.pending.len(), 1, "a cross-shard fire must be kept");
+        assert_eq!(routing.pending[0].target_workflow_id, expected_id);
+        assert_eq!(routing.pending[0].target_shard, target_shard);
+        assert_eq!(routing.pending[0].source_shard, source_shard);
+    }
+
+    #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
+    fn route_trigger_fires_still_adjudicates_a_recorded_same_shard_fire() {
+        let router = two_shard_router();
+        let mut fire = resolved_fire("child_flow");
+        let target_workflow_id = format!(
+            "completion-trigger-{}-{}",
+            fire.trigger_id, fire.source_exec_id
+        );
+        let same_shard = router
+            .pick_for_new_workflow("child_flow", &target_workflow_id)
+            .as_i32();
+        // A RECORDED same-shard fire is a historical fact, not a guess.
+        // The target can still have rebalanced away since (Codex follow-up
+        // x14), so it must reach `pending` for adjudication rather than
+        // being dropped outright.
+        fire.target_shard = Some(same_shard);
+
+        let routing = route_trigger_fires(vec![(same_shard, fire)], &router);
+
+        assert_eq!(
+            routing.pending.len(),
+            1,
+            "a RECORDED same-shard fire must still be adjudicated, in case \
+             the target rebalanced away after the atomic commit: {:?}",
+            routing.pending
+        );
+        assert_eq!(routing.pending[0].target_shard, same_shard);
+        assert_eq!(routing.pending[0].source_shard, same_shard);
+        assert!(
+            routing.uncertain.is_empty(),
+            "a RECORDED same-shard fire is a historical fact, not a guess, \
+             so it must not be flagged uncertain: {:?}",
+            routing.uncertain
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
+    fn route_trigger_fires_flags_a_reconstructed_same_shard_pick_as_uncertain() {
+        let router = two_shard_router();
+        // A pre-migration fire: `target_shard` is unset, so this must be
+        // re-derived from the router.
+        let fire = resolved_fire("child_flow");
+        let target_workflow_id = format!(
+            "completion-trigger-{}-{}",
+            fire.trigger_id, fire.source_exec_id
+        );
+        let same_shard = router
+            .pick_for_new_workflow("child_flow", &target_workflow_id)
+            .as_i32();
+
+        let routing = route_trigger_fires(vec![(same_shard, fire)], &router);
+
+        assert!(
+            routing.pending.is_empty(),
+            "a re-derived same-shard pick must not be adjudicated as a \
+             normal cross-shard fire: {:?}",
+            routing.pending
+        );
+        assert_eq!(
+            routing.uncertain.len(),
+            1,
+            "a re-derived same-shard pick cannot rule out a lost cross-shard \
+             relay, so it must be flagged uncertain instead of dropped"
+        );
+        assert_eq!(routing.uncertain_count, 1);
+    }
+
+    #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
+    fn route_trigger_fires_bounds_uncertain_samples_but_keeps_an_exact_count() {
+        let router = two_shard_router();
+        let total = MAX_FINDING_SAMPLES + 2;
+        let mut fires = Vec::with_capacity(total);
+        while fires.len() < total {
+            let fire = resolved_fire("child_flow");
+            let target_workflow_id = format!(
+                "completion-trigger-{}-{}",
+                fire.trigger_id, fire.source_exec_id
+            );
+            let same_shard = router
+                .pick_for_new_workflow("child_flow", &target_workflow_id)
+                .as_i32();
+            fires.push((same_shard, fire));
+        }
+
+        let routing = route_trigger_fires(fires, &router);
+
+        assert!(routing.pending.is_empty());
+        assert_eq!(
+            routing.uncertain.len(),
+            MAX_FINDING_SAMPLES,
+            "the sample list must stay bounded regardless of how many fires matched"
+        );
+        assert_eq!(
+            routing.uncertain_count, total as u64,
+            "the count must stay exact even though the sample list is capped"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
+    fn route_trigger_fires_prefers_the_persisted_shard_over_the_router_pick() {
+        let router = two_shard_router();
+        let mut fire = resolved_fire("child_flow");
+        let target_workflow_id = format!(
+            "completion-trigger-{}-{}",
+            fire.trigger_id, fire.source_exec_id
+        );
+        let router_pick = router
+            .pick_for_new_workflow("child_flow", &target_workflow_id)
+            .as_i32();
+        // A historical drain: the persisted shard disagrees with what the
+        // router would compute today.
+        let persisted_shard = 1 - router_pick;
+        fire.target_shard = Some(persisted_shard);
+
+        let routing = route_trigger_fires(vec![(router_pick, fire)], &router);
+
+        assert_eq!(
+            routing.pending.len(),
+            1,
+            "the persisted shard differs from the source, so this is cross-shard"
+        );
+        assert_eq!(
+            routing.pending[0].target_shard, persisted_shard,
+            "the persisted shard must win over a re-derived router pick"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
+    fn absence_is_decisive_loss_requires_a_restore_point_strictly_before_the_fire() {
+        let fired_at = Utc::now();
+
+        assert!(
+            !absence_is_decisive_loss(fired_at, None, 0),
+            "no timestamp signal at all must not be treated as proof of loss"
+        );
+        assert!(
+            absence_is_decisive_loss(fired_at, Some(fired_at - chrono::Duration::seconds(1)), 0),
+            "a target restore point strictly before the fire proves the loss"
+        );
+        assert!(
+            !absence_is_decisive_loss(fired_at, Some(fired_at), 0),
+            "a restore point exactly at the fire is not proof of loss"
+        );
+        assert!(
+            !absence_is_decisive_loss(fired_at, Some(fired_at + chrono::Duration::seconds(1)), 0),
+            "a target shard that progressed past the fire may simply have \
+             retained and collected the run"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
+    fn absence_is_decisive_loss_requires_the_gap_to_exceed_the_skew_tolerance() {
+        let fired_at = Utc::now();
+        let max_skew_secs = 60;
+
+        assert!(
+            !absence_is_decisive_loss(
+                fired_at,
+                Some(fired_at - chrono::Duration::seconds(max_skew_secs)),
+                max_skew_secs,
+            ),
+            "a gap no larger than the configured cross-shard clock-skew \
+             tolerance is not proof of loss (issue #1401, Codex follow-up)"
+        );
+        assert!(
+            absence_is_decisive_loss(
+                fired_at,
+                Some(fired_at - chrono::Duration::seconds(max_skew_secs + 1)),
+                max_skew_secs,
+            ),
+            "a gap exceeding the skew tolerance is still proof of loss"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
+    fn absence_is_decisive_loss_floors_a_negative_skew_tolerance_at_zero() {
+        // `VerifyOptions::max_skew_secs` is a public, unvalidated field
+        // (Codex follow-up x20). A negative value must not flip the
+        // comparison and report a target shard AHEAD of `fired_at` as
+        // decisive loss.
+        let fired_at = Utc::now();
+
+        assert!(
+            !absence_is_decisive_loss(
+                fired_at,
+                Some(fired_at + chrono::Duration::seconds(30)),
+                -60
+            ),
+            "a target shard ahead of fired_at is proof of life, not loss, \
+             regardless of a negative configured tolerance"
+        );
+        assert!(
+            absence_is_decisive_loss(fired_at, Some(fired_at - chrono::Duration::seconds(1)), -60),
+            "a negative tolerance floors to zero, so any positive gap is still \
+             decisive loss"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
+    fn absence_is_decisive_loss_clamps_a_skew_tolerance_too_large_for_a_chrono_duration() {
+        // `VerifyOptions::max_skew_secs` is a public, unvalidated field
+        // (Codex follow-up). `chrono::Duration::seconds` panics when its
+        // argument overflows the representable range. This must return a
+        // finding instead of aborting the whole verify run.
+        let fired_at = Utc::now();
+
+        assert!(
+            !absence_is_decisive_loss(
+                fired_at,
+                Some(fired_at - chrono::Duration::seconds(30)),
+                i64::MAX
+            ),
+            "an out-of-range tolerance means \"treat as unbounded,\" so a \
+             small gap must still read as proof of life, not a panic"
+        );
     }
 
     /// Codex round 1, P2. `host=alias-a&hostaddr=X` and `host=alias-b&hostaddr=X`
@@ -3155,6 +4652,7 @@ mod tests {
             (FindingClass::ExternalEffectRolledBack, Incoherent),
             (FindingClass::ReplayDivergence, Incoherent),
             (FindingClass::ReplayWorkflowFailed, Incoherent),
+            (FindingClass::CompletionTriggerFireLost, Incoherent),
             (FindingClass::ExternalEffectUnverifiable, Advisory),
             // Worth an operator's eye; does not fail the gate.
             (FindingClass::RestorePointSkew, Advisory),
@@ -3165,6 +4663,7 @@ mod tests {
             // Looked at nothing -- never a pass.
             (FindingClass::ProbeFailed, Undetermined),
             (FindingClass::RetentionUnproven, Undetermined),
+            (FindingClass::CompletionTriggerFireUnproven, Undetermined),
         ];
         assert_eq!(
             expected.len(),

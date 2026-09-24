@@ -4647,9 +4647,47 @@ pub async fn enforce_external_awaits_outbox(
 /// # Errors
 ///
 /// Returns the first database or persistence error encountered.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub async fn enforce_timeouts_once(
     conn: &mut AsyncPgConnection,
+    metrics: &(dyn MetricsRecorder + Send + Sync),
+    unknown_target_grace_window: Duration,
+    sharded_pool: &Option<crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
+    max_workflow_history_events: Option<u64>,
+    session_worker_stale_secs: i64,
+    payload_codecs: &crate::payload_codec::PayloadCodecs,
+    codec_rotation_batch_size: i64,
+) -> HarvestResult<usize> {
+    enforce_timeouts_once_on_conn_shard(
+        conn,
+        None,
+        metrics,
+        unknown_target_grace_window,
+        sharded_pool,
+        shard_assignments,
+        circuit_breakers,
+        max_workflow_history_events,
+        session_worker_stale_secs,
+        payload_codecs,
+        codec_rotation_batch_size,
+    )
+    .await
+}
+
+/// [`enforce_timeouts_once`] for a caller that knows `conn`'s shard.
+///
+/// `conn_shard` must name the shard whose own pool `conn` came from. The
+/// per-shard scanners in this pass then reuse `conn` for that shard instead
+/// of checking out a second connection. See
+/// [`crate::shard::connect_or_reuse`].
+// `&Option` because the body forwards `sharded_pool` to many public
+// scanners that take `&Option<ShardedDbPool>`.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::ref_option)]
+pub(crate) async fn enforce_timeouts_once_on_conn_shard(
+    conn: &mut AsyncPgConnection,
+    conn_shard: Option<crate::types::ShardId>,
     metrics: &(dyn MetricsRecorder + Send + Sync),
     unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
@@ -4793,33 +4831,37 @@ pub async fn enforce_timeouts_once(
         metrics,
     )
     .await?;
-    count += crate::debounce::fire_due_debounced_starts_with_codecs(
+    count += crate::debounce::fire_due_debounced_starts_on_conn_shard(
         conn,
-        sharded_pool,
+        conn_shard,
+        sharded_pool.as_ref(),
         shard_assignments,
         metrics,
         payload_codecs,
     )
     .await?;
-    count += crate::throttle::fire_due_throttled_starts_with_codecs(
+    count += crate::throttle::fire_due_throttled_starts_on_conn_shard(
         conn,
-        sharded_pool,
+        conn_shard,
+        sharded_pool.as_ref(),
         shard_assignments,
         metrics,
         payload_codecs,
     )
     .await?;
-    count += crate::event_batch::fire_due_event_batches_with_codecs(
+    count += crate::event_batch::fire_due_event_batches_on_conn_shard(
         conn,
-        sharded_pool,
+        conn_shard,
+        sharded_pool.as_ref(),
         shard_assignments,
         metrics,
         payload_codecs,
     )
     .await?;
-    count += crate::completion_callback::fire_due_completion_deliveries(
+    count += crate::completion_callback::fire_due_completion_deliveries_on_conn_shard(
         conn,
-        sharded_pool,
+        conn_shard,
+        sharded_pool.as_ref(),
         shard_assignments,
     )
     .await?;
@@ -4834,9 +4876,10 @@ pub async fn enforce_timeouts_once(
     // Sweep expired request-scoped start-idempotency claims (issue #808). Best
     // effort table growth control; the reserve upsert overwrites an expired row
     // in place regardless, so correctness does not depend on this running.
-    count += crate::start_idempotency::sweep_expired_start_idempotency(
+    count += crate::start_idempotency::sweep_expired_start_idempotency_on_conn_shard(
         conn,
-        sharded_pool,
+        conn_shard,
+        sharded_pool.as_ref(),
         shard_assignments,
     )
     .await?;
@@ -4984,6 +5027,47 @@ pub fn spawn_timeout_checker_for_shard(
     payload_codecs: crate::payload_codec::PayloadCodecs,
     codec_rotation_batch_size: i64,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_timeout_checker_on_shard_pool(
+        pool,
+        cancel,
+        interval,
+        telemetry,
+        unknown_target_grace_window,
+        sharded_pool,
+        shard_assignments,
+        circuit_breakers,
+        max_workflow_history_events,
+        session_worker_stale_secs,
+        shard,
+        None,
+        payload_codecs,
+        codec_rotation_batch_size,
+    )
+}
+
+/// [`spawn_timeout_checker_for_shard`] for a caller that knows `pool`'s shard.
+///
+/// `pool_shard` must name the shard whose own pool `pool` is. `shard` stays
+/// a health-check label only. The worker passes both, because it builds
+/// `pool` from `sharded_pool.pool_for(shard)` itself.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_timeout_checker_on_shard_pool(
+    pool: Pool<AsyncPgConnection>,
+    cancel: CancellationToken,
+    interval: Duration,
+    telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
+    unknown_target_grace_window: Duration,
+    sharded_pool: Option<crate::shard::ShardedDbPool>,
+    shard_assignments: Vec<crate::types::ShardId>,
+    circuit_breakers: std::sync::Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
+    max_workflow_history_events: Option<u64>,
+    session_worker_stale_secs: i64,
+    shard: Option<crate::types::ShardId>,
+    pool_shard: Option<crate::types::ShardId>,
+    payload_codecs: crate::payload_codec::PayloadCodecs,
+    codec_rotation_batch_size: i64,
+) -> tokio::task::JoinHandle<()> {
     // Issue #797: declare this loop (and the sub-passes it drives) before the
     // first iteration, so the `scanner_liveness` health check knows they are
     // expected in this process and grants them their boot grace window.
@@ -5034,9 +5118,22 @@ pub fn spawn_timeout_checker_for_shard(
             // posture `acquire_shard_conn` already uses for registration and
             // heartbeats. It is better than blocking the whole scanner on
             // one contested pool.
-            match tokio::time::timeout(interval, pool.get()).await {
-                Ok(Ok(mut conn)) => match enforce_timeouts_once(
+            //
+            // Also selected against `cancel` (issue #1426): the `interval`
+            // bound above only limits a merely-slow acquisition. Without this
+            // select, a shutdown request during that wait would still queue
+            // behind the full `interval` before this loop noticed it.
+            let get_result = tokio::select! {
+                () = cancel.cancelled() => {
+                    tracing::debug!("timeout checker cancelled while acquiring a connection");
+                    break;
+                }
+                result = tokio::time::timeout(interval, pool.get()) => result,
+            };
+            match get_result {
+                Ok(Ok(mut conn)) => match enforce_timeouts_once_on_conn_shard(
                     &mut conn,
+                    pool_shard,
                     &*telemetry.metrics,
                     unknown_target_grace_window,
                     &sharded_pool,

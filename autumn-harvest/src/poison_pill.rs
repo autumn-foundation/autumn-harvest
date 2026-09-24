@@ -1028,7 +1028,18 @@ mod scanner {
                     () = cancel.cancelled() => break,
                     () = tokio::time::sleep(interval) => {}
                 }
-                match pool.get().await {
+                // Selected against `cancel` (issue #1426). Harvest configures no
+                // deadpool `Timeouts`, so `pool.get()` alone can park this task
+                // indefinitely on an exhausted shard pool. The top-of-loop select
+                // only guards the sleep between ticks. A tick already
+                // parked here would otherwise never observe shutdown. The
+                // join in `shutdown_and_cleanup_monitors` would then wait
+                // forever.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => break,
+                    result = pool.get() => result,
+                };
+                match get_result {
                     Ok(mut conn) => {
                         match reclaim_orphaned_tasks(
                             &mut conn,

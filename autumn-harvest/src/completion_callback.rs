@@ -2843,6 +2843,24 @@ pub async fn fire_due_completion_deliveries(
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
 ) -> crate::error::HarvestResult<usize> {
+    fire_due_completion_deliveries_on_conn_shard(
+        conn,
+        None,
+        sharded_pool.as_ref(),
+        shard_assignments,
+    )
+    .await
+}
+
+/// [`fire_due_completion_deliveries`] for a caller that knows `conn`'s shard.
+/// See [`crate::shard::connect_or_reuse`].
+#[cfg(feature = "db")]
+pub(crate) async fn fire_due_completion_deliveries_on_conn_shard(
+    conn: &mut diesel_async::AsyncPgConnection,
+    conn_shard: Option<crate::types::ShardId>,
+    sharded_pool: Option<&crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+) -> crate::error::HarvestResult<usize> {
     let Some(config) = read_global_callback_config() else {
         return Ok(0);
     };
@@ -2854,7 +2872,9 @@ pub async fn fire_due_completion_deliveries(
     match sharded_pool {
         Some(sp) if !shard_assignments.is_empty() => {
             for shard in shard_assignments {
-                let Some(mut shard_conn) = crate::shard::connect_to_shard(
+                let Some(mut shard_conn) = crate::shard::connect_or_reuse(
+                    conn,
+                    conn_shard,
                     sp,
                     *shard,
                     "completion_callback",

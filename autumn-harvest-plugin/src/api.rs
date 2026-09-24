@@ -117,7 +117,7 @@ use autumn_harvest::types::{
     ExecutionId, ExternalActivityToken, Priority, ShardId, UpdateId, WorkflowIdConflictPolicy,
     WorkflowIdReusePolicy,
 };
-use autumn_harvest::worker::{DbPool, HandlerRegistry};
+use autumn_harvest::worker::{DbPool, DispatchDeadline, HandlerRegistry};
 use autumn_harvest::workers::{
     DrainPreviewItem, DrainResponse, FleetHealth, PinnedExecutionRow, WorkerFilters, WorkerRow,
     get_worker, list_pinned_executions, list_workers, parse_worker_filters, preview_item_from_row,
@@ -6869,15 +6869,18 @@ pub const fn management_api_request_fields()
             "POST",
             "/dead-letters/replay",
             Some(&[
+                "dead_letter_id",
                 "activity_name",
                 "workflow_name",
                 "queue_name",
                 "min_attempts",
+                "task_type",
                 "failed_after",
                 "failed_before",
                 "error_class",
                 "dlq_reason",
                 "failure_signature",
+                "shard_id",
                 "limit",
                 "dry_run",
             ]),
@@ -6886,15 +6889,18 @@ pub const fn management_api_request_fields()
             "POST",
             "/dead-letters/discard",
             Some(&[
+                "dead_letter_id",
                 "activity_name",
                 "workflow_name",
                 "queue_name",
                 "min_attempts",
+                "task_type",
                 "failed_after",
                 "failed_before",
                 "error_class",
                 "dlq_reason",
                 "failure_signature",
+                "shard_id",
                 "limit",
                 "dry_run",
             ]),
@@ -6905,6 +6911,7 @@ pub const fn management_api_request_fields()
             "/dlq/redrive",
             Some(&[
                 "queue",
+                "shard_id",
                 "workflow_name",
                 "dead_lettered_after",
                 "dead_lettered_before",
@@ -24004,11 +24011,22 @@ async fn set_legal_hold_handler(
     }
 
     let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let exec_id_str = exec_id.to_string();
+    let pool = api_state.storage_pool().map_err(map_error)?;
 
-    let result =
-        autumn_harvest::set_legal_hold(&mut conn, exec_id, &reason, hold_until, &actor, now).await;
+    // Issue #1405: `set_legal_hold` refuses a row a concurrent cutover sealed
+    // out from under it, rather than writing the hold onto the sealed
+    // tombstone. The `_forwarded` sibling follows the pointer and retries,
+    // and reports the shard it landed on.
+    let result = ::autumn_harvest::shard_rebalance::set_legal_hold_forwarded(
+        pool.sharded_pool(),
+        exec_id,
+        &reason,
+        hold_until,
+        &actor,
+        now,
+    )
+    .await;
 
     let (status, error_summary) = match &result {
         Ok(_) => (STATUS_SUCCEEDED, None),
@@ -24027,10 +24045,31 @@ async fn set_legal_hold_handler(
         shard_id: None,
         source: &source,
     };
-    let _ = audit::insert_audit(&mut conn, &ar).await;
+    // Best-effort, on its own connection: an audit-log failure here must not
+    // mask the write's outcome from the caller (issue #1405 review). On
+    // success the write already reports the shard it landed on, so this
+    // reuses that instead of re-walking the forwarding pointer from
+    // scratch. `ShardUnavailable` means the write itself could not resolve
+    // a working shard (Codex review). Retrying that same resolution here
+    // would cost the caller a second pool-checkout wait on an
+    // already-unavailable shard. This skips the audit write in that one
+    // case. Every other error is cheap to retry a checkout for and still
+    // worth auditing (e.g. `NotFound`).
+    let audit_conn = match &result {
+        Ok((_, shard)) => {
+            ::autumn_harvest::shard_rebalance::conn_for_shard(pool.sharded_pool(), *shard)
+                .await
+                .ok()
+        }
+        Err(HarvestError::ShardUnavailable { .. }) => None,
+        Err(_) => db_conn_for_execution(&api_state, exec_id).await.ok(),
+    };
+    if let Some(mut conn) = audit_conn {
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+    }
 
     match result {
-        Ok(outcome) => Ok((axum::http::StatusCode::OK, Json(outcome))),
+        Ok((outcome, _)) => Ok((axum::http::StatusCode::OK, Json(outcome))),
         Err(e) => Err(conflict_from(e)),
     }
 }
@@ -24056,10 +24095,16 @@ async fn release_legal_hold_handler(
     let route = "POST /workflows/{id}/legal-hold/release";
 
     let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let exec_id_str = exec_id.to_string();
+    let pool = api_state.storage_pool().map_err(map_error)?;
 
-    let result = autumn_harvest::release_legal_hold(&mut conn, exec_id, chrono::Utc::now()).await;
+    // Issue #1405: see the same-shaped comment in set_legal_hold_handler.
+    let result = ::autumn_harvest::shard_rebalance::release_legal_hold_forwarded(
+        pool.sharded_pool(),
+        exec_id,
+        chrono::Utc::now(),
+    )
+    .await;
 
     let (status, error_summary) = match &result {
         Ok(_) => (STATUS_SUCCEEDED, None),
@@ -24078,10 +24123,23 @@ async fn release_legal_hold_handler(
         shard_id: None,
         source: &source,
     };
-    let _ = audit::insert_audit(&mut conn, &ar).await;
+    // Best-effort, on its own connection. See the same-shaped comment in
+    // set_legal_hold_handler.
+    let audit_conn = match &result {
+        Ok((_, shard)) => {
+            ::autumn_harvest::shard_rebalance::conn_for_shard(pool.sharded_pool(), *shard)
+                .await
+                .ok()
+        }
+        Err(HarvestError::ShardUnavailable { .. }) => None,
+        Err(_) => db_conn_for_execution(&api_state, exec_id).await.ok(),
+    };
+    if let Some(mut conn) = audit_conn {
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+    }
 
     match result {
-        Ok(outcome) => Ok((axum::http::StatusCode::OK, Json(outcome))),
+        Ok((outcome, _)) => Ok((axum::http::StatusCode::OK, Json(outcome))),
         Err(e) => Err(conflict_from(e)),
     }
 }
@@ -30627,20 +30685,17 @@ pub(crate) async fn schedule_backfill_inner(
                     },
                 );
                 let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
-                // Issue #743 review (PR #1141, Finding #5): a workflow backfill
-                // must ALSO thread the declared `execution_timeout` and the
-                // fleet-wide `max_workflow_execution_timeout` ceiling into the
-                // start below -- `info_execution_timeout` was already resolved
-                // above (it feeds the `sla` clamp) but was never applied to the
-                // execution row itself, leaving a backfilled run with no hard
-                // deadline even when the workflow type declares one. Mirrors the
-                // DAG branch's identical fix immediately below.
-                let workflow_execution_timeout =
-                    info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
-                let workflow_max_execution_timeout_ceiling = runtime
-                    .registry
-                    .max_workflow_execution_timeout
-                    .and_then(|d| chrono::Duration::from_std(d).ok());
+                // Issue #1412: thread the declared execution_timeout and the
+                // fleet-wide ceiling into the start below, via the same shared
+                // lookup the DAG branch uses right below. `info_execution_timeout`
+                // above still separately feeds the `sla` clamp on the raw
+                // `std::time::Duration` form -- `resolve_dispatch_deadline` returns
+                // an unclamped `sla` too, so it is discarded here.
+                let DispatchDeadline {
+                    execution_timeout: workflow_execution_timeout,
+                    max_execution_timeout_ceiling: workflow_max_execution_timeout_ceiling,
+                    ..
+                } = runtime.registry.resolve_dispatch_deadline(&wf_name);
 
                 // issue #377: check admission gates before firing a backfill run.
                 // Workflow backfill writes to pool.default_pool() and creates
@@ -31186,32 +31241,26 @@ pub(crate) async fn schedule_backfill_inner(
                             )
                         });
 
-                // Issue #743 review (PR #1141, Finding #5): a DAG backfill must
-                // thread the DAG's declared execution_timeout/sla, and the
-                // fleet-wide max_workflow_execution_timeout ceiling, the SAME
-                // way the scheduler tick's dispatch path and a manual/MCP
-                // trigger (`trigger_unified_dag`) already do -- resolved from the
-                // DAG's own shadow `WorkflowInfo`, registered under `dag_name` in
-                // `registry.workflows` by `DagInfo::as_workflow_info()`. Kept as a
-                // separate lookup from the `(owner, runbook_url, severity)` tuple
-                // above (sourced from `runtime.dags()`) so this fix stays scoped
-                // to the deadline fields and never touches classic-DAG behavior
-                // for those three unrelated fields. `chain_execution_timeout` is
-                // deliberately left `None` for a DAG start (issue #617: DAGs
-                // carry no chain-scoped lifetime cap), matching
-                // `DagInfo::as_workflow_info()`'s own `chain_execution_timeout:
-                // None`.
-                let dag_wf_info = runtime.registry.workflows.get(&dag_name);
-                let dag_execution_timeout = dag_wf_info
-                    .and_then(|info| info.execution_timeout)
-                    .and_then(|d| chrono::Duration::from_std(d).ok());
-                let dag_sla = dag_wf_info
-                    .and_then(|info| info.sla)
-                    .and_then(|d| chrono::Duration::from_std(d).ok());
-                let dag_max_execution_timeout_ceiling = runtime
-                    .registry
-                    .max_workflow_execution_timeout
-                    .and_then(|d| chrono::Duration::from_std(d).ok());
+                // Issue #1412: a DAG backfill must thread the DAG's declared
+                // execution_timeout/sla/ceiling. The scheduler tick's dispatch path
+                // and the manual/MCP trigger (`trigger_unified_dag`) already do this.
+                // One shared lookup resolves these fields from the DAG's own shadow
+                // `WorkflowInfo`. `DagInfo::as_workflow_info()` registers this shadow
+                // entry under `dag_name` in `registry.workflows`.
+                //
+                // This lookup stays separate from the `(owner, runbook_url, severity)`
+                // tuple above. That tuple comes from `runtime.dags()`. Keeping the
+                // lookups separate scopes this fix to the deadline fields only; it
+                // never touches classic-DAG behavior for those three unrelated fields.
+                //
+                // `chain_execution_timeout` stays `None` for a DAG start (issue #617).
+                // DAGs carry no chain-scoped lifetime cap. This matches
+                // `DagInfo::as_workflow_info()`'s own `chain_execution_timeout: None`.
+                let DispatchDeadline {
+                    execution_timeout: dag_execution_timeout,
+                    sla: dag_sla,
+                    max_execution_timeout_ceiling: dag_max_execution_timeout_ceiling,
+                } = runtime.registry.resolve_dispatch_deadline(&dag_name);
 
                 // issue #377: enforce admission gates for DAG backfills, mirroring
                 // the workflow backfill branch gate check.
