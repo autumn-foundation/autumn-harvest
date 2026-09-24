@@ -1690,20 +1690,26 @@ const DISPATCH_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// fallback covers the running state only. The message names the endpoint in
 /// credential-free form.
 ///
-/// Clears the per-shard slot unconditionally on entry (Codex review, issue
-/// #1429). A process may have previously run a multi-shard install and now
-/// start this single-shard one with no intervening `stop()`. `run_poll_loop`
-/// prioritizes an installed per-shard channel for its polled shard over the
-/// freshly installed global one (see its own `per_shard_installed` check).
-/// A stale per-shard slot left behind would then keep this new runner
-/// consuming from the old endpoint or key prefix. `/admin/config` would
-/// report the newly installed global channel instead.
+/// Clears the per-shard slot only after a Redis connect succeeds, or
+/// immediately on the redis-off branch (Codex review, issue #1429
+/// follow-up). An earlier version cleared it unconditionally on entry,
+/// before attempting to connect. A process may have previously run a
+/// multi-shard install and now start this single-shard one with no
+/// intervening `stop()`. If that connect then failed, the old version
+/// left the still-active multi-shard runner with every per-shard channel
+/// gone and nothing to replace them. It fell back to Postgres for no
+/// reason of its own. Connecting first, as
+/// [`install_dispatch_channels_for_shards`] also does, means a failed
+/// connect here leaves every existing channel exactly as this call found
+/// it.
 ///
-/// This function only ever holds one connection attempt. Unlike
-/// [`install_dispatch_channels_for_shards`] it has no multi-shard partial
-/// failure to guard against. A failed connect here leaves the single-shard
-/// slot exactly as it was, since only the redis-off branch and the success
-/// path below ever touch it.
+/// The clear still needs to happen somewhere unconditionally reachable,
+/// though: on success, or on the redis-off branch. `run_poll_loop`
+/// prioritizes an installed per-shard channel for its polled shard over
+/// the freshly installed global one (see its own `per_shard_installed`
+/// check). A stale per-shard slot left behind would then keep this new
+/// runner consuming from the old endpoint or key prefix. `/admin/config`
+/// would report the newly installed global channel instead.
 #[cfg(feature = "redis")]
 async fn install_dispatch_channel(
     config: &HarvestRuntimeConfig,
@@ -1711,18 +1717,18 @@ async fn install_dispatch_channel(
 ) -> autumn_web::AutumnResult<bool> {
     use std::time::Duration;
 
-    autumn_harvest::dispatch::uninstall_all_shards();
-
     // The endpoint string comes from the redacted form only, so neither the
     // startup log line nor the connect error can carry a password. Both
     // halves are `Some` together, because both read `config.redis.url`.
     let (Some(url), Some(endpoint)) = (config.redis.url.as_deref(), config.redis.redacted_url())
     else {
-        // Redis is off for this start. The slot is process wide, so a channel a
-        // previous runtime installed is still live in it (issue #1312). Leaving
-        // it there would keep this process publishing and consuming through a
-        // channel the operator has turned off.
+        // Redis is off for this start. Both slots are process wide, so a
+        // channel a previous runtime installed is still live in them
+        // (issue #1312). Leaving either there would keep this process
+        // publishing and consuming through a channel the operator has
+        // turned off.
         autumn_harvest::dispatch::uninstall();
+        autumn_harvest::dispatch::uninstall_all_shards();
         return Ok(false);
     };
 
@@ -1744,6 +1750,10 @@ async fn install_dispatch_channel(
             "failed to connect the Redis dispatch channel at {endpoint}: {error}"
         ))
     })?;
+
+    // Connected. Clear the per-shard slot now: see the doc comment above
+    // for why this waits until here.
+    autumn_harvest::dispatch::uninstall_all_shards();
 
     autumn_harvest::dispatch::install(
         Arc::new(channel),
@@ -2788,6 +2798,56 @@ mod tests {
         assert!(
             autumn_harvest::dispatch::installed_for_shard(stale_shard).is_none(),
             "entering the single-shard install path must clear a stale per-shard slot"
+        );
+    }
+
+    /// A single-shard install whose connect fails leaves an active
+    /// multi-shard runner's per-shard channels untouched (Codex review,
+    /// issue #1429 follow-up), the single-shard mirror of
+    /// `a_shard_connect_failure_leaves_existing_channels_untouched`.
+    ///
+    /// An earlier version cleared every per-shard slot unconditionally on
+    /// entry, before attempting to connect. A single-shard runner could
+    /// then replace a still-active multi-shard runner with no intervening
+    /// `stop()`. If that connect failed, the multi-shard runner lost every
+    /// dispatch channel it owned, and fell back to Postgres for no reason
+    /// of its own. This drives that connect to a black-holed address, and
+    /// checks that a per-shard channel installed before the call is still
+    /// there after it fails.
+    #[test]
+    fn a_single_shard_connect_failure_leaves_existing_per_shard_channels_untouched() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        let active_shard = ShardId::new(3);
+        autumn_harvest::dispatch::install_for_shard(
+            active_shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        // A black-holed address: `RedisDispatch::connect` fails after its
+        // own connect timeout, never after a fast refusal. This proves the
+        // failure path rather than a config-validation shortcut.
+        let config = crate::config::HarvestRuntimeConfig {
+            redis: super::HarvestRedisConfig {
+                url: Some("redis://10.255.255.1:6379".to_string()),
+                ..super::HarvestRedisConfig::default()
+            },
+            ..crate::config::HarvestRuntimeConfig::default()
+        };
+
+        let result = block_on(super::install_dispatch_channel(&config, None));
+        assert!(
+            result.is_err(),
+            "an unreachable Redis endpoint must fail the call"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(active_shard).is_some(),
+            "a failed connect must not clear a pre-existing per-shard channel"
         );
     }
 
