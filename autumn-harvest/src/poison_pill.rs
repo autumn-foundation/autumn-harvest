@@ -698,8 +698,20 @@ mod scanner {
         // would otherwise reach the channel before this COMMIT. The
         // buffering scope holds it until then, matching every other
         // transaction owner that calls `wake_workflow_task`.
+        //
+        // `reclaim_orphaned_tasks` claims one row per loop iteration over an
+        // unbounded orphan set, the same shape as the outbox sweeps
+        // `buffered_settled_in_background` already covers. An inline
+        // `buffered_settled` awaits the dispatch channel's publish call
+        // after every commit. That can cost up to `DISPATCH_CALL_TIMEOUT`
+        // per quarantined row when the channel is slow (Codex review, issue
+        // #1429). It delays the rest of the sweep even though Postgres
+        // already committed. Reconciliation is the durability fallback
+        // regardless, so `buffered_settled_in_background` hands the hint to
+        // the existing non-blocking background publisher instead of
+        // awaiting it inline.
         let (acted, failed_workflow, deferred_starts, closed_children, pending_cancel_metrics) =
-            crate::dispatch::buffered_settled(Box::pin(conn.transaction::<(
+            crate::dispatch::buffered_settled_in_background(Box::pin(conn.transaction::<(
                 bool,
                 Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
                 Vec<DeferredTriggerStart>,

@@ -67,7 +67,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use autumn_harvest::dispatch::{
@@ -109,6 +109,25 @@ const RECOVER_BATCH: usize = 128;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Deadline for one command on an open connection (contract C4).
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Per-queue cap on [`RedisDispatch::read_across_queues`]'s blocking pass
+/// when more than one queue is in rotation (Codex review, issue #1429).
+///
+/// One queue's stream carries its own hash tag. A single multi-key
+/// `XREADGROUP` across several queues therefore crosses Redis Cluster slots
+/// (see `read_across_queues`'s own doc comment). Reading each queue with its
+/// own single-key call lost a property the old multi-key blocking read had
+/// for free. Any configured queue's arrival used to wake the read at once.
+/// Blocking the whole `wait` on only the rotation's leader loses that. An
+/// entry can land on a different queue right after that queue's own
+/// non-blocking scan. It then waits out the leader's full timeout before
+/// the next call's scan finds it.
+///
+/// Capping each queue's blocking slice to this value, and cycling the
+/// rotation across the remaining `wait` budget, bounds that latency to about
+/// `QUEUE_BLOCK_SLICE * ordered.len()` instead. A single-queue rotation
+/// leaves `wait` undivided. There is no sibling queue to starve.
+const QUEUE_BLOCK_SLICE: Duration = Duration::from_millis(200);
 
 /// Separator between the entry id and the payload inside a lease handle.
 ///
@@ -687,8 +706,11 @@ impl RedisDispatch {
     }
 
     /// Read every queue in `ordered`, one single-key call each. It runs a
-    /// non-blocking pass first. Only if nothing was ready does it then run
-    /// a blocking one, on `ordered`'s leader.
+    /// non-blocking pass first. Only if nothing was ready does it then
+    /// block. It cycles the rotation across `wait`'s budget, in slices of
+    /// at most [`QUEUE_BLOCK_SLICE`] each (Codex review, issue #1429). That
+    /// keeps a sibling queue's arrival from starving behind the leader's
+    /// full timeout. See `QUEUE_BLOCK_SLICE`'s own doc comment.
     ///
     /// Extracted from [`Self::next_inner`] to keep that function's line
     /// count under clippy's `too_many_lines` threshold (issue #1429).
@@ -763,29 +785,40 @@ impl RedisDispatch {
                 }
             }
         }
-        if !any_ready
-            && !wait.is_zero()
-            && let Some(first) = ordered.first()
-        {
-            match self
-                .read_with_heal(
-                    queues,
-                    std::slice::from_ref(first),
-                    consumer,
-                    remaining,
-                    wait,
-                )
-                .await
-            {
-                Ok(blocked) => {
-                    if blocked.keys.iter().any(|stream| !stream.ids.is_empty()) {
-                        any_ready = true;
+        if !any_ready && !wait.is_zero() && !ordered.is_empty() {
+            let deadline = Instant::now() + wait;
+            let mut rotation = 0usize;
+            while !any_ready && remaining > 0 {
+                let Some(budget) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                // A lone queue leaves `wait` undivided: there is no sibling
+                // to starve, so this stays the original single-call block
+                // (see `QUEUE_BLOCK_SLICE`'s doc comment).
+                let slice = if ordered.len() > 1 {
+                    budget.min(QUEUE_BLOCK_SLICE)
+                } else {
+                    budget
+                };
+                let key = &ordered[rotation % ordered.len()];
+                match self
+                    .read_with_heal(queues, std::slice::from_ref(key), consumer, remaining, slice)
+                    .await
+                {
+                    Ok(blocked) => {
+                        let delivered: usize =
+                            blocked.keys.iter().map(|stream| stream.ids.len()).sum();
+                        if delivered > 0 {
+                            any_ready = true;
+                            remaining = remaining.saturating_sub(delivered);
+                        }
+                        reply.keys.extend(blocked.keys);
                     }
-                    reply.keys.extend(blocked.keys);
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
                 }
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                }
+                rotation += 1;
             }
         }
         if !any_ready && let Some(error) = first_error {
@@ -818,10 +851,12 @@ impl RedisDispatch {
         // A first, non-blocking pass over every queue costs one fast round
         // trip per queue. It finds an already-ready entry immediately,
         // without paying `wait` once per queue. Only when that pass finds
-        // nothing does this call block, and only on the queue this call's
-        // own rotation leads with. `ordered` rotates every call, so
-        // blocking fairness matches the round-robin already used to decide
-        // which queue's `COUNT` fills the batch first.
+        // nothing does this call block. It then cycles the rotation in
+        // short slices across `wait`'s budget, rather than parking the
+        // whole budget on the leader alone. See `read_across_queues`'s own
+        // doc comment. `ordered` rotates every call, so blocking fairness
+        // matches the round-robin already used to decide which queue's
+        // `COUNT` fills the batch first.
         let (reply, read_error) = self
             .read_across_queues(queues, &ordered, consumer, max, wait)
             .await?;

@@ -898,6 +898,63 @@ async fn every_queue_is_served_when_the_read_cap_is_one() {
     );
 }
 
+/// An entry published on a non-leader queue must not wait out the leader's
+/// full blocking timeout (Codex review, issue #1429).
+///
+/// `read_across_queues` blocks each queue's stream on its own single-key
+/// call. A multi-key `XREADGROUP` across several queues' hash-tagged
+/// streams would cross Redis Cluster slots. Blocking the whole `wait` on
+/// only the rotation's leader has a cost, though. An entry can land on a
+/// different queue right after that queue's own non-blocking scan. It then
+/// sits unseen until the leader's timeout expires. The fix caps each
+/// queue's blocking slice and cycles the rotation across `wait`'s budget.
+/// A sibling queue's arrival then surfaces within about one slice, instead
+/// of the whole wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_leader_queue_is_not_starved_behind_the_leaders_full_wait() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    // First call's rotation offset is 0, so `ordered` keeps this order:
+    // "first" leads, "second" does not.
+    let queues = vec!["first".to_string(), "second".to_string()];
+    let wait = Duration::from_millis(600);
+
+    let dispatch = fixture.dispatch.clone();
+    let read_queues = queues.clone();
+    let handle = tokio::spawn(async move {
+        let started = Instant::now();
+        let leases = dispatch
+            .next(&read_queues, "consumer-1", 1, wait)
+            .await
+            .expect("next");
+        (started.elapsed(), leases)
+    });
+
+    // Give the read time to start blocking on "first" before publishing to
+    // "second", so this exercises the rotation rather than the initial
+    // non-blocking pass.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    fixture
+        .dispatch
+        .publish(&[hint("second", Uuid::new_v4(), Utc::now())])
+        .await
+        .expect("publish");
+
+    let (elapsed, leases) = handle.await.expect("join");
+    assert_eq!(
+        leases.len(),
+        1,
+        "the read must find the entry published on the non-leader queue"
+    );
+    assert_eq!(leases[0].queue_name, "second");
+    assert!(
+        elapsed < wait / 2,
+        "a non-leader queue's arrival must not wait out the leader's full \
+         block; elapsed was {elapsed:?} against a {wait:?} wait"
+    );
+}
+
 /// An address that accepts no connection, so `connect` has to time out.
 ///
 /// Some environments answer with a reset at once. The case tolerates that:
