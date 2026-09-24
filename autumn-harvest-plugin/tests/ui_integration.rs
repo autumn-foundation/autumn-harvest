@@ -6973,6 +6973,83 @@ async fn ui_dag_retry_error_renders_human_message() {
     );
 }
 
+// I-E2
+/// Snag repro (issue #1723): a genuine commit failure drops the operator's
+/// submitted retry `reason`. `dag_retry_commit_redirect` only returns a
+/// target run id and a flash string, so a real form submission's `reason`
+/// has nowhere to travel on a 409 conflict.
+///
+/// This exercises the actual HTTP handler with a `reason` field. A `ui.rs`
+/// unit test cannot reach that field on its own. The field lives on the
+/// caller of `dag_retry_commit_redirect`, not on that function itself.
+#[tokio::test]
+async fn ui_dag_retry_error_drops_submitted_reason() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    // A COMPLETED run cannot be retried (409, "DAG run succeeded ...") --
+    // the same genuine-failure precondition as `ui_dag_retry_error_renders_human_message`.
+    let ia = autumn_harvest::ActivityExecId::new();
+    let events = vec![
+        dag957_sched("dag957_step_a", ia),
+        dag957_started(ia),
+        dag957_completed(ia),
+        autumn_harvest::WorkflowEvent::WorkflowCompleted {
+            output: Value::Null,
+        },
+    ];
+    let exec_id = dag957_seed_run(
+        &url,
+        "dag957_linear",
+        "graph-reason-dropped",
+        events,
+        "COMPLETED",
+    )
+    .await;
+
+    let submitted_reason = "retrying after upstream API fix, ticket JIRA-4521";
+    let (status, headers, _body) = post_form(
+        &app,
+        &format!("/dags/dag957_linear/runs/{exec_id}/retry"),
+        format!(
+            "from_node=dag957_step_a&reason={}",
+            url_encode_test(submitted_reason)
+        ),
+    )
+    .await;
+    assert!(status.is_redirection(), "commit redirects; got {status}");
+    let location = headers
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    // The flash is percent-encoded in the `Location` header (`url_encode`
+    // turns the space after "Retry failed:" into "%20").
+    assert!(
+        location.contains("Retry%20failed"),
+        "a genuine failure must use the hard failure message: {location}"
+    );
+    assert!(
+        !location.to_lowercase().contains("jira-4521")
+            && !location.to_lowercase().contains("jira%2d4521"),
+        "the operator's submitted reason must not survive the failure \
+         redirect if this bug is still present; got: {location}"
+    );
+}
+
+fn url_encode_test(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_string()
+            } else if c == ' ' {
+                "+".to_string()
+            } else {
+                format!("%{:02X}", c as u32)
+            }
+        })
+        .collect()
+}
+
 // I-F
 #[tokio::test]
 async fn ui_dag_run_graph_classic_dag_degraded() {

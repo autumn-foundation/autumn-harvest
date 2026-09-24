@@ -15761,30 +15761,34 @@ mod tests {
         );
     }
 
-    /// Snag repro: `dag_retry_commit_redirect` returns `(String, String)` — a
-    /// target run id and a flash string. On a genuine failure, nothing
-    /// carries the operator's edited retry `reason`.
+    /// Snag finding (issue #1723): `dag_retry_commit_redirect` returns
+    /// `(String, String)` — a target run id and a flash string. Neither
+    /// slot names or carries a retry `reason`, on any branch.
+    ///
+    /// This pins the root cause at the signature level. No value this
+    /// function returns can ever hold the operator's edited reason. So the
+    /// real submitted `reason` a form sends to `dag_retry_commit_ui`
+    /// cannot survive a genuine failure either.
+    ///
+    /// `ui_dag_retry_error_drops_submitted_reason` in
+    /// `autumn-harvest-plugin/tests/ui_integration.rs` exercises that full
+    /// form-to-redirect path end to end (Codex review on this PR). This
+    /// test only pins the narrower, always-true fact about this
+    /// function's own return type.
     ///
     /// This is the same "entered data lost on a form's failure redirect"
     /// defect class already tracked for the workflow-detail action forms
     /// (issue #1687, `WorkflowActionEcho`). It is also tracked for the
-    /// build-routing forms (issue #1714). Neither fix reaches the DAG retry
-    /// confirm form.
-    ///
-    /// A custom reason, edited away from `dag_retry_default_reason`'s
-    /// auto-filled text, is discarded here. The operator must recall and
-    /// retype it after the confirm page's dry run races a concurrent
-    /// change to the run. Example: the node already retried, or succeeded
-    /// through another path (`DagRetryResolveError::AlreadySucceeded`).
+    /// build-routing forms (issue #1714). Neither fix reaches the DAG
+    /// retry confirm form.
     #[test]
-    fn dag_retry_commit_redirect_drops_the_operators_custom_reason_on_real_failure() {
-        let custom_reason = "retrying after upstream API fix, ticket JIRA-4521";
+    fn dag_retry_commit_redirect_return_type_carries_no_reason_on_real_failure() {
         let failure = DagRetryFailure::StateConflict("DAG run succeeded".to_string());
         let (_target, flash) = dag_retry_commit_redirect(Err(failure), "source-run");
         assert!(
-            !flash.contains(custom_reason),
-            "the operator's custom reason is not carried anywhere in the \
-             failure redirect, so it cannot survive to the redisplayed page: {flash}"
+            !flash.to_lowercase().contains("reason"),
+            "the failure flash never echoes any reason field, by \
+             construction of this function's return type: {flash}"
         );
     }
 
