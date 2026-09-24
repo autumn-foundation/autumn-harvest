@@ -54,7 +54,16 @@ stay in one Cluster slot and the `CROSSSLOT` failure is gone. This crate still
 connects with a single-node `redis::Client`/`ConnectionManager`, not a
 cluster-aware client, and does not follow `MOVED`/`ASK` redirects — that
 remains a separate follow-up, stated honestly in the crate doc rather than
-implied as done.
+implied as done. This renames every dispatch key (the tag brackets nest
+inside the existing prefix, so `harvest:dispatch:email` becomes
+`{harvest:dispatch:email}`); a deployment that already ran Redis dispatch
+before this PR has references sitting in the old, unbracketed family that no
+worker reads after the upgrade. Nothing is lost — the rows are still
+`PENDING` in Postgres and the reconcile sweep republishes them into the
+bracketed family within one `reconcile_interval` — and the old keys are
+inert, documented in `docs/operations/redis-dispatch.md`'s key-layout
+section alongside the identical story issue #1429's shard-suffix change
+already told for a narrower case.
 
 **6. `[harvest.redis]` in `EffectiveConfigView`.** New `DispatchConfigView`
 (installed state, endpoint, key prefix, consumer group, visibility timeout,

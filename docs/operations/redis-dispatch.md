@@ -151,14 +151,23 @@ reads them again. Nothing is lost: the rows are still `PENDING` in Postgres,
 and the reconcile sweep republishes them into the new family within one
 `reconcile_interval`. Delete the old keys at leisure with a prefix scan.
 
+The same recovery story covers issue #1429's own key-family change: every key
+now nests a `{...}` hash tag around the prefix and queue name, so Redis
+Cluster hashes the whole family to one slot (see [Limits in v1](#limits-in-v1)).
+A deployment that ran Redis dispatch before issue #1429 has references sitting
+in the old, unbracketed key family. No worker reads that family after the
+upgrade. As above, nothing is lost — the rows are still `PENDING` in Postgres
+and the reconcile sweep republishes them into the bracketed family — and the
+old keys are inert; delete them at leisure with a prefix scan.
+
 With the default prefix and a queue named `email`:
 
 | Key | Kind | Holds |
 |-----|------|-------|
-| `harvest:dispatch:email` | stream | References that are due now |
-| `harvest:dispatch:email:delayed` | sorted set | References parked until their due time, scored by that time |
-| `harvest:dispatch:email:delayed:payloads` | hash | Payload of each parked reference, keyed by task id |
-| `harvest:dispatch:marker:<task_id>` | string | Publish marker that makes a publish idempotent per task id |
+| `{harvest:dispatch:email}` | stream | References that are due now |
+| `{harvest:dispatch:email}:delayed` | sorted set | References parked until their due time, scored by that time |
+| `{harvest:dispatch:email}:delayed:payloads` | hash | Payload of each parked reference, keyed by task id |
+| `{harvest:dispatch:email}:marker:<task_id>` | string | Publish marker that makes a publish idempotent per task id |
 
 `autumn-harvest-redis/src/naming.rs` is the single source of truth for the key
 shape. The older `harvest:queue:*`, `harvest:scheduled:*` and `harvest:dlq:*`
@@ -264,10 +273,14 @@ fails startup instead, in every mode.
   `:s<shard>` prefix suffix in [Key layout](#key-layout). A central API process
   that spans several shards is still rejected, because it publishes for shards
   it cannot separate. Issue #1429 tracks true multi-shard routing.
-- **No Redis Cluster.** v1 targets one Redis instance. The keys carry no hash
-  tags, so a Cluster deployment spreads the streams, the delayed sets and the
-  markers of one queue across slots, and the Lua scripts that touch them
-  together fail. Redis Sentinel and a single primary are the supported shapes.
+- **No Redis Cluster.** v1 targets one Redis instance. Every key for one
+  queue now nests a `{...}` hash tag (issue #1429), so the streams, the
+  delayed sets and the markers of one queue hash to the same Cluster slot,
+  and the `CROSSSLOT` failure the multi-key Lua scripts once hit is gone.
+  This crate still connects with a single-node `redis::Client`/
+  `ConnectionManager`, though, not a cluster-aware client, and does not
+  follow `MOVED`/`ASK` redirects. Redis Sentinel and a single primary stay
+  the supported shapes.
 - **Priority is best effort.** A stream delivers in publish order. Only the
   reconcile sweep publishes in priority order.
 - **Sticky affinity is best effort.** A non-pinned worker releases the
