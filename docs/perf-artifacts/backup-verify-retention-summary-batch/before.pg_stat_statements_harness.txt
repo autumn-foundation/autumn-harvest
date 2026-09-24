@@ -1,0 +1,26 @@
+Harness: autumn-harvest/tests/integration/backup_verify_retention_batch_perf.rs
+Test: terminal_child_batch_resolves_with_bounded_retention_lookup_calls
+Code state: BEFORE the fix (backup_verify.rs's `adjudicate_refs` still calls
+the per-reference `retention_summary_exists` helper).
+
+pg_stat_statements snapshot on the target shard's database (db_b), reset
+immediately before the measured `verify_restore` call and snapshotted
+immediately after. 500 `ChildTerminalRecorded` references, each against a
+target row absent from `harvest_workflow_executions` but proven by a
+`harvest_execution_summaries` row.
+
+    query: "SELECT id, state FROM harvest_workflow_executions WHERE id = ANY($1)"
+    calls: 1
+
+    query: "SELECT EXISTS ( SELECT $2 FROM harvest_execution_summaries WHERE execution_id = $1 ) AS present"
+    calls: 500
+
+The batched shape ("SELECT execution_id FROM harvest_execution_summaries
+WHERE execution_id = ANY($1)") does not appear at all -- it does not exist
+yet in this code state.
+
+Test result: FAILED (as expected -- the harness asserts the fixed shape;
+run again below, against the code state, is expected to fail here and pass
+after the fix). The functional-correctness assertions (no RetentionUnproven/
+ChildTerminalRolledBack/ChildExecutionMissing findings) passed unchanged in
+both states -- only the round-trip count differs.
