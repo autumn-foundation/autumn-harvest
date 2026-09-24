@@ -15761,6 +15761,33 @@ mod tests {
         );
     }
 
+    /// Snag repro: `dag_retry_commit_redirect` returns `(String, String)` — a
+    /// target run id and a flash string. On a genuine failure, nothing
+    /// carries the operator's edited retry `reason`.
+    ///
+    /// This is the same "entered data lost on a form's failure redirect"
+    /// defect class already tracked for the workflow-detail action forms
+    /// (issue #1687, `WorkflowActionEcho`). It is also tracked for the
+    /// build-routing forms (issue #1714). Neither fix reaches the DAG retry
+    /// confirm form.
+    ///
+    /// A custom reason, edited away from `dag_retry_default_reason`'s
+    /// auto-filled text, is discarded here. The operator must recall and
+    /// retype it after the confirm page's dry run races a concurrent
+    /// change to the run. Example: the node already retried, or succeeded
+    /// through another path (`DagRetryResolveError::AlreadySucceeded`).
+    #[test]
+    fn dag_retry_commit_redirect_drops_the_operators_custom_reason_on_real_failure() {
+        let custom_reason = "retrying after upstream API fix, ticket JIRA-4521";
+        let failure = DagRetryFailure::StateConflict("DAG run succeeded".to_string());
+        let (_target, flash) = dag_retry_commit_redirect(Err(failure), "source-run");
+        assert!(
+            !flash.contains(custom_reason),
+            "the operator's custom reason is not carried anywhere in the \
+             failure redirect, so it cannot survive to the redisplayed page: {flash}"
+        );
+    }
+
     #[test]
     fn dag_detail_relative_url_builds_back_link_and_flash() {
         assert_eq!(
