@@ -97,17 +97,7 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Skip the leading ctx param when building signal args.
     let params: Vec<_> = func.sig.inputs.iter().skip(1).collect();
-    let param_names: Vec<_> = params
-        .iter()
-        .filter_map(|arg| {
-            if let syn::FnArg::Typed(pt) = arg
-                && let syn::Pat::Ident(ident) = &*pt.pat
-            {
-                return Some(&ident.ident);
-            }
-            None
-        })
-        .collect();
+    let param_names: Vec<_> = crate::attr_util::param_idents(&params);
 
     let serialize_payload = if param_names.is_empty() {
         quote! { ::autumn_harvest::serde_json::Value::Null }
