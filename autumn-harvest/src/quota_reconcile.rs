@@ -310,6 +310,46 @@ struct CandidateRow {
 /// against a large REGISTERED one instead, not a strict win. See the
 /// migration's own comment for the full trade-off.
 ///
+/// Measured against production-shaped fixtures (issue #1226 follow-up,
+/// see `docs/performance-quota-reconcile-candidate-scan.md`). The
+/// residual filter cost is real. It grows with the non-quota'd
+/// population: about 3,900 buffers at 20,000 such rows. It reaches about
+/// 95,000 buffers, and a ~150ms single-batch execution time, at 500,000.
+/// That is once the quota'd workflow type also carries its own realistic
+/// terminal history. `idx_harvest_wfx_workflow_identity` does not rescue
+/// this in practice. It is a full index, so it pays for that terminal
+/// history too.
+///
+/// This is not a one-time rollout cost, for a sustained workload. A
+/// non-quota'd row leaves the candidate index too, once its execution
+/// goes terminal -- the predicate is `state IN ('RUNNING', 'PAUSED')`,
+/// not `quota_key IS NULL` alone. This fixture never advances that
+/// population. It measures a live production system's steady state
+/// instead: new non-quota'd starts continuously replace completions,
+/// holding the active non-quota'd population roughly constant. Under
+/// that condition, not literally "the same rows forever", the candidate
+/// scan cost recurs every tick, since nothing shrinks the population it
+/// walks. Measured directly: 504,201 buffers, immediately after the
+/// target backlog is fully backfilled -- worse than any single tick
+/// measured during the backfill itself.
+///
+/// The rejected `(workflow_name, id)` index was built and tested
+/// directly. The unforced planner does not pick it either. The reason is
+/// a cost misestimate, not a hard limitation. Forcing the planner onto
+/// it (`enable_indexscan = off`) drops the cost from about 95,000
+/// buffers to 46. A literal `workflow_name = $1` rewrite drops it to
+/// 189, with no forcing needed. The index would help enormously; the
+/// default planner just never reaches for it under `= ANY($1)` against
+/// this correlated data.
+///
+/// Two fix directions exist, both evidenced, neither shipped. One
+/// rewrites `CANDIDATE_SQL` as one bounded, ordered scan per registered
+/// quota'd workflow name, merged by `id`. That touches the keyset
+/// cursor's anti-starvation guarantee below, so it needs a human
+/// decision. The other fixes the underlying statistics -- attempted
+/// once, unsuccessfully, and not pursued further. No fix ships in this
+/// pass.
+///
 /// `AND ($2::uuid IS NULL OR id > $2) ORDER BY id LIMIT $3` is a keyset
 /// cursor, not a bare `LIMIT`. A row this sweep can never resolve --
 /// [`ReconcileOutcome::Unresolvable`] or [`ReconcileOutcome::OverCap`] --

@@ -267,6 +267,26 @@ jobs:
         # matching stand-in text. See
         # scripts/check-continue-as-new-checkpoint-example.sh.
         run: ./scripts/check-continue-as-new-checkpoint-example.sh
+      - name: Check operations chapter's preflight declared-deps example
+        # Guards two real, reproduced-live compile failures an Onramp
+        # clean-room pass found in chapter 10's flagship
+        # "Catching a forgotten registration before rollout" example: (1)
+        # `ctx.execute_activity(...).await?` and the spawn_child_workflow
+        # call below it are `HarvestResult<_>`, but the workflow returns
+        # `Result<_, String>` with no `From<HarvestError> for String` --
+        # same defect class as chapter 7's continue_as_new example (PR
+        # #1700); (2) even with `.map_err(...)` added, execute_activity's
+        # generic output type is left unconstrained by a discarded bare
+        # statement, which current stable rustc denies by default on every
+        # edition (`dependency_on_unit_never_type_fallback`), confirmed
+        # live against a standalone edition-2021 crate matching chapter 1's
+        # own pinned tutorial edition. Neither is a syntax error, so
+        # doc-snippet-syntax.py's rustfmt-only check passes this block
+        # clean. This actually compiles the pinned block with `cargo check`
+        # rather than pattern-matching stand-in text, matching the sibling
+        # guards above. See
+        # scripts/check-preflight-declared-deps-example.sh.
+        run: ./scripts/check-preflight-declared-deps-example.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest
@@ -1026,19 +1046,144 @@ jobs:
       # Actions matrix expressions can't derive one from the other, so keep
       # them in sync by hand when changing the shard count.
       #
-      # 11, not 10 (issue #1267 review). `row_ordinal % 10` put
-      # `integration_e2e` and `quota_enforcement_tests` on one shard. These
-      # are the manifest's two largest, most wall-clock-timeout-shaped
-      # suites. Their manifest positions are exactly 10 apart, so the old
-      # count always collided them. That shard ran ~35 min against 18-28 min
-      # for every other shard. CI-health flake reports name it most often
-      # (docs/rnd/2026-09-0{4,8,11}-ci-health-semaphore*.md). 11 shares no
-      # factor with the 10-row gap, so it cannot reproduce the collision.
-      # Chosen over 12/13/14 by simulating per-shard test weight
-      # (`#[tokio::test]` count per manifest row) and picking the smallest
-      # max-min spread.
+      # 21, not 11 (issue #1685 review; see also PR #1703's
+      # `docs/audits/shard-weight-drift.py`, a report-only harness that
+      # independently reaches the same "no N is collision-free" finding
+      # below with a more careful count -- it resolves substring-matched
+      # manifest filters and plugin-crate rows this comment's own earlier
+      # drafts undercounted). 11 was chosen (issue #1267) to break a 10-row
+      # gap between `integration_e2e` and `quota_enforcement_tests`, the
+      # manifest's two largest suites at the time. The manifest keeps
+      # growing alphabetically, and their gap silently drifted back onto a
+      # value 11 cannot tolerate either. That drift is real and confirmed.
+      #
+      # This comment went through eight rounds of correction (kept here
+      # rather than silently rewritten, since a later commit's diff is not
+      # where a future reader will look for this history):
+      #
+      # Round 1 computed weight from `autumn-harvest/integration` rows
+      # only, flattening every `autumn-harvest-plugin` row to weight 1
+      # (`ui_integration` alone is 148 tests) -- and separately mislabeled
+      # which shard was heaviest under that undercount (claimed shard 0 at
+      # 323). Chose 17.
+      #
+      # Round 2 (Codex review) fixed the mislabeling -- shard 7, not shard
+      # 0, was actually heaviest (323 vs shard 0's 268) -- but left the
+      # plugin-row undercount itself in place. Still chose 17.
+      #
+      # Round 3 (Codex review) found the real bug behind both: five
+      # manifest `filter` values are Cargo substring/prefix matches, not
+      # filenames, so the naive per-row weight lookup silently scored them
+      # 0. Switched to PR #1703's `docs/audits/shard-weight-drift.py`, a
+      # harness that resolves plugin-crate rows and substring filters
+      # correctly, and re-swept N=9-24 with it. 20 came out best in that
+      # range (max 247, versus 17's true max, which is higher than round
+      # 2 ever computed). Chose 20.
+      #
+      # Round 4: this PR's own live CI reproduced the
+      # `quota_enforcement_tests` hang again, on shard 4 under the new
+      # N=20 layout -- a shard confirmed isolated from every other heavy
+      # (>=30-test) suite. An earlier draft of this history claimed that
+      # recurrence "confirms shard load is not the cause"; Codex review
+      # correctly narrowed that to "rules out heavy-suite collision as a
+      # necessary condition," since one occurrence on a shard still running
+      # seven smaller suites cannot rule out load-sensitivity in general.
+      # No shard-count change.
+      #
+      # Round 5 (this one, Codex review): the N=9-24 sweep behind round 3's
+      # choice only covered the sharded `run linux` step. The same job also
+      # runs `Integration suites (partitioned harvest_events layout)`
+      # unconditionally on `matrix.shard == 0` (below), re-running 9 more
+      # rows -- including a full second pass of `integration_e2e`, 118
+      # tests -- worth a fixed +188 that ALWAYS lands on shard 0 regardless
+      # of N. Under round 3's N=20, shard 0's own sharded rows already
+      # totaled 247 (`ui_integration` landed there); adding the fixed +188
+      # makes shard 0's true total 435 -- worse than the original N=11's
+      # own true max of 426. N=20 was, corrected, one of the WORST choices
+      # in the swept range, not the best.
+      #
+      # Re-swept N=9-24 with the fixed +188 correctly added to shard 0's
+      # total for every candidate. Best true max in that range: N=24 (261)
+      # and N=23 (262), essentially tied. Chose N=21 (true max 287, ~13%
+      # worse than the N=24/23 optimum) instead, for one reason with any
+      # independent merit left: `quota_enforcement_tests` lands on shard 2
+      # at N=21 with no co-resident heavy (>=30-test) suite, versus a
+      # 3-way collision at N=23 and a 2-way collision with `ui_integration`
+      # at N=24. That isolation is NOT established to help the actual hang
+      # (see below) -- it is the one property this fix can still honestly
+      # claim, at a real but small cost in overall balance.
+      #
+      # Round 6 (Codex review): round 5's own "426" figure for N=11 was
+      # never re-derived with the same +188 addition -- it was carried over
+      # from the ORIGINAL (pre-linuxpart-fix) sweep, where 426 was a
+      # different shard's total (shard 7), not shard 0's. Actually running
+      # the harness at N=11 finds shard 0 alone already totals 417 on the
+      # sharded rows -- nearly the old "max" by itself, before the fixed
+      # pass is even added. With it: shard 0's true total at N=11 is 605,
+      # not 426. That retracts round 5's claim that N=20 (435) was worse
+      # than doing nothing: N=20 is still better than N=11, just not the
+      # best available. Full corrected sweep (all of N=9-24, not a spot
+      # check): true max ranges from N=24's 261 (best) through N=11's 605
+      # (worst); N=21's 287 is third-best overall, ~53% below the true
+      # N=11 baseline (605), not the ~13%-worse-than-optimum framing round
+      # 5 gave in isolation. The N=21 choice itself is unchanged -- it
+      # remains the best option that also keeps `quota_enforcement_tests`
+      # isolated (checked directly: N=18, the next lower true-max candidate
+      # that also isolates it, is 316, still worse than N=21's 287).
+      #
+      # Round 7 (Codex review): round 6's isolation check above named only
+      # N=18 and N=20 as the other isolating candidates. Testing every
+      # N=9-24 directly against the harness's own heavy-collision function,
+      # rather than the two that had already come up in conversation, finds
+      # THREE more: N=9, N=10, N=14 all isolate `quota_enforcement_tests`
+      # too. None beats N=21 (their true maxima are 472, 520, and 429 --
+      # all worse than 287), so the shipped shard count does not change.
+      # Only the claim of an exhaustive check was wrong; it is exhaustive
+      # now (see the report's "🔍 Sixth correction" for the full N=9-24
+      # isolation table).
+      #
+      # No shard count in 9-24 is collision-free (confirmed, this round,
+      # under the corrected accounting too) -- a durable fix needs a
+      # weight-aware assignment that also accounts for the linuxpart pass,
+      # not a bigger modulus, and that is a bigger change than this fix
+      # attempts.
+      #
+      # Round 8 (Codex review): every round above measured test-WEIGHT
+      # redistribution and called the result a "CI-cost improvement." It
+      # isn't one. Ten more matrix jobs (11 -> 21) each pay their own fixed
+      # setup cost -- checkout, toolchain install, `rust-cache` restore,
+      # disk pruning, four Docker pulls -- regardless of how many tests
+      # they run; the 151 manifest rows are only redistributed, not
+      # reduced. Total GitHub Actions runner-minutes per run almost
+      # certainly goes UP, not down. Fitting `duration = fixed + rate *
+      # weight` against ten real `Test DB (linux, shard N)` job timings
+      # (from an unrelated PR's N=11 run, so uncontaminated by this PR's
+      # own changes) gives a rough fixed cost of ~16 min/job -- noisy, but
+      # not negligible: ~160 extra runner-minutes per CI run for the ten
+      # new jobs. The wall-clock benefit for the slowest shard specifically
+      # is real but smaller than the weight ratio implies once that fixed
+      # cost is included: ~30% (about 37.7 -> 26.5 min by the same fit),
+      # not 52.6%. That benefit also assumes the runner pool has spare
+      # concurrency for the extra jobs -- unverified this session; a
+      # constrained pool could queue the new shards and erode or eliminate
+      # the latency win while still paying the extra fixed cost. See the
+      # report's "🔍 Seventh correction" for the full derivation.
+      #
+      # Whether shard load explains `quota_enforcement_tests`'s recurring,
+      # exactly-at-the-configured-timeout hang at all -- named by the "🚦
+      # Semaphore" CI-health report series
+      # (docs/rnd/2026-09-*-ci-health-semaphore-quota-outbox-*.md) and
+      # multiple concurrent PRs (#1697, #1698, #1699, #1706 at the time of
+      # this fix) -- is NOT established, and this PR's own first CI run
+      # (see the report) reproduced the hang on an isolated shard, which
+      # rules out heavy-suite collision as a NECESSARY condition (not shard
+      # load or probabilistic causes in general -- see the report for that
+      # distinction). This change is offered as a real, measured
+      # worst-case wall-clock latency improvement for the slowest shard,
+      # traded against higher total compute cost -- not a CI-cost
+      # improvement, and not a claimed fix for the hang.
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -1109,7 +1254,7 @@ jobs:
           # into a panic, so "the Redis suites stopped testing anything" is a
           # red build here rather than a silent green.
           HARVEST_TEST_REQUIRE_REDIS: "1"
-          SEMAPHORE_SHARD_COUNT: "11"
+          SEMAPHORE_SHARD_COUNT: "21"
           SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
         run: bash .github/ci/run-suites.sh run linux
       # Issue #958, AC2: re-run the store/replay/retention suites against the
