@@ -239,19 +239,55 @@ pub struct InstalledDispatch {
     pub channel: Arc<dyn TaskDispatch>,
     /// Worker-side tuning.
     pub settings: DispatchSettings,
+    /// The generation [`install`]/[`install_for_shard`] stamped on this
+    /// install, for [`uninstall_if_current`]/[`uninstall_all_shards_if_current`]
+    /// (Codex review, issue #1429 follow-up). Not read by anything else.
+    generation: u64,
 }
 
 static INSTALLED: RwLock<Option<InstalledDispatch>> = RwLock::new(None);
 
+/// Shared source for every install's generation stamp, across both the
+/// single-shard and per-shard slots (Codex review, issue #1429 follow-up).
+///
+/// One counter for both slots keeps the ownership check simple. A caller
+/// that captured a generation from either [`install`] or
+/// [`install_for_shard`] can ask "is this still the current occupant of
+/// the slot I installed into". No single-shard generation ever collides
+/// with a per-shard one.
+static INSTALL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Install the process-global channel. A later call replaces the earlier one.
-pub fn install(channel: Arc<dyn TaskDispatch>, settings: DispatchSettings) {
-    if let Ok(mut slot) = INSTALLED.write() {
-        *slot = Some(InstalledDispatch { channel, settings });
-        ANY_INSTALLED.store(true, Ordering::Relaxed);
-    }
+///
+/// Returns the generation this install was stamped with. A caller that may
+/// need to undo only *this* install keeps this value, for
+/// [`uninstall_if_current`] (Codex review, issue #1429 follow-up). That
+/// call, unlike the unconditional [`uninstall`], never also clears a later
+/// install that has since replaced this one.
+pub fn install(channel: Arc<dyn TaskDispatch>, settings: DispatchSettings) -> u64 {
+    let Ok(mut slot) = INSTALLED.write() else {
+        return 0;
+    };
+    // The generation is minted and stamped while still holding the write
+    // lock. Two racing installs cannot interleave: whichever call last
+    // wrote the slot is also the one whose generation the slot now carries.
+    let generation = INSTALL_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    *slot = Some(InstalledDispatch {
+        channel,
+        settings,
+        generation,
+    });
+    ANY_INSTALLED.store(true, Ordering::Relaxed);
+    generation
 }
 
-/// Remove the process-global channel. Tests use this between cases.
+/// Remove the process-global channel unconditionally. Tests use this between
+/// cases.
+///
+/// A production caller wants [`uninstall_if_current`] instead, when it
+/// installed a channel earlier and wants to undo specifically that
+/// install. A later install may have replaced it in the same process, and
+/// this function's own unconditional clear does not distinguish that case.
 ///
 /// The background publisher is stopped as well, so the next install starts
 /// with an empty publisher queue. A hint still in that queue is dropped; the
@@ -270,6 +306,36 @@ pub fn uninstall() {
     if let Ok(mut slot) = INSTALLED.write() {
         *slot = None;
     }
+    if INSTALLED_BY_SHARD.read().is_ok_and(|slot| slot.is_none()) {
+        ANY_INSTALLED.store(false, Ordering::Relaxed);
+    }
+    stop_publisher();
+}
+
+/// Remove the process-global channel, but only if `generation` still names
+/// the currently installed one (Codex review, issue #1429 follow-up).
+/// `generation` is a value [`install`] returned earlier.
+///
+/// A process may start a replacement runner before stopping the previous
+/// one. The replacement's `install` overwrites the slot and returns a new
+/// generation of its own. The previous runner's later, unconditional
+/// `uninstall` would then clear the replacement's channel out from under
+/// it. The replacement believes Redis dispatch is still active, since its
+/// own effective-config snapshot says so, while every read and publish
+/// silently falls through to Postgres. Checking the generation first means
+/// a stop call overtaken by a fresher install becomes a no-op instead.
+pub fn uninstall_if_current(generation: u64) {
+    let Ok(mut slot) = INSTALLED.write() else {
+        return;
+    };
+    let still_current = slot
+        .as_ref()
+        .is_some_and(|installed| installed.generation == generation);
+    if !still_current {
+        return;
+    }
+    *slot = None;
+    drop(slot);
     if INSTALLED_BY_SHARD.read().is_ok_and(|slot| slot.is_none()) {
         ANY_INSTALLED.store(false, Ordering::Relaxed);
     }
@@ -325,16 +391,33 @@ static INSTALLED_BY_SHARD: RwLock<
 ///
 /// A later call for the same shard replaces the earlier one. Does not touch
 /// [`install`]'s single-shard slot.
+///
+/// Returns the generation this shard's install was stamped with, drawn from
+/// the same counter [`install`] uses. A caller that may need to undo only
+/// the shards it installed keeps these values, for
+/// [`uninstall_all_shards_if_current`] (Codex review, issue #1429
+/// follow-up). That call, unlike the unconditional [`uninstall_all_shards`],
+/// never also clears a later install that has since replaced one of them.
 pub fn install_for_shard(
     shard: crate::types::ShardId,
     channel: Arc<dyn TaskDispatch>,
     settings: DispatchSettings,
-) {
-    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
-        slot.get_or_insert_with(std::collections::HashMap::new)
-            .insert(shard, InstalledDispatch { channel, settings });
-        ANY_INSTALLED.store(true, Ordering::Relaxed);
-    }
+) -> u64 {
+    let Ok(mut slot) = INSTALLED_BY_SHARD.write() else {
+        return 0;
+    };
+    let generation = INSTALL_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    slot.get_or_insert_with(std::collections::HashMap::new)
+        .insert(
+            shard,
+            InstalledDispatch {
+                channel,
+                settings,
+                generation,
+            },
+        );
+    ANY_INSTALLED.store(true, Ordering::Relaxed);
+    generation
 }
 
 /// The channel installed for `shard`, if any.
@@ -361,6 +444,47 @@ pub fn uninstall_all_shards() {
         *slot = None;
     }
     if INSTALLED.read().is_ok_and(|slot| slot.is_none()) {
+        ANY_INSTALLED.store(false, Ordering::Relaxed);
+    }
+    stop_publisher();
+}
+
+/// Remove only the shards in `expected` whose currently installed channel
+/// still carries the generation [`install_for_shard`] stamped on it.
+///
+/// `expected` holds the values that call returned earlier, one per shard
+/// (Codex review, issue #1429 follow-up). A shard whose generation has
+/// moved on was reinstalled by a later,
+/// unrelated call since `expected` was captured. This leaves it alone,
+/// rather than tearing out a replacement runner's channel for that shard.
+/// See [`uninstall_if_current`] for the single-shard version of the same
+/// race.
+pub fn uninstall_all_shards_if_current(expected: &[(crate::types::ShardId, u64)]) {
+    let mut any_removed = false;
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write()
+        && let Some(map) = slot.as_mut()
+    {
+        for (shard, generation) in expected {
+            let still_current = map
+                .get(shard)
+                .is_some_and(|installed| installed.generation == *generation);
+            if still_current {
+                map.remove(shard);
+                any_removed = true;
+            }
+        }
+        if map.is_empty() {
+            *slot = None;
+        }
+    }
+    if !any_removed {
+        return;
+    }
+    let shards_now_empty = INSTALLED_BY_SHARD.read().is_ok_and(|slot| {
+        slot.as_ref()
+            .is_none_or(std::collections::HashMap::is_empty)
+    });
+    if shards_now_empty && INSTALLED.read().is_ok_and(|slot| slot.is_none()) {
         ANY_INSTALLED.store(false, Ordering::Relaxed);
     }
     stop_publisher();

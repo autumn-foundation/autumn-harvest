@@ -26105,24 +26105,32 @@ async fn dispatch_call_with_timeout<T>(
 /// See [`dispatch_call_with_timeout`] for why a flat deadline is not
 /// enough.
 ///
-/// `round_trips_per_queue` must match the channel call this bounds.
-/// `ack_many_inner` does two round trips per queue: an `XACK`/`XDEL`
-/// pipeline, then a separate marker-cleanup script. An earlier round of
-/// this fix sized the deadline for only one round trip, unconditionally.
-/// That left latency around half `DISPATCH_CALL_TIMEOUT` per round trip
-/// free to cancel the call partway through a lap. That gap is exactly the
-/// failure mode this deadline exists to close. `release_many_inner` /
-/// `requeue_batch` and the dispatch read's own non-blocking pass are one
-/// round trip per queue.
-fn dispatch_batch_timeout(distinct_queues: usize, round_trips_per_queue: usize) -> Duration {
-    DISPATCH_CALL_TIMEOUT.saturating_mul(
-        u32::try_from(
-            distinct_queues
-                .max(1)
-                .saturating_mul(round_trips_per_queue.max(1)),
-        )
-        .unwrap_or(u32::MAX),
-    )
+/// `round_trips_per_queue` must match the channel call's *pipelined*
+/// implementation. `ack_many_inner` does two round trips per queue: an
+/// `XACK`/`XDEL` pipeline, then a separate marker-cleanup script.
+/// `release_many_inner` / `requeue_batch` and the dispatch read's own
+/// non-blocking pass are one round trip per queue.
+///
+/// `lease_count` covers a different implementation entirely (Codex review,
+/// issue #1429 follow-up). `TaskDispatch::ack_many`/`release_many`'s own
+/// default falls back to one round trip per *lease*, not per queue, for a
+/// channel with no batched override. A queue-scaled budget alone would
+/// starve that fallback the same way a flat one starved the pipelined
+/// path. A single busy queue with many leases would get only that
+/// queue's round-trip allowance, however many leases it actually holds.
+/// The deadline is sized for whichever cost model turns out to be true,
+/// not the one this call site's installed channel happens to use. Pass
+/// `0` from a call site with no lease batch, such as the dispatch read.
+fn dispatch_batch_timeout(
+    distinct_queues: usize,
+    round_trips_per_queue: usize,
+    lease_count: usize,
+) -> Duration {
+    let queue_rounds = distinct_queues
+        .max(1)
+        .saturating_mul(round_trips_per_queue.max(1));
+    DISPATCH_CALL_TIMEOUT
+        .saturating_mul(u32::try_from(queue_rounds.max(lease_count)).unwrap_or(u32::MAX))
 }
 
 /// Per-shard block duration for a dispatch-channel read during multi-shard
@@ -28571,7 +28579,7 @@ impl Worker {
         // path. It sits pending until visibility recovery, not just
         // delayed. The shutdown arm gives a stopping worker its exit
         // without waiting out the read.
-        let read_timeout = block_for + dispatch_batch_timeout(self.config.queues.len(), 1);
+        let read_timeout = block_for + dispatch_batch_timeout(self.config.queues.len(), 1, 0);
         let read = tokio::select! {
             () = self.shutdown.cancelled() => return 0,
             result = tokio::time::timeout(
@@ -28724,9 +28732,12 @@ impl Worker {
         // is.
         if !to_ack.is_empty() {
             let queues: HashSet<&str> = to_ack.iter().map(|l| l.queue_name.as_str()).collect();
-            // Two round trips per queue: `ack_many_inner`'s XACK/XDEL
-            // pipeline, then its separate marker-cleanup script.
-            let timeout = dispatch_batch_timeout(queues.len(), 2);
+            // Two round trips per queue for the pipelined path
+            // (`ack_many_inner`'s XACK/XDEL pipeline, then its separate
+            // marker-cleanup script). Or one round trip per lease for the
+            // trait's default fallback (Codex review, issue #1429
+            // follow-up) — whichever this installed channel actually costs.
+            let timeout = dispatch_batch_timeout(queues.len(), 2, to_ack.len());
             if let Err(error) =
                 dispatch_call_with_timeout(installed.channel.ack_many(&to_ack), "ack", timeout)
                     .await
@@ -28739,7 +28750,7 @@ impl Worker {
                 .iter()
                 .map(|(lease, _)| lease.queue_name.as_str())
                 .collect();
-            let timeout = dispatch_batch_timeout(queues.len(), 1);
+            let timeout = dispatch_batch_timeout(queues.len(), 1, to_release.len());
             if let Err(error) = dispatch_call_with_timeout(
                 installed.channel.release_many(&to_release),
                 "release",
@@ -42442,25 +42453,44 @@ mod tests {
     #[test]
     fn dispatch_batch_timeout_scales_with_distinct_queue_count() {
         assert_eq!(
-            dispatch_batch_timeout(1, 1),
+            dispatch_batch_timeout(1, 1, 0),
             DISPATCH_CALL_TIMEOUT,
             "a single-queue, single-round-trip batch must not regress the flat deadline"
         );
-        assert_eq!(dispatch_batch_timeout(3, 1), DISPATCH_CALL_TIMEOUT * 3);
+        assert_eq!(dispatch_batch_timeout(3, 1, 0), DISPATCH_CALL_TIMEOUT * 3);
         assert_eq!(
-            dispatch_batch_timeout(0, 1),
+            dispatch_batch_timeout(0, 1, 0),
             DISPATCH_CALL_TIMEOUT,
             "an empty batch still gets at least one queue's worth of budget"
         );
         assert_eq!(
-            dispatch_batch_timeout(3, 2),
+            dispatch_batch_timeout(3, 2, 0),
             DISPATCH_CALL_TIMEOUT * 6,
             "ack_many's two round trips per queue must both be budgeted"
         );
         assert_eq!(
-            dispatch_batch_timeout(3, 0),
+            dispatch_batch_timeout(3, 0, 0),
             DISPATCH_CALL_TIMEOUT * 3,
             "a call still makes at least one round trip per queue"
+        );
+    }
+
+    /// A default `TaskDispatch::ack_many`/`release_many` fallback makes one
+    /// round trip per lease, not per queue (Codex review, issue #1429
+    /// follow-up). A single busy queue holding many leases must still get
+    /// a budget covering all of them, not just that one queue's own
+    /// queue-scaled allowance.
+    #[test]
+    fn dispatch_batch_timeout_covers_a_lease_scaled_fallback_too() {
+        assert_eq!(
+            dispatch_batch_timeout(1, 2, 64),
+            DISPATCH_CALL_TIMEOUT * 64,
+            "64 leases on one queue must outweigh that queue's own 2-round-trip allowance"
+        );
+        assert_eq!(
+            dispatch_batch_timeout(3, 2, 4),
+            DISPATCH_CALL_TIMEOUT * 6,
+            "a lease count smaller than the queue-scaled budget must not shrink it"
         );
     }
 
@@ -42478,7 +42508,8 @@ mod tests {
             tokio::time::sleep(DISPATCH_CALL_TIMEOUT + Duration::from_secs(1)).await;
             Ok::<(), HarvestError>(())
         };
-        let result = dispatch_call_with_timeout(call, "test", dispatch_batch_timeout(3, 1)).await;
+        let result =
+            dispatch_call_with_timeout(call, "test", dispatch_batch_timeout(3, 1, 0)).await;
         assert!(
             result.is_ok(),
             "a 3-queue budget must cover a call past the flat one-queue deadline"
