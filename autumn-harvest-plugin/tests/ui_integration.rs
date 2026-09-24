@@ -6984,13 +6984,16 @@ async fn ui_dag_retry_error_renders_human_message() {
 /// caller of `dag_retry_commit_redirect`, not on that function itself.
 ///
 /// Seeds a genuinely retryable (`FAILED`) run and confirms the form
-/// renders with the editable `reason` field. It then flips the run
-/// `COMPLETED` directly in the database, before submitting the captured
-/// form.
+/// renders with the editable `reason` field. A competing retry then
+/// really runs and seals the source `TERMINATED`
+/// (`terminate_source_execution`, `reset.rs`), before the operator
+/// submits the form they had open.
 ///
-/// This is the real operator path a reviewer on this PR asked for. The
-/// confirm page's dry run races a concurrent change to the run, exactly
-/// as issue #1723 describes.
+/// This is the real operator path a reviewer on this PR asked for. It
+/// uses a genuine competing retry, not a synthetic state. The transition
+/// is one this engine's own reset path actually produces. The confirm
+/// page's dry run races a concurrent retry of the same run, exactly as
+/// issue #1723 describes.
 #[tokio::test]
 async fn ui_dag_retry_error_drops_submitted_reason() {
     let (url, _c) = setup_test_database_url().await;
@@ -7028,19 +7031,23 @@ async fn ui_dag_retry_error_drops_submitted_reason() {
     assert_eq!(status, StatusCode::OK, "confirm page must render: {html}");
     assert!(html.contains("reason"), "reason field must be present");
 
-    // Race: something completes the run between the confirm GET and the
-    // operator's Confirm click (e.g. another operator's fresh start, or an
-    // automatic recovery). The operator's browser still has the form open.
-    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
-        .await
-        .expect("connect to flip run state");
-    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .set(harvest_workflow_executions::state.eq("COMPLETED"))
-        .execute(&mut conn)
-        .await
-        .expect("simulate the race by completing the run underneath the open form");
+    // Race: a second operator (or an automatic recovery) retries the same
+    // node first, through a real commit against the real handler. It
+    // forks a new run and seals THIS source `TERMINATED`, exactly as
+    // `terminate_source_execution` does for a live competing retry.
+    let (competing_status, _headers, competing_body) = post_form(
+        &app,
+        &format!("/dags/dag957_linear/runs/{exec_id}/retry"),
+        "from_node=dag957_step_b&reason=competing+operator+retry",
+    )
+    .await;
+    assert!(
+        competing_status.is_redirection(),
+        "the competing retry must itself succeed: {competing_status} {competing_body}"
+    );
 
-    // The operator submits the form exactly as it was rendered.
+    // The first operator, still looking at the form from the confirm page
+    // fetched above, submits it -- unaware the source run is now sealed.
     let submitted_reason = "retrying after upstream API fix, ticket JIRA-4521";
     let (status, headers, _body) = post_form(
         &app,
