@@ -193,7 +193,10 @@ pub fn build_webhook_router(
     detached_state.insert_extension(registry);
     let mut router = axum::Router::<AppState>::new();
     for trigger in triggers {
-        router = router.route(trigger.path, webhook_method_router(trigger, api_state.clone()));
+        router = router.route(
+            trigger.path,
+            webhook_method_router(trigger, api_state.clone()),
+        );
     }
     Ok(router.with_state(detached_state))
 }
