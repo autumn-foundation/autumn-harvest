@@ -1898,6 +1898,15 @@ pub(crate) type ShardConn = deadpool::managed::Object<
 /// fired and committed before a later shard's connection fails. This
 /// preserves that order.
 ///
+/// Do not call this for the shard the caller's own connection already
+/// belongs to. The per-shard timeout checker calls these scanners with that
+/// connection checked out and `shard_assignments == [its own shard]`. A
+/// second `pool.get()` against the same pool is then a hold-and-wait.
+/// Harvest configures no deadpool acquisition timeout. Once that pool is
+/// exhausted, the wait never ends, and it wedges the whole timeout pass.
+/// A single assigned shard must run on the caller's own connection instead
+/// (issue #1426 follow-up).
+///
 /// # Errors
 /// Returns [`HarvestError::Database`](crate::error::HarvestError::Database)
 /// for a connect failure under [`ShardConnectError::Abort`].

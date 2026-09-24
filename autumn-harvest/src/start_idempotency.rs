@@ -765,6 +765,11 @@ mod db_impl {
         let window_secs = super::purge_window_secs();
         let mut total = 0usize;
         match sharded_pool {
+            // A single assigned shard runs on `conn`, the caller's own
+            // connection to that shard. See `shard::connect_to_shard` for why.
+            Some(_) if shard_assignments.len() == 1 => {
+                total += purge_on_conn(conn, shard_assignments[0].as_i32(), window_secs).await?;
+            }
             Some(sp) if !shard_assignments.is_empty() => {
                 for shard in shard_assignments {
                     let Some(pool) = sp.exact_pool_for(*shard).cloned() else {

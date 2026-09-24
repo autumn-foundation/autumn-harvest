@@ -885,7 +885,14 @@ pub async fn fire_due_event_batches_with_codecs(
     // Unlike debounce/throttle, a shard connection failure here aborts the
     // whole scan. It does not log the failure and skip the shard
     // (issue #1362).
-    if let Some(pool) = sharded_pool {
+    if let (Some(_), [shard_id]) = (sharded_pool, shard_assignments) {
+        // A single assigned shard runs on `conn`, the caller's own
+        // connection to that shard. See `connect_to_shard` for why.
+        let (fired, deferred) =
+            fire_due_on_conn(conn, Some(shard_id.as_i32()), Some(metrics), codecs).await?;
+        fired_count += fired.len();
+        deferred_to_spawn.extend(deferred);
+    } else if let Some(pool) = sharded_pool {
         for shard_id in shard_assignments {
             let Some(mut shard_conn) = crate::shard::connect_to_shard(
                 pool,

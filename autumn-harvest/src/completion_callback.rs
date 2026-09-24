@@ -2851,8 +2851,13 @@ pub async fn fire_due_completion_deliveries(
 
     // Scans each assigned shard's own `harvest_completion_deliveries` table
     // in turn (issue #1362).
-    match sharded_pool {
-        Some(sp) if !shard_assignments.is_empty() => {
+    match (sharded_pool, shard_assignments) {
+        // A single assigned shard runs on `conn`, the caller's own
+        // connection to that shard. See `connect_to_shard` for why.
+        (Some(_), [shard]) => {
+            total += fire_due_on_conn(conn, &config, Some(shard.as_i32())).await?;
+        }
+        (Some(sp), shard_assignments) if !shard_assignments.is_empty() => {
             for shard in shard_assignments {
                 let Some(mut shard_conn) = crate::shard::connect_to_shard(
                     sp,

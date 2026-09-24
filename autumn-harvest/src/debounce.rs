@@ -968,7 +968,9 @@ pub async fn fire_due_debounced_starts_with_codecs(
 
     match sharded_pool {
         // Multi-shard: scan each assigned shard's own harvest_debounce table.
-        Some(sp) if !shard_assignments.is_empty() => {
+        // A single assigned shard falls through to `conn`, the caller's own
+        // connection to that shard. See `connect_to_shard` for why.
+        Some(sp) if shard_assignments.len() > 1 => {
             for shard in shard_assignments {
                 let Some(mut shard_conn) = crate::shard::connect_to_shard(
                     sp,
