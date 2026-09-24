@@ -1628,6 +1628,30 @@ pub struct WorkflowHandle {
     client: WorkflowHandleClient,
 }
 
+/// What a result wait blocks on between two reads of the execution state.
+enum ResultWaiter {
+    /// A LISTEN connection on the shard's `harvest_events` channel.
+    Listen(WorkflowEventListener),
+    /// A fixed sleep. Used when the listener cannot connect (issue #1717).
+    Poll,
+}
+
+impl ResultWaiter {
+    /// Block until a notification arrives or `max_wait` elapses.
+    ///
+    /// A polling waiter sleeps for `max_wait` or for
+    /// [`WorkflowHandle::RESULT_POLL_INTERVAL`], whichever is shorter.
+    async fn wait(&mut self, max_wait: Duration) -> HarvestResult<WorkflowEventWaitOutcome> {
+        match self {
+            Self::Listen(listener) => listener.wait_for_notification_timeout(max_wait).await,
+            Self::Poll => {
+                tokio::time::sleep(max_wait.min(WorkflowHandle::RESULT_POLL_INTERVAL)).await;
+                Ok(WorkflowEventWaitOutcome::TimedOut)
+            }
+        }
+    }
+}
+
 impl WorkflowHandle {
     /// Execution ID this handle awaits.
     #[must_use]
@@ -1815,7 +1839,7 @@ impl WorkflowHandle {
         }
 
         let mut listener_shard = self.shard().await?;
-        let mut listener = self.connect_listener().await?;
+        let mut listener = self.connect_waiter().await?;
 
         loop {
             let snapshot = WorkflowResult::from_execution(&self.load_effective_execution().await?);
@@ -1837,12 +1861,12 @@ impl WorkflowHandle {
             // (potentially very long) caller-supplied timeout.
             let current_shard = self.shard().await?;
             if current_shard != listener_shard {
-                listener = self.connect_listener().await?;
+                listener = self.connect_waiter().await?;
                 listener_shard = current_shard;
             }
             let wait_for = remaining.min(Self::RESULT_WAIT_SAFETY_NET);
 
-            match listener.wait_for_notification_timeout(wait_for).await? {
+            match listener.wait(wait_for).await? {
                 WorkflowEventWaitOutcome::Notification(_payload) => {}
                 WorkflowEventWaitOutcome::TimedOut => {
                     // Distinguish the safety-net tick from the caller's
@@ -1858,7 +1882,7 @@ impl WorkflowHandle {
                     }
                 }
                 WorkflowEventWaitOutcome::ChannelClosed => {
-                    listener = self.connect_listener().await?;
+                    listener = self.connect_waiter().await?;
                     listener_shard = self.shard().await?;
                 }
             }
@@ -1887,6 +1911,12 @@ impl WorkflowHandle {
     /// common case where nothing unusual happens for the whole interval.
     const RESULT_WAIT_SAFETY_NET: Duration = Duration::from_secs(3);
 
+    /// How long a polling [`ResultWaiter`] sleeps between state reads.
+    ///
+    /// This is shorter than [`Self::RESULT_WAIT_SAFETY_NET`], because no
+    /// notification can end the sleep early.
+    const RESULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
     /// Wait until the workflow reaches a terminal state and return its raw JSON
     /// output. Failure terminal states are returned as typed [`HarvestError`]
     /// variants.
@@ -1904,7 +1934,7 @@ impl WorkflowHandle {
         }
 
         let mut listener_shard = self.shard().await?;
-        let mut listener = self.connect_listener().await?;
+        let mut listener = self.connect_waiter().await?;
 
         loop {
             let execution = self.load_effective_execution().await?;
@@ -1929,18 +1959,15 @@ impl WorkflowHandle {
             // again.
             let current_shard = self.shard().await?;
             if current_shard != listener_shard {
-                listener = self.connect_listener().await?;
+                listener = self.connect_waiter().await?;
                 listener_shard = current_shard;
             }
 
-            match listener
-                .wait_for_notification_timeout(Self::RESULT_WAIT_SAFETY_NET)
-                .await?
-            {
+            match listener.wait(Self::RESULT_WAIT_SAFETY_NET).await? {
                 WorkflowEventWaitOutcome::Notification(_payload) => {}
                 WorkflowEventWaitOutcome::TimedOut => {}
                 WorkflowEventWaitOutcome::ChannelClosed => {
-                    listener = self.connect_listener().await?;
+                    listener = self.connect_waiter().await?;
                     listener_shard = self.shard().await?;
                 }
             }
@@ -1970,7 +1997,7 @@ impl WorkflowHandle {
         }
 
         let mut listener_shard = self.shard().await?;
-        let mut listener = self.connect_listener().await?;
+        let mut listener = self.connect_waiter().await?;
 
         loop {
             let execution = self.load_effective_execution().await?;
@@ -1993,12 +2020,12 @@ impl WorkflowHandle {
             // timeout, which can run minutes or hours.
             let current_shard = self.shard().await?;
             if current_shard != listener_shard {
-                listener = self.connect_listener().await?;
+                listener = self.connect_waiter().await?;
                 listener_shard = current_shard;
             }
             let wait_for = remaining.min(Self::RESULT_WAIT_SAFETY_NET);
 
-            match listener.wait_for_notification_timeout(wait_for).await? {
+            match listener.wait(wait_for).await? {
                 WorkflowEventWaitOutcome::Notification(_payload) => {}
                 WorkflowEventWaitOutcome::TimedOut => {
                     // Distinguish the safety-net tick from the caller's
@@ -2017,7 +2044,7 @@ impl WorkflowHandle {
                     }
                 }
                 WorkflowEventWaitOutcome::ChannelClosed => {
-                    listener = self.connect_listener().await?;
+                    listener = self.connect_waiter().await?;
                     listener_shard = self.shard().await?;
                 }
             }
@@ -2158,8 +2185,25 @@ impl WorkflowHandle {
             })
     }
 
-    async fn connect_listener(&self) -> HarvestResult<WorkflowEventListener> {
-        WorkflowEventListener::connect(&self.notification_database_url().await?).await
+    /// Connect a result waiter for this execution's shard.
+    ///
+    /// A listener that cannot connect gives a polling waiter, not an error.
+    /// Each loop reads the execution state again, so polling changes only the
+    /// wake-up latency (issue #1717). A missing notification URL is still a
+    /// configuration error.
+    async fn connect_waiter(&self) -> HarvestResult<ResultWaiter> {
+        let database_url = self.notification_database_url().await?;
+        match WorkflowEventListener::connect(&database_url).await {
+            Ok(listener) => Ok(ResultWaiter::Listen(listener)),
+            Err(error) => {
+                tracing::warn!(
+                    exec_id = %self.exec_id,
+                    error = %error,
+                    "failed to start LISTEN/NOTIFY listener; result wait falls back to polling"
+                );
+                Ok(ResultWaiter::Poll)
+            }
+        }
     }
 
     /// Load the *effective* execution for this handle: the **live attempt** of
