@@ -26,3 +26,26 @@ COMMENT ON COLUMN harvest_task_queue.timer_fires_at IS
     '(issue #1402). Set only by queue::reschedule_task. Survives a '
     'later scheduled_at drift with the same wake reason. NULL when no '
     'timer owns this row, or once a different wake reason repends it.';
+
+-- Backfill (issue #1402): a row already armed by reschedule_task
+-- before this migration ran gets NULL here, even though its scheduled_at
+-- still exactly matches an unfired timer's fires_at. is_the_missed_timer_wake
+-- trusts that exact match outright today, so the row is safe right now. But
+-- a later drift (a queue-pause resume credit, an orphan reclaim, a
+-- capability-miss release) can move scheduled_at away from fires_at without
+-- changing the wake reason -- and with no marker to survive that drift, the
+-- exact false negative issue #1402 fixes reopens for that one row, until it
+-- is freshly rescheduled.
+--
+-- This closes that gap for every row the exact-match branch already trusts:
+-- a scheduled_at that exactly equals a still-unfired timer's fires_at on the
+-- same execution is unambiguous, so stamping timer_fires_at from it merely
+-- makes durable a fact the classifier already accepts unconditionally.
+UPDATE harvest_task_queue AS tq
+SET timer_fires_at = tq.scheduled_at
+FROM harvest_timers AS t
+WHERE tq.task_type = 'workflow'
+  AND tq.state IN ('PENDING', 'RUNNING')
+  AND tq.workflow_exec_id = t.workflow_exec_id
+  AND tq.scheduled_at = t.fires_at
+  AND NOT t.fired;

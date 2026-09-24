@@ -2049,6 +2049,145 @@ async fn overdue_timer_still_wins_after_a_queue_pause_resume_shift() {
     assert_eq!(body["health"], "stalled", "body: {body}");
 }
 
+#[derive(diesel::QueryableByName)]
+struct ScheduledAtAndTimerFiresAt {
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    scheduled_at: chrono::DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    timer_fires_at: Option<chrono::DateTime<Utc>>,
+}
+
+/// Issue #1402. A row already armed by `reschedule_task` before the
+/// `timer_fires_at` migration ever ran gets `NULL` from `ADD COLUMN`, not
+/// the marker. `is_the_missed_timer_wake`'s exact-match branch trusts
+/// `scheduled_at == fires_at` outright. So the row stays safe until
+/// something drifts `scheduled_at` away: a queue-pause resume, an orphan
+/// reclaim, or a capability-miss release. At that point no marker
+/// survives the drift, and the exact false negative issue #1402 fixes
+/// reopens for that one pre-existing row.
+///
+/// The migration's backfill closes this. It replays against a row seeded
+/// to look like one that predates the column, then drifts `scheduled_at`
+/// through the real `queue_pause` pair. The backfilled marker must
+/// survive the drift, same as a freshly-armed row's would.
+#[tokio::test]
+async fn migration_backfill_lets_a_pre_existing_armed_timer_survive_a_later_resume_shift() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "timer_wf", "RUNNING", vec![started_event()]).await;
+    let task_id = Uuid::new_v4();
+    let fires_at = Utc::now() - chrono::Duration::hours(2);
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+
+        // `state`/`worker_id` modeled as `queue::reschedule_task` itself
+        // leaves them (PENDING, no claimant), but `scheduled_at` inserted
+        // directly rather than through that function, so `timer_fires_at`
+        // stays unset. That is exactly the shape `ADD COLUMN` leaves a row
+        // armed before this migration ever ran.
+        diesel::sql_query(
+            "INSERT INTO harvest_task_queue \
+             (id, queue_name, task_type, workflow_exec_id, input, state, priority, \
+              attempt, max_attempts, scheduled_at) \
+             VALUES ($1, 'premigration-backfill-q', 'workflow', $2, '{}'::jsonb, 'PENDING', 0, \
+                     1, 3, $3)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+        .execute(&mut conn)
+        .await
+        .expect("seed a pre-migration-shaped armed row");
+
+        diesel::sql_query(
+            "UPDATE harvest_task_queue SET created_at = NOW() - INTERVAL '3 hours' \
+             WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .execute(&mut conn)
+        .await
+        .expect("backdate created_at");
+
+        diesel::sql_query(
+            "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+             VALUES ($1, $2, 'long_sleep', $3, false)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+        .execute(&mut conn)
+        .await
+        .expect("seed the timer");
+
+        // Replay the shipped migration to simulate deploying it against
+        // this already-seeded, pre-migration-shaped row. It is idempotent:
+        // `ADD COLUMN IF NOT EXISTS`, `COMMENT ON COLUMN`, and the
+        // backfill `UPDATE` all tolerate a rerun.
+        let up_sql = include_str!(
+            "../../autumn-harvest/migrations/20260921011505_harvest_task_queue_timer_fires_at/up.sql"
+        );
+        conn.batch_execute(up_sql)
+            .await
+            .expect("replay the migration's backfill");
+
+        let row: ScheduledAtAndTimerFiresAt = diesel::sql_query(
+            "SELECT scheduled_at, timer_fires_at FROM harvest_task_queue WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .get_result(&mut conn)
+        .await
+        .expect("read back the backfilled row");
+        // Compared against the row's own stored `scheduled_at`, not the
+        // Rust-side `fires_at` the row was seeded from. Postgres
+        // `TIMESTAMPTZ` rounds to microseconds, one step coarser than
+        // `chrono`'s nanosecond value. The two never compare equal
+        // directly, even though the backfill copied one from the other.
+        assert_eq!(
+            row.timer_fires_at,
+            Some(row.scheduled_at),
+            "the backfill must stamp timer_fires_at from the exact-match row's own scheduled_at"
+        );
+    }
+    seed_live_worker(&pool, "w-live", "premigration-backfill-q").await;
+
+    // The real production pause/resume pair, same as the freshly-armed
+    // case above. The whole point of the backfill is that a pre-existing
+    // row survives this identically.
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        queue_pause::pause_queue(
+            &mut conn,
+            "premigration-backfill-q",
+            "maintenance",
+            "operator",
+            None,
+        )
+        .await
+        .expect("pause the queue");
+        diesel::sql_query(
+            "UPDATE harvest_queue_pauses SET paused_at = NOW() - INTERVAL '90 minutes' \
+             WHERE queue_name = 'premigration-backfill-q'",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("backdate the pause");
+        queue_pause::resume_queue(&mut conn, "premigration-backfill-q", "operator")
+            .await
+            .expect("resume the queue");
+    }
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "timer_overdue",
+        "the backfilled marker must survive the resume credit just like a freshly-armed \
+         row's would: {body}"
+    );
+    assert_eq!(body["health"], "stalled", "body: {body}");
+}
+
 /// Issue #1402's original ask. Confirm a queue-pause resume of a
 /// workflow-type row that was NOT timer-owned still behaves correctly
 /// when an unrelated armed timer happens to be nearby. This row's own
