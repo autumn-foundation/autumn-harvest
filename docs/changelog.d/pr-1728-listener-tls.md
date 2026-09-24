@@ -27,7 +27,8 @@ fallback, so each synchronous result wait failed.
   every 500 ms when the listener cannot connect within 5 s. A polling wait
   tries the listener again every 30 s. Each loop reads the execution state
   again, so polling changes only the wake-up latency. A configuration error
-  is still returned.
+  is still returned. A listener DSN that does not parse is now a
+  `HarvestError::Config`, not a `Database` error.
 
 No new `WorkflowEvent` variant. No migration. The public API is unchanged.
 
@@ -38,6 +39,7 @@ No new `WorkflowEvent` variant. No migration. The public API is unchanged.
   - Against a fake server, `require` sends SSLRequest and then a TLS
     ClientHello. `prefer` sends a plaintext startup message.
   - Without `tls`, `require` is a configuration error.
+  - A DSN that does not parse is a configuration error.
   - `error_chain` names every cause.
 - Integration (`workflow_handle_tests.rs`, now run in CI): each of the three
   result waits returns the result when the listener URL refuses connections.

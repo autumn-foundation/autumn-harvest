@@ -352,7 +352,14 @@ async fn open_listen_connection(
     database_url: &str,
     error_message: &'static str,
 ) -> HarvestResult<ListenConnection> {
-    let config: tokio_postgres::Config = database_url.parse().map_err(|e| connect_error(&e))?;
+    // A DSN that does not parse is a permanent misconfiguration, not an outage.
+    // A result wait returns a `Config` error and does not poll over it.
+    let config: tokio_postgres::Config = database_url.parse().map_err(|e| {
+        HarvestError::Config(format!(
+            "invalid notification database URL: {}",
+            error_chain(&e)
+        ))
+    })?;
     match listen_transport(&config) {
         ListenTransport::Plain => {
             let (client, connection) = config
@@ -503,7 +510,8 @@ impl QueueListener {
     /// # Errors
     ///
     /// Returns [`HarvestError::Database`] if the connection or LISTEN fails.
-    /// Returns [`HarvestError::Config`] if TLS cannot be configured.
+    /// Returns [`HarvestError::Config`] if the URL does not parse, or if TLS
+    /// cannot be configured.
     pub async fn connect(database_url: &str, queues: &[String]) -> HarvestResult<Self> {
         let ListenConnection { client, rx, driver } =
             open_listen_connection(database_url, "postgres listener connection error").await?;
@@ -596,7 +604,8 @@ impl WorkflowEventListener {
     /// # Errors
     ///
     /// Returns [`HarvestError::Database`] if the connection or LISTEN fails.
-    /// Returns [`HarvestError::Config`] if TLS cannot be configured.
+    /// Returns [`HarvestError::Config`] if the URL does not parse, or if TLS
+    /// cannot be configured.
     pub async fn connect(database_url: &str) -> HarvestResult<Self> {
         let ListenConnection { client, rx, driver } =
             open_listen_connection(database_url, "postgres workflow event listener error").await?;
@@ -676,7 +685,8 @@ impl WorkflowProgressListener {
     /// # Errors
     ///
     /// Returns [`HarvestError::Database`] if the connection or LISTEN fails.
-    /// Returns [`HarvestError::Config`] if TLS cannot be configured.
+    /// Returns [`HarvestError::Config`] if the URL does not parse, or if TLS
+    /// cannot be configured.
     pub async fn connect(database_url: &str, exec_id: Uuid) -> HarvestResult<Self> {
         let ListenConnection { client, rx, driver } =
             open_listen_connection(database_url, "postgres workflow progress listener error")
@@ -906,6 +916,21 @@ mod tests {
         .map(|_| ());
         assert!(
             matches!(&result, Err(HarvestError::Config(m)) if m.contains("`tls` feature")),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_dsn_is_a_config_error() {
+        let result = open_listen_connection(
+            "postgres://u@127.0.0.1:1/db?sslmode=verify-full",
+            "test listener error",
+        )
+        .await
+        .map(|_| ());
+        assert!(
+            matches!(&result, Err(HarvestError::Config(m)) if m.contains("sslmode")),
             "{:?}",
             result.err()
         );

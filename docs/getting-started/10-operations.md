@@ -214,8 +214,8 @@ The `sslmode` in that URL sets the transport:
 - A result wait (`result_raw`, `result_raw_with_timeout`,
   `result_snapshot_with_wait`) does not fail when the listener cannot connect
   within 5 s. It logs a warning and polls every 500 ms. After 30 s it tries
-  the listener again. A configuration error, such as a `require` URL without
-  the `tls` feature, is still returned.
+  the listener again. A configuration error is still returned. Examples are a
+  URL that does not parse, or a `require` URL without the `tls` feature.
 
 ## Dashboard
 
