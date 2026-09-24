@@ -336,5 +336,11 @@ done
 #    2026-09-24T08:36:04Z, byte-identical panic at integration_e2e.rs:1383:6
 git fetch origin f63634b8893d2b946e8cee716456aa44ddaa82c8
 git merge-base --is-ancestor f63634b8893d2b946e8cee716456aa44ddaa82c8 origin/claude/cool-noether-dymixg
-# -> not an ancestor: this branch predates the fix, as expected pre-merge
+# -> not an ancestor -- necessary but not sufficient (Codex correction: an
+#    equivalent fix could land under a different commit and still fail this
+#    check). Confirm by content, not just ancestry:
+git show origin/claude/cool-noether-dymixg:autumn-harvest/tests/integration/integration_e2e.rs \
+  | grep -c "20260920215812_harvest_completion_trigger_fires_target"
+# -> 0: no include_str! for the target-shard migration anywhere in this
+#    branch's own tree, confirming it lacks the fix by content
 ```
