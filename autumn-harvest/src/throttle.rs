@@ -1512,19 +1512,43 @@ async fn order_due_rows_for_deadlock_free_firing(
 /// re-acquires the SAME already-held row lock. Postgres row locks are
 /// re-entrant within one session. It still does the actual
 /// debit-if-available check then, unchanged.
+///
+/// One round trip locks the whole batch. An earlier cut issued one
+/// `FOR UPDATE` statement per distinct bucket key. A claimed batch of
+/// [`THROTTLE_FIRE_BATCH_SIZE`] rows from that many tenants paid that
+/// many extra round trips on every scanner tick.
+///
+/// `ORDER BY key` on the batched query preserves the sorted-order
+/// requirement above. Postgres plans a `LockRows` node above the `Sort`.
+/// Rows lock in the sorted order the query returns them, not in scan
+/// order. `EXPLAIN (ANALYZE, BUFFERS)` on this exact shape confirms this
+/// (`docs/perf-artifacts/rate-limit-bucket-prelock-batch/`).
+///
+/// `COLLATE "C"` pins that order to a plain byte comparison. Rust's
+/// `BTreeSet<String>` -- [`collect_distinct_bucket_keys`]'s own type --
+/// always sorts by byte value, never by locale. A database with a
+/// locale-aware collation (`en_US.UTF-8` and similar) would otherwise
+/// lock in a different order. A peer still running the pre-fix per-key
+/// loop locks in Rust's byte order. During a rolling upgrade that
+/// mismatch reopens the same ABBA hazard this function exists to close.
 #[cfg(feature = "db")]
 async fn pre_lock_rate_limit_buckets_for_claimed_batch(
     conn: &mut diesel_async::AsyncPgConnection,
     due_rows: &[FireDueRow],
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
-    for bucket_key in collect_distinct_bucket_keys(due_rows) {
-        diesel::sql_query("SELECT key FROM harvest_rate_limit_buckets WHERE key = $1 FOR UPDATE")
-            .bind::<diesel::sql_types::Text, _>(&bucket_key)
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
+    let bucket_keys: Vec<String> = collect_distinct_bucket_keys(due_rows).into_iter().collect();
+    if bucket_keys.is_empty() {
+        return Ok(());
     }
+    diesel::sql_query(
+        "SELECT key FROM harvest_rate_limit_buckets WHERE key = ANY($1) \
+         ORDER BY key COLLATE \"C\" FOR UPDATE",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&bucket_keys)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
     Ok(())
 }
 
