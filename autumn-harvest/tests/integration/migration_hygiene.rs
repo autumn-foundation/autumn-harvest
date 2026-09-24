@@ -352,6 +352,15 @@ const ALLOWED_HANDROLLED_MIGRATION_INCLUDES: &[&str] = &[
     // suite bootstraps its databases through `test_init_sql()` like every
     // other.
     "autumn-harvest/tests/integration/event_partitioning_tests.rs",
+    // Does not BUILD a schema from the include either: the suite bootstraps
+    // through `test_init_sql()` like every other, and only REPLAYS the
+    // already-applied `20260921011505_harvest_task_queue_timer_fires_at`
+    // migration's own `up.sql` a second time, idempotently, against a row
+    // seeded to look like one that predates the column (issue #1402 review,
+    // Codex finding). That is the only way to test the migration's own
+    // backfill `UPDATE` against pre-existing data, since `test_init_sql()`
+    // always applies every migration to an empty database.
+    "autumn-harvest-plugin/tests/stall_diagnosis_integration.rs",
 ];
 
 /// True when a single source line reintroduces a hand-rolled migration bundle: a
