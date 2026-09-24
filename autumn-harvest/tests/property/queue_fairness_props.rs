@@ -44,7 +44,7 @@ proptest! {
         prop_assert_eq!(order.len(), spec.len(), "length changed");
 
         let input: HashSet<&str> = spec.iter().map(|(n, _)| n.as_str()).collect();
-        let output: HashSet<&str> = order.iter().map(String::as_str).collect();
+        let output: HashSet<&str> = order.iter().copied().collect();
         prop_assert_eq!(&output, &input, "output is not a set-permutation of the input");
 
         // No duplicates in the output (set len == vec len).
@@ -62,7 +62,7 @@ proptest! {
 
         let mut seen_zero = false;
         for name in &order {
-            let w = weight_of[name.as_str()];
+            let w = weight_of[*name];
             if w == 0 {
                 seen_zero = true;
             } else {

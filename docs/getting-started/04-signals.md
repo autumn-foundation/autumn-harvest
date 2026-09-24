@@ -86,18 +86,25 @@ async fn collect_approvals_manual(ctx: &WorkflowContext) -> HarvestResult<Value>
 
 ```rust
 // --- Clean Declarative await_condition ---
-#[workflow]
+// Racing wait_for_signal against await_condition_timeout below needs
+// futures::future::select, which HVG010 hard-blocks at compile time unless
+// the workflow opts out (see the Determinism Warning below). The counter
+// lives behind a Mutex because the closure keeps a borrow on it alive for
+// the whole loop -- a plain `let mut approvals` cannot also be reassigned
+// by the loop body while that borrow is live.
+#[workflow(allow_nondeterministic_apis)]
 async fn collect_approvals_clean(ctx: &WorkflowContext) -> HarvestResult<Value> {
-    let mut approvals = 0;
+    let approvals = std::sync::Arc::new(std::sync::Mutex::new(0));
 
     // Await condition timeout races our condition closure against a timer
-    let met_fut = ctx.await_condition_timeout("deadline", 86400, || {
-        approvals >= 2
+    let check_approvals = approvals.clone();
+    let met_fut = ctx.await_condition_timeout("deadline", 86400, move || {
+        *check_approvals.lock().unwrap() >= 2
     });
     tokio::pin!(met_fut);
 
     let mut success = false;
-    while approvals < 2 {
+    while *approvals.lock().unwrap() < 2 {
         // Check if our condition/timer already resolved early
         if let std::task::Poll::Ready(val) = futures::poll!(&mut met_fut) {
             success = val?;
@@ -108,10 +115,11 @@ async fn collect_approvals_clean(ctx: &WorkflowContext) -> HarvestResult<Value> 
         let sig_fut = ctx.wait_for_signal("approved");
         tokio::pin!(sig_fut);
 
+        // harvest-suppress: DET011 "fixed poll order + &mut timer keeps the loser alive; replay-safe, see the workflow-level opt-out above"
         match futures::future::select(sig_fut, &mut met_fut).await {
             futures::future::Either::Left((sig_res, _)) => {
                 if sig_res.is_ok() {
-                    approvals += 1;
+                    *approvals.lock().unwrap() += 1;
                 }
             }
             futures::future::Either::Right((timeout_res, _)) => {
@@ -123,7 +131,7 @@ async fn collect_approvals_clean(ctx: &WorkflowContext) -> HarvestResult<Value> 
 
     // If we completed the loop (approvals >= 2) but didn't resolve met_fut yet,
     // await it now to get the final outcome.
-    if approvals >= 2 && !success {
+    if *approvals.lock().unwrap() >= 2 && !success {
         success = met_fut.await?;
     }
 
@@ -133,6 +141,17 @@ async fn collect_approvals_clean(ctx: &WorkflowContext) -> HarvestResult<Value> 
 
 ### Determinism Warning
 The predicate closure passed to `await_condition` is evaluated multiple times during replay. It **must be deterministic** and rely purely on rehydrated local variables. Never read system time (`Instant::now()`) or generate random values inside the closure, otherwise you will trigger non-determinism replay failures (see rule `HVG008` in the [Workflow Determinism Guide](../workflow-determinism-guide.md)).
+
+Racing two ctx-managed awaitables with `futures::future::select` (as above) is
+a second, separate determinism concern: `HVG010` hard-blocks that combinator
+by default because it cannot prove the race is replay-safe in general. This
+particular race *is* safe -- fixed poll order, the losing branch stays alive
+across iterations instead of being dropped -- which is what
+`#[workflow(allow_nondeterministic_apis)]` and the `harvest-suppress: DET011`
+comment above assert. Prefer `ctx.race()` for a new workflow that only needs
+to race a signal against a deadline; reach for this pattern when you also
+need `await_condition`'s local-state predicate. See `HVG010` in the
+[Workflow Determinism Guide](../workflow-determinism-guide.md).
 
 ---
 

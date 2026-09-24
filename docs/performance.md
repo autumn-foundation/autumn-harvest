@@ -1833,6 +1833,11 @@ standalone note rather than part of the claim-path attribution table above:
 * [`docs/performance-quota-history-bytes.md`](performance-quota-history-bytes.md)
   — measuring the `history_bytes` admission check's cost claim (issue #946
   AC7); partially inaccurate claim, no fix identified.
+* [`docs/performance-quota-reconcile-candidate-scan.md`](performance-quota-reconcile-candidate-scan.md)
+  — `reconcile_quota_keys_from` candidate-scan cost under mixed-deployment
+  skew (issue #1226 follow-up); confirms the scaling risk is a permanent
+  per-tick cost, not a rollout expense, and diagnoses a planner
+  cardinality misestimate as the cause. No fix ships in this pass.
 * [`docs/performance-codec-rotation-reencrypt.md`](performance-codec-rotation-reencrypt.md)
   — skipping a JSON round-trip in the codec-key-rotation re-encryption sweep
   (issue #948).
@@ -1920,3 +1925,17 @@ standalone note rather than part of the claim-path attribution table above:
   `MATERIALIZED` CTE anti-joined by equality (`Nested Loop Anti Join` →
   `Hash Anti Join`; -97.8% buffers in the execution-heavy regime, a
   smaller but real win in the other two measured regimes, PR #1656).
+* [`docs/performance-queue-fairness.md`](performance-queue-fairness.md) —
+  `queue_fairness::weighted_queue_order`, the weighted-random queue-selection
+  step `Worker::poll_once` runs on every poll once an operator configures
+  `WorkerConfig::queue_weights` (issue #515), 53.72% of a 16-queue/20,000-poll
+  harness; a per-queue `String` clone eliminated by returning a borrowed
+  permutation instead (instructions -36.26%, allocations -76.18%).
+* [`docs/performance-payload-codec-owned-transform.md`](performance-payload-codec-owned-transform.md)
+  — `payload_codec::{encode_payload, decode_payload}`'s identity-codec fast
+  path, run once per payload-bearing field of every workflow event ever
+  appended or replayed (`store.rs`'s `encode_event`/`decode_event`), 52.05%
+  of a 454,000-event-round-trip harness's allocation blocks; a redundant
+  `serde_json::Value` clone eliminated by taking the field by value
+  (`std::mem::take`) instead of borrowing it from the event tree the caller
+  already owns (instructions -36.89%, allocation blocks -52.05%).

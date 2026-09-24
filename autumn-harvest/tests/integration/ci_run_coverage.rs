@@ -200,9 +200,16 @@ const ALLOWLIST_CHAOS_REASON: &str = "chaos-feature-gated (issue #940): DOES run
      workflow_dispatch + nightly job (.github/workflows/chaos.yml) that runs the suite with >=5 distinct \
      seeds — NOT the manifest's `test` job (chaos is `#[cfg(feature = \"chaos\")]`, off by default and \
      seed-driven/slower, so it is deliberately not part of every PR run). Not a coverage gap.";
+const ALLOWLIST_EVIDENCE_HARNESS_REASON: &str = "single-purpose evidence-capture harness (Ledger, \
+     issue #1272) — its only test is #[ignore]d by design (500k-row fixture, VACUUM FULL); a manifest \
+     row would add a CI step that compiles it but runs nothing. Invoked manually with --ignored.";
 
 const ALLOWLIST: &[(&str, &str)] = &[
     // ── core (autumn-harvest/tests/integration) ──
+    (
+        "core:audit_log_unexported_idx_write_cost_perf",
+        ALLOWLIST_EVIDENCE_HARNESS_REASON,
+    ),
     ("core:audit_tests", ALLOWLIST_DEBT_REASON),
     ("core:build_routing_tests", ALLOWLIST_DEBT_REASON),
     ("core:cache_delta_load_tests", ALLOWLIST_DEBT_REASON),

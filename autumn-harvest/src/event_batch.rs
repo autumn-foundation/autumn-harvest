@@ -878,6 +878,28 @@ pub async fn fire_due_event_batches_with_codecs(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<usize> {
+    fire_due_event_batches_on_conn_shard(
+        conn,
+        None,
+        sharded_pool.as_ref(),
+        shard_assignments,
+        metrics,
+        codecs,
+    )
+    .await
+}
+
+/// [`fire_due_event_batches_with_codecs`] for a caller that knows `conn`'s
+/// shard. See [`crate::shard::connect_or_reuse`].
+#[cfg(feature = "db")]
+pub(crate) async fn fire_due_event_batches_on_conn_shard(
+    conn: &mut diesel_async::AsyncPgConnection,
+    conn_shard: Option<crate::types::ShardId>,
+    sharded_pool: Option<&crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<usize> {
     let mut fired_count = 0usize;
     let mut deferred_to_spawn = Vec::new();
 
@@ -887,7 +909,9 @@ pub async fn fire_due_event_batches_with_codecs(
     // (issue #1362).
     if let Some(pool) = sharded_pool {
         for shard_id in shard_assignments {
-            let Some(mut shard_conn) = crate::shard::connect_to_shard(
+            let Some(mut shard_conn) = crate::shard::connect_or_reuse(
+                conn,
+                conn_shard,
                 pool,
                 *shard_id,
                 "event_batch",
