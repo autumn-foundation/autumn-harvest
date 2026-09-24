@@ -1630,7 +1630,7 @@ pub struct WorkflowHandle {
 
 /// What a result wait blocks on between two reads of the execution state.
 enum ResultWaiter {
-    /// A LISTEN connection on the shard's `harvest_events` channel.
+    /// A listener on the shard's `harvest_events` channel.
     Listen(WorkflowEventListener),
     /// A fixed sleep. Used when the listener cannot connect (issue #1717).
     Poll {
