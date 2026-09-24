@@ -201,7 +201,7 @@ The `sslmode` in that URL sets the transport:
 
 | `sslmode` | Transport |
 |---|---|
-| `disable`, `prefer`, or not set | Plaintext, as before. |
+| `disable`, `prefer`, or not set | Plaintext, as before. `prefer` never encrypts listener traffic. |
 | `require` | TLS. The chain and the hostname are verified. |
 
 - The trust store is the platform store. To trust a private CA, such as the
@@ -209,11 +209,13 @@ The `sslmode` in that URL sets the transport:
   platform store.
 - TLS needs the `tls` feature. It is on by default. Without it, a `require`
   URL gets a configuration error.
-- `verify-ca` and `verify-full` do not parse yet. Use `require`. It already
-  verifies the chain and the hostname.
+- A listener URL with `verify-ca` or `verify-full` does not parse yet. Use
+  `require`. It already verifies the chain and the hostname.
 - A result wait (`result_raw`, `result_raw_with_timeout`,
-  `result_snapshot_with_wait`) does not fail when the listener cannot connect.
-  It logs a warning and polls every 500 ms.
+  `result_snapshot_with_wait`) does not fail when the listener cannot connect
+  within 5 s. It logs a warning and polls every 500 ms. After 30 s it tries
+  the listener again. A configuration error, such as a `require` URL without
+  the `tls` feature, is still returned.
 
 ## Dashboard
 

@@ -1633,18 +1633,34 @@ enum ResultWaiter {
     /// A LISTEN connection on the shard's `harvest_events` channel.
     Listen(WorkflowEventListener),
     /// A fixed sleep. Used when the listener cannot connect (issue #1717).
-    Poll,
+    Poll {
+        /// When to try the listener again.
+        retry_at: Instant,
+    },
 }
 
 impl ResultWaiter {
+    /// A polling waiter that tries the listener again after
+    /// [`WorkflowHandle::LISTEN_RETRY_INTERVAL`].
+    fn poll() -> Self {
+        Self::Poll {
+            retry_at: Instant::now() + WorkflowHandle::LISTEN_RETRY_INTERVAL,
+        }
+    }
+
     /// Block until a notification arrives or `max_wait` elapses.
     ///
     /// A polling waiter sleeps for `max_wait` or for
-    /// [`WorkflowHandle::RESULT_POLL_INTERVAL`], whichever is shorter.
+    /// [`WorkflowHandle::RESULT_POLL_INTERVAL`], whichever is shorter. When
+    /// its retry time is past, it returns `ChannelClosed` at once. The caller
+    /// then connects a new waiter.
     async fn wait(&mut self, max_wait: Duration) -> HarvestResult<WorkflowEventWaitOutcome> {
         match self {
             Self::Listen(listener) => listener.wait_for_notification_timeout(max_wait).await,
-            Self::Poll => {
+            Self::Poll { retry_at } => {
+                if Instant::now() >= *retry_at {
+                    return Ok(WorkflowEventWaitOutcome::ChannelClosed);
+                }
                 tokio::time::sleep(max_wait.min(WorkflowHandle::RESULT_POLL_INTERVAL)).await;
                 Ok(WorkflowEventWaitOutcome::TimedOut)
             }
@@ -1819,7 +1835,7 @@ impl WorkflowHandle {
     ///
     /// # Errors
     ///
-    /// Returns database, listener setup, notification payload, or not-found
+    /// Returns database, listener configuration, notification payload, or not-found
     /// errors.
     pub async fn result_snapshot_with_wait(
         &self,
@@ -1917,14 +1933,25 @@ impl WorkflowHandle {
     /// notification can end the sleep early.
     const RESULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+    /// How long a polling [`ResultWaiter`] waits before it tries the listener
+    /// again. A short outage thus does not make the rest of a long wait poll.
+    const LISTEN_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+    /// The longest time a listener connect can take before the wait polls.
+    ///
+    /// A host that drops packets can otherwise hold the connect until the OS
+    /// TCP timeout. That can be minutes, past the caller's own deadline.
+    const LISTEN_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
     /// Wait until the workflow reaches a terminal state and return its raw JSON
     /// output. Failure terminal states are returned as typed [`HarvestError`]
     /// variants.
     ///
     /// # Errors
     ///
-    /// Returns terminal workflow errors, database errors, listener setup errors,
-    /// or not-found errors.
+    /// Returns terminal workflow errors, database errors, listener
+    /// configuration errors, or not-found errors. A listener that cannot
+    /// connect makes the wait poll. It is not an error.
     pub async fn result_raw(&self) -> HarvestResult<Value> {
         let execution = self.load_effective_execution().await?;
         if let Some(result) = terminal_raw_result(&execution) {
@@ -1981,7 +2008,7 @@ impl WorkflowHandle {
     /// # Errors
     ///
     /// Returns terminal workflow errors, timeout, database errors, listener
-    /// setup errors, or not-found errors.
+    /// configuration errors, or not-found errors.
     pub async fn result_raw_with_timeout(&self, timeout: Duration) -> HarvestResult<Value> {
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
             HarvestError::Config("workflow result timeout duration overflowed".to_string())
@@ -2189,21 +2216,27 @@ impl WorkflowHandle {
     ///
     /// A listener that cannot connect gives a polling waiter, not an error.
     /// Each loop reads the execution state again, so polling changes only the
-    /// wake-up latency (issue #1717). A missing notification URL is still a
-    /// configuration error.
+    /// wake-up latency (issue #1717). A configuration error is still returned.
+    /// Examples are a missing notification URL, or `sslmode=require` with no
+    /// usable TLS configuration.
     async fn connect_waiter(&self) -> HarvestResult<ResultWaiter> {
         let database_url = self.notification_database_url().await?;
-        match WorkflowEventListener::connect(&database_url).await {
-            Ok(listener) => Ok(ResultWaiter::Listen(listener)),
-            Err(error) => {
-                tracing::warn!(
-                    exec_id = %self.exec_id,
-                    error = %error,
-                    "failed to start LISTEN/NOTIFY listener; result wait falls back to polling"
-                );
-                Ok(ResultWaiter::Poll)
-            }
-        }
+        let connect = WorkflowEventListener::connect(&database_url);
+        let error = match tokio::time::timeout(Self::LISTEN_CONNECT_TIMEOUT, connect).await {
+            Ok(Ok(listener)) => return Ok(ResultWaiter::Listen(listener)),
+            Ok(Err(error @ HarvestError::Config(_))) => return Err(error),
+            Ok(Err(error)) => error.to_string(),
+            Err(_elapsed) => format!(
+                "listener connect took longer than {:?}",
+                Self::LISTEN_CONNECT_TIMEOUT
+            ),
+        };
+        tracing::warn!(
+            exec_id = %self.exec_id,
+            error = %error,
+            "failed to start LISTEN/NOTIFY listener; result wait falls back to polling"
+        );
+        Ok(ResultWaiter::poll())
     }
 
     /// Load the *effective* execution for this handle: the **live attempt** of

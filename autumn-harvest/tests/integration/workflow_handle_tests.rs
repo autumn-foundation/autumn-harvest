@@ -727,10 +727,13 @@ async fn result_raw_with_timeout_polls_when_the_listener_cannot_connect() {
     let (handle, completer, _container) =
         complete_later_with_notify_url(UNREACHABLE_NOTIFY_URL).await;
 
-    let result = handle
-        .result_raw_with_timeout(Duration::from_secs(10))
-        .await
-        .expect("a dead listener must not fail the wait");
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        handle.result_raw_with_timeout(Duration::from_secs(10)),
+    )
+    .await
+    .expect("the wait must end")
+    .expect("a dead listener must not fail the wait");
 
     assert_eq!(result, serde_json::json!({"ok": true}));
     completer.await.expect("completer should not panic");
@@ -741,36 +744,37 @@ async fn result_snapshot_with_wait_polls_when_the_listener_cannot_connect() {
     let (handle, completer, _container) =
         complete_later_with_notify_url(UNREACHABLE_NOTIFY_URL).await;
 
-    let snapshot = handle
-        .result_snapshot_with_wait(Duration::from_secs(10))
-        .await
-        .expect("a dead listener must not fail the wait")
-        .expect("polling must see the completion");
+    let snapshot = tokio::time::timeout(
+        Duration::from_secs(20),
+        handle.result_snapshot_with_wait(Duration::from_secs(10)),
+    )
+    .await
+    .expect("the wait must end")
+    .expect("a dead listener must not fail the wait")
+    .expect("polling must see the completion");
 
     assert_eq!(snapshot.state, WorkflowResultState::Completed);
     completer.await.expect("completer should not panic");
 }
 
-/// `sslmode=require` must reach a real TLS negotiation.
+/// A failed `sslmode=require` listener must name the TLS cause.
 ///
-/// A `NoTls` connector fails before it contacts the server. The error must
-/// also carry the cause, not only "error performing TLS handshake".
+/// `tokio_postgres` shows only "error performing TLS handshake". The cause is
+/// in `source()`. The unit test `sslmode_require_starts_a_tls_handshake` in
+/// `notify.rs` proves that `require` selects the rustls connector.
 #[tokio::test]
-async fn listener_with_sslmode_require_negotiates_tls() {
+async fn listener_with_sslmode_require_names_the_tls_cause() {
     let (database_url, _container) = setup_isolated_database_url().await;
-    let require_url = format!("{database_url}?sslmode=require");
+    let separator = if database_url.contains('?') { '&' } else { '?' };
+    let require_url = format!("{database_url}{separator}sslmode=require");
 
     let Err(error) = autumn_harvest::notify::WorkflowEventListener::connect(&require_url).await
     else {
-        // The test server accepted TLS, so there is no failure to inspect.
+        // The server has a trusted certificate. No failure to inspect.
         return;
     };
     let message = error.to_string();
 
-    assert!(
-        !message.contains("no TLS implementation configured"),
-        "sslmode=require must use a TLS connector: {message}"
-    );
     assert!(
         message.contains("server does not support TLS") || message.contains("certificate"),
         "the error must name the TLS cause: {message}"

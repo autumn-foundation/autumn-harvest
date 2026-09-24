@@ -140,6 +140,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          typed_stub_deferred_admission_tests
 linux        autumn-harvest         integration                      -                          typed_workflow_failure_tests
 linux        autumn-harvest         integration                      -                          usage_report_activity_lookback_tests
+linux        autumn-harvest         integration                      -                          workflow_handle_tests
 linux        autumn-harvest         integration                      -                          workflow_id_targeted_tests
 linux        autumn-harvest         integration                      -                          workflow_logs_tests
 linux        autumn-harvest         integration                      -                          workflow_pause_claim_recheck_tests

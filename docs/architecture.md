@@ -128,7 +128,7 @@ The `harvest_events` table is the exception: its `id` column is `BIGSERIAL i64` 
 
 **2. `db` feature gates all Diesel code**
 
-`schema.rs` and `models.rs` are compiled only when `features = ["db"]`. `default = ["db"]`, so it compiles in by default. Tests on Windows run `--no-default-features` to avoid OpenSSL dependency. CI tests the `db` feature on Linux.
+`schema.rs` and `models.rs` are compiled only when `features = ["db"]`. `default = ["db", "unified-dag-execution", "tls"]`, so it compiles in by default. `tls` adds rustls for LISTEN/NOTIFY connections with `sslmode=require` (issue #1717). Tests on Windows run `--no-default-features` to avoid OpenSSL dependency. CI tests the `db` feature on Linux.
 
 **3. Adjacently-tagged event JSON**
 

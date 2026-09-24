@@ -378,6 +378,7 @@ async fn open_tls_listen_connection(
 
 /// Refuse `sslmode=require` when the crate has no TLS support.
 #[cfg(not(feature = "tls"))]
+#[allow(clippy::unused_async, reason = "the signature matches the `tls` build")]
 async fn open_tls_listen_connection(
     _config: &tokio_postgres::Config,
     _error_message: &'static str,
@@ -830,6 +831,83 @@ mod tests {
         assert_eq!(
             transport_for("host=db.internal dbname=harvest"),
             ListenTransport::Plain
+        );
+    }
+
+    /// An `SSLRequest` message: length 8, then the code 80877103.
+    #[cfg(feature = "tls")]
+    const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 4, 210, 22, 47];
+
+    /// Open a listener connection to a fake server, and record what arrives.
+    ///
+    /// The fake server reads the first message header. When `answer_tls` is
+    /// true, it accepts TLS with `S` and also reads the next byte.
+    async fn first_bytes_sent(sslmode: &str, answer_tls: bool) -> ([u8; 8], Option<u8>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake server");
+        let port = server.local_addr().expect("fake server address").port();
+        let accept = tokio::spawn(async move {
+            let (mut socket, _) = server.accept().await.expect("accept");
+            let mut header = [0_u8; 8];
+            socket
+                .read_exact(&mut header)
+                .await
+                .expect("message header");
+            if !answer_tls {
+                return (header, None);
+            }
+            socket.write_all(b"S").await.expect("accept TLS");
+            let mut next = [0_u8; 1];
+            let next = socket.read_exact(&mut next).await.ok().map(|_| next[0]);
+            (header, next)
+        });
+        let url = format!("postgres://u@127.0.0.1:{port}/db?sslmode={sslmode}");
+        let client = tokio::spawn(async move {
+            open_listen_connection(&url, "test listener error")
+                .await
+                .map(|_| ())
+        });
+        let seen = tokio::time::timeout(Duration::from_secs(10), accept)
+            .await
+            .expect("fake server sees the client")
+            .expect("fake server task");
+        client.abort();
+        seen
+    }
+
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn sslmode_require_starts_a_tls_handshake() {
+        let (header, next) = first_bytes_sent("require", true).await;
+        assert_eq!(header, SSL_REQUEST);
+        // 0x16 is the TLS handshake record type, so this is a ClientHello.
+        // A `NoTls` connector sends nothing after the server accepts TLS.
+        assert_eq!(next, Some(0x16), "sslmode=require must send a ClientHello");
+    }
+
+    #[tokio::test]
+    async fn sslmode_prefer_stays_plaintext() {
+        let (header, _) = first_bytes_sent("prefer", false).await;
+        // A startup message carries protocol version 3.0 after its length.
+        assert_eq!(header[4..], [0, 3, 0, 0], "prefer must not send SSLRequest");
+    }
+
+    #[cfg(not(feature = "tls"))]
+    #[tokio::test]
+    async fn sslmode_require_without_the_tls_feature_is_a_config_error() {
+        let result = open_listen_connection(
+            "postgres://u@127.0.0.1:1/db?sslmode=require",
+            "test listener error",
+        )
+        .await
+        .map(|_| ());
+        assert!(
+            matches!(&result, Err(HarvestError::Config(m)) if m.contains("`tls` feature")),
+            "{:?}",
+            result.err()
         );
     }
 
