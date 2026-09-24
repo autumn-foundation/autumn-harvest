@@ -15761,6 +15761,37 @@ mod tests {
         );
     }
 
+    /// Snag finding (issue #1723): `dag_retry_commit_redirect` returns
+    /// `(String, String)` — a target run id and a flash string. Neither
+    /// slot names or carries a retry `reason`, on any branch.
+    ///
+    /// This pins the root cause at the signature level. No value this
+    /// function returns can ever hold the operator's edited reason. So the
+    /// real submitted `reason` a form sends to `dag_retry_commit_ui`
+    /// cannot survive a genuine failure either.
+    ///
+    /// `ui_dag_retry_error_drops_submitted_reason` in
+    /// `autumn-harvest-plugin/tests/ui_integration.rs` exercises that full
+    /// form-to-redirect path end to end (Codex review on this PR). This
+    /// test only pins the narrower, always-true fact about this
+    /// function's own return type.
+    ///
+    /// This is the same "entered data lost on a form's failure redirect"
+    /// defect class already tracked for the workflow-detail action forms
+    /// (issue #1687, `WorkflowActionEcho`). It is also tracked for the
+    /// build-routing forms (issue #1714). Neither fix reaches the DAG
+    /// retry confirm form.
+    #[test]
+    fn dag_retry_commit_redirect_return_type_carries_no_reason_on_real_failure() {
+        let failure = DagRetryFailure::StateConflict("DAG run succeeded".to_string());
+        let (_target, flash) = dag_retry_commit_redirect(Err(failure), "source-run");
+        assert!(
+            !flash.to_lowercase().contains("reason"),
+            "the failure flash never echoes any reason field, by \
+             construction of this function's return type: {flash}"
+        );
+    }
+
     #[test]
     fn dag_detail_relative_url_builds_back_link_and_flash() {
         assert_eq!(

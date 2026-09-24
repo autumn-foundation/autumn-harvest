@@ -6973,6 +6973,124 @@ async fn ui_dag_retry_error_renders_human_message() {
     );
 }
 
+// I-E2
+/// Snag repro (issue #1723): a genuine commit failure drops the operator's
+/// submitted retry `reason`. `dag_retry_commit_redirect` only returns a
+/// target run id and a flash string, so a real form submission's `reason`
+/// has nowhere to travel on a 409 conflict.
+///
+/// This exercises the actual HTTP handler with a `reason` field. A `ui.rs`
+/// unit test cannot reach that field on its own. The field lives on the
+/// caller of `dag_retry_commit_redirect`, not on that function itself.
+///
+/// Seeds a genuinely retryable (`FAILED`) run and confirms the form
+/// renders with the editable `reason` field. A competing retry then
+/// really runs and seals the source `TERMINATED`
+/// (`terminate_source_execution`, `reset.rs`), before the operator
+/// submits the form they had open.
+///
+/// This is the real operator path a reviewer on this PR asked for. It
+/// uses a genuine competing retry, not a synthetic state. The transition
+/// is one this engine's own reset path actually produces. The confirm
+/// page's dry run races a concurrent retry of the same run, exactly as
+/// issue #1723 describes.
+#[tokio::test]
+async fn ui_dag_retry_error_drops_submitted_reason() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    let (ia, ib) = (
+        autumn_harvest::ActivityExecId::new(),
+        autumn_harvest::ActivityExecId::new(),
+    );
+    let events = vec![
+        dag957_sched("dag957_step_a", ia),
+        dag957_started(ia),
+        dag957_completed(ia),
+        dag957_sched("dag957_step_b", ib),
+        dag957_started(ib),
+        dag957_failed(ib),
+        autumn_harvest::WorkflowEvent::workflow_failed("dag failed"),
+    ];
+    let exec_id = dag957_seed_run(
+        &url,
+        "dag957_linear",
+        "graph-reason-dropped",
+        events,
+        "FAILED",
+    )
+    .await;
+
+    // The confirm page renders the editable form for this still-open run --
+    // this is the page the operator actually sees and types into.
+    let (status, html) = fetch_html(
+        &app,
+        &format!("/dags/dag957_linear/runs/{exec_id}/retry?from_node=dag957_step_b"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "confirm page must render: {html}");
+    assert!(html.contains("reason"), "reason field must be present");
+
+    // Race: a second operator (or an automatic recovery) retries the same
+    // node first, through a real commit against the real handler. It
+    // forks a new run and seals THIS source `TERMINATED`, exactly as
+    // `terminate_source_execution` does for a live competing retry.
+    let (competing_status, _headers, competing_body) = post_form(
+        &app,
+        &format!("/dags/dag957_linear/runs/{exec_id}/retry"),
+        "from_node=dag957_step_b&reason=competing+operator+retry",
+    )
+    .await;
+    assert!(
+        competing_status.is_redirection(),
+        "the competing retry must itself succeed: {competing_status} {competing_body}"
+    );
+
+    // The first operator, still looking at the form from the confirm page
+    // fetched above, submits it -- unaware the source run is now sealed.
+    let submitted_reason = "retrying after upstream API fix, ticket JIRA-4521";
+    let (status, headers, _body) = post_form(
+        &app,
+        &format!("/dags/dag957_linear/runs/{exec_id}/retry"),
+        format!(
+            "from_node=dag957_step_b&reason={}",
+            url_encode_test(submitted_reason)
+        ),
+    )
+    .await;
+    assert!(status.is_redirection(), "commit redirects; got {status}");
+    let location = headers
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    // The flash is percent-encoded in the `Location` header (`url_encode`
+    // turns the space after "Retry failed:" into "%20").
+    assert!(
+        location.contains("Retry%20failed"),
+        "a genuine failure must use the hard failure message: {location}"
+    );
+    assert!(
+        !location.to_lowercase().contains("jira-4521")
+            && !location.to_lowercase().contains("jira%2d4521"),
+        "the operator's submitted reason must not survive the failure \
+         redirect if this bug is still present; got: {location}"
+    );
+}
+
+fn url_encode_test(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_string()
+            } else if c == ' ' {
+                "+".to_string()
+            } else {
+                format!("%{:02X}", c as u32)
+            }
+        })
+        .collect()
+}
+
 // I-F
 #[tokio::test]
 async fn ui_dag_run_graph_classic_dag_degraded() {
