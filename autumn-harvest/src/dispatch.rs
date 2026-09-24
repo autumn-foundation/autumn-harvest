@@ -256,9 +256,21 @@ pub fn install(channel: Arc<dyn TaskDispatch>, settings: DispatchSettings) {
 /// The background publisher is stopped as well, so the next install starts
 /// with an empty publisher queue. A hint still in that queue is dropped; the
 /// reconcile sweep republishes its row.
+///
+/// Clears [`ANY_INSTALLED`] only when [`INSTALLED_BY_SHARD`] is also empty
+/// (Codex review, issue #1429), mirroring the check [`uninstall_all_shards`]
+/// already runs for the inverse case. A direct embedder using the
+/// per-shard API can call this on the independent single-shard slot while
+/// shard channels are still installed. Clearing the flag unconditionally
+/// then let `is_installed()` read false while `installed_for_shard` still
+/// returned live channels. `Worker::new` skips its full-coverage
+/// validation whenever `is_installed()` is false. A partial shard map
+/// could then run silently with mixed Redis/Postgres dispatch behaviour.
 pub fn uninstall() {
     if let Ok(mut slot) = INSTALLED.write() {
         *slot = None;
+    }
+    if INSTALLED_BY_SHARD.read().is_ok_and(|slot| slot.is_none()) {
         ANY_INSTALLED.store(false, Ordering::Relaxed);
     }
     stop_publisher();
@@ -1657,6 +1669,44 @@ mod tests {
             lock(&PUBLISHER).is_none(),
             "uninstall_all_shards must stop and clear the background publisher"
         );
+    }
+
+    /// `uninstall` must not clear [`is_installed`] while a per-shard
+    /// channel is still installed (Codex review, issue #1429).
+    ///
+    /// A direct embedder can call the single-shard `install`/`uninstall`
+    /// pair alongside the independent per-shard API. Clearing the flag
+    /// unconditionally on `uninstall` let `is_installed()` read false
+    /// while `installed_for_shard` still returned a live channel.
+    /// `Worker::new` skips its full-coverage validation whenever
+    /// `is_installed()` is false, so a partial shard map could then run
+    /// silently with mixed Redis/Postgres dispatch behaviour.
+    #[tokio::test]
+    async fn uninstall_leaves_the_flag_set_while_a_shard_channel_remains() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        install(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        install_for_shard(
+            crate::types::ShardId::new(1),
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        uninstall();
+
+        assert!(installed().is_none(), "uninstall must clear its own slot");
+        assert!(
+            is_installed(),
+            "a shard channel is still installed, so the flag must stay set"
+        );
+
+        uninstall_all_shards();
+        assert!(!is_installed(), "the flag clears once every slot is empty");
     }
 
     #[tokio::test]

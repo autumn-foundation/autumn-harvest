@@ -2042,8 +2042,16 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
         };
 
         // `wake_workflow_task` below raises a dispatch hint (issue #1429).
-        // The scope ties its publish to this transaction's commit.
-        let result = crate::dispatch::buffered_settled(Box::pin(
+        // This scanner claims one row per loop iteration, the same shape as
+        // the three outbox sweeps `buffered_settled_in_background` already
+        // covers. An inline `buffered_settled` awaits the dispatch
+        // channel's publish call after every commit. That can cost up to
+        // `DISPATCH_CALL_TIMEOUT` per row when the channel is slow (Codex
+        // review, issue #1429). Postgres already committed by then.
+        // Reconciliation is the durability fallback regardless, so
+        // `buffered_settled_in_background` hands the hint to the existing
+        // non-blocking background publisher instead of awaiting it inline.
+        let result = crate::dispatch::buffered_settled_in_background(Box::pin(
             conn.transaction::<bool, HarvestError, _>(async |conn| {
                 // Per-table lock-ordering convention (issue #609
                 // post-review hardening, third bot-review round):
@@ -5290,10 +5298,15 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
         let queue_name = row.queue_name.clone();
 
         // `wake_parent_for_child_timeout` below raises a dispatch hint
-        // (issue #1429). The scope ties its publish to this transaction's
-        // commit.
+        // (issue #1429). This scanner claims one row per loop iteration,
+        // the same shape as the outbox sweeps and the external-task
+        // timeout scanner. Those already use `buffered_settled_in_background`
+        // (Codex review, issue #1429). That function hands the hint to the
+        // existing non-blocking background publisher instead of awaiting
+        // it inline. Reconciliation is the durability fallback regardless
+        // of when the hint reaches the channel.
         let (applied, deferred_starts, closed_children, pending_cancel_metrics) =
-            crate::dispatch::buffered_settled(Box::pin(conn.transaction::<(
+            crate::dispatch::buffered_settled_in_background(Box::pin(conn.transaction::<(
                 bool,
                 Vec<crate::completion_trigger::DeferredTriggerStart>,
                 Vec<(ExecutionId, String)>,
