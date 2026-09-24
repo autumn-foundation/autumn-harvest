@@ -26336,6 +26336,37 @@ const fn dispatch_kind_admitted(
     }
 }
 
+/// Whether one more lease of `kind` fits this shard's own fair share of its
+/// pool this batch (Codex review, issue #1429).
+///
+/// [`dispatch_read_size`] bounds the whole batch to a fair share of the
+/// *sum* of both pools. That alone does not stop this shard's own claims
+/// from exhausting one kind's pool alone. [`dispatch_kind_admitted`] only
+/// checks the live global total, with no per-shard ceiling. A shard visited
+/// early in a multi-shard round-robin may have a channel that holds mostly
+/// one kind. It could then claim every sibling's share of that kind before
+/// their own turn comes up. Each kind therefore also gets its own
+/// shard-count share (`share_workflow`, `share_activity`). This function
+/// checks that share. It compares the share against how many of that kind
+/// `dispatch_leases` has already claimed this batch (`claimed_workflow`,
+/// `claimed_activity`), rather than against the pool's live total.
+///
+/// `None` is a reference of unknown type. It has no kind-specific pool to
+/// exhaust, so it is always within share.
+const fn dispatch_kind_within_share(
+    kind: Option<crate::dispatch::DispatchKind>,
+    claimed_workflow: usize,
+    share_workflow: usize,
+    claimed_activity: usize,
+    share_activity: usize,
+) -> bool {
+    match kind {
+        Some(crate::dispatch::DispatchKind::Workflow) => claimed_workflow < share_workflow,
+        Some(crate::dispatch::DispatchKind::Activity) => claimed_activity < share_activity,
+        None => true,
+    }
+}
+
 /// Where the next reconcile sweep of one queue starts (issue #1312).
 ///
 /// A full page means rows may still sit below it, so the walk continues from
@@ -28538,6 +28569,18 @@ impl Worker {
         // `DISPATCH_READ_MAX` separate acknowledgement round trips, despite
         // `ack_many` already existing on the trait.
         let mut to_ack: Vec<crate::dispatch::DispatchLease> = Vec::new();
+        // Each kind's fair share of this batch, snapshotted once per shard's
+        // turn. See [`dispatch_kind_within_share`] for why the read-size
+        // share is not enough on its own (Codex review, issue #1429).
+        let divisor = shard_count.max(1);
+        let share_workflow =
+            Self::free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow)
+                .div_ceil(divisor);
+        let share_activity =
+            Self::free_permits(&self.activity_semaphore, &self.dispatch_reserved_activity)
+                .div_ceil(divisor);
+        let mut claimed_workflow = 0usize;
+        let mut claimed_activity = 0usize;
         let mut leases = leases.into_iter();
         while let Some(lease) = leases.next() {
             if self.shutdown.is_cancelled() {
@@ -28547,13 +28590,20 @@ impl Worker {
                 to_release.extend(leases.map(|lease| (lease, Duration::ZERO)));
                 break;
             }
-            if !dispatch_kind_admitted(
+            if !dispatch_kind_within_share(
+                lease.kind,
+                claimed_workflow,
+                share_workflow,
+                claimed_activity,
+                share_activity,
+            ) || !dispatch_kind_admitted(
                 lease.kind,
                 Self::free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow),
                 Self::free_permits(&self.activity_semaphore, &self.dispatch_reserved_activity),
             ) {
-                // No permit for this pool. Give the reference straight back, so
-                // a peer with capacity reads it on its next poll.
+                // No permit for this pool, or this shard's own share of it is
+                // already spent this batch. Give the reference straight
+                // back, so a peer with capacity reads it on its next poll.
                 to_release.push((lease, Duration::ZERO));
                 continue;
             }
@@ -28561,9 +28611,11 @@ impl Worker {
             // spawned task holds its permit. See [`DispatchReservation`].
             let reservation = match lease.kind {
                 Some(crate::dispatch::DispatchKind::Workflow) => {
+                    claimed_workflow += 1;
                     Some(DispatchReservation::new(&self.dispatch_reserved_workflow))
                 }
                 Some(crate::dispatch::DispatchKind::Activity) => {
+                    claimed_activity += 1;
                     Some(DispatchReservation::new(&self.dispatch_reserved_activity))
                 }
                 None => None,
@@ -42242,6 +42294,38 @@ mod tests {
         assert!(
             dispatch_kind_admitted(None, 0, 0),
             "an untyped reference keeps the behaviour it had before the kind existed"
+        );
+    }
+
+    /// A shard's batch must not spend a sibling's share of one kind's pool.
+    /// It must not do so even while the pool's live total still reads free
+    /// (Codex review, issue #1429). `dispatch_read_size` bounds the whole
+    /// batch to a fair share of the sum of both pools. A batch of one kind
+    /// alone can still claim every free permit of that kind. It can do so
+    /// before a sibling shard's own turn comes up in the round-robin.
+    #[test]
+    fn a_shard_cannot_spend_a_sibling_s_share_of_one_kind() {
+        use crate::dispatch::DispatchKind;
+        // Four free workflow permits, four shards: each shard's own share is
+        // one, however many workflow-kind leases its own batch holds.
+        assert!(dispatch_kind_within_share(
+            Some(DispatchKind::Workflow),
+            0,
+            1,
+            0,
+            1
+        ));
+        assert!(
+            !dispatch_kind_within_share(Some(DispatchKind::Workflow), 1, 1, 0, 1),
+            "this shard already claimed its one-of-four share this batch"
+        );
+        assert!(
+            !dispatch_kind_within_share(Some(DispatchKind::Activity), 25, 25, 0, 0),
+            "a spent activity share blocks further activity leases even at zero workflow share"
+        );
+        assert!(
+            dispatch_kind_within_share(None, 999, 0, 999, 0),
+            "an untyped reference has no kind-specific pool to exhaust"
         );
     }
 
