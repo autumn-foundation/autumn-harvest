@@ -90,3 +90,30 @@ classifier; nothing in the replay path touches it.
 zero regressions; `cargo test -p autumn-harvest-plugin --lib` (1273 tests) is
 green. `docs/upgrading/0.5.0.md` and `docs/rnd/sqlite-feasibility.md`'s
 migration count are updated to match.
+
+**Second review round (Codex).** Two more findings, both addressed without
+weakening the veto above.
+
+First: a row already armed by `reschedule_task` before this migration ran
+got `NULL` for the marker, not because it lacked a timer, but because the
+column did not exist yet. `is_the_missed_timer_wake`'s exact-match branch
+covered it right up until the first post-upgrade drift, then lost it —
+reopening this same issue for that one pre-existing row. The migration now
+also backfills `timer_fires_at` for the unambiguous case: a `PENDING`/
+`RUNNING` workflow row whose `scheduled_at` exactly matches a still-unfired
+timer on the same execution. `docs/upgrading/0.5.0.md`'s blanket "no data
+backfill" claim is corrected to name this one exception.
+
+Second: a short-lived draft tried exempting the marker match from the
+`wake_source_repended_this_row` veto entirely, on the reasoning that only
+`reschedule_task` ever writes it. That is true only of code that knows the
+column exists. During this very migration's own rolling deploy, an
+old-binary worker's repend for a genuinely different wake reason clears
+nothing it has never heard of, and an unconditionally trusted marker would
+then report a false `timer_overdue` on a row that is not actually stalled
+— a near-guaranteed failure on every rollout of this fix, not a
+hypothetical one. Reverted; the veto stays as originally shipped. The
+narrower cost that draft was chasing — a genuinely short timer's own
+`created_at`-to-`fires_at` gap landing inside the veto's slack after a
+same-reason drift — is accepted as the lesser failure mode and is now
+pinned by its own test.

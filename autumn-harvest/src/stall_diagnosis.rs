@@ -1368,11 +1368,12 @@ const WAKE_REPEND_MIN_GAP_SECONDS: i64 = -2;
 /// A very short-lived genuine timer's own `created_at`-to-`scheduled_at`
 /// gap CAN land inside this small negative slack (issue #1191 review).
 /// This function alone cannot rule that out. It does not have to.
-/// [`is_the_missed_timer_wake`] only ever calls it for the tolerance
-/// branch. That set shrank in issue #1402 review: both the exact match
-/// AND the marker match now bypass it. See that function's own doc for
-/// why. This function only ever gets to veto a merely CLOSE, unmarked
-/// match.
+/// [`is_the_missed_timer_wake`] never calls it for an EXACT
+/// `scheduled_at == fires_at` match. That is what a genuine
+/// `queue::reschedule_task` write always produces, whatever the timer's
+/// duration. This function still gets to veto a marker match, though.
+/// See that function's own doc (issue #1402 review, Codex finding) for
+/// why the marker alone is not exempted the way the exact match is.
 ///
 /// A pre-`#501` legacy row has no `created_at` at all. `None` answers
 /// `false` here -- no evidence either way. So [`is_the_missed_timer_wake`]
@@ -1406,24 +1407,34 @@ fn wake_source_repended_this_row(task: &WorkflowTaskFacts) -> bool {
 ///    heuristic's small negative slack. Without this exact-match fast path
 ///    it would be vetoed as a false re-pend, rather than reported as the
 ///    missed wake it is.
-/// 2. `task.timer_fires_at == Some(fires_at)` (issue #1402 review).
-///    `reschedule_task` is also the one writer of `timer_fires_at`, from
-///    that same value. Unlike `scheduled_at`, nothing else ever moves it
-///    -- a genuinely different wake reason always repends through a path
-///    that clears it first. Trusted outright, same as the exact match
-///    above and for the identical reason. A queue-pause resume credit,
-///    an orphan reclaim, or a capability-miss release can drift
-///    `scheduled_at` an UNBOUNDED distance from `fires_at` without
-///    changing the wake reason. That defeats both the exact match and
-///    `timer_owns_the_wake`'s tolerance below, but never touches this
-///    marker. Subjecting it to `wake_source_repended_this_row`'s
-///    `created_at` heuristic anyway reopens the exact failure mode
-///    branch 1's fast path exists to avoid. A genuinely SHORT timer's
-///    `created_at`-to-`fires_at` gap can already sit inside the
-///    heuristic's small negative slack, even before any drift. Once
-///    drifted, it would be wrongly vetoed the moment ANY of those three
-///    paths moved `scheduled_at` at all. The marker is stronger evidence
-///    than that heuristic, not weaker, so it is exempted the same way.
+/// 2. `task.timer_fires_at == Some(fires_at)`, cleared by
+///    [`wake_source_repended_this_row`] (issue #1402). `reschedule_task`
+///    is also the one writer of `timer_fires_at`, from that same value.
+///    Unlike `scheduled_at`, nothing else ever moves it. A queue-pause
+///    resume credit, an orphan reclaim, or a capability-miss release can
+///    each drift `scheduled_at` an UNBOUNDED distance from `fires_at`
+///    without changing the wake reason. That defeats both this match and
+///    `timer_owns_the_wake`'s tolerance below. The preserved marker
+///    survives that drift, so it is what proves the row is still this
+///    timer's even once `scheduled_at` no longer says so. Still deferred
+///    to `wake_source_repended_this_row`, same as the tolerance match
+///    below. NOT exempted the way the exact match above is (issue #1402
+///    review, Codex finding, second round). An earlier draft of this fix
+///    exempted it too. That draft reasoned the marker is written and
+///    cleared only by code that knows about the column. The reasoning
+///    breaks during a mixed-version rollout of this very column. An
+///    old-binary worker's repend for a genuinely different wake reason
+///    does not know to clear a marker a new-binary worker already wrote.
+///    It still resets `created_at` alongside `scheduled_at`, the same
+///    way every repend always has. `wake_source_repended_this_row`
+///    catches that regardless of which binary version wrote it. It only
+///    ever looks at the shape those writes leave behind, never at the
+///    marker itself. Losing that protection costs a near-guaranteed
+///    false `timer_overdue` on every rolling deploy of this column.
+///    Keeping it costs a narrower false `sleeping_timer` instead. That
+///    one is reachable only for a genuinely short timer that ALSO
+///    survives a same-reason drift small enough to still land inside the
+///    heuristic's slack. The narrower failure mode is the accepted one.
 /// 3. A merely CLOSE match cleared by [`wake_source_repended_this_row`] --
 ///    never a close match alone (issue #1191 review). This is
 ///    [`timer_owns_the_wake`]'s tolerance: an unrelated timer landing near
@@ -1438,8 +1449,8 @@ fn is_the_missed_timer_wake(
     (now - timer.fires_at).num_seconds() >= TIMER_OVERDUE_GRACE_SECONDS
         && task.is_none_or(|task| {
             task.scheduled_at == timer.fires_at
-                || task.timer_fires_at == Some(timer.fires_at)
-                || (timer_owns_the_wake(task.scheduled_at, timer.fires_at)
+                || ((task.timer_fires_at == Some(timer.fires_at)
+                    || timer_owns_the_wake(task.scheduled_at, timer.fires_at))
                     && !wake_source_repended_this_row(task))
         })
 }
@@ -3920,21 +3931,20 @@ mod tests {
         }
     }
 
-    /// The preserved marker is trusted outright, the same as an exact
-    /// `scheduled_at == fires_at` match (issue #1402 review, Codex
-    /// finding). `wake_source_repended_this_row`'s `created_at` heuristic
-    /// is not consulted for it. Earlier drafts of this classifier deferred
-    /// to that heuristic here too, reasoning a stale marker a hypothetical
-    /// write-path bug left behind should fail safe. That reopened the
-    /// exact failure mode branch 1's own fast path exists to avoid. A
-    /// genuinely SHORT timer's `created_at`-to-`fires_at` gap can already
-    /// sit inside the heuristic's small negative slack before any drift
-    /// at all. So the marker match was wrongly vetoed the moment ANY of
-    /// the three drift paths moved `scheduled_at` even slightly. This
-    /// pins the corrected behavior: the marker settles it, whatever
-    /// `created_at` says.
+    /// The preserved marker is evidence, not proof on its own: it must
+    /// still defer to `wake_source_repended_this_row` (issue #1402). A
+    /// row whose wake reason genuinely changed (a signal, a child, or a
+    /// handoff resolved) always goes through a path that clears
+    /// `timer_fires_at` in production. That is PROVIDED the code doing
+    /// the repending knows about that column. It might not. During a
+    /// rolling deploy of this very column, an old-binary worker's repend
+    /// clears nothing it has never heard of. This is issue #1402 review,
+    /// Codex finding, second round. This pins the classifier's own behavior
+    /// for that case. It is indistinguishable at read time from a future
+    /// write-path bug that forgets to clear it. Both must fail safe, not
+    /// misattribute the row to a stale, unrelated timer.
     #[test]
-    fn overdue_timer_marker_is_trusted_over_a_repend_shaped_timestamp_gap() {
+    fn overdue_timer_marker_is_vetoed_by_real_repend_evidence() {
         let inputs = DiagnosisInputs {
             timers: vec![PendingTimerFacts {
                 fires_at: t(-3_600),
@@ -3942,9 +3952,13 @@ mod tests {
             workflow_task: Some(WorkflowTaskFacts {
                 scheduled_at: t(-98),
                 // `wake_workflow_task`'s repend fingerprint: created_at
-                // lands ~5s after scheduled_at. Coincidental here -- the
-                // marker below is what actually settles this row's owner.
+                // lands ~5s after scheduled_at. An old-binary worker's
+                // repend leaves this identical shape, whether or not its
+                // binary version even knows `timer_fires_at` exists.
                 created_at: Some(t(-98 + 5)),
+                // A stale marker: either a hypothetical bug, or a
+                // pre-upgrade binary that repended the row without
+                // knowing to clear it.
                 timer_fires_at: Some(t(-3_600)),
                 ..wf_task()
             }),
@@ -3954,26 +3968,35 @@ mod tests {
             classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
         assert_eq!(
             verdict.kind(),
-            "timer_overdue",
-            "the marker is proof, not merely evidence a timestamp heuristic can override: \
-             {verdict:?}"
+            "sleeping_timer",
+            "created_at proves a different wake source re-pended this row, \
+             so a stale timer_fires_at must not override it: {verdict:?}"
         );
-        assert_eq!(verdict.health(), ExecutionHealth::Stalled, "{verdict:?}");
+        assert_eq!(verdict.health(), ExecutionHealth::Healthy, "{verdict:?}");
     }
 
-    /// Issue #1402 review (Codex finding). A near-zero-duration timer
-    /// whose row later drifts through one of the three marker-preserving
-    /// paths. Modeled here after `release_task_for_capability_miss_query`,
-    /// a short backoff that moves `scheduled_at` without touching
-    /// `created_at` or `timer_fires_at`. The row's own `created_at`-to-
-    /// `fires_at` gap already sits inside `wake_source_repended_this_row`'s
-    /// small negative slack. That is purely because the timer was so
-    /// short-lived -- the same shape as the exact-match branch's own
-    /// short-timer case. Before this fix, the marker branch alone still
-    /// deferred to that heuristic. It misread the drift as a re-pend,
-    /// masking a genuinely missed wake as a healthy `sleeping_timer`.
+    /// Issue #1402 review (Codex finding, second round). A near-zero-
+    /// duration timer whose row later drifts through one of the three
+    /// marker-preserving paths. Modeled here after
+    /// `release_task_for_capability_miss_query`, a short backoff that
+    /// moves `scheduled_at` without touching `created_at` or
+    /// `timer_fires_at`. The row's own `created_at`-to-`fires_at` gap
+    /// already sits inside `wake_source_repended_this_row`'s small
+    /// negative slack, purely because the timer was so short-lived.
+    ///
+    /// This IS a real false negative. A narrower fix was tried and
+    /// reverted (see this file's own history): exempting the marker from
+    /// the veto entirely fixes this case. But that reopens a WORSE one.
+    /// During a mixed-version rollout of this column, an old-binary
+    /// repend leaves an unaware marker uncleared. An unconditionally
+    /// trusted marker then reports a false `timer_overdue` on a row that
+    /// is not actually stalled at all. That failure is near-guaranteed on
+    /// every rolling deploy of this fix. This one needs a genuinely short
+    /// timer AND a same-reason drift small enough to still land inside
+    /// the slack. This pins the accepted, narrower failure mode: a false
+    /// `sleeping_timer`, not a false `timer_overdue`.
     #[test]
-    fn overdue_timer_short_timer_marker_survives_a_capability_miss_style_drift() {
+    fn overdue_timer_short_timer_marker_is_vetoed_by_a_small_capability_miss_style_drift() {
         let inputs = DiagnosisInputs {
             timers: vec![PendingTimerFacts {
                 fires_at: t(-3_600),
@@ -3994,11 +4017,11 @@ mod tests {
             classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
         assert_eq!(
             verdict.kind(),
-            "timer_overdue",
-            "a short timer's own gap must not be misread as a re-pend once it has drifted: \
-             {verdict:?}"
+            "sleeping_timer",
+            "the accepted, narrower failure mode: a short timer's own gap read as a re-pend \
+             rather than trusting the marker unconditionally: {verdict:?}"
         );
-        assert_eq!(verdict.health(), ExecutionHealth::Stalled, "{verdict:?}");
+        assert_eq!(verdict.health(), ExecutionHealth::Healthy, "{verdict:?}");
     }
 
     /// A row with no marker at all keeps the pre-#1402 ladder
@@ -4106,10 +4129,13 @@ mod tests {
         );
     }
 
-    /// Issue #1402 review. The marker branch never consults `created_at`
-    /// at all, so a pre-`#501` legacy row with no `created_at` resolves
-    /// exactly like one that has it. This pins that the ladder still
-    /// resolves correctly with `created_at` entirely absent.
+    /// Issue #1402 review. `wake_source_repended_this_row` answers `false`
+    /// (no evidence either way) for a pre-`#501` legacy row with no
+    /// `created_at`. It cannot veto a marker match there. That is safe,
+    /// not a hole. The marker itself is only ever set by
+    /// `queue::reschedule_task`, from the same value as `fires_at`. So a
+    /// `Some` marker is current, positive evidence on its own. This pins
+    /// that the ladder still resolves correctly without the veto's help.
     #[test]
     fn overdue_timer_marker_wins_without_a_created_at_veto_available() {
         let inputs = DiagnosisInputs {
