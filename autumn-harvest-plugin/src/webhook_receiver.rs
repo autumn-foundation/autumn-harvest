@@ -5,9 +5,9 @@
 //! time from the descriptors [`HarvestPlugin::webhooks(...)`] registered, one
 //! per `#[webhook]` binding.
 //!
-//! Two entry points build from the same trigger descriptors:
+//! Two entry points build from the same trigger descriptors.
 //! [`build_webhook_routes`] returns `Vec<autumn_web::Route>` for
-//! `HarvestPlugin`/`autumn_web::AppBuilder`; [`build_webhook_router`] returns
+//! `HarvestPlugin`/`autumn_web::AppBuilder`. [`build_webhook_router`] returns
 //! a bare `axum::Router<()>` for an embedder mounting `harvest_api_router`
 //! standalone (issue #1612). Both dispatch through the same handler, built
 //! once in `webhook_method_router`.
@@ -116,39 +116,42 @@ pub fn build_webhook_routes(
 /// that mounts `harvest_api_router` on a plain Axum server instead of going
 /// through `HarvestPlugin` and `autumn_web::app()` (issue #1612).
 ///
-/// `autumn_web::Route::handler` is `MethodRouter<autumn_web::AppState>` -- not
-/// generic over the router's state type -- because the `SignedWebhook`
-/// extractor it wraps only implements `FromRequest<AppState>` (it reads the
-/// installed [`WebhookRegistry`] out of that state's typed-extension store).
-/// So a bare `axum::Router` cannot use `SignedWebhook` directly; what it
-/// needs is an `AppState`, just not one built by the full `autumn_web::app()`
-/// pipeline. `AppState::detached()` is exactly that: a minimal `AppState`
-/// with no HTTP server or database pool attached, documented for "background
+/// `autumn_web::Route::handler` is `MethodRouter<autumn_web::AppState>`, not
+/// generic over the router's state type. The `SignedWebhook` extractor it
+/// wraps only implements `FromRequest<AppState>`, reading the installed
+/// [`WebhookRegistry`] out of that state's typed-extension store. So a bare
+/// `axum::Router` cannot use `SignedWebhook` directly; what it needs is an
+/// `AppState`, just not one built by the full `autumn_web::app()` pipeline.
+/// `AppState::detached()` is exactly that: a minimal `AppState` with no HTTP
+/// server or database pool attached. It is documented for "background
 /// runtimes or helper processes that still need framework-managed resources
-/// such as typed extensions". This function builds one, installs a
-/// [`WebhookRegistry`] resolved from `webhook_config` into it (the same
-/// registry `HarvestPlugin` installs from `autumn.toml`'s
-/// `[security.webhooks]`, just supplied directly here since a standalone
-/// embedder has no `autumn.toml` to load it from), mounts every trigger, and
-/// then erases the state with `Router::with_state` -- the returned
-/// `Router<()>` carries the `AppState` inside its closures, not in its type,
-/// so it merges onto an embedder's own bare router like any other handler.
+/// such as typed extensions".
+///
+/// This function builds one, installs a [`WebhookRegistry`] resolved from
+/// `webhook_config` into it, mounts every trigger, and erases the state with
+/// `Router::with_state`. The registry is the same one `HarvestPlugin`
+/// installs from `autumn.toml`'s `[security.webhooks]`. It is supplied
+/// directly here because a standalone embedder has no `autumn.toml` to load
+/// it from. The returned `Router<()>` carries the `AppState` inside its
+/// closures, not in its type. So it merges onto an embedder's own bare
+/// router like any other handler.
 ///
 /// # Replay protection is not available standalone
 ///
-/// Autumn's boot-window/failure replay-key cleanup (`WebhookReplayCleanupLayer`,
-/// what makes a reserved replay key get released on a `5xx` instead of stuck
-/// forever) is installed only by `autumn_web::app()`'s own router-building
-/// code and has no public constructor an embedder can install by hand. An
-/// endpoint with `replay_protection` enabled would reserve a key on every
-/// signed request and never release it on failure, so this function rejects
-/// such a config outright rather than mounting a route with that latent
-/// correctness bug. This is a narrow gap in practice:
-/// `docs/getting-started/12-webhooks.md` already recommends
-/// `replay_protection = false` for every Harvest-bound endpoint, since
-/// Harvest's own dedup (the mapping function's deterministic `WorkflowId`, or
-/// the `SignalsWithStart` idempotency key) is durable and autumn-web's
-/// in-memory replay store is not.
+/// Autumn's boot-window/failure replay-key cleanup is `WebhookReplayCleanupLayer`
+/// -- it releases a reserved replay key on a `5xx` instead of leaving it
+/// stuck forever. It is installed only by `autumn_web::app()`'s own
+/// router-building code, with no public constructor an embedder can install
+/// by hand. An endpoint with `replay_protection` enabled would reserve a key
+/// on every signed request and never release it on failure. So this function
+/// rejects such a config outright, rather than mounting a route with that
+/// latent correctness bug.
+///
+/// This is a narrow gap in practice. `docs/getting-started/12-webhooks.md`
+/// already recommends `replay_protection = false` for every Harvest-bound
+/// endpoint. Harvest's own dedup -- the mapping function's deterministic
+/// `WorkflowId`, or the `SignalsWithStart` idempotency key -- is durable, and
+/// autumn-web's in-memory replay store is not.
 ///
 /// # Errors
 ///
@@ -161,7 +164,11 @@ pub fn build_webhook_routes(
 ///
 /// Same as [`build_webhook_routes`]: a malformed/duplicate trigger set, a
 /// trigger targeting a registered DAG, or a trigger targeting an
-/// unregistered workflow.
+/// unregistered workflow. Also panics when a trigger's path has no matching
+/// entry in `webhook_config.endpoints`. `SignedWebhook` installs a verifier
+/// per configured endpoint, not per trigger, so an uncovered path would
+/// otherwise 500 on every request. Failing here at build time instead is the
+/// point (Codex review, PR #1720).
 pub fn build_webhook_router(
     triggers: &[WebhookTriggerInfo],
     registered_workflows: &[WorkflowInfo],
@@ -170,6 +177,22 @@ pub fn build_webhook_router(
     webhook_config: &WebhookConfig,
 ) -> Result<axum::Router<()>, WebhookConfigError> {
     validate_triggers_or_panic(triggers, registered_workflows, registered_dags);
+    for trigger in triggers {
+        assert!(
+            webhook_config
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.path == trigger.path),
+            "webhook trigger '{}' (path '{}') has no matching entry in webhook_config.endpoints \
+             -- SignedWebhook installs a verifier per configured endpoint, not per trigger, so \
+             every delivery to this path would fail at request time (a 500) instead of failing \
+             here at build time. Add a WebhookEndpointConfig for '{}' to the WebhookConfig passed \
+             to build_webhook_router.",
+            trigger.name,
+            trigger.path,
+            trigger.path
+        );
+    }
     if let Some(endpoint) = webhook_config
         .endpoints
         .iter()

@@ -1,22 +1,22 @@
 //! A standalone mount can reach the inbound webhook receiver (issue #1612).
 //!
 //! `build_webhook_routes` returns `Vec<autumn_web::Route>`, which only
-//! composes with an `autumn_web::AppBuilder` -- so before this file's subject
+//! composes with an `autumn_web::AppBuilder`. So before this file's subject
 //! (`build_webhook_router`) existed, a `#[webhook]` binding was reachable only
 //! through `HarvestPlugin`. This is the compile-time and runtime guard for the
-//! standalone counterpart: it builds the exact shape a non-`HarvestPlugin`
-//! embedder builds -- a bare `axum::Router` with no `autumn_web::AppBuilder`
-//! and no `.with_state(...)` call at the embedder's own call site -- and
+//! standalone counterpart. It builds the exact shape a non-`HarvestPlugin`
+//! embedder builds: a bare `axum::Router` with no `autumn_web::AppBuilder`,
+//! and no `.with_state(...)` call at the embedder's own call site. And it
 //! drives a genuinely HMAC-signed request through the real `SignedWebhook`
 //! extractor, proving that extractor runs with no autumn-web app in the test.
 //!
 //! No database is required. `fails_closed_when_runtime_is_not_started` proves
-//! the request reaches this crate's handler code (signature verified, then
-//! fails closed because no `HarvestApiState::install(...)` ever ran) -- the
-//! same boot-window proof `webhook_receiver_http_tests.rs` uses for the
-//! plugin path. Full dispatch (idempotent redelivery, exactly-one-execution)
-//! is unchanged and already covered there and by the testcontainers
-//! integration test: both entry points share one handler
+//! the request reaches this crate's handler code. The signature is verified,
+//! then it fails closed because no `HarvestApiState::install(...)` ever ran.
+//! This is the same boot-window proof `webhook_receiver_http_tests.rs` uses
+//! for the plugin path. Full dispatch (idempotent redelivery,
+//! exactly-one-execution) is unchanged and already covered there and by the
+//! testcontainers integration test. Both entry points share one handler
 //! (`webhook_method_router`), so this file only needs to prove the mount, not
 //! re-prove dispatch.
 
@@ -105,11 +105,11 @@ async fn signature_verification_runs_with_no_autumn_web_app_in_the_test() {
 
     let status = post_signed(standalone_router(false).unwrap(), body, &sig).await;
 
-    // The signature verified (proving SignedWebhook's extractor ran against
+    // The signature verified, proving SignedWebhook's extractor ran against
     // the AppState::detached() this function installs, with no
-    // autumn_web::AppBuilder involved anywhere), which then fails closed
-    // because no HarvestApiState::install(...) ever ran in this no-DB test --
-    // 503, matching the plugin path's identical boot-window behavior.
+    // autumn_web::AppBuilder involved anywhere. It then fails closed because
+    // no HarvestApiState::install(...) ever ran in this no-DB test -- 503,
+    // matching the plugin path's identical boot-window behavior.
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
@@ -128,8 +128,8 @@ async fn bad_signature_is_rejected_before_any_dispatch_code_runs() {
 }
 
 /// `WebhookReplayCleanupLayer` (what releases a reserved replay key on a
-/// `5xx`) is `pub(crate)` inside autumn-web and installed only by its own
-/// `AppBuilder` -- a standalone mount has no way to install it. Rather than
+/// `5xx`) is `pub(crate)` inside autumn-web, installed only by its own
+/// `AppBuilder`. A standalone mount has no way to install it. Rather than
 /// silently mounting a route that would leak a stuck replay key on every
 /// failure, `build_webhook_router` refuses a config that asks for it.
 #[test]
