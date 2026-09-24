@@ -996,21 +996,43 @@ impl RedisDispatch {
     /// The delete names each entry id, so nothing else leaves the stream. The
     /// dedupe marker is left alone: a reference that cannot be read does not
     /// say which task it belongs to.
+    ///
+    /// One round trip per distinct stream in `entries`, not one atomic pipe
+    /// over all of them (Codex review, issue #1429). A multi-queue read's
+    /// malformed entries can span several queues, and each queue's stream
+    /// carries its own hash tag. One `MULTI`/`EXEC` spanning two queues'
+    /// keys would fail `CROSSSLOT` on a real Cluster, mirroring
+    /// [`Self::ack_many_inner`]/[`Self::requeue_batch`]'s own reasoning for
+    /// the same split. One stream's pipeline failing must not abort the
+    /// rest, for the same reason those two document. Every stream is
+    /// attempted, and the first error, if any, is returned after the loop.
     async fn discard_entries(&self, entries: &[(String, String)]) -> RedisAdapterResult<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut pipe = redis::pipe();
-        pipe.atomic();
+        let mut by_stream: HashMap<&str, Vec<&str>> = HashMap::new();
         for (key, entry_id) in entries {
-            pipe.xack(key, &self.config.consumer_group, &[entry_id])
-                .ignore()
-                .xdel(key, &[entry_id])
-                .ignore();
+            by_stream
+                .entry(key.as_str())
+                .or_default()
+                .push(entry_id.as_str());
         }
         let mut conn = self.conn.clone();
-        pipe.query_async::<()>(&mut conn).await?;
-        Ok(())
+        let mut first_error = None;
+        for (key, entry_ids) in by_stream {
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            for entry_id in &entry_ids {
+                pipe.xack(key, &self.config.consumer_group, &[*entry_id])
+                    .ignore()
+                    .xdel(key, &[*entry_id])
+                    .ignore();
+            }
+            if let Err(error) = pipe.query_async::<()>(&mut conn).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), |error| Err(error.into()))
     }
 
     async fn ack_inner(&self, lease: &DispatchLease) -> RedisAdapterResult<()> {

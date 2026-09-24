@@ -1183,6 +1183,70 @@ async fn a_malformed_entry_leaves_the_pending_list() {
     );
 }
 
+/// Malformed entries spanning two queues in one multi-queue read must both
+/// get cleaned up (Codex review, issue #1429).
+///
+/// `discard_entries` used to build one atomic `MULTI`/`EXEC` pipe over
+/// every malformed entry a read collected, across every queue involved.
+/// Each queue's stream carries its own hash tag. That pipe would then fail
+/// `CROSSSLOT` on a real Cluster the moment two queues both contributed a
+/// malformed entry to the same multi-queue read. It now groups by stream
+/// first, mirroring `ack_many_inner`/`requeue_batch`. This pins the
+/// functional behavior that split preserves. Every queue's malformed
+/// entries still get cleaned up, not just the first one a `HashMap`
+/// happens to visit.
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_entries_across_two_queues_are_both_discarded() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["malformed-a".to_string(), "malformed-b".to_string()];
+    let task_a = Uuid::new_v4();
+    let task_b = Uuid::new_v4();
+
+    // A real publish on each queue creates the consumer group the
+    // hand-written entries need.
+    fixture
+        .dispatch
+        .publish(&[hint("malformed-a", task_a, Utc::now())])
+        .await
+        .expect("publish a");
+    fixture
+        .dispatch
+        .publish(&[hint("malformed-b", task_b, Utc::now())])
+        .await
+        .expect("publish b");
+
+    let mut conn = fixture.raw.clone();
+    for queue in &queues {
+        let key = fixture.stream_key(queue);
+        let _: String = redis::cmd("XADD")
+            .arg(&key)
+            .arg("*")
+            .arg("other")
+            .arg("no payload field here")
+            .query_async(&mut conn)
+            .await
+            .expect("xadd an entry with no payload field");
+    }
+
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 2, "only the legitimate entries yield leases");
+
+    assert_eq!(
+        fixture.pending_count("malformed-a").await,
+        1,
+        "queue a's malformed entry must be acknowledged"
+    );
+    assert_eq!(
+        fixture.pending_count("malformed-b").await,
+        1,
+        "queue b's malformed entry must be acknowledged too, not just queue a's"
+    );
+    assert_eq!(fixture.stream_len("malformed-a").await, 1);
+    assert_eq!(fixture.stream_len("malformed-b").await, 1);
+}
+
 /// The recovery pass discards an entry it cannot read, rather than leaving it
 /// pending for the next pass (issue #1312).
 #[tokio::test(flavor = "multi_thread")]
