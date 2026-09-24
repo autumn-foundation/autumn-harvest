@@ -878,6 +878,28 @@ pub async fn fire_due_event_batches_with_codecs(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<usize> {
+    fire_due_event_batches_on_conn_shard(
+        conn,
+        None,
+        sharded_pool.as_ref(),
+        shard_assignments,
+        metrics,
+        codecs,
+    )
+    .await
+}
+
+/// [`fire_due_event_batches_with_codecs`] for a caller that knows `conn`'s
+/// shard. See [`crate::shard::connect_or_reuse`].
+#[cfg(feature = "db")]
+pub(crate) async fn fire_due_event_batches_on_conn_shard(
+    conn: &mut diesel_async::AsyncPgConnection,
+    conn_shard: Option<crate::types::ShardId>,
+    sharded_pool: Option<&crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<usize> {
     let mut fired_count = 0usize;
     let mut deferred_to_spawn = Vec::new();
 
@@ -885,16 +907,11 @@ pub async fn fire_due_event_batches_with_codecs(
     // Unlike debounce/throttle, a shard connection failure here aborts the
     // whole scan. It does not log the failure and skip the shard
     // (issue #1362).
-    if let (Some(_), [shard_id]) = (sharded_pool, shard_assignments) {
-        // A single assigned shard runs on `conn`, the caller's own
-        // connection to that shard. See `connect_to_shard` for why.
-        let (fired, deferred) =
-            fire_due_on_conn(conn, Some(shard_id.as_i32()), Some(metrics), codecs).await?;
-        fired_count += fired.len();
-        deferred_to_spawn.extend(deferred);
-    } else if let Some(pool) = sharded_pool {
+    if let Some(pool) = sharded_pool {
         for shard_id in shard_assignments {
-            let Some(mut shard_conn) = crate::shard::connect_to_shard(
+            let Some(mut shard_conn) = crate::shard::connect_or_reuse(
+                conn,
+                conn_shard,
                 pool,
                 *shard_id,
                 "event_batch",

@@ -929,6 +929,28 @@ pub async fn fire_due_debounced_starts_with_codecs(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
+    fire_due_debounced_starts_on_conn_shard(
+        conn,
+        None,
+        sharded_pool.as_ref(),
+        shard_assignments,
+        metrics,
+        codecs,
+    )
+    .await
+}
+
+/// [`fire_due_debounced_starts_with_codecs`] for a caller that knows `conn`'s
+/// shard. See [`crate::shard::connect_or_reuse`].
+#[cfg(feature = "db")]
+pub(crate) async fn fire_due_debounced_starts_on_conn_shard(
+    conn: &mut diesel_async::AsyncPgConnection,
+    conn_shard: Option<crate::types::ShardId>,
+    sharded_pool: Option<&crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> crate::error::HarvestResult<usize> {
     // Spawn a shard's fired follow-ups + record metrics, returning the count.
     // Done per-shard immediately after that shard's claim transaction commits, so
     // an error on a *later* shard can never drop an earlier shard's already-
@@ -968,11 +990,11 @@ pub async fn fire_due_debounced_starts_with_codecs(
 
     match sharded_pool {
         // Multi-shard: scan each assigned shard's own harvest_debounce table.
-        // A single assigned shard falls through to `conn`, the caller's own
-        // connection to that shard. See `connect_to_shard` for why.
-        Some(sp) if shard_assignments.len() > 1 => {
+        Some(sp) if !shard_assignments.is_empty() => {
             for shard in shard_assignments {
-                let Some(mut shard_conn) = crate::shard::connect_to_shard(
+                let Some(mut shard_conn) = crate::shard::connect_or_reuse(
+                    conn,
+                    conn_shard,
                     sp,
                     *shard,
                     "debounce",
