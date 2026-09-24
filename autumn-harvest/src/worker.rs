@@ -26069,11 +26069,41 @@ async fn dispatch_call<T>(
     call: impl std::future::Future<Output = HarvestResult<T>>,
     what: &'static str,
 ) -> HarvestResult<T> {
-    (tokio::time::timeout(DISPATCH_CALL_TIMEOUT, call).await).unwrap_or_else(|_| {
+    dispatch_call_with_timeout(call, what, DISPATCH_CALL_TIMEOUT).await
+}
+
+/// Run one channel call under an explicit deadline, rather than the flat
+/// [`DISPATCH_CALL_TIMEOUT`] (Codex review, issue #1429).
+///
+/// A batched multi-queue call (`ack_many`, `release_many`) is one round
+/// trip per distinct queue inside the channel implementation, not one
+/// round trip overall. See `ack_many_inner`'s/`requeue_batch`'s own doc
+/// comments for why. A flat deadline sized for a single round trip can
+/// then fire partway through that loop. `tokio::time::timeout` drops the
+/// whole future on expiry. A queue the loop had not yet reached is then
+/// never attempted at all, not merely left for a later retry. That
+/// silently breaks the "every queue is attempted" contract those two
+/// document.
+/// Scaling the deadline by the distinct queue count keeps a single-queue
+/// call's timeout unchanged and gives a multi-queue call the same budget
+/// per queue.
+async fn dispatch_call_with_timeout<T>(
+    call: impl std::future::Future<Output = HarvestResult<T>>,
+    what: &'static str,
+    timeout: Duration,
+) -> HarvestResult<T> {
+    (tokio::time::timeout(timeout, call).await).unwrap_or_else(|_| {
         Err(HarvestError::Dispatch(format!(
-            "dispatch {what} did not answer within {DISPATCH_CALL_TIMEOUT:?}"
+            "dispatch {what} did not answer within {timeout:?}"
         )))
     })
+}
+
+/// The deadline for a batched multi-queue channel call, scaled by how many
+/// distinct queues it touches (Codex review, issue #1429). See
+/// [`dispatch_call_with_timeout`] for why a flat deadline is not enough.
+fn dispatch_batch_timeout(distinct_queues: usize) -> Duration {
+    DISPATCH_CALL_TIMEOUT.saturating_mul(u32::try_from(distinct_queues.max(1)).unwrap_or(u32::MAX))
 }
 
 /// Per-shard block duration for a dispatch-channel read during multi-shard
@@ -28609,13 +28639,12 @@ impl Worker {
             }
             // The reservation is taken before the claim and lives until the
             // spawned task holds its permit. See [`DispatchReservation`].
-            let reservation = match lease.kind {
+            let kind = lease.kind;
+            let reservation = match kind {
                 Some(crate::dispatch::DispatchKind::Workflow) => {
-                    claimed_workflow += 1;
                     Some(DispatchReservation::new(&self.dispatch_reserved_workflow))
                 }
                 Some(crate::dispatch::DispatchKind::Activity) => {
-                    claimed_activity += 1;
                     Some(DispatchReservation::new(&self.dispatch_reserved_activity))
                 }
                 None => None,
@@ -28626,6 +28655,19 @@ impl Worker {
             {
                 ReferenceDisposition::Dispatched(lease) => {
                     dispatched += 1;
+                    // Only a reference this shard actually dispatched spends
+                    // its share of the pool (Codex review, issue #1429). A
+                    // stale, gated, or otherwise unclaimable reference used
+                    // to spend it too, before `consume_reference` ever ran.
+                    // That could exhaust the share on references this shard
+                    // never ran. Every later claimable lease of the same
+                    // kind in this batch would then go back to
+                    // `to_release`, even with ready capacity left.
+                    match kind {
+                        Some(crate::dispatch::DispatchKind::Workflow) => claimed_workflow += 1,
+                        Some(crate::dispatch::DispatchKind::Activity) => claimed_activity += 1,
+                        None => {}
+                    }
                     to_ack.push(lease);
                 }
                 ReferenceDisposition::AlreadyTerminal(lease) => to_ack.push(lease),
@@ -28644,16 +28686,31 @@ impl Worker {
         // restores that visibility,
         // throttled the same way a read/maintain/reconcile failure already
         // is.
-        if !to_ack.is_empty()
-            && let Err(error) = dispatch_call(installed.channel.ack_many(&to_ack), "ack").await
-        {
-            self.log_dispatch_error(state, &error, "dispatch batched ack failed");
+        if !to_ack.is_empty() {
+            let queues: HashSet<&str> = to_ack.iter().map(|l| l.queue_name.as_str()).collect();
+            let timeout = dispatch_batch_timeout(queues.len());
+            if let Err(error) =
+                dispatch_call_with_timeout(installed.channel.ack_many(&to_ack), "ack", timeout)
+                    .await
+            {
+                self.log_dispatch_error(state, &error, "dispatch batched ack failed");
+            }
         }
-        if !to_release.is_empty()
-            && let Err(error) =
-                dispatch_call(installed.channel.release_many(&to_release), "release").await
-        {
-            self.log_dispatch_error(state, &error, "dispatch batched release failed");
+        if !to_release.is_empty() {
+            let queues: HashSet<&str> = to_release
+                .iter()
+                .map(|(lease, _)| lease.queue_name.as_str())
+                .collect();
+            let timeout = dispatch_batch_timeout(queues.len());
+            if let Err(error) = dispatch_call_with_timeout(
+                installed.channel.release_many(&to_release),
+                "release",
+                timeout,
+            )
+            .await
+            {
+                self.log_dispatch_error(state, &error, "dispatch batched release failed");
+            }
         }
         dispatched
     }
@@ -42326,6 +42383,60 @@ mod tests {
         assert!(
             dispatch_kind_within_share(None, 999, 0, 999, 0),
             "an untyped reference has no kind-specific pool to exhaust"
+        );
+    }
+
+    /// A single-queue batch keeps the flat deadline unchanged; an N-queue
+    /// batch gets N times the per-queue budget (Codex review, issue #1429).
+    #[test]
+    fn dispatch_batch_timeout_scales_with_distinct_queue_count() {
+        assert_eq!(
+            dispatch_batch_timeout(1),
+            DISPATCH_CALL_TIMEOUT,
+            "a single-queue batch must not regress the flat deadline"
+        );
+        assert_eq!(dispatch_batch_timeout(3), DISPATCH_CALL_TIMEOUT * 3);
+        assert_eq!(
+            dispatch_batch_timeout(0),
+            DISPATCH_CALL_TIMEOUT,
+            "an empty batch still gets at least one queue's worth of budget"
+        );
+    }
+
+    /// A scaled deadline must not cut off a multi-queue call the flat
+    /// [`DISPATCH_CALL_TIMEOUT`] alone would have (Codex review, issue
+    /// #1429).
+    ///
+    /// `tokio::time::timeout` drops the whole future on expiry. A call
+    /// stands in for a 3-queue `ack_many_inner` loop here, taking longer
+    /// than one queue's flat budget but well inside three queues' worth.
+    /// It must still be allowed to finish.
+    #[tokio::test(start_paused = true)]
+    async fn dispatch_call_with_timeout_survives_what_a_flat_deadline_would_cut_off() {
+        let call = async {
+            tokio::time::sleep(DISPATCH_CALL_TIMEOUT + Duration::from_secs(1)).await;
+            Ok::<(), HarvestError>(())
+        };
+        let result = dispatch_call_with_timeout(call, "test", dispatch_batch_timeout(3)).await;
+        assert!(
+            result.is_ok(),
+            "a 3-queue budget must cover a call past the flat one-queue deadline"
+        );
+    }
+
+    /// A call that never answers must still time out under a scaled
+    /// deadline, same as under the flat one (Codex review, issue #1429).
+    #[tokio::test(start_paused = true)]
+    async fn dispatch_call_with_timeout_still_bounds_a_stuck_call() {
+        let result = dispatch_call_with_timeout(
+            std::future::pending::<HarvestResult<()>>(),
+            "test",
+            DISPATCH_CALL_TIMEOUT,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a call that never answers must still time out"
         );
     }
 
