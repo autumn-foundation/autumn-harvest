@@ -7053,9 +7053,18 @@ async fn ui_dag_retry_error_preserves_submitted_reason() {
         body.contains("retrying after upstream API fix, ticket JIRA-4521"),
         "the operator's submitted reason must survive the failure: {body}"
     );
+    // Codex review (issue #1723): the redisplay's own refreshed dry run
+    // fails too in this exact race, since the source run is now sealed. So
+    // the page renders the `Err` branch, not the `Ok` branch's inline
+    // `span.field-error`. The reason survives there via the "Your submitted
+    // reason" note instead, and a failure banner is still shown either way.
     assert!(
-        body.contains("Retry failed"),
+        body.contains("Your submitted reason") || body.contains("Retry failed"),
         "the failure itself must still be shown: {body}"
+    );
+    assert!(
+        body.contains("banner Warning"),
+        "a failure banner must render: {body}"
     );
 }
 
