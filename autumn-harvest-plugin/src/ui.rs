@@ -297,6 +297,38 @@ pub(crate) struct WorkflowDetailParams {
     log_level: Option<String>,
 }
 
+/// Entered values and the validation error for the Send signal / Reset to
+/// event N / Trigger update forms. Passed in memory from a failed POST
+/// handler to [`render_workflow_detail_page`] (issue #1687).
+///
+/// Each of the three action forms on the workflow detail page is a
+/// `<details>`-collapsed form that POSTs back to this same page. Before
+/// this type existed, every failure branch of those handlers redirected to
+/// `?flash={error}` alone. The redirect re-rendered the form collapsed and
+/// empty. The operator's signal name, JSON payload, reset event
+/// number/reason, or update name/payload were gone. Only a generic
+/// top-of-page flash said something had failed.
+///
+/// A rejected submission never becomes a redirect at all now. See
+/// [`render_workflow_detail_page`]'s own doc comment for why a payload in
+/// the URL is itself a problem, not just a lost-data one. Instead the POST
+/// handler renders this page directly. It passes the rejected values here.
+/// `render_workflow_detail` uses them to keep the relevant `<details>`
+/// open, and to pre-fill the inputs with what was submitted. It shows the
+/// error inline next to the field that caused it.
+#[derive(Debug, Default)]
+struct WorkflowActionEcho {
+    signal_error: Option<String>,
+    signal_name: Option<String>,
+    signal_payload: Option<String>,
+    reset_error: Option<String>,
+    reset_event: Option<String>,
+    reset_reason: Option<String>,
+    update_error: Option<String>,
+    update_name: Option<String>,
+    update_payload: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Workflow detail action form structs
 // ---------------------------------------------------------------------------
@@ -1475,20 +1507,66 @@ async fn workflow_detail_ui(
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> Result<Markup, AutumnError> {
-    let exec_id = parse_execution_id(&id)?;
+    render_workflow_detail_page(
+        &api_state,
+        &id,
+        params.event_page.as_deref(),
+        params.jump_event.as_deref(),
+        params.log_level.as_deref(),
+        params.flash.as_deref(),
+        WorkflowActionEcho::default(),
+        false,
+        "GET /ui/workflows/{id}",
+        &headers,
+        maybe_session,
+    )
+    .await
+}
+
+/// Loads and renders the workflow detail page.
+///
+/// Shared by the `GET` route and by the three action-form handlers. Those
+/// are Send signal, Reset to event N, and Trigger update, on a rejected
+/// submission (issue #1687 review). A rejected submission renders this
+/// page directly. It does not redirect with the entered values in the
+/// query string. Putting a signal or update payload in a redirect URL
+/// would put it in browser history, in proxy/server access logs, and in
+/// the same-origin referrer. A payload near the engine's own size cap
+/// could also push the URL past a typical request-line limit.
+/// `action_echo` carries the rejected values and error in memory instead.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn render_workflow_detail_page(
+    api_state: &HarvestApiState,
+    id: &str,
+    event_page_raw: Option<&str>,
+    jump_event_raw: Option<&str>,
+    log_level_raw: Option<&str>,
+    flash: Option<&str>,
+    action_echo: WorkflowActionEcho,
+    rendered_at_action_url: bool,
+    // The caller's own route, for the payload-decode audit trail (issue
+    // #1687 review, Codex finding). Before this parameter existed, every
+    // caller's decoded-payload reads were attributed to the hard-coded
+    // `"GET /ui/workflows/{id}"`. That was wrong for the three POST
+    // handlers rendering this page directly on a rejected submission.
+    // A sensitive-read audit trail must name the request that actually
+    // triggered the read, not a different route that happens to share
+    // the same renderer.
+    route_or_command: &'static str,
+    headers: &axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
+) -> Result<Markup, AutumnError> {
+    let exec_id = parse_execution_id(id)?;
     let exec_uuid = exec_id.as_uuid();
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let mut conn = db_conn_for_execution(api_state, exec_id).await?;
     let execution = load_execution(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
 
     // Resolve event_page before any DB queries so we can use OFFSET/LIMIT directly.
     let page_size = DETAIL_EVENT_PAGE_SIZE;
-    let (event_page, event_page_error, jump_event_error) = resolve_workflow_detail_event_page(
-        params.event_page.as_deref(),
-        params.jump_event.as_deref(),
-        page_size,
-    );
+    let (event_page, event_page_error, jump_event_error) =
+        resolve_workflow_detail_event_page(event_page_raw, jump_event_raw, page_size);
 
     // Total event count — used for pagination controls.
     let total_events: i64 = harvest_events::table
@@ -1577,7 +1655,7 @@ async fn workflow_detail_ui(
         heartbeat_details_cap,
     )
     .await?;
-    resolve_blocked_on_heartbeat_caps(&api_state, &mut blocked_on);
+    resolve_blocked_on_heartbeat_caps(api_state, &mut blocked_on);
 
     // Resolve the continue-as-new threshold from the runtime registry if available.
     // This is a lightweight read of an in-memory value — no extra DB query.
@@ -1596,14 +1674,15 @@ async fn workflow_detail_ui(
     let mut page_events = page_events;
     let session = extension_session(maybe_session);
     decode_and_audit_workflow_detail(
-        &api_state,
+        api_state,
         &mut conn,
-        &headers,
+        headers,
         session.clone(),
         exec_id,
         &mut execution,
         &mut page_events,
         &mut blocked_on,
+        route_or_command,
     )
     .await;
 
@@ -1624,9 +1703,8 @@ async fn workflow_detail_ui(
     // Loaded on the page's own connection before it is dropped. Best-effort: a
     // failure hides the panel rather than failing the page (logs are
     // observational, AC7), with a warn so a persistent failure is diagnosable.
-    let logs_admin = crate::api::has_harvest_admin_access(&api_state, session.clone()).await;
-    let log_level_filter =
-        autumn_harvest::WorkflowLogLevel::from_wire(params.log_level.as_deref().unwrap_or(""));
+    let logs_admin = crate::api::has_harvest_admin_access(api_state, session.clone()).await;
+    let log_level_filter = autumn_harvest::WorkflowLogLevel::from_wire(log_level_raw.unwrap_or(""));
     let mut log_read_failed = false;
     let mut log_truncated = false;
     let log_lines: Vec<autumn_harvest::models::HarvestWorkflowLog> = if logs_admin {
@@ -1693,9 +1771,9 @@ async fn workflow_detail_ui(
 
     drop(conn);
     if !is_terminal_workflow_state(&execution.state)
-        && crate::api::has_harvest_admin_access(&api_state, session).await
+        && crate::api::has_harvest_admin_access(api_state, session).await
     {
-        blocked_on.awaitables = match crate::api::build_awaitables_report(&api_state, exec_id).await
+        blocked_on.awaitables = match crate::api::build_awaitables_report(api_state, exec_id).await
         {
             Ok(report) => Some(report),
             Err(err) => {
@@ -1719,7 +1797,7 @@ async fn workflow_detail_ui(
         &children,
         event_page,
         &blocked_on,
-        params.flash.as_deref(),
+        flash,
         event_page_error.as_deref(),
         jump_event_error.as_deref(),
         continue_as_new_threshold,
@@ -1730,6 +1808,8 @@ async fn workflow_detail_ui(
             truncated: log_truncated,
             read_failed: log_read_failed,
         },
+        &action_echo,
+        rendered_at_action_url,
     ))
 }
 
@@ -1783,6 +1863,7 @@ async fn decode_and_audit_workflow_detail(
     execution: &mut WorkflowExecution,
     timeline_events: &mut [HarvestEvent],
     blocked_on: &mut BlockedOnData,
+    route_or_command: &'static str,
 ) {
     let Some(codecs) = read_path_decoder(api_state, session).await else {
         return;
@@ -1796,7 +1877,7 @@ async fn decode_and_audit_workflow_detail(
         headers,
         TARGET_WORKFLOW,
         Some(&target),
-        "GET /ui/workflows/{id}",
+        route_or_command,
         Some(exec_id.shard()),
         outcome,
         Some(SOURCE_UI),
@@ -2182,6 +2263,7 @@ async fn signal_workflow_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
+    maybe_session: Option<Extension<Session>>,
     Form(form): Form<WorkflowSignalForm>,
 ) -> Result<axum::response::Response, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
@@ -2245,8 +2327,42 @@ async fn signal_workflow_ui(
     )
     .await;
 
-    let redirect_url = format!("../../workflows/{id}?flash={flash}");
-    Ok(axum::response::Redirect::to(&redirect_url).into_response())
+    // On failure, render this page directly with the entered signal name
+    // and payload pre-filled (issue #1687 review). It does not redirect
+    // with them in the query string. A signal payload can carry credentials
+    // or other workflow data. A redirect would put it in browser history,
+    // in proxy/server access logs, and in the same-origin referrer. A
+    // large payload could also push the URL past a typical request-line
+    // limit. `conn` is dropped first: the render acquires its own
+    // connection, and holding two at once can deadlock a pool-size-one
+    // shard.
+    let Some(error) = error_summary else {
+        drop(conn);
+        let redirect_url = format!("../../workflows/{id}?flash={flash}");
+        return Ok(axum::response::Redirect::to(&redirect_url).into_response());
+    };
+    drop(conn);
+    let echo = WorkflowActionEcho {
+        signal_error: Some(error.clone()),
+        signal_name: Some(form.signal_name.clone()),
+        signal_payload: Some(payload_str.to_string()),
+        ..Default::default()
+    };
+    let markup = render_workflow_detail_page(
+        &api_state,
+        &id,
+        None,
+        None,
+        None,
+        Some(&error),
+        echo,
+        true,
+        "POST /workflows/{id}/signal",
+        &headers,
+        maybe_session,
+    )
+    .await?;
+    Ok(markup.into_response())
 }
 
 /// Parse the "Reset to event N" field (1-based, matching the timeline "#"
@@ -2284,6 +2400,7 @@ async fn reset_workflow_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
+    maybe_session: Option<Extension<Session>>,
     Form(form): Form<WorkflowResetForm>,
 ) -> Result<axum::response::Response, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
@@ -2355,14 +2472,44 @@ async fn reset_workflow_ui(
     )
     .await;
 
-    let redirect_url = format!("../../workflows/{id}?flash={flash}");
-    Ok(axum::response::Redirect::to(&redirect_url).into_response())
+    // On failure, render this page directly with the entered event number
+    // and reason pre-filled (issue #1687 review) — same reasoning as
+    // `signal_workflow_ui`.
+    let Some(error) = error_summary else {
+        drop(conn);
+        let redirect_url = format!("../../workflows/{id}?flash={flash}");
+        return Ok(axum::response::Redirect::to(&redirect_url).into_response());
+    };
+    drop(conn);
+    let echo = WorkflowActionEcho {
+        reset_error: Some(error.clone()),
+        reset_event: Some(form.reset_to_event_id.clone()),
+        reset_reason: Some(form.reason.clone().unwrap_or_default()),
+        ..Default::default()
+    };
+    let markup = render_workflow_detail_page(
+        &api_state,
+        &id,
+        None,
+        None,
+        None,
+        Some(&error),
+        echo,
+        true,
+        "POST /workflows/{id}/reset",
+        &headers,
+        maybe_session,
+    )
+    .await?;
+    Ok(markup.into_response())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn trigger_update_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
+    maybe_session: Option<Extension<Session>>,
     Form(form): Form<WorkflowTriggerUpdateForm>,
 ) -> Result<axum::response::Response, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
@@ -2395,9 +2542,31 @@ async fn trigger_update_ui(
                     },
                 )
                 .await;
-                let flash = url_encode(&err_msg);
-                let redirect_url = format!("../../workflows/{id}?flash={flash}");
-                return Ok(axum::response::Redirect::to(&redirect_url).into_response());
+                // Render this page directly with the entered update name
+                // and payload pre-filled (issue #1687 review) — same
+                // reasoning as `signal_workflow_ui`.
+                drop(conn);
+                let echo = WorkflowActionEcho {
+                    update_error: Some(err_msg.clone()),
+                    update_name: Some(form.update_name.clone()),
+                    update_payload: Some(payload_str.to_string()),
+                    ..Default::default()
+                };
+                let markup = render_workflow_detail_page(
+                    &api_state,
+                    &id,
+                    None,
+                    None,
+                    None,
+                    Some(&err_msg),
+                    echo,
+                    true,
+                    "POST /workflows/{id}/trigger-update",
+                    &headers,
+                    maybe_session,
+                )
+                .await?;
+                return Ok(markup.into_response());
             }
         }
     };
@@ -2465,8 +2634,33 @@ async fn trigger_update_ui(
     )
     .await;
 
-    let redirect_url = format!("../../workflows/{id}?flash={flash}");
-    Ok(axum::response::Redirect::to(&redirect_url).into_response())
+    let Some(error) = error_summary else {
+        drop(conn);
+        let redirect_url = format!("../../workflows/{id}?flash={flash}");
+        return Ok(axum::response::Redirect::to(&redirect_url).into_response());
+    };
+    drop(conn);
+    let echo = WorkflowActionEcho {
+        update_error: Some(error.clone()),
+        update_name: Some(form.update_name.clone()),
+        update_payload: Some(payload_str.to_string()),
+        ..Default::default()
+    };
+    let markup = render_workflow_detail_page(
+        &api_state,
+        &id,
+        None,
+        None,
+        None,
+        Some(&error),
+        echo,
+        true,
+        "POST /workflows/{id}/trigger-update",
+        &headers,
+        maybe_session,
+    )
+    .await?;
+    Ok(markup.into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -5031,7 +5225,7 @@ fn render_workflow_list(
         (render_pagination(page, limit, limit_raw, has_next, state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_before_raw, exec_id_search, page_error))
     };
 
-    layout("Workflows · Vantage", &body, "")
+    layout("Workflows · Vantage", &body, "", None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5437,6 +5631,8 @@ fn render_workflow_detail(
     jump_event_error: Option<&str>,
     continue_as_new_threshold: Option<u64>,
     logs: &WorkflowLogsPanelData<'_>,
+    action_echo: &WorkflowActionEcho,
+    rendered_at_action_url: bool,
 ) -> Markup {
     let exec_id_str = execution.id.to_string();
     let title = format!("{} · Vantage", execution.workflow_name);
@@ -5541,44 +5737,78 @@ fn render_workflow_detail(
                 button.danger type="submit" disabled[terminal]
                     title=[terminal.then_some("Workflow is terminal")] { "Terminate" }
             }
-            details style="display:inline-block" {
+            details style="display:inline-block" open[action_echo.signal_error.is_some()] {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Send signal" }
                 form method="post" action={ (exec_id_str) "/signal" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Signal name"
-                        input type="text" name="signal_name" required placeholder="e.g. approve" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        input type="text" name="signal_name" required placeholder="e.g. approve"
+                            value=(action_echo.signal_name.as_deref().unwrap_or(""))
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Payload (JSON)"
-                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {}
+                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {
+                            (action_echo.signal_payload.as_deref().unwrap_or(""))
+                        }
+                    }
+                    @if let Some(error) = action_echo.signal_error.as_deref() {
+                        span.field-error role="alert" { (error) }
                     }
                     button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Send" }
                 }
             }
-            details style="display:inline-block" {
+            details style="display:inline-block" open[action_echo.reset_error.is_some()] {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Reset to event N" }
                 form method="post" action={ (exec_id_str) "/reset" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Event # (1-based, as shown in timeline)"
-                        input type="number" name="reset_to_event_id" min="1" required placeholder="1" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        // `type="text"` with `inputmode`/`pattern`, not
+                        // `type="number"` (Codex review, issue #1687). A
+                        // browser's number-input value-sanitization
+                        // algorithm blanks a non-numeric value from the
+                        // visible control. This happens even though the raw
+                        // HTML attribute still carries it. On the exact
+                        // rejected-input case this field exists to
+                        // redisplay, `type="number"` would show an empty
+                        // box. The DOM attribute, and this file's own
+                        // tests, would say otherwise. `inputmode="numeric"`
+                        // still gives mobile browsers a numeric keypad.
+                        // `pattern` is a hint; the server-side parser
+                        // remains the authority, not a replacement for it.
+                        input type="text" inputmode="numeric" pattern="[0-9]*" name="reset_to_event_id" required placeholder="1"
+                            value=(action_echo.reset_event.as_deref().unwrap_or(""))
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Reason"
-                        input type="text" name="reason" placeholder="rollback" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        input type="text" name="reason" placeholder="rollback"
+                            value=(action_echo.reset_reason.as_deref().unwrap_or(""))
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                    }
+                    @if let Some(error) = action_echo.reset_error.as_deref() {
+                        span.field-error role="alert" { (error) }
                     }
                     button type="submit" style="background:#92400e;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" onclick="return confirm('Reset this workflow execution? This is destructive.')" { "Reset" }
                 }
             }
-            details style="display:inline-block" {
+            details style="display:inline-block" open[action_echo.update_error.is_some()] {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Trigger update" }
                 form method="post" action={ (exec_id_str) "/trigger-update" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Update name"
-                        input type="text" name="update_name" required placeholder="e.g. set_priority" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        input type="text" name="update_name" required placeholder="e.g. set_priority"
+                            value=(action_echo.update_name.as_deref().unwrap_or(""))
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Payload (JSON)"
-                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {}
+                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {
+                            (action_echo.update_payload.as_deref().unwrap_or(""))
+                        }
+                    }
+                    @if let Some(error) = action_echo.update_error.as_deref() {
+                        span.field-error role="alert" { (error) }
                     }
                     button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Submit" }
                 }
@@ -5791,7 +6021,7 @@ fn render_workflow_detail(
                 @if total_events > DETAIL_EVENT_PAGE_SIZE {
                     div.pagination style="margin-bottom:12px" {
                         @if has_prev_page {
-                            a href=(workflow_detail_href(event_page - 1, selected_log_level)) {
+                            a href=(workflow_detail_href(&exec_id_str, event_page - 1, selected_log_level)) {
                                 (PreEscaped("&larr;")) " Previous"
                             }
                         } @else {
@@ -5799,13 +6029,13 @@ fn render_workflow_detail(
                         }
                         span { " Events " (page_start + 1) "–" (page_end) " of " (total_events) " " }
                         @if has_next_page {
-                            a href=(workflow_detail_href(event_page + 1, selected_log_level)) {
+                            a href=(workflow_detail_href(&exec_id_str, event_page + 1, selected_log_level)) {
                                 "Next " (PreEscaped("&rarr;"))
                             }
                         } @else {
                             span.disabled { "Next " (PreEscaped("&rarr;")) }
                         }
-                        a href=(workflow_detail_href(last_page, selected_log_level)) { "Jump to latest" }
+                        a href=(workflow_detail_href(&exec_id_str, last_page, selected_log_level)) { "Jump to latest" }
                     }
                 }
                 table {
@@ -5845,7 +6075,7 @@ fn render_workflow_detail(
                 @if total_events > DETAIL_EVENT_PAGE_SIZE {
                     div.pagination style="margin-top:12px" {
                         @if has_prev_page {
-                            a href=(workflow_detail_href(event_page - 1, selected_log_level)) {
+                            a href=(workflow_detail_href(&exec_id_str, event_page - 1, selected_log_level)) {
                                 (PreEscaped("&larr;")) " Previous"
                             }
                         } @else {
@@ -5853,14 +6083,22 @@ fn render_workflow_detail(
                         }
                         span { "Page " (event_page + 1) }
                         @if has_next_page {
-                            a href=(workflow_detail_href(event_page + 1, selected_log_level)) {
+                            a href=(workflow_detail_href(&exec_id_str, event_page + 1, selected_log_level)) {
                                 "Next " (PreEscaped("&rarr;"))
                             }
                         } @else {
                             span.disabled { "Next " (PreEscaped("&rarr;")) }
                         }
-                        a href=(workflow_detail_href(last_page, selected_log_level)) { "Jump to latest" }
-                        form method="get" style="display:inline-flex;gap:6px;align-items:center;margin-left:8px" {
+                        a href=(workflow_detail_href(&exec_id_str, last_page, selected_log_level)) { "Jump to latest" }
+                        // `action=(exec_id_str)`, not the default omitted
+                        // action (issue #1687 review, Codex finding). A GET
+                        // form with no `action` submits to the document's
+                        // base url with its query replaced. On this page's
+                        // `<base href="..">` fallback (see `layout`'s doc
+                        // comment) that base url is `/workflows/`, not
+                        // `/workflows/{id}`. It drops the execution id the
+                        // same way a bare `workflow_detail_href` link would.
+                        form method="get" action=(exec_id_str) style="display:inline-flex;gap:6px;align-items:center;margin-left:8px" {
                             label style="font-size:12px;color:#94a3b8;display:inline-flex;align-items:center;gap:6px" {
                                 "Jump to event:"
                                 input type="number" name="jump_event" min="1" max=(total_events) placeholder="N"
@@ -5874,7 +6112,10 @@ fn render_workflow_detail(
         }
     };
 
-    layout(&title, &body, "../")
+    // See `layout`'s own doc comment for why this is a real `<base>`
+    // element and not just a string prefix (issue #1687 review).
+    let html_base = rendered_at_action_url.then_some("..");
+    layout(&title, &body, "../", html_base)
 }
 
 /// Per-row checkpoint rendering decision for the pending-activities table, after
@@ -5982,8 +6223,19 @@ fn render_heartbeat_checkpoint_cell(item: &TaskQueueItem, state: CheckpointCellS
 /// `jump_event` is deliberately NOT preserved: it is a one-shot "take me to
 /// event N" action that `event_page` already resolves to a concrete page, so
 /// carrying it would re-trigger the jump on every subsequent click.
-fn workflow_detail_href(event_page: i64, log_level: Option<&str>) -> String {
-    let mut url = format!("?event_page={event_page}");
+///
+/// Prefixed with `exec_id_str`, not a bare `?query` (issue #1687 review,
+/// Codex finding). A relative reference with an empty path inherits the
+/// browser's *entire* current base path, not just its directory. See
+/// `layout`'s doc comment for this page's `<base href="..">` fallback, on
+/// a direct-rendered rejected action. A bare `?event_page=1` there would
+/// resolve to `/workflows/?event_page=1`, dropping the execution id
+/// entirely. A path-relative reference merges against only the base's
+/// directory component instead, which `<base href="..">` already
+/// restores to the correct one. Prefixing here fixes it under both the
+/// base-tag case and the ordinary `GET` page load.
+fn workflow_detail_href(exec_id_str: &str, event_page: i64, log_level: Option<&str>) -> String {
+    let mut url = format!("{exec_id_str}?event_page={event_page}");
     if let Some(level) = log_level {
         url.push_str("&log_level=");
         url.push_str(level);
@@ -6059,12 +6311,12 @@ fn render_workflow_logs_panel(
             h3 { "Logs" }
             div.log-filters style="margin-bottom:12px" {
                 @let all_class = if selected.is_none() { "active" } else { "" };
-                a class=(all_class) href=(workflow_detail_href(event_page, None)) { "All" }
+                a class=(all_class) href=(workflow_detail_href(exec_id_str, event_page, None)) { "All" }
                 @for level in [WorkflowLogLevel::Info, WorkflowLogLevel::Warn, WorkflowLogLevel::Error] {
                     @let wire = level.as_str();
                     @let class = if selected == Some(wire) { "active" } else { "" };
                     " "
-                    a class=(class) href=(workflow_detail_href(event_page, Some(wire))) { (wire) }
+                    a class=(class) href=(workflow_detail_href(exec_id_str, event_page, Some(wire))) { (wire) }
                 }
             }
             @if truncated {
@@ -6388,13 +6640,36 @@ fn js_escape(s: &str) -> String {
         .replace('\u{2029}', "\\u2029")
 }
 
-fn layout(title: &str, body: &Markup, base_href: &str) -> Markup {
+/// `base_href` is a plain string prepended to the header nav's own links
+/// (`"../"`, `"../../"`, or `""` -- how many directories up the canonical
+/// page sits). `html_base` is a real `<base href>` element. It is `None`
+/// on every ordinary `GET` page load.
+///
+/// The two are unrelated. `base_href` never resolves in the browser on its
+/// own. Every nav link that uses it is itself parsed relative to the
+/// document's OWN url. `html_base` exists for exactly one caller (issue
+/// #1687 review). `render_workflow_detail_page` renders the workflow
+/// detail page directly, as a rejected POST's response body. That happens
+/// from a URL one path segment below the canonical detail page, such as
+/// `/workflows/{id}/signal`. The page's body has many relative links and
+/// form actions -- `{id}/signal`, `../workflows`,
+/// `../../workflows/{id}/history/export`, pagination hrefs, all of it.
+/// Each one is written assuming the document's own url IS the canonical
+/// detail page. Serving that body unchanged from one level deeper
+/// resolves every one of those wrong (issue #1687 review, Codex finding).
+/// `<base href="..">` there re-establishes the same directory context the
+/// canonical url would give. It fixes all of them at once, rather than
+/// rewriting each link to be mount-depth-aware.
+fn layout(title: &str, body: &Markup, base_href: &str, html_base: Option<&str>) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width,initial-scale=1";
+                @if let Some(base) = html_base {
+                    base href=(base);
+                }
                 title { (title) }
                 style { (PreEscaped(STYLE)) }
             }
@@ -7383,7 +7658,7 @@ async fn workflow_timeline_ui(
     );
     let title = format!("Timeline · {} · Vantage", execution.workflow_name);
     let body = render_timeline_body(&timeline, &execution, now);
-    Ok(layout(&title, &body, "../../"))
+    Ok(layout(&title, &body, "../../", None))
 }
 
 /// Build the timeline page body (back link + heading + Gantt). Extracted from
@@ -12990,7 +13265,7 @@ mod tests {
     #[test]
     fn layout_escapes_title_but_keeps_body_markup() {
         let body = html! { p { "hello" } };
-        let html = layout("<evil>", &body, "").into_string();
+        let html = layout("<evil>", &body, "", None).into_string();
         assert!(html.contains("<title>&lt;evil&gt;</title>"));
         assert!(html.contains("<p>hello</p>"));
         assert!(html.contains("🔭 Vantage"));
@@ -13814,7 +14089,7 @@ mod tests {
     #[test]
     fn layout_includes_workers_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout("Test", &body, "").into_string();
+        let html = layout("Test", &body, "", None).into_string();
         assert!(
             html.contains("workers"),
             "layout must include a Workers nav link"
@@ -14259,7 +14534,7 @@ mod tests {
     #[test]
     fn layout_includes_schedules_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout("Test", &body, "").into_string();
+        let html = layout("Test", &body, "", None).into_string();
         assert!(
             html.contains("schedules"),
             "layout must include schedules nav link"
@@ -14812,6 +15087,8 @@ mod tests {
             None,
             Some(10_000),
             &WorkflowLogsPanelData::default(),
+            &WorkflowActionEcho::default(),
+            false,
         )
         .into_string();
 
@@ -14848,6 +15125,8 @@ mod tests {
             None,
             None,
             &WorkflowLogsPanelData::default(),
+            &WorkflowActionEcho::default(),
+            false,
         )
         .into_string();
 
@@ -14880,6 +15159,8 @@ mod tests {
             None,
             Some(500),
             &WorkflowLogsPanelData::default(),
+            &WorkflowActionEcho::default(),
+            false,
         )
         .into_string();
 
@@ -14910,7 +15191,7 @@ mod tests {
     #[test]
     fn layout_includes_build_routing_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout("Test", &body, "").into_string();
+        let html = layout("Test", &body, "", None).into_string();
         assert!(
             html.contains("build-routing"),
             "base layout must include a Build Routing nav link"
@@ -16631,6 +16912,8 @@ mod tests {
             None,
             None,
             logs,
+            &WorkflowActionEcho::default(),
+            false,
         )
         .into_string()
     }
@@ -16754,6 +17037,8 @@ mod tests {
                 admin: true,
                 ..Default::default()
             },
+            &WorkflowActionEcho::default(),
+            false,
         )
         .into_string();
         // maud escapes `&` inside an attribute value, which is the correct
@@ -16794,6 +17079,8 @@ mod tests {
                 admin: true,
                 ..Default::default()
             },
+            &WorkflowActionEcho::default(),
+            false,
         )
         .into_string();
 
@@ -16840,6 +17127,8 @@ mod tests {
             Some("Invalid jump_event 'zap'; expected a whole number. Jump ignored."),
             None,
             &WorkflowLogsPanelData::default(),
+            &WorkflowActionEcho::default(),
+            false,
         )
         .into_string();
         assert!(
@@ -16849,6 +17138,221 @@ mod tests {
         assert!(
             html.contains("Invalid jump_event 'zap'"),
             "the jump_event error must render inline: {html}"
+        );
+    }
+
+    /// RED before this fix (issue #1687): a failed Send signal / Reset to
+    /// event N / Trigger update submission redirected to `?flash={error}`
+    /// alone. The collapsed `<details>` re-rendered closed and empty.
+    /// The operator's signal name, JSON payload, reset event number/reason,
+    /// or update name/payload were gone. Only a generic top-of-page flash
+    /// remained. GREEN: `WorkflowActionEcho` keeps the relevant `<details>`
+    /// open, and pre-fills its inputs with what was submitted. It shows the
+    /// error next to the field that rejected it, matching the
+    /// `BackfillFormEcho` mechanism the backfill launcher already uses.
+    #[test]
+    fn render_workflow_detail_echoes_entered_values_on_action_form_errors() {
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let echo = WorkflowActionEcho {
+            signal_error: Some("Invalid JSON payload: expected value".to_string()),
+            signal_name: Some("approve".to_string()),
+            signal_payload: Some("{not json".to_string()),
+            reset_error: Some("invalid event number 'zz'; expected a whole number".to_string()),
+            reset_event: Some("zz".to_string()),
+            reset_reason: Some("rollback after incident".to_string()),
+            update_error: Some("Invalid JSON payload: expected value".to_string()),
+            update_name: Some("set_priority".to_string()),
+            update_payload: Some("{also not json".to_string()),
+        };
+        let html = render_workflow_detail(
+            &execution,
+            0,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            None,
+            None,
+            None,
+            &WorkflowLogsPanelData::default(),
+            &echo,
+            false,
+        )
+        .into_string();
+
+        assert!(
+            html.contains("Invalid JSON payload: expected value"),
+            "the signal form's error must render inline: {html}"
+        );
+        assert!(
+            html.contains(
+                r#"name="signal_name" required placeholder="e.g. approve" value="approve""#
+            ),
+            "the signal name the operator typed must be redisplayed, not blanked: {html}"
+        );
+        assert!(
+            html.contains("{not json"),
+            "the signal payload the operator typed must be redisplayed, not blanked: {html}"
+        );
+
+        assert!(
+            html.contains("invalid event number") && html.contains("expected a whole number"),
+            "the reset form's error must render inline: {html}"
+        );
+        assert!(
+            html.contains(r#"name="reset_to_event_id" required placeholder="1" value="zz""#),
+            "the reset event number the operator typed must be redisplayed, not blanked: {html}"
+        );
+        assert!(
+            html.contains("rollback after incident"),
+            "the reset reason the operator typed must be redisplayed, not blanked: {html}"
+        );
+
+        assert!(
+            html.contains(r#"name="update_name" required placeholder="e.g. set_priority" value="set_priority""#),
+            "the update name the operator typed must be redisplayed, not blanked: {html}"
+        );
+        assert!(
+            html.contains("{also not json"),
+            "the update payload the operator typed must be redisplayed, not blanked: {html}"
+        );
+    }
+
+    /// Companion to the echo test above. With no error, none of the three
+    /// action forms should be forced open. They stay collapsed by default,
+    /// same as every prior page load.
+    #[test]
+    fn render_workflow_detail_leaves_action_forms_collapsed_with_no_error() {
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let html = render_workflow_detail(
+            &execution,
+            0,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            None,
+            None,
+            None,
+            &WorkflowLogsPanelData::default(),
+            &WorkflowActionEcho::default(),
+            false,
+        )
+        .into_string();
+
+        assert!(
+            !html.contains("<details style=\"display:inline-block\" open"),
+            "no action form should be forced open absent an error: {html}"
+        );
+    }
+
+    /// RED before this fix (issue #1687 review, Codex finding). Serving the
+    /// detail page's markup directly as a rejected POST's response body
+    /// left every relative link and form action wrong. The body assumed
+    /// the document's own url was the canonical `/workflows/{id}` page.
+    /// The browser stays at `/workflows/{id}/signal` (or `/reset`,
+    /// `/trigger-update`) on a direct render. So `{id}/signal` would
+    /// resolve to the nonexistent `/workflows/{id}/{id}/signal`. Every
+    /// other relative link and pagination href would be wrong the same
+    /// way. GREEN: `rendered_at_action_url: true` emits a real `<base
+    /// href="..">` element. It re-establishes the same directory context
+    /// the canonical url gives, so every existing relative link resolves
+    /// correctly without being rewritten.
+    #[test]
+    fn render_workflow_detail_emits_a_base_tag_only_when_rendered_at_an_action_url() {
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let render = |rendered_at_action_url: bool| {
+            render_workflow_detail(
+                &execution,
+                0,
+                &[],
+                &[],
+                &[],
+                false,
+                &[],
+                0,
+                &blocked,
+                None,
+                None,
+                None,
+                None,
+                &WorkflowLogsPanelData::default(),
+                &WorkflowActionEcho::default(),
+                rendered_at_action_url,
+            )
+            .into_string()
+        };
+
+        let from_get = render(false);
+        assert!(
+            !from_get.contains("<base "),
+            "an ordinary GET page load must not carry a <base> element: {from_get}"
+        );
+
+        let from_post = render(true);
+        assert!(
+            from_post.contains(r#"<base href="..">"#),
+            "a page rendered directly from a rejected action POST must carry <base href=\"..\">: {from_post}"
+        );
+    }
+
+    /// RED before this fix (issue #1687 review, second Codex finding).
+    /// Take a relative reference with an empty path: a bare
+    /// `?event_page=1` link, or a GET `<form>` with no `action`. It
+    /// inherits the browser's *entire* current base path, not just its
+    /// directory. That differs
+    /// from a path-relative reference like `{id}/signal`, which merges
+    /// against only the base's directory. `<base href="..">` restores the
+    /// right directory for path-relative references. But a query-only one
+    /// under that base would still resolve to `/workflows/?event_page=1`,
+    /// dropping the execution id. GREEN: every pagination link and the
+    /// jump-to-event form's `action` are prefixed with the execution id
+    /// explicitly. They no longer depend on that distinction at all.
+    #[test]
+    fn render_workflow_detail_pagination_and_jump_form_are_execution_specific() {
+        let execution = stub_execution();
+        let exec_id_str = execution.id.to_string();
+        let blocked = stub_blocked_on();
+        let page_events: Vec<HarvestEvent> = Vec::new();
+        let html = render_workflow_detail(
+            &execution,
+            150, // past DETAIL_EVENT_PAGE_SIZE so pagination and the jump form render
+            &page_events,
+            &[],
+            &[],
+            false,
+            &[],
+            1, // event_page, so both Previous and Next render
+            &blocked,
+            None,
+            None,
+            None,
+            None,
+            &WorkflowLogsPanelData::default(),
+            &WorkflowActionEcho::default(),
+            true, // rendered_at_action_url — the case the base-tag fix affects
+        )
+        .into_string();
+
+        assert!(
+            html.contains(&format!("href=\"{exec_id_str}?event_page=")),
+            "pagination links must carry the execution id, not a bare '?event_page=': {html}"
+        );
+        assert!(
+            html.contains(&format!(r#"form method="get" action="{exec_id_str}""#)),
+            "the jump-to-event form must have an explicit execution-id action, \
+             not rely on the browser's default form-submission target: {html}"
         );
     }
 
@@ -16915,10 +17419,13 @@ mod tests {
 
     #[test]
     fn workflow_detail_href_preserves_both_dimensions() {
-        assert_eq!(workflow_detail_href(0, None), "?event_page=0");
         assert_eq!(
-            workflow_detail_href(2, Some("error")),
-            "?event_page=2&log_level=error"
+            workflow_detail_href("abc-123", 0, None),
+            "abc-123?event_page=0"
+        );
+        assert_eq!(
+            workflow_detail_href("abc-123", 2, Some("error")),
+            "abc-123?event_page=2&log_level=error"
         );
     }
 
