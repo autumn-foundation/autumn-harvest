@@ -3223,12 +3223,13 @@ mod probes {
     /// whole reference set.
     ///
     /// The retention-summary proof a few lines below is batched the same way
-    /// (issue #1704 follow-up): every reference in the chunk whose target row
-    /// is absent is resolved by one shared `= ANY($1)` call to
-    /// [`matching_retention_summaries`], not one `EXISTS` round trip per such
-    /// reference. A restore drill against a backup old enough for retention
-    /// to have already run makes this branch the common case, not an edge
-    /// case, for a `ChildTerminalRecorded` reference set.
+    /// (issue #1704 follow-up). Every reference in the chunk whose target row
+    /// is absent resolves through one shared `= ANY($1)` call to
+    /// [`matching_retention_summaries`]. That replaces one `EXISTS` round
+    /// trip per such reference. A restore drill against a backup old enough
+    /// for retention to have already run is common, not rare. For a
+    /// `ChildTerminalRecorded` reference set, this branch is the ordinary
+    /// case, not an edge case.
     async fn adjudicate_refs(conn: &mut AsyncPgConnection, owned: &[&PendingRef]) -> RefBuckets {
         let mut out = RefBuckets::default();
 
@@ -3249,8 +3250,8 @@ mod probes {
             };
 
             // Pre-resolve retention-summary proof for the whole chunk before
-            // the per-reference match below, so that match only ever reads
-            // an already-fetched set -- never awaits a query of its own.
+            // the per-reference match below. That match then only ever reads
+            // an already-fetched set. It never awaits a query of its own.
             let retention_present = retention_present_for_chunk(conn, chunk, &states).await;
 
             for r in chunk {
