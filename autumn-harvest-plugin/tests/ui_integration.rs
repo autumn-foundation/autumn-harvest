@@ -6973,6 +6973,92 @@ async fn ui_dag_retry_error_renders_human_message() {
     );
 }
 
+// I-E2
+/// Issue #1723 fix: a genuine commit failure must not drop the operator's
+/// submitted retry `reason`.
+///
+/// Seeds a genuinely retryable (`FAILED`) run and confirms the form renders
+/// with the editable `reason` field. A competing retry then really runs and
+/// seals the source `TERMINATED` (`terminate_source_execution`, `reset.rs`).
+/// That happens before the operator submits the form they had open. This is
+/// the same race issue #1723 describes. It reproduces against the real
+/// handler, rather than only the pure redirect-decision function.
+#[tokio::test]
+async fn ui_dag_retry_error_preserves_submitted_reason() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    let (ia, ib) = (
+        autumn_harvest::ActivityExecId::new(),
+        autumn_harvest::ActivityExecId::new(),
+    );
+    let events = vec![
+        dag957_sched("dag957_step_a", ia),
+        dag957_started(ia),
+        dag957_completed(ia),
+        dag957_sched("dag957_step_b", ib),
+        dag957_started(ib),
+        dag957_failed(ib),
+        autumn_harvest::WorkflowEvent::workflow_failed("dag failed"),
+    ];
+    let exec_id = dag957_seed_run(
+        &url,
+        "dag957_linear",
+        "graph-reason-preserved",
+        events,
+        "FAILED",
+    )
+    .await;
+
+    // The confirm page renders the editable form for this still-open run --
+    // this is the page the operator actually sees and types into.
+    let (status, html) = fetch_html(
+        &app,
+        &format!("/dags/dag957_linear/runs/{exec_id}/retry?from_node=dag957_step_b"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "confirm page must render: {html}");
+    assert!(html.contains("reason"), "reason field must be present");
+
+    // Race: a second operator (or an automatic recovery) retries the same
+    // node first, through a real commit against the real handler. It forks a
+    // new run and seals THIS source `TERMINATED`, exactly as
+    // `terminate_source_execution` does for a live competing retry.
+    let (competing_status, _headers, competing_body) = post_form(
+        &app,
+        &format!("/dags/dag957_linear/runs/{exec_id}/retry"),
+        "from_node=dag957_step_b&reason=competing+operator+retry",
+    )
+    .await;
+    assert!(
+        competing_status.is_redirection(),
+        "the competing retry must itself succeed: {competing_status} {competing_body}"
+    );
+
+    // The first operator, still looking at the form from the confirm page
+    // fetched above, submits it -- unaware the source run is now sealed.
+    let (status, _headers, body) = post_form(
+        &app,
+        &format!("/dags/dag957_linear/runs/{exec_id}/retry"),
+        "from_node=dag957_step_b&reason=retrying+after+upstream+API+fix,+ticket+JIRA-4521",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a genuine commit failure renders the confirm page in place, not a \
+         redirect: {body}"
+    );
+    assert!(
+        body.contains("retrying after upstream API fix, ticket JIRA-4521"),
+        "the operator's submitted reason must survive the failure: {body}"
+    );
+    assert!(
+        body.contains("Retry failed"),
+        "the failure itself must still be shown: {body}"
+    );
+}
+
 // I-F
 #[tokio::test]
 async fn ui_dag_run_graph_classic_dag_degraded() {
