@@ -1943,6 +1943,6 @@ standalone note rather than part of the claim-path attribution table above:
   — the per-child `harvest_events` N+1 in
   `check_and_report_unfinished_handlers`'s parent-close-cascade callers,
   spanning eighteen call sites across `worker.rs`, `timeout.rs`,
-  `execution.rs`, and `completion_trigger.rs`; batched into one `eq_any`
-  query via `check_and_report_unfinished_handlers_batch` (calls 400→1,
-  buffers -75.4% at a 400-child fixture).
+  `execution.rs`, and `completion_trigger.rs`; batched into a chunked
+  `eq_any` query via `check_and_report_unfinished_handlers_batch` (calls
+  400→4 at a 400-child fixture, 100 executions per chunk).

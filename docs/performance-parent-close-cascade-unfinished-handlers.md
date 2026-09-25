@@ -35,7 +35,7 @@ Eighteen call sites carried this loop, across `worker.rs`, `timeout.rs`,
   the terminal-write commit-boundary path); two resolve per-execution
   cross-shard residence and may route different ids to different physical
   connections (`timeout.rs`'s cross-pool cancel-outbox sweep).
-* **The fix is one new batched query** —
+* **The fix is one new batched, chunked query** —
   `store::load_histories_undecoded_batch`, an `eq_any` load over
   `harvest_events` grouped by execution id in memory — and one new
   `execution::check_and_report_unfinished_handlers_batch` that reports each
@@ -43,12 +43,27 @@ Eighteen call sites carried this loop, across `worker.rs`, `timeout.rs`,
   index change (the existing `idx_harvest_events_exec (workflow_exec_id,
   event_id)` index already serves the batched query's `eq_any` + `ORDER BY`
   exactly as it served the single-execution query's `=` + `ORDER BY`).
+  **Review finding on this PR (Codex, P2):** an unchunked `eq_any` over an
+  unbounded cascade would materialize every event row of every requested
+  execution into one `Vec` before grouping, turning peak memory from "one
+  history" into "the sum of every history in the cascade." The shipped
+  version chunks `exec_ids` into groups of `HISTORY_BATCH_CHUNK = 100`, one
+  query per chunk, bounding peak memory back down to roughly one chunk's
+  worth at the cost of `ceil(n / 100)` round trips instead of one.
 * **Measured on a 400-child fixture**: the per-child loop issued **400**
   `harvest_events` statements touching **1,573** buffers
-  (`shared_blks_hit + shared_blks_read`); the batched call issues **1**
-  statement touching **387** buffers — **calls 400→1**, **buffers -75.4%**.
-  This clears the impact floor twice over: it eliminates an N+1 outright,
-  and the buffer reduction alone clears the 20% floor by a wide margin.
+  (`shared_blks_hit + shared_blks_read`); the chunked batched call issues
+  **4** statements (400 executions / 100 per chunk) touching **1,548**
+  buffers — **calls 400→4 (-99.0%)**. This clears the impact floor via
+  N+1 elimination: statement count drops from one-per-execution to a small
+  constant, bounded by the chunk size regardless of cascade width. The
+  buffer count barely moves at this size (**-1.6%**, short of the 20%
+  floor) — chunking trades away most of the single-scan buffer win the
+  unchunked version had, in exchange for the bounded-memory guarantee the
+  review flagged as missing. For a cascade at or under the 100-execution
+  chunk size (the common case per the original investigation, "dozens to
+  hundreds" of children), the chunked form still collapses to a single
+  query, matching the unchunked version's numbers exactly.
 * **Result-equivalence is exact.** Both strategies report the identical
   sorted set of `(workflow_name, unfinished_update_handler_count)` pairs —
   asserted in both the always-run correctness test and the evidence-capture
@@ -97,10 +112,10 @@ Both strategies ran against the identical seeded fixture in the same
 session, with `pg_stat_statements` reset between them so each capture is
 attributable to only its own strategy.
 
-| | Before (looped, N=400) | After (batched, N=1) | Δ |
+| | Before (looped, N=400) | After (chunked batch, 100/chunk) | Δ |
 |:--|--:|--:|--:|
-| `harvest_events` SELECT calls | 400 | 1 | -99.75% |
-| Total buffers (`shared_blks_hit + shared_blks_read`) | 1,573 | 387 | -75.40% |
+| `harvest_events` SELECT calls | 400 | 4 | -99.00% |
+| Total buffers (`shared_blks_hit + shared_blks_read`) | 1,573 | 1,548 | -1.59% |
 | Unfinished-handler reports | 27 | 27 | identical (byte-for-byte) |
 
 Raw `pg_stat_statements` rows and the full sorted result-row dumps are
@@ -112,9 +127,9 @@ The batched query's plan text itself changes shape as expected — `WHERE
 workflow_exec_id = $1` becomes `WHERE workflow_exec_id = ANY($1) ORDER BY
 workflow_exec_id ASC, event_id ASC` — but still leads on the same
 `idx_harvest_events_exec (workflow_exec_id, event_id)` index the
-single-execution form used; Postgres serves the whole batch as one ordered
-index scan across every requested execution rather than 400 independent
-point lookups.
+single-execution form used. Postgres serves each 100-execution chunk as one
+ordered index scan, four scans total for this 400-child fixture, instead of
+400 independent point lookups.
 
 ## Equivalence
 

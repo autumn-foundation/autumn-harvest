@@ -2,9 +2,9 @@
 [
     StatRow {
         query: "SELECT \"harvest_events\".\"id\", \"harvest_events\".\"workflow_exec_id\", \"harvest_events\".\"event_id\", \"harvest_events\".\"event_type\", \"harvest_events\".\"event_data\", \"harvest_events\".\"timestamp\" FROM \"harvest_events\" WHERE (\"harvest_events\".\"workflow_exec_id\" = ANY($1)) ORDER BY \"harvest_events\".\"workflow_exec_id\" ASC, \"harvest_events\".\"event_id\" ASC",
-        calls: 1,
-        shared_blks_hit: 387,
+        calls: 4,
+        shared_blks_hit: 1548,
         shared_blks_read: 0,
-        total_buffers: 387,
+        total_buffers: 1548,
     },
 ]
