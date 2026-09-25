@@ -1,13 +1,25 @@
 # 🚦 Semaphore CI health — the `quota_enforcement_tests`/`integration_e2e.rs:1383` SOURCE-completion hang series closes; two more independently-diagnosed flakes and the shard rebalance landed alongside it; one open PR's harness needs a fresh run against today's manifest before merging
 
 **Status:** health report — no PR opened against `ci.yml` or any test file. This
-role's hard gate is not met because there is no new mechanism to diagnose: every
-open item the series was tracking as of the last report
-(`docs/rnd/2026-09-24-ci-health-semaphore-source-completion-hang-confirmed-fixed.md`)
-has already been fixed and merged by other sessions in the ~28 hours since, and
-this session's own check of the post-merge CI history found no new failure
-signature to investigate. Nothing here changes the tolerance of any test; this
-is confirmation plus one procedural flag.
+role's hard gate is not met because there is no new mechanism to diagnose: the
+one item the last report treated as an open bug — the `integration_e2e.rs:1383`
+hang itself — is fixed and merged, and this session's own check of the
+post-merge CI history found no new failure signature to investigate.
+
+**Correction (post-review, Codex on this PR).** An earlier draft of this
+paragraph said "every open item the series was tracking... has already been
+fixed," which overstates it. The last report's own Treatment section (line
+254-266) also flagged a recurring bug-class follow-up as a candidate for a
+*future* session, explicitly not attempted there: nothing checks that an
+allowlisted hand-rolled migration bundle (like `integration_e2e.rs`'s
+`INIT_SQL`) stays complete as new migrations land, which is exactly how this
+hang's root cause was introduced in the first place. `676e79c3` only appended
+the one missing migration; it did not add that guard, and
+`migration_hygiene.rs`'s `no_new_handrolled_migration_bundles_outside_allowlist`
+still only checks for new offenders and stale allowlist entries (verified this
+session), not bundle completeness. That item is still open — carried forward
+below, not closed by this report. Nothing here changes the tolerance of any
+test; this is confirmation of the hang's fix plus two procedural flags.
 
 ## 🎯 Verdict path
 
@@ -104,7 +116,22 @@ Do not attribute the hang's fix to the rebalance — the collision
 old 11-shard layout) only ever explained why both suites' failures showed up
 in the *same* CI job; it was never the reason either suite failed on its own.
 
-## 🔧 Treatment — one procedural flag, not actioned
+## 🔧 Treatment — two procedural flags, neither actioned
+
+**Carried forward, not fixed: the allowlist-completeness gap.** The prior
+report (`docs/rnd/2026-09-24-...-confirmed-fixed.md:254-266`) named this as
+a real, recurring bug class — an allowlisted hand-rolled migration bundle
+(`integration_e2e.rs`'s `INIT_SQL`, on `ALLOWED_HANDROLLED_MIGRATION_INCLUDES`)
+has no check that it stays complete as new migrations land, which is exactly
+how this series' whole tracked hang got introduced on 09-20. `676e79c3`
+fixed the one missing migration; it did not add that check. Verified this
+session: `migration_hygiene.rs`'s `no_new_handrolled_migration_bundles_outside_allowlist`
+still only asserts (1) no new file outside the allowlist reintroduces a bundle
+and (2) no allowlisted entry has gone stale — neither direction compares an
+allowlisted bundle's included migrations against the full `migrations/`
+directory. Not fixed here either, for the same reason the prior report gave:
+this is a real product/test-harness improvement, not a health-report action.
+Carrying it forward again so a future session doesn't have to re-discover it.
 
 **Correction (post-review, Codex on this PR).** An earlier draft of this
 section claimed merging PR #1703 as-is "would reintroduce a shard-count
