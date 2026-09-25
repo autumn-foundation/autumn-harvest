@@ -1,0 +1,119 @@
+# 🚦 Semaphore CI health — the `quota_enforcement_tests`/`integration_e2e.rs:1383` SOURCE-completion hang series closes; two more independently-diagnosed flakes and the shard rebalance landed alongside it; one open PR is now stale against the new shard count
+
+**Status:** health report — no PR opened against `ci.yml` or any test file. This
+role's hard gate is not met because there is no new mechanism to diagnose: every
+open item the series was tracking as of the last report
+(`docs/rnd/2026-09-24-ci-health-semaphore-source-completion-hang-confirmed-fixed.md`)
+has already been fixed and merged by other sessions in the ~28 hours since, and
+this session's own check of the post-merge CI history found no new failure
+signature to investigate. Nothing here changes the tolerance of any test; this
+is confirmation plus one procedural flag.
+
+## 🎯 Verdict path
+
+Unchanged from the whole series: `ci.yml`'s `pull_request` trigger against
+`trunk-dev`, `Test DB (linux, shard N)`. What changed is the shard count itself
+(11 → 21, below) and the schema/config each shard's containers boot from.
+
+## 🌡️ Symptom — closed, not just quiet
+
+The prior report counted 9 confirmed occurrences of the byte-identical
+`integration_e2e.rs:1383:6` panic
+(`workflow should reach expected state within timeout: Elapsed(())`) across
+this series, tracing to the same root cause this session already verified twice
+independently (Docker-based, in PR #1713's own report, and Docker-free, in the
+prior session's local-Postgres rerun harness: 5/5 fail unpatched, 20/20 pass
+patched). Three commits landed the fix and two related-but-distinct flake
+fixes within two minutes of each other on `trunk-dev`:
+
+| Commit | Time (UTC) | PR | Mechanism |
+|---|---|---|---|
+| `676e79c3` | 09-24 14:28:22 | #1713 | `INIT_SQL`'s hand-rolled bundle in `integration_e2e.rs` was missing migration `20260920215812_harvest_completion_trigger_fires_target` — this series' own tracked defect |
+| `5a3cf148` | 09-24 14:30:31 | #1706 | `quota_enforcement_tests`'s outbox-retry path didn't wire `sharded_pool` into the test's own worker config (issue #1685) — a **different** mechanism hitting the same test module, tracked separately since `docs/rnd/2026-09-21-ci-health-semaphore-quota-outbox-recurrence.md` |
+| `f08842e0` | 09-24 14:29:37 | #1719 | `sharded_runtime_tests`'s timeout-pass hold-and-wait wedges on an exhausted shard pool — a third, distinct suite |
+
+Then `285c7fa0` (09-24 17:27:14 UTC, PR #1707) rebalanced `test-db-linux` from
+11 to 21 shards, for the slowest-shard latency this series' shard-weight-drift
+harness (open PR #1703, still unmerged) had already flagged, not primarily to
+un-collide `integration_e2e`/`quota_enforcement_tests` (that collision's
+*symptom* is now moot since the underlying test no longer hangs, but the
+collision itself was never the root cause — the missing migration was).
+
+**Post-fix verification (this session, from CI history, not a fresh rerun
+harness):** three trunk-dev pushes have completed their full `Test DB
+(linux, *)` matrix since `676e79c3` merged, none showing this signature or any
+`quota_enforcement_tests`/`sharded_runtime_tests` failure:
+
+- `5a3cf148` (run `36013321172`, still 11 shards): 11/11 shards green.
+- `285c7fa0` (run `36034407319`, first 21-shard run): 21/21 shards green.
+- `b0f5a4d1` (run `36047203664`, current `trunk-dev` head): 21/21 shards green.
+
+That is 3 full sweeps and 0 recurrences — real signal, but explicitly **not**
+this role's ≥20x same-commit rerun protocol (each sweep is a different commit,
+not 20 reruns of one), so it is reported as corroboration of the prior
+session's already-rigorous local verification, not as an independent
+rerun-protocol result in its own right. No occurrence of the tracked panic
+appears in any `pull_request`-event run sampled from the last 24 hours either
+(`#1727`, `#1731`, `#1732`, `#1734`, all green, all post-dating the fix).
+
+**Series closed.** Nine confirmed occurrences, one root cause, one merged fix,
+zero recurrences across every sampled post-merge run. No further action item
+carries forward from this specific signature.
+
+## 🔍 Diagnosis note — nothing new, one correction to the record
+
+Nothing in this session changes the diagnosis already rendered and twice
+verified in the prior two reports. One bookkeeping note for future sessions
+reading this series: the shard rebalance and the three flake fixes are
+independent changes that happened to land within the same three-hour window.
+Do not attribute the hang's fix to the rebalance — the collision
+(`integration_e2e`/`quota_enforcement_tests` both landing on shard 0 under the
+old 11-shard layout) only ever explained why both suites' failures showed up
+in the *same* CI job; it was never the reason either suite failed on its own.
+
+## 🔧 Treatment — one procedural flag, not actioned
+
+**PR #1703** (`🚦 Semaphore: shard-weight drift harness (report-only, 2
+collisions found)`, opened 09-22, a prior session in this same series) is now
+stale against `trunk-dev`: its base (`ae29c106`) predates the 11→21 rebalance
+in `285c7fa0` by two days, its `mergeable_state` reads `unknown`, and its
+`docs/audits/shard-weight-drift.py` harness — which does not exist on
+`trunk-dev` today — was authored and self-tested against the 11-shard manifest
+this session's own `git log` shows has since changed. Merging it as-is would
+reintroduce a shard-count assumption the codebase has already moved past.
+This is not this session's fix to make unilaterally (the PR belongs to a
+different session and rebasing a harness's own sweep range/self-test fixture
+onto a new manifest is exactly the kind of change that needs to be re-verified
+against live CI, not assumed); flagging here so the next session in this
+series rebases it, re-runs its `--self-test`/`--sweep` against the current
+21-shard manifest, and either confirms the 2 previously-found collisions are
+gone or updates the finding, before merging.
+
+**Ledger:** still no quarantine ledger in this repository (unchanged from
+every prior report in this series).
+
+## 📊 Measurement
+
+No new rerun harness executed this session. Evidence is entirely from the
+CI history table in Symptom above (GitHub Actions run/job data for the three
+full-matrix `trunk-dev` pushes and four sampled `pull_request` runs since the
+fix merged), which is reproducible by any session with API access, no
+Docker/Postgres environment needed.
+
+## 🔬 Reproduce
+
+```sh
+# Confirm the three fix commits and the rebalance commit, in order:
+git log --format='%H %ad %s' --date=iso 676e79c3 5a3cf148 f08842e0 285c7fa0
+
+# Confirm zero recurrences: pull job results for the three full trunk-dev
+# sweeps since the fix (via actions_list/list_workflow_jobs on runs
+# 36013321172, 36034407319, 36047203664) and grep for anything other than
+# "success" among jobs named "Test DB (linux, shard *)" or
+# "sharded_runtime_tests"/"quota_enforcement_tests" in their logs.
+
+# Confirm PR #1703 is stale:
+git merge-base --is-ancestor 285c7fa04c18e8862c7601f24e8fae7667db88f9 \
+  <PR #1703 head sha>   # -> not an ancestor
+ls docs/audits/shard-weight-drift.py   # -> absent on trunk-dev today
+```
