@@ -387,6 +387,40 @@ fn the_replication_down_alert_keys_on_standby_count_not_on_lag() {
     );
 }
 
+/// The dropped-hints alert must require sustained growth, not a single
+/// burst (Codex review, issue #1429 follow-up).
+///
+/// `harvest.dispatch.dropped_hints` is a running total. A bare
+/// `increase(m[15m]) > 0` clause goes true the moment any one hint drops
+/// anywhere in that window. It then stays true for the rest of the
+/// window, even if the burst cleared immediately. The alert's own runbook
+/// and `default_threshold` name that exact shape as a false positive: "a
+/// brief spike... that clears within one or two reconcile intervals".
+/// The expression must also require growth in a shorter, more recent
+/// window, so a burst that already stopped climbing does not alone
+/// satisfy it.
+#[test]
+fn the_dropped_hints_alert_requires_sustained_growth_not_one_burst() {
+    let pack = read_pack();
+    let rules = pack["rules"].as_array().expect("rules must be an array");
+    let rule = rules
+        .iter()
+        .find(|rule| rule["id"].as_str() == Some("harvest_dispatch_dropped_hints"))
+        .expect("dropped-hints alert must exist");
+    let expr = rule["prometheus"]["expressions"][0]["expr"]
+        .as_str()
+        .expect("must carry a PromQL expression");
+    assert!(
+        expr.contains("increase(harvest_dispatch_dropped_hints[15m]) > 0"),
+        "the alert must still require growth over the full window: {expr}"
+    );
+    assert!(
+        expr.contains("and increase(harvest_dispatch_dropped_hints[5m]) > 0"),
+        "the alert must also require growth in a shorter, more recent window, so a burst \
+         that already stopped climbing does not alone fire it: {expr}"
+    );
+}
+
 /// A fenced worker never recovers on its own.
 #[test]
 fn the_fenced_alert_says_the_condition_is_not_self_healing() {

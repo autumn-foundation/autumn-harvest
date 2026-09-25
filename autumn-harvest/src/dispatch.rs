@@ -560,6 +560,37 @@ pub fn install_shards(
     installed_shards
 }
 
+/// Replace the single-shard topology atomically: clear both slots and
+/// install `channel` into the single-shard slot, in one
+/// [`DISPATCH_SLOT_LOCK`] acquisition (Codex review, issue #1429
+/// follow-up).
+///
+/// Mirrors [`install_shards`]'s own reasoning, for the single-shard case.
+/// A caller that instead clears both slots and then calls [`install`]
+/// leaves a gap between those two calls. A racing [`install_shards`] call
+/// could land in that gap and end up installed alongside this one, rather
+/// than cleanly replaced by it.
+///
+/// Returns the generation stamped on the installed channel.
+pub fn install_single(channel: Arc<dyn TaskDispatch>, settings: DispatchSettings) -> u64 {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        *slot = None;
+    }
+    let mut generation = 0;
+    if let Ok(mut slot) = INSTALLED.write() {
+        generation = INSTALL_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        *slot = Some(InstalledDispatch {
+            channel,
+            settings,
+            generation,
+        });
+    }
+    ANY_INSTALLED.store(true, Ordering::Relaxed);
+    stop_publisher();
+    generation
+}
+
 // ---------------------------------------------------------------------------
 // Fast path guard
 // ---------------------------------------------------------------------------
@@ -1600,6 +1631,40 @@ mod tests {
         }
 
         uninstall_all_shards();
+    }
+
+    /// `install_single` is the single-shard mirror of `install_shards`
+    /// (Codex review, issue #1429 follow-up): it replaces both slots, not
+    /// only the single-shard one, in one `DISPATCH_SLOT_LOCK` acquisition.
+    #[tokio::test]
+    async fn install_single_replaces_both_slots_atomically() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let stale_shard = crate::types::ShardId::new(3);
+        install_for_shard(
+            stale_shard,
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let generation = install_single(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        assert!(
+            installed_for_shard(stale_shard).is_none(),
+            "install_single must clear a stale per-shard channel too"
+        );
+        let live = installed().expect("install_single must install the single-shard slot");
+        assert_eq!(
+            live.generation, generation,
+            "the returned generation must match the one actually stamped on the slot"
+        );
+
+        uninstall();
     }
 
     #[tokio::test]

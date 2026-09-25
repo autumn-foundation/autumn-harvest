@@ -1440,11 +1440,11 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Unlabeled gauge, one series per process. A sustained climb over the alert window, not a single sample, is the signal.",
+        "notes": "Unlabeled gauge, one series per process. A sustained climb over the alert window, not a single sample, is the signal. The 5m clause requires growth to still be happening in the most recent slice, so a brief burst that already cleared does not satisfy the 15m clause alone.",
         "expressions": [
           {
             "kind": "promql",
-            "expr": "increase(harvest_dispatch_dropped_hints[15m]) > 0"
+            "expr": "increase(harvest_dispatch_dropped_hints[15m]) > 0 and increase(harvest_dispatch_dropped_hints[5m]) > 0"
           }
         ]
       },

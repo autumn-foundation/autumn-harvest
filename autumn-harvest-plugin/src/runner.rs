@@ -1747,6 +1747,13 @@ const DISPATCH_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// check). A stale per-shard slot left behind would then keep this new
 /// runner consuming from the old endpoint or key prefix. `/admin/config`
 /// would report the newly installed global channel instead.
+///
+/// The success path replaces both slots through `dispatch::install_single`
+/// in one atomic step (Codex review, issue #1429 follow-up). That
+/// replaces clearing the per-shard slot and then separately calling
+/// `dispatch::install`. A racing `dispatch::install_shards` call could
+/// otherwise land in the gap between those two calls. It would then end
+/// up installed alongside this one, instead of cleanly replaced by it.
 #[cfg(feature = "redis")]
 async fn install_dispatch_channel(
     config: &HarvestRuntimeConfig,
@@ -1788,11 +1795,11 @@ async fn install_dispatch_channel(
         ))
     })?;
 
-    // Connected. Clear the per-shard slot now: see the doc comment above
-    // for why this waits until here.
-    autumn_harvest::dispatch::uninstall_all_shards();
-
-    let generation = autumn_harvest::dispatch::install(
+    // Connected. Replace both slots atomically (Codex review, issue #1429
+    // follow-up). See the doc comment above for why the per-shard clear
+    // waits until here. `dispatch::install_single`'s own doc explains why
+    // this is one call rather than a separate clear and install.
+    let generation = autumn_harvest::dispatch::install_single(
         Arc::new(channel),
         autumn_harvest::dispatch::DispatchSettings {
             poll_interval: Duration::from_millis(config.redis.poll_interval_ms),
