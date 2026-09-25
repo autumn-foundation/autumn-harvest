@@ -300,18 +300,22 @@ pub(crate) struct WorkflowDetailParams {
     // the error path of a redirect back to this page. The operator's typed
     // input then survives a failed submission. It no longer vanishes behind
     // a re-collapsed `<details>` panel. `None` on a normal page load.
+    //
+    // The JSON payload fields deliberately have no counterpart here (#1737
+    // review). A signal or update payload is arbitrary operator-supplied
+    // data, up to the configured size cap. It can carry PII or secrets.
+    // Putting one in a redirect's query string would leave it in browser
+    // history, proxy and access logs, and same-origin `Referer` headers.
+    // Only the short identifying fields round-trip. The payload textarea
+    // reopens empty, and the operator retypes it, exactly as before this fix.
     #[serde(default)]
     signal_name: Option<String>,
-    #[serde(default)]
-    signal_payload: Option<String>,
     #[serde(default)]
     reset_event_id: Option<String>,
     #[serde(default)]
     reset_reason: Option<String>,
     #[serde(default)]
     update_name: Option<String>,
-    #[serde(default)]
-    update_payload: Option<String>,
 }
 
 /// Submitted field values to redisplay on the workflow-detail page after a
@@ -321,22 +325,18 @@ pub(crate) struct WorkflowDetailParams {
 #[derive(Debug, Default)]
 struct WorkflowDetailFormRepopulate<'a> {
     signal_name: Option<&'a str>,
-    signal_payload: Option<&'a str>,
     reset_event_id: Option<&'a str>,
     reset_reason: Option<&'a str>,
     update_name: Option<&'a str>,
-    update_payload: Option<&'a str>,
 }
 
 impl<'a> WorkflowDetailFormRepopulate<'a> {
     fn from_params(params: &'a WorkflowDetailParams) -> Self {
         Self {
             signal_name: params.signal_name.as_deref(),
-            signal_payload: params.signal_payload.as_deref(),
             reset_event_id: params.reset_event_id.as_deref(),
             reset_reason: params.reset_reason.as_deref(),
             update_name: params.update_name.as_deref(),
-            update_payload: params.update_payload.as_deref(),
         }
     }
 }
@@ -2292,12 +2292,11 @@ async fn signal_workflow_ui(
 
     let mut redirect_url = format!("../../workflows/{id}?flash={flash}");
     if status == STATUS_FAILED {
+        // The payload deliberately does not round-trip here (issue #1737
+        // review) -- see `WorkflowDetailParams`'s doc comment.
         append_repopulate_params(
             &mut redirect_url,
-            &[
-                ("signal_name", Some(form.signal_name.as_str())),
-                ("signal_payload", Some(payload_str)),
-            ],
+            &[("signal_name", Some(form.signal_name.as_str()))],
         );
     }
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
@@ -2461,12 +2460,11 @@ async fn trigger_update_ui(
                 .await;
                 let flash = url_encode(&err_msg);
                 let mut redirect_url = format!("../../workflows/{id}?flash={flash}");
+                // The payload deliberately does not round-trip here (issue
+                // #1737 review) -- see `WorkflowDetailParams`'s doc comment.
                 append_repopulate_params(
                     &mut redirect_url,
-                    &[
-                        ("update_name", Some(form.update_name.as_str())),
-                        ("update_payload", Some(payload_str)),
-                    ],
+                    &[("update_name", Some(form.update_name.as_str()))],
                 );
                 return Ok(axum::response::Redirect::to(&redirect_url).into_response());
             }
@@ -2538,12 +2536,11 @@ async fn trigger_update_ui(
 
     let mut redirect_url = format!("../../workflows/{id}?flash={flash}");
     if status == STATUS_FAILED {
+        // The payload deliberately does not round-trip here (issue #1737
+        // review) -- see `WorkflowDetailParams`'s doc comment.
         append_repopulate_params(
             &mut redirect_url,
-            &[
-                ("update_name", Some(form.update_name.as_str())),
-                ("update_payload", Some(payload_str)),
-            ],
+            &[("update_name", Some(form.update_name.as_str()))],
         );
     }
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
@@ -5622,10 +5619,13 @@ fn render_workflow_detail(
                 button.danger type="submit" disabled[terminal]
                     title=[terminal.then_some("Workflow is terminal")] { "Terminate" }
             }
-            // `open[...]` and `value=[...]`/inline text repopulate this
-            // panel after a failed submission (issue #1737). A mistyped
-            // payload or event number then no longer sends the operator
-            // back to a blank, re-collapsed form.
+            // `open[...]`/`value=[...]` repopulate this panel's short
+            // signal-name field after a failed submission (issue #1737). A
+            // mistyped payload then no longer sends the operator back to a
+            // blank, re-collapsed form. The payload textarea itself stays
+            // empty and is not repopulated (#1737 review). It is arbitrary
+            // operator data that can carry PII or secrets. It never goes
+            // through the redirect URL that reopens this panel.
             details style="display:inline-block" open[form_repopulate.signal_name.is_some()] {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Send signal" }
                 form method="post" action={ (exec_id_str) "/signal" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
@@ -5637,9 +5637,7 @@ fn render_workflow_detail(
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Payload (JSON)"
-                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {
-                            (form_repopulate.signal_payload.unwrap_or(""))
-                        }
+                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {}
                     }
                     button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Send" }
                 }
@@ -5649,7 +5647,13 @@ fn render_workflow_detail(
                 form method="post" action={ (exec_id_str) "/reset" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Event # (1-based, as shown in timeline)"
-                        input type="number" name="reset_to_event_id" min="1" required placeholder="1"
+                        // `type="text"`, not `type="number"` (issue #1737 review). A
+                        // number input sanitizes an invalid value (e.g. the malformed
+                        // text this field exists to reject) to blank at render time.
+                        // The operator could then never see the bad input `value=[...]`
+                        // just repopulated. Matches the Workflows/Workers/Schedules
+                        // "Per page" fields' own fix for the same sanitization gap.
+                        input type="text" inputmode="numeric" pattern="[0-9]*" name="reset_to_event_id" required placeholder="1"
                             value=[form_repopulate.reset_event_id]
                             style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
@@ -5673,9 +5677,9 @@ fn render_workflow_detail(
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Payload (JSON)"
-                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {
-                            (form_repopulate.update_payload.unwrap_or(""))
-                        }
+                        // Not repopulated on failure, same as the Send-signal
+                        // panel's payload field (#1737 review).
+                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {}
                     }
                     button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Submit" }
                 }
@@ -16969,9 +16973,13 @@ mod tests {
     }
 
     /// GREEN -- the fix under test (issue #1737). A failed Send-signal
-    /// submission must reopen the panel. The operator's typed
-    /// `signal_name`/payload must stay intact, not reset to a blank,
-    /// re-collapsed form.
+    /// submission must reopen the panel. The operator's typed `signal_name`
+    /// must stay intact, not reset to a blank, re-collapsed form.
+    ///
+    /// The payload field must stay EMPTY (#1737 review). A reviewer flagged
+    /// the first version of this fix. It put the raw JSON payload into the
+    /// redirect's query string, where it would persist in browser history
+    /// and access logs. Only the short `signal_name` round-trips.
     #[test]
     fn render_workflow_detail_repopulates_the_signal_panel_on_failure() {
         let execution = stub_execution();
@@ -16993,7 +17001,6 @@ mod tests {
             &WorkflowLogsPanelData::default(),
             &WorkflowDetailFormRepopulate {
                 signal_name: Some("approve"),
-                signal_payload: Some("{not json}"),
                 ..Default::default()
             },
         )
@@ -17016,9 +17023,20 @@ mod tests {
             panel.contains("value=\"approve\""),
             "the typed signal name must survive the failed submission: {panel}"
         );
-        assert!(
-            panel.contains("{not json}"),
-            "the typed payload must survive the failed submission: {panel}"
+        let textarea_start = panel.find("<textarea").expect("payload textarea must render");
+        let textarea_open_end = panel[textarea_start..]
+            .find('>')
+            .map(|i| textarea_start + i + 1)
+            .expect("payload textarea open tag must close");
+        let textarea_close = panel[textarea_open_end..]
+            .find("</textarea>")
+            .map(|i| textarea_open_end + i)
+            .expect("payload textarea must close");
+        assert_eq!(
+            &panel[textarea_open_end..textarea_close],
+            "",
+            "the payload must never round-trip through the redirect URL -- \
+             it can carry PII or secrets: {panel}"
         );
     }
 
