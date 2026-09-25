@@ -221,6 +221,17 @@ harness = false
 name = "queue_coverage_profile"
 harness = false
 
+# Deterministic (non-criterion) instruction-count profiling harness for
+# `ConnectorRuntime::run_once` -- the broker connector's receive -> map ->
+# idempotency-key -> dispatch -> decide -> settle pass (issue #944). Needs
+# `connectors` for the module itself. See
+# `benches/connector_dispatch_profile.rs` and
+# `docs/performance-connector-dispatch.md`.
+[[bench]]
+name = "connector_dispatch_profile"
+harness = false
+required-features = ["connectors"]
+
 [lints]
 workspace = true
 
