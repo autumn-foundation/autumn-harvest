@@ -1939,3 +1939,10 @@ standalone note rather than part of the claim-path attribution table above:
   `serde_json::Value` clone eliminated by taking the field by value
   (`std::mem::take`) instead of borrowing it from the event tree the caller
   already owns (instructions -36.89%, allocation blocks -52.05%).
+* [`docs/performance-parent-close-cascade-unfinished-handlers.md`](performance-parent-close-cascade-unfinished-handlers.md)
+  — the per-child `harvest_events` N+1 in
+  `check_and_report_unfinished_handlers`'s parent-close-cascade callers,
+  spanning eighteen call sites across `worker.rs`, `timeout.rs`,
+  `execution.rs`, and `completion_trigger.rs`; batched into one `eq_any`
+  query via `check_and_report_unfinished_handlers_batch` (calls 400→1,
+  buffers -75.4% at a 400-child fixture).

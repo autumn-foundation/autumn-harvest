@@ -26,7 +26,7 @@ use crate::error::{HarvestError, HarvestResult, TimeoutType};
 use crate::event::WorkflowEvent;
 use crate::execution::{
     apply_parent_close_cascade, cancel_workflow_execution_collect,
-    check_and_report_unfinished_handlers,
+    check_and_report_unfinished_handlers, check_and_report_unfinished_handlers_batch,
 };
 use crate::models::{ExternalTask, TaskQueueItem, WorkflowExecution};
 use crate::schema::{harvest_external_tasks, harvest_task_queue, harvest_workflow_executions};
@@ -1917,16 +1917,14 @@ async fn enforce_workflow_timeout(
         start.spawn();
     }
 
-    for (child_id, child_name) in closed_children {
-        if let Err(e) =
-            check_and_report_unfinished_handlers(conn, child_id, &child_name, Some(metrics)).await
-        {
-            tracing::error!(
-                child_id = %child_id,
-                err = %e,
-                "Failed to check and report unfinished handlers on cascaded child in workflow timeout"
-            );
-        }
+    if let Err(e) =
+        check_and_report_unfinished_handlers_batch(conn, &closed_children, Some(metrics)).await
+    {
+        tracing::error!(
+            child_count = closed_children.len(),
+            err = %e,
+            "Failed to check and report unfinished handlers on cascaded children in workflow timeout"
+        );
     }
 
     if let Err(e) =
@@ -2263,21 +2261,18 @@ pub async fn enforce_workflow_execution_timeouts(
             start.spawn();
         }
 
-        for (child_id, child_name) in closed_children {
-            if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
-                conn,
-                child_id,
-                &child_name,
-                Some(metrics),
-            )
-            .await
-            {
-                tracing::error!(
-                    child_id = %child_id,
-                    err = %e,
-                    "Failed to check and report unfinished handlers on cascaded child in timeout"
-                );
-            }
+        if let Err(e) = crate::execution::check_and_report_unfinished_handlers_batch(
+            conn,
+            &closed_children,
+            Some(metrics),
+        )
+        .await
+        {
+            tracing::error!(
+                child_count = closed_children.len(),
+                err = %e,
+                "Failed to check and report unfinished handlers on cascaded children in timeout"
+            );
         }
 
         if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
@@ -4000,21 +3995,18 @@ pub async fn enforce_external_cancels_outbox(
                         for start in deferred_starts {
                             start.spawn();
                         }
-                        for (exec_id, workflow_name) in deferred_checks {
-                            if let Err(e) = check_and_report_unfinished_handlers(
-                                &mut target_conn,
-                                exec_id,
-                                &workflow_name,
-                                Some(metrics),
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    exec_id = %exec_id,
-                                    err = %e,
-                                    "cancel outbox sweep: failed to check unfinished update handlers on target shard"
-                                );
-                            }
+                        if let Err(e) = check_and_report_unfinished_handlers_batch(
+                            &mut target_conn,
+                            &deferred_checks,
+                            Some(metrics),
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                check_count = deferred_checks.len(),
+                                err = %e,
+                                "cancel outbox sweep: failed to check unfinished update handlers on target shard"
+                            );
                         }
                         for (workflow_name, queue_name) in cancel_metrics {
                             crate::telemetry::emit_workflow_terminal(
@@ -5373,21 +5365,18 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
             );
         }
 
-        for (child_id, child_name) in closed_children {
-            if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
-                conn,
-                child_id,
-                &child_name,
-                Some(metrics),
-            )
-            .await
-            {
-                tracing::error!(
-                    child_id = %child_id,
-                    err = %e,
-                    "Failed to check and report unfinished handlers on cascaded child execution in history ceiling"
-                );
-            }
+        if let Err(e) = crate::execution::check_and_report_unfinished_handlers_batch(
+            conn,
+            &closed_children,
+            Some(metrics),
+        )
+        .await
+        {
+            tracing::error!(
+                child_count = closed_children.len(),
+                err = %e,
+                "Failed to check and report unfinished handlers on cascaded child executions in history ceiling"
+            );
         }
 
         // Best-effort: count ceiling failures toward the schedule auto-pause threshold.

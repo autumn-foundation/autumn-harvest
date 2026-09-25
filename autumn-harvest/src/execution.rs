@@ -1983,10 +1983,8 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                 for start in pre_check_deferred {
                     start.spawn();
                 }
-                for check in deferred_checks {
-                    let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics)
-                        .await;
-                }
+                let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, metrics)
+                    .await;
                 if let Some(m) = metrics {
                     emit_start_cancel_metrics(m, &cancel_metrics);
                 }
@@ -2070,9 +2068,7 @@ pub async fn start_or_load_workflow_execution_with_codecs(
     for start in deferred_starts {
         start.spawn();
     }
-    for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, None).await;
-    }
+    let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, None).await;
     Ok(result)
 }
 
@@ -2119,9 +2115,7 @@ pub async fn start_or_load_workflow_execution_with_metrics_and_codecs(
     for start in deferred_starts {
         start.spawn();
     }
-    for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
-    }
+    let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, metrics).await;
     if let Some(m) = metrics {
         emit_start_cancel_metrics(m, &cancel_metrics);
     }
@@ -2276,9 +2270,7 @@ pub async fn start_or_load_workflow_execution_idempotent_with_codecs(
     for start in deferred_starts {
         start.spawn();
     }
-    for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
-    }
+    let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, metrics).await;
     if let Some(m) = metrics {
         emit_start_cancel_metrics(m, &cancel_metrics);
     }
@@ -3570,9 +3562,7 @@ pub async fn cancel_workflow_execution(
     let (cancel_result, deferred_starts, deferred_checks, deferred_terminal) =
         cancel_workflow_execution_collect(conn, exec_id, reason, Some(metrics)).await?;
 
-    for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, Some(metrics)).await;
-    }
+    let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, Some(metrics)).await;
     if let Some((workflow_name, queue_name)) = deferred_terminal {
         crate::telemetry::emit_workflow_terminal(
             metrics,
@@ -5907,9 +5897,7 @@ pub async fn terminate_workflow_execution(
     let (cancel_result, deferred_starts, deferred_checks, deferred_terminal) =
         terminate_workflow_execution_collect(conn, exec_id, reason).await?;
 
-    for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, Some(metrics)).await;
-    }
+    let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, Some(metrics)).await;
     if let Some((workflow_name, queue_name)) = deferred_terminal {
         crate::telemetry::emit_workflow_terminal(
             metrics,
@@ -6899,9 +6887,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
     for start in deferred_starts {
         start.spawn();
     }
-    for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
-    }
+    let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, metrics).await;
     if let Some(m) = metrics {
         emit_start_cancel_metrics(m, &cancel_metrics);
     }
@@ -7615,9 +7601,7 @@ pub async fn rerun_workflow_execution_with_codecs(
     for start in deferred_starts {
         start.spawn();
     }
-    for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
-    }
+    let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, metrics).await;
     if let Some(m) = metrics {
         emit_start_cancel_metrics(m, &cancel_metrics);
     }
@@ -8364,9 +8348,7 @@ pub async fn update_with_start_workflow_execution_with_metrics_and_codecs(
     for start in deferred_starts {
         start.spawn();
     }
-    for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
-    }
+    let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, metrics).await;
     if let Some(m) = metrics {
         emit_start_cancel_metrics(m, &cancel_metrics);
         // Post-outer-commit: emit update.admitted (issue #684) only when an
@@ -9484,6 +9466,67 @@ pub async fn check_and_report_unfinished_handlers(
         );
         if let Some(recorder) = metrics {
             recorder.record_workflow_unfinished_handlers(workflow_name, "update", count as u64);
+        }
+    }
+    Ok(())
+}
+
+/// Batched form of [`check_and_report_unfinished_handlers`] for many
+/// executions closed in the same operation.
+///
+/// Covers a parent-close cascade, a superseded-run cancellation, or any
+/// other post-commit cleanup that collects more than one `(exec_id,
+/// workflow_name)` pair before reporting.
+///
+/// Every call site this replaces looped over its own collected pairs,
+/// issuing one `check_and_report_unfinished_handlers` call -- one
+/// `harvest_events` query -- per pair, and discarding each call's error
+/// independently (`let _ = ...`). This does the same job with exactly one
+/// `harvest_events` query for the whole batch
+/// ([`store::load_histories_undecoded_batch`]), then reports each pair from
+/// the in-memory result.
+///
+/// # Error-isolation trade-off
+///
+/// The old per-pair loop kept one pair's failure from affecting any other:
+/// each ran its own independent query. Batched, a single query failure (a
+/// connection error, or one row's `event_data` failing to deserialize) is
+/// reported for the whole batch, and every caller already discards that
+/// error (`let _ = ...`) exactly as it did before. A connection failure
+/// would already have failed every pair's own query too. Only an
+/// undecodable `event_data` value is a real behavior change: previously it
+/// dropped just that one pair's report, now it drops the whole batch's. This
+/// function reports on already-committed workflow history, which never
+/// disagreed with this shape before commit; the fixture and integration
+/// suite that exercise this path would already fail if it ever did.
+pub async fn check_and_report_unfinished_handlers_batch(
+    conn: &mut AsyncPgConnection,
+    checks: &[(ExecutionId, String)],
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+) -> HarvestResult<()> {
+    if checks.is_empty() {
+        return Ok(());
+    }
+
+    let exec_ids: Vec<ExecutionId> = checks.iter().map(|(id, _)| *id).collect();
+    let histories = store::load_histories_undecoded_batch(conn, &exec_ids).await?;
+
+    for (exec_id, workflow_name) in checks {
+        let Some(history) = histories.get(exec_id) else {
+            continue;
+        };
+        let matcher = crate::replay::HistoryMatcher::new(history.events.clone());
+        let count = matcher.unfinished_update_handler_count_at_end();
+        if count > 0 {
+            tracing::warn!(
+                workflow_name = workflow_name.as_str(),
+                execution_id = %exec_id,
+                unfinished_update_handler_count = count,
+                "Workflow completed with unfinished update handlers"
+            );
+            if let Some(recorder) = metrics {
+                recorder.record_workflow_unfinished_handlers(workflow_name, "update", count as u64);
+            }
         }
     }
     Ok(())
