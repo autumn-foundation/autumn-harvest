@@ -6519,15 +6519,17 @@ fn url_encode(input: &str) -> String {
     out
 }
 
-/// Values repopulated into a redirect must already read as short
-/// identifiers -- a signal/update name or a 1-based event number (#1737
-/// review). Nothing enforced that before this cap. A pasted, oversized
-/// value would still reach `Location`, where it could make the redirect
-/// itself exceed a browser or proxy header-size limit. A value over this
-/// length is therefore never a well-formed identifier. It gets dropped
-/// instead of truncated, so the panel reopens empty rather than showing a
+/// A backstop against a pathological paste in the redirect URL (#1737
+/// review), not a real bound on any of these fields. `signal_name` and
+/// `update_name` store into `TEXT` columns with no length check anywhere
+/// in `send_signal` or the update path. `reset_event_id` is likewise
+/// free-typed text before parsing. The threat this guards against is a
+/// 100 KB paste. This cap sits far above any realistic hand-typed
+/// identifier, comfortably clear of that threat, so no normal value is
+/// ever affected. A value over this length gets dropped rather than
+/// truncated. The panel then reopens empty for it, rather than showing a
 /// garbled fragment.
-const REPOPULATE_VALUE_MAX_LEN: usize = 200;
+const REPOPULATE_VALUE_MAX_LEN: usize = 2000;
 
 /// Appends `&key=value` query pairs to a redirect URL for each non-empty
 /// value, url-encoding the value (issue #1737). Use this only on a failed
