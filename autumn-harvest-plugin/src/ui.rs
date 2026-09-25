@@ -17022,7 +17022,9 @@ mod tests {
             panel.contains("value=\"approve\""),
             "the typed signal name must survive the failed submission: {panel}"
         );
-        let textarea_start = panel.find("<textarea").expect("payload textarea must render");
+        let textarea_start = panel
+            .find("<textarea")
+            .expect("payload textarea must render");
         let textarea_open_end = panel[textarea_start..]
             .find('>')
             .map(|i| textarea_start + i + 1)
