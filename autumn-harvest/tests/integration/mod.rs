@@ -149,6 +149,8 @@ mod mutex_lease_reclaim_perf;
 mod mutex_tests;
 mod nd_block_tests;
 mod panic_containment_tests;
+#[cfg(feature = "db")]
+mod parent_close_cascade_unfinished_handlers_perf;
 mod partitioned_events_docs;
 mod pause_tests;
 #[cfg(feature = "testing")]

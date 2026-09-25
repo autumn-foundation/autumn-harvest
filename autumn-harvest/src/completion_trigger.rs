@@ -1500,7 +1500,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
         use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
         use crate::schema::harvest_workflow_executions::dsl as execs_dsl;
         use crate::models::{CompletionTriggerDb, NewCompletionTriggerFireDb, WorkflowExecution, NewCompletionTriggerOutboxDb};
-        use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution_collect_with_codecs, check_and_report_unfinished_handlers};
+        use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution_collect_with_codecs, check_and_report_unfinished_handlers_batch};
         use crate::types::WorkflowIdReusePolicy;
         use crate::types::Priority;
 
@@ -2162,11 +2162,12 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                 for start in cancel_deferred_starts {
                     start.spawn();
                 }
-                for check in cancel_deferred_checks {
-                    let _ =
-                        check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics)
-                            .await;
-                }
+                let _ = check_and_report_unfinished_handlers_batch(
+                    conn,
+                    &cancel_deferred_checks,
+                    metrics,
+                )
+                .await;
                 pending.extend(cancel_metrics);
 
                 if let Some(m) = metrics {

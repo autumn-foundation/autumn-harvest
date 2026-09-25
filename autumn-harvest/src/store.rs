@@ -1205,6 +1205,101 @@ pub async fn load_history_undecoded(
     })
 }
 
+/// Batched form of [`load_history_undecoded`] for many executions at once.
+///
+/// One `eq_any` query loads every requested execution's history. This
+/// replaces one `load_history_undecoded` call per execution. It shares the
+/// same `idx_harvest_events_exec (workflow_exec_id, event_id)` index
+/// `load_history_undecoded` relies on. Ordering by that same leading pair
+/// lets Postgres serve the whole batch as one ordered index scan. No extra
+/// sort node is needed, across every requested execution.
+///
+/// **Callers with an unbounded `exec_ids` count must chunk it themselves**,
+/// and should process and drop each chunk's result before requesting the
+/// next. This function holds every decoded history of the ids it is given
+/// in memory at once. An unchunked call over an unbounded id list makes
+/// peak memory proportional to the sum of every requested history. It is
+/// not proportional to any one of them alone.
+/// [`execution::check_and_report_unfinished_handlers_batch`] is this
+/// function's own chunking caller; its own doc comment records why (review
+/// findings on PR #1739).
+///
+/// An `exec_id` with no rows in `harvest_events` is simply absent from the
+/// returned map rather than an error. Every caller of this function already
+/// tolerates that outcome for the single-execution case. That case is a
+/// workflow with no appended event yet. The batched form preserves the
+/// outcome rather than inventing a new error path.
+///
+/// Same restriction as [`load_history_undecoded`]: **never use this to feed
+/// workflow code.** It is for callers that only need `next_event_id` or
+/// non-payload structural fields, exactly like the single-execution loader.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on connection or query
+/// errors, or [`crate::error::HarvestError::Serialization`] if a stored JSON
+/// value cannot be deserialized into [`WorkflowEvent`].
+pub async fn load_histories_undecoded_batch(
+    conn: &mut AsyncPgConnection,
+    exec_ids: &[ExecutionId],
+) -> HarvestResult<std::collections::HashMap<ExecutionId, EventHistory>> {
+    use crate::models::HarvestEvent;
+    use std::collections::HashMap;
+
+    if exec_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let ids: Vec<uuid::Uuid> = exec_ids.iter().map(ExecutionId::as_uuid).collect();
+
+    let rows: Vec<HarvestEvent> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq_any(&ids))
+        .order((
+            harvest_events::workflow_exec_id.asc(),
+            harvest_events::event_id.asc(),
+        ))
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    // Grouped by the raw uuid column, not by `ExecutionId`. Reconstructing
+    // an `ExecutionId` from an arbitrary row's uuid needs the same
+    // string-round-trip `parse()` every other module uses. The shard bits
+    // live in a private field, so no cheaper conversion exists outside
+    // `types`. Every id this function could possibly need is already
+    // sitting in `exec_ids`. Keying by the input values avoids that
+    // round-trip entirely.
+    let mut grouped: HashMap<uuid::Uuid, Vec<HarvestEvent>> = HashMap::new();
+    for row in rows {
+        grouped.entry(row.workflow_exec_id).or_default().push(row);
+    }
+
+    let mut out = HashMap::with_capacity(exec_ids.len());
+    for &exec_id in exec_ids {
+        let Some(rows) = grouped.remove(&exec_id.as_uuid()) else {
+            continue;
+        };
+        let next_event_id = rows.last().map_or(0, |r| r.event_id.saturating_add(1));
+        let events = rows
+            .into_iter()
+            .map(|row| {
+                serde_json::from_value::<WorkflowEvent>(row.event_data)
+                    .map_err(crate::error::HarvestError::from)
+            })
+            .collect::<Result<Vec<WorkflowEvent>, _>>()?;
+        out.insert(
+            exec_id,
+            EventHistory {
+                exec_id,
+                events,
+                next_event_id,
+            },
+        );
+    }
+
+    Ok(out)
+}
+
 /// Load every event of an execution paired with its `harvest_events` row
 /// timestamp, ordered by `event_id ASC` (issue #739).
 ///

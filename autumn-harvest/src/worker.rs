@@ -4213,9 +4213,12 @@ async fn persist_external_signal_inline(
     for start in deferred_starts {
         start.spawn();
     }
-    for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, Some(metrics)).await;
-    }
+    let _ = crate::execution::check_and_report_unfinished_handlers_batch(
+        conn,
+        &deferred_checks,
+        Some(metrics),
+    )
+    .await;
     for (workflow_name, queue_name) in cancel_metrics {
         crate::telemetry::emit_workflow_terminal(
             metrics,
@@ -7977,10 +7980,7 @@ pub async fn persist_workflow_completion(
 
     pending_cancel_metrics.extend(tx_cancel_metrics);
 
-    for (child_id, child_name) in closed_children {
-        check_and_report_unfinished_handlers_for_worker(conn, child_id, Some(&child_name), metrics)
-            .await;
-    }
+    check_and_report_unfinished_handlers_batch_for_worker(conn, &closed_children, metrics).await;
 
     Ok((exec_id, None))
 }
@@ -8008,6 +8008,30 @@ async fn check_and_report_unfinished_handlers_for_worker(
         if let Err(e) = check_res {
             tracing::error!(execution_id = %exec_id, err = %e, "Failed to check and report unfinished handlers");
         }
+    }
+}
+
+/// Batched form of [`check_and_report_unfinished_handlers_for_worker`] for a
+/// caller that already has every `(exec_id, workflow_name)` pair on hand,
+/// with a guaranteed non-empty name. Every `closed_children` pair a
+/// parent-close cascade produces qualifies: the cascade always knows the
+/// child's workflow name from the row it just closed. Skips the
+/// name-resolution fallback the single-execution wrapper needs for a caller
+/// that might not have a name, because every caller of this batched form
+/// does.
+async fn check_and_report_unfinished_handlers_batch_for_worker(
+    conn: &mut AsyncPgConnection,
+    checks: &[(ExecutionId, String)],
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+) {
+    if let Err(e) =
+        crate::execution::check_and_report_unfinished_handlers_batch(conn, checks, metrics).await
+    {
+        tracing::error!(
+            check_count = checks.len(),
+            err = %e,
+            "Failed to check and report unfinished handlers"
+        );
     }
 }
 
@@ -13443,10 +13467,7 @@ pub async fn persist_child_workflow_completion(
     // see this function's `pending_cancel_metrics` parameter doc.
     pending_cancel_metrics.extend(tx_cancel_metrics);
 
-    for (child_id, child_name) in closed_children {
-        check_and_report_unfinished_handlers_for_worker(conn, child_id, Some(&child_name), metrics)
-            .await;
-    }
+    check_and_report_unfinished_handlers_batch_for_worker(conn, &closed_children, metrics).await;
 
     Ok((exec_id, None))
 }
@@ -13527,10 +13548,7 @@ pub async fn persist_child_workflow_failure(
     // see this function's `pending_cancel_metrics` parameter doc.
     pending_cancel_metrics.extend(tx_cancel_metrics);
 
-    for (child_id, child_name) in closed_children {
-        check_and_report_unfinished_handlers_for_worker(conn, child_id, Some(&child_name), metrics)
-            .await;
-    }
+    check_and_report_unfinished_handlers_batch_for_worker(conn, &closed_children, metrics).await;
 
     Ok((exec_id, None))
 }
@@ -20212,15 +20230,12 @@ async fn fail_workflow_for_history_cap(
     )
     .await;
 
-    for (child_id, child_name) in closed_children {
-        check_and_report_unfinished_handlers_for_worker(
-            conn,
-            child_id,
-            Some(&child_name),
-            Some(telemetry.metrics.as_ref()),
-        )
-        .await;
-    }
+    check_and_report_unfinished_handlers_batch_for_worker(
+        conn,
+        &closed_children,
+        Some(telemetry.metrics.as_ref()),
+    )
+    .await;
 
     Ok(deferred)
 }
@@ -30247,15 +30262,12 @@ pub async fn quarantine_workflow_task_timeout(
                 .await;
             }
 
-            for (child_id, child_name) in closed_children {
-                check_and_report_unfinished_handlers_for_worker(
-                    &mut conn,
-                    child_id,
-                    Some(&child_name),
-                    Some(metrics),
-                )
-                .await;
-            }
+            check_and_report_unfinished_handlers_batch_for_worker(
+                &mut conn,
+                &closed_children,
+                Some(metrics),
+            )
+            .await;
 
             for start in deferred_starts {
                 start.spawn();
