@@ -26165,6 +26165,38 @@ const fn dispatch_read_block(shard_count: usize, poll_interval: Duration) -> Dur
     }
 }
 
+/// Cap on `maintain`/reconcile-publish during one shard's turn in a
+/// multi-shard round-robin (Codex review, issue #1429 follow-up).
+///
+/// `run_poll_loop_multi` awaits each shard's whole turn sequentially, not
+/// only its read. `dispatch_read_block` already bounds the read half, at
+/// [`MULTI_SHARD_DISPATCH_READ_BLOCK`]. `maintain` and the reconcile
+/// sweep's publish still ran under the flat five-second
+/// [`DISPATCH_CALL_TIMEOUT`]. That bound is sized for a single-shard
+/// worker with no sibling shard waiting its turn. One stalled shard's
+/// `maintain` or publish call could still park every other shard's turn
+/// behind it, for up to five seconds. That held whenever that shard's own
+/// maintenance or reconcile interval came due. Five hundred milliseconds
+/// bounds that blast radius across a fleet of shards. It stays long
+/// enough that an ordinary Redis round trip under load never spuriously
+/// trips it.
+const MULTI_SHARD_DISPATCH_MAINTENANCE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The deadline `maintain`/reconcile-publish uses for one shard's turn.
+///
+/// `1` (single shard) keeps the flat [`DISPATCH_CALL_TIMEOUT`], unchanged:
+/// there is no sibling shard to starve. More than one caps it at
+/// [`MULTI_SHARD_DISPATCH_MAINTENANCE_TIMEOUT`], the maintenance-call
+/// mirror of [`dispatch_read_block`].
+#[must_use]
+const fn dispatch_maintenance_timeout(shard_count: usize) -> Duration {
+    if shard_count > 1 {
+        MULTI_SHARD_DISPATCH_MAINTENANCE_TIMEOUT
+    } else {
+        DISPATCH_CALL_TIMEOUT
+    }
+}
+
 /// How many references one read asks for (issue #1312).
 ///
 /// The two pools have separate permits, and a workflow reference cannot start
@@ -28493,6 +28525,14 @@ impl Worker {
     /// `poll_interval`. It also stops one busy shard from claiming every
     /// sibling's fair share of free permits. `1` (single shard) leaves both
     /// unbounded, byte-for-byte the pre-#1429 behaviour.
+    ///
+    /// `shard_count` also bounds `maintain` and the reconcile sweep's
+    /// publish through [`dispatch_maintenance_timeout`] (Codex review,
+    /// issue #1429 follow-up). The read bound alone left this turn's
+    /// other two channel calls under the flat, single-shard-sized
+    /// [`DISPATCH_CALL_TIMEOUT`]. One stalled shard's maintenance or
+    /// reconcile call could then still park every sibling shard's turn
+    /// behind it, for up to five seconds.
     async fn run_dispatch_iteration(
         &self,
         pool: &DbPool,
@@ -28517,9 +28557,10 @@ impl Worker {
         // successful reference read does. See
         // [`DispatchDegradation::record_read_success`].
         if DispatchLoopState::due(&mut state.maintained, settings.poll_interval)
-            && let Err(error) = dispatch_call(
+            && let Err(error) = dispatch_call_with_timeout(
                 installed.channel.maintain(&self.config.queues),
                 "maintenance",
+                dispatch_maintenance_timeout(shard_count),
             )
             .await
         {
@@ -28794,6 +28835,16 @@ impl Worker {
     /// prevent. `1` (single shard) keeps draining the whole backlog before
     /// its wait, unchanged.
     ///
+    /// The closing wait only runs when the loop exits idle, not when a
+    /// multi-shard turn exits after its one claim (Codex review, issue
+    /// #1429 follow-up). Waiting after a successful claim capped a
+    /// continuously-backlogged shard's throughput at one claim per
+    /// `dispatch_read_block`. Its current low multi-shard bound gives
+    /// roughly a hundred claims per second per worker, far below the
+    /// uncapped rate the pre-multi-shard fallback drained at. Returning
+    /// immediately after a claim instead lets the round-robin revisit this
+    /// shard on its very next turn, with no artificial pace on real work.
+    ///
     /// Returns how many tasks were dispatched (`poll_once` claims at most one
     /// per call, so this is the number of loop iterations that claimed).
     async fn drain_postgres(
@@ -28803,6 +28854,7 @@ impl Worker {
         shard_count: usize,
     ) -> u32 {
         let mut dispatched = 0u32;
+        let mut idle = false;
         while !self.shutdown.is_cancelled() {
             if !self
                 .poll_once(
@@ -28812,6 +28864,7 @@ impl Worker {
                 )
                 .await
             {
+                idle = true;
                 break;
             }
             dispatched += 1;
@@ -28819,10 +28872,18 @@ impl Worker {
                 break;
             }
         }
-        let wait = dispatch_read_block(shard_count, self.config.poll_interval);
-        tokio::select! {
-            () = self.shutdown.cancelled() => {}
-            () = tokio::time::sleep(wait) => {}
+        // The wait only paces an idle poll (issue #1429 review). A
+        // multi-shard turn that just claimed a row returns immediately
+        // instead. The round-robin can then rotate to the next shard,
+        // rather than sitting out `dispatch_read_block` with backlog
+        // still waiting. Single-shard mode only ever exits this loop
+        // idle, so it always waits, unchanged.
+        if idle {
+            let wait = dispatch_read_block(shard_count, self.config.poll_interval);
+            tokio::select! {
+                () = self.shutdown.cancelled() => {}
+                () = tokio::time::sleep(wait) => {}
+            }
         }
         dispatched
     }
@@ -29052,8 +29113,12 @@ impl Worker {
         // The connection goes back before the publish: the publish is a channel
         // round trip that the database has no part in.
         drop(conn);
-        if let Err(error) =
-            dispatch_call(installed.channel.publish(&hints), "reconcile publish").await
+        if let Err(error) = dispatch_call_with_timeout(
+            installed.channel.publish(&hints),
+            "reconcile publish",
+            dispatch_maintenance_timeout(shard_count),
+        )
+        .await
         {
             self.enter_degraded(
                 state,
@@ -42491,6 +42556,29 @@ mod tests {
             dispatch_batch_timeout(3, 2, 4),
             DISPATCH_CALL_TIMEOUT * 6,
             "a lease count smaller than the queue-scaled budget must not shrink it"
+        );
+    }
+
+    /// A single-shard turn keeps the flat `maintain`/reconcile-publish
+    /// deadline unchanged. A multi-shard turn gets the short bound
+    /// instead (Codex review, issue #1429 follow-up). One stalled shard's
+    /// maintenance or reconcile call must not park every sibling shard's
+    /// turn behind it for the full five seconds.
+    #[test]
+    fn dispatch_maintenance_timeout_is_bounded_only_for_multi_shard_turns() {
+        assert_eq!(
+            dispatch_maintenance_timeout(1),
+            DISPATCH_CALL_TIMEOUT,
+            "a single-shard turn has no sibling to starve, so the flat deadline stays"
+        );
+        assert_eq!(
+            dispatch_maintenance_timeout(2),
+            MULTI_SHARD_DISPATCH_MAINTENANCE_TIMEOUT,
+            "a multi-shard turn must use the short, round-robin-safe bound"
+        );
+        assert!(
+            MULTI_SHARD_DISPATCH_MAINTENANCE_TIMEOUT < DISPATCH_CALL_TIMEOUT,
+            "the multi-shard bound must actually be shorter than the flat deadline"
         );
     }
 

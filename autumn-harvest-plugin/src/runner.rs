@@ -1846,9 +1846,11 @@ async fn install_dispatch_channel(
 /// startup. Connecting first means a failure here leaves both slots exactly
 /// as this call found them.
 ///
-/// Only once every shard in `shards` has connected does this function clear
-/// both slots and install each connected channel. That clear still needs to
-/// run unconditionally. A process may have previously run single-shard
+/// Only once every shard in `shards` has connected does this function
+/// replace both slots, via `dispatch::install_shards`. That call clears
+/// and installs the whole topology in one atomic step (Codex review,
+/// issue #1429 follow-up). The replacement still needs to run
+/// unconditionally: a process may have previously run single-shard
 /// dispatch, or a differently shaped multi-shard install, with no
 /// intervening `stop()`:
 ///
@@ -1908,25 +1910,31 @@ async fn install_dispatch_channels_for_shards(
         connected.push((shard, key_prefix, channel));
     }
 
-    // Every shard connected. Clear both slots, then install: see the doc
-    // comment above for why the clear still runs unconditionally here.
-    autumn_harvest::dispatch::uninstall();
-    autumn_harvest::dispatch::uninstall_all_shards();
+    // Every shard connected. Replace the whole topology in one atomic
+    // step (Codex review, issue #1429 follow-up). A loop that clears both
+    // slots, then installs each shard through its own separately locked
+    // call, is not atomic enough. See `dispatch::install_shards`'s own
+    // doc for why.
+    let mut key_prefixes = Vec::with_capacity(connected.len());
+    let channels = connected
+        .into_iter()
+        .map(|(shard, key_prefix, channel)| {
+            key_prefixes.push(key_prefix);
+            (
+                shard,
+                Arc::new(channel) as Arc<dyn autumn_harvest::dispatch::TaskDispatch>,
+                autumn_harvest::dispatch::DispatchSettings {
+                    poll_interval: Duration::from_millis(config.redis.poll_interval_ms),
+                    reconcile_interval: Duration::from_millis(config.redis.reconcile_interval_ms),
+                    reconcile_batch: config.redis.reconcile_batch,
+                    ..autumn_harvest::dispatch::DispatchSettings::default()
+                },
+            )
+        })
+        .collect();
+    let installed_shards = autumn_harvest::dispatch::install_shards(channels);
 
-    let mut installed_shards = Vec::with_capacity(connected.len());
-    for (shard, key_prefix, channel) in connected {
-        let generation = autumn_harvest::dispatch::install_for_shard(
-            shard,
-            Arc::new(channel),
-            autumn_harvest::dispatch::DispatchSettings {
-                poll_interval: Duration::from_millis(config.redis.poll_interval_ms),
-                reconcile_interval: Duration::from_millis(config.redis.reconcile_interval_ms),
-                reconcile_batch: config.redis.reconcile_batch,
-                ..autumn_harvest::dispatch::DispatchSettings::default()
-            },
-        );
-        installed_shards.push((shard, generation));
-
+    for (key_prefix, &(shard, _generation)) in key_prefixes.iter().zip(installed_shards.iter()) {
         tracing::info!(
             shard = shard.as_i32(),
             endpoint = %endpoint,

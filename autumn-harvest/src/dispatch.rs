@@ -511,6 +511,55 @@ pub fn uninstall_all_shards_if_current(expected: &[(crate::types::ShardId, u64)]
     stop_publisher();
 }
 
+/// Replace the whole multi-shard topology atomically: clear both slots and
+/// install every given shard's channel in one [`DISPATCH_SLOT_LOCK`]
+/// acquisition (Codex review, issue #1429 follow-up).
+///
+/// A caller that instead clears the slots and then calls
+/// [`install_for_shard`] once per shard still leaves a gap between those
+/// calls. That holds even though each one is individually serialized
+/// against every other install or uninstall call. Two runtimes racing to
+/// install a fresh multi-shard topology could interleave their per-shard
+/// installs. Each runtime's own worker would then see a map mixing shards
+/// from both. It could read and claim through the wrong Redis endpoint or
+/// key prefix for a shard it does not actually own. Every entry here
+/// lands in the map as one atomic step. No other install or uninstall
+/// call can observe, or contribute to, a partial result.
+///
+/// Returns the generation stamped on each shard, in `channels`' order.
+pub fn install_shards(
+    channels: Vec<(
+        crate::types::ShardId,
+        Arc<dyn TaskDispatch>,
+        DispatchSettings,
+    )>,
+) -> Vec<(crate::types::ShardId, u64)> {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    if let Ok(mut slot) = INSTALLED.write() {
+        *slot = None;
+    }
+    let mut installed_shards = Vec::with_capacity(channels.len());
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        let mut map = std::collections::HashMap::with_capacity(channels.len());
+        for (shard, channel, settings) in channels {
+            let generation = INSTALL_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+            map.insert(
+                shard,
+                InstalledDispatch {
+                    channel,
+                    settings,
+                    generation,
+                },
+            );
+            installed_shards.push((shard, generation));
+        }
+        *slot = if map.is_empty() { None } else { Some(map) };
+    }
+    ANY_INSTALLED.store(!installed_shards.is_empty(), Ordering::Relaxed);
+    stop_publisher();
+    installed_shards
+}
+
 // ---------------------------------------------------------------------------
 // Fast path guard
 // ---------------------------------------------------------------------------
@@ -1488,6 +1537,69 @@ mod tests {
         uninstall_all_shards();
         assert!(installed_for_shard(shard_a).is_none());
         assert!(installed_for_shard(shard_b).is_none());
+    }
+
+    /// `install_shards` replaces the whole topology — both slots, and
+    /// every shard — in one atomic step (Codex review, issue #1429
+    /// follow-up).
+    ///
+    /// A caller that instead clears both slots and then calls
+    /// `install_for_shard` once per shard leaves a gap between those
+    /// calls. A racing installer could land in that gap. This pins the
+    /// single-call replacement's own correctness. It clears a stale
+    /// single-shard channel, and a stale per-shard channel for a shard
+    /// the new topology no longer names. It installs every given shard,
+    /// and returns generations that match what is actually in the map.
+    #[tokio::test]
+    async fn install_shards_replaces_both_slots_and_every_shard_atomically() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        install(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        let stale_shard = crate::types::ShardId::new(9);
+        install_for_shard(
+            stale_shard,
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let shard_a = crate::types::ShardId::new(1);
+        let shard_b = crate::types::ShardId::new(2);
+        let installed_shards = install_shards(vec![
+            (
+                shard_a,
+                Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+                DispatchSettings::default(),
+            ),
+            (
+                shard_b,
+                Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+                DispatchSettings::default(),
+            ),
+        ]);
+
+        assert!(
+            installed().is_none(),
+            "install_shards must clear the single-shard slot too"
+        );
+        assert!(
+            installed_for_shard(stale_shard).is_none(),
+            "install_shards must clear a shard the new topology no longer names"
+        );
+        assert_eq!(installed_shards.len(), 2);
+        for (shard, generation) in installed_shards {
+            let live = installed_for_shard(shard).expect("each returned shard must be installed");
+            assert_eq!(
+                live.generation, generation,
+                "the returned generation must match the one actually stamped on the slot"
+            );
+        }
+
+        uninstall_all_shards();
     }
 
     #[tokio::test]
