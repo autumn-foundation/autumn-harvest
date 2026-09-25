@@ -12,7 +12,10 @@
 use std::time::{Duration, Instant};
 
 use autumn_harvest::dispatch::{DispatchHint, DispatchLease, TaskDispatch};
-use autumn_harvest_redis::{RedisDispatch, RedisDispatchConfig};
+use autumn_harvest_redis::{
+    RedisDispatch, RedisDispatchConfig, dispatch_delayed_key, dispatch_marker_key,
+    dispatch_stream_key,
+};
 use chrono::{DateTime, Utc};
 use redis::AsyncCommands;
 use testcontainers::runners::AsyncRunner;
@@ -32,11 +35,11 @@ struct Fixture {
 
 impl Fixture {
     fn stream_key(&self, queue: &str) -> String {
-        format!("{}:dispatch:{queue}", self.prefix)
+        dispatch_stream_key(&self.prefix, queue)
     }
 
-    fn marker_key(&self, task_id: Uuid) -> String {
-        format!("{}:dispatch:marker:{task_id}", self.prefix)
+    fn marker_key(&self, queue: &str, task_id: Uuid) -> String {
+        dispatch_marker_key(&self.prefix, queue, &task_id.to_string())
     }
 
     async fn stream_len(&self, queue: &str) -> i64 {
@@ -44,9 +47,11 @@ impl Fixture {
         conn.xlen(self.stream_key(queue)).await.expect("xlen")
     }
 
-    async fn marker_exists(&self, task_id: Uuid) -> bool {
+    async fn marker_exists(&self, queue: &str, task_id: Uuid) -> bool {
         let mut conn = self.raw.clone();
-        conn.exists(self.marker_key(task_id)).await.expect("exists")
+        conn.exists(self.marker_key(queue, task_id))
+            .await
+            .expect("exists")
     }
 
     async fn pending_count(&self, queue: &str) -> usize {
@@ -429,6 +434,71 @@ async fn release_with_delay_hides_the_entry_and_counts_a_redelivery() {
     assert_eq!(again[0].redeliveries, 1, "release counts one redelivery");
 }
 
+/// One lease's delay overflowing `chrono::Duration` must not skip its
+/// siblings' release in the same batch (Codex review, issue #1429
+/// follow-up).
+///
+/// `release_many_inner` used to build every entry's due time with a `?` on
+/// the `chrono::Duration::from_std` conversion. One out-of-range delay
+/// then aborted the whole call before `requeue_batch` ever ran, and every
+/// other, unrelated lease in the batch stayed pending until visibility
+/// recovery. This drives a batch with one ordinary lease and one whose delay
+/// `chrono::Duration` cannot represent, and asserts the ordinary lease
+/// still gets released.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leases_invalid_release_delay_does_not_block_its_siblings() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["healthy".to_string(), "overflow".to_string()];
+    let healthy_task = Uuid::new_v4();
+    let overflow_task = Uuid::new_v4();
+
+    fixture
+        .dispatch
+        .publish(&[hint("healthy", healthy_task, Utc::now())])
+        .await
+        .expect("publish healthy");
+    fixture
+        .dispatch
+        .publish(&[hint("overflow", overflow_task, Utc::now())])
+        .await
+        .expect("publish overflow");
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 2);
+    let healthy_lease = leases
+        .iter()
+        .find(|lease| lease.task_id == healthy_task)
+        .cloned()
+        .expect("healthy lease");
+    let overflow_lease = leases
+        .iter()
+        .find(|lease| lease.task_id == overflow_task)
+        .cloned()
+        .expect("overflow lease");
+
+    let result = fixture
+        .dispatch
+        .release_many(&[
+            (healthy_lease, Duration::from_millis(50)),
+            (overflow_lease, Duration::MAX),
+        ])
+        .await;
+    assert!(
+        result.is_err(),
+        "an out-of-range delay must still surface as an error"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let again = read(&fixture, &["healthy".to_string()], 10).await;
+    assert_eq!(
+        again.len(),
+        1,
+        "the healthy lease's release must not be skipped by its sibling's bad delay"
+    );
+    assert_eq!(again[0].task_id, healthy_task);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ack_deletes_the_marker_so_a_republish_is_delivered() {
     let Some(fixture) = try_start(Duration::from_secs(60)).await else {
@@ -445,13 +515,13 @@ async fn ack_deletes_the_marker_so_a_republish_is_delivered() {
     let leases = read(&fixture, &queues, 10).await;
     assert_eq!(leases.len(), 1);
     assert!(
-        fixture.marker_exists(task_id).await,
+        fixture.marker_exists("acked", task_id).await,
         "publish sets a marker"
     );
 
     fixture.dispatch.ack(&leases[0]).await.expect("ack");
     assert!(
-        !fixture.marker_exists(task_id).await,
+        !fixture.marker_exists("acked", task_id).await,
         "ack must delete the marker"
     );
     assert_eq!(
@@ -469,6 +539,154 @@ async fn ack_deletes_the_marker_so_a_republish_is_delivered() {
     let again = read(&fixture, &queues, 10).await;
     assert_eq!(again.len(), 1, "a republish after ack is delivered again");
     assert_eq!(again[0].task_id, task_id);
+}
+
+/// Acking a stale lease must not delete a marker a fresher entry now owns
+/// (Codex review, issue #1429).
+///
+/// A batched worker defers a lease's ack until after its task has already
+/// been spawned. A fast-completing task can re-pend and republish the same
+/// task id before that stale lease is acked. That overwrites the marker to
+/// name the fresh entry. Acking the stale lease afterward must not delete
+/// that marker. Doing so would leave the fresh entry undetected by a later
+/// publish's own intact check, producing a duplicate.
+#[tokio::test(flavor = "multi_thread")]
+async fn acking_a_stale_lease_leaves_a_fresher_entrys_marker_intact() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["acked".to_string()];
+    let task_id = Uuid::new_v4();
+    let stale_due = Utc::now();
+
+    fixture
+        .dispatch
+        .publish(&[hint("acked", task_id, stale_due)])
+        .await
+        .expect("publish");
+    let stale = read(&fixture, &queues, 10).await;
+    assert_eq!(stale.len(), 1);
+
+    // Simulates the fast-completing task's re-pend: republishing before the
+    // stale lease above is acked, at a due time distinct from the first
+    // publish. The old marker then reads as not intact, so this writes a
+    // fresh entry and overwrites the marker to name it.
+    let fresh_due = stale_due + chrono::Duration::milliseconds(1);
+    fixture
+        .dispatch
+        .publish(&[hint("acked", task_id, fresh_due)])
+        .await
+        .expect("republish before the stale lease is acked");
+    let fresh = read(&fixture, &queues, 10).await;
+    assert_eq!(fresh.len(), 1, "the republish delivers a fresh entry");
+    assert_ne!(
+        fresh[0].handle, stale[0].handle,
+        "the fresh lease must be a different stream entry from the stale one"
+    );
+
+    fixture
+        .dispatch
+        .ack(&stale[0])
+        .await
+        .expect("ack the stale lease");
+    assert!(
+        fixture.marker_exists("acked", task_id).await,
+        "acking the stale lease must not delete the fresh entry's marker"
+    );
+
+    // A republish at the fresh entry's own due time now reads the marker as
+    // intact and skips, proving it still guards against a duplicate.
+    fixture
+        .dispatch
+        .publish(&[hint("acked", task_id, fresh_due)])
+        .await
+        .expect("publish at the fresh entry's due time");
+    assert_eq!(
+        fixture.stream_len("acked").await,
+        1,
+        "the fresh entry's marker must have prevented a duplicate"
+    );
+}
+
+/// Recovering a stale, unacked lease must not clobber a fresher entry's
+/// marker (Codex review, issue #1429).
+///
+/// Same republish-before-settling setup as
+/// `acking_a_stale_lease_leaves_a_fresher_entrys_marker_intact`, but the
+/// stale lease's deferred ack fails outright instead of merely running
+/// late. It is then never acked at all. It sits in the pending entries
+/// list until visibility recovery claims it, long after the fresh entry
+/// already claimed the marker. Recovery must see that fresher marker and
+/// skip both the duplicate publish and the overwrite, exactly like a stale
+/// ack must. The fresh entry is left undelivered rather than read. It then
+/// never enters the pending entries list itself, so only the stale lease
+/// is there for recovery to find.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovering_a_stale_lease_leaves_a_fresher_entrys_marker_intact() {
+    let Some(fixture) = try_start(Duration::from_millis(300)).await else {
+        return;
+    };
+    let queues = vec!["recovered-stale".to_string()];
+    let task_id = Uuid::new_v4();
+    let stale_due = Utc::now();
+
+    fixture
+        .dispatch
+        .publish(&[hint("recovered-stale", task_id, stale_due)])
+        .await
+        .expect("publish");
+    let stale = read(&fixture, &queues, 10).await;
+    assert_eq!(stale.len(), 1);
+
+    // Simulates the fast-completing task's re-pend: republishing before the
+    // stale lease is ever settled, at a due time distinct from the first
+    // publish. The old marker then reads as not intact, so this writes a
+    // fresh entry and overwrites the marker to name it. Left undelivered
+    // here, so it never enters the pending entries list itself -- only the
+    // stale lease read above does. Recovery's `XPENDING` scan must see
+    // just that one idle entry.
+    let fresh_due = stale_due + chrono::Duration::milliseconds(1);
+    fixture
+        .dispatch
+        .publish(&[hint("recovered-stale", task_id, fresh_due)])
+        .await
+        .expect("republish before the stale lease is settled");
+    assert_eq!(
+        fixture.stream_len("recovered-stale").await,
+        2,
+        "the republish must add a fresh entry alongside the still-pending stale one"
+    );
+
+    // The stale lease's own deferred ack never runs -- it sits pending
+    // until visibility recovery claims it.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let counts = fixture.dispatch.maintain(&queues).await.expect("maintain");
+    assert_eq!(counts.recovered, 1, "the stale entry is still cleared out");
+    assert_eq!(fixture.pending_count("recovered-stale").await, 0);
+
+    assert_eq!(
+        fixture.stream_len("recovered-stale").await,
+        1,
+        "recovering the stale lease must not add a duplicate entry"
+    );
+    assert!(
+        fixture.marker_exists("recovered-stale", task_id).await,
+        "recovering the stale lease must not delete the fresh entry's marker"
+    );
+
+    // A republish at the fresh entry's own due time now reads the marker
+    // as intact and skips. That proves it still names the fresh entry, not
+    // a recovery-created duplicate.
+    fixture
+        .dispatch
+        .publish(&[hint("recovered-stale", task_id, fresh_due)])
+        .await
+        .expect("publish at the fresh entry's due time");
+    assert_eq!(
+        fixture.stream_len("recovered-stale").await,
+        1,
+        "the fresh entry's marker must have prevented a duplicate"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -498,6 +716,115 @@ async fn maintain_recovers_an_unacked_lease_after_the_visibility_timeout() {
     assert_eq!(again.len(), 1, "a recovered entry is delivered again");
     assert_eq!(again[0].task_id, task_id);
     assert_eq!(again[0].redeliveries, 1, "recovery counts one redelivery");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn maintain_recovers_unacked_leases_across_several_queues_in_one_pass() {
+    // Issue #1429: recovery pipelines its `XPENDING` scan across every queue
+    // in one round trip. This pins that a multi-queue pass still recovers
+    // every queue's idle entries correctly, not only a single queue's.
+    let Some(fixture) = try_start(Duration::from_millis(300)).await else {
+        return;
+    };
+    let queues = vec!["crashed-a".to_string(), "crashed-b".to_string()];
+    let task_a = Uuid::new_v4();
+    let task_b = Uuid::new_v4();
+
+    fixture
+        .dispatch
+        .publish(&[hint("crashed-a", task_a, Utc::now())])
+        .await
+        .expect("publish a");
+    fixture
+        .dispatch
+        .publish(&[hint("crashed-b", task_b, Utc::now())])
+        .await
+        .expect("publish b");
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 2);
+    // Both consumers "crash": neither lease is acked nor released.
+    assert_eq!(fixture.pending_count("crashed-a").await, 1);
+    assert_eq!(fixture.pending_count("crashed-b").await, 1);
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let counts = fixture.dispatch.maintain(&queues).await.expect("maintain");
+    assert_eq!(
+        counts.recovered, 2,
+        "both queues' idle entries must recover"
+    );
+    assert_eq!(fixture.pending_count("crashed-a").await, 0);
+    assert_eq!(fixture.pending_count("crashed-b").await, 0);
+
+    let again = read(&fixture, &queues, 10).await;
+    let recovered_ids: std::collections::HashSet<Uuid> =
+        again.iter().map(|lease| lease.task_id).collect();
+    assert_eq!(again.len(), 2, "both recovered entries are delivered again");
+    assert!(recovered_ids.contains(&task_a));
+    assert!(recovered_ids.contains(&task_b));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_queues_broken_pending_scan_does_not_block_its_siblings_recovery() {
+    // Issue #1429 review: `recover_queues` reads its pipelined `XPENDING`
+    // scan through `req_packed_commands` instead of `Pipeline::query_async`.
+    // One queue's reply erroring does not collapse the whole call into a
+    // single `Err`. This pins that behavior end to end. A queue whose
+    // stream key has the wrong type for `XPENDING` must not stop a sibling
+    // queue's idle entry from recovering in the same pass.
+    let Some(fixture) = try_start(Duration::from_millis(300)).await else {
+        return;
+    };
+    let queues = vec!["healthy".to_string(), "broken".to_string()];
+    let healthy_task = Uuid::new_v4();
+    let broken_task = Uuid::new_v4();
+
+    fixture
+        .dispatch
+        .publish(&[hint("healthy", healthy_task, Utc::now())])
+        .await
+        .expect("publish healthy");
+    fixture
+        .dispatch
+        .publish(&[hint("broken", broken_task, Utc::now())])
+        .await
+        .expect("publish broken");
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 2);
+    assert_eq!(fixture.pending_count("healthy").await, 1);
+    assert_eq!(fixture.pending_count("broken").await, 1);
+
+    // Overwrite "broken"'s stream key with a plain string, after the
+    // consumer group already claimed its entry above. `XPENDING` against a
+    // wrong-typed key fails with a `WRONGTYPE` error. That is the same
+    // class of per-queue failure a wrong-typed key or an ACL denial would
+    // produce in production.
+    let mut raw = fixture.raw.clone();
+    let _: () = redis::cmd("SET")
+        .arg(fixture.stream_key("broken"))
+        .arg("not-a-stream")
+        .query_async(&mut raw)
+        .await
+        .expect("corrupt the broken queue's stream key");
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let counts = fixture.dispatch.maintain(&queues).await.expect(
+        "maintain must still succeed: the broken queue's XPENDING failure is logged and \
+         skipped, not propagated",
+    );
+    assert_eq!(
+        counts.recovered, 1,
+        "only the healthy queue's idle entry recovers"
+    );
+    assert_eq!(fixture.pending_count("healthy").await, 0);
+
+    let again = read(&fixture, &["healthy".to_string()], 10).await;
+    assert_eq!(
+        again.len(),
+        1,
+        "the healthy queue's entry is delivered again"
+    );
+    assert_eq!(again[0].task_id, healthy_task);
+    assert_eq!(again[0].redeliveries, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -533,6 +860,56 @@ async fn a_blocking_read_returns_early_when_an_entry_arrives() {
     assert!(
         elapsed < Duration::from_secs(2),
         "the read must return on arrival, not on the wait deadline (elapsed {elapsed:?})"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_multi_queue_blocking_read_still_delivers_an_arrival_on_either_queue() {
+    // Issue #1429, Codex review: a multi-queue read no longer combines every
+    // queue's stream into one blocking `XREADGROUP` (that crossed Redis
+    // Cluster slots). It blocks on only the queue this call's own rotation
+    // leads with, and reads every other queue non-blocking. A caller's own
+    // poll loop calls `next` repeatedly. It still picks up an arrival on any
+    // queue within a small bounded number of calls, regardless of which
+    // queue led this call's rotation.
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["multi-a".to_string(), "multi-b".to_string()];
+    // Prime both consumer groups so neither read hits NOGROUP mid-test.
+    assert!(read(&fixture, &queues, 10).await.is_empty());
+
+    let task_id = Uuid::new_v4();
+    let publisher = fixture.dispatch.clone();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        publisher
+            .publish(&[hint("multi-b", task_id, Utc::now())])
+            .await
+            .expect("publish");
+    });
+
+    let started = Instant::now();
+    let mut leases = Vec::new();
+    while leases.is_empty() && started.elapsed() < Duration::from_secs(5) {
+        leases = fixture
+            .dispatch
+            .next(&queues, "consumer-1", 10, Duration::from_millis(300))
+            .await
+            .expect("next");
+    }
+    handle.await.expect("publisher");
+
+    assert_eq!(
+        leases.len(),
+        1,
+        "the arrival on either queue must still be delivered"
+    );
+    assert_eq!(leases[0].task_id, task_id);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "delivery must stay within a small bounded number of poll calls (elapsed {:?})",
+        started.elapsed()
     );
 }
 
@@ -579,8 +956,11 @@ async fn a_read_across_two_queues_returns_at_most_the_requested_count() {
         }
     }
 
-    // `COUNT` bounds one stream, so a read over two queues can return four
-    // entries for a caller that asked for three. The surplus goes back.
+    // Each queue's `COUNT` is sized from the batch's remaining capacity
+    // (issue #1429). This read still honours the cap of three: the first
+    // queue visited takes up to all three, leaving only what is left for
+    // the second. Whichever queue that leaves an entry unclaimed, it stays
+    // in its stream for a later read to pick up.
     let leases = read(&fixture, &queues, 3).await;
     assert_eq!(leases.len(), 3, "the read must honour the caller's cap");
     assert_eq!(
@@ -599,6 +979,104 @@ async fn a_read_across_two_queues_returns_at_most_the_requested_count() {
     seen.sort_unstable();
     published.sort_unstable();
     assert_eq!(seen, published, "every reference must be delivered once");
+}
+
+/// A single busy queue's read is sized from the full remaining batch
+/// capacity, not an equal `max / queue_count` split (Codex review, issue
+/// #1429).
+///
+/// Before this fix, `per_stream_count` divided the cap evenly across every
+/// configured queue, regardless of which ones actually had work. A worker
+/// serving many mostly idle queues would then throttle its one busy queue
+/// to `max / N` per read. Filling one batch needed roughly `N` such reads,
+/// each visiting every queue: about `N²` commands for what one full-budget
+/// read now does. This also means a same-call surplus across queues, the
+/// kind `a_capped_read_favors_the_higher_priority_candidates` used to
+/// exercise, no longer normally arises. The busy queue processed first now
+/// consumes the whole cap before a second queue is ever visited. The
+/// priority sort-and-split in `next_inner` stays as a defensive
+/// fallback regardless.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_busy_queue_gets_the_full_budget_among_idle_peers() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec![
+        "busy".to_string(),
+        "idle-a".to_string(),
+        "idle-b".to_string(),
+        "idle-c".to_string(),
+    ];
+    let mut published = Vec::new();
+    for _ in 0..4 {
+        let task_id = Uuid::new_v4();
+        published.push(task_id);
+        fixture
+            .dispatch
+            .publish(&[hint("busy", task_id, Utc::now())])
+            .await
+            .expect("publish");
+    }
+
+    // Four idle peer queues no longer throttle "busy"'s own read to
+    // `4 / 4 == 1` per call. One call now delivers all four.
+    let leases = read(&fixture, &queues, 4).await;
+    assert_eq!(
+        leases.len(),
+        4,
+        "the busy queue's read must not be capped by its idle peers"
+    );
+    let mut delivered: Vec<Uuid> = leases.iter().map(|lease| lease.task_id).collect();
+    delivered.sort_unstable();
+    published.sort_unstable();
+    assert_eq!(delivered, published);
+}
+
+/// A persistently broken queue must surface as an error, not a quiet
+/// success, even while a healthy sibling queue keeps delivering (Codex
+/// review, issue #1429).
+///
+/// `read_across_queues` used to swallow a failing queue's error whenever
+/// any other queue in the same pass returned an entry. Consider a queue
+/// whose stream key is the wrong Redis type: `WRONGTYPE`, which
+/// `read_with_heal` cannot self-heal the way it heals `NOGROUP`. It would
+/// then never surface its own failure as long as a busy sibling kept
+/// every pass "ready". The
+/// caller's `enter_degraded` fallback never engaged, so the broken queue
+/// went undrained except by the much slower reconcile sweep.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_persistently_broken_queue_is_not_masked_by_a_healthy_sibling() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["healthy".to_string(), "broken".to_string()];
+
+    fixture
+        .dispatch
+        .publish(&[hint("healthy", Uuid::new_v4(), Utc::now())])
+        .await
+        .expect("publish");
+
+    // Corrupt "broken"'s stream key to a non-stream type. `XREADGROUP` on
+    // it then fails `WRONGTYPE`, which `read_with_heal` cannot self-heal
+    // (only `NOGROUP` is healed).
+    let mut raw = fixture.raw.clone();
+    let _: () = redis::cmd("SET")
+        .arg(fixture.stream_key("broken"))
+        .arg("not-a-stream")
+        .query_async(&mut raw)
+        .await
+        .expect("corrupt the broken queue's stream key");
+
+    let result = fixture
+        .dispatch
+        .next(&queues, "consumer-1", 10, Duration::from_millis(50))
+        .await;
+    assert!(
+        result.is_err(),
+        "a persistently broken queue must surface as an error, not a quiet \
+         success, even though the healthy queue had a ready entry"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -627,6 +1105,125 @@ async fn every_queue_is_served_when_the_read_cap_is_one() {
         served,
         vec!["first".to_string(), "second".to_string()],
         "the queue order must rotate so no queue starves"
+    );
+}
+
+/// An entry published on a non-leader queue must not wait out the leader's
+/// full blocking timeout (Codex review, issue #1429).
+///
+/// `read_across_queues` blocks each queue's stream on its own single-key
+/// call. A multi-key `XREADGROUP` across several queues' hash-tagged
+/// streams would cross Redis Cluster slots. Blocking the whole `wait` on
+/// only the rotation's leader has a cost, though. An entry can land on a
+/// different queue right after that queue's own non-blocking scan. It then
+/// sits unseen until the leader's timeout expires. The fix caps each
+/// queue's blocking slice and cycles the rotation across `wait`'s budget.
+/// A sibling queue's arrival then surfaces within about one slice, instead
+/// of the whole wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_leader_queue_is_not_starved_behind_the_leaders_full_wait() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    // First call's rotation offset is 0, so `ordered` keeps this order:
+    // "first" leads, "second" does not.
+    let queues = vec!["first".to_string(), "second".to_string()];
+    let wait = Duration::from_millis(600);
+
+    let dispatch = fixture.dispatch.clone();
+    let read_queues = queues.clone();
+    let handle = tokio::spawn(async move {
+        let started = Instant::now();
+        let leases = dispatch
+            .next(&read_queues, "consumer-1", 1, wait)
+            .await
+            .expect("next");
+        (started.elapsed(), leases)
+    });
+
+    // Give the read time to start blocking on "first" before publishing to
+    // "second", so this exercises the rotation rather than the initial
+    // non-blocking pass.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    fixture
+        .dispatch
+        .publish(&[hint("second", Uuid::new_v4(), Utc::now())])
+        .await
+        .expect("publish");
+
+    let (elapsed, leases) = handle.await.expect("join");
+    assert_eq!(
+        leases.len(),
+        1,
+        "the read must find the entry published on the non-leader queue"
+    );
+    assert_eq!(leases[0].queue_name, "second");
+    assert!(
+        elapsed < wait / 2,
+        "a non-leader queue's arrival must not wait out the leader's full \
+         block; elapsed was {elapsed:?} against a {wait:?} wait"
+    );
+}
+
+/// A queue near the tail of a long rotation must still get a blocking
+/// look within the same `wait` (Codex review, issue #1429). That must
+/// hold however many queues are configured.
+///
+/// A fixed per-queue blocking slice does not fit a lap with more queues
+/// than `wait / QUEUE_BLOCK_SLICE`. The deadline passes before the
+/// rotation reaches a queue near the tail. The rotation always restarts
+/// at 0 on the next call. That queue would then never get a blocking
+/// slice at all, not just a delayed one. `read_across_queues` instead
+/// divides the budget still left by the queues still left in the lap. So
+/// every queue gets one blocking look inside the same `wait`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queue_near_the_tail_of_a_long_rotation_still_gets_a_blocking_look() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    // 20 queues at a fixed 200ms slice each would need 4s to reach the
+    // last one, more than this test's 3s wait. First call's rotation
+    // offset is 0, so `ordered` keeps this declaration order.
+    let queues: Vec<String> = (0..20).map(|i| format!("tail-{i}")).collect();
+    let wait = Duration::from_secs(3);
+    let tail_queue = queues.last().cloned().expect("at least one queue");
+
+    let dispatch = fixture.dispatch.clone();
+    let read_queues = queues.clone();
+    let handle = tokio::spawn(async move {
+        let started = Instant::now();
+        let leases = dispatch
+            .next(&read_queues, "consumer-1", 1, wait)
+            .await
+            .expect("next");
+        (started.elapsed(), leases)
+    });
+
+    // Give the read time to start blocking before publishing to the tail
+    // queue, so this exercises the rotation rather than the initial
+    // non-blocking pass.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    fixture
+        .dispatch
+        .publish(&[hint(&tail_queue, Uuid::new_v4(), Utc::now())])
+        .await
+        .expect("publish");
+
+    let (elapsed, leases) = handle.await.expect("join");
+    assert_eq!(
+        leases.len(),
+        1,
+        "the read must find the entry published on the tail queue"
+    );
+    assert_eq!(leases[0].queue_name, tail_queue);
+    // `wait` only bounds the blocking phase. The initial non-blocking pass
+    // over all 20 queues runs before that budget starts, adding its own
+    // round-trip time. So this leaves it a margin on top of `wait`.
+    let generous_bound = wait + Duration::from_secs(1);
+    assert!(
+        elapsed < generous_bound,
+        "a tail queue's arrival must surface within the same wait, not a \
+         later call; elapsed was {elapsed:?} against a {generous_bound:?} bound"
     );
 }
 
@@ -713,6 +1310,70 @@ async fn a_malformed_entry_leaves_the_pending_list() {
         0,
         "no entry may be left pending after the recovery pass"
     );
+}
+
+/// Malformed entries spanning two queues in one multi-queue read must both
+/// get cleaned up (Codex review, issue #1429).
+///
+/// `discard_entries` used to build one atomic `MULTI`/`EXEC` pipe over
+/// every malformed entry a read collected, across every queue involved.
+/// Each queue's stream carries its own hash tag. That pipe would then fail
+/// `CROSSSLOT` on a real Cluster the moment two queues both contributed a
+/// malformed entry to the same multi-queue read. It now groups by stream
+/// first, mirroring `ack_many_inner`/`requeue_batch`. This pins the
+/// functional behavior that split preserves. Every queue's malformed
+/// entries still get cleaned up, not just the first one a `HashMap`
+/// happens to visit.
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_entries_across_two_queues_are_both_discarded() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["malformed-a".to_string(), "malformed-b".to_string()];
+    let task_a = Uuid::new_v4();
+    let task_b = Uuid::new_v4();
+
+    // A real publish on each queue creates the consumer group the
+    // hand-written entries need.
+    fixture
+        .dispatch
+        .publish(&[hint("malformed-a", task_a, Utc::now())])
+        .await
+        .expect("publish a");
+    fixture
+        .dispatch
+        .publish(&[hint("malformed-b", task_b, Utc::now())])
+        .await
+        .expect("publish b");
+
+    let mut conn = fixture.raw.clone();
+    for queue in &queues {
+        let key = fixture.stream_key(queue);
+        let _: String = redis::cmd("XADD")
+            .arg(&key)
+            .arg("*")
+            .arg("other")
+            .arg("no payload field here")
+            .query_async(&mut conn)
+            .await
+            .expect("xadd an entry with no payload field");
+    }
+
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 2, "only the legitimate entries yield leases");
+
+    assert_eq!(
+        fixture.pending_count("malformed-a").await,
+        1,
+        "queue a's malformed entry must be acknowledged"
+    );
+    assert_eq!(
+        fixture.pending_count("malformed-b").await,
+        1,
+        "queue b's malformed entry must be acknowledged too, not just queue a's"
+    );
+    assert_eq!(fixture.stream_len("malformed-a").await, 1);
+    assert_eq!(fixture.stream_len("malformed-b").await, 1);
 }
 
 /// The recovery pass discards an entry it cannot read, rather than leaving it
@@ -838,7 +1499,7 @@ async fn a_republish_restores_a_stream_entry_that_vanished() {
         .expect("xdel");
     assert_eq!(fixture.stream_len("vanished").await, 0);
     assert!(
-        fixture.marker_exists(task_id).await,
+        fixture.marker_exists("vanished", task_id).await,
         "the case needs the marker to outlive the entry"
     );
 
@@ -877,13 +1538,13 @@ async fn a_republish_restores_a_parked_reference_that_vanished() {
     // The parked reference goes; the marker stays.
     let mut conn = fixture.raw.clone();
     let _: i64 = redis::cmd("ZREM")
-        .arg(format!("{}:dispatch:parked:delayed", fixture.prefix))
+        .arg(dispatch_delayed_key(&fixture.prefix, "parked"))
         .arg(task_id.to_string())
         .query_async(&mut conn)
         .await
         .expect("zrem");
     assert!(
-        fixture.marker_exists(task_id).await,
+        fixture.marker_exists("parked", task_id).await,
         "the case needs the marker to outlive the parked reference"
     );
 

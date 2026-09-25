@@ -96,6 +96,7 @@ fn sample_view() -> EffectiveConfigView {
         },
         Duration::from_millis(500),
         None,
+        None,
     )
 }
 

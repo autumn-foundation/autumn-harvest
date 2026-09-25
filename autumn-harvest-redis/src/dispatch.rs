@@ -12,12 +12,18 @@
 //!
 //! ## Key family
 //!
-//! - `{prefix}:dispatch:{queue}` — the stream of claimable references.
-//! - `{prefix}:dispatch:{queue}:delayed` — a sorted set of references that are
+//! Every key for one queue nests the literal substring `{prefix:dispatch:queue}`,
+//! the queue's Redis Cluster hash tag (issue #1429). A multi-key script
+//! (`PUBLISH_LUA`, `REQUEUE_LUA`, `PROMOTE_MARKED_LUA`) touching several of
+//! them in one call therefore stays in one Cluster slot.
+//!
+//! - `{prefix:dispatch:queue}` — the stream of claimable references.
+//! - `{prefix:dispatch:queue}:delayed` — a sorted set of references that are
 //!   not yet due, scored by due time in unix milliseconds.
-//! - `{prefix}:dispatch:{queue}:delayed:payloads` — the payload of each
+//! - `{prefix:dispatch:queue}:delayed:payloads` — the payload of each
 //!   delayed reference, keyed by task id.
-//! - `{prefix}:dispatch:marker:{task_id}` — the dedupe marker.
+//! - `{prefix:dispatch:queue}:marker:{task_id}` — the dedupe marker. Scoped to
+//!   its queue's tag, not global, so it lands in that queue's slot too.
 //!
 //! The standalone [`crate::RedisTaskQueue`] owns `{prefix}:queue:*` and
 //! `{prefix}:scheduled:*`. The two key families do not overlap, so one Redis
@@ -61,7 +67,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use autumn_harvest::dispatch::{
@@ -74,7 +80,7 @@ use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::streams::{
     StreamClaimReply, StreamPendingCountReply, StreamReadOptions, StreamReadReply,
 };
-use redis::{AsyncCommands, RedisError, Script};
+use redis::{AsyncCommands, FromRedisValue, RedisError, Script};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -103,6 +109,36 @@ const RECOVER_BATCH: usize = 128;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Deadline for one command on an open connection (contract C4).
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Per-queue cap on [`RedisDispatch::read_across_queues`]'s blocking pass
+/// when more than one queue is in rotation (Codex review, issue #1429).
+///
+/// One queue's stream carries its own hash tag. A single multi-key
+/// `XREADGROUP` across several queues therefore crosses Redis Cluster slots
+/// (see `read_across_queues`'s own doc comment). Reading each queue with its
+/// own single-key call lost a property the old multi-key blocking read had
+/// for free. Any configured queue's arrival used to wake the read at once.
+/// Blocking the whole `wait` on only the rotation's leader loses that. An
+/// entry can land on a different queue right after that queue's own
+/// non-blocking scan. It then waits out the leader's full timeout before
+/// the next call's scan finds it.
+///
+/// Capping each queue's blocking slice to this value, and cycling the
+/// rotation across the remaining `wait` budget, bounds that latency. It
+/// stays about `QUEUE_BLOCK_SLICE * ordered.len()` when there is budget to
+/// spare. A single-queue rotation leaves `wait` undivided. There is no
+/// sibling queue to starve.
+///
+/// This cap alone does not fit a lap with more than `wait /
+/// QUEUE_BLOCK_SLICE` queues (Codex review, issue #1429). The deadline
+/// would pass before the rotation reached every queue once. The tail
+/// queues would then never get a blocking slice at all, in this call or
+/// the next, since the rotation always restarts at 0. `read_across_queues`
+/// therefore shrinks each slice below this cap when the current lap needs
+/// it to. It divides the budget still left by the queues still left in
+/// the lap. Every queue then gets one blocking look within the same
+/// `wait`, regardless of how many queues are configured.
+const QUEUE_BLOCK_SLICE: Duration = Duration::from_millis(200);
 
 /// Separator between the entry id and the payload inside a lease handle.
 ///
@@ -244,6 +280,7 @@ pub struct RedisDispatch {
     publish_script: Arc<Script>,
     promote_script: Arc<Script>,
     requeue_script: Arc<Script>,
+    ack_marker_script: Arc<Script>,
     /// Queues whose consumer group this process already created.
     ensured: Arc<Mutex<HashSet<String>>>,
     /// Unix milliseconds of the last promotion pass driven by a read.
@@ -262,6 +299,10 @@ impl std::fmt::Debug for RedisDispatch {
             .finish_non_exhaustive()
     }
 }
+
+/// One queue's share of a [`RedisDispatch::requeue_batch`] call: each
+/// entry's handle, reference and due time, borrowed from the caller's slice.
+type QueueBatch<'a> = Vec<(&'a String, &'a DispatchRef, DateTime<Utc>)>;
 
 impl RedisDispatch {
     /// Build a channel from two open connection managers.
@@ -286,6 +327,7 @@ impl RedisDispatch {
             publish_script: Arc::new(Script::new(PUBLISH_LUA)),
             promote_script: Arc::new(Script::new(PROMOTE_MARKED_LUA)),
             requeue_script: Arc::new(Script::new(REQUEUE_LUA)),
+            ack_marker_script: Arc::new(Script::new(ACK_MARKER_LUA)),
             ensured: Arc::new(Mutex::new(HashSet::new())),
             last_promote_ms: Arc::new(AtomicI64::new(0)),
             last_recover_ms: Arc::new(AtomicI64::new(0)),
@@ -348,8 +390,8 @@ impl RedisDispatch {
         dispatch_payloads_key(&self.config.key_prefix, queue_name)
     }
 
-    fn marker_key(&self, task_id: Uuid) -> String {
-        dispatch_marker_key(&self.config.key_prefix, &task_id.to_string())
+    fn marker_key(&self, queue_name: &str, task_id: Uuid) -> String {
+        dispatch_marker_key(&self.config.key_prefix, queue_name, &task_id.to_string())
     }
 
     fn dedupe_ttl_secs(&self) -> i64 {
@@ -421,7 +463,7 @@ impl RedisDispatch {
                 .arg(self.payloads_key(queue))
                 .arg(self.stream_key(queue))
                 .arg(now_ms)
-                .arg(dispatch_marker_prefix(&self.config.key_prefix))
+                .arg(dispatch_marker_prefix(&self.config.key_prefix, queue))
                 .arg(self.dedupe_ttl_secs());
         }
         pipe
@@ -556,16 +598,22 @@ impl RedisDispatch {
         reference: &DispatchRef,
         due: DateTime<Utc>,
     ) -> RedisAdapterResult<()> {
-        let entries = [(handle.to_string(), reference.clone())];
-        self.requeue_batch(&entries, due).await
+        let entries = [(handle.to_string(), reference.clone(), due)];
+        self.requeue_batch(&entries).await
     }
 
-    /// Give several entries back to their streams in one round trip.
+    /// Give several entries back to their streams in one round trip per
+    /// queue. Each entry carries its own due time (issue #1429). A batch may
+    /// therefore mix an immediate requeue (a surplus read, a recovered
+    /// entry) with a backed-off release.
     ///
     /// The delivered entry is acked and deleted first, so the pending entries
     /// list never holds a reference the worker no longer owns. The marker is
-    /// rewritten, not deleted. The row is still un-claimed, so a republish of
-    /// the same `scheduled_at` stays a no-op until the new entry is delivered.
+    /// rewritten, not deleted, when it still names the entry being requeued.
+    /// The row is still un-claimed, so a republish of the same `scheduled_at`
+    /// stays a no-op until the new entry is delivered. See [`REQUEUE_LUA`]'s
+    /// own doc comment for when the marker no longer names the entry, and why
+    /// the rewrite is skipped there instead.
     ///
     /// `due` moves the delivery time only. `reference.scheduled_at` keeps the
     /// row's due time, which is what contract C1 compares against.
@@ -575,47 +623,60 @@ impl RedisDispatch {
     /// `XADD` generates.
     async fn requeue_batch(
         &self,
-        entries: &[(String, DispatchRef)],
-        due: DateTime<Utc>,
+        entries: &[(String, DispatchRef, DateTime<Utc>)],
     ) -> RedisAdapterResult<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut by_queue: HashMap<&str, Vec<(&String, &DispatchRef)>> = HashMap::new();
-        for (handle, reference) in entries {
+        let mut by_queue: HashMap<&str, QueueBatch<'_>> = HashMap::new();
+        for (handle, reference, due) in entries {
             by_queue
                 .entry(reference.queue_name.as_str())
                 .or_default()
-                .push((handle, reference));
+                .push((handle, reference, *due));
         }
         let now_ms = Utc::now().timestamp_millis();
-        let due_ms = due.timestamp_millis();
         let ttl = self.dedupe_ttl_secs();
+        // One queue's script invocation failing must not abort the rest of
+        // this batch (issue #1429 review). A caller
+        // that batches leases spanning several queues (`release_many_inner`,
+        // the surplus/PEL-recovery paths) would otherwise risk every other
+        // queue's requeue. One transient error on the first queue a
+        // `HashMap` happens to iterate would silently skip it. That is a
+        // real increase in blast radius over the pre-batch
+        // one-lease-at-a-time behavior. The cost stays latency-only: a
+        // requeue this call drops still sits behind its old visibility
+        // timeout. The reconcile sweep is the durability floor regardless.
+        // Every queue is attempted; the first error, if any, is returned
+        // after the loop.
+        let mut first_error = None;
         for (queue, batch) in by_queue {
             let mut invocation = self.requeue_script.prepare_invoke();
             invocation
                 .key(self.stream_key(queue))
                 .key(self.delayed_key(queue))
                 .key(self.payloads_key(queue));
-            for (_, reference) in &batch {
-                invocation.key(self.marker_key(reference.task_id));
+            for (_, reference, _) in &batch {
+                invocation.key(self.marker_key(queue, reference.task_id));
             }
             invocation
                 .arg(now_ms)
                 .arg(ttl)
                 .arg(self.config.consumer_group.as_str());
-            for (handle, reference) in &batch {
+            for (handle, reference, due) in &batch {
                 invocation
                     .arg(handle_entry_id(handle))
                     .arg(reference.task_id.to_string())
-                    .arg(due_ms)
+                    .arg(due.timestamp_millis())
                     .arg(reference.marker_value())
                     .arg(serde_json::to_string(reference)?);
             }
             let mut conn = self.conn.clone();
-            let _: i64 = invocation.invoke_async(&mut conn).await?;
+            if let Err(error) = invocation.invoke_async::<i64>(&mut conn).await {
+                first_error.get_or_insert_with(|| RedisAdapterError::from(error));
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn publish_inner(&self, hints: &[DispatchHint]) -> RedisAdapterResult<()> {
@@ -642,7 +703,7 @@ impl RedisDispatch {
                 .key(self.delayed_key(queue))
                 .key(self.payloads_key(queue));
             for hint in &batch {
-                invocation.key(self.marker_key(hint.task_id));
+                invocation.key(self.marker_key(queue, hint.task_id));
             }
             invocation.arg(now_ms).arg(ttl);
             for hint in &batch {
@@ -658,6 +719,149 @@ impl RedisDispatch {
         Ok(())
     }
 
+    /// Read every queue in `ordered`, one single-key call each. It runs a
+    /// non-blocking pass first. Only if nothing was ready does it then
+    /// block. It cycles the rotation across `wait`'s budget, in slices of
+    /// at most [`QUEUE_BLOCK_SLICE`] each (Codex review, issue #1429). That
+    /// keeps a sibling queue's arrival from starving behind the leader's
+    /// full timeout. See `QUEUE_BLOCK_SLICE`'s own doc comment.
+    ///
+    /// `ordered` pairs each stream key with its own queue name. A NOGROUP
+    /// heal (via [`Self::read_with_heal`]) can then pass just that one
+    /// queue, rather than every configured queue (Codex review, issue
+    /// #1429 follow-up). An operator deleting one queue's consumer group
+    /// must not turn that queue's own recovery into a full
+    /// `ensure_groups` sweep. That sweep costs one `XGROUP CREATE` round
+    /// trip per *every* configured queue, on top of the read this call
+    /// already budgets one round trip for.
+    ///
+    /// Extracted from [`Self::next_inner`] to keep that function's line
+    /// count under clippy's `too_many_lines` threshold (issue #1429).
+    ///
+    /// Each queue's `COUNT` is sized from the batch capacity `max` still
+    /// left, not an equal `max / ordered.len()` split (Codex review, issue
+    /// #1429). An even split throttles a single busy queue among many idle
+    /// ones to `max / N`, even though every one of `max`'s slots is free.
+    /// Filling a batch then needs roughly `N` such reads, each visiting
+    /// every queue: about `N²` commands where a single full-budget read
+    /// would do. Sizing from the remaining capacity lets one queue's first
+    /// read fill the whole batch. The loop then stops early once it does,
+    /// still visiting the rest only when an earlier queue came up short.
+    ///
+    /// One queue's read failing must not discard entries an earlier queue
+    /// in this same pass already claimed into this consumer's PEL (Codex
+    /// review, issue #1429). Propagating the error immediately would drop
+    /// those entries on the floor. They would then sit stranded, invisible
+    /// to the caller, until visibility recovery reclaims them — a real
+    /// latency cost this batching should not add. Every queue is
+    /// attempted, mirroring the same attempt-every-queue-and-keep-going
+    /// shape `ack_many_inner` and `requeue_batch` already use.
+    ///
+    /// Returns the error alongside the reply rather than swallowing it
+    /// whenever some other queue's read still succeeded (Codex review,
+    /// issue #1429). A queue that persistently fails its read — a
+    /// wrong-typed key, say — must not go undrained forever. That is what
+    /// would happen if a busy sibling queue kept every pass "successful"
+    /// from the caller's point of view. [`Self::next_inner`] requeues
+    /// whatever this call did collect, and propagates the error in that
+    /// case. So the worker's degraded-mode fallback still engages instead
+    /// of silently masking a broken queue. The `Err` variant is reserved
+    /// for when nothing at all was read, so a genuine channel outage still
+    /// surfaces even with no
+    /// entries to requeue.
+    async fn read_across_queues(
+        &self,
+        ordered: &[(String, String)],
+        consumer: &str,
+        max: usize,
+        wait: Duration,
+    ) -> RedisAdapterResult<(StreamReadReply, Option<RedisAdapterError>)> {
+        let mut reply = StreamReadReply::default();
+        let mut any_ready = false;
+        let mut first_error = None;
+        let mut remaining = max.max(1);
+        for (queue, key) in ordered {
+            if remaining == 0 {
+                break;
+            }
+            match self
+                .read_with_heal(
+                    std::slice::from_ref(queue),
+                    std::slice::from_ref(key),
+                    consumer,
+                    remaining,
+                    Duration::ZERO,
+                )
+                .await
+            {
+                Ok(one) => {
+                    let delivered: usize = one.keys.iter().map(|stream| stream.ids.len()).sum();
+                    if delivered > 0 {
+                        any_ready = true;
+                        remaining = remaining.saturating_sub(delivered);
+                    }
+                    reply.keys.extend(one.keys);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if !any_ready && !wait.is_zero() && !ordered.is_empty() {
+            let deadline = Instant::now() + wait;
+            let mut rotation = 0usize;
+            while !any_ready && remaining > 0 {
+                let Some(budget) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                // A lone queue leaves `wait` undivided: there is no sibling
+                // to starve, so this stays the original single-call block
+                // (see `QUEUE_BLOCK_SLICE`'s doc comment).
+                //
+                // A lap with more queues than `wait / QUEUE_BLOCK_SLICE`
+                // needs a smaller share per queue (Codex review, issue
+                // #1429). See `QUEUE_BLOCK_SLICE`'s own doc comment.
+                let lap_position = rotation % ordered.len();
+                let queues_left_in_lap = ordered.len() - lap_position;
+                let slice = if ordered.len() > 1 {
+                    let fair_share = budget / u32::try_from(queues_left_in_lap).unwrap_or(1);
+                    fair_share.min(QUEUE_BLOCK_SLICE)
+                } else {
+                    budget
+                };
+                let (queue, key) = &ordered[lap_position];
+                match self
+                    .read_with_heal(
+                        std::slice::from_ref(queue),
+                        std::slice::from_ref(key),
+                        consumer,
+                        remaining,
+                        slice,
+                    )
+                    .await
+                {
+                    Ok(blocked) => {
+                        let delivered: usize =
+                            blocked.keys.iter().map(|stream| stream.ids.len()).sum();
+                        if delivered > 0 {
+                            any_ready = true;
+                            remaining = remaining.saturating_sub(delivered);
+                        }
+                        reply.keys.extend(blocked.keys);
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                rotation += 1;
+            }
+        }
+        if !any_ready && let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok((reply, first_error))
+    }
+
     async fn next_inner(
         &self,
         queues: &[String],
@@ -665,20 +869,40 @@ impl RedisDispatch {
         max: usize,
         wait: Duration,
     ) -> RedisAdapterResult<Vec<DispatchLease>> {
-        let keys: Vec<String> = queues.iter().map(|queue| self.stream_key(queue)).collect();
-        // `COUNT` bounds one stream, not the whole read. Sizing it per stream
-        // keeps the read close to `max` entries in total. The order rotates
-        // per call, so the queue that fills the batch changes. No queue
-        // therefore starves behind a busy peer.
+        // Paired with its queue name so a NOGROUP heal during the read below
+        // can target just that one queue (Codex review, issue #1429
+        // follow-up). See `read_across_queues`'s own doc comment.
+        let queue_and_key: Vec<(String, String)> = queues
+            .iter()
+            .map(|queue| (queue.clone(), self.stream_key(queue)))
+            .collect();
+        // The order rotates per call, so the queue that fills the batch
+        // changes. No queue therefore starves behind a busy peer.
+        // `read_across_queues` sizes each queue's own `COUNT` from `max`
+        // itself, not a fixed even split (see its own doc comment).
         let offset = usize::try_from(self.reads.fetch_add(1, Ordering::Relaxed)).unwrap_or(0);
-        let ordered = rotate(&keys, offset);
-        let count = per_stream_count(max, ordered.len());
-        let reply = self
-            .read_with_heal(queues, &ordered, consumer, count, wait)
+        let ordered = rotate(&queue_and_key, offset);
+
+        // One queue's stream carries its own hash tag (issue #1429). So a
+        // single multi-key `XREADGROUP` across several queues crosses Redis
+        // Cluster slots (Codex review). Read each queue's stream in its own
+        // call instead, which stays inside one slot no matter how many
+        // queues this worker serves.
+        //
+        // A first, non-blocking pass over every queue costs one fast round
+        // trip per queue. It finds an already-ready entry immediately,
+        // without paying `wait` once per queue. Only when that pass finds
+        // nothing does this call block. It then cycles the rotation in
+        // short slices across `wait`'s budget, rather than parking the
+        // whole budget on the leader alone. See `read_across_queues`'s own
+        // doc comment. `ordered` rotates every call, so blocking fairness
+        // matches the round-robin already used to decide which queue's
+        // `COUNT` fills the batch first.
+        let (reply, read_error) = self
+            .read_across_queues(&ordered, consumer, max, wait)
             .await?;
 
-        let mut leases = Vec::new();
-        let mut surplus = Vec::new();
+        let mut candidates = Vec::new();
         let mut malformed = Vec::new();
         for stream in reply.keys {
             let stream_key = stream.key;
@@ -701,12 +925,41 @@ impl RedisDispatch {
                     malformed.push((stream_key.clone(), entry.id));
                     continue;
                 };
-                if leases.len() < max {
-                    let handle = encode_handle(&entry.id, &payload);
-                    leases.push(reference.into_lease(handle));
-                } else {
-                    surplus.push((entry.id, reference));
-                }
+                candidates.push((entry.id, payload, reference));
+            }
+        }
+
+        // Priority is best effort under dispatch (issue #1429). One FIFO
+        // stream per queue carries no priority order on its own. `COUNT`
+        // also caps what Redis returns per stream before this call ever sees
+        // a candidate. `read_across_queues` sizes each queue's `COUNT` from
+        // the batch's remaining capacity, so a normal read no longer
+        // intentionally exceeds `max`. This split is kept as a defensive
+        // fallback regardless. A stable sort by priority (descending)
+        // favors the highest-priority candidates among whatever this read
+        // did collect, for the leases this call actually claims. It
+        // requeues the rest. Ties keep arrival order, since the sort is
+        // stable, so this never starves same-priority work. The reconcile
+        // sweep's own `(priority DESC, scheduled_at ASC)` publish order is
+        // the other half of this best-effort signal.
+        candidates.sort_by_key(|a| std::cmp::Reverse(a.2.priority));
+
+        // A sibling queue's read failed while this one succeeded
+        // (`read_error`, from `read_across_queues`; see its own doc
+        // comment). Deliver nothing and requeue every candidate instead of
+        // the normal `max` cap. The caller then still sees the failure,
+        // rather than a quiet, apparently-successful read (Codex review,
+        // issue #1429). The failing queue would otherwise never surface
+        // its own trouble while a busy sibling keeps every pass "ready".
+        let deliver_cap = if read_error.is_some() { 0 } else { max };
+        let mut leases = Vec::new();
+        let mut surplus = Vec::new();
+        for (entry_id, payload, reference) in candidates {
+            if leases.len() < deliver_cap {
+                let handle = encode_handle(&entry_id, &payload);
+                leases.push(reference.into_lease(handle));
+            } else {
+                surplus.push((entry_id, reference));
             }
         }
 
@@ -715,14 +968,20 @@ impl RedisDispatch {
         // timeout. One pipeline carries the whole surplus. A failure there
         // costs one redelivery per entry, which the visibility timeout already
         // covers, so the leases already collected are returned either way.
-        if !surplus.is_empty()
-            && let Err(error) = self.requeue_batch(&surplus, Utc::now()).await
-        {
-            tracing::warn!(
-                error = %error,
-                surplus = surplus.len(),
-                "failed to requeue surplus dispatch references"
-            );
+        if !surplus.is_empty() {
+            let now = Utc::now();
+            let surplus_len = surplus.len();
+            let surplus_entries: Vec<(String, DispatchRef, DateTime<Utc>)> = surplus
+                .into_iter()
+                .map(|(handle, reference)| (handle, reference, now))
+                .collect();
+            if let Err(error) = self.requeue_batch(&surplus_entries).await {
+                tracing::warn!(
+                    error = %error,
+                    surplus = surplus_len,
+                    "failed to requeue surplus dispatch references"
+                );
+            }
         }
 
         if let Err(error) = self.discard_entries(&malformed).await {
@@ -731,6 +990,9 @@ impl RedisDispatch {
                 malformed = malformed.len(),
                 "failed to discard unreadable dispatch entries"
             );
+        }
+        if let Some(error) = read_error {
+            return Err(error);
         }
         Ok(leases)
     }
@@ -748,21 +1010,43 @@ impl RedisDispatch {
     /// The delete names each entry id, so nothing else leaves the stream. The
     /// dedupe marker is left alone: a reference that cannot be read does not
     /// say which task it belongs to.
+    ///
+    /// One round trip per distinct stream in `entries`, not one atomic pipe
+    /// over all of them (Codex review, issue #1429). A multi-queue read's
+    /// malformed entries can span several queues, and each queue's stream
+    /// carries its own hash tag. One `MULTI`/`EXEC` spanning two queues'
+    /// keys would fail `CROSSSLOT` on a real Cluster, mirroring
+    /// [`Self::ack_many_inner`]/[`Self::requeue_batch`]'s own reasoning for
+    /// the same split. One stream's pipeline failing must not abort the
+    /// rest, for the same reason those two document. Every stream is
+    /// attempted, and the first error, if any, is returned after the loop.
     async fn discard_entries(&self, entries: &[(String, String)]) -> RedisAdapterResult<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut pipe = redis::pipe();
-        pipe.atomic();
+        let mut by_stream: HashMap<&str, Vec<&str>> = HashMap::new();
         for (key, entry_id) in entries {
-            pipe.xack(key, &self.config.consumer_group, &[entry_id])
-                .ignore()
-                .xdel(key, &[entry_id])
-                .ignore();
+            by_stream
+                .entry(key.as_str())
+                .or_default()
+                .push(entry_id.as_str());
         }
         let mut conn = self.conn.clone();
-        pipe.query_async::<()>(&mut conn).await?;
-        Ok(())
+        let mut first_error = None;
+        for (key, entry_ids) in by_stream {
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            for entry_id in &entry_ids {
+                pipe.xack(key, &self.config.consumer_group, &[*entry_id])
+                    .ignore()
+                    .xdel(key, &[*entry_id])
+                    .ignore();
+            }
+            if let Err(error) = pipe.query_async::<()>(&mut conn).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), |error| Err(error.into()))
     }
 
     async fn ack_inner(&self, lease: &DispatchLease) -> RedisAdapterResult<()> {
@@ -775,9 +1059,17 @@ impl RedisDispatch {
             .ignore()
             .xdel(&key, &[entry_id])
             .ignore()
-            .del(self.marker_key(lease.task_id))
-            .ignore()
             .query_async::<()>(&mut conn)
+            .await?;
+        // A separate, conditional call (Codex review, issue #1429). See
+        // `ACK_MARKER_LUA`'s own doc comment for why an unconditional `DEL`
+        // here would risk deleting a *different*, still-live entry's marker.
+        let _: i64 = self
+            .ack_marker_script
+            .prepare_invoke()
+            .key(self.marker_key(&lease.queue_name, lease.task_id))
+            .arg(entry_id)
+            .invoke_async(&mut conn)
             .await?;
         Ok(())
     }
@@ -802,30 +1094,177 @@ impl RedisDispatch {
             .await
     }
 
-    /// Re-add every entry that has been idle in the pending entries list
-    /// longer than the visibility timeout.
-    async fn recover_queue(&self, queue_name: &str) -> RedisAdapterResult<usize> {
-        self.ensure_group(queue_name, false).await?;
-        let key = self.stream_key(queue_name);
-        let mut conn = self.conn.clone();
-
-        let pending: StreamPendingCountReply = conn
-            .xpending_count(&key, &self.config.consumer_group, "-", "+", RECOVER_BATCH)
-            .await?;
-        if pending.ids.is_empty() {
-            return Ok(0);
+    /// Drop several leases at once, one round trip per distinct queue in the
+    /// batch (issue #1429).
+    ///
+    /// Same shape as [`Self::ack_inner`], batched into one atomic pipeline
+    /// per queue for `XACK`/`XDEL`, plus one [`ACK_MARKER_LUA`] call per
+    /// queue for the marker cleanup. `XACK`/`XDEL`/the marker for one queue
+    /// all share that queue's hash tag. A stream, delayed set and marker
+    /// from a DIFFERENT queue carry a different tag by design (issue
+    /// #1429's own per-queue hash-tag split). One `MULTI`/`EXEC` spanning
+    /// two queues' keys would therefore fail `CROSSSLOT` on a real Cluster
+    /// the moment this crate's client becomes Cluster-aware. That is
+    /// exactly the failure the hash tags exist to remove. Grouping by
+    /// queue first, mirroring [`Self::release_many_inner`]/
+    /// [`Self::requeue_batch`], keeps every call's keys inside one queue's
+    /// tag.
+    ///
+    /// One queue's pipeline failing must not abort the rest of this batch
+    /// (Codex review, issue #1429). [`Self::requeue_batch`] already
+    /// documents the same reasoning. A transient error on whichever queue
+    /// the `HashMap` happens to visit first would otherwise leave every
+    /// later queue's references stuck. They would stay acked in Postgres
+    /// but still pending in Redis, until visibility recovery. Every queue
+    /// is attempted; the first error, if any, is returned after the loop.
+    async fn ack_many_inner(&self, leases: &[DispatchLease]) -> RedisAdapterResult<()> {
+        if leases.is_empty() {
+            return Ok(());
         }
-        let visibility_ms = self.visibility_ms();
+        let mut by_queue: HashMap<&str, Vec<&DispatchLease>> = HashMap::new();
+        for lease in leases {
+            by_queue
+                .entry(lease.queue_name.as_str())
+                .or_default()
+                .push(lease);
+        }
+        let mut conn = self.conn.clone();
+        let mut first_error = None;
+        for (queue, batch) in by_queue {
+            let key = self.stream_key(queue);
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            for lease in &batch {
+                let entry_id = handle_entry_id(&lease.handle);
+                pipe.xack(&key, &self.config.consumer_group, &[entry_id])
+                    .ignore()
+                    .xdel(&key, &[entry_id])
+                    .ignore();
+            }
+            if let Err(error) = pipe.query_async::<()>(&mut conn).await {
+                // Skip this queue's marker cleanup when its XACK/XDEL pipe
+                // itself failed (Codex review, issue #1429). The entry is
+                // then still pending, unacked. Deleting its marker here
+                // would let the reconcile sweep republish a duplicate ahead
+                // of the entry's own eventual visibility-timeout recovery.
+                // That recovery redelivers the very same duplicate again.
+                first_error.get_or_insert(error);
+                continue;
+            }
+
+            // A separate, conditional call (Codex review, issue #1429). See
+            // `ACK_MARKER_LUA`'s own doc comment for why an unconditional
+            // `DEL` here would risk deleting a *different*, still-live
+            // entry's marker.
+            let mut invocation = self.ack_marker_script.prepare_invoke();
+            for lease in &batch {
+                invocation.key(self.marker_key(queue, lease.task_id));
+            }
+            for lease in &batch {
+                invocation.arg(handle_entry_id(&lease.handle));
+            }
+            if let Err(error) = invocation.invoke_async::<i64>(&mut conn).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), |error| Err(error.into()))
+    }
+
+    /// Give several leases back at once, each after its own delay
+    /// (issue #1429).
+    ///
+    /// Builds every entry's fresh reference and due time up front. It then
+    /// makes one [`Self::requeue_batch`] call: one round trip per distinct
+    /// queue in the batch, not one per lease.
+    ///
+    /// One lease's delay failing to convert must not skip the rest of the
+    /// batch (Codex review, issue #1429 follow-up). An oversized
+    /// `poll_interval`/`release_backoff_cap` on a direct embedder's
+    /// `DispatchSettings` can make one lease's `std::time::Duration` land
+    /// outside what `chrono::Duration` can represent. The `?` this used to
+    /// return on would abort before [`Self::requeue_batch`] ever ran.
+    /// Every other, unrelated lease in the batch then stayed pending until
+    /// visibility recovery, the exact blast radius this PR's own
+    /// `ack_many`/`requeue_batch` fixes closed elsewhere. Every lease
+    /// with a convertible delay is still requeued; the first conversion
+    /// error, if any, is returned after that call.
+    async fn release_many_inner(
+        &self,
+        leases: &[(DispatchLease, Duration)],
+    ) -> RedisAdapterResult<()> {
+        if leases.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now();
+        let mut entries = Vec::with_capacity(leases.len());
+        let mut first_error = None;
+        for (lease, delay) in leases {
+            // The handle carries the payload (contract C2), so no read-back
+            // is needed and the priority survives the release.
+            let mut reference = handle_payload(&lease.handle)
+                .and_then(|payload| serde_json::from_str::<DispatchRef>(payload).ok())
+                .unwrap_or_else(|| DispatchRef::from_lease(lease));
+            reference.redeliveries = lease.redeliveries.saturating_add(1);
+            match chrono::Duration::from_std(*delay) {
+                Ok(chrono_delay) => {
+                    entries.push((lease.handle.clone(), reference, now + chrono_delay));
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| {
+                        RedisAdapterError::DurationOutOfRange(format!("release delay: {error}"))
+                    });
+                }
+            }
+        }
+        let batch_result = self.requeue_batch(&entries).await;
+        first_error.map_or(batch_result, Err)
+    }
+
+    /// One `XPENDING` per queue, in one pipeline (issue #1429).
+    ///
+    /// Mirrors [`Self::promote_pipeline`]: recovery used to cost one round
+    /// trip per queue per pass just to learn which queues have idle entries
+    /// at all. This folds that scan into the one round trip every other pass
+    /// already pays.
+    fn pending_pipeline(&self, queues: &[String]) -> redis::Pipeline {
+        let mut pipe = redis::pipe();
+        for queue in queues {
+            pipe.xpending_count(
+                self.stream_key(queue),
+                &self.config.consumer_group,
+                "-",
+                "+",
+                RECOVER_BATCH,
+            );
+        }
+        pipe
+    }
+
+    /// Idle entry ids in `pending`, at or past the visibility timeout.
+    fn idle_entry_ids(pending: &StreamPendingCountReply, visibility_ms: u64) -> Vec<String> {
         let threshold = usize::try_from(visibility_ms).unwrap_or(usize::MAX);
-        let idle: Vec<String> = pending
+        pending
             .ids
             .iter()
             .filter(|entry| entry.last_delivered_ms >= threshold)
             .map(|entry| entry.id.clone())
-            .collect();
+            .collect()
+    }
+
+    /// Re-add one queue's entries that have been idle in the pending entries
+    /// list longer than the visibility timeout. `idle` is the id list a
+    /// prior `XPENDING` (see [`Self::pending_pipeline`]) already found.
+    async fn recover_idle_entries(
+        &self,
+        queue_name: &str,
+        idle: &[String],
+    ) -> RedisAdapterResult<usize> {
         if idle.is_empty() {
             return Ok(0);
         }
+        let key = self.stream_key(queue_name);
+        let mut conn = self.conn.clone();
+        let visibility_ms = self.visibility_ms();
 
         // XCLAIM moves the entries to a sentinel consumer so their payloads
         // can be read. `XREADGROUP >` never returns a pending entry, so the
@@ -836,7 +1275,7 @@ impl RedisDispatch {
                 &self.config.consumer_group,
                 RECOVERY_CONSUMER,
                 visibility_ms,
-                &idle,
+                idle,
             )
             .await?;
 
@@ -870,14 +1309,63 @@ impl RedisDispatch {
         // here. See [`RedisDispatch::discard_entries`].
         self.discard_entries(&malformed).await?;
         let count = recovered.len();
-        self.requeue_batch(&recovered, Utc::now()).await?;
+        let now = Utc::now();
+        let recovered_entries: Vec<(String, DispatchRef, DateTime<Utc>)> = recovered
+            .into_iter()
+            .map(|(handle, reference)| (handle, reference, now))
+            .collect();
+        self.requeue_batch(&recovered_entries).await?;
         Ok(count)
     }
 
+    /// Re-add every idle pending entry across `queues`.
+    ///
+    /// The `XPENDING` scan that finds idle entries runs once, pipelined
+    /// across every queue (issue #1429). `XCLAIM` and the requeue still run
+    /// per queue with idle entries. Their reply shapes and payloads are
+    /// per-queue, so only a queue actually holding idle work pays for them.
+    ///
+    /// The scan reads each queue's raw reply through `req_packed_commands`
+    /// rather than `Pipeline::query_async` (Codex review, issue #1429).
+    /// This pipe is not a Redis transaction. Each `XPENDING` still runs
+    /// independently server-side. But `query_async`'s typed decode treats
+    /// any single command erroring (a wrong-typed key, an ACL denial) as a
+    /// failure of the whole call. That discards every other queue's own
+    /// reply too, not just the broken queue's. A single persistently bad
+    /// queue would then silently disable visibility recovery for every
+    /// queue this worker serves. One queue's `XPENDING` failing here costs
+    /// only that queue's own recovery this pass.
     async fn recover_queues(&self, queues: &[String]) -> RedisAdapterResult<usize> {
+        if queues.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_groups(queues, false).await?;
+        let mut conn = self.conn.clone();
+        let visibility_ms = self.visibility_ms();
+        let pipe = self.pending_pipeline(queues);
+        let replies: Vec<redis::Value> =
+            redis::aio::ConnectionLike::req_packed_commands(&mut conn, &pipe, 0, queues.len())
+                .await?;
+
         let mut total = 0;
-        for queue in queues {
-            total += self.recover_queue(queue).await?;
+        for (queue, value) in queues.iter().zip(replies) {
+            let pending = match value
+                .extract_error()
+                .and_then(StreamPendingCountReply::from_owned_redis_value)
+            {
+                Ok(pending) => pending,
+                Err(error) => {
+                    tracing::warn!(
+                        queue = %queue,
+                        error = %error,
+                        "XPENDING failed for one queue during recovery; the rest of this pass \
+                         still runs"
+                    );
+                    continue;
+                }
+            };
+            let idle = Self::idle_entry_ids(&pending, visibility_ms);
+            total += self.recover_idle_entries(queue, &idle).await?;
         }
         Ok(total)
     }
@@ -912,6 +1400,14 @@ impl TaskDispatch for RedisDispatch {
 
     async fn release(&self, lease: &DispatchLease, delay: Duration) -> HarvestResult<()> {
         harvest(self.release_inner(lease, delay).await)
+    }
+
+    async fn ack_many(&self, leases: &[DispatchLease]) -> HarvestResult<()> {
+        harvest(self.ack_many_inner(leases).await)
+    }
+
+    async fn release_many(&self, leases: &[(DispatchLease, Duration)]) -> HarvestResult<()> {
+        harvest(self.release_many_inner(leases).await)
     }
 
     async fn maintain(&self, queues: &[String]) -> HarvestResult<DispatchMaintenance> {
@@ -981,14 +1477,6 @@ fn validate_queue_name(queue_name: &str) -> RedisAdapterResult<()> {
         return Err(RedisAdapterError::InvalidQueueName(queue_name.to_string()));
     }
     Ok(())
-}
-
-/// `COUNT` for one stream of a read that wants `max` entries in total.
-fn per_stream_count(max: usize, queues: usize) -> usize {
-    if queues == 0 {
-        return max.max(1);
-    }
-    max.div_ceil(queues).max(1)
 }
 
 /// `items`, rotated left by `offset` positions.
@@ -1164,6 +1652,22 @@ return written
 /// a reference the worker gave back. The marker then names the new location, so
 /// a republish can verify it. See [`PUBLISH_LUA`] for why that matters. Returns
 /// the number of entries handled.
+///
+/// The marker write is skipped, along with the requeue itself, when the
+/// marker no longer names this entry (Codex review, issue #1429). A batched
+/// worker defers a lease's ack until after its task has already been
+/// spawned, the same ordering [`ACK_MARKER_LUA`]'s own doc comment
+/// describes. A fast-completing task can re-pend and republish the same
+/// task id before that stale lease is ever settled. If the deferred ack
+/// then fails outright rather than merely running late, the stale entry is
+/// never acked at all. It sits in the pending entries list until this
+/// script's caller — visibility recovery — claims it. That happens long
+/// after the fresh entry already claimed the marker. An unconditional
+/// overwrite here would then publish a stray duplicate. It would also
+/// steal the marker back from the fresh entry, exactly like an
+/// unconditional marker `DEL` would in `ack`. The stale entry is still
+/// acked and deleted either way, so the pending entries list never keeps a
+/// reference no worker owns.
 const REQUEUE_LUA: &str = r"
 local stream = KEYS[1]
 local delayed = KEYS[2]
@@ -1183,15 +1687,25 @@ for i = 1, count do
     idx = idx + 5
     redis.call('XACK', stream, group, entry_id)
     redis.call('XDEL', stream, entry_id)
-    if due <= now then
-        redis.call('ZREM', delayed, task_id)
-        redis.call('HDEL', payloads, task_id)
-        local id = redis.call('XADD', stream, '*', 'payload', payload)
-        redis.call('SET', marker, scheduled .. '|' .. id, 'EX', ttl)
-    else
-        redis.call('ZADD', delayed, due, task_id)
-        redis.call('HSET', payloads, task_id, payload)
-        redis.call('SET', marker, scheduled .. '|delayed', 'EX', ttl)
+    local held = redis.call('GET', marker)
+    local held_at = false
+    if held then
+        local sep = string.find(held, '|', 1, true)
+        if sep then
+            held_at = string.sub(held, sep + 1)
+        end
+    end
+    if held_at == entry_id then
+        if due <= now then
+            redis.call('ZREM', delayed, task_id)
+            redis.call('HDEL', payloads, task_id)
+            local id = redis.call('XADD', stream, '*', 'payload', payload)
+            redis.call('SET', marker, scheduled .. '|' .. id, 'EX', ttl)
+        else
+            redis.call('ZADD', delayed, due, task_id)
+            redis.call('HSET', payloads, task_id, payload)
+            redis.call('SET', marker, scheduled .. '|delayed', 'EX', ttl)
+        end
     end
 end
 return count
@@ -1248,6 +1762,47 @@ end
 return promoted
 ";
 
+/// Lua script that deletes a dedupe marker only if it still names the entry
+/// being acked (Codex review, issue #1429).
+///
+/// Keys:
+/// - `KEYS[1..]`: one dedupe marker per acked lease.
+///
+/// Arguments:
+/// - `ARGV[1..]`: the entry id `KEYS`'s matching marker must still name, in
+///   the same order as `KEYS`.
+///
+/// `ack`/`ack_many` defer the marker delete until after the claimed task
+/// has already been spawned. That is issue #1312's connection-release
+/// ordering, and the batching this defers across an entire read's worth of
+/// leases widens it. A fast-completing task can re-pend and republish the
+/// same task id before its own lease is acked. That overwrites the marker
+/// to name the fresh publish. An unconditional `DEL` there would then
+/// delete a marker naming a *different*, still-live entry. `PUBLISH_LUA`'s
+/// own intact check would never see that loss, so the reconcile sweep
+/// republishes a duplicate. Deleting only when the marker still names the
+/// entry being acked closes that gap. An overwritten marker is left alone,
+/// exactly like the pattern `PUBLISH_LUA` and `PROMOTE_MARKED_LUA` already
+/// use to decide whether a marker is still intact.
+const ACK_MARKER_LUA: &str = r"
+local n = #KEYS
+for i = 1, n do
+    local marker = KEYS[i]
+    local expected = ARGV[i]
+    local held = redis.call('GET', marker)
+    if held then
+        local sep = string.find(held, '|', 1, true)
+        if sep then
+            local at = string.sub(held, sep + 1)
+            if at == expected then
+                redis.call('DEL', marker)
+            end
+        end
+    end
+end
+return n
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1285,6 +1840,11 @@ mod tests {
     #[test]
     fn promote_script_compiles() {
         let _ = Script::new(PROMOTE_MARKED_LUA);
+    }
+
+    #[test]
+    fn ack_marker_script_compiles() {
+        let _ = Script::new(ACK_MARKER_LUA);
     }
 
     #[test]
@@ -1516,15 +2076,6 @@ mod tests {
     }
 
     #[test]
-    fn a_read_is_sized_per_stream() {
-        assert_eq!(per_stream_count(64, 1), 64);
-        assert_eq!(per_stream_count(64, 4), 16);
-        assert_eq!(per_stream_count(3, 2), 2, "the split rounds up");
-        assert_eq!(per_stream_count(1, 8), 1, "a stream always reads one");
-        assert_eq!(per_stream_count(0, 0), 1, "no queue still reads one");
-    }
-
-    #[test]
     fn the_queue_order_rotates() {
         let queues = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         assert_eq!(rotate(&queues, 0), vec!["a", "b", "c"]);
@@ -1532,6 +2083,33 @@ mod tests {
         assert_eq!(rotate(&queues, 2), vec!["c", "a", "b"]);
         assert_eq!(rotate(&queues, 3), vec!["a", "b", "c"], "the offset wraps");
         assert!(rotate::<String>(&[], 5).is_empty());
+    }
+
+    /// `next_inner` rotates `(queue, key)` pairs, not two separately
+    /// rotated lists. A queue's name and its own stream key therefore stay
+    /// paired at every offset (Codex review, issue #1429 follow-up).
+    ///
+    /// A NOGROUP heal during a read passes only the single queue name
+    /// paired with the key that read used. Rotating the two lists
+    /// independently would desync that pairing at a non-zero offset. A
+    /// healthy queue would then get force-recreated instead of the one
+    /// that actually failed.
+    #[test]
+    fn rotate_keeps_each_queue_paired_with_its_own_key() {
+        let pairs = vec![
+            ("a".to_string(), "key-a".to_string()),
+            ("b".to_string(), "key-b".to_string()),
+            ("c".to_string(), "key-c".to_string()),
+        ];
+        for offset in 0..pairs.len() * 2 {
+            for (queue, key) in rotate(&pairs, offset) {
+                assert_eq!(
+                    key,
+                    format!("key-{queue}"),
+                    "offset {offset} desynced queue {queue:?} from its own key"
+                );
+            }
+        }
     }
 
     #[test]

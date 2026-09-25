@@ -8,7 +8,7 @@ use autumn_harvest::BuiltHarvest;
 use autumn_harvest::batch::{BatchExecutorConfig, run_executor_once};
 use autumn_harvest::context::SharedStateMap;
 use autumn_harvest::effective_config::{
-    EffectiveConfigView, PayloadCapsView, PoolConfigView, ShardedInfo,
+    DispatchConfigView, EffectiveConfigView, PayloadCapsView, PoolConfigView, ShardedInfo,
 };
 use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::retention::{RetentionConfig, RetentionRuntime};
@@ -19,6 +19,7 @@ use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::{
     DEFAULT_WORKER_POLL_INTERVAL, DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig,
+    spawn_dispatch_metrics_sampler,
 };
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
@@ -26,7 +27,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{HarvestApiRuntime, HarvestRetentionRuntime};
-use crate::config::{HarvestRuntimeConfig, OrphanStartupAction};
+use crate::config::{HarvestRedisConfig, HarvestRuntimeConfig, OrphanStartupAction};
 use crate::state::{AppDbPool, HarvestDbPool};
 use crate::workflow_reachability::{
     ReachabilityReportStatus, ReachabilityVerdict, StartupOrphanDecision,
@@ -859,12 +860,32 @@ pub struct HarvestRunner {
     retention: Option<RetentionRuntime>,
     batch: Option<BatchRuntime>,
     codec_refresh: Option<CodecRefreshRuntime>,
-    /// True when this runner installed the process-global dispatch channel.
+    /// The generation `dispatch::install` returned, if this runner installed
+    /// the single-shard channel.
     ///
-    /// The slot is process wide and outlives one runner, so `stop` must give it
-    /// back (issue #1312). A runner that installed nothing leaves the slot
-    /// alone, because another owner in the same process may hold it.
-    dispatch_installed: bool,
+    /// The slot is process wide and outlives one runner, so `stop` must
+    /// give it back (issue #1312). But only if a later runner in this same
+    /// process has not since replaced it with its own install. `stop`
+    /// passes this to `dispatch::uninstall_if_current`, which is a no-op
+    /// once the generation no longer matches (Codex review, issue #1429
+    /// follow-up). A runner that installed nothing carries `None`. It
+    /// leaves the slot alone unconditionally, same as before.
+    dispatch_install_generation: Option<u64>,
+    /// The shard + generation pairs `dispatch::install_for_shard` returned,
+    /// if this runner installed the per-shard slots (issue #1429) instead
+    /// of the single-shard one.
+    ///
+    /// `stop` passes these to `dispatch::uninstall_all_shards_if_current`
+    /// instead of the unconditional `uninstall_all_shards` (Codex review,
+    /// issue #1429 follow-up). The reason matches
+    /// `dispatch_install_generation`'s own: a later runner may have
+    /// reinstalled one of these shards since this runner started. Empty
+    /// when this runner used the single-shard path or installed nothing.
+    dispatch_shard_generations: Vec<(ShardId, u64)>,
+    /// The dropped-hints metrics sampler this runner owns. `Some` only for
+    /// an API-only process — no `Worker`, which spawns its own copy instead
+    /// (issue #1429 review). `stop` cancels and joins it.
+    dispatch_metrics_sampler: Option<(CancellationToken, JoinHandle<()>)>,
 }
 
 /// Background batch-operations executor handle (issue #102).
@@ -1078,32 +1099,60 @@ impl HarvestRunner {
             })?;
         }
 
-        // Issue #1312: install the process-global dispatch channel BEFORE the
-        // worker is constructed, and in every mode. An API-only process owns
-        // no worker but still publishes references for the fleet, so the
-        // install cannot sit inside the `worker_enabled` branch.
-        //
-        // The shard-span check runs BEFORE the install (contract C7). A
-        // multi-shard process must fail startup without a connected channel
-        // behind it. `Worker::new` repeats the check, but only a
-        // worker-enabled process reaches it.
+        // Issue #1312: install the process-global dispatch channel(s) BEFORE
+        // the worker is constructed, and in every mode. An API-only process
+        // owns no worker but still publishes references for the fleet, so
+        // the install cannot sit inside the `worker_enabled` branch.
         let dispatch_shards = prepared.storage_pool.sharded_pool().shard_ids();
-        reject_multi_shard_dispatch(config.redis.url.is_some(), dispatch_shards.len())
-            .map_err(AutumnError::service_unavailable_msg)?;
         reject_dispatch_queue_names(
             config.redis.url.is_some(),
             &prepared.worker_runtime_config.queues,
         )
         .map_err(AutumnError::service_unavailable_msg)?;
-        // The shard this process owns, which names its key family. The check
-        // above proves the runtime resolves one shard at most, so any other
-        // count leaves the configured prefix alone.
-        let dispatch_shard = match dispatch_shards.as_slice() {
-            [only] => Some(*only),
-            _ => None,
+        // A span of one shard (or none) installs the single-shard channel,
+        // named by that one shard's key family. A wider span installs one
+        // channel per shard instead (issue #1429). `Worker::new` requires
+        // full per-shard coverage before it accepts the wider span. A
+        // partial install here — cut short by a shard connect failure —
+        // therefore fails startup, rather than leaving some shards silently
+        // uncovered.
+        let (
+            dispatch_guard,
+            dispatch_installed,
+            dispatch_shard,
+            dispatch_installed_shards,
+            dispatch_install_generation,
+            dispatch_shard_generations,
+        ) = if dispatch_shards.len() > 1 {
+            let (installed_shards, snapshot) =
+                install_dispatch_channels_for_shards(config, &dispatch_shards).await?;
+            let installed = !installed_shards.is_empty();
+            let reported_shards: Vec<ShardId> =
+                installed_shards.iter().map(|(shard, _)| *shard).collect();
+            (
+                DispatchInstallGuard::new_shards(installed_shards.clone(), snapshot),
+                installed,
+                None,
+                reported_shards,
+                None,
+                installed_shards,
+            )
+        } else {
+            let dispatch_shard = match dispatch_shards.as_slice() {
+                [only] => Some(*only),
+                _ => None,
+            };
+            let installed = install_dispatch_channel(config, dispatch_shard).await?;
+            let generation = installed.as_ref().map(|(generation, _)| *generation);
+            (
+                DispatchInstallGuard::new(installed),
+                generation.is_some(),
+                dispatch_shard,
+                Vec::new(),
+                generation,
+                Vec::new(),
+            )
         };
-        let dispatch_installed = install_dispatch_channel(config, dispatch_shard).await?;
-        let dispatch_guard = DispatchInstallGuard::new(dispatch_installed);
 
         let worker = if config.worker_enabled {
             let worker = Worker::new(
@@ -1139,6 +1188,32 @@ impl HarvestRunner {
             guard.commit();
         }
         dispatch_guard.commit();
+        prepared.effective_config.dispatch = Some(dispatch_config_view(
+            &config.redis,
+            dispatch_installed,
+            dispatch_shard,
+            &dispatch_installed_shards,
+        ));
+
+        // A `Worker` already spawns its own copy of this sampler in
+        // `spawn_monitoring_tasks`. An API-only process (`worker_enabled =
+        // false`) owns no `Worker`, so nothing would otherwise sample
+        // `harvest_dispatch_dropped_hints` here. The dispatch background
+        // publisher this metric describes is installed unconditionally,
+        // above. That happens specifically because an API-only process
+        // still publishes references for the fleet (issue #1429 review).
+        // Only spawn when there is no `Worker` to double up with.
+        let dispatch_metrics_sampler = if worker.is_none() {
+            let cancel = CancellationToken::new();
+            let handle = spawn_dispatch_metrics_sampler(
+                cancel.clone(),
+                Arc::clone(registry.telemetry()),
+                DEFAULT_WORKER_POLL_INTERVAL,
+            );
+            Some((cancel, handle))
+        } else {
+            None
+        };
 
         let worker_id = worker
             .as_ref()
@@ -1235,7 +1310,9 @@ impl HarvestRunner {
             retention,
             batch,
             codec_refresh,
-            dispatch_installed,
+            dispatch_install_generation,
+            dispatch_shard_generations,
+            dispatch_metrics_sampler,
         })
     }
 
@@ -1253,9 +1330,23 @@ impl HarvestRunner {
 
     /// Stop any locally owned worker and scheduler tasks.
     ///
-    /// A runner that installed the dispatch channel also uninstalls it. The
-    /// slot is process wide, so a channel left behind would still carry
-    /// references for a runtime that has stopped (issue #1312).
+    /// A runner that installed a dispatch channel also uninstalls it. The
+    /// slot(s) are process wide, so a channel left behind would still carry
+    /// references for a runtime that has stopped (issue #1312). It could
+    /// also make a later runtime's own per-shard coverage check misread
+    /// stale state (issue #1429 review).
+    ///
+    /// Uninstalls only if this runner's own install is still the current
+    /// occupant of the slot(s) it used (Codex review, issue #1429
+    /// follow-up). A process may start a replacement runner before calling
+    /// `stop` on this one. The replacement's install already overwrote the
+    /// slot(s) by then. An unconditional uninstall here would clear the
+    /// replacement's channel(s) instead of this runner's own. The
+    /// replacement's own effective-config snapshot would keep claiming
+    /// Redis dispatch is active, while every read and publish silently
+    /// falls through to Postgres. `dispatch::uninstall_if_current`/
+    /// `uninstall_all_shards_if_current` are no-ops once the generation(s)
+    /// this runner captured at install time no longer match.
     pub async fn stop(self) {
         let Self {
             api_runtime: _,
@@ -1266,11 +1357,25 @@ impl HarvestRunner {
             retention,
             batch,
             codec_refresh,
-            dispatch_installed,
+            dispatch_install_generation,
+            dispatch_shard_generations,
+            dispatch_metrics_sampler,
         } = self;
 
-        if dispatch_installed {
-            autumn_harvest::dispatch::uninstall();
+        if !dispatch_shard_generations.is_empty() {
+            autumn_harvest::dispatch::uninstall_all_shards_if_current(&dispatch_shard_generations);
+        } else if let Some(generation) = dispatch_install_generation {
+            autumn_harvest::dispatch::uninstall_if_current(generation);
+        }
+
+        if let Some((cancel, handle)) = dispatch_metrics_sampler {
+            cancel.cancel();
+            if let Err(error) = handle.await {
+                tracing::warn!(
+                    error = %error,
+                    "dispatch metrics sampler task failed during shutdown"
+                );
+            }
         }
 
         if let Some(worker) = worker {
@@ -1388,32 +1493,12 @@ fn capture_effective_config(
         pool_view,
         DEFAULT_WORKER_POLL_INTERVAL,
         Some(resolved_sharding),
+        // The `[harvest.redis]` section is filled in by `start`, once the
+        // dispatch channel install has actually run (issue #1429). This
+        // capture happens inside `PreparedHarvestRuntime::build`, before
+        // `install_dispatch_channel` and with no access to `config.redis`.
+        None,
     )
-}
-
-/// Reject Redis dispatch on a runtime that spans more than one shard.
-///
-/// Issue #1312 contract C7. A reference carries a task id and no connection.
-/// A runtime that owns several shard pools cannot tell which pool holds the
-/// named row. A reference read for one shard would then be claimed against
-/// another shard's database, and it would always miss. `Worker::new` applies
-/// the same rule. A worker-disabled process never builds a worker, and it
-/// would still publish. This check therefore runs in the runner, before the
-/// install.
-///
-/// # Errors
-///
-/// Returns the operator-facing message when a URL is configured and
-/// `shard_count` is above one.
-fn reject_multi_shard_dispatch(redis_url_set: bool, shard_count: usize) -> Result<(), String> {
-    if redis_url_set && shard_count > 1 {
-        return Err(format!(
-            "harvest.redis.url is set and this runtime resolves {shard_count} shard pools; \
-             redis dispatch supports single-shard runtimes only in v1 (issue #1312). Unset \
-             harvest.redis.url, or run one process per shard"
-        ));
-    }
-    Ok(())
 }
 
 /// Reject Redis dispatch on a runtime whose queue names the channel cannot
@@ -1451,28 +1536,30 @@ fn reject_dispatch_queue_names(redis_url_set: bool, queues: &[String]) -> Result
 /// it owns one database and no shard layout.
 const DEFAULT_DISPATCH_SHARD: ShardId = ShardId::new(0);
 
-/// The Redis key prefix this process owns, for the shard it serves.
+/// The Redis key prefix one shard's dispatch channel owns.
 ///
-/// Issue #1312 limits Redis dispatch to a runtime that resolves one shard
-/// pool. A sharded fleet meets that limit by running one process per shard, so
-/// every process passes the check. The configured prefix alone would then give
-/// every process in the fleet the same `{prefix}:dispatch:{queue}` stream. A
-/// worker for shard B would read shard A's reference, probe B's database, find
-/// no row, release it three times and ack it as absent. Shard A's row would
-/// wait for A's reconcile sweep, and a peer could steal it again.
+/// Two callers use this. A one-process-per-shard fleet (issue #1312) calls
+/// it once, for the single shard that process resolves. A process that
+/// spans several shards in one runtime (issue #1429) calls it once per
+/// shard, installing one channel per call. Either way, the configured
+/// prefix alone would give every shard the same `{prefix}:dispatch:{queue}`
+/// stream. A worker for shard B would then read shard A's reference. It
+/// would probe B's database, find no row, release it three times, and ack
+/// it as absent. Shard A's row would wait for A's reconcile sweep, and a
+/// peer could steal it again.
 ///
-/// The shard suffix gives each shard its own key family, so a reference only
-/// ever reaches a process that holds the named row. The suffix extends the
-/// configured prefix and never replaces it, so an operator who namespaces the
-/// prefix per environment keeps that namespace.
+/// The shard suffix gives each shard its own key family instead, so a
+/// reference only ever reaches a channel that can resolve the named row. It
+/// extends the configured prefix and never replaces it. An operator who
+/// namespaces the prefix per environment keeps that namespace.
 ///
 /// [`DEFAULT_DISPATCH_SHARD`] keeps the plain prefix. Every single-database
-/// deployment resolves that shard, and a suffix there would move the key
+/// deployment resolves that shard. A suffix there would move the key
 /// family away from the references a previous release published.
 ///
-/// A central API process that spans several shards still rejects Redis
-/// dispatch at startup. Issue #1429 tracks true multi-shard routing.
-#[cfg_attr(not(feature = "redis"), allow(dead_code))]
+/// Used unconditionally by [`dispatch_config_view`] too, which every build
+/// evaluates regardless of the `redis` cargo feature. This function is
+/// therefore never dead code, even on a build without that feature.
 #[must_use]
 fn effective_dispatch_prefix(configured: &str, shard: Option<ShardId>) -> String {
     match shard {
@@ -1483,36 +1570,156 @@ fn effective_dispatch_prefix(configured: &str, shard: Option<ShardId>) -> String
     }
 }
 
-/// Uninstall the process-global dispatch channel when startup fails later.
+/// Build the `[harvest.redis]` section of the effective-config snapshot
+/// (issue #1429).
+///
+/// `installed` is the return value of [`install_dispatch_channel`], not a
+/// re-derivation from `redis.url`. A configured URL that fails to connect
+/// aborts `start` before this runs, so the two agree in practice. The
+/// caller's own result is the fact and never a guess.
+///
+/// The reported `key_prefix` is the effective, shard-suffixed prefix this
+/// process actually publishes under (see [`effective_dispatch_prefix`]). An
+/// operator comparing two shards' `/admin/config` output then sees the
+/// difference between their key families, not the one configured value the
+/// two processes share.
+///
+/// `multi_shards` names the shards a multi-shard install (issue #1429
+/// review) actually covers. A non-empty slice reports one prefix per shard
+/// under [`DispatchConfigView::key_prefixes`] and leaves `key_prefix` empty,
+/// since a multi-shard install has no single key family. An empty slice
+/// (the single-shard install) keeps the prior `key_prefix`-only shape,
+/// derived from `shard` alone.
+#[must_use]
+fn dispatch_config_view(
+    redis: &HarvestRedisConfig,
+    installed: bool,
+    shard: Option<ShardId>,
+    multi_shards: &[ShardId],
+) -> DispatchConfigView {
+    let configured = redis.url.is_some();
+    DispatchConfigView {
+        installed,
+        endpoint: redis.redacted_url(),
+        key_prefix: (configured && multi_shards.is_empty())
+            .then(|| effective_dispatch_prefix(&redis.key_prefix, shard)),
+        key_prefixes: (configured && !multi_shards.is_empty()).then(|| {
+            multi_shards
+                .iter()
+                .map(|shard| effective_dispatch_prefix(&redis.key_prefix, Some(*shard)))
+                .collect()
+        }),
+        consumer_group: configured.then(|| redis.consumer_group.clone()),
+        visibility_timeout_ms: configured.then_some(redis.visibility_timeout_ms),
+        poll_interval_ms: configured.then_some(redis.poll_interval_ms),
+        reconcile_interval_ms: configured.then_some(redis.reconcile_interval_ms),
+        reconcile_batch: configured.then_some(redis.reconcile_batch),
+    }
+}
+
+/// What kind of dispatch install [`DispatchInstallGuard`] owns.
+enum DispatchInstallKind {
+    /// Nothing installed. Dropping the guard does nothing.
+    None,
+    /// The single-shard slot (`dispatch::install_single`), stamped with the
+    /// generation that call returned, plus the [`TopologySnapshot`] of both
+    /// slots from immediately before it ran.
+    ///
+    /// Unwinding calls `dispatch::restore_single_if_current` rather than
+    /// `dispatch::uninstall_if_current` (Codex review, issue #1429
+    /// follow-up). `install_single` destructively replaces the topology
+    /// before `Worker::new` and the shard-pool validation after it have run
+    /// — both of which can still fail. Merely clearing this install on
+    /// unwind would leave a still-running previous runner without the
+    /// dispatch channels it had before this replacement startup began.
+    /// Restoring the snapshot instead puts that previous topology back,
+    /// generations and all. It does so only while this install is still
+    /// the current occupant of its slot. See `restore_single_if_current`'s
+    /// own doc for the race that guards against.
+    Single(u64, autumn_harvest::dispatch::TopologySnapshot),
+    /// The per-shard slots (`dispatch::install_shards`, issue #1429) this
+    /// call populated, each stamped with its own generation, plus the
+    /// [`TopologySnapshot`] that call returned.
+    ///
+    /// Unwinding calls `dispatch::restore_shards_if_current` (Codex review,
+    /// issue #1429 follow-up), the per-shard mirror of `Single`'s own
+    /// reasoning.
+    Shards(
+        Vec<(ShardId, u64)>,
+        autumn_harvest::dispatch::TopologySnapshot,
+    ),
+}
+
+/// Uninstall the process-global dispatch channel(s) when startup fails later.
 ///
 /// `start` installs the channel before it builds the worker, because an
 /// API-only process publishes too. A step after the install can still fail.
 /// The runtime is then dropped, but the channel is process-global and would
-/// stay installed for the next runtime in this process. The guard removes it
-/// unless [`DispatchInstallGuard::commit`] runs, which mirrors how
+/// stay installed for the next runtime in this process. The guard restores
+/// whatever topology the install replaced unless
+/// [`DispatchInstallGuard::commit`] runs, which mirrors how
 /// `DeferredAuditExportInstall` guards the audit sink.
 struct DispatchInstallGuard {
-    /// True while the guard owns an install that startup has not confirmed.
-    armed: bool,
+    /// `None` once the guard is committed or was never armed.
+    kind: DispatchInstallKind,
 }
 
 impl DispatchInstallGuard {
-    /// A guard over an install that happened, or an inert guard when it did
-    /// not.
-    const fn new(installed: bool) -> Self {
-        Self { armed: installed }
+    /// A guard over a single-shard install that happened, carrying the
+    /// generation and [`TopologySnapshot`] `dispatch::install_single`
+    /// returned, or an inert guard when no install ran.
+    fn new(installed: Option<(u64, autumn_harvest::dispatch::TopologySnapshot)>) -> Self {
+        Self {
+            kind: match installed {
+                Some((generation, snapshot)) => DispatchInstallKind::Single(generation, snapshot),
+                None => DispatchInstallKind::None,
+            },
+        }
     }
 
-    /// Keep the channel installed. Startup has passed every fallible step.
+    /// A guard over the per-shard installs `shards` names (issue #1429),
+    /// carrying the [`TopologySnapshot`] `dispatch::install_shards`
+    /// returned, or an inert guard when `shards` is empty.
+    fn new_shards(
+        shards: Vec<(ShardId, u64)>,
+        snapshot: Option<autumn_harvest::dispatch::TopologySnapshot>,
+    ) -> Self {
+        Self {
+            kind: match snapshot {
+                Some(snapshot) if !shards.is_empty() => {
+                    DispatchInstallKind::Shards(shards, snapshot)
+                }
+                _ => DispatchInstallKind::None,
+            },
+        }
+    }
+
+    /// Keep the channel(s) installed. Startup has passed every fallible step.
     fn commit(mut self) {
-        self.armed = false;
+        self.kind = DispatchInstallKind::None;
     }
 }
 
 impl Drop for DispatchInstallGuard {
     fn drop(&mut self) {
-        if self.armed {
-            autumn_harvest::dispatch::uninstall();
+        match &self.kind {
+            DispatchInstallKind::None => {}
+            DispatchInstallKind::Single(generation, snapshot) => {
+                tracing::warn!(
+                    "unwinding an uncommitted single-shard dispatch install: a later startup \
+                     step failed after this channel connected; restoring the previous topology"
+                );
+                autumn_harvest::dispatch::restore_single_if_current(snapshot, *generation);
+            }
+            DispatchInstallKind::Shards(shards, snapshot) => {
+                tracing::warn!(
+                    shards = ?shards.iter().map(|(shard, _)| shard.as_i32()).collect::<Vec<_>>(),
+                    "unwinding an uncommitted multi-shard dispatch install: a later startup \
+                     step failed after these shards' channels connected; restoring the \
+                     previous topology"
+                );
+                autumn_harvest::dispatch::restore_shards_if_current(snapshot, shards);
+            }
         }
     }
 }
@@ -1528,8 +1735,10 @@ const DISPATCH_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// claimable `harvest_task_queue` rows. With no URL the runtime keeps the
 /// Postgres claim path and this is a no-op.
 ///
-/// Returns `true` when a channel is installed, so the caller can uninstall it
-/// if a later startup step fails.
+/// Returns the generation `dispatch::install` stamped on the channel when
+/// one is installed (Codex review, issue #1429 follow-up). The caller
+/// keeps this to undo specifically this install on a later startup
+/// failure, without also clearing a later one that may have replaced it.
 ///
 /// # Errors
 ///
@@ -1538,11 +1747,47 @@ const DISPATCH_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// Redis is visible at boot rather than after the first read. The Postgres
 /// fallback covers the running state only. The message names the endpoint in
 /// credential-free form.
+///
+/// Clears the per-shard slot only after a Redis connect succeeds, or
+/// immediately on the redis-off branch (Codex review, issue #1429
+/// follow-up). An earlier version cleared it unconditionally on entry,
+/// before attempting to connect. A process may have previously run a
+/// multi-shard install and now start this single-shard one with no
+/// intervening `stop()`. If that connect then failed, the old version
+/// left the still-active multi-shard runner with every per-shard channel
+/// gone and nothing to replace them. It fell back to Postgres for no
+/// reason of its own. Connecting first, as
+/// [`install_dispatch_channels_for_shards`] also does, means a failed
+/// connect here leaves every existing channel exactly as this call found
+/// it.
+///
+/// The clear still needs to happen somewhere unconditionally reachable,
+/// though: on success, or on the redis-off branch. `run_poll_loop`
+/// prioritizes an installed per-shard channel for its polled shard over
+/// the freshly installed global one (see its own `per_shard_installed`
+/// check). A stale per-shard slot left behind would then keep this new
+/// runner consuming from the old endpoint or key prefix. `/admin/config`
+/// would report the newly installed global channel instead.
+///
+/// The success path replaces both slots through `dispatch::install_single`
+/// in one atomic step (Codex review, issue #1429 follow-up). That
+/// replaces clearing the per-shard slot and then separately calling
+/// `dispatch::install`. A racing `dispatch::install_shards` call could
+/// otherwise land in the gap between those two calls. It would then end
+/// up installed alongside this one, instead of cleanly replaced by it.
+///
+/// The `Ok(Some(..))` case also carries the [`TopologySnapshot`] that call
+/// returned. [`DispatchInstallGuard`] can then restore the topology this
+/// replaced if a later startup step still fails (Codex review, issue
+/// #1429 follow-up). Installing here happens before `Worker::new`. That
+/// constructor's own dispatch-coverage check can still fail, or
+/// shard-pool validation after it can. See [`DispatchInstallGuard`]'s doc
+/// for why undoing only this install is not enough on its own.
 #[cfg(feature = "redis")]
 async fn install_dispatch_channel(
     config: &HarvestRuntimeConfig,
     shard: Option<ShardId>,
-) -> autumn_web::AutumnResult<bool> {
+) -> autumn_web::AutumnResult<Option<(u64, autumn_harvest::dispatch::TopologySnapshot)>> {
     use std::time::Duration;
 
     // The endpoint string comes from the redacted form only, so neither the
@@ -1550,12 +1795,14 @@ async fn install_dispatch_channel(
     // halves are `Some` together, because both read `config.redis.url`.
     let (Some(url), Some(endpoint)) = (config.redis.url.as_deref(), config.redis.redacted_url())
     else {
-        // Redis is off for this start. The slot is process wide, so a channel a
-        // previous runtime installed is still live in it (issue #1312). Leaving
-        // it there would keep this process publishing and consuming through a
-        // channel the operator has turned off.
+        // Redis is off for this start. Both slots are process wide, so a
+        // channel a previous runtime installed is still live in them
+        // (issue #1312). Leaving either there would keep this process
+        // publishing and consuming through a channel the operator has
+        // turned off.
         autumn_harvest::dispatch::uninstall();
-        return Ok(false);
+        autumn_harvest::dispatch::uninstall_all_shards();
+        return Ok(None);
     };
 
     // Each shard's processes own their own key family (issue #1312).
@@ -1577,11 +1824,16 @@ async fn install_dispatch_channel(
         ))
     })?;
 
-    autumn_harvest::dispatch::install(
+    // Connected. Replace both slots atomically (Codex review, issue #1429
+    // follow-up). See the doc comment above for why the per-shard clear
+    // waits until here. `dispatch::install_single`'s own doc explains why
+    // this is one call rather than a separate clear and install.
+    let (generation, previous) = autumn_harvest::dispatch::install_single(
         Arc::new(channel),
         autumn_harvest::dispatch::DispatchSettings {
             poll_interval: Duration::from_millis(config.redis.poll_interval_ms),
             reconcile_interval: Duration::from_millis(config.redis.reconcile_interval_ms),
+            reconcile_batch: config.redis.reconcile_batch,
             ..autumn_harvest::dispatch::DispatchSettings::default()
         },
     );
@@ -1592,21 +1844,184 @@ async fn install_dispatch_channel(
         consumer_group = %config.redis.consumer_group,
         poll_interval_ms = config.redis.poll_interval_ms,
         reconcile_interval_ms = config.redis.reconcile_interval_ms,
+        reconcile_batch = config.redis.reconcile_batch,
         "redis dispatch enabled: workers read task references from redis and claim the named \
          row in postgres"
     );
-    Ok(true)
+    Ok(Some((generation, previous)))
+}
+
+/// Install one Redis dispatch channel per shard for a runtime that spans
+/// more than one shard (issue #1429).
+///
+/// Each shard gets its own connection and its own shard-suffixed key prefix
+/// (see [`effective_dispatch_prefix`]). This is the same key-family split
+/// the existing one-process-per-shard deployment already relies on, except
+/// every shard's channel now lives in this one process. `Worker::new` reads
+/// and claims each shard through its own installed channel. A shard with
+/// none stays on the Postgres path.
+///
+/// Immediate hints from `queue.rs` helpers still route through the
+/// single-shard slot only, which this path never populates. So on a
+/// multi-shard runtime only the reconcile sweep publishes. That costs
+/// reconcile-interval latency, never a lost or duplicated dispatch: the
+/// reconcile sweep is the durability floor for every dispatch path.
+///
+/// Returns the shards this call actually installed, paired with the
+/// generation `dispatch::install_for_shard` stamped on each. Once at
+/// least one shard connected, it also returns the [`TopologySnapshot`]
+/// `dispatch::install_shards` returned. If a later startup step fails,
+/// the caller's guard restores that snapshot rather than leaving the
+/// slots empty (Codex review, issue #1429 follow-up).
+///
+/// Connects every shard's channel first, into a local list, before touching
+/// either dispatch slot (Codex review, issue #1429 follow-up). An earlier
+/// version cleared both slots unconditionally on entry, then connected
+/// shards one at a time. A connection failure partway through that loop
+/// left this runtime with neither topology installed. The old channels were
+/// already cleared, and the new ones never finished connecting. Every shard
+/// then silently fell back to the Postgres claim path, instead of failing
+/// startup. Connecting first means a failure here leaves both slots exactly
+/// as this call found them.
+///
+/// Only once every shard in `shards` has connected does this function
+/// replace both slots, via `dispatch::install_shards`. That call clears
+/// and installs the whole topology in one atomic step (Codex review,
+/// issue #1429 follow-up). The replacement still needs to run
+/// unconditionally: a process may have previously run single-shard
+/// dispatch, or a differently shaped multi-shard install, with no
+/// intervening `stop()`:
+///
+/// - A stale single-shard slot: `Worker::new` prioritizes a populated
+///   single-shard slot over per-shard coverage.
+///   `dispatch::installed().is_some()` gates which check it applies. So it
+///   would reject the very multi-shard worker this call installs channels
+///   for.
+/// - A stale per-shard slot for a shard this call's own `shards` no longer
+///   names: `installed_for_shard` would still return that old channel. A
+///   later worker singly assigned to it could then pass its coverage check
+///   against a Redis namespace this runtime no longer owns.
+///
+/// # Errors
+///
+/// Returns an error, naming the shard, the first time a shard's Redis
+/// endpoint cannot be reached. Neither dispatch slot is touched on this
+/// path. The caller's guard has nothing to unwind, and the runtime keeps
+/// whatever topology, if any, it had before this call.
+#[cfg(feature = "redis")]
+async fn install_dispatch_channels_for_shards(
+    config: &HarvestRuntimeConfig,
+    shards: &[ShardId],
+) -> autumn_web::AutumnResult<(
+    Vec<(ShardId, u64)>,
+    Option<autumn_harvest::dispatch::TopologySnapshot>,
+)> {
+    use std::time::Duration;
+
+    let (Some(url), Some(endpoint)) = (config.redis.url.as_deref(), config.redis.redacted_url())
+    else {
+        // Redis is off for this start. Clear both slots, as before: a
+        // channel a previous runtime installed (issue #1312) must not
+        // outlive this process turning Redis off.
+        autumn_harvest::dispatch::uninstall();
+        autumn_harvest::dispatch::uninstall_all_shards();
+        return Ok((Vec::new(), None));
+    };
+
+    let mut connected = Vec::with_capacity(shards.len());
+    for &shard in shards {
+        let key_prefix = effective_dispatch_prefix(&config.redis.key_prefix, Some(shard));
+        let channel = autumn_harvest_redis::RedisDispatch::connect(
+            url,
+            autumn_harvest_redis::RedisDispatchConfig {
+                key_prefix: key_prefix.clone(),
+                consumer_group: config.redis.consumer_group.clone(),
+                visibility_timeout: Duration::from_millis(config.redis.visibility_timeout_ms),
+                dedupe_ttl: DISPATCH_DEDUPE_TTL,
+            },
+        )
+        .await
+        .map_err(|error| {
+            AutumnError::service_unavailable_msg(format!(
+                "failed to connect the Redis dispatch channel for shard {} at {endpoint}: \
+                 {error}",
+                shard.as_i32()
+            ))
+        })?;
+        connected.push((shard, key_prefix, channel));
+    }
+
+    // Every shard connected. Replace the whole topology in one atomic
+    // step (Codex review, issue #1429 follow-up). A loop that clears both
+    // slots, then installs each shard through its own separately locked
+    // call, is not atomic enough. See `dispatch::install_shards`'s own
+    // doc for why.
+    let mut key_prefixes = Vec::with_capacity(connected.len());
+    let channels = connected
+        .into_iter()
+        .map(|(shard, key_prefix, channel)| {
+            key_prefixes.push(key_prefix);
+            (
+                shard,
+                Arc::new(channel) as Arc<dyn autumn_harvest::dispatch::TaskDispatch>,
+                autumn_harvest::dispatch::DispatchSettings {
+                    poll_interval: Duration::from_millis(config.redis.poll_interval_ms),
+                    reconcile_interval: Duration::from_millis(config.redis.reconcile_interval_ms),
+                    reconcile_batch: config.redis.reconcile_batch,
+                    ..autumn_harvest::dispatch::DispatchSettings::default()
+                },
+            )
+        })
+        .collect();
+    let (installed_shards, previous) = autumn_harvest::dispatch::install_shards(channels);
+
+    for (key_prefix, &(shard, _generation)) in key_prefixes.iter().zip(installed_shards.iter()) {
+        tracing::info!(
+            shard = shard.as_i32(),
+            endpoint = %endpoint,
+            key_prefix = %key_prefix,
+            consumer_group = %config.redis.consumer_group,
+            poll_interval_ms = config.redis.poll_interval_ms,
+            reconcile_interval_ms = config.redis.reconcile_interval_ms,
+            reconcile_batch = config.redis.reconcile_batch,
+            "redis dispatch enabled for shard: workers read task references from redis and \
+             claim the named row in postgres"
+        );
+    }
+    Ok((installed_shards, Some(previous)))
+}
+
+/// No per-shard dispatch channel exists without the `redis` cargo feature.
+/// Mirrors [`install_dispatch_channel`]'s no-feature stub, including
+/// clearing both dispatch slots (issue #1429 review).
+///
+/// # Errors
+///
+/// Never returns an error.
+#[cfg(not(feature = "redis"))]
+#[allow(clippy::unused_async)]
+async fn install_dispatch_channels_for_shards(
+    _config: &HarvestRuntimeConfig,
+    _shards: &[ShardId],
+) -> autumn_web::AutumnResult<(
+    Vec<(ShardId, u64)>,
+    Option<autumn_harvest::dispatch::TopologySnapshot>,
+)> {
+    autumn_harvest::dispatch::uninstall();
+    autumn_harvest::dispatch::uninstall_all_shards();
+    Ok((Vec::new(), None))
 }
 
 /// No dispatch channel exists without the `redis` cargo feature.
 ///
 /// Configuration validation rejects `[harvest.redis] url` on such a build, so
 /// this path can only be reached with Redis dispatch off. The result is
-/// always `false`, because nothing is installed.
+/// always `None`, because nothing is installed.
 ///
-/// The slot is still cleared. It is process wide, so a channel another owner
-/// installed would otherwise stay live for a runtime that has Redis off
-/// (issue #1312).
+/// Both slots are still cleared. Each is process wide, so a channel another
+/// owner installed would otherwise stay live for a runtime that has Redis
+/// off (issue #1312). The per-shard half mirrors the Codex review at issue
+/// #1429 this stub's `redis`-feature counterpart applies the same fix for.
 ///
 /// # Errors
 ///
@@ -1616,9 +2031,10 @@ async fn install_dispatch_channel(
 async fn install_dispatch_channel(
     _config: &HarvestRuntimeConfig,
     _shard: Option<ShardId>,
-) -> autumn_web::AutumnResult<bool> {
+) -> autumn_web::AutumnResult<Option<(u64, autumn_harvest::dispatch::TopologySnapshot)>> {
     autumn_harvest::dispatch::uninstall();
-    Ok(false)
+    autumn_harvest::dispatch::uninstall_all_shards();
+    Ok(None)
 }
 
 /// The writable shards `assignments` does **not** cover, ascending (issue #961).
@@ -2156,34 +2572,6 @@ mod tests {
             "a caller that already ran the gate must be able to say so",
         );
     }
-    /// Redis dispatch is single-shard in v1 (issue #1312, contract C7). The
-    /// runner rejects the combination before it installs the channel, so a
-    /// multi-shard process never reaches a connected channel it cannot use.
-    #[test]
-    fn redis_dispatch_is_rejected_on_a_multi_shard_runtime() {
-        let error = super::reject_multi_shard_dispatch(true, 3)
-            .expect_err("a multi-shard runtime must reject redis dispatch");
-
-        assert!(
-            error.contains("1312") && error.contains("single-shard"),
-            "expected the rejection to name the limit and the issue, got {error}"
-        );
-    }
-
-    /// A single-shard runtime is the supported shape, so the check passes.
-    #[test]
-    fn redis_dispatch_is_accepted_on_a_single_shard_runtime() {
-        super::reject_multi_shard_dispatch(true, 1)
-            .expect("a single-shard runtime must accept redis dispatch");
-    }
-
-    /// With no URL the channel stays off, so the shard span does not matter.
-    #[test]
-    fn a_multi_shard_runtime_without_a_redis_url_starts() {
-        super::reject_multi_shard_dispatch(false, 4)
-            .expect("a runtime with redis dispatch off must not be rejected");
-    }
-
     /// An unsharded runtime keeps the configured prefix exactly (issue #1312).
     ///
     /// Every existing single-database deployment resolves the default shard.
@@ -2231,6 +2619,45 @@ mod tests {
         );
     }
 
+    /// A multi-shard install reports one prefix per covered shard, not the
+    /// bare configured prefix (Codex review, issue #1429).
+    ///
+    /// `dispatch_shard` is `None` for a multi-shard install. `start` never
+    /// resolves one shard to represent the whole span. So applying
+    /// `effective_dispatch_prefix` to it alone would silently drop back to
+    /// the plain configured prefix and hide every shard's real key family
+    /// from `/admin/config`.
+    #[test]
+    fn a_multi_shard_install_reports_every_covered_prefix() {
+        let redis = super::HarvestRedisConfig {
+            url: Some("redis://example:6379".to_string()),
+            key_prefix: "harvest".to_string(),
+            ..super::HarvestRedisConfig::default()
+        };
+        let view =
+            super::dispatch_config_view(&redis, true, None, &[ShardId::new(1), ShardId::new(2)]);
+        assert_eq!(view.key_prefix, None);
+        assert_eq!(
+            view.key_prefixes,
+            Some(vec!["harvest:s1".to_string(), "harvest:s2".to_string()])
+        );
+    }
+
+    /// A single-shard install keeps reporting through `key_prefix` alone,
+    /// with `key_prefixes` empty — the shape every existing caller of
+    /// `/admin/config` already expects (issue #1429 review).
+    #[test]
+    fn a_single_shard_install_leaves_key_prefixes_empty() {
+        let redis = super::HarvestRedisConfig {
+            url: Some("redis://example:6379".to_string()),
+            key_prefix: "harvest".to_string(),
+            ..super::HarvestRedisConfig::default()
+        };
+        let view = super::dispatch_config_view(&redis, true, Some(ShardId::new(3)), &[]);
+        assert_eq!(view.key_prefix, Some("harvest:s3".to_string()));
+        assert_eq!(view.key_prefixes, None);
+    }
+
     /// `start` installs the process-global channel before it builds the
     /// worker. A later failure must leave no channel behind, or the next
     /// runtime in this process inherits one it never configured (issue #1312).
@@ -2241,7 +2668,9 @@ mod tests {
             error.into_inner()
         });
 
-        autumn_harvest::dispatch::install(
+        autumn_harvest::dispatch::uninstall();
+        autumn_harvest::dispatch::uninstall_all_shards();
+        let (generation, snapshot) = autumn_harvest::dispatch::install_single(
             std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
             autumn_harvest::dispatch::DispatchSettings::default(),
         );
@@ -2250,11 +2679,68 @@ mod tests {
             "the test fixture must install a channel"
         );
 
-        drop(super::DispatchInstallGuard::new(true));
+        drop(super::DispatchInstallGuard::new(Some((
+            generation, snapshot,
+        ))));
 
         assert!(
             !autumn_harvest::dispatch::is_installed(),
-            "a startup that fails after the install must uninstall the channel"
+            "a startup that fails after the install must uninstall the channel, since nothing \
+             preceded it"
+        );
+    }
+
+    /// A failed replacement startup restores the previous single-shard
+    /// channel, not just clears the one it failed to finish installing
+    /// (Codex review, issue #1429 follow-up).
+    ///
+    /// `install_single` destructively replaces the topology before
+    /// `Worker::new` and the shard-pool validation after it can still fail.
+    /// A guard that only cleared its own install, as in the case above,
+    /// would leave a still-running previous runner without dispatch. This
+    /// pins that dropping an uncommitted guard restores the previous
+    /// channel instead, under its own, original generation. That previous
+    /// runner's own eventual `stop()` call can then still clear it.
+    #[test]
+    fn a_failed_replacement_startup_restores_the_previous_dispatch_channel() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall();
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        let original_generation = autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        let (replacement_generation, snapshot) = autumn_harvest::dispatch::install_single(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        drop(super::DispatchInstallGuard::new(Some((
+            replacement_generation,
+            snapshot,
+        ))));
+
+        assert!(
+            autumn_harvest::dispatch::installed().is_some(),
+            "dropping the guard must restore the previous channel"
+        );
+        // `InstalledDispatch::generation` is private to `autumn_harvest`.
+        // This proves the restored slot carries the original generation
+        // indirectly: the replacement generation no longer names it, and
+        // the original one still does.
+        autumn_harvest::dispatch::uninstall_if_current(replacement_generation);
+        assert!(
+            autumn_harvest::dispatch::installed().is_some(),
+            "the replacement's own generation must no longer name the restored slot"
+        );
+        autumn_harvest::dispatch::uninstall_if_current(original_generation);
+        assert!(
+            autumn_harvest::dispatch::installed().is_none(),
+            "the original generation's own uninstall must still clear the restored slot"
         );
     }
 
@@ -2265,13 +2751,15 @@ mod tests {
             DISPATCH_TEST_LOCK.clear_poison();
             error.into_inner()
         });
+        autumn_harvest::dispatch::uninstall();
+        autumn_harvest::dispatch::uninstall_all_shards();
 
-        autumn_harvest::dispatch::install(
+        let (generation, snapshot) = autumn_harvest::dispatch::install_single(
             std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
             autumn_harvest::dispatch::DispatchSettings::default(),
         );
 
-        super::DispatchInstallGuard::new(true).commit();
+        super::DispatchInstallGuard::new(Some((generation, snapshot))).commit();
 
         assert!(
             autumn_harvest::dispatch::is_installed(),
@@ -2313,11 +2801,17 @@ mod tests {
             .expect("a runtime with redis dispatch off must not be rejected");
     }
 
-    /// A runner that owns nothing but the dispatch flag.
+    /// A runner that owns nothing but the dispatch generation it captured at
+    /// install time.
     ///
-    /// `stop` is driven through this, so the case needs no database, no worker
-    /// and no scheduler.
-    fn runner_owning_dispatch(installed: bool) -> super::HarvestRunner {
+    /// `generation` is `None` for a runner that installed no single-shard
+    /// channel, or `Some` of the value `dispatch::install` actually
+    /// returned (Codex review, issue #1429 follow-up). A fabricated value
+    /// would not match the real slot's generation, so `stop`'s ownership
+    /// check would always treat it as stale. `stop` is driven through
+    /// this, so the case needs no database, no worker and no
+    /// scheduler.
+    fn runner_owning_dispatch(generation: Option<u64>) -> super::HarvestRunner {
         let api_runtime = crate::api::HarvestApiRuntime::new(
             std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(vec![], vec![])),
             std::sync::Arc::new(autumn_harvest::scheduler::DagCatalog::default()),
@@ -2339,8 +2833,56 @@ mod tests {
             retention: None,
             batch: None,
             codec_refresh: None,
-            dispatch_installed: installed,
+            dispatch_install_generation: generation,
+            dispatch_shard_generations: Vec::new(),
+            dispatch_metrics_sampler: None,
         }
+    }
+
+    /// Like [`runner_owning_dispatch`], but the install it owns is the
+    /// per-shard slots rather than the single-shard slot.
+    ///
+    /// `shard_generations` must be the real values `dispatch::install_for_shard`
+    /// returned, for the same reason `runner_owning_dispatch`'s own
+    /// `generation` parameter must be.
+    fn runner_owning_multi_shard_dispatch(
+        shard_generations: Vec<(ShardId, u64)>,
+    ) -> super::HarvestRunner {
+        super::HarvestRunner {
+            dispatch_shard_generations: shard_generations,
+            ..runner_owning_dispatch(None)
+        }
+    }
+
+    /// `stop` cancels and joins an API-only process's dispatch metrics
+    /// sampler (issue #1429 review). A `Worker`-less runner previously
+    /// spawned no sampler for `harvest_dispatch_dropped_hints` at all.
+    ///
+    /// A hung join would make this test itself hang, so a passing test is
+    /// the proof. The sampler task actually observes its cancellation and
+    /// returns, rather than `stop` leaking a detached task forever.
+    #[test]
+    fn stop_cancels_and_joins_the_api_only_dispatch_metrics_sampler() {
+        // `tokio::spawn` (inside `spawn_dispatch_metrics_sampler`) needs a
+        // live runtime. The spawn and the `stop` it feeds must therefore
+        // share one `block_on` call, rather than spawning before entering
+        // it.
+        block_on(async {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let telemetry =
+                std::sync::Arc::new(autumn_harvest::telemetry::TelemetryConfig::builder().build());
+            let handle = autumn_harvest::worker::spawn_dispatch_metrics_sampler(
+                cancel.clone(),
+                telemetry,
+                std::time::Duration::from_secs(3600),
+            );
+            let runner = super::HarvestRunner {
+                dispatch_metrics_sampler: Some((cancel, handle)),
+                ..runner_owning_dispatch(None)
+            };
+
+            runner.stop().await;
+        });
     }
 
     /// Run `future` on a private current-thread runtime.
@@ -2377,10 +2919,108 @@ mod tests {
         let installed = block_on(super::install_dispatch_channel(&config, None))
             .expect("a disabled start must succeed");
 
-        assert!(!installed, "a disabled start installs no channel");
+        assert!(installed.is_none(), "a disabled start installs no channel");
         assert!(
             autumn_harvest::dispatch::installed().is_none(),
             "a disabled start must clear the channel a previous runtime installed"
+        );
+    }
+
+    /// Entering the single-shard install path clears a stale per-shard
+    /// slot too, the mirror of
+    /// `entering_the_multi_shard_path_clears_the_single_shard_slot` (Codex
+    /// review, issue #1429).
+    ///
+    /// `run_poll_loop` prioritizes an installed per-shard channel for its
+    /// polled shard over the single-shard slot this call installs. A
+    /// process may have previously run a multi-shard install. Starting this
+    /// single-shard one, with no intervening `stop()`, would otherwise keep
+    /// consuming from the old per-shard endpoint or key prefix. Meanwhile
+    /// `/admin/config` would report the newly installed global channel.
+    #[test]
+    fn a_disabled_single_shard_start_clears_a_stale_per_shard_slot() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        let stale_shard = ShardId::new(2);
+        autumn_harvest::dispatch::install_for_shard(
+            stale_shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(stale_shard).is_some(),
+            "the test fixture must install the stale shard's channel"
+        );
+
+        let config = crate::config::HarvestRuntimeConfig::default();
+        assert!(config.redis.url.is_none());
+        block_on(super::install_dispatch_channel(&config, None))
+            .expect("a disabled start must succeed");
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(stale_shard).is_none(),
+            "entering the single-shard install path must clear a stale per-shard slot"
+        );
+    }
+
+    /// A single-shard install whose connect fails leaves an active
+    /// multi-shard runner's per-shard channels untouched (Codex review,
+    /// issue #1429 follow-up), the single-shard mirror of
+    /// `a_shard_connect_failure_leaves_existing_channels_untouched`.
+    ///
+    /// An earlier version cleared every per-shard slot unconditionally on
+    /// entry, before attempting to connect. A single-shard runner could
+    /// then replace a still-active multi-shard runner with no intervening
+    /// `stop()`. If that connect failed, the multi-shard runner lost every
+    /// dispatch channel it owned, and fell back to Postgres for no reason
+    /// of its own. This drives a connect failure with a `rediss://` URL.
+    /// `RedisDispatch::connect` rejects it before any network I/O, since
+    /// this release carries no TLS transport — deterministic and fast on
+    /// every platform, unlike a black-holed address. A sandboxed CI
+    /// runner's network policy is not guaranteed to reproduce that
+    /// connect-timeout failure. Checks that a per-shard channel installed
+    /// before the call is still there after it fails.
+    ///
+    /// Gated on the `redis` feature. The no-feature stub of
+    /// `install_dispatch_channel` never inspects `config.redis.url` at
+    /// all, so it would return `Ok` here regardless of the `rediss://`
+    /// scheme. This test's own `is_err()` assertion would then fail for a
+    /// reason that has nothing to do with the connect-failure behavior it
+    /// means to pin.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn a_single_shard_connect_failure_leaves_existing_per_shard_channels_untouched() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        let active_shard = ShardId::new(3);
+        autumn_harvest::dispatch::install_for_shard(
+            active_shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        let config = crate::config::HarvestRuntimeConfig {
+            redis: super::HarvestRedisConfig {
+                url: Some("rediss://127.0.0.1:6379".to_string()),
+                ..super::HarvestRedisConfig::default()
+            },
+            ..crate::config::HarvestRuntimeConfig::default()
+        };
+
+        let result = block_on(super::install_dispatch_channel(&config, None));
+        assert!(
+            result.is_err(),
+            "a rediss:// URL must fail the call before any connection attempt"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(active_shard).is_some(),
+            "a failed connect must not clear a pre-existing per-shard channel"
         );
     }
 
@@ -2392,12 +3032,12 @@ mod tests {
             error.into_inner()
         });
 
-        autumn_harvest::dispatch::install(
+        let generation = autumn_harvest::dispatch::install(
             std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
             autumn_harvest::dispatch::DispatchSettings::default(),
         );
 
-        block_on(runner_owning_dispatch(true).stop());
+        block_on(runner_owning_dispatch(Some(generation)).stop());
 
         assert!(
             autumn_harvest::dispatch::installed().is_none(),
@@ -2421,13 +3061,445 @@ mod tests {
             autumn_harvest::dispatch::DispatchSettings::default(),
         );
 
-        block_on(runner_owning_dispatch(false).stop());
+        block_on(runner_owning_dispatch(None).stop());
 
         assert!(
             autumn_harvest::dispatch::is_installed(),
             "stop must not uninstall a channel this runner never installed"
         );
         autumn_harvest::dispatch::uninstall();
+    }
+
+    /// A runner that installed per-shard channels (issue #1429) uninstalls
+    /// them via `uninstall_all_shards`, not the single-shard slot, when it
+    /// stops. `stop` previously called only `dispatch::uninstall` (issue
+    /// #1429 review), leaving per-shard state live for whatever runtime
+    /// started next in this process.
+    #[test]
+    fn stop_uninstalls_the_per_shard_channels_a_multi_shard_runner_installed() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        let gen0 = autumn_harvest::dispatch::install_for_shard(
+            ShardId::new(0),
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        let gen1 = autumn_harvest::dispatch::install_for_shard(
+            ShardId::new(1),
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        block_on(
+            runner_owning_multi_shard_dispatch(vec![
+                (ShardId::new(0), gen0),
+                (ShardId::new(1), gen1),
+            ])
+            .stop(),
+        );
+
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(ShardId::new(0)).is_none(),
+            "stop must uninstall shard 0's channel"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(ShardId::new(1)).is_none(),
+            "stop must uninstall shard 1's channel"
+        );
+    }
+
+    /// `stop` on an old runner must not clear a replacement runner's
+    /// channel (Codex review, issue #1429 follow-up).
+    ///
+    /// A process may start a replacement `HarvestRunner` before calling
+    /// `stop` on the previous one. The replacement's own `install` already
+    /// overwrote the single-shard slot by the time the old runner's `stop`
+    /// runs. An unconditional `uninstall` there would clear the
+    /// replacement's channel out from under it. The replacement's own
+    /// effective-config snapshot still says Redis dispatch is installed,
+    /// but every read and publish would silently fall through to Postgres.
+    #[test]
+    fn stop_does_not_clear_a_replacement_runners_single_shard_channel() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        let old_generation = autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        // The replacement runner starts and installs its own channel before
+        // the old runner's `stop` gets a chance to run.
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        block_on(runner_owning_dispatch(Some(old_generation)).stop());
+
+        assert!(
+            autumn_harvest::dispatch::installed().is_some(),
+            "stop must not clear a channel a replacement runner installed after this one"
+        );
+        autumn_harvest::dispatch::uninstall();
+    }
+
+    /// The per-shard mirror of
+    /// `stop_does_not_clear_a_replacement_runners_single_shard_channel`
+    /// (Codex review, issue #1429 follow-up).
+    ///
+    /// A replacement multi-shard runner may reinstall some, but not all, of
+    /// the shards the old runner owned before the old runner's `stop`
+    /// runs. Only the shards whose generation the old runner still
+    /// recognizes are cleared; the reinstalled shard is left alone.
+    #[test]
+    fn stop_does_not_clear_a_replacement_runners_per_shard_channel() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        let shard0 = ShardId::new(0);
+        let shard1 = ShardId::new(1);
+        let old_gen0 = autumn_harvest::dispatch::install_for_shard(
+            shard0,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        let old_gen1 = autumn_harvest::dispatch::install_for_shard(
+            shard1,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        // The replacement runner reinstalls shard 0 only, before the old
+        // runner's `stop` gets a chance to run.
+        autumn_harvest::dispatch::install_for_shard(
+            shard0,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        block_on(
+            runner_owning_multi_shard_dispatch(vec![(shard0, old_gen0), (shard1, old_gen1)]).stop(),
+        );
+
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(shard0).is_some(),
+            "stop must not clear shard 0's channel: a replacement runner reinstalled it"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(shard1).is_none(),
+            "stop must still clear shard 1's channel: no replacement ever touched it"
+        );
+        autumn_harvest::dispatch::uninstall_all_shards();
+    }
+
+    /// A restart with Redis off must clear per-shard channels too (issue
+    /// #1429), the multi-shard mirror of
+    /// `a_disabled_start_clears_a_previously_installed_channel`.
+    #[test]
+    fn a_disabled_start_clears_previously_installed_per_shard_channels() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        let shard = ShardId::new(1);
+        autumn_harvest::dispatch::install_for_shard(
+            shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        let config = crate::config::HarvestRuntimeConfig::default();
+        assert!(
+            config.redis.url.is_none(),
+            "the default config has redis dispatch off"
+        );
+        let (installed_shards, _snapshot) = block_on(super::install_dispatch_channels_for_shards(
+            &config,
+            &[shard],
+        ))
+        .expect("a disabled start must succeed");
+
+        assert!(
+            installed_shards.is_empty(),
+            "a disabled start installs no per-shard channel"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(shard).is_none(),
+            "a disabled start must clear the per-shard channel a previous runtime installed"
+        );
+    }
+
+    /// A multi-shard install clears a stale single-shard slot too (Codex
+    /// review, issue #1429).
+    ///
+    /// `Worker::new` treats a populated single-shard slot as authoritative
+    /// over per-shard coverage. A process that previously ran single-shard
+    /// dispatch, and now starts a multi-shard runtime with no intervening
+    /// `stop()`, would otherwise leave that stale slot in place. It would
+    /// then reject the very worker the fresh per-shard install was meant
+    /// to cover.
+    ///
+    /// `install_dispatch_channels_for_shards` clears the single-shard slot
+    /// unconditionally on the Redis-off branch, before returning. This test
+    /// exercises that branch, the only one this suite can drive without a
+    /// live Redis. The Redis-configured branch clears both slots too, but
+    /// only after every shard connects — see
+    /// `a_shard_connect_failure_leaves_existing_channels_untouched` for that
+    /// branch's own coverage.
+    #[test]
+    fn entering_the_multi_shard_path_clears_the_single_shard_slot() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        assert!(
+            autumn_harvest::dispatch::installed().is_some(),
+            "the test fixture must install the single-shard slot"
+        );
+
+        let disabled_config = crate::config::HarvestRuntimeConfig::default();
+        assert!(disabled_config.redis.url.is_none());
+        block_on(super::install_dispatch_channels_for_shards(
+            &disabled_config,
+            &[ShardId::new(0), ShardId::new(1)],
+        ))
+        .expect("a disabled start must succeed");
+        assert!(
+            autumn_harvest::dispatch::installed().is_none(),
+            "entering the multi-shard install path must clear the stale single-shard slot"
+        );
+    }
+
+    /// Reinstalling for a smaller or differently shaped multi-shard span
+    /// clears every per-shard slot first. It clears more than just the
+    /// shards the new call names (Codex review, issue #1429).
+    ///
+    /// A shard from an earlier, uncommitted-`stop()` multi-shard install
+    /// may fall outside the new call's own `shards`. It must not survive
+    /// as a stale entry. `installed_for_shard` would otherwise still
+    /// return it. A worker singly assigned to that shard could then pass
+    /// its coverage check against a Redis namespace this runtime no
+    /// longer owns.
+    #[test]
+    fn a_smaller_multi_shard_reinstall_clears_the_shard_it_drops() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        let stale_shard = ShardId::new(9);
+        autumn_harvest::dispatch::install_for_shard(
+            stale_shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(stale_shard).is_some(),
+            "the test fixture must install the stale shard's channel"
+        );
+
+        let disabled_config = crate::config::HarvestRuntimeConfig::default();
+        assert!(disabled_config.redis.url.is_none());
+        block_on(super::install_dispatch_channels_for_shards(
+            &disabled_config,
+            &[ShardId::new(0), ShardId::new(1)],
+        ))
+        .expect("a disabled start must succeed");
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(stale_shard).is_none(),
+            "reinstalling for a new shard span must clear a shard the new span no longer names"
+        );
+    }
+
+    /// A shard that fails to connect leaves every existing channel exactly
+    /// as this call found it (Codex review, issue #1429 follow-up).
+    ///
+    /// An earlier version cleared both dispatch slots unconditionally on
+    /// entry, then connected shards one at a time. A connect failure
+    /// partway through that loop left this runtime with no channels at
+    /// all. The old topology was already cleared, and the new one never
+    /// finished installing. The fix connects every shard into a local list
+    /// first, and only clears and installs once every shard has succeeded.
+    /// This test drives a connect failure with a `rediss://` URL.
+    /// `RedisDispatch::connect` rejects it before any network I/O, since
+    /// this release carries no TLS transport — deterministic and fast on
+    /// every platform, unlike a black-holed address. A sandboxed CI
+    /// runner's network policy is not guaranteed to reproduce that
+    /// connect-timeout failure. It checks that a channel installed before
+    /// the call is still there after it fails.
+    ///
+    /// Gated on the `redis` feature, the same reason
+    /// `a_single_shard_connect_failure_leaves_existing_per_shard_channels_untouched`
+    /// is: the no-feature stub of `install_dispatch_channels_for_shards`
+    /// never inspects `config.redis.url`, so it always succeeds.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn a_shard_connect_failure_leaves_existing_channels_untouched() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        let other_shard = ShardId::new(7);
+        autumn_harvest::dispatch::install_for_shard(
+            other_shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        let config = crate::config::HarvestRuntimeConfig {
+            redis: super::HarvestRedisConfig {
+                url: Some("rediss://127.0.0.1:6379".to_string()),
+                ..super::HarvestRedisConfig::default()
+            },
+            ..crate::config::HarvestRuntimeConfig::default()
+        };
+
+        let result = block_on(super::install_dispatch_channels_for_shards(
+            &config,
+            &[ShardId::new(0)],
+        ));
+        assert!(
+            result.is_err(),
+            "a rediss:// URL must fail the call before any connection attempt"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed().is_some(),
+            "a failed connect must not clear the pre-existing single-shard channel"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(other_shard).is_some(),
+            "a failed connect must not clear a pre-existing per-shard channel for another shard"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(ShardId::new(0)).is_none(),
+            "the shard whose connect failed must not end up with a channel installed"
+        );
+    }
+
+    /// [`DispatchInstallGuard::new_shards`] unwinds every shard it was given
+    /// when it drops uncommitted, mirroring the single-shard guard's own
+    /// unwind test. Nothing preceded these shards, so unwinding restores
+    /// them to empty, the same as the single-shard case above.
+    #[test]
+    fn an_uncommitted_shard_guard_unwinds_every_shard_it_installed() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        let shard_a = ShardId::new(1);
+        let shard_b = ShardId::new(2);
+        let channels = [shard_a, shard_b]
+            .into_iter()
+            .map(|shard| {
+                (
+                    shard,
+                    std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new())
+                        as std::sync::Arc<dyn autumn_harvest::dispatch::TaskDispatch>,
+                    autumn_harvest::dispatch::DispatchSettings::default(),
+                )
+            })
+            .collect();
+        let (shard_generations, snapshot) = autumn_harvest::dispatch::install_shards(channels);
+
+        drop(super::DispatchInstallGuard::new_shards(
+            shard_generations,
+            Some(snapshot),
+        ));
+
+        assert!(autumn_harvest::dispatch::installed_for_shard(shard_a).is_none());
+        assert!(autumn_harvest::dispatch::installed_for_shard(shard_b).is_none());
+    }
+
+    /// A failed replacement startup restores the previous per-shard
+    /// channels, the multi-shard mirror of
+    /// `a_failed_replacement_startup_restores_the_previous_dispatch_channel`
+    /// (Codex review, issue #1429 follow-up).
+    #[test]
+    fn a_failed_shard_replacement_startup_restores_the_previous_channels() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        let shard = ShardId::new(6);
+        let original_generation = autumn_harvest::dispatch::install_for_shard(
+            shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        let (replacement_shards, snapshot) = autumn_harvest::dispatch::install_shards(vec![(
+            shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        )]);
+
+        drop(super::DispatchInstallGuard::new_shards(
+            replacement_shards.clone(),
+            Some(snapshot),
+        ));
+
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(shard).is_some(),
+            "dropping the guard must restore the previous shard channel"
+        );
+        // `InstalledDispatch::generation` is private to `autumn_harvest`.
+        // This proves the restored slot carries the original generation
+        // indirectly: the replacement generation no longer names it, and
+        // the original one still does.
+        autumn_harvest::dispatch::uninstall_all_shards_if_current(&replacement_shards);
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(shard).is_some(),
+            "the replacement's own generation must no longer name the restored slot"
+        );
+        autumn_harvest::dispatch::uninstall_all_shards_if_current(&[(shard, original_generation)]);
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(shard).is_none(),
+            "the original generation's own uninstall must still clear the restored slot"
+        );
+    }
+
+    /// A committed shard guard leaves the per-shard channels installed.
+    #[test]
+    fn a_committed_shard_guard_leaves_the_channels_installed() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        let shard = ShardId::new(1);
+        let (shard_generations, snapshot) = autumn_harvest::dispatch::install_shards(vec![(
+            shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        )]);
+
+        super::DispatchInstallGuard::new_shards(shard_generations, Some(snapshot)).commit();
+
+        assert!(autumn_harvest::dispatch::installed_for_shard(shard).is_some());
+        autumn_harvest::dispatch::uninstall_all_shards();
     }
 
     /// The process-global dispatch slot is one resource. The dispatch cases
