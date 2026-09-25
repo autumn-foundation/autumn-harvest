@@ -27,4 +27,5 @@ mod review_fixes_48d54b2;
 mod runtime_robustness;
 mod signal_timeout;
 mod subsecond_timer;
+mod unknown_execution_id_error_shape;
 mod workflow_info_features;
