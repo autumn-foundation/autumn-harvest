@@ -1,4 +1,4 @@
-# 🚦 Semaphore CI health — the `quota_enforcement_tests`/`integration_e2e.rs:1383` SOURCE-completion hang series closes; two more independently-diagnosed flakes and the shard rebalance landed alongside it; one open PR is now stale against the new shard count
+# 🚦 Semaphore CI health — the `quota_enforcement_tests`/`integration_e2e.rs:1383` SOURCE-completion hang series closes; two more independently-diagnosed flakes and the shard rebalance landed alongside it; one open PR's harness needs a fresh run against today's manifest before merging
 
 **Status:** health report — no PR opened against `ci.yml` or any test file. This
 role's hard gate is not met because there is no new mechanism to diagnose: every
@@ -23,14 +23,30 @@ The prior report counted 9 confirmed occurrences of the byte-identical
 this series, tracing to the same root cause this session already verified twice
 independently (Docker-based, in PR #1713's own report, and Docker-free, in the
 prior session's local-Postgres rerun harness: 5/5 fail unpatched, 20/20 pass
-patched). Three commits landed the fix and two related-but-distinct flake
-fixes within two minutes of each other on `trunk-dev`:
+patched). That fix, plus two related-but-distinct flake fixes, are all on
+`trunk-dev` now, though not all landed where their own PR number would
+suggest:
 
 | Commit | Time (UTC) | PR | Mechanism |
 |---|---|---|---|
 | `676e79c3` | 09-24 14:28:22 | #1713 | `INIT_SQL`'s hand-rolled bundle in `integration_e2e.rs` was missing migration `20260920215812_harvest_completion_trigger_fires_target` — this series' own tracked defect |
-| `5a3cf148` | 09-24 14:30:31 | #1706 | `quota_enforcement_tests`'s outbox-retry path didn't wire `sharded_pool` into the test's own worker config (issue #1685) — a **different** mechanism hitting the same test module, tracked separately since `docs/rnd/2026-09-21-ci-health-semaphore-quota-outbox-recurrence.md` |
+| `49d1a56c` | 09-23 13:01:20 | #1710 | `quota_enforcement_tests`'s outbox-retry path didn't wire `sharded_pool` into the test's own worker config (issue #1685) — a **different** mechanism hitting the same test module, tracked separately since `docs/rnd/2026-09-21-ci-health-semaphore-quota-outbox-recurrence.md` |
 | `f08842e0` | 09-24 14:29:37 | #1719 | `sharded_runtime_tests`'s timeout-pass hold-and-wait wedges on an exhausted shard pool — a third, distinct suite |
+
+**Correction (post-review, Codex on this PR).** An earlier draft attributed
+the outbox-retry wiring fix to `5a3cf148` (PR #1706, titled for exactly this
+fix) and grouped all three as landing within two minutes of each other.
+Checking `5a3cf148`'s own diff shows it touches only one file —
+`docs/rnd/2026-09-22-ci-health-semaphore-quota-outbox-root-cause.md` — no
+code. The actual `worker_cfg.sharded_pool = Some(sharded_pool)` line, with a
+comment citing issue #1685 by name, is in `49d1a56` (`⚡ Bolt: own payload
+fields instead of cloning them`, PR #1710), an otherwise-unrelated
+payload-ownership performance PR that happened to touch the same test file
+and landed a full day earlier, on 09-23. PR #1706 appears to have been
+opened for the same fix independently, then merged after Bolt's PR already
+carried the identical change on `trunk-dev`, leaving only its own docs
+artifact as new content by the time it landed. Corrected above: the table
+now cites `49d1a56` and its real timestamp, not `5a3cf148`'s.
 
 Then `285c7fa0` (09-24 17:27:14 UTC, PR #1707) rebalanced `test-db-linux` from
 11 to 21 shards, for the slowest-shard latency this series' shard-weight-drift
@@ -65,7 +81,9 @@ carries forward from this specific signature.
 Nothing in this session changes the diagnosis already rendered and twice
 verified in the prior two reports. One bookkeeping note for future sessions
 reading this series: the shard rebalance and the three flake fixes are
-independent changes that happened to land within the same three-hour window.
+independent changes — `49d1a56` landed a day ahead of the other two
+(09-23), which landed within two minutes of each other (09-24 14:28-14:29
+UTC), and the rebalance followed three hours after those.
 Do not attribute the hang's fix to the rebalance — the collision
 (`integration_e2e`/`quota_enforcement_tests` both landing on shard 0 under the
 old 11-shard layout) only ever explained why both suites' failures showed up
@@ -119,7 +137,12 @@ Docker/Postgres environment needed.
 # --no-walk is required: without it, git log treats four revisions as a
 # range/set to walk ancestry from, printing every reachable ancestor
 # (6ddbc976, 90f5c714, ...) instead of just these four rows.
-git log --no-walk --format='%H %ad %s' --date=iso 676e79c3 5a3cf148 f08842e0 285c7fa0
+git log --no-walk --format='%H %ad %s' --date=iso 676e79c3 49d1a56c f08842e0 285c7fa0
+
+# Confirm 49d1a56, not 5a3cf148, carries the outbox-retry code fix:
+git diff 5a3cf148^ 5a3cf148 --stat   # -> one docs/rnd file, no code
+git diff 49d1a56^ 49d1a56 -- autumn-harvest/tests/integration/quota_enforcement_tests.rs \
+  | grep -n "sharded_pool"           # -> worker_cfg.sharded_pool = Some(sharded_pool)
 
 # Confirm zero recurrences: pull job results for the three full trunk-dev
 # sweeps since the fix (via actions_list/list_workflow_jobs on runs
