@@ -1613,6 +1613,39 @@ enum ClaimOutcome {
     Empty,
 }
 
+/// Execute one pre-built release-if-paused statement and report whether a
+/// row was released (🪞 Echo clone-class merge, instances 4→1).
+///
+/// [`crate::queue_pause::release_claim_if_queue_paused`],
+/// [`crate::queue_pause::release_claim`],
+/// [`crate::activity_pause::release_claim_if_activity_paused`], and
+/// [`crate::execution::release_claim_if_workflow_paused`] used to repeat
+/// this exact body. Each bound `task_id`/`worker_id` into its own
+/// statement, executed it, and mapped the row count to a bool.
+///
+/// `sql` is the one thing that legitimately varies between them: which
+/// statement decides a hold is in force. This function never branches on
+/// `sql`'s content. It carries no caller-identity or mode encoding.
+///
+/// Each of the four callers still owns its own statement text. Each still
+/// owns its own barrier strategy. Each still owns its own doc comment on
+/// the residual window that strategy accepts. See
+/// [`apply_post_claim_rechecks`] below for how those strategies differ.
+pub(crate) async fn release_claim_via(
+    conn: &mut AsyncPgConnection,
+    sql: &'static str,
+    task_id: Uuid,
+    worker_id: &str,
+) -> HarvestResult<bool> {
+    let released = diesel::sql_query(sql)
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(released > 0)
+}
+
 /// The post-claim re-checks shared by [`claim_task_on_shard`] and
 /// [`claim_task_by_id_on_shard`].
 ///
