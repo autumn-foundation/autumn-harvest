@@ -10,14 +10,15 @@
 //! `SqliteRuntime::run_until_blocked` does not. `drive_one_cycle` reads
 //! `store::execution_state` (a bare `SELECT ... WHERE exec_id = ?1`) with no
 //! existence check first. `rusqlite::Connection::query_row` on zero rows
-//! returns `rusqlite::Error::QueryReturnedNoRows`. That `?`-converts into
-//! `SqliteError::Sqlite(QueryReturnedNoRows)` — a generic, driver-level error.
-//! It names no execution id. It gives no hint the problem is "unknown id,"
-//! not "database problem." `run_until_blocked`'s own rustdoc `# Errors`
-//! section lists `Stuck` / `Unsupported` / "a persistence error." It does not
-//! mention `ExecutionNotFound` at all, even though an unknown id is a likely
-//! error for an embedder to hit — a typo in a stored id, a stale id from a
-//! dropped `open_in_memory` database, or a wrong-file `open`.
+//! returns `rusqlite::Error::QueryReturnedNoRows`. That converts into
+//! `SqliteError::Sqlite(QueryReturnedNoRows)` through the `?` operator. This
+//! is a generic, driver-level error. It names no execution id. It gives no
+//! hint that the real problem is an unknown id, rather than a database
+//! fault. The `# Errors` section on `run_until_blocked`'s own rustdoc lists
+//! `Stuck`, `Unsupported`, and a generic persistence error. It never
+//! mentions `ExecutionNotFound`. Yet an unknown id is a likely failure for
+//! an embedder to hit. A typo in a stored id, a stale id from a dropped
+//! `open_in_memory` database, or a wrong-file `open` can all cause it.
 //!
 //! `load_history` and `activity_attempts` share the same root cause: no
 //! existence check. Each surfaces it a third way: a silent `Ok(vec![])`.
