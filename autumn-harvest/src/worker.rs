@@ -6080,10 +6080,13 @@ pub(crate) const fn dispatch_allowed_for_span(
 /// Whether every one of `assignments` has its own per-shard dispatch channel
 /// installed (issue #1429).
 ///
-/// The multi-shard poll loop consults [`crate::dispatch::installed_for_shard`]
-/// per shard at read time. This is the matching startup check. A runtime
-/// missing coverage for even one assigned shard fails loud instead of
-/// silently falling that one shard back to the Postgres path forever.
+/// `Worker::new` calls [`crate::dispatch::installed_for_shard`] per shard
+/// twice (Codex review, issue #1429 follow-up). This first call validates
+/// coverage. A second call, right after, captures each shard's channel
+/// for the whole life of the poll loop. This is the coverage half of that
+/// pair. A runtime missing coverage for even one assigned shard fails
+/// loud instead of silently falling that one shard back to the Postgres
+/// path forever.
 /// An empty `assignments` (the unsharded/default span) is never covered
 /// here. It has no shard identity to look up, so it needs the
 /// single-shard channel (`dispatch::install`), not this path.
@@ -6093,6 +6096,35 @@ fn per_shard_dispatch_covers(assignments: &[crate::types::ShardId]) -> bool {
         && assignments
             .iter()
             .all(|shard| crate::dispatch::installed_for_shard(*shard).is_some())
+}
+
+/// Each of `assignments`' own per-shard dispatch channel, for [`Worker::new`]
+/// to hold for the rest of the worker's life (Codex review, issue #1429
+/// follow-up).
+///
+/// `Worker::run` used to decide this multi-shard span's channels itself, by
+/// re-reading `dispatch::installed_for_shard` right before spawning the poll
+/// loop. That read ran inside a `tokio::spawn`ed task, scheduled after
+/// `Worker::new`'s own coverage validation, not synchronously with it. A
+/// second `HarvestRunner::start` for an overlapping shard set could install
+/// its own topology in that gap. This worker's poll loop would then hold
+/// the *other* runner's channels, for shards it was never validated
+/// against. That pairs the other runner's Redis endpoints with this
+/// runner's own database pools, for the rest of this worker's life.
+/// Calling this here instead,
+/// synchronously with [`per_shard_dispatch_covers`]'s own check, means the
+/// poll loop uses exactly the channels that check just validated. No gap is
+/// left for a racing install to land in.
+#[must_use]
+fn capture_shard_dispatch(
+    assignments: &[crate::types::ShardId],
+) -> std::collections::HashMap<crate::types::ShardId, crate::dispatch::InstalledDispatch> {
+    assignments
+        .iter()
+        .filter_map(|shard| {
+            crate::dispatch::installed_for_shard(*shard).map(|installed| (*shard, installed))
+        })
+        .collect()
 }
 
 /// Whether a shard's poll loop may claim tasks, given that shard's pending
@@ -25378,6 +25410,12 @@ pub struct Worker {
     /// `tokio::sync::Semaphore`/`OwnedSemaphorePermit` map -- see
     /// [`crate::sessions::SessionSlotRegistry`]'s doc comment for why.
     session_slots_in_use: crate::sessions::SessionSlotRegistry,
+    /// Each assigned shard's per-shard dispatch channel, captured once at
+    /// construction (issue #1429 follow-up). See the capture site in
+    /// [`Worker::new`] for why this is decided here rather than later, at
+    /// `run` time.
+    shard_dispatch:
+        std::collections::HashMap<crate::types::ShardId, crate::dispatch::InstalledDispatch>,
 }
 
 struct WorkerMonitoringHandles {
@@ -26694,6 +26732,12 @@ impl Worker {
             }
         }
 
+        // Capture each assigned shard's per-shard dispatch channel here, in
+        // the same synchronous step as the coverage check above (Codex
+        // review, issue #1429 follow-up). See `capture_shard_dispatch`'s
+        // own doc comment for why this cannot wait until `run`.
+        let shard_dispatch = capture_shard_dispatch(&config.shard_assignments);
+
         let mut ineligible_activities = Vec::new();
         for activity in registry.activities.values() {
             if let Some(requires) = activity.requires {
@@ -26740,6 +26784,7 @@ impl Worker {
                 std::collections::HashMap::new(),
             )),
             session_slots_in_use: crate::sessions::new_session_slot_registry(),
+            shard_dispatch,
         })
     }
 
@@ -27266,18 +27311,20 @@ impl Worker {
 
         let shard_listeners = self.build_shard_listeners(&shard_targets).await;
 
-        // Decide each shard's dispatch channel once, here, and hold it for
-        // the whole loop (issue #1429). This is the multi-shard mirror of
-        // the single-pool loop's one-time decision just above
-        // `run_poll_loop`.
-        // `Worker::new` already required a per-shard channel for every
-        // assigned shard before construction succeeded, whenever any
-        // per-shard channel is installed at all. A `None` entry here means
-        // dispatch was never installed for this span. That shard then polls
-        // Postgres, same as no channel at all.
+        // Use each assigned shard's dispatch channel, captured once by
+        // `Worker::new` and held for the whole loop (Codex review, issue
+        // #1429 follow-up). A `None` entry here means dispatch was never
+        // installed for this span; that shard then polls Postgres, same as
+        // no channel at all.
+        //
+        // This reads `self.shard_dispatch`, not `dispatch::installed_for_shard`
+        // again. See `Worker::new`'s own capture site for why re-reading
+        // global state here is risky. This task starts well after that
+        // validation, in exactly the gap a racing, overlapping runner's
+        // own install could land in.
         let shard_dispatch: Vec<Option<crate::dispatch::InstalledDispatch>> = shard_targets
             .iter()
-            .map(|(shard, _)| crate::dispatch::installed_for_shard(*shard))
+            .map(|(shard, _)| self.shard_dispatch.get(shard).cloned())
             .collect();
 
         self.run_poll_loop_multi(
@@ -43025,5 +43072,66 @@ mod tests {
              with a global channel also installed, got {:?}",
             result.err()
         );
+    }
+
+    /// `Worker::new` captures each assigned shard's channel at construction,
+    /// not later at `run` time (Codex review, issue #1429 follow-up).
+    ///
+    /// A replacement runner's own install can land in the gap between this
+    /// construction and the later `tokio::spawn`ed task that used to
+    /// re-read `dispatch::installed_for_shard`. This worker would then
+    /// hold the *other* runner's channels for the rest of its life, even
+    /// though `per_shard_dispatch_covers` validated a completely
+    /// different set at construction. This pins that the captured channel
+    /// still matches the one installed at `Worker::new` time, after a
+    /// later install replaces it.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn worker_new_captures_shard_channels_immune_to_a_later_install() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::dispatch::uninstall_all_shards();
+        let shard_0 = crate::types::ShardId::new(0);
+        let shard_1 = crate::types::ShardId::new(1);
+        let original_shard_0_channel = Arc::new(crate::dispatch::MemoryDispatch::new())
+            as Arc<dyn crate::dispatch::TaskDispatch>;
+        crate::dispatch::install_for_shard(
+            shard_0,
+            Arc::clone(&original_shard_0_channel),
+            crate::dispatch::DispatchSettings::default(),
+        );
+        crate::dispatch::install_for_shard(
+            shard_1,
+            Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let config = WorkerRuntimeConfig {
+            shard_assignments: vec![shard_0, shard_1],
+            ..default_runtime_config()
+        };
+        let worker = Worker::new(config, registry).expect("full per-shard coverage must accept");
+
+        // A second, "overlapping" runner replaces shard 0's channel after
+        // this worker was already constructed and validated.
+        crate::dispatch::install_for_shard(
+            shard_0,
+            Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+
+        let captured = worker
+            .shard_dispatch
+            .get(&shard_0)
+            .expect("shard 0 must have a captured channel");
+        assert!(
+            Arc::ptr_eq(&captured.channel, &original_shard_0_channel),
+            "the captured channel must still be the one installed at construction, not the \
+             later replacement"
+        );
+
+        crate::dispatch::uninstall_all_shards();
     }
 }

@@ -726,6 +726,15 @@ impl RedisDispatch {
     /// keeps a sibling queue's arrival from starving behind the leader's
     /// full timeout. See `QUEUE_BLOCK_SLICE`'s own doc comment.
     ///
+    /// `ordered` pairs each stream key with its own queue name. A NOGROUP
+    /// heal (via [`Self::read_with_heal`]) can then pass just that one
+    /// queue, rather than every configured queue (Codex review, issue
+    /// #1429 follow-up). An operator deleting one queue's consumer group
+    /// must not turn that queue's own recovery into a full
+    /// `ensure_groups` sweep. That sweep costs one `XGROUP CREATE` round
+    /// trip per *every* configured queue, on top of the read this call
+    /// already budgets one round trip for.
+    ///
     /// Extracted from [`Self::next_inner`] to keep that function's line
     /// count under clippy's `too_many_lines` threshold (issue #1429).
     ///
@@ -762,8 +771,7 @@ impl RedisDispatch {
     /// entries to requeue.
     async fn read_across_queues(
         &self,
-        queues: &[String],
-        ordered: &[String],
+        ordered: &[(String, String)],
         consumer: &str,
         max: usize,
         wait: Duration,
@@ -772,13 +780,13 @@ impl RedisDispatch {
         let mut any_ready = false;
         let mut first_error = None;
         let mut remaining = max.max(1);
-        for key in ordered {
+        for (queue, key) in ordered {
             if remaining == 0 {
                 break;
             }
             match self
                 .read_with_heal(
-                    queues,
+                    std::slice::from_ref(queue),
                     std::slice::from_ref(key),
                     consumer,
                     remaining,
@@ -821,10 +829,10 @@ impl RedisDispatch {
                 } else {
                     budget
                 };
-                let key = &ordered[lap_position];
+                let (queue, key) = &ordered[lap_position];
                 match self
                     .read_with_heal(
-                        queues,
+                        std::slice::from_ref(queue),
                         std::slice::from_ref(key),
                         consumer,
                         remaining,
@@ -861,13 +869,19 @@ impl RedisDispatch {
         max: usize,
         wait: Duration,
     ) -> RedisAdapterResult<Vec<DispatchLease>> {
-        let keys: Vec<String> = queues.iter().map(|queue| self.stream_key(queue)).collect();
+        // Paired with its queue name so a NOGROUP heal during the read below
+        // can target just that one queue (Codex review, issue #1429
+        // follow-up). See `read_across_queues`'s own doc comment.
+        let queue_and_key: Vec<(String, String)> = queues
+            .iter()
+            .map(|queue| (queue.clone(), self.stream_key(queue)))
+            .collect();
         // The order rotates per call, so the queue that fills the batch
         // changes. No queue therefore starves behind a busy peer.
         // `read_across_queues` sizes each queue's own `COUNT` from `max`
         // itself, not a fixed even split (see its own doc comment).
         let offset = usize::try_from(self.reads.fetch_add(1, Ordering::Relaxed)).unwrap_or(0);
-        let ordered = rotate(&keys, offset);
+        let ordered = rotate(&queue_and_key, offset);
 
         // One queue's stream carries its own hash tag (issue #1429). So a
         // single multi-key `XREADGROUP` across several queues crosses Redis
@@ -885,7 +899,7 @@ impl RedisDispatch {
         // matches the round-robin already used to decide which queue's
         // `COUNT` fills the batch first.
         let (reply, read_error) = self
-            .read_across_queues(queues, &ordered, consumer, max, wait)
+            .read_across_queues(&ordered, consumer, max, wait)
             .await?;
 
         let mut candidates = Vec::new();
@@ -2069,6 +2083,33 @@ mod tests {
         assert_eq!(rotate(&queues, 2), vec!["c", "a", "b"]);
         assert_eq!(rotate(&queues, 3), vec!["a", "b", "c"], "the offset wraps");
         assert!(rotate::<String>(&[], 5).is_empty());
+    }
+
+    /// `next_inner` rotates `(queue, key)` pairs, not two separately
+    /// rotated lists. A queue's name and its own stream key therefore stay
+    /// paired at every offset (Codex review, issue #1429 follow-up).
+    ///
+    /// A NOGROUP heal during a read passes only the single queue name
+    /// paired with the key that read used. Rotating the two lists
+    /// independently would desync that pairing at a non-zero offset. A
+    /// healthy queue would then get force-recreated instead of the one
+    /// that actually failed.
+    #[test]
+    fn rotate_keeps_each_queue_paired_with_its_own_key() {
+        let pairs = vec![
+            ("a".to_string(), "key-a".to_string()),
+            ("b".to_string(), "key-b".to_string()),
+            ("c".to_string(), "key-c".to_string()),
+        ];
+        for offset in 0..pairs.len() * 2 {
+            for (queue, key) in rotate(&pairs, offset) {
+                assert_eq!(
+                    key,
+                    format!("key-{queue}"),
+                    "offset {offset} desynced queue {queue:?} from its own key"
+                );
+            }
+        }
     }
 
     #[test]
