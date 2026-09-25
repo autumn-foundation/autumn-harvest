@@ -316,25 +316,48 @@ pub(crate) struct WorkflowDetailParams {
     reset_event_id: Option<String>,
     #[serde(default)]
     update_name: Option<String>,
+    // Panel-open markers, independent of the value fields above (#1737
+    // review). `append_repopulate_params` drops an oversized value outright
+    // rather than truncating it. A value field alone therefore cannot tell
+    // "no failure happened" apart from "a failure happened, but the typed
+    // value was too long to carry". A 1-byte marker is never itself subject
+    // to that cap. The panel still reopens -- empty, but open -- on an
+    // oversized submission instead of silently re-collapsing.
+    #[serde(default)]
+    signal_open: Option<String>,
+    #[serde(default)]
+    reset_open: Option<String>,
+    #[serde(default)]
+    update_open: Option<String>,
 }
 
 /// Submitted field values to redisplay on the workflow-detail page after a
 /// failed Send-signal / Reset / Trigger-update submission (issue #1737).
-/// `Some` on a field opens that panel and fills it back in; `None` leaves
-/// the panel collapsed and empty, as on any normal page load.
+/// `Some` on a value field fills it back in. `None` leaves it empty, either
+/// because the operator left it blank or because it was too long to carry
+/// (#1737 review). Either way is harmless: the value is only ever
+/// redisplayed, never re-submitted on the operator's behalf. Whether the
+/// panel reopens is decided by the `_open` flag alone, not by whether any
+/// value survived.
 #[derive(Debug, Default)]
 struct WorkflowDetailFormRepopulate<'a> {
     signal_name: Option<&'a str>,
+    signal_open: bool,
     reset_event_id: Option<&'a str>,
+    reset_open: bool,
     update_name: Option<&'a str>,
+    update_open: bool,
 }
 
 impl<'a> WorkflowDetailFormRepopulate<'a> {
     fn from_params(params: &'a WorkflowDetailParams) -> Self {
         Self {
             signal_name: params.signal_name.as_deref(),
+            signal_open: params.signal_open.is_some(),
             reset_event_id: params.reset_event_id.as_deref(),
+            reset_open: params.reset_open.is_some(),
             update_name: params.update_name.as_deref(),
+            update_open: params.update_open.is_some(),
         }
     }
 }
@@ -2291,10 +2314,16 @@ async fn signal_workflow_ui(
     let mut redirect_url = format!("../../workflows/{id}?flash={flash}");
     if status == STATUS_FAILED {
         // The payload deliberately does not round-trip here (issue #1737
-        // review) -- see `WorkflowDetailParams`'s doc comment.
+        // review) -- see `WorkflowDetailParams`'s doc comment. `signal_open`
+        // is a 1-byte marker. It always survives the length cap even when
+        // `signal_name` itself does not, so the panel still reopens on an
+        // oversized submission.
         append_repopulate_params(
             &mut redirect_url,
-            &[("signal_name", Some(form.signal_name.as_str()))],
+            &[
+                ("signal_name", Some(form.signal_name.as_str())),
+                ("signal_open", Some("1")),
+            ],
         );
     }
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
@@ -2409,10 +2438,16 @@ async fn reset_workflow_ui(
     let mut redirect_url = format!("../../workflows/{id}?flash={flash}");
     if status == STATUS_FAILED {
         // `reason` deliberately does not round-trip here (issue #1737
-        // review) -- see `WorkflowDetailParams`'s doc comment.
+        // review) -- see `WorkflowDetailParams`'s doc comment. `reset_open`
+        // always survives the length cap even when `reset_event_id` does
+        // not (#1737 review) -- the panel still reopens on an
+        // oversized submission.
         append_repopulate_params(
             &mut redirect_url,
-            &[("reset_event_id", Some(form.reset_to_event_id.as_str()))],
+            &[
+                ("reset_event_id", Some(form.reset_to_event_id.as_str())),
+                ("reset_open", Some("1")),
+            ],
         );
     }
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
@@ -2459,9 +2494,14 @@ async fn trigger_update_ui(
                 let mut redirect_url = format!("../../workflows/{id}?flash={flash}");
                 // The payload deliberately does not round-trip here (issue
                 // #1737 review) -- see `WorkflowDetailParams`'s doc comment.
+                // `update_open` always survives the length cap even when
+                // `update_name` does not (#1737 review).
                 append_repopulate_params(
                     &mut redirect_url,
-                    &[("update_name", Some(form.update_name.as_str()))],
+                    &[
+                        ("update_name", Some(form.update_name.as_str())),
+                        ("update_open", Some("1")),
+                    ],
                 );
                 return Ok(axum::response::Redirect::to(&redirect_url).into_response());
             }
@@ -2534,10 +2574,15 @@ async fn trigger_update_ui(
     let mut redirect_url = format!("../../workflows/{id}?flash={flash}");
     if status == STATUS_FAILED {
         // The payload deliberately does not round-trip here (issue #1737
-        // review) -- see `WorkflowDetailParams`'s doc comment.
+        // review) -- see `WorkflowDetailParams`'s doc comment. `update_open`
+        // always survives the length cap even when `update_name` does not
+        // (#1737 review).
         append_repopulate_params(
             &mut redirect_url,
-            &[("update_name", Some(form.update_name.as_str()))],
+            &[
+                ("update_name", Some(form.update_name.as_str())),
+                ("update_open", Some("1")),
+            ],
         );
     }
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
@@ -5623,7 +5668,7 @@ fn render_workflow_detail(
             // empty and is not repopulated (#1737 review). It is arbitrary
             // operator data that can carry PII or secrets. It never goes
             // through the redirect URL that reopens this panel.
-            details style="display:inline-block" open[form_repopulate.signal_name.is_some()] {
+            details style="display:inline-block" open[form_repopulate.signal_open] {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Send signal" }
                 form method="post" action={ (exec_id_str) "/signal" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
@@ -5639,7 +5684,7 @@ fn render_workflow_detail(
                     button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Send" }
                 }
             }
-            details style="display:inline-block" open[form_repopulate.reset_event_id.is_some()] {
+            details style="display:inline-block" open[form_repopulate.reset_open] {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Reset to event N" }
                 form method="post" action={ (exec_id_str) "/reset" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
@@ -5665,7 +5710,7 @@ fn render_workflow_detail(
                     button type="submit" style="background:#92400e;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" onclick="return confirm('Reset this workflow execution? This is destructive.')" { "Reset" }
                 }
             }
-            details style="display:inline-block" open[form_repopulate.update_name.is_some()] {
+            details style="display:inline-block" open[form_repopulate.update_open] {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Trigger update" }
                 form method="post" action={ (exec_id_str) "/trigger-update" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
@@ -17037,6 +17082,7 @@ mod tests {
             &WorkflowLogsPanelData::default(),
             &WorkflowDetailFormRepopulate {
                 signal_name: Some("approve"),
+                signal_open: true,
                 ..Default::default()
             },
         )
@@ -17107,6 +17153,7 @@ mod tests {
             &WorkflowLogsPanelData::default(),
             &WorkflowDetailFormRepopulate {
                 reset_event_id: Some("nope"),
+                reset_open: true,
                 ..Default::default()
             },
         )
@@ -17140,6 +17187,57 @@ mod tests {
             !panel[reason_input_start..reason_tag_end].contains("value="),
             "the reason field must never round-trip through the redirect URL, \
              even as its own `value=` attribute: {panel}"
+        );
+    }
+
+    /// GREEN -- the fix under test (issue #1737 review). A reviewer pointed
+    /// out that `append_repopulate_params` dropping an oversized value also
+    /// drops the panel's only `open[...]` signal. That signal used to read
+    /// `reset_event_id.is_some()` directly. A pasted, too-long event number
+    /// would then redirect with no `reset_event_id` at all. The operator
+    /// would land back on the same collapsed panel this whole fix exists to
+    /// avoid. The dedicated `reset_open` marker must keep the panel open
+    /// even when the value itself did not survive.
+    #[test]
+    fn render_workflow_detail_reopens_the_reset_panel_even_when_the_value_was_dropped() {
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let html = render_workflow_detail(
+            &execution,
+            0,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            None,
+            None,
+            None,
+            &WorkflowLogsPanelData::default(),
+            &WorkflowDetailFormRepopulate {
+                reset_event_id: None,
+                reset_open: true,
+                ..Default::default()
+            },
+        )
+        .into_string();
+        let details_start = html
+            .find("Reset to event N")
+            .map(|i| html[..i].rfind("<details").expect("details open tag"))
+            .expect("the Reset panel must render");
+        let details_close = details_start
+            + html[details_start..]
+                .find("</details>")
+                .expect("the Reset panel must close");
+        let panel = &html[details_start..details_close];
+        let open_tag_end = panel.find('>').expect("details open tag must close");
+        assert!(
+            panel[..open_tag_end].contains("open"),
+            "the panel must reopen from `reset_open` alone, even with no \
+             surviving `reset_event_id` value: {panel}"
         );
     }
 
