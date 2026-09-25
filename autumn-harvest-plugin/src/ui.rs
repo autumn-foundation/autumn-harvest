@@ -301,19 +301,19 @@ pub(crate) struct WorkflowDetailParams {
     // input then survives a failed submission. It no longer vanishes behind
     // a re-collapsed `<details>` panel. `None` on a normal page load.
     //
-    // The JSON payload fields deliberately have no counterpart here (#1737
-    // review). A signal or update payload is arbitrary operator-supplied
-    // data, up to the configured size cap. It can carry PII or secrets.
-    // Putting one in a redirect's query string would leave it in browser
-    // history, proxy and access logs, and same-origin `Referer` headers.
-    // Only the short identifying fields round-trip. The payload textarea
-    // reopens empty, and the operator retypes it, exactly as before this fix.
+    // The JSON payload fields, and `reset_reason`, deliberately have no
+    // counterpart here (#1737 review). A signal/update payload is
+    // arbitrary operator-supplied data, up to the configured size cap, and
+    // `reason` is free text with no length limit. Either can carry PII,
+    // customer identifiers, or incident details. Putting one in a
+    // redirect's query string would leave it in browser history, proxy and
+    // access logs, and same-origin `Referer` headers. Only the short,
+    // bounded identifying fields round-trip; the free-text fields reopen
+    // empty, and the operator retypes them, exactly as before this fix.
     #[serde(default)]
     signal_name: Option<String>,
     #[serde(default)]
     reset_event_id: Option<String>,
-    #[serde(default)]
-    reset_reason: Option<String>,
     #[serde(default)]
     update_name: Option<String>,
 }
@@ -326,7 +326,6 @@ pub(crate) struct WorkflowDetailParams {
 struct WorkflowDetailFormRepopulate<'a> {
     signal_name: Option<&'a str>,
     reset_event_id: Option<&'a str>,
-    reset_reason: Option<&'a str>,
     update_name: Option<&'a str>,
 }
 
@@ -335,7 +334,6 @@ impl<'a> WorkflowDetailFormRepopulate<'a> {
         Self {
             signal_name: params.signal_name.as_deref(),
             reset_event_id: params.reset_event_id.as_deref(),
-            reset_reason: params.reset_reason.as_deref(),
             update_name: params.update_name.as_deref(),
         }
     }
@@ -2410,12 +2408,11 @@ async fn reset_workflow_ui(
 
     let mut redirect_url = format!("../../workflows/{id}?flash={flash}");
     if status == STATUS_FAILED {
+        // `reason` deliberately does not round-trip here (issue #1737
+        // review) -- see `WorkflowDetailParams`'s doc comment.
         append_repopulate_params(
             &mut redirect_url,
-            &[
-                ("reset_event_id", Some(form.reset_to_event_id.as_str())),
-                ("reset_reason", form.reason.as_deref()),
-            ],
+            &[("reset_event_id", Some(form.reset_to_event_id.as_str()))],
         );
     }
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
@@ -5642,7 +5639,7 @@ fn render_workflow_detail(
                     button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Send" }
                 }
             }
-            details style="display:inline-block" open[form_repopulate.reset_event_id.is_some() || form_repopulate.reset_reason.is_some()] {
+            details style="display:inline-block" open[form_repopulate.reset_event_id.is_some()] {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Reset to event N" }
                 form method="post" action={ (exec_id_str) "/reset" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
@@ -5659,8 +5656,10 @@ fn render_workflow_detail(
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Reason"
+                        // Not repopulated on failure (issue #1737 review): free
+                        // text with no length cap, the same PII/logging risk as
+                        // the payload fields.
                         input type="text" name="reason" placeholder="rollback"
-                            value=[form_repopulate.reset_reason]
                             style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     button type="submit" style="background:#92400e;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" onclick="return confirm('Reset this workflow execution? This is destructive.')" { "Reset" }
@@ -17041,8 +17040,13 @@ mod tests {
     }
 
     /// GREEN -- the fix under test (issue #1737): the same repopulation
-    /// mechanism for the Reset-to-event-N panel, the page's one destructive
-    /// recovery action.
+    /// mechanism for the Reset-to-event-N panel's event-number field, the
+    /// page's one destructive recovery action.
+    ///
+    /// The reason field must stay EMPTY (#1737 review). A reviewer flagged
+    /// `reason` as unbounded free text that can carry customer identifiers
+    /// or incident details, the same risk class as the JSON payload
+    /// fields. It never round-trips through the redirect URL either.
     #[test]
     fn render_workflow_detail_repopulates_the_reset_panel_on_failure() {
         let execution = stub_execution();
@@ -17064,7 +17068,6 @@ mod tests {
             &WorkflowLogsPanelData::default(),
             &WorkflowDetailFormRepopulate {
                 reset_event_id: Some("nope"),
-                reset_reason: Some("rollback bad deploy"),
                 ..Default::default()
             },
         )
@@ -17087,9 +17090,17 @@ mod tests {
             panel.contains("value=\"nope\""),
             "the typed (invalid) event number must survive the failed submission: {panel}"
         );
+        let reason_input_start = panel
+            .find("name=\"reason\"")
+            .expect("the reason field must render");
+        let reason_tag_end = panel[reason_input_start..]
+            .find('>')
+            .map(|i| reason_input_start + i)
+            .expect("the reason field's tag must close");
         assert!(
-            panel.contains("value=\"rollback bad deploy\""),
-            "the typed reason must survive the failed submission: {panel}"
+            !panel[reason_input_start..reason_tag_end].contains("value="),
+            "the reason field must never round-trip through the redirect URL, \
+             even as its own `value=` attribute: {panel}"
         );
     }
 
