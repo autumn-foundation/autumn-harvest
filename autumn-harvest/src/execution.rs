@@ -4687,13 +4687,13 @@ pub async fn release_claim_if_workflow_paused(
     task_id: Uuid,
     worker_id: &str,
 ) -> HarvestResult<bool> {
-    let released = diesel::sql_query(release_claim_if_workflow_paused_query())
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .bind::<diesel::sql_types::Text, _>(worker_id)
-        .execute(conn)
-        .await
-        .map_err(database_error)?;
-    Ok(released > 0)
+    queue::release_claim_via(
+        conn,
+        release_claim_if_workflow_paused_query(),
+        task_id,
+        worker_id,
+    )
+    .await
 }
 
 #[cfg(test)]
