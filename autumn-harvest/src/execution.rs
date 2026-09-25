@@ -9471,6 +9471,30 @@ pub async fn check_and_report_unfinished_handlers(
     Ok(())
 }
 
+/// Executions checked per [`check_and_report_unfinished_handlers_batch`]
+/// round trip.
+///
+/// Review findings on PR #1739 (Codex, P2, two rounds).
+///
+/// Round one flagged an unchunked [`store::load_histories_undecoded_batch`]
+/// call. It materializes every requested history into one map before this
+/// function reads any of them. A parent-close cascade is bounded only by
+/// its own fan-out width. An unbounded `checks` list therefore makes peak
+/// memory proportional to the sum of every history in the cascade.
+///
+/// Chunking the *loader's own* `exec_ids` fixed that call's shape. Round
+/// two found the regression survived one layer up. This function's own
+/// accumulator still held every chunk's decoded histories for the life of
+/// the whole call, so peak memory was unchanged.
+///
+/// The fix lives here, not in the loader. This function chunks `checks`
+/// itself, calls the loader once per chunk, and finishes reporting that
+/// chunk before moving to the next. The loader's own returned map, and
+/// every history inside it, is dropped at the end of each loop iteration.
+/// Peak memory is therefore bounded by one chunk's histories at a time,
+/// not by the whole batch.
+const UNFINISHED_HANDLER_CHECK_CHUNK: usize = 100;
+
 /// Batched form of [`check_and_report_unfinished_handlers`] for many
 /// executions closed in the same operation.
 ///
@@ -9481,54 +9505,61 @@ pub async fn check_and_report_unfinished_handlers(
 /// Every call site this replaces looped over its own collected pairs. Each
 /// issued one `check_and_report_unfinished_handlers` call, one
 /// `harvest_events` query per pair, and discarded each call's error
-/// independently (`let _ = ...`). This does the same job with exactly one
-/// `harvest_events` query for the whole batch
-/// ([`store::load_histories_undecoded_batch`]), then reports each pair from
-/// the in-memory result.
+/// independently (`let _ = ...`). This does the same job with one
+/// `harvest_events` query per [`UNFINISHED_HANDLER_CHECK_CHUNK`]-sized
+/// chunk of `checks` ([`store::load_histories_undecoded_batch`]). It
+/// reports each chunk from its own in-memory result before moving on.
 ///
 /// # Error-isolation trade-off
 ///
 /// The old per-pair loop kept one pair's failure from affecting any other:
-/// each ran its own independent query. Batched, a single query failure is
-/// reported for the whole batch instead. That failure is a connection
-/// error, or one row's `event_data` failing to deserialize. Every caller
-/// already discards that error (`let _ = ...`) exactly as it did before. A
-/// connection failure would already have failed every pair's own query
-/// too. Only an undecodable `event_data` value is a real behavior change.
-/// Previously it dropped just that one pair's report; now it drops the
-/// whole batch's. This function reports on already-committed workflow
-/// history, which never disagreed with this shape before commit. The
-/// fixture and integration suite that exercise this path would already
-/// fail if it ever did.
+/// each ran its own independent query. Chunked, a single query failure is
+/// reported for its own chunk and every later chunk too. The error
+/// propagates out of this function entirely, so no later chunk is ever
+/// attempted. That failure is a connection error, or one row's
+/// `event_data` failing to deserialize. Every caller already discards this
+/// error (`let _ = ...`) exactly as it did before chunking.
+///
+/// A connection failure would already have failed every pair's own query
+/// too, in the old loop. Only an undecodable `event_data` value is a real
+/// behavior change. Previously it dropped just that one pair's report; now
+/// it drops its whole chunk's and every later chunk's. This function
+/// reports on already-committed workflow history, which never disagreed
+/// with this shape before commit. The fixture and integration suite that
+/// exercise this path would already fail if it ever did.
 pub async fn check_and_report_unfinished_handlers_batch(
     conn: &mut AsyncPgConnection,
     checks: &[(ExecutionId, String)],
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<()> {
-    if checks.is_empty() {
-        return Ok(());
-    }
+    for chunk in checks.chunks(UNFINISHED_HANDLER_CHECK_CHUNK) {
+        let exec_ids: Vec<ExecutionId> = chunk.iter().map(|(id, _)| *id).collect();
+        let histories = store::load_histories_undecoded_batch(conn, &exec_ids).await?;
 
-    let exec_ids: Vec<ExecutionId> = checks.iter().map(|(id, _)| *id).collect();
-    let histories = store::load_histories_undecoded_batch(conn, &exec_ids).await?;
-
-    for (exec_id, workflow_name) in checks {
-        let Some(history) = histories.get(exec_id) else {
-            continue;
-        };
-        let matcher = crate::replay::HistoryMatcher::new(history.events.clone());
-        let count = matcher.unfinished_update_handler_count_at_end();
-        if count > 0 {
-            tracing::warn!(
-                workflow_name = workflow_name.as_str(),
-                execution_id = %exec_id,
-                unfinished_update_handler_count = count,
-                "Workflow completed with unfinished update handlers"
-            );
-            if let Some(recorder) = metrics {
-                recorder.record_workflow_unfinished_handlers(workflow_name, "update", count as u64);
+        for (exec_id, workflow_name) in chunk {
+            let Some(history) = histories.get(exec_id) else {
+                continue;
+            };
+            let matcher = crate::replay::HistoryMatcher::new(history.events.clone());
+            let count = matcher.unfinished_update_handler_count_at_end();
+            if count > 0 {
+                tracing::warn!(
+                    workflow_name = workflow_name.as_str(),
+                    execution_id = %exec_id,
+                    unfinished_update_handler_count = count,
+                    "Workflow completed with unfinished update handlers"
+                );
+                if let Some(recorder) = metrics {
+                    recorder.record_workflow_unfinished_handlers(
+                        workflow_name,
+                        "update",
+                        count as u64,
+                    );
+                }
             }
         }
+        // `histories`, and every decoded `EventHistory` inside it, drops
+        // here -- before the next chunk's query loads the next batch.
     }
     Ok(())
 }

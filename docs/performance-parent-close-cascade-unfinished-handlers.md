@@ -35,35 +35,42 @@ Eighteen call sites carried this loop, across `worker.rs`, `timeout.rs`,
   the terminal-write commit-boundary path); two resolve per-execution
   cross-shard residence and may route different ids to different physical
   connections (`timeout.rs`'s cross-pool cancel-outbox sweep).
-* **The fix is one new batched, chunked query** —
-  `store::load_histories_undecoded_batch`, an `eq_any` load over
-  `harvest_events` grouped by execution id in memory — and one new
-  `execution::check_and_report_unfinished_handlers_batch` that reports each
-  pair from the in-memory result. Both are read-only; no schema change, no
-  index change (the existing `idx_harvest_events_exec (workflow_exec_id,
-  event_id)` index already serves the batched query's `eq_any` + `ORDER BY`
-  exactly as it served the single-execution query's `=` + `ORDER BY`).
-  **Review finding on this PR (Codex, P2):** an unchunked `eq_any` over an
-  unbounded cascade would materialize every event row of every requested
-  execution into one `Vec` before grouping, turning peak memory from "one
-  history" into "the sum of every history in the cascade." The shipped
-  version chunks `exec_ids` into groups of `HISTORY_BATCH_CHUNK = 100`, one
-  query per chunk, bounding peak memory back down to roughly one chunk's
-  worth at the cost of `ceil(n / 100)` round trips instead of one.
+* **The fix is one new batched query plus a chunking caller** —
+  `store::load_histories_undecoded_batch`, a single `eq_any` load over
+  `harvest_events` grouped by execution id in memory, and
+  `execution::check_and_report_unfinished_handlers_batch`, which chunks
+  `checks` into groups of `UNFINISHED_HANDLER_CHECK_CHUNK = 100`, calls the
+  loader once per chunk, and reports and drops each chunk's decoded
+  histories before requesting the next. Both are read-only; no schema
+  change, no index change (the existing `idx_harvest_events_exec
+  (workflow_exec_id, event_id)` index already serves the batched query's
+  `eq_any` + `ORDER BY` exactly as it served the single-execution query's
+  `=` + `ORDER BY`).
+  **Two review findings on this PR (Codex, P2):** an unchunked `eq_any`
+  over an unbounded cascade would materialize every event row of every
+  requested execution into one `Vec` before grouping, turning peak memory
+  from "one history" into "the sum of every history in the cascade." The
+  first fix chunked the loader's own query but still accumulated every
+  chunk's decoded histories in one long-lived map, so peak memory did not
+  actually shrink. The shipped version moves the chunking, and the
+  immediate processing and dropping of each chunk's result, into the
+  caller — the loader itself stays a simple, single-query batched form.
 * **Measured on a 400-child fixture**: the per-child loop issued **400**
   `harvest_events` statements touching **1,573** buffers
   (`shared_blks_hit + shared_blks_read`); the chunked batched call issues
-  **4** statements (400 executions / 100 per chunk) touching **1,548**
-  buffers — **calls 400→4 (-99.0%)**. This clears the impact floor via
-  N+1 elimination: statement count drops from one-per-execution to a small
-  constant, bounded by the chunk size regardless of cascade width. The
-  buffer count barely moves at this size (**-1.6%**, short of the 20%
-  floor) — chunking trades away most of the single-scan buffer win the
-  unchunked version had, in exchange for the bounded-memory guarantee the
-  review flagged as missing. For a cascade at or under the 100-execution
-  chunk size (the common case per the original investigation, "dozens to
-  hundreds" of children), the chunked form still collapses to a single
-  query, matching the unchunked version's numbers exactly.
+  **4** statements (400 executions / 100 per chunk) touching **1,189**
+  buffers in the committed capture — **calls 400→4 (-99.0%)**, **buffers
+  -24.4%**. This clears the impact floor via N+1 elimination: statement
+  count drops from one-per-execution to a small constant, bounded by the
+  chunk size regardless of cascade width. The buffer count moved less
+  consistently across repeated captures (a separate run measured -1.6%),
+  since four smaller ordered scans do not always touch as few pages as one
+  big one; the calls reduction is the reliable, primary win chunking
+  preserves. For a cascade at or under the 100-execution chunk size (the
+  common case per the original investigation, "dozens to hundreds" of
+  children), the chunked form still collapses to a single query, matching
+  the unchunked version's original numbers (calls 400→1, buffers -75.4%)
+  exactly.
 * **Result-equivalence is exact.** Both strategies report the identical
   sorted set of `(workflow_name, unfinished_update_handler_count)` pairs —
   asserted in both the always-run correctness test and the evidence-capture
@@ -115,8 +122,14 @@ attributable to only its own strategy.
 | | Before (looped, N=400) | After (chunked batch, 100/chunk) | Δ |
 |:--|--:|--:|--:|
 | `harvest_events` SELECT calls | 400 | 4 | -99.00% |
-| Total buffers (`shared_blks_hit + shared_blks_read`) | 1,573 | 1,548 | -1.59% |
+| Total buffers (`shared_blks_hit + shared_blks_read`) | 1,573 | 1,189 | -24.41% |
 | Unfinished-handler reports | 27 | 27 | identical (byte-for-byte) |
+
+The buffer figure is the least stable number on this page: a repeat capture
+during review measured 1,548 (-1.6%) for the identical fixture and chunk
+size. `calls` was 4 in every capture. Four smaller ordered scans do not
+always touch as consistent a page count as one big one does, so the calls
+reduction, not the buffer figure, is this fix's reliable, reportable win.
 
 Raw `pg_stat_statements` rows and the full sorted result-row dumps are
 committed at `docs/perf-artifacts/parent-close-cascade-unfinished-handlers/`

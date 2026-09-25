@@ -1205,34 +1205,24 @@ pub async fn load_history_undecoded(
     })
 }
 
-/// Executions loaded per [`load_histories_undecoded_batch`] round trip.
-///
-/// Review finding on PR #1739 (Codex, P2). An unchunked `eq_any` over the
-/// whole batch materializes every event row of every requested execution
-/// into one `Vec` before grouping. `closed_children` is bounded only by a
-/// parent's own fan-out width. A single history is itself unbounded too.
-/// An unchunked call therefore turns peak memory from one history, the old
-/// per-execution loop's own shape, into the sum of every history in the
-/// cascade.
-///
-/// Chunking by execution count bounds memory back down to roughly one
-/// chunk's worth. The cost is `ceil(n / CHUNK)` round trips instead of one.
-/// 100 keeps that ratio far below the old one-call-per-execution shape: a
-/// 400-execution cascade still drops from 400 calls to 4. It also keeps a
-/// chunk's own worst case small relative to a single pathological history.
-/// That single-history risk already exists on
-/// [`load_history_undecoded`] alone; this function does not add it.
-const HISTORY_BATCH_CHUNK: usize = 100;
-
 /// Batched form of [`load_history_undecoded`] for many executions at once.
 ///
-/// One `eq_any` query per [`HISTORY_BATCH_CHUNK`]-sized chunk of `exec_ids`
-/// loads that chunk's histories. This replaces one `load_history_undecoded`
-/// call per execution with a small, bounded number of chunked calls
-/// instead. Each chunk shares the same `idx_harvest_events_exec
-/// (workflow_exec_id, event_id)` index `load_history_undecoded` relies on.
-/// Ordering by that same leading pair lets Postgres serve each chunk as one
-/// ordered index scan, with no extra sort node.
+/// One `eq_any` query loads every requested execution's history. This
+/// replaces one `load_history_undecoded` call per execution. It shares the
+/// same `idx_harvest_events_exec (workflow_exec_id, event_id)` index
+/// `load_history_undecoded` relies on. Ordering by that same leading pair
+/// lets Postgres serve the whole batch as one ordered index scan. No extra
+/// sort node is needed, across every requested execution.
+///
+/// **Callers with an unbounded `exec_ids` count must chunk it themselves**,
+/// and should process and drop each chunk's result before requesting the
+/// next. This function holds every decoded history of the ids it is given
+/// in memory at once. An unchunked call over an unbounded id list makes
+/// peak memory proportional to the sum of every requested history. It is
+/// not proportional to any one of them alone.
+/// [`execution::check_and_report_unfinished_handlers_batch`] is this
+/// function's own chunking caller; its own doc comment records why (review
+/// findings on PR #1739).
 ///
 /// An `exec_id` with no rows in `harvest_events` is simply absent from the
 /// returned map rather than an error. Every caller of this function already
@@ -1256,54 +1246,55 @@ pub async fn load_histories_undecoded_batch(
     use crate::models::HarvestEvent;
     use std::collections::HashMap;
 
+    if exec_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let ids: Vec<uuid::Uuid> = exec_ids.iter().map(ExecutionId::as_uuid).collect();
+
+    let rows: Vec<HarvestEvent> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq_any(&ids))
+        .order((
+            harvest_events::workflow_exec_id.asc(),
+            harvest_events::event_id.asc(),
+        ))
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    // Grouped by the raw uuid column, not by `ExecutionId`. Reconstructing
+    // an `ExecutionId` from an arbitrary row's uuid needs the same
+    // string-round-trip `parse()` every other module uses. The shard bits
+    // live in a private field, so no cheaper conversion exists outside
+    // `types`. Every id this function could possibly need is already
+    // sitting in `exec_ids`. Keying by the input values avoids that
+    // round-trip entirely.
+    let mut grouped: HashMap<uuid::Uuid, Vec<HarvestEvent>> = HashMap::new();
+    for row in rows {
+        grouped.entry(row.workflow_exec_id).or_default().push(row);
+    }
+
     let mut out = HashMap::with_capacity(exec_ids.len());
-
-    for chunk in exec_ids.chunks(HISTORY_BATCH_CHUNK) {
-        let ids: Vec<uuid::Uuid> = chunk.iter().map(ExecutionId::as_uuid).collect();
-
-        let rows: Vec<HarvestEvent> = harvest_events::table
-            .filter(harvest_events::workflow_exec_id.eq_any(&ids))
-            .order((
-                harvest_events::workflow_exec_id.asc(),
-                harvest_events::event_id.asc(),
-            ))
-            .load(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-
-        // Grouped by the raw uuid column, not by `ExecutionId`.
-        // Reconstructing an `ExecutionId` from an arbitrary row's uuid needs
-        // the same string-round-trip `parse()` every other module uses. The
-        // shard bits live in a private field, so no cheaper conversion
-        // exists outside `types`. Every id this chunk could possibly need
-        // is already sitting in `chunk`. Keying by the input values avoids
-        // that round-trip entirely.
-        let mut grouped: HashMap<uuid::Uuid, Vec<HarvestEvent>> = HashMap::new();
-        for row in rows {
-            grouped.entry(row.workflow_exec_id).or_default().push(row);
-        }
-
-        for &exec_id in chunk {
-            let Some(rows) = grouped.remove(&exec_id.as_uuid()) else {
-                continue;
-            };
-            let next_event_id = rows.last().map_or(0, |r| r.event_id.saturating_add(1));
-            let events = rows
-                .into_iter()
-                .map(|row| {
-                    serde_json::from_value::<WorkflowEvent>(row.event_data)
-                        .map_err(crate::error::HarvestError::from)
-                })
-                .collect::<Result<Vec<WorkflowEvent>, _>>()?;
-            out.insert(
+    for &exec_id in exec_ids {
+        let Some(rows) = grouped.remove(&exec_id.as_uuid()) else {
+            continue;
+        };
+        let next_event_id = rows.last().map_or(0, |r| r.event_id.saturating_add(1));
+        let events = rows
+            .into_iter()
+            .map(|row| {
+                serde_json::from_value::<WorkflowEvent>(row.event_data)
+                    .map_err(crate::error::HarvestError::from)
+            })
+            .collect::<Result<Vec<WorkflowEvent>, _>>()?;
+        out.insert(
+            exec_id,
+            EventHistory {
                 exec_id,
-                EventHistory {
-                    exec_id,
-                    events,
-                    next_event_id,
-                },
-            );
-        }
+                events,
+                next_event_id,
+            },
+        );
     }
 
     Ok(out)
