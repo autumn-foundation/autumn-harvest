@@ -56,21 +56,36 @@ un-collide `integration_e2e`/`quota_enforcement_tests` (that collision's
 collision itself was never the root cause — the missing migration was).
 
 **Post-fix verification (this session, from CI history, not a fresh rerun
-harness):** three trunk-dev pushes have completed their full `Test DB
-(linux, *)` matrix since `676e79c3` merged, none showing this signature or any
+harness), corrected for docs-only skips (see below):** two trunk-dev pushes
+have completed a genuine full `Test DB (linux, *)` matrix since `676e79c3`
+merged, confirmed by per-job run duration (real execution: ~15-30 minutes
+per shard; a docs-only push completes the same step in single-digit
+seconds because `ci.yml`'s `Run Linux Docker-backed manifest suites` step
+is gated on `needs.changes.outputs.code == 'true'` and skips instantly
+otherwise). Neither shows this signature or any
 `quota_enforcement_tests`/`sharded_runtime_tests` failure:
 
-- `5a3cf148` (run `36013321172`, still 11 shards): 11/11 shards green.
-- `285c7fa0` (run `36034407319`, first 21-shard run): 21/21 shards green.
-- `b0f5a4d1` (run `36047203664`, current `trunk-dev` head): 21/21 shards green.
+- `285c7fa0` (run `36034407319`, first 21-shard run): 21/21 shards green, ~18-28 min/shard.
+- `b0f5a4d1` (run `36047203664`, current `trunk-dev` head): 21/21 shards green, ~20-28 min/shard.
 
-That is 3 full sweeps and 0 recurrences — real signal, but explicitly **not**
-this role's ≥20x same-commit rerun protocol (each sweep is a different commit,
-not 20 reruns of one), so it is reported as corroboration of the prior
-session's already-rigorous local verification, not as an independent
-rerun-protocol result in its own right. No occurrence of the tracked panic
-appears in any `pull_request`-event run sampled from the last 24 hours either
-(`#1727`, `#1731`, `#1732`, `#1734`, all green, all post-dating the fix).
+**Correction (post-review, Codex on this PR).** An earlier draft listed
+`5a3cf148` (run `36013321172`) as a third full sweep. That commit is
+docs-only (see the correction above), so `needs.changes.outputs.code` was
+`false` for its run and every `Test DB (linux, *)` job's actual suite step
+was skipped — the jobs still report `success` (a skipped step doesn't fail
+a job), but none of them exercised the code under test. Removed from the
+count; the real number is 2 full sweeps, not 3.
+
+That is 2 full sweeps and 0 recurrences — real signal, but explicitly
+**not** this role's ≥20x same-commit rerun protocol (each sweep is a
+different commit, not 20 reruns of one), so it is reported as corroboration
+of the prior session's already-rigorous local verification, not as an
+independent rerun-protocol result in its own right. Of the `pull_request`-event
+runs sampled from the last 24 hours, three ran the suite for real and none
+showed the tracked panic (`#1727`, `#1731`, `#1734`, each confirmed by the
+same duration check, all green, all post-dating the fix); a fourth
+(`#1732`) is also docs-only and skipped the suite the same way `5a3cf148`
+did, so it is not counted as evidence either way.
 
 **Series closed.** Nine confirmed occurrences, one root cause, one merged fix,
 zero recurrences across every sampled post-merge run. No further action item
@@ -125,10 +140,11 @@ every prior report in this series).
 ## 📊 Measurement
 
 No new rerun harness executed this session. Evidence is entirely from the
-CI history table in Symptom above (GitHub Actions run/job data for the three
-full-matrix `trunk-dev` pushes and four sampled `pull_request` runs since the
-fix merged), which is reproducible by any session with API access, no
-Docker/Postgres environment needed.
+CI history table in Symptom above (GitHub Actions run/job data for the two
+genuine full-matrix `trunk-dev` pushes and three genuine sampled
+`pull_request` runs since the fix merged, each confirmed by per-job
+duration rather than by conclusion alone), which is reproducible by any
+session with API access, no Docker/Postgres environment needed.
 
 ## 🔬 Reproduce
 
@@ -144,11 +160,17 @@ git diff 5a3cf148^ 5a3cf148 --stat   # -> one docs/rnd file, no code
 git diff 49d1a56^ 49d1a56 -- autumn-harvest/tests/integration/quota_enforcement_tests.rs \
   | grep -n "sharded_pool"           # -> worker_cfg.sharded_pool = Some(sharded_pool)
 
-# Confirm zero recurrences: pull job results for the three full trunk-dev
-# sweeps since the fix (via actions_list/list_workflow_jobs on runs
-# 36013321172, 36034407319, 36047203664) and grep for anything other than
+# Confirm zero recurrences: pull job results for the two genuine full
+# trunk-dev sweeps since the fix (via actions_list/list_workflow_jobs on
+# runs 36034407319, 36047203664) and grep for anything other than
 # "success" among jobs named "Test DB (linux, shard *)" or
 # "sharded_runtime_tests"/"quota_enforcement_tests" in their logs.
+
+# Confirm a run's Test DB jobs actually executed the suite rather than
+# skipping it: compare each job's started_at/completed_at. A skip
+# completes in single-digit seconds (e.g. run 36013321172, 5a3cf148's
+# docs-only push); real execution takes ~15-30 minutes per shard (e.g.
+# runs 36034407319, 36047203664, or any of #1727/#1731/#1734's own CI).
 
 # Confirm PR #1703 is stale:
 git merge-base --is-ancestor 285c7fa04c18e8862c7601f24e8fae7667db88f9 \
