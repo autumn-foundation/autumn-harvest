@@ -9478,9 +9478,9 @@ pub async fn check_and_report_unfinished_handlers(
 /// other post-commit cleanup that collects more than one `(exec_id,
 /// workflow_name)` pair before reporting.
 ///
-/// Every call site this replaces looped over its own collected pairs,
-/// issuing one `check_and_report_unfinished_handlers` call -- one
-/// `harvest_events` query -- per pair, and discarding each call's error
+/// Every call site this replaces looped over its own collected pairs. Each
+/// issued one `check_and_report_unfinished_handlers` call, one
+/// `harvest_events` query per pair, and discarded each call's error
 /// independently (`let _ = ...`). This does the same job with exactly one
 /// `harvest_events` query for the whole batch
 /// ([`store::load_histories_undecoded_batch`]), then reports each pair from
@@ -9489,16 +9489,17 @@ pub async fn check_and_report_unfinished_handlers(
 /// # Error-isolation trade-off
 ///
 /// The old per-pair loop kept one pair's failure from affecting any other:
-/// each ran its own independent query. Batched, a single query failure (a
-/// connection error, or one row's `event_data` failing to deserialize) is
-/// reported for the whole batch, and every caller already discards that
-/// error (`let _ = ...`) exactly as it did before. A connection failure
-/// would already have failed every pair's own query too. Only an
-/// undecodable `event_data` value is a real behavior change: previously it
-/// dropped just that one pair's report, now it drops the whole batch's. This
-/// function reports on already-committed workflow history, which never
-/// disagreed with this shape before commit; the fixture and integration
-/// suite that exercise this path would already fail if it ever did.
+/// each ran its own independent query. Batched, a single query failure is
+/// reported for the whole batch instead. That failure is a connection
+/// error, or one row's `event_data` failing to deserialize. Every caller
+/// already discards that error (`let _ = ...`) exactly as it did before. A
+/// connection failure would already have failed every pair's own query
+/// too. Only an undecodable `event_data` value is a real behavior change.
+/// Previously it dropped just that one pair's report; now it drops the
+/// whole batch's. This function reports on already-committed workflow
+/// history, which never disagreed with this shape before commit. The
+/// fixture and integration suite that exercise this path would already
+/// fail if it ever did.
 pub async fn check_and_report_unfinished_handlers_batch(
     conn: &mut AsyncPgConnection,
     checks: &[(ExecutionId, String)],

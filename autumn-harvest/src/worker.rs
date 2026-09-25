@@ -8012,10 +8012,10 @@ async fn check_and_report_unfinished_handlers_for_worker(
 }
 
 /// Batched form of [`check_and_report_unfinished_handlers_for_worker`] for a
-/// caller that already has every `(exec_id, workflow_name)` pair on hand
-/// with a guaranteed non-empty name -- every `closed_children` pair a
-/// parent-close cascade produces qualifies, since the cascade always knows
-/// the child's workflow name from the row it just closed. Skips the
+/// caller that already has every `(exec_id, workflow_name)` pair on hand,
+/// with a guaranteed non-empty name. Every `closed_children` pair a
+/// parent-close cascade produces qualifies: the cascade always knows the
+/// child's workflow name from the row it just closed. Skips the
 /// name-resolution fallback the single-execution wrapper needs for a caller
 /// that might not have a name, because every caller of this batched form
 /// does.

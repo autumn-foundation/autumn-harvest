@@ -5,28 +5,28 @@
 //!
 //! `apply_parent_close_cascade` closes every child a `ParentClosePolicy`
 //! still governs when its parent reaches a terminal state. Before this fix,
-//! every caller of that cascade (five sites in `worker.rs`, three more in
-//! `timeout.rs`) looped over the returned `closed_children` and called
-//! `check_and_report_unfinished_handlers` once per child -- one
+//! every caller of that cascade looped over the returned `closed_children`.
+//! Five call sites live in `worker.rs`, three more in `timeout.rs`. Each
+//! called `check_and_report_unfinished_handlers` once per child: one
 //! `SELECT * FROM harvest_events WHERE workflow_exec_id = $1` per child,
-//! issued strictly after the writing transaction committed (a best-effort,
-//! error-ignored diagnostic, not a correctness path). A parent with `N`
-//! children under a close policy therefore issued `N` history-load
-//! round trips on every one of its own terminal transitions --
-//! effectively the hottest write path in the engine.
+//! issued strictly after the writing transaction committed. This is a
+//! best-effort, error-ignored diagnostic, not a correctness path. A parent
+//! with `N` children under a close policy therefore issued `N`
+//! history-load round trips on every one of its own terminal transitions.
+//! That is effectively the hottest write path in the engine.
 //!
 //! `check_and_report_unfinished_handlers_batch` replaces the loop with one
-//! `eq_any` query ([`autumn_harvest::store::load_histories_undecoded_batch`]),
-//! backed by the same `idx_harvest_events_exec (workflow_exec_id, event_id)`
-//! index the single-execution loader already used, so the fix needs no
-//! schema change.
+//! `eq_any` query, [`autumn_harvest::store::load_histories_undecoded_batch`].
+//! It is backed by the same `idx_harvest_events_exec (workflow_exec_id,
+//! event_id)` index the single-execution loader already used, so the fix
+//! needs no schema change.
 //!
 //! Two tests:
 //! - [`batched_check_agrees_with_the_per_child_loop`] -- fast, always-run
 //!   correctness check. Ties the batched function's reported
-//!   `(workflow_name, count)` pairs to the old per-child loop's, over a
-//!   fixture that includes both children with a genuinely unfinished update
-//!   handler and children with none.
+//!   `(workflow_name, count)` pairs to the old per-child loop's. The
+//!   fixture includes children with a genuinely unfinished update handler
+//!   and children with none.
 //! - [`zz_capture_parent_close_cascade_unfinished_handlers_evidence`] --
 //!   `#[ignore]`d. Seeds a production-shaped fixture of closed children into
 //!   a throwaway database and captures a `pg_stat_statements` snapshot for
@@ -71,17 +71,19 @@ impl MetricsRecorder for UnfinishedHandlerRecorder {
     }
 }
 
-/// A deterministic, moderate-depth history: one `WorkflowStarted`, a run of
-/// `SignalReceived` filler events (a real, minimal-field event type -- not a
-/// synthetic one invented for this fixture), and -- for a fraction of
+/// A deterministic, moderate-depth history. It holds one `WorkflowStarted`,
+/// a run of `SignalReceived` filler events, and -- for a fraction of
 /// children -- a trailing `UpdateAdmitted` with no matching
-/// `UpdateCompleted`/`UpdateFailed`, exactly the shape
-/// `unfinished_update_handler_count_at_end` exists to detect.
+/// `UpdateCompleted`/`UpdateFailed`. `SignalReceived` is a real,
+/// minimal-field event type, not one invented for this fixture. The
+/// trailing shape is exactly what `unfinished_update_handler_count_at_end`
+/// exists to detect.
 ///
 /// `events_per_child` mirrors a real, moderately active workflow's history
-/// depth, not a toy 1-2 event fixture: enough that the per-child `SELECT`
-/// this test measures touches a realistic number of heap/index pages, not a
-/// single-row lookup that would understate the loop's real cost.
+/// depth, not a toy 1-2 event fixture. It is large enough that the
+/// per-child `SELECT` this test measures touches a realistic number of
+/// heap/index pages. A single-row lookup would understate the loop's real
+/// cost.
 fn history_for(i: usize, events_per_child: usize, unfinished: bool) -> Vec<WorkflowEvent> {
     let mut events = Vec::with_capacity(events_per_child);
     events.push(WorkflowEvent::WorkflowStarted {
@@ -127,12 +129,12 @@ async fn seed_execution_row(conn: &mut AsyncPgConnection, id: ExecutionId, workf
     .expect("seed harvest_workflow_executions row");
 }
 
-/// Every 15th child carries a genuinely unfinished update handler -- close
-/// to the low, real-world rate this diagnostic exists to catch (it fires on
-/// a bug in workflow code, not on ordinary traffic), while still giving the
-/// equivalence check a nonzero, deterministic set of positive cases to
+/// Every 15th child carries a genuinely unfinished update handler. That is
+/// close to the low, real-world rate this diagnostic exists to catch: it
+/// fires on a bug in workflow code, not on ordinary traffic. It still gives
+/// the equivalence check a nonzero, deterministic set of positive cases to
 /// compare.
-fn is_unfinished(i: usize) -> bool {
+const fn is_unfinished(i: usize) -> bool {
     i.is_multiple_of(15)
 }
 
@@ -142,6 +144,9 @@ fn is_unfinished(i: usize) -> bool {
 
 #[tokio::test]
 async fn batched_check_agrees_with_the_per_child_loop() {
+    const N: usize = 40;
+    const EVENTS_PER_CHILD: usize = 12;
+
     let (database_url, _container) = setup_test_database_url_or_env().await;
     let mut conn = AsyncPgConnection::establish(&database_url)
         .await
@@ -149,9 +154,6 @@ async fn batched_check_agrees_with_the_per_child_loop() {
 
     let run_id = uuid::Uuid::new_v4().simple().to_string();
     let workflow_name = format!("cascade_child_wf_{run_id}");
-
-    const N: usize = 40;
-    const EVENTS_PER_CHILD: usize = 12;
 
     let mut checks: Vec<(ExecutionId, String)> = Vec::with_capacity(N);
     for i in 0..N {
@@ -166,8 +168,8 @@ async fn batched_check_agrees_with_the_per_child_loop() {
 
     let before = UnfinishedHandlerRecorder::default();
     for (exec_id, name) in &checks {
-        let _ = check_and_report_unfinished_handlers(&mut conn, *exec_id, name, Some(&before))
-            .await;
+        let _ =
+            check_and_report_unfinished_handlers(&mut conn, *exec_id, name, Some(&before)).await;
     }
 
     let after = UnfinishedHandlerRecorder::default();
@@ -196,8 +198,8 @@ async fn batched_check_agrees_with_the_per_child_loop() {
 
 /// 400 closed children, each with a 30-event history -- a large parent-close
 /// cascade (a fan-out workflow whose parent just went terminal), not a toy
-/// input. Every history is a deterministic function of its index, so the
-/// fixture -- and the before/after result sets it produces -- are
+/// input. Every history is a deterministic function of its index. The
+/// fixture, and the before/after result sets it produces, are therefore
 /// byte-identical on every run.
 const N_CHILDREN: usize = 400;
 const EVENTS_PER_CHILD: usize = 30;

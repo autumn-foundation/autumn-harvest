@@ -1207,18 +1207,18 @@ pub async fn load_history_undecoded(
 
 /// Batched form of [`load_history_undecoded`] for many executions at once.
 ///
-/// One `eq_any` query loads every requested execution's history, instead of
-/// one `load_history_undecoded` call per execution. Backed by the same
-/// `idx_harvest_events_exec (workflow_exec_id, event_id)` index
-/// `load_history_undecoded` relies on: ordering by that same leading pair
-/// lets Postgres serve the whole batch as one ordered index scan across all
-/// requested executions, with no extra sort node.
+/// One `eq_any` query loads every requested execution's history. This
+/// replaces one `load_history_undecoded` call per execution. It shares the
+/// same `idx_harvest_events_exec (workflow_exec_id, event_id)` index
+/// `load_history_undecoded` relies on. Ordering by that same leading pair
+/// lets Postgres serve the whole batch as one ordered index scan. No extra
+/// sort node is needed, across every requested execution.
 ///
 /// An `exec_id` with no rows in `harvest_events` is simply absent from the
 /// returned map rather than an error. Every caller of this function already
-/// tolerates that outcome for the single-execution case (a workflow that has
-/// not yet appended its first event), so the batched form preserves it
-/// rather than inventing a new error path.
+/// tolerates that outcome for the single-execution case. That case is a
+/// workflow with no appended event yet. The batched form preserves the
+/// outcome rather than inventing a new error path.
 ///
 /// Same restriction as [`load_history_undecoded`]: **never use this to feed
 /// workflow code.** It is for callers that only need `next_event_id` or
@@ -1228,7 +1228,7 @@ pub async fn load_history_undecoded(
 ///
 /// Returns [`crate::error::HarvestError::Database`] on connection or query
 /// errors, or [`crate::error::HarvestError::Serialization`] if a stored JSON
-/// value can't be deserialized into [`WorkflowEvent`].
+/// value cannot be deserialized into [`WorkflowEvent`].
 pub async fn load_histories_undecoded_batch(
     conn: &mut AsyncPgConnection,
     exec_ids: &[ExecutionId],
@@ -1252,12 +1252,13 @@ pub async fn load_histories_undecoded_batch(
         .await
         .map_err(crate::error::database_error)?;
 
-    // Grouped by the raw uuid column, not by `ExecutionId` -- reconstructing
+    // Grouped by the raw uuid column, not by `ExecutionId`. Reconstructing
     // an `ExecutionId` from an arbitrary row's uuid needs the same
-    // string-round-trip `parse()` every other module uses (the shard bits
-    // live in a private field), and every id this function could possibly
-    // need is already sitting in `exec_ids`. Keying by the input values
-    // avoids that round-trip entirely.
+    // string-round-trip `parse()` every other module uses. The shard bits
+    // live in a private field, so no cheaper conversion exists outside
+    // `types`. Every id this function could possibly need is already
+    // sitting in `exec_ids`. Keying by the input values avoids that
+    // round-trip entirely.
     let mut grouped: HashMap<uuid::Uuid, Vec<HarvestEvent>> = HashMap::new();
     for row in rows {
         grouped.entry(row.workflow_exec_id).or_default().push(row);
