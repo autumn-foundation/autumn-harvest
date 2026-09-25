@@ -628,3 +628,113 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 }
+
+// ── Dispatch-block characterization tests (issue #1632) ─────────────────────
+//
+// `activity_macro`'s arity-keyed dispatch block (0/1/N non-`ctx` params, plus
+// the `encode_err` branch for a plain vs. `ActivityFailure` return type) is
+// byte-identical to `workflow.rs`'s `workflow_macro` dispatch block. Issue
+// #1632 documents this as one decision, hand-mirrored across both macros.
+// It defers a merge until characterization tests exist here (this file had
+// no macro-expansion tests before this commit). Pinned here first so a
+// follow-up move to a shared `build_handler_dispatch` cannot silently change
+// what a handler's dispatch closure does.
+#[cfg(test)]
+mod dispatch_characterization_tests {
+    use super::activity_macro;
+    use quote::quote;
+
+    /// Isolate the `async move { ... }` dispatch body from `#companion_name`'s
+    /// `handler` closure. Brace-depth walk, mirroring `query.rs`'s
+    /// `extract_impl_body`.
+    fn extract_dispatch_body(full: &str) -> String {
+        let marker = "Box :: pin (async move {";
+        let start = full
+            .find(marker)
+            .unwrap_or_else(|| panic!("no dispatch marker in generated output:\n{full}"))
+            + marker.len();
+        let mut depth = 1i32;
+        let bytes = full.as_bytes();
+        let mut i = start;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] as char {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        full[start..i - 1].trim().to_string()
+    }
+
+    fn generate(item: proc_macro2::TokenStream) -> String {
+        activity_macro(quote! {}, item).to_string()
+    }
+
+    const ACTIVITY_DISPATCH_0_LEGACY: &str = "let result = my_activity (ctx) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const ACTIVITY_DISPATCH_0_TYPED: &str = "let result = my_activity (ctx) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoActivityErrorString :: into_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const ACTIVITY_DISPATCH_1_LEGACY: &str = "let n = :: autumn_harvest :: serde_json :: from_value (input) . map_err (| e | e . to_string ()) ? ; let result = my_activity (ctx , n) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const ACTIVITY_DISPATCH_1_TYPED: &str = "let n = :: autumn_harvest :: serde_json :: from_value (input) . map_err (| e | e . to_string ()) ? ; let result = my_activity (ctx , n) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoActivityErrorString :: into_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const ACTIVITY_DISPATCH_N_LEGACY: &str = "let args : :: autumn_harvest :: serde_json :: Value = input ; let a = :: autumn_harvest :: serde_json :: from_value (args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_activity (ctx , a , b) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const ACTIVITY_DISPATCH_N_TYPED: &str = "let args : :: autumn_harvest :: serde_json :: Value = input ; let a = :: autumn_harvest :: serde_json :: from_value (args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_activity (ctx , a , b) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoActivityErrorString :: into_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+
+    #[test]
+    fn zero_params_legacy_error_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_activity(ctx: &ActivityContext) -> Result<u32, String> {
+                Ok(1)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), ACTIVITY_DISPATCH_0_LEGACY);
+    }
+
+    #[test]
+    fn zero_params_typed_failure_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_activity(ctx: &ActivityContext) -> Result<u32, ActivityFailure> {
+                Ok(1)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), ACTIVITY_DISPATCH_0_TYPED);
+    }
+
+    #[test]
+    fn one_param_legacy_error_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_activity(ctx: &ActivityContext, n: u32) -> Result<u32, String> {
+                Ok(n)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), ACTIVITY_DISPATCH_1_LEGACY);
+    }
+
+    #[test]
+    fn one_param_typed_failure_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_activity(ctx: &ActivityContext, n: u32) -> Result<u32, ActivityFailure> {
+                Ok(n)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), ACTIVITY_DISPATCH_1_TYPED);
+    }
+
+    #[test]
+    fn multi_param_legacy_error_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_activity(ctx: &ActivityContext, a: u32, b: u32) -> Result<u32, String> {
+                Ok(a + b)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), ACTIVITY_DISPATCH_N_LEGACY);
+    }
+
+    #[test]
+    fn multi_param_typed_failure_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_activity(ctx: &ActivityContext, a: u32, b: u32) -> Result<u32, ActivityFailure> {
+                Ok(a + b)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), ACTIVITY_DISPATCH_N_TYPED);
+    }
+}
