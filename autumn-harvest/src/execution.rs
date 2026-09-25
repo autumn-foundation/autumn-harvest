@@ -1250,8 +1250,8 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         Vec<StartCancelledRun>,
     ), HarvestError, _>(async |conn| {
         let row = row;
-        let enqueue = enqueue.clone();
-        let request = request.clone();
+        let enqueue = enqueue;
+        let request = &request;
         let quota_key = quota_key.clone();
         // `gate`, `metrics`, `shard_id_value`, `quota_policy`, and
         // `quota_enforcement_policy` (issue #946) are all `Copy`, so the
@@ -1414,7 +1414,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         // FAILED/CANCELLED. Either way, the INSERT below is a genuine
         // fresh create the gate may legitimately block.
         //
-        // Recompute the fast-path predicate from the (cloned) request:
+        // Recompute the fast-path predicate from the (borrowed) request:
         // POINT 1 + the pre-check already applied the unlocked gate for the
         // state-independent `terminate_via_pre_check` case, so skip it here.
         // Every other policy (incl. conflict-driven Terminate with a
