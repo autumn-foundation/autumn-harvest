@@ -6474,13 +6474,24 @@ fn url_encode(input: &str) -> String {
     out
 }
 
+/// Values repopulated into a redirect must already read as short
+/// identifiers -- a signal/update name or a 1-based event number (#1737
+/// review). Nothing enforced that before this cap. A pasted, oversized
+/// value would still reach `Location`, where it could make the redirect
+/// itself exceed a browser or proxy header-size limit. A value over this
+/// length is therefore never a well-formed identifier. It gets dropped
+/// instead of truncated, so the panel reopens empty rather than showing a
+/// garbled fragment.
+const REPOPULATE_VALUE_MAX_LEN: usize = 200;
+
 /// Appends `&key=value` query pairs to a redirect URL for each non-empty
 /// value, url-encoding the value (issue #1737). Use this only on a failed
 /// operator-form submission. It carries the typed input back to the page
 /// that redisplays it. A successful submission has nothing to repopulate.
 fn append_repopulate_params(url: &mut String, pairs: &[(&str, Option<&str>)]) {
     for (key, value) in pairs {
-        if let Some(value) = value.filter(|v| !v.is_empty()) {
+        if let Some(value) = value.filter(|v| !v.is_empty() && v.len() <= REPOPULATE_VALUE_MAX_LEN)
+        {
             let _ = write!(url, "&{key}={}", url_encode(value));
         }
     }
@@ -13046,6 +13057,32 @@ mod tests {
         assert_eq!(url_encode("foo-bar.BAZ_1~"), "foo-bar.BAZ_1~");
         assert_eq!(url_encode("a b"), "a%20b");
         assert_eq!(url_encode("é"), "%C3%A9");
+    }
+
+    /// GREEN -- the fix under test (issue #1737 review). An oversized value
+    /// (e.g. a pasted digit string far longer than any real event number)
+    /// must never reach the redirect URL. It could push `Location` past a
+    /// browser or proxy header-size limit, breaking the redirect outright.
+    #[test]
+    fn append_repopulate_params_drops_oversized_values() {
+        let mut url = "../../workflows/abc?flash=x".to_string();
+        let oversized = "9".repeat(REPOPULATE_VALUE_MAX_LEN + 1);
+        append_repopulate_params(&mut url, &[("reset_event_id", Some(oversized.as_str()))]);
+        assert_eq!(
+            url, "../../workflows/abc?flash=x",
+            "an oversized value must be dropped, not truncated or copied in full: {url}"
+        );
+    }
+
+    #[test]
+    fn append_repopulate_params_keeps_values_at_the_length_cap() {
+        let mut url = "../../workflows/abc?flash=x".to_string();
+        let at_cap = "9".repeat(REPOPULATE_VALUE_MAX_LEN);
+        append_repopulate_params(&mut url, &[("reset_event_id", Some(at_cap.as_str()))]);
+        assert!(
+            url.contains(&format!("reset_event_id={at_cap}")),
+            "a value exactly at the cap must still round-trip: {url}"
+        );
     }
 
     #[test]
