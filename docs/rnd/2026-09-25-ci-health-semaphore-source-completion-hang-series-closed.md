@@ -73,21 +73,33 @@ in the *same* CI job; it was never the reason either suite failed on its own.
 
 ## 🔧 Treatment — one procedural flag, not actioned
 
+**Correction (post-review, Codex on this PR).** An earlier draft of this
+section claimed merging PR #1703 as-is "would reintroduce a shard-count
+assumption the codebase has already moved past" and that its harness "was
+authored and self-tested against the 11-shard manifest." That is wrong:
+`docs/rnd/2026-09-23-ci-health-semaphore-shard-0-rebalance.md:143-161`
+already fetched PR #1703's `shard-weight-drift.py` from its branch and ran
+its `--sweep` (which covers `SEMAPHORE_SHARD_COUNT` 9 through 24, so 21 is
+inside its range, not outside it) against that day's manifest — and that
+same report's final choice of N=21 (line 168) is the value `285c7fa0`
+shipped. The harness is N-agnostic by construction and was not blind to
+21; it was, if anything, the evidence base the rebalance drew on.
+
 **PR #1703** (`🚦 Semaphore: shard-weight drift harness (report-only, 2
-collisions found)`, opened 09-22, a prior session in this same series) is now
-stale against `trunk-dev`: its base (`ae29c106`) predates the 11→21 rebalance
-in `285c7fa0` by two days, its `mergeable_state` reads `unknown`, and its
-`docs/audits/shard-weight-drift.py` harness — which does not exist on
-`trunk-dev` today — was authored and self-tested against the 11-shard manifest
-this session's own `git log` shows has since changed. Merging it as-is would
-reintroduce a shard-count assumption the codebase has already moved past.
-This is not this session's fix to make unilaterally (the PR belongs to a
-different session and rebasing a harness's own sweep range/self-test fixture
-onto a new manifest is exactly the kind of change that needs to be re-verified
-against live CI, not assumed); flagging here so the next session in this
-series rebases it, re-runs its `--self-test`/`--sweep` against the current
-21-shard manifest, and either confirms the 2 previously-found collisions are
-gone or updates the finding, before merging.
+collisions found)`, opened 09-22, a prior session in this same series) is
+still worth a fresh look before merging, for a narrower reason than
+originally stated here: its branch is three days old and unmerged, its
+`mergeable_state` reads `unknown`, and `docs/audits/shard-weight-drift.py`
+does not exist on `trunk-dev` today, so nothing has re-run its
+`--self-test`/`--sweep` against whatever the manifest looks like *now* —
+after the rebalance and after however many test files other PRs have added
+or removed since 09-22. That is a staleness concern about the manifest's
+current content, not about the shard-count range the harness already
+covers. This is not this session's fix to make unilaterally (the PR
+belongs to a different session); flagging here so the next session in this
+series rebases it, re-runs both commands against the current manifest, and
+confirms the 2 previously-found collisions either persist or have moved,
+before merging.
 
 **Ledger:** still no quarantine ledger in this repository (unchanged from
 every prior report in this series).
@@ -103,8 +115,11 @@ Docker/Postgres environment needed.
 ## 🔬 Reproduce
 
 ```sh
-# Confirm the three fix commits and the rebalance commit, in order:
-git log --format='%H %ad %s' --date=iso 676e79c3 5a3cf148 f08842e0 285c7fa0
+# Confirm the three fix commits and the rebalance commit, in order.
+# --no-walk is required: without it, git log treats four revisions as a
+# range/set to walk ancestry from, printing every reachable ancestor
+# (6ddbc976, 90f5c714, ...) instead of just these four rows.
+git log --no-walk --format='%H %ad %s' --date=iso 676e79c3 5a3cf148 f08842e0 285c7fa0
 
 # Confirm zero recurrences: pull job results for the three full trunk-dev
 # sweeps since the fix (via actions_list/list_workflow_jobs on runs
