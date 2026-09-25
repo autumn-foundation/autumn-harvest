@@ -1001,6 +1001,65 @@ struct DagRetryCommitForm {
     reason: String,
 }
 
+/// The operator's submitted retry `reason` and a genuine commit failure.
+/// Echoed back into the confirm page's already-open form, instead of being
+/// lost on a redirect (issue #1723).
+///
+/// Both fields are `None` on the plain `GET`. Nothing has failed yet, so the
+/// auto-generated default reason applies. `dag_retry_commit_ui` fills them on
+/// a real commit failure. It then renders the confirm page directly, rather
+/// than redirecting. A redirect can only carry a flash string. That string
+/// has no slot for the reason the operator typed. Redirecting the reason
+/// would also put it in the browser's history and any proxy or server
+/// access log.
+#[derive(Debug, Default)]
+struct DagRetryEcho {
+    reason: Option<String>,
+    error: Option<String>,
+}
+
+/// Loads a fresh dry-run outcome and renders the retry confirm page.
+///
+/// Shared by the `GET` route and, on a genuine commit failure, by
+/// `dag_retry_commit_ui` (issue #1723). The dry run is re-run rather than
+/// reused, so the redisplayed node list reflects current state. The two-step
+/// confirm/commit split exists precisely because that state can change
+/// between the two requests.
+async fn render_dag_retry_confirm_page(
+    api_state: &HarvestApiState,
+    headers: &axum::http::HeaderMap,
+    dag_name: &str,
+    run_exec_id: &str,
+    from_node: &str,
+    echo: &DagRetryEcho,
+    route_or_command: &'static str,
+) -> Markup {
+    let actor = api_state.extract_actor(headers);
+    let default_reason = dag_retry_default_reason(from_node);
+    let reason = echo.reason.as_deref().unwrap_or(&default_reason);
+    let outcome = retry_dag_run_inner(
+        api_state,
+        dag_name,
+        run_exec_id,
+        headers,
+        vec![from_node.to_string()],
+        reason.to_string(),
+        actor,
+        true,
+        route_or_command,
+        Some(SOURCE_UI),
+    )
+    .await;
+    render_dag_retry_confirm(
+        dag_name,
+        run_exec_id,
+        from_node,
+        reason,
+        echo.error.as_deref(),
+        outcome,
+    )
+}
+
 /// GET the retry confirm page: run a **dry-run** retry through the shared,
 /// audited `retry_dag_run_inner` so the operator sees the authoritative widened
 /// node list (`nodes_to_re_execute`) before committing. On any endpoint error
@@ -1013,28 +1072,17 @@ async fn dag_retry_confirm_ui(
     Query(params): Query<DagRetryConfirmParams>,
 ) -> Result<Markup, AutumnError> {
     let from_node = params.from_node.unwrap_or_default();
-    let actor = api_state.extract_actor(&headers);
-    let reason = dag_retry_default_reason(&from_node);
-    let outcome = retry_dag_run_inner(
+    let markup = render_dag_retry_confirm_page(
         &api_state,
-        &dag_name,
-        &run_exec_id,
         &headers,
-        vec![from_node.clone()],
-        reason.clone(),
-        actor,
-        true,
-        "GET /ui/dags/{dag_name}/runs/{run_exec_id}/retry",
-        Some(SOURCE_UI),
-    )
-    .await;
-    Ok(render_dag_retry_confirm(
         &dag_name,
         &run_exec_id,
         &from_node,
-        &reason,
-        outcome,
-    ))
+        &DagRetryEcho::default(),
+        "GET /ui/dags/{dag_name}/runs/{run_exec_id}/retry",
+    )
+    .await;
+    Ok(markup)
 }
 
 /// POST the retry commit: run the fork through `retry_dag_run_inner`
@@ -1042,8 +1090,10 @@ async fn dag_retry_confirm_ui(
 /// `source = ui`. Redirects back to the DAG page with a success flash naming
 /// the new run. If the fork committed but the audit row failed to write
 /// (a partial success), redirects to the *new* run with a warning flash rather
-/// than misreporting it as a failure. A genuine failure (400/404/409) redirects
-/// to the source run with a "Retry failed" flash. Admin-gated at the router.
+/// than misreporting it as a failure. A genuine failure (400/404/409) renders
+/// the confirm page in place instead of redirecting. The submitted reason and
+/// the failure itself are both preserved (issue #1723; see `DagRetryEcho`).
+/// Admin-gated at the router.
 async fn dag_retry_commit_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -1069,6 +1119,37 @@ async fn dag_retry_commit_ui(
         Some(SOURCE_UI),
     )
     .await;
+
+    // A genuine failure is any outcome but a successful fork or the
+    // `AuditFailed` partial success. It used to redirect to the unrelated DAG
+    // detail page with only a generic "Retry failed" flash. The operator's
+    // edited `reason` had no slot to survive that redirect. The two-step
+    // confirm/commit split exists so a stale dry run can lose a race against
+    // a concurrent change. Issue #1723's repro: a competing retry seals the
+    // source run between the confirm page loading and this submit. A real
+    // failure here is the *expected* outcome of that race, not a rare edge.
+    // So losing the operator's typed input on it was common, not theoretical.
+    match &outcome {
+        Err(failure) if !matches!(failure, DagRetryFailure::AuditFailed { .. }) => {
+            let echo = DagRetryEcho {
+                reason: Some(form.reason.clone()),
+                error: Some(failure.human_message()),
+            };
+            let markup = render_dag_retry_confirm_page(
+                &api_state,
+                &headers,
+                &dag_name,
+                &run_exec_id,
+                &form.from_node,
+                &echo,
+                "POST /ui/dags/{dag_name}/runs/{run_exec_id}/retry",
+            )
+            .await;
+            return Ok(markup.into_response());
+        }
+        _ => {}
+    }
+
     let (target_run, flash_text) = dag_retry_commit_redirect(outcome, &run_exec_id);
     let flash = url_encode(&flash_text);
     let redirect_url = dag_detail_relative_url(&dag_name, &target_run, Some(&flash));
@@ -1091,11 +1172,18 @@ fn dag_detail_relative_url(dag_name: &str, run: &str, flash: Option<&str>) -> St
 /// Render the retry confirm page from a dry-run outcome: on success, the
 /// widened re-execute list + carried-over list + an editable required reason and
 /// a Confirm form (`POSTing` to the same URL); on failure, the human message.
+///
+/// `reason` pre-fills the textarea: either the auto-generated default (the
+/// first-visit `GET`), or the operator's own submission. That submission is
+/// echoed back after a genuine commit failure (issue #1723). `commit_error`,
+/// when present, is that failure's message, shown inline next to the field
+/// rather than lost on a redirect.
 fn render_dag_retry_confirm(
     dag_name: &str,
     run_exec_id: &str,
     from_node: &str,
-    default_reason: &str,
+    reason: &str,
+    commit_error: Option<&str>,
     outcome: Result<DagRetryResponse, DagRetryFailure>,
 ) -> Markup {
     let body = match outcome {
@@ -1128,20 +1216,52 @@ fn render_dag_retry_confirm(
                 p {
                     label {
                         "Reason (required) "
-                        textarea name="reason" required[true] rows="2" cols="60" { (default_reason) }
+                        textarea name="reason" required[true] rows="2" cols="60" { (reason) }
                     }
+                }
+                @if let Some(error) = commit_error {
+                    span.field-error role="alert" { "Retry failed: " (error) }
                 }
                 button type="submit" class="btn reset" { "Confirm retry" }
             }
         },
-        Err(failure) => html! {
-            div class="banner Warning" { (failure.human_message()) }
-            p {
-                a class="back" href=(dag_detail_relative_url(dag_name, run_exec_id, None)) {
-                    "← Back to run"
+        Err(dry_run_failure) => {
+            let dry_run_message = dry_run_failure.human_message();
+            html! {
+                div class="banner Warning" { (dry_run_message) }
+                // Codex review (issue #1723): the refreshed dry run this
+                // function's caller re-runs for redisplay can itself fail.
+                // That is exactly what happens in the race this fix targets,
+                // where a competing retry has already sealed the source run.
+                // Dropping `reason` here on that second failure would
+                // silently repeat the very bug this fix exists to close.
+                //
+                // Only shown when `commit_error` is `Some`. On the plain
+                // first-visit `GET` failure, nothing has been submitted yet,
+                // so `reason` is just the auto-generated default, not the
+                // operator's own input.
+                @if let Some(error) = commit_error {
+                    p {
+                        "Your submitted reason (preserved, but this run can \
+                         no longer be retried from here): "
+                        code { (reason) }
+                    }
+                    // Codex review (issue #1723): the banner above is the
+                    // *refreshed* dry run's own failure, not necessarily what
+                    // the operator's actual commit attempt failed with. Show
+                    // the original commit failure too, when it differs, so a
+                    // divergent diagnosis is never silently dropped.
+                    @if error != dry_run_message {
+                        p { "The retry attempt itself failed with: " (error) }
+                    }
+                }
+                p {
+                    a class="back" href=(dag_detail_relative_url(dag_name, run_exec_id, None)) {
+                        "← Back to run"
+                    }
                 }
             }
-        },
+        }
     };
     layout_dag_detail(
         &format!("Retry DAG {dag_name} · Vantage"),
@@ -15758,6 +15878,156 @@ mod tests {
         assert!(
             flash.contains("Retry failed"),
             "a real failure must use the hard failure message: {flash}"
+        );
+    }
+
+    // Issue #1723 fix: a submitted reason and a commit-failure message must
+    // both reach the redisplayed confirm page. They replace the
+    // auto-generated default reason and the earlier no-error state.
+    #[test]
+    fn render_dag_retry_confirm_echoes_submitted_reason_and_commit_error() {
+        let plan = DagRetryResponse {
+            dry_run: true,
+            dag_name: "graph_linear".to_string(),
+            source_run_exec_id: "source-run".to_string(),
+            reset_to_event_id: 3,
+            nodes_to_re_execute: vec!["step_b".to_string()],
+            nodes_carried_over: vec![],
+            new_run_exec_id: None,
+            events_carried_over: None,
+        };
+        let markup = render_dag_retry_confirm(
+            "graph_linear",
+            "source-run",
+            "step_b",
+            "retrying after upstream API fix, ticket JIRA-4521",
+            Some("DAG run succeeded"),
+            Ok(plan),
+        )
+        .into_string();
+        assert!(
+            markup.contains("retrying after upstream API fix, ticket JIRA-4521"),
+            "the operator's submitted reason must survive a redisplay: {markup}"
+        );
+        assert!(
+            !markup.contains("retry from node step_b via Vantage"),
+            "the auto-generated default reason must not silently replace the \
+             operator's own submission: {markup}"
+        );
+        assert!(
+            markup.contains("DAG run succeeded"),
+            "the commit failure must be shown inline on the redisplayed \
+             form, not only in a since-vanished redirect flash: {markup}"
+        );
+    }
+
+    // The plain first-visit GET has nothing to echo: no commit has happened
+    // yet. So no error renders, and the textarea carries the auto-generated
+    // default reason unchanged.
+    #[test]
+    fn render_dag_retry_confirm_shows_no_error_when_nothing_failed_yet() {
+        let plan = DagRetryResponse {
+            dry_run: true,
+            dag_name: "graph_linear".to_string(),
+            source_run_exec_id: "source-run".to_string(),
+            reset_to_event_id: 3,
+            nodes_to_re_execute: vec!["step_b".to_string()],
+            nodes_carried_over: vec![],
+            new_run_exec_id: None,
+            events_carried_over: None,
+        };
+        let markup = render_dag_retry_confirm(
+            "graph_linear",
+            "source-run",
+            "step_b",
+            "retry from node step_b via Vantage",
+            None,
+            Ok(plan),
+        )
+        .into_string();
+        // Not `!markup.contains("field-error")`: that substring also
+        // appears in the page's shared, always-embedded stylesheet
+        // (`.field-error{...}`). So it is true on every page, regardless of
+        // whether the error span itself renders. `role="alert"` only ever
+        // appears on that span.
+        assert!(
+            !markup.contains(r#"role="alert""#),
+            "a first-visit confirm page must show no error banner: {markup}"
+        );
+    }
+
+    // Codex review (issue #1723): the confirm page's caller re-runs the dry
+    // run for a current node list on a commit failure. That refreshed dry
+    // run can itself fail — exactly the race this fix targets, where a
+    // competing retry has already sealed the source run. The `Err` branch
+    // must still preserve the operator's submitted reason in that case,
+    // not just on the `Ok` branch covered by the sibling test above.
+    #[test]
+    fn render_dag_retry_confirm_preserves_reason_when_the_refreshed_dry_run_also_fails() {
+        let failure = DagRetryFailure::StateConflict("DAG run terminated".to_string());
+        let markup = render_dag_retry_confirm(
+            "graph_linear",
+            "source-run",
+            "step_b",
+            "retrying after upstream API fix, ticket JIRA-4521",
+            Some("DAG run terminated"),
+            Err(failure),
+        )
+        .into_string();
+        assert!(
+            markup.contains("retrying after upstream API fix, ticket JIRA-4521"),
+            "the operator's submitted reason must survive even when the \
+             redisplay's own fresh dry run also fails: {markup}"
+        );
+    }
+
+    // Codex review (issue #1723): the banner shows the *refreshed* dry run's
+    // own failure, which is not necessarily what the operator's actual
+    // commit attempt failed with. When the two diagnoses differ, both must
+    // reach the operator, not just the redisplay's own fresh failure.
+    #[test]
+    fn render_dag_retry_confirm_shows_original_commit_error_when_it_differs_from_the_refreshed_dry_run()
+     {
+        let refreshed_failure =
+            DagRetryFailure::StateConflict("DAG run terminated by a competing retry".to_string());
+        let markup = render_dag_retry_confirm(
+            "graph_linear",
+            "source-run",
+            "step_b",
+            "retrying after upstream API fix, ticket JIRA-4521",
+            Some("node step_b already retried by another operator"),
+            Err(refreshed_failure),
+        )
+        .into_string();
+        assert!(
+            markup.contains("DAG run terminated by a competing retry"),
+            "the refreshed dry run's own failure must still show: {markup}"
+        );
+        assert!(
+            markup.contains("node step_b already retried by another operator"),
+            "a diverging original commit failure must not be silently \
+             dropped in favour of the refreshed dry run's own message: \
+             {markup}"
+        );
+    }
+
+    // The plain first-visit `GET` failure (no prior submission) must not
+    // claim to be preserving a reason that was never the operator's own.
+    #[test]
+    fn render_dag_retry_confirm_shows_no_preserved_reason_on_first_visit_dry_run_failure() {
+        let failure = DagRetryFailure::StateConflict("DAG run succeeded".to_string());
+        let markup = render_dag_retry_confirm(
+            "graph_linear",
+            "source-run",
+            "step_b",
+            "retry from node step_b via Vantage",
+            None,
+            Err(failure),
+        )
+        .into_string();
+        assert!(
+            !markup.contains("Your submitted reason"),
+            "a first-visit dry-run failure has nothing to preserve: {markup}"
         );
     }
 
