@@ -295,6 +295,50 @@ pub(crate) struct WorkflowDetailParams {
     /// `info` | `warn` | `error`. Absent or unrecognised means "all levels".
     #[serde(default)]
     log_level: Option<String>,
+    // Repopulation fields for the Send signal / Reset to event N / Trigger
+    // update panels (issue #1737). Each handler sets its own pair only on
+    // the error path of a redirect back to this page. The operator's typed
+    // input then survives a failed submission. It no longer vanishes behind
+    // a re-collapsed `<details>` panel. `None` on a normal page load.
+    #[serde(default)]
+    signal_name: Option<String>,
+    #[serde(default)]
+    signal_payload: Option<String>,
+    #[serde(default)]
+    reset_event_id: Option<String>,
+    #[serde(default)]
+    reset_reason: Option<String>,
+    #[serde(default)]
+    update_name: Option<String>,
+    #[serde(default)]
+    update_payload: Option<String>,
+}
+
+/// Submitted field values to redisplay on the workflow-detail page after a
+/// failed Send-signal / Reset / Trigger-update submission (issue #1737).
+/// `Some` on a field opens that panel and fills it back in; `None` leaves
+/// the panel collapsed and empty, as on any normal page load.
+#[derive(Debug, Default)]
+struct WorkflowDetailFormRepopulate<'a> {
+    signal_name: Option<&'a str>,
+    signal_payload: Option<&'a str>,
+    reset_event_id: Option<&'a str>,
+    reset_reason: Option<&'a str>,
+    update_name: Option<&'a str>,
+    update_payload: Option<&'a str>,
+}
+
+impl<'a> WorkflowDetailFormRepopulate<'a> {
+    fn from_params(params: &'a WorkflowDetailParams) -> Self {
+        Self {
+            signal_name: params.signal_name.as_deref(),
+            signal_payload: params.signal_payload.as_deref(),
+            reset_event_id: params.reset_event_id.as_deref(),
+            reset_reason: params.reset_reason.as_deref(),
+            update_name: params.update_name.as_deref(),
+            update_payload: params.update_payload.as_deref(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1730,6 +1774,7 @@ async fn workflow_detail_ui(
             truncated: log_truncated,
             read_failed: log_read_failed,
         },
+        &WorkflowDetailFormRepopulate::from_params(&params),
     ))
 }
 
@@ -2245,7 +2290,16 @@ async fn signal_workflow_ui(
     )
     .await;
 
-    let redirect_url = format!("../../workflows/{id}?flash={flash}");
+    let mut redirect_url = format!("../../workflows/{id}?flash={flash}");
+    if status == STATUS_FAILED {
+        append_repopulate_params(
+            &mut redirect_url,
+            &[
+                ("signal_name", Some(form.signal_name.as_str())),
+                ("signal_payload", Some(payload_str)),
+            ],
+        );
+    }
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
 
@@ -2355,10 +2409,20 @@ async fn reset_workflow_ui(
     )
     .await;
 
-    let redirect_url = format!("../../workflows/{id}?flash={flash}");
+    let mut redirect_url = format!("../../workflows/{id}?flash={flash}");
+    if status == STATUS_FAILED {
+        append_repopulate_params(
+            &mut redirect_url,
+            &[
+                ("reset_event_id", Some(form.reset_to_event_id.as_str())),
+                ("reset_reason", form.reason.as_deref()),
+            ],
+        );
+    }
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn trigger_update_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -2396,7 +2460,14 @@ async fn trigger_update_ui(
                 )
                 .await;
                 let flash = url_encode(&err_msg);
-                let redirect_url = format!("../../workflows/{id}?flash={flash}");
+                let mut redirect_url = format!("../../workflows/{id}?flash={flash}");
+                append_repopulate_params(
+                    &mut redirect_url,
+                    &[
+                        ("update_name", Some(form.update_name.as_str())),
+                        ("update_payload", Some(payload_str)),
+                    ],
+                );
                 return Ok(axum::response::Redirect::to(&redirect_url).into_response());
             }
         }
@@ -2465,7 +2536,16 @@ async fn trigger_update_ui(
     )
     .await;
 
-    let redirect_url = format!("../../workflows/{id}?flash={flash}");
+    let mut redirect_url = format!("../../workflows/{id}?flash={flash}");
+    if status == STATUS_FAILED {
+        append_repopulate_params(
+            &mut redirect_url,
+            &[
+                ("update_name", Some(form.update_name.as_str())),
+                ("update_payload", Some(payload_str)),
+            ],
+        );
+    }
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
 
@@ -5437,6 +5517,7 @@ fn render_workflow_detail(
     jump_event_error: Option<&str>,
     continue_as_new_threshold: Option<u64>,
     logs: &WorkflowLogsPanelData<'_>,
+    form_repopulate: &WorkflowDetailFormRepopulate<'_>,
 ) -> Markup {
     let exec_id_str = execution.id.to_string();
     let title = format!("{} · Vantage", execution.workflow_name);
@@ -5541,44 +5622,60 @@ fn render_workflow_detail(
                 button.danger type="submit" disabled[terminal]
                     title=[terminal.then_some("Workflow is terminal")] { "Terminate" }
             }
-            details style="display:inline-block" {
+            // `open[...]` and `value=[...]`/inline text repopulate this
+            // panel after a failed submission (issue #1737). A mistyped
+            // payload or event number then no longer sends the operator
+            // back to a blank, re-collapsed form.
+            details style="display:inline-block" open[form_repopulate.signal_name.is_some()] {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Send signal" }
                 form method="post" action={ (exec_id_str) "/signal" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Signal name"
-                        input type="text" name="signal_name" required placeholder="e.g. approve" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        input type="text" name="signal_name" required placeholder="e.g. approve"
+                            value=[form_repopulate.signal_name]
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Payload (JSON)"
-                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {}
+                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {
+                            (form_repopulate.signal_payload.unwrap_or(""))
+                        }
                     }
                     button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Send" }
                 }
             }
-            details style="display:inline-block" {
+            details style="display:inline-block" open[form_repopulate.reset_event_id.is_some() || form_repopulate.reset_reason.is_some()] {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Reset to event N" }
                 form method="post" action={ (exec_id_str) "/reset" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Event # (1-based, as shown in timeline)"
-                        input type="number" name="reset_to_event_id" min="1" required placeholder="1" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        input type="number" name="reset_to_event_id" min="1" required placeholder="1"
+                            value=[form_repopulate.reset_event_id]
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Reason"
-                        input type="text" name="reason" placeholder="rollback" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        input type="text" name="reason" placeholder="rollback"
+                            value=[form_repopulate.reset_reason]
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     button type="submit" style="background:#92400e;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" onclick="return confirm('Reset this workflow execution? This is destructive.')" { "Reset" }
                 }
             }
-            details style="display:inline-block" {
+            details style="display:inline-block" open[form_repopulate.update_name.is_some()] {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Trigger update" }
                 form method="post" action={ (exec_id_str) "/trigger-update" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Update name"
-                        input type="text" name="update_name" required placeholder="e.g. set_priority" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        input type="text" name="update_name" required placeholder="e.g. set_priority"
+                            value=[form_repopulate.update_name]
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Payload (JSON)"
-                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {}
+                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {
+                            (form_repopulate.update_payload.unwrap_or(""))
+                        }
                     }
                     button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Submit" }
                 }
@@ -6372,6 +6469,18 @@ fn url_encode(input: &str) -> String {
         }
     }
     out
+}
+
+/// Appends `&key=value` query pairs to a redirect URL for each non-empty
+/// value, url-encoding the value (issue #1737). Use this only on a failed
+/// operator-form submission. It carries the typed input back to the page
+/// that redisplays it. A successful submission has nothing to repopulate.
+fn append_repopulate_params(url: &mut String, pairs: &[(&str, Option<&str>)]) {
+    for (key, value) in pairs {
+        if let Some(value) = value.filter(|v| !v.is_empty()) {
+            let _ = write!(url, "&{key}={}", url_encode(value));
+        }
+    }
 }
 
 /// Escape a string for safe embedding inside a single-quoted JavaScript string literal.
@@ -14812,6 +14921,7 @@ mod tests {
             None,
             Some(10_000),
             &WorkflowLogsPanelData::default(),
+            &WorkflowDetailFormRepopulate::default(),
         )
         .into_string();
 
@@ -14848,6 +14958,7 @@ mod tests {
             None,
             None,
             &WorkflowLogsPanelData::default(),
+            &WorkflowDetailFormRepopulate::default(),
         )
         .into_string();
 
@@ -14880,6 +14991,7 @@ mod tests {
             None,
             Some(500),
             &WorkflowLogsPanelData::default(),
+            &WorkflowDetailFormRepopulate::default(),
         )
         .into_string();
 
@@ -16631,6 +16743,7 @@ mod tests {
             None,
             None,
             logs,
+            &WorkflowDetailFormRepopulate::default(),
         )
         .into_string()
     }
@@ -16754,6 +16867,7 @@ mod tests {
                 admin: true,
                 ..Default::default()
             },
+            &WorkflowDetailFormRepopulate::default(),
         )
         .into_string();
         // maud escapes `&` inside an attribute value, which is the correct
@@ -16794,6 +16908,7 @@ mod tests {
                 admin: true,
                 ..Default::default()
             },
+            &WorkflowDetailFormRepopulate::default(),
         )
         .into_string();
 
@@ -16840,6 +16955,7 @@ mod tests {
             Some("Invalid jump_event 'zap'; expected a whole number. Jump ignored."),
             None,
             &WorkflowLogsPanelData::default(),
+            &WorkflowDetailFormRepopulate::default(),
         )
         .into_string();
         assert!(
@@ -16850,6 +16966,152 @@ mod tests {
             html.contains("Invalid jump_event 'zap'"),
             "the jump_event error must render inline: {html}"
         );
+    }
+
+    /// GREEN -- the fix under test (issue #1737). A failed Send-signal
+    /// submission must reopen the panel. The operator's typed
+    /// `signal_name`/payload must stay intact, not reset to a blank,
+    /// re-collapsed form.
+    #[test]
+    fn render_workflow_detail_repopulates_the_signal_panel_on_failure() {
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let html = render_workflow_detail(
+            &execution,
+            0,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            None,
+            None,
+            None,
+            &WorkflowLogsPanelData::default(),
+            &WorkflowDetailFormRepopulate {
+                signal_name: Some("approve"),
+                signal_payload: Some("{not json}"),
+                ..Default::default()
+            },
+        )
+        .into_string();
+        let details_start = html
+            .find("Send signal")
+            .map(|i| html[..i].rfind("<details").expect("details open tag"))
+            .expect("the Send signal panel must render");
+        let details_close = details_start
+            + html[details_start..]
+                .find("</details>")
+                .expect("the Send signal panel must close");
+        let panel = &html[details_start..details_close];
+        let open_tag_end = panel.find('>').expect("details open tag must close");
+        assert!(
+            panel[..open_tag_end].contains("open"),
+            "a failed signal submission must reopen its panel: {panel}"
+        );
+        assert!(
+            panel.contains("value=\"approve\""),
+            "the typed signal name must survive the failed submission: {panel}"
+        );
+        assert!(
+            panel.contains("{not json}"),
+            "the typed payload must survive the failed submission: {panel}"
+        );
+    }
+
+    /// GREEN -- the fix under test (issue #1737): the same repopulation
+    /// mechanism for the Reset-to-event-N panel, the page's one destructive
+    /// recovery action.
+    #[test]
+    fn render_workflow_detail_repopulates_the_reset_panel_on_failure() {
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let html = render_workflow_detail(
+            &execution,
+            0,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            None,
+            None,
+            None,
+            &WorkflowLogsPanelData::default(),
+            &WorkflowDetailFormRepopulate {
+                reset_event_id: Some("nope"),
+                reset_reason: Some("rollback bad deploy"),
+                ..Default::default()
+            },
+        )
+        .into_string();
+        let details_start = html
+            .find("Reset to event N")
+            .map(|i| html[..i].rfind("<details").expect("details open tag"))
+            .expect("the Reset panel must render");
+        let details_close = details_start
+            + html[details_start..]
+                .find("</details>")
+                .expect("the Reset panel must close");
+        let panel = &html[details_start..details_close];
+        let open_tag_end = panel.find('>').expect("details open tag must close");
+        assert!(
+            panel[..open_tag_end].contains("open"),
+            "a failed reset submission must reopen its panel: {panel}"
+        );
+        assert!(
+            panel.contains("value=\"nope\""),
+            "the typed (invalid) event number must survive the failed submission: {panel}"
+        );
+        assert!(
+            panel.contains("value=\"rollback bad deploy\""),
+            "the typed reason must survive the failed submission: {panel}"
+        );
+    }
+
+    /// GREEN -- the fix under test (issue #1737). A page load carrying no
+    /// repopulation data is the normal case. It must leave every
+    /// operator-action panel collapsed, exactly as before this fix.
+    #[test]
+    fn render_workflow_detail_leaves_action_panels_collapsed_by_default() {
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let html = render_workflow_detail(
+            &execution,
+            0,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            None,
+            None,
+            None,
+            &WorkflowLogsPanelData::default(),
+            &WorkflowDetailFormRepopulate::default(),
+        )
+        .into_string();
+        for summary in ["Send signal", "Reset to event N", "Trigger update"] {
+            let details_start = html[..html.find(summary).unwrap()]
+                .rfind("<details")
+                .expect("details open tag");
+            let tag_close = html[details_start..]
+                .find('>')
+                .expect("details open tag must close");
+            assert!(
+                !html[details_start..details_start + tag_close].contains("open"),
+                "the {summary} panel must stay collapsed with no repopulation data"
+            );
+        }
     }
 
     #[test]
