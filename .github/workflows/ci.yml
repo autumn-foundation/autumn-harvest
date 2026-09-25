@@ -287,6 +287,22 @@ jobs:
         # guards above. See
         # scripts/check-preflight-declared-deps-example.sh.
         run: ./scripts/check-preflight-declared-deps-example.sh
+      - name: Check sqlite-backend guide's outcome-match example
+        # Guards a real, reproduced-live compile failure in
+        # docs/sqlite-backend.md's §7 "drive model" example:
+        # `ExecutionOutcome::Terminated` and this doc were both added in the
+        # same commit (3abb5b6, issue #1348), but the guide's own
+        # `match rt.outcome(exec)? { ... }` never got the new arm, so it has
+        # been non-exhaustive (E0004) since the day it was written. This
+        # file is outside doc-snippet-syntax.py's corpus (getting-started/
+        # and README.md only), and E0004 is a type-checker property, not a
+        # syntax error, so nothing else in CI ever compiled it --
+        # examples/quickstart.rs has the correct four-arm match, which is
+        # why the crate's own tests stayed green throughout. This actually
+        # compiles the pinned block with `cargo check` rather than counting
+        # match arms textually. See
+        # scripts/check-sqlite-outcome-match-example.sh.
+        run: ./scripts/check-sqlite-outcome-match-example.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest

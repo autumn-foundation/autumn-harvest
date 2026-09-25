@@ -262,6 +262,7 @@ match rt.outcome(exec)? {
     ExecutionOutcome::Completed(output) => println!("{output}"),
     ExecutionOutcome::Failed(err)       => println!("{err}"),
     ExecutionOutcome::Running           => println!("still running"),
+    ExecutionOutcome::Terminated(state) => println!("terminal ({state}) — superseded/cancelled, no clean output"),
 }
 ```
 
