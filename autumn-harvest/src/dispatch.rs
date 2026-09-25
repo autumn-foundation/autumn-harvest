@@ -257,6 +257,21 @@ static INSTALLED: RwLock<Option<InstalledDispatch>> = RwLock::new(None);
 /// with a per-shard one.
 static INSTALL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Serializes every dispatch install/uninstall call, across both slots
+/// (Codex review, issue #1429 follow-up).
+///
+/// Each mutating function writes its own slot, then separately reads the
+/// *other* slot to recompute [`ANY_INSTALLED`] and decide whether to stop
+/// the publisher. A concurrent call touching the other slot could land in
+/// that gap. Its own `ANY_INSTALLED` write would then get overwritten by
+/// this call's stale recomputation, true clobbered back to false or the
+/// reverse. Every mutating function now holds this lock for its whole
+/// body. Its slot write and the `ANY_INSTALLED`/publisher decision it
+/// drives become one atomic step. No other install or uninstall call can
+/// land in between. [`installed`]/[`installed_for_shard`]/[`is_installed`]
+/// never take it, so a read never blocks on a concurrent install.
+static DISPATCH_SLOT_LOCK: Mutex<()> = Mutex::new(());
+
 /// Install the process-global channel. A later call replaces the earlier one.
 ///
 /// Returns the generation this install was stamped with. A caller that may
@@ -265,6 +280,7 @@ static INSTALL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// call, unlike the unconditional [`uninstall`], never also clears a later
 /// install that has since replaced this one.
 pub fn install(channel: Arc<dyn TaskDispatch>, settings: DispatchSettings) -> u64 {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
     let Ok(mut slot) = INSTALLED.write() else {
         return 0;
     };
@@ -303,6 +319,7 @@ pub fn install(channel: Arc<dyn TaskDispatch>, settings: DispatchSettings) -> u6
 /// validation whenever `is_installed()` is false. A partial shard map
 /// could then run silently with mixed Redis/Postgres dispatch behaviour.
 pub fn uninstall() {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
     if let Ok(mut slot) = INSTALLED.write() {
         *slot = None;
     }
@@ -325,6 +342,7 @@ pub fn uninstall() {
 /// silently falls through to Postgres. Checking the generation first means
 /// a stop call overtaken by a fresher install becomes a no-op instead.
 pub fn uninstall_if_current(generation: u64) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
     let Ok(mut slot) = INSTALLED.write() else {
         return;
     };
@@ -403,6 +421,7 @@ pub fn install_for_shard(
     channel: Arc<dyn TaskDispatch>,
     settings: DispatchSettings,
 ) -> u64 {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
     let Ok(mut slot) = INSTALLED_BY_SHARD.write() else {
         return 0;
     };
@@ -440,6 +459,7 @@ pub fn installed_for_shard(shard: crate::types::ShardId) -> Option<InstalledDisp
 /// embedded runner's restart. It would wait on hints that only ever
 /// reach a dead end.
 pub fn uninstall_all_shards() {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
     if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
         *slot = None;
     }
@@ -460,6 +480,7 @@ pub fn uninstall_all_shards() {
 /// See [`uninstall_if_current`] for the single-shard version of the same
 /// race.
 pub fn uninstall_all_shards_if_current(expected: &[(crate::types::ShardId, u64)]) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
     let mut any_removed = false;
     if let Ok(mut slot) = INSTALLED_BY_SHARD.write()
         && let Some(map) = slot.as_mut()
@@ -1903,6 +1924,50 @@ mod tests {
 
         uninstall_all_shards();
         assert!(!is_installed(), "the flag clears once every slot is empty");
+    }
+
+    /// Concurrent install/uninstall calls never leave `is_installed()`
+    /// disagreeing with `installed()` (Codex review, issue #1429
+    /// follow-up).
+    ///
+    /// `uninstall_if_current` used to drop its slot's write lock, then
+    /// separately read the other slot to recompute `ANY_INSTALLED`. A
+    /// concurrent `install` could land in that gap and set
+    /// `ANY_INSTALLED = true` for its own fresh channel. The stale
+    /// recomputation then clobbered it back to `false`: `is_installed()`
+    /// said no channel was installed while `installed()` still returned
+    /// one. `DISPATCH_SLOT_LOCK` now serializes every mutating call. This
+    /// hammers `install`/`uninstall_if_current` from several threads at
+    /// once, then checks the flag and the slot agree once every thread has
+    /// finished.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_install_and_uninstall_never_desyncs_the_installed_flag() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..200 {
+                        let channel = Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>;
+                        let generation = install(channel, DispatchSettings::default());
+                        uninstall_if_current(generation);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("a racing thread must not panic");
+        }
+
+        assert_eq!(
+            is_installed(),
+            installed().is_some(),
+            "the fast-path flag must never disagree with the slot it mirrors"
+        );
+
+        uninstall();
     }
 
     #[tokio::test]
