@@ -1440,11 +1440,12 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Unlabeled gauge, one series per process. A sustained climb over the alert window, not a single sample, is the signal. The 5m clause requires growth to still be happening in the most recent slice, so a brief burst that already cleared does not satisfy the 15m clause alone.",
+        "notes": "Unlabeled gauge, one series per process. A sustained climb over the alert window, not a single sample, is the signal. The 5m clause requires growth to still be happening in the most recent slice, so a brief burst that already cleared does not satisfy the 15m clause alone. That AND alone still lets one dropped hint hold both clauses true for up to 5 minutes, so the `for: 15m` clause is load-bearing too: a single burst's AND clause decays to false once its 5m window ages out, well short of 15m, so only drops still recurring every 5-minute slice across the full window keep the condition true long enough to fire.",
         "expressions": [
           {
             "kind": "promql",
-            "expr": "increase(harvest_dispatch_dropped_hints[15m]) > 0 and increase(harvest_dispatch_dropped_hints[5m]) > 0"
+            "expr": "increase(harvest_dispatch_dropped_hints[15m]) > 0 and increase(harvest_dispatch_dropped_hints[5m]) > 0",
+            "for": "15m"
           }
         ]
       },
