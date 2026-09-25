@@ -26197,6 +26197,41 @@ const fn dispatch_maintenance_timeout(shard_count: usize) -> Duration {
     }
 }
 
+/// The deadline for the reconcile sweep's publish call (Codex review, issue
+/// #1429 follow-up).
+///
+/// `run_dispatch_reconcile` collects `hints` across every configured queue
+/// before it calls `publish` once. Unlike `maintain`,
+/// `RedisDispatch::publish_inner` then processes those hints queue by
+/// queue, one round trip per distinct queue, sequentially. That is the same
+/// shape `ack_many_inner`/`requeue_batch` already document. Budgeting that
+/// call with [`dispatch_maintenance_timeout`] alone sizes it for one round
+/// trip. A sweep that gathered due references from several queues at once
+/// could then time out partway through. By then the reconcile cursor for
+/// every queue has already advanced past what this call was meant to
+/// publish.
+///
+/// This scales [`dispatch_maintenance_timeout`]'s own per-shard-turn
+/// budget by the number of distinct queues in `hints`, mirroring how
+/// [`dispatch_batch_timeout`] scales the single-shard budget for
+/// `ack_many`/`release_many`. A multi-shard turn keeps its tight
+/// per-queue cap, rather than trading away the head-of-line-blocking
+/// bound `dispatch_maintenance_timeout` exists for.
+#[must_use]
+fn dispatch_reconcile_publish_timeout(
+    shard_count: usize,
+    hints: &[crate::dispatch::DispatchHint],
+) -> Duration {
+    let distinct_queues = hints
+        .iter()
+        .map(|hint| hint.queue_name.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        .max(1);
+    dispatch_maintenance_timeout(shard_count)
+        .saturating_mul(u32::try_from(distinct_queues).unwrap_or(u32::MAX))
+}
+
 /// How many references one read asks for (issue #1312).
 ///
 /// The two pools have separate permits, and a workflow reference cannot start
@@ -29116,7 +29151,7 @@ impl Worker {
         if let Err(error) = dispatch_call_with_timeout(
             installed.channel.publish(&hints),
             "reconcile publish",
-            dispatch_maintenance_timeout(shard_count),
+            dispatch_reconcile_publish_timeout(shard_count, &hints),
         )
         .await
         {
@@ -42559,11 +42594,13 @@ mod tests {
         );
     }
 
-    /// A single-shard turn keeps the flat `maintain`/reconcile-publish
-    /// deadline unchanged. A multi-shard turn gets the short bound
-    /// instead (Codex review, issue #1429 follow-up). One stalled shard's
-    /// maintenance or reconcile call must not park every sibling shard's
-    /// turn behind it for the full five seconds.
+    /// A single-shard turn keeps `maintain`'s flat deadline unchanged. A
+    /// multi-shard turn gets the short bound instead (Codex review, issue
+    /// #1429 follow-up). One stalled shard's maintenance call must not
+    /// park every sibling shard's turn behind it for the full five
+    /// seconds. `dispatch_reconcile_publish_timeout` builds its own,
+    /// queue-scaled deadline on top of this same per-shard-turn unit; see
+    /// its own test for that.
     #[test]
     fn dispatch_maintenance_timeout_is_bounded_only_for_multi_shard_turns() {
         assert_eq!(
@@ -42579,6 +42616,68 @@ mod tests {
         assert!(
             MULTI_SHARD_DISPATCH_MAINTENANCE_TIMEOUT < DISPATCH_CALL_TIMEOUT,
             "the multi-shard bound must actually be shorter than the flat deadline"
+        );
+    }
+
+    fn reconcile_hint(queue: &str) -> crate::dispatch::DispatchHint {
+        crate::dispatch::DispatchHint {
+            task_id: uuid::Uuid::new_v4(),
+            queue_name: queue.to_string(),
+            scheduled_at: chrono::Utc::now(),
+            priority: 0,
+            shard: None,
+            kind: None,
+        }
+    }
+
+    /// `publish` is one round trip per distinct queue, not one round trip
+    /// overall. The reconcile-publish deadline scales the same way
+    /// `dispatch_batch_timeout` scales `ack_many`/`release_many` (Codex
+    /// review, issue #1429 follow-up).
+    ///
+    /// A single-shard turn keeps `dispatch_maintenance_timeout`'s own flat
+    /// deadline as its per-queue unit. A multi-shard turn keeps that
+    /// function's short, round-robin-safe bound as its per-queue unit
+    /// instead. Either way, several queues in one sweep must not share a
+    /// single queue's worth of budget.
+    #[test]
+    fn dispatch_reconcile_publish_timeout_scales_with_distinct_queue_count() {
+        let one_queue = [reconcile_hint("default")];
+        let three_queues = [
+            reconcile_hint("default"),
+            reconcile_hint("priority"),
+            reconcile_hint("bulk"),
+        ];
+        let three_queues_one_duplicated = [
+            reconcile_hint("default"),
+            reconcile_hint("default"),
+            reconcile_hint("priority"),
+        ];
+
+        assert_eq!(
+            dispatch_reconcile_publish_timeout(1, &one_queue),
+            DISPATCH_CALL_TIMEOUT,
+            "a single queue on a single-shard turn must not regress the flat deadline"
+        );
+        assert_eq!(
+            dispatch_reconcile_publish_timeout(1, &three_queues),
+            DISPATCH_CALL_TIMEOUT * 3,
+            "three distinct queues on a single-shard turn must get three times the budget"
+        );
+        assert_eq!(
+            dispatch_reconcile_publish_timeout(1, &three_queues_one_duplicated),
+            DISPATCH_CALL_TIMEOUT * 2,
+            "the budget must count distinct queues, not hints"
+        );
+        assert_eq!(
+            dispatch_reconcile_publish_timeout(1, &[]),
+            DISPATCH_CALL_TIMEOUT,
+            "an empty hint list still gets at least one queue's worth of budget"
+        );
+        assert_eq!(
+            dispatch_reconcile_publish_timeout(2, &three_queues),
+            MULTI_SHARD_DISPATCH_MAINTENANCE_TIMEOUT * 3,
+            "a multi-shard turn scales its own short per-queue bound instead of the flat one"
         );
     }
 

@@ -1124,13 +1124,13 @@ impl HarvestRunner {
             dispatch_install_generation,
             dispatch_shard_generations,
         ) = if dispatch_shards.len() > 1 {
-            let installed_shards =
+            let (installed_shards, snapshot) =
                 install_dispatch_channels_for_shards(config, &dispatch_shards).await?;
             let installed = !installed_shards.is_empty();
             let reported_shards: Vec<ShardId> =
                 installed_shards.iter().map(|(shard, _)| *shard).collect();
             (
-                DispatchInstallGuard::new_shards(installed_shards.clone()),
+                DispatchInstallGuard::new_shards(installed_shards.clone(), snapshot),
                 installed,
                 None,
                 reported_shards,
@@ -1142,11 +1142,11 @@ impl HarvestRunner {
                 [only] => Some(*only),
                 _ => None,
             };
-            let generation = install_dispatch_channel(config, dispatch_shard).await?;
-            let installed = generation.is_some();
+            let installed = install_dispatch_channel(config, dispatch_shard).await?;
+            let generation = installed.as_ref().map(|(generation, _)| *generation);
             (
-                DispatchInstallGuard::new(generation),
-                installed,
+                DispatchInstallGuard::new(installed),
+                generation.is_some(),
                 dispatch_shard,
                 Vec::new(),
                 generation,
@@ -1621,22 +1621,33 @@ fn dispatch_config_view(
 enum DispatchInstallKind {
     /// Nothing installed. Dropping the guard does nothing.
     None,
-    /// The single-shard slot (`dispatch::install`), stamped with the
-    /// generation that call returned.
+    /// The single-shard slot (`dispatch::install_single`), stamped with the
+    /// generation that call returned, plus the [`TopologySnapshot`] of both
+    /// slots from immediately before it ran.
     ///
-    /// Unwinding calls `dispatch::uninstall_if_current` rather than the
-    /// unconditional `uninstall` (Codex review, issue #1429 follow-up). It
-    /// clears only this install, not a later one that may have replaced it
-    /// in the same process while this startup was still failing.
-    Single(u64),
-    /// The per-shard slots (`dispatch::install_for_shard`, issue #1429) this
-    /// call populated, each stamped with its own generation.
+    /// Unwinding calls `dispatch::restore_single_if_current` rather than
+    /// `dispatch::uninstall_if_current` (Codex review, issue #1429
+    /// follow-up). `install_single` destructively replaces the topology
+    /// before `Worker::new` and the shard-pool validation after it have run
+    /// — both of which can still fail. Merely clearing this install on
+    /// unwind would leave a still-running previous runner without the
+    /// dispatch channels it had before this replacement startup began.
+    /// Restoring the snapshot instead puts that previous topology back,
+    /// generations and all. It does so only while this install is still
+    /// the current occupant of its slot. See `restore_single_if_current`'s
+    /// own doc for the race that guards against.
+    Single(u64, autumn_harvest::dispatch::TopologySnapshot),
+    /// The per-shard slots (`dispatch::install_shards`, issue #1429) this
+    /// call populated, each stamped with its own generation, plus the
+    /// [`TopologySnapshot`] that call returned.
     ///
-    /// Unwinding calls `dispatch::uninstall_all_shards_if_current` (Codex
-    /// review, issue #1429 follow-up), the per-shard mirror of `Single`'s
-    /// own reasoning. It removes only the shards among these whose
-    /// generation still matches.
-    Shards(Vec<(ShardId, u64)>),
+    /// Unwinding calls `dispatch::restore_shards_if_current` (Codex review,
+    /// issue #1429 follow-up), the per-shard mirror of `Single`'s own
+    /// reasoning.
+    Shards(
+        Vec<(ShardId, u64)>,
+        autumn_harvest::dispatch::TopologySnapshot,
+    ),
 }
 
 /// Uninstall the process-global dispatch channel(s) when startup fails later.
@@ -1644,8 +1655,9 @@ enum DispatchInstallKind {
 /// `start` installs the channel before it builds the worker, because an
 /// API-only process publishes too. A step after the install can still fail.
 /// The runtime is then dropped, but the channel is process-global and would
-/// stay installed for the next runtime in this process. The guard removes it
-/// unless [`DispatchInstallGuard::commit`] runs, which mirrors how
+/// stay installed for the next runtime in this process. The guard restores
+/// whatever topology the install replaced unless
+/// [`DispatchInstallGuard::commit`] runs, which mirrors how
 /// `DeferredAuditExportInstall` guards the audit sink.
 struct DispatchInstallGuard {
     /// `None` once the guard is committed or was never armed.
@@ -1654,26 +1666,30 @@ struct DispatchInstallGuard {
 
 impl DispatchInstallGuard {
     /// A guard over a single-shard install that happened, carrying the
-    /// generation `dispatch::install` returned, or an inert guard when it
-    /// did not.
-    const fn new(installed: Option<u64>) -> Self {
+    /// generation and [`TopologySnapshot`] `dispatch::install_single`
+    /// returned, or an inert guard when no install ran.
+    fn new(installed: Option<(u64, autumn_harvest::dispatch::TopologySnapshot)>) -> Self {
         Self {
             kind: match installed {
-                Some(generation) => DispatchInstallKind::Single(generation),
+                Some((generation, snapshot)) => DispatchInstallKind::Single(generation, snapshot),
                 None => DispatchInstallKind::None,
             },
         }
     }
 
-    /// A guard over the per-shard installs `shards` names (issue #1429), or
-    /// an inert guard when `shards` is empty. Each entry pairs a shard with
-    /// the generation `dispatch::install_for_shard` returned for it.
-    fn new_shards(shards: Vec<(ShardId, u64)>) -> Self {
+    /// A guard over the per-shard installs `shards` names (issue #1429),
+    /// carrying the [`TopologySnapshot`] `dispatch::install_shards`
+    /// returned, or an inert guard when `shards` is empty.
+    fn new_shards(
+        shards: Vec<(ShardId, u64)>,
+        snapshot: Option<autumn_harvest::dispatch::TopologySnapshot>,
+    ) -> Self {
         Self {
-            kind: if shards.is_empty() {
-                DispatchInstallKind::None
-            } else {
-                DispatchInstallKind::Shards(shards)
+            kind: match snapshot {
+                Some(snapshot) if !shards.is_empty() => {
+                    DispatchInstallKind::Shards(shards, snapshot)
+                }
+                _ => DispatchInstallKind::None,
             },
         }
     }
@@ -1688,16 +1704,21 @@ impl Drop for DispatchInstallGuard {
     fn drop(&mut self) {
         match &self.kind {
             DispatchInstallKind::None => {}
-            DispatchInstallKind::Single(generation) => {
-                autumn_harvest::dispatch::uninstall_if_current(*generation);
+            DispatchInstallKind::Single(generation, snapshot) => {
+                tracing::warn!(
+                    "unwinding an uncommitted single-shard dispatch install: a later startup \
+                     step failed after this channel connected; restoring the previous topology"
+                );
+                autumn_harvest::dispatch::restore_single_if_current(snapshot, *generation);
             }
-            DispatchInstallKind::Shards(shards) => {
+            DispatchInstallKind::Shards(shards, snapshot) => {
                 tracing::warn!(
                     shards = ?shards.iter().map(|(shard, _)| shard.as_i32()).collect::<Vec<_>>(),
                     "unwinding an uncommitted multi-shard dispatch install: a later startup \
-                     step failed after these shards' channels connected"
+                     step failed after these shards' channels connected; restoring the \
+                     previous topology"
                 );
-                autumn_harvest::dispatch::uninstall_all_shards_if_current(shards);
+                autumn_harvest::dispatch::restore_shards_if_current(snapshot, shards);
             }
         }
     }
@@ -1754,11 +1775,19 @@ const DISPATCH_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// `dispatch::install`. A racing `dispatch::install_shards` call could
 /// otherwise land in the gap between those two calls. It would then end
 /// up installed alongside this one, instead of cleanly replaced by it.
+///
+/// The `Ok(Some(..))` case also carries the [`TopologySnapshot`] that call
+/// returned. [`DispatchInstallGuard`] can then restore the topology this
+/// replaced if a later startup step still fails (Codex review, issue
+/// #1429 follow-up). Installing here happens before `Worker::new`. That
+/// constructor's own dispatch-coverage check can still fail, or
+/// shard-pool validation after it can. See [`DispatchInstallGuard`]'s doc
+/// for why undoing only this install is not enough on its own.
 #[cfg(feature = "redis")]
 async fn install_dispatch_channel(
     config: &HarvestRuntimeConfig,
     shard: Option<ShardId>,
-) -> autumn_web::AutumnResult<Option<u64>> {
+) -> autumn_web::AutumnResult<Option<(u64, autumn_harvest::dispatch::TopologySnapshot)>> {
     use std::time::Duration;
 
     // The endpoint string comes from the redacted form only, so neither the
@@ -1799,7 +1828,7 @@ async fn install_dispatch_channel(
     // follow-up). See the doc comment above for why the per-shard clear
     // waits until here. `dispatch::install_single`'s own doc explains why
     // this is one call rather than a separate clear and install.
-    let generation = autumn_harvest::dispatch::install_single(
+    let (generation, previous) = autumn_harvest::dispatch::install_single(
         Arc::new(channel),
         autumn_harvest::dispatch::DispatchSettings {
             poll_interval: Duration::from_millis(config.redis.poll_interval_ms),
@@ -1819,7 +1848,7 @@ async fn install_dispatch_channel(
         "redis dispatch enabled: workers read task references from redis and claim the named \
          row in postgres"
     );
-    Ok(Some(generation))
+    Ok(Some((generation, previous)))
 }
 
 /// Install one Redis dispatch channel per shard for a runtime that spans
@@ -1839,9 +1868,11 @@ async fn install_dispatch_channel(
 /// reconcile sweep is the durability floor for every dispatch path.
 ///
 /// Returns the shards this call actually installed, paired with the
-/// generation `dispatch::install_for_shard` stamped on each. If a later
-/// startup step fails, the caller's guard can then unwind exactly those —
-/// and only those still unreplaced (Codex review, issue #1429 follow-up).
+/// generation `dispatch::install_for_shard` stamped on each. Once at
+/// least one shard connected, it also returns the [`TopologySnapshot`]
+/// `dispatch::install_shards` returned. If a later startup step fails,
+/// the caller's guard restores that snapshot rather than leaving the
+/// slots empty (Codex review, issue #1429 follow-up).
 ///
 /// Connects every shard's channel first, into a local list, before touching
 /// either dispatch slot (Codex review, issue #1429 follow-up). An earlier
@@ -1881,7 +1912,10 @@ async fn install_dispatch_channel(
 async fn install_dispatch_channels_for_shards(
     config: &HarvestRuntimeConfig,
     shards: &[ShardId],
-) -> autumn_web::AutumnResult<Vec<(ShardId, u64)>> {
+) -> autumn_web::AutumnResult<(
+    Vec<(ShardId, u64)>,
+    Option<autumn_harvest::dispatch::TopologySnapshot>,
+)> {
     use std::time::Duration;
 
     let (Some(url), Some(endpoint)) = (config.redis.url.as_deref(), config.redis.redacted_url())
@@ -1891,7 +1925,7 @@ async fn install_dispatch_channels_for_shards(
         // outlive this process turning Redis off.
         autumn_harvest::dispatch::uninstall();
         autumn_harvest::dispatch::uninstall_all_shards();
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     };
 
     let mut connected = Vec::with_capacity(shards.len());
@@ -1939,7 +1973,7 @@ async fn install_dispatch_channels_for_shards(
             )
         })
         .collect();
-    let installed_shards = autumn_harvest::dispatch::install_shards(channels);
+    let (installed_shards, previous) = autumn_harvest::dispatch::install_shards(channels);
 
     for (key_prefix, &(shard, _generation)) in key_prefixes.iter().zip(installed_shards.iter()) {
         tracing::info!(
@@ -1954,7 +1988,7 @@ async fn install_dispatch_channels_for_shards(
              claim the named row in postgres"
         );
     }
-    Ok(installed_shards)
+    Ok((installed_shards, Some(previous)))
 }
 
 /// No per-shard dispatch channel exists without the `redis` cargo feature.
@@ -1969,10 +2003,13 @@ async fn install_dispatch_channels_for_shards(
 async fn install_dispatch_channels_for_shards(
     _config: &HarvestRuntimeConfig,
     _shards: &[ShardId],
-) -> autumn_web::AutumnResult<Vec<(ShardId, u64)>> {
+) -> autumn_web::AutumnResult<(
+    Vec<(ShardId, u64)>,
+    Option<autumn_harvest::dispatch::TopologySnapshot>,
+)> {
     autumn_harvest::dispatch::uninstall();
     autumn_harvest::dispatch::uninstall_all_shards();
-    Ok(Vec::new())
+    Ok((Vec::new(), None))
 }
 
 /// No dispatch channel exists without the `redis` cargo feature.
@@ -1994,7 +2031,7 @@ async fn install_dispatch_channels_for_shards(
 async fn install_dispatch_channel(
     _config: &HarvestRuntimeConfig,
     _shard: Option<ShardId>,
-) -> autumn_web::AutumnResult<Option<u64>> {
+) -> autumn_web::AutumnResult<Option<(u64, autumn_harvest::dispatch::TopologySnapshot)>> {
     autumn_harvest::dispatch::uninstall();
     autumn_harvest::dispatch::uninstall_all_shards();
     Ok(None)
@@ -2631,7 +2668,9 @@ mod tests {
             error.into_inner()
         });
 
-        let generation = autumn_harvest::dispatch::install(
+        autumn_harvest::dispatch::uninstall();
+        autumn_harvest::dispatch::uninstall_all_shards();
+        let (generation, snapshot) = autumn_harvest::dispatch::install_single(
             std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
             autumn_harvest::dispatch::DispatchSettings::default(),
         );
@@ -2640,11 +2679,68 @@ mod tests {
             "the test fixture must install a channel"
         );
 
-        drop(super::DispatchInstallGuard::new(Some(generation)));
+        drop(super::DispatchInstallGuard::new(Some((
+            generation, snapshot,
+        ))));
 
         assert!(
             !autumn_harvest::dispatch::is_installed(),
-            "a startup that fails after the install must uninstall the channel"
+            "a startup that fails after the install must uninstall the channel, since nothing \
+             preceded it"
+        );
+    }
+
+    /// A failed replacement startup restores the previous single-shard
+    /// channel, not just clears the one it failed to finish installing
+    /// (Codex review, issue #1429 follow-up).
+    ///
+    /// `install_single` destructively replaces the topology before
+    /// `Worker::new` and the shard-pool validation after it can still fail.
+    /// A guard that only cleared its own install, as in the case above,
+    /// would leave a still-running previous runner without dispatch. This
+    /// pins that dropping an uncommitted guard restores the previous
+    /// channel instead, under its own, original generation. That previous
+    /// runner's own eventual `stop()` call can then still clear it.
+    #[test]
+    fn a_failed_replacement_startup_restores_the_previous_dispatch_channel() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall();
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        let original_generation = autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        let (replacement_generation, snapshot) = autumn_harvest::dispatch::install_single(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        drop(super::DispatchInstallGuard::new(Some((
+            replacement_generation,
+            snapshot,
+        ))));
+
+        assert!(
+            autumn_harvest::dispatch::installed().is_some(),
+            "dropping the guard must restore the previous channel"
+        );
+        // `InstalledDispatch::generation` is private to `autumn_harvest`.
+        // This proves the restored slot carries the original generation
+        // indirectly: the replacement generation no longer names it, and
+        // the original one still does.
+        autumn_harvest::dispatch::uninstall_if_current(replacement_generation);
+        assert!(
+            autumn_harvest::dispatch::installed().is_some(),
+            "the replacement's own generation must no longer name the restored slot"
+        );
+        autumn_harvest::dispatch::uninstall_if_current(original_generation);
+        assert!(
+            autumn_harvest::dispatch::installed().is_none(),
+            "the original generation's own uninstall must still clear the restored slot"
         );
     }
 
@@ -2655,13 +2751,15 @@ mod tests {
             DISPATCH_TEST_LOCK.clear_poison();
             error.into_inner()
         });
+        autumn_harvest::dispatch::uninstall();
+        autumn_harvest::dispatch::uninstall_all_shards();
 
-        let generation = autumn_harvest::dispatch::install(
+        let (generation, snapshot) = autumn_harvest::dispatch::install_single(
             std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
             autumn_harvest::dispatch::DispatchSettings::default(),
         );
 
-        super::DispatchInstallGuard::new(Some(generation)).commit();
+        super::DispatchInstallGuard::new(Some((generation, snapshot))).commit();
 
         assert!(
             autumn_harvest::dispatch::is_installed(),
@@ -2884,6 +2982,14 @@ mod tests {
     /// runner's network policy is not guaranteed to reproduce that
     /// connect-timeout failure. Checks that a per-shard channel installed
     /// before the call is still there after it fails.
+    ///
+    /// Gated on the `redis` feature. The no-feature stub of
+    /// `install_dispatch_channel` never inspects `config.redis.url` at
+    /// all, so it would return `Ok` here regardless of the `rediss://`
+    /// scheme. This test's own `is_err()` assertion would then fail for a
+    /// reason that has nothing to do with the connect-failure behavior it
+    /// means to pin.
+    #[cfg(feature = "redis")]
     #[test]
     fn a_single_shard_connect_failure_leaves_existing_per_shard_channels_untouched() {
         let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
@@ -3115,7 +3221,7 @@ mod tests {
             config.redis.url.is_none(),
             "the default config has redis dispatch off"
         );
-        let installed_shards = block_on(super::install_dispatch_channels_for_shards(
+        let (installed_shards, _snapshot) = block_on(super::install_dispatch_channels_for_shards(
             &config,
             &[shard],
         ))
@@ -3234,6 +3340,12 @@ mod tests {
     /// runner's network policy is not guaranteed to reproduce that
     /// connect-timeout failure. It checks that a channel installed before
     /// the call is still there after it fails.
+    ///
+    /// Gated on the `redis` feature, the same reason
+    /// `a_single_shard_connect_failure_leaves_existing_per_shard_channels_untouched`
+    /// is: the no-feature stub of `install_dispatch_channels_for_shards`
+    /// never inspects `config.redis.url`, so it always succeeds.
+    #[cfg(feature = "redis")]
     #[test]
     fn a_shard_connect_failure_leaves_existing_channels_untouched() {
         let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
@@ -3285,7 +3397,8 @@ mod tests {
 
     /// [`DispatchInstallGuard::new_shards`] unwinds every shard it was given
     /// when it drops uncommitted, mirroring the single-shard guard's own
-    /// unwind test.
+    /// unwind test. Nothing preceded these shards, so unwinding restores
+    /// them to empty, the same as the single-shard case above.
     #[test]
     fn an_uncommitted_shard_guard_unwinds_every_shard_it_installed() {
         let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
@@ -3296,22 +3409,75 @@ mod tests {
 
         let shard_a = ShardId::new(1);
         let shard_b = ShardId::new(2);
-        let shard_generations: Vec<(ShardId, u64)> = [shard_a, shard_b]
+        let channels = [shard_a, shard_b]
             .into_iter()
             .map(|shard| {
-                let generation = autumn_harvest::dispatch::install_for_shard(
+                (
                     shard,
-                    std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+                    std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new())
+                        as std::sync::Arc<dyn autumn_harvest::dispatch::TaskDispatch>,
                     autumn_harvest::dispatch::DispatchSettings::default(),
-                );
-                (shard, generation)
+                )
             })
             .collect();
+        let (shard_generations, snapshot) = autumn_harvest::dispatch::install_shards(channels);
 
-        drop(super::DispatchInstallGuard::new_shards(shard_generations));
+        drop(super::DispatchInstallGuard::new_shards(
+            shard_generations,
+            Some(snapshot),
+        ));
 
         assert!(autumn_harvest::dispatch::installed_for_shard(shard_a).is_none());
         assert!(autumn_harvest::dispatch::installed_for_shard(shard_b).is_none());
+    }
+
+    /// A failed replacement startup restores the previous per-shard
+    /// channels, the multi-shard mirror of
+    /// `a_failed_replacement_startup_restores_the_previous_dispatch_channel`
+    /// (Codex review, issue #1429 follow-up).
+    #[test]
+    fn a_failed_shard_replacement_startup_restores_the_previous_channels() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        let shard = ShardId::new(6);
+        let original_generation = autumn_harvest::dispatch::install_for_shard(
+            shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        let (replacement_shards, snapshot) = autumn_harvest::dispatch::install_shards(vec![(
+            shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        )]);
+
+        drop(super::DispatchInstallGuard::new_shards(
+            replacement_shards.clone(),
+            Some(snapshot),
+        ));
+
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(shard).is_some(),
+            "dropping the guard must restore the previous shard channel"
+        );
+        // `InstalledDispatch::generation` is private to `autumn_harvest`.
+        // This proves the restored slot carries the original generation
+        // indirectly: the replacement generation no longer names it, and
+        // the original one still does.
+        autumn_harvest::dispatch::uninstall_all_shards_if_current(&replacement_shards);
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(shard).is_some(),
+            "the replacement's own generation must no longer name the restored slot"
+        );
+        autumn_harvest::dispatch::uninstall_all_shards_if_current(&[(shard, original_generation)]);
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(shard).is_none(),
+            "the original generation's own uninstall must still clear the restored slot"
+        );
     }
 
     /// A committed shard guard leaves the per-shard channels installed.
@@ -3324,13 +3490,13 @@ mod tests {
         autumn_harvest::dispatch::uninstall_all_shards();
 
         let shard = ShardId::new(1);
-        let generation = autumn_harvest::dispatch::install_for_shard(
+        let (shard_generations, snapshot) = autumn_harvest::dispatch::install_shards(vec![(
             shard,
             std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
             autumn_harvest::dispatch::DispatchSettings::default(),
-        );
+        )]);
 
-        super::DispatchInstallGuard::new_shards(vec![(shard, generation)]).commit();
+        super::DispatchInstallGuard::new_shards(shard_generations, Some(snapshot)).commit();
 
         assert!(autumn_harvest::dispatch::installed_for_shard(shard).is_some());
         autumn_harvest::dispatch::uninstall_all_shards();

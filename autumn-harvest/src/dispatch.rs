@@ -527,14 +527,28 @@ pub fn uninstall_all_shards_if_current(expected: &[(crate::types::ShardId, u64)]
 /// call can observe, or contribute to, a partial result.
 ///
 /// Returns the generation stamped on each shard, in `channels`' order.
+/// It is paired with a [`TopologySnapshot`] of both slots as they stood
+/// immediately before this call replaced them.
+///
+/// A caller whose own startup can still fail after this call keeps that
+/// snapshot (Codex review, issue #1429 follow-up). It passes the
+/// snapshot to [`restore_shards_if_current`] on that later failure, to
+/// put the previous topology back rather than leave the slots empty. The
+/// snapshot is captured under the same [`DISPATCH_SLOT_LOCK`] acquisition
+/// as the replacement itself. No concurrent install can therefore land
+/// between the two and be captured as "previous" by mistake.
 pub fn install_shards(
     channels: Vec<(
         crate::types::ShardId,
         Arc<dyn TaskDispatch>,
         DispatchSettings,
     )>,
-) -> Vec<(crate::types::ShardId, u64)> {
+) -> (Vec<(crate::types::ShardId, u64)>, TopologySnapshot) {
     let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let previous = TopologySnapshot {
+        single: INSTALLED.read().ok().and_then(|slot| slot.clone()),
+        shards: INSTALLED_BY_SHARD.read().ok().and_then(|slot| slot.clone()),
+    };
     if let Ok(mut slot) = INSTALLED.write() {
         *slot = None;
     }
@@ -557,7 +571,7 @@ pub fn install_shards(
     }
     ANY_INSTALLED.store(!installed_shards.is_empty(), Ordering::Relaxed);
     stop_publisher();
-    installed_shards
+    (installed_shards, previous)
 }
 
 /// Replace the single-shard topology atomically: clear both slots and
@@ -571,9 +585,21 @@ pub fn install_shards(
 /// could land in that gap and end up installed alongside this one, rather
 /// than cleanly replaced by it.
 ///
-/// Returns the generation stamped on the installed channel.
-pub fn install_single(channel: Arc<dyn TaskDispatch>, settings: DispatchSettings) -> u64 {
+/// Returns the generation stamped on the installed channel, paired with a
+/// [`TopologySnapshot`] of both slots as they stood immediately before
+/// this call replaced them. See [`install_shards`]'s own doc for why the
+/// snapshot is captured under the same lock acquisition as the
+/// replacement. See [`restore_single_if_current`] for how a caller uses
+/// it.
+pub fn install_single(
+    channel: Arc<dyn TaskDispatch>,
+    settings: DispatchSettings,
+) -> (u64, TopologySnapshot) {
     let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let previous = TopologySnapshot {
+        single: INSTALLED.read().ok().and_then(|slot| slot.clone()),
+        shards: INSTALLED_BY_SHARD.read().ok().and_then(|slot| slot.clone()),
+    };
     if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
         *slot = None;
     }
@@ -588,7 +614,116 @@ pub fn install_single(channel: Arc<dyn TaskDispatch>, settings: DispatchSettings
     }
     ANY_INSTALLED.store(true, Ordering::Relaxed);
     stop_publisher();
-    generation
+    (generation, previous)
+}
+
+/// Both dispatch slots exactly as [`install_single`]/[`install_shards`]
+/// found them, immediately before replacing them (Codex review, issue
+/// #1429 follow-up).
+///
+/// A caller whose own startup can still fail after that replacement keeps
+/// this, and passes it to [`restore_single_if_current`] or
+/// [`restore_shards_if_current`] on that later failure. Restoring writes
+/// these slots back with their original generations, rather than minting
+/// fresh ones through [`install`]/[`install_for_shard`]. A still-running
+/// previous runner remembers its own, older generation for its eventual
+/// `stop()` call. A restore that minted a new generation for the same
+/// channel would desync that call. Its `uninstall_if_current` would then
+/// find a mismatch, treat itself as already superseded, and leave the
+/// restored channel installed forever.
+#[derive(Debug, Clone, Default)]
+pub struct TopologySnapshot {
+    single: Option<InstalledDispatch>,
+    shards: Option<std::collections::HashMap<crate::types::ShardId, InstalledDispatch>>,
+}
+
+/// Undo [`install_single`], restoring the topology `snapshot` names, but
+/// only while `generation` still names the single-shard slot's current
+/// occupant (Codex review, issue #1429 follow-up).
+///
+/// A later, unrelated install may have already replaced this one since
+/// `snapshot` was captured. Restoring over it would discard that install
+/// instead of the failed startup this call is meant to undo. This checks
+/// the generation first, mirroring [`uninstall_if_current`]'s own
+/// reasoning.
+///
+/// The per-shard slot is restored too, but only while it is still empty.
+/// `install_single` left it empty. A direct embedder may since have
+/// populated it with its own, unrelated [`install_for_shard`] calls; this
+/// leaves that alone rather than discarding it.
+pub fn restore_single_if_current(snapshot: &TopologySnapshot, generation: u64) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let mut restored = false;
+    if let Ok(mut slot) = INSTALLED.write() {
+        let still_current = slot
+            .as_ref()
+            .is_some_and(|installed| installed.generation == generation);
+        if still_current {
+            slot.clone_from(&snapshot.single);
+            restored = true;
+        }
+    }
+    if restored
+        && let Ok(mut slot) = INSTALLED_BY_SHARD.write()
+        && slot.is_none()
+    {
+        slot.clone_from(&snapshot.shards);
+    }
+    if !restored {
+        return;
+    }
+    let any_installed = INSTALLED.read().is_ok_and(|slot| slot.is_some())
+        || INSTALLED_BY_SHARD
+            .read()
+            .is_ok_and(|slot| slot.as_ref().is_some_and(|map| !map.is_empty()));
+    ANY_INSTALLED.store(any_installed, Ordering::Relaxed);
+    stop_publisher();
+}
+
+/// Undo [`install_shards`], restoring the topology `snapshot` names, but
+/// only while `generations` still names exactly the per-shard slot's
+/// current occupants (Codex review, issue #1429 follow-up).
+///
+/// Every shard `install_shards` installed must still carry the same
+/// generation, and no other shard may be present, or this leaves the
+/// per-shard slot alone. A later, unrelated install may have already
+/// replaced or extended it since `snapshot` was captured. See
+/// [`restore_single_if_current`] for the single-shard mirror of this same
+/// check.
+pub fn restore_shards_if_current(
+    snapshot: &TopologySnapshot,
+    generations: &[(crate::types::ShardId, u64)],
+) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let mut restored = false;
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        let still_current = slot.as_ref().is_some_and(|map| {
+            map.len() == generations.len()
+                && generations.iter().all(|(shard, generation)| {
+                    map.get(shard)
+                        .is_some_and(|installed| installed.generation == *generation)
+                })
+        });
+        if still_current {
+            slot.clone_from(&snapshot.shards);
+            restored = true;
+        }
+    }
+    if restored
+        && let Ok(mut slot) = INSTALLED.write()
+        && slot.is_none()
+    {
+        slot.clone_from(&snapshot.single);
+    }
+    if !restored {
+        return;
+    }
+    let any_installed = INSTALLED.read().is_ok_and(|slot| slot.is_some())
+        || INSTALLED_BY_SHARD
+            .read()
+            .is_ok_and(|slot| slot.as_ref().is_some_and(|map| !map.is_empty()));
+    ANY_INSTALLED.store(any_installed, Ordering::Relaxed);
+    stop_publisher();
 }
 
 // ---------------------------------------------------------------------------
@@ -1600,7 +1735,7 @@ mod tests {
 
         let shard_a = crate::types::ShardId::new(1);
         let shard_b = crate::types::ShardId::new(2);
-        let installed_shards = install_shards(vec![
+        let (installed_shards, previous) = install_shards(vec![
             (
                 shard_a,
                 Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
@@ -1613,6 +1748,10 @@ mod tests {
             ),
         ]);
 
+        assert!(
+            previous.single.is_some(),
+            "the snapshot must carry the single-shard slot install_shards just cleared"
+        );
         assert!(
             installed().is_none(),
             "install_shards must clear the single-shard slot too"
@@ -1649,11 +1788,15 @@ mod tests {
             DispatchSettings::default(),
         );
 
-        let generation = install_single(
+        let (generation, previous) = install_single(
             Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
             DispatchSettings::default(),
         );
 
+        assert!(
+            previous.shards.is_some(),
+            "the snapshot must carry the per-shard slot install_single just cleared"
+        );
         assert!(
             installed_for_shard(stale_shard).is_none(),
             "install_single must clear a stale per-shard channel too"
@@ -1665,6 +1808,153 @@ mod tests {
         );
 
         uninstall();
+    }
+
+    /// `restore_single_if_current` puts the previous single-shard channel
+    /// back with its own, original generation, not a freshly minted one
+    /// (Codex review, issue #1429 follow-up).
+    ///
+    /// A caller whose own startup fails after `install_single` replaced
+    /// the topology restores it this way, rather than through `install`.
+    /// The still-running previous runner's own remembered generation
+    /// still names the slot's occupant this way. This pins that: the
+    /// original generation's own `uninstall_if_current` clears the slot
+    /// again after the restore, proving the restored slot still carries
+    /// it.
+    #[tokio::test]
+    async fn restore_single_if_current_puts_back_the_previous_channel_and_its_generation() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let original_generation = install(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let (replacement_generation, previous) = install_single(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        assert_eq!(
+            previous
+                .single
+                .as_ref()
+                .map(|installed| installed.generation),
+            Some(original_generation)
+        );
+
+        restore_single_if_current(&previous, replacement_generation);
+        let live = installed().expect("restore must put the previous channel back");
+        assert_eq!(
+            live.generation, original_generation,
+            "restore must not mint a fresh generation for the restored channel"
+        );
+
+        uninstall_if_current(original_generation);
+        assert!(
+            installed().is_none(),
+            "the original generation's own uninstall must still clear the restored slot"
+        );
+    }
+
+    /// `restore_single_if_current` is a no-op once a newer, unrelated
+    /// install has already replaced the one it was meant to undo (Codex
+    /// review, issue #1429 follow-up).
+    ///
+    /// A restore that ignored this could discard that newer install
+    /// instead of undoing its own caller's failed startup.
+    #[tokio::test]
+    async fn restore_single_if_current_is_a_no_op_once_a_newer_install_has_replaced_it() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let (replacement_generation, previous) = install_single(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        let newer_generation = install(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        restore_single_if_current(&previous, replacement_generation);
+        let live = installed().expect("the newer install must still be in place");
+        assert_eq!(
+            live.generation, newer_generation,
+            "restore must leave a newer, unrelated install alone"
+        );
+
+        uninstall();
+    }
+
+    /// `restore_shards_if_current` mirrors
+    /// `restore_single_if_current_puts_back_the_previous_channel_and_its_generation`
+    /// for the per-shard slot (Codex review, issue #1429 follow-up).
+    #[tokio::test]
+    async fn restore_shards_if_current_puts_back_the_previous_shards_and_their_generations() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let shard = crate::types::ShardId::new(4);
+        let original_generation = install_for_shard(
+            shard,
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let (replacement_shards, previous) = install_shards(vec![(
+            shard,
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        )]);
+
+        restore_shards_if_current(&previous, &replacement_shards);
+        let live = installed_for_shard(shard).expect("restore must put the previous shard back");
+        assert_eq!(
+            live.generation, original_generation,
+            "restore must not mint a fresh generation for the restored shard"
+        );
+
+        uninstall_all_shards();
+    }
+
+    /// `restore_shards_if_current` is a no-op once a newer, unrelated
+    /// install has already replaced the shards it was meant to undo
+    /// (Codex review, issue #1429 follow-up).
+    #[tokio::test]
+    async fn restore_shards_if_current_is_a_no_op_once_a_newer_install_has_replaced_it() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let shard = crate::types::ShardId::new(5);
+        let (replacement_shards, previous) = install_shards(vec![(
+            shard,
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        )]);
+        let (newer_shards, _newer_previous) = install_shards(vec![(
+            shard,
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        )]);
+
+        restore_shards_if_current(&previous, &replacement_shards);
+        let live = installed_for_shard(shard).expect("the newer install must still be in place");
+        let newer_generation = newer_shards
+            .iter()
+            .find(|(installed_shard, _)| *installed_shard == shard)
+            .map(|(_, generation)| *generation)
+            .expect("the newer install must cover this shard");
+        assert_eq!(
+            live.generation, newer_generation,
+            "restore must leave a newer, unrelated install alone"
+        );
+
+        uninstall_all_shards();
     }
 
     #[tokio::test]
