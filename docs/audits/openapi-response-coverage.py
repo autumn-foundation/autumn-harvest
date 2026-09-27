@@ -230,8 +230,18 @@ def defined_structs() -> dict[str, str]:
             source = path.read_text()
             for found in re.finditer(r"\bstruct ([A-Za-z_][A-Za-z_0-9]*)\s*\{", source):
                 if found.group(1) not in blocks:
-                    blocks[found.group(1)] = balanced(source[found.end() - 1 :], "{", "}")
+                    blocks[found.group(1)] = struct_text(source, found)
     return blocks
+
+
+def struct_text(source: str, found: re.Match) -> str:
+    """The attribute lines above a struct match, then its block."""
+    lines = source[: found.start()].split("\n")[:-1]
+    attributes: list[str] = []
+    while lines and lines[-1].strip().startswith(("#[", "//")):
+        attributes.insert(0, lines.pop().strip())
+    block = balanced(source[found.end() - 1 :], "{", "}")
+    return "\n".join(attributes + [block])
 
 
 def accepted_fields(struct: str) -> list[str]:
@@ -291,16 +301,17 @@ WIRE_TYPES = {
     **{kind: "integer" for kind in ("i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize".split())},
 }
 
-# A typed query extractor, naming its struct.
-QUERY_EXTRACTOR = re.compile(r"Query\(\s*[a-z_0-9]+\s*\)\s*:\s*Query<([A-Za-z0-9_]+)>")
+# A typed query extractor in any form, naming its struct. A `Query<` that this
+# does not match is reported, not skipped.
+QUERY_EXTRACTOR = re.compile(r"\bQuery<\s*([A-Za-z0-9_:]+)\s*>")
 
 # A parameter that carries the raw request body.
-BYTE_PARAMETER = re.compile(r"\b([a-z_][a-z_0-9]*)\s*:\s*&?\s*(?:(?:axum::body::)?Bytes\b|\[u8\])")
-
-# A body parse, with an optional turbofish type and the variable it reads.
-FROM_SLICE = re.compile(
-    r"serde_json::from_slice(?:::<\s*([A-Za-z0-9_:]+)\s*>)?\s*\(\s*&?\s*([a-z_][a-z_0-9]*)\s*\)"
+BYTE_PARAMETER = re.compile(
+    r"\b([a-z_][a-z_0-9]*)\s*:\s*&?\s*(?:(?:[a-z_]+::)*Bytes\b|\[u8\]|Vec<u8>)"
 )
+
+# A `from_slice` call: its turbofish, if any, then its argument list.
+FROM_SLICE = re.compile(r"\bfrom_slice\s*(?:::<|\()")
 
 
 def function_parts(source: str, name: str) -> tuple[str, str, str] | None:
@@ -325,34 +336,83 @@ def byte_parameters(params: str) -> set[str]:
 def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool]]:
     """`(type, guarded)` for each raw-body parse in a handler and its helpers.
 
-    The type comes from a turbofish, then from a `let` binding in the same
-    statement, then from a `Result<T, _>` return type. It is `None` when none
-    of those names it. A parse is guarded when an `.is_empty()` test on the
-    same variable comes before it, since the handler then runs without a body.
+    A helper counts only when the handler passes it a body variable. The type
+    comes from a turbofish, then from a `let` binding in the same statement,
+    then from a `Result<T, _>` return type. It is `None` when none of those
+    names it, or when the call reads the body in a form the audit cannot read.
     """
     handler_parts = function_parts(source, handler)
     if handler_parts is None:
         return []
-    names = [handler] + called_helpers(source, handler_parts[2])
+    handler_block = handler_parts[2]
+    carriers = byte_parameters(handler_parts[0])
+    names = [handler] + [
+        helper
+        for helper in called_helpers(source, handler_block)
+        if passes_variable(handler_block, helper, carriers)
+    ]
     parses: list[tuple[str | None, bool]] = []
     for name in names:
         parts = function_parts(source, name)
         if parts is None:
             continue
         params, returns, block = parts
-        carriers = byte_parameters(params)
-        for hit in FROM_SLICE.finditer(block):
-            variable = hit.group(2)
-            if variable not in carriers:
-                continue
-            before = block[: hit.start()]
-            parses.append(
-                (
-                    parse_type(hit.group(1), before, returns),
-                    re.search(r"\b%s\.is_empty\(\)" % re.escape(variable), before) is not None,
-                )
-            )
+        parses += block_parses(block, byte_parameters(params), returns)
     return parses
+
+
+def passes_variable(block: str, helper: str, variables: set[str]) -> bool:
+    """Whether a call to `helper` in the block passes one of the variables."""
+    for call in re.finditer(r"\b%s\s*\(" % re.escape(helper), block):
+        arguments = balanced(block[call.end() - 1 :])
+        if any(re.search(r"\b%s\b" % re.escape(name), arguments) for name in variables):
+            return True
+    return False
+
+
+def block_parses(block: str, carriers: set[str], returns: str) -> list[tuple[str | None, bool]]:
+    """`(type, guarded)` for each `from_slice` call that reads a carrier."""
+    parses: list[tuple[str | None, bool]] = []
+    for hit in FROM_SLICE.finditer(block):
+        turbofish = None
+        opener = hit.end() - 1
+        if block[opener] == "<":
+            turbofish = balanced(block[opener:], "<", ">")[1:-1].strip()
+            opener = block.find("(", opener + len(turbofish) + 2)
+        argument = balanced(block[opener:])[1:-1].strip().rstrip(",").strip()
+        root = re.match(r"&?\s*([a-z_][a-z_0-9]*)", argument)
+        if root is None or root.group(1) not in carriers:
+            continue
+        before = block[: hit.start()]
+        guarded = guards(before, root.group(1))
+        # A body read through an index, a method or a generic type is not
+        # something the audit can type, so it is reported.
+        if re.sub(r"^&\s*", "", argument) != root.group(1):
+            parses.append((None, guarded))
+        elif turbofish is not None and not re.fullmatch(r"[A-Za-z0-9_:]+", turbofish):
+            parses.append((None, guarded))
+        else:
+            parses.append((parse_type(turbofish, before, returns), guarded))
+    return parses
+
+
+def guards(before: str, variable: str) -> bool:
+    """Whether an `.is_empty()` test before the parse lets an empty body through.
+
+    `!body.is_empty()` skips the parse for an empty body. A plain
+    `if body.is_empty() { .. }` counts only when its block returns no error.
+    Any other use, such as a log field, is no guard.
+    """
+    for test in re.finditer(r"(!\s*)?\b%s\.is_empty\(\)" % re.escape(variable), before):
+        if test.group(1):
+            return True
+        rest = before[test.end() :]
+        if not rest.lstrip().startswith("{"):
+            continue
+        block = balanced(rest[rest.index("{") :], "{", "}")
+        if not re.search(r"AutumnError::|StatusCode::|\bErr\(", block):
+            return True
+    return False
 
 
 def parse_type(turbofish: str | None, before: str, returns: str) -> str | None:
@@ -363,30 +423,39 @@ def parse_type(turbofish: str | None, before: str, returns: str) -> str | None:
     binding = re.search(r"\blet\s+(?:mut\s+)?[a-z_0-9]+\s*:\s*([A-Za-z0-9_:]+)\s*=", statement)
     if binding:
         return binding.group(1).split("::")[-1]
+    if re.search(r"\blet\b", statement):
+        return None
     result = re.search(r"->\s*Result<\s*([A-Za-z0-9_:]+)\s*,", returns)
     return result.group(1).split("::")[-1] if result else None
 
 
 def struct_fields(struct: str) -> list[tuple[str, str, bool]]:
-    """`(name, type, mandatory)` for each field serde reads from the wire."""
+    """`(name, type, mandatory)` for each field serde reads from the wire.
+
+    The text before the first `{` holds the container attributes. A container
+    `#[serde(default)]` makes every field optional.
+    """
+    opener = struct.index("{")
+    all_default = re.search(r"serde\([^)]*\bdefault\b", struct[:opener]) is not None
     fields: list[tuple[str, str, bool]] = []
     attributes: list[str] = []
-    for line in struct.split("\n"):
-        text = line.strip()
+    for line in struct[opener:].split("\n"):
+        text = re.sub(r"/\*.*?\*/", "", line).strip()
         if text.startswith("#["):
             attributes.append(text)
             continue
-        if not text or text.startswith("//") or text in ("{", "}"):
+        text = re.sub(r"//.*$", "", text).strip()
+        if not text or text in ("{", "}"):
             continue
-        field = re.match(r"(?:pub(?:\([a-z]+\))?\s+)?([a-z_0-9]+)\s*:\s*(.+?),?$", text)
+        field = re.match(r"(?:pub(?:\([^)]*\))?\s+)?(?:r#)?([a-z_0-9]+)\s*:\s*(.+?),?$", text)
         if not field:
             attributes = []
             continue
         name, declared_type = field.group(1), field.group(2)
         joined = " ".join(attributes)
-        skipped = re.search(r"serde\([^)]*\bskip\b", joined) and "skip_serializing_if" not in joined
-        if not skipped:
-            optional = "default" in joined or declared_type.startswith("Option<")
+        if not re.search(r"serde\([^)]*\bskip(?:_deserializing)?\b", joined):
+            defaulted = all_default or re.search(r"serde\([^)]*\bdefault\b", joined)
+            optional = defaulted or declared_type.startswith("Option<")
             fields.append((name, declared_type, not optional))
         attributes = []
     return fields
@@ -398,42 +467,50 @@ def wire_type(declared_type: str) -> str | None:
     return WIRE_TYPES.get(inner.group(1) if inner else declared_type)
 
 
-def query_struct_findings(method: str, path: str, route: dict, name: str, struct: str) -> list[str]:
-    """Check 6: a `Query<T>` struct and the route's query parameters agree."""
+def query_struct_findings(
+    method: str, path: str, route: dict, queries: list[tuple[str, str]]
+) -> list[str]:
+    """Check 6: the `Query<T>` structs and the route's query parameters agree."""
     documented = {
-        entry["name"]: entry for entry in route.get("params", []) if entry.get("in") == "query"
+        entry.get("name"): entry
+        for entry in route.get("params") or []
+        if entry.get("in") == "query"
     }
     where = "  %s %s: `%%s`" % (method, path)
     found: list[str] = []
-    fields = struct_fields(struct)
-    for field, declared_type, mandatory in fields:
-        entry = documented.get(field)
-        if entry is None:
-            found.append(
-                where % field + " is accepted by %s but the contract does not document it" % name
-            )
-            continue
-        kind = wire_type(declared_type)
-        if kind is None:
-            found.append(
-                where % field + " has type %s, which maps to no OpenAPI type" % declared_type
-            )
-        elif entry.get("type") != kind:
-            found.append(
-                where % field
-                + " is %s in %s but the contract says %s" % (kind, name, entry.get("type"))
-            )
-        if mandatory and entry.get("required") is not True:
-            found.append(
-                where % field + " is mandatory in %s but the contract marks it optional" % name
-            )
-        if not mandatory and entry.get("required") is True:
-            found.append(
-                where % field + " is optional in %s but the contract marks it required" % name
-            )
-    accepted = {field for field, _, _ in fields}
+    accepted: set[str] = set()
+    for name, struct in queries:
+        for field, declared_type, mandatory in struct_fields(struct):
+            accepted.add(field)
+            entry = documented.get(field)
+            if entry is None:
+                found.append(
+                    where % field
+                    + " is accepted by %s but the contract does not document it" % name
+                )
+                continue
+            kind = wire_type(declared_type)
+            if kind is None:
+                found.append(
+                    where % field + " has type %s, which maps to no OpenAPI type" % declared_type
+                )
+            elif entry.get("type") != kind:
+                found.append(
+                    where % field
+                    + " is %s in %s but the contract says %s" % (kind, name, entry.get("type"))
+                )
+            if mandatory and entry.get("required") is not True:
+                found.append(
+                    where % field + " is mandatory in %s but the contract marks it optional" % name
+                )
+            if not mandatory and entry.get("required") is True:
+                found.append(
+                    where % field + " is optional in %s but the contract marks it required" % name
+                )
+    owners = " or ".join(name for name, _ in queries)
     for key in documented.keys() - accepted:
-        found.append(where % key + " is documented but %s does not accept it" % name)
+        if key is not None:
+            found.append(where % key + " is documented but %s does not accept it" % owners)
     return found
 
 
@@ -541,13 +618,18 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
         route = by_route.get((method, path))
         if params is None or route is None:
             continue
-        query = QUERY_EXTRACTOR.search(params)
-        if query is not None:
-            struct = find_struct(query.group(1))
+        queries: list[tuple[str, str]] = []
+        for query in QUERY_EXTRACTOR.finditer(params):
+            name = query.group(1).split("::")[-1]
+            struct = find_struct(name)
             if struct is None:
-                unresolved.append(missing % (method, path, query.group(1)))
+                unresolved.append(missing % (method, path, name))
             else:
-                typed_query += query_struct_findings(method, path, route, query.group(1), struct)
+                queries.append((name, struct))
+        if len(re.findall(r"\bQuery<", params)) > len(QUERY_EXTRACTOR.findall(params)):
+            unresolved.append("  %s %s: cannot read a `Query<..>` extractor" % (method, path))
+        if queries:
+            typed_query += query_struct_findings(method, path, route, queries)
 
         # A bare `Json<T>` means the body is mandatory; `Result<Json<T>, _>` and
         # `Option<Json<T>>` leave that to the handler. All three still name the
@@ -567,8 +649,8 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             for name, guarded in raw_body_parses(source, handler):
                 if name is None:
                     unresolved.append(
-                        "  %s %s: cannot resolve the body type of a "
-                        "`serde_json::from_slice` call" % (method, path)
+                        "  %s %s: cannot read a `from_slice` call or resolve its "
+                        "body type" % (method, path)
                     )
                 elif name != "Value":
                     parses.append((name, not guarded))
@@ -581,7 +663,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
                 "does not mark it required" % (method, path)
             )
         declared = {
-            field["name"]: field.get("required", False)
+            field.get("name"): field.get("required", False)
             for field in request_body.get("fields", []) or []
         }
         for name, mandatory in parses:
@@ -713,7 +795,7 @@ def fixture_struct(source: str):
 
     def find(name: str) -> str | None:
         found = re.search(r"\bstruct %s\s*\{" % re.escape(name), source)
-        return balanced(source[found.end() - 1 :], "{", "}") if found else None
+        return struct_text(source, found) if found else None
 
     return find
 
@@ -935,6 +1017,135 @@ struct Thing {
 """
 
 
+# Shapes that once slipped past the audit or failed it on correct code.
+FIXTURE_EDGES = r"""
+pub fn harvest_api_router() -> Router {
+    Router::new()
+        .route("/e/wrapped", post(e_wrapped))
+        .route("/e/sliced", post(e_sliced))
+        .route("/e/vector", post(e_vector))
+        .route("/e/crate-bytes", post(e_crate_bytes))
+        .route("/e/rejects", post(e_rejects))
+        .route("/e/logged", post(e_logged))
+        .route("/e/cursor", post(e_cursor))
+        .route("/e/optional-query", get(e_optional_query))
+        .route("/e/plain-query", get(e_plain_query))
+        .route("/e/two-queries", get(e_two_queries))
+        .route("/e/commented", get(e_commented))
+        .route("/e/defaulted", get(e_defaulted))
+        .route("/e/shapes", get(e_shapes))
+}
+
+async fn e_wrapped(body: Bytes) -> Response {
+    let widget = serde_json::from_slice::<Gadget>(
+        &body,
+    );
+    StatusCode::OK.into_response()
+}
+
+async fn e_sliced(body: Bytes) -> Response {
+    let widget: Gadget = serde_json::from_slice(&body[..]).unwrap_or_default();
+    StatusCode::OK.into_response()
+}
+
+async fn e_vector(body: Bytes) -> Response {
+    let widgets = serde_json::from_slice::<Vec<Gadget>>(&body).ok();
+    StatusCode::OK.into_response()
+}
+
+async fn e_crate_bytes(body: bytes::Bytes) -> Response {
+    let widget = serde_json::from_slice::<Gadget>(&body).ok();
+    StatusCode::OK.into_response()
+}
+
+async fn e_rejects(body: Bytes) -> Response {
+    if body.is_empty() {
+        return AutumnError::bad_request_msg("a body is required").into_response();
+    }
+    let widget = serde_json::from_slice::<Gadget>(&body).ok();
+    StatusCode::OK.into_response()
+}
+
+async fn e_logged(body: Bytes) -> Response {
+    tracing::debug!(empty = body.is_empty(), "parsing");
+    let widget = serde_json::from_slice::<Gadget>(&body).ok();
+    StatusCode::OK.into_response()
+}
+
+fn decode_cursor(raw: &[u8]) -> Option<Cursor> {
+    serde_json::from_slice::<Cursor>(raw).ok()
+}
+
+async fn e_cursor(body: Bytes) -> Response {
+    let widget = serde_json::from_slice::<Gadget>(&body).ok();
+    let cursor = decode_cursor(STORED);
+    StatusCode::OK.into_response()
+}
+
+async fn e_optional_query(query: Option<Query<Filter>>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_plain_query(filter: axum::extract::Query<Filter>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_two_queries(Query(mut a): Query<Filter>, Query(b): Query<Paging>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_commented(Query(query): Query<Commented>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_defaulted(Query(query): Query<Defaulted>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_shapes(Query(query): Query<Shapes>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+struct Gadget {
+    name: String,
+}
+
+struct Cursor {
+    offset: u64,
+}
+
+struct Filter {
+    kind: Option<String>,
+}
+
+struct Paging {
+    page: Option<u32>,
+}
+
+struct Commented {
+    kind: Option<String>, // A trailing note.
+    /* A leading note. */ page: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct Defaulted {
+    kind: String,
+}
+
+struct Shapes {
+    r#type: Option<String>,
+    pub(in crate::api) page: Option<u32>,
+    #[serde(skip_deserializing)]
+    cache: Option<String>,
+    #[serde(deserialize_with = "default_kind")]
+    kind: String,
+}
+"""
+
+GADGET_BODY = body_of(("name", True))
+
+
 # (name, source, routes, expected findings by check). Each expected string must
 # appear in exactly one finding, and the check must report nothing else.
 SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
@@ -1062,7 +1273,7 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         "a raw-byte body of unknown type is reported",
         FIXTURE_BYTES,
         [fixture_route("POST", "/raw/untyped", 200, request_body=OPTIONAL_WIDGET)],
-        {"unresolved": ["POST /raw/untyped: cannot resolve the body type"]},
+        {"unresolved": ["POST /raw/untyped: cannot read a `from_slice` call"]},
     ),
     (
         "a typed query that matches the contract is clean",
@@ -1187,7 +1398,7 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         "a typed let in an earlier statement does not type a parse",
         FIXTURE_STATUS,
         [fixture_route("POST", "/s/scoped", 200, request_body=body_of(required=True))],
-        {"unresolved": ["POST /s/scoped: cannot resolve the body type"]},
+        {"unresolved": ["POST /s/scoped: cannot read a `from_slice` call"]},
     ),
     (
         "a Result<Json<T>> body is not mandatory",
@@ -1199,6 +1410,153 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         ],
         {},
     ),
+    (
+        "a wrapped from_slice call is read",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/wrapped", 200, request_body=body_of(("name", True), required=False)
+            )
+        ],
+        {"body_required": ["POST /e/wrapped: the body is mandatory"]},
+    ),
+    (
+        "a from_slice call the audit cannot read is reported",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", "/e/sliced", 200, request_body=GADGET_BODY),
+            fixture_route("POST", "/e/vector", 200, request_body=GADGET_BODY),
+        ],
+        {
+            "unresolved": [
+                "POST /e/sliced: cannot read a `from_slice` call",
+                "POST /e/vector: cannot read a `from_slice` call",
+            ]
+        },
+    ),
+    (
+        "a Bytes type from another path is a body",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/crate-bytes", 200, request_body=body_of(("name", True), required=False)
+            )
+        ],
+        {"body_required": ["POST /e/crate-bytes: the body is mandatory"]},
+    ),
+    (
+        "an is_empty test that rejects or only logs is no guard",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/rejects",
+                200,
+                request_body=body_of(("name", True), required=False),
+                error_responses=[{"status": 400}],
+            ),
+            fixture_route(
+                "POST", "/e/logged", 200, request_body=body_of(("name", True), required=False)
+            ),
+        ],
+        {
+            "body_required": [
+                "POST /e/rejects: the body is mandatory",
+                "POST /e/logged: the body is mandatory",
+            ]
+        },
+    ),
+    (
+        "a helper that does not get the body is not a body parse",
+        FIXTURE_EDGES,
+        [fixture_route("POST", "/e/cursor", 200, request_body=GADGET_BODY)],
+        {},
+    ),
+    (
+        "every Query extractor form is read",
+        FIXTURE_EDGES,
+        [
+            fixture_route("GET", "/e/optional-query", 200, params=[]),
+            fixture_route("GET", "/e/plain-query", 200, params=[]),
+        ],
+        {
+            "query_params": [
+                "GET /e/optional-query: `kind` is accepted by Filter",
+                "GET /e/plain-query: `kind` is accepted by Filter",
+            ]
+        },
+    ),
+    (
+        "two Query extractors on one route are both read",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "GET",
+                "/e/two-queries",
+                200,
+                params=[
+                    query_param("kind", "string", False),
+                    query_param("page", "integer", False),
+                ],
+            ),
+        ],
+        {},
+    ),
+    (
+        "a comment beside a field is not part of it",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "GET",
+                "/e/commented",
+                200,
+                params=[
+                    query_param("kind", "string", False),
+                    query_param("page", "integer", False),
+                ],
+            ),
+        ],
+        {},
+    ),
+    (
+        "a container serde default makes every field optional",
+        FIXTURE_EDGES,
+        [fixture_route("GET", "/e/defaulted", 200, params=[query_param("kind", "string", False)])],
+        {},
+    ),
+    (
+        "raw names, scoped pub, skip_deserializing and default-named fns are read",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "GET",
+                "/e/shapes",
+                200,
+                params=[
+                    query_param("type", "string", False),
+                    query_param("page", "integer", False),
+                    query_param("kind", "string", True),
+                ],
+            ),
+        ],
+        {},
+    ),
+    (
+        "a malformed contract entry does not crash the audit",
+        FIXTURE_EDGES,
+        [
+            fixture_route("GET", "/e/defaulted", 200, params=None),
+            fixture_route("GET", "/e/shapes", 200, params=[{"in": "query"}]),
+        ],
+        {
+            "query_params": [
+                "GET /e/defaulted: `kind` is accepted by Defaulted",
+                "GET /e/shapes: `type` is accepted by Shapes",
+                "GET /e/shapes: `page` is accepted by Shapes",
+                "GET /e/shapes: `kind` is accepted by Shapes",
+            ]
+        },
+    ),
 ]
 
 
@@ -1206,8 +1564,13 @@ def self_test() -> int:
     """Run each fixture through `audit` and compare the findings."""
     failures = 0
     for name, source, routes, expected in SELF_TESTS:
-        found = audit(source, {"routes": routes}, fixture_struct(source))
         problems: list[str] = []
+        try:
+            found = audit(source, {"routes": routes}, fixture_struct(source))
+        except Exception as error:  # noqa: BLE001 - report it as a failure
+            print("FAIL  %s\n      raised %r" % (name, error))
+            failures += 1
+            continue
         # A route the fixture router lacks is skipped, so its test would pass
         # without a check.
         known = {(method, path) for method, path, _ in router_routes(source)}
