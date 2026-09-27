@@ -56,7 +56,8 @@ its brainstorm, reverse brainstorm and six hats, is
   sweep that fails on Postgres gives its leases back. After a Redis failure,
   the lease expires. A stopping worker releases its leases, best effort. Slow
   page reads renew the lease before the publish, and a queue a peer took is
-  dropped from that publish. The holder saves each
+  dropped from that publish. A failed renewal publishes nothing, and the
+  worker claims through Postgres for a cooldown. The holder saves each
   queue's cursor in Redis after a successful sweep, and a new holder resumes
   from it (`TaskDispatch::save_reconcile_cursors`).
 

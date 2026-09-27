@@ -233,7 +233,9 @@ the lease. A new holder resumes from that cursor, so a hand-over does not
 restart the walk. A worker that gets a lease back after a peer's sweep takes
 the peer's cursor, and an empty one starts the walk at the top. A sweep whose
 page reads outlast one renewal period renews its leases before it publishes.
-It publishes only the queues it still holds. A due row that
+It publishes only the queues it still holds. If the renewal fails, the sweep
+publishes nothing, and the worker claims through Postgres for a cooldown. The
+fallback counter reports it as `lease`. A due row that
 the channel does not hold is published on a later sweep, usually the next one.
 A backlog deeper than `reconcile_batch` takes one interval per page.
 
@@ -312,7 +314,7 @@ Use the `metrics-rs` adapter or another recorder, as
 | Metric | Prometheus series | Meaning |
 |--------|-------------------|---------|
 | `harvest.dispatch.hints_dropped` | `harvest_dispatch_hints_dropped_total` | Hints the background publisher dropped because its queue (10,000 hints) was full. The reconcile sweep republishes each row, so a drop costs latency, never work. |
-| `harvest.dispatch.fallbacks{reason}` | `harvest_dispatch_fallbacks_total` | Failed channel calls that sent a worker to the Postgres claim path for a cooldown. `reason` is `maintain`, `read`, `read_timeout` or `publish`. |
+| `harvest.dispatch.fallbacks{reason}` | `harvest_dispatch_fallbacks_total` | Failed channel calls that sent a worker to the Postgres claim path for a cooldown. `reason` is `maintain`, `read`, `read_timeout`, `publish` or `lease`. |
 | `harvest.dispatch.recovered` | `harvest_dispatch_recovered_total` | References a maintenance pass recovered from a consumer that stopped acking. A non-zero rate means workers crash or stall between a read and its ack. |
 
 The starter alert pack carries two rules on them. Both are ticket severity.

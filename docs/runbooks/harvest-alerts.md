@@ -601,6 +601,7 @@ at 30 s. Only a successful reference read ends it. The operator guide is
    | `read_timeout` | The reference read did not answer in time. |
    | `maintain` | The maintenance pass failed. It promotes delayed references and recovers unacked ones. |
    | `publish` | The reconcile sweep could not publish its page of rows. |
+   | `lease` | The reconcile sweep could not renew its sweep leases after slow page reads. It published nothing. |
 
 2. Read the channel settings:
    `curl -s .../api/harvest/admin/config | jq '.redis'`. Confirm `installed` is
@@ -608,8 +609,9 @@ at 30 s. Only a successful reference read ends it. The operator guide is
 3. From a worker host, run `redis-cli -u <endpoint> PING`. Expect `PONG`. If
    it fails, check DNS, firewall rules, the Redis port and the credentials.
 4. Search the worker log for `dispatch read failed`,
-   `dispatch read timed out`, `dispatch maintenance failed` or
-   `dispatch reconcile publish failed`. The log line is throttled, and the
+   `dispatch read timed out`, `dispatch maintenance failed`,
+   `dispatch reconcile publish failed` or
+   `dispatch reconcile lease renewal failed`. The log line is throttled, and the
    counter is not.
 5. Check the recovered rate,
    `sum(increase(harvest_dispatch_recovered_total[5m]))`. A non-zero rate

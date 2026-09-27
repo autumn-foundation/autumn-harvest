@@ -26160,6 +26160,8 @@ enum DispatchFallback {
     ReadTimeout,
     /// The reconcile publish failed.
     Publish,
+    /// The sweep lease renewal before a reconcile publish failed.
+    Lease,
 }
 
 impl DispatchFallback {
@@ -26170,6 +26172,7 @@ impl DispatchFallback {
             Self::Read => "read",
             Self::ReadTimeout => "read_timeout",
             Self::Publish => "publish",
+            Self::Lease => "lease",
         }
     }
 
@@ -26180,6 +26183,7 @@ impl DispatchFallback {
             Self::Read => "dispatch read failed",
             Self::ReadTimeout => "dispatch read timed out",
             Self::Publish => "dispatch reconcile publish failed",
+            Self::Lease => "dispatch reconcile lease renewal failed",
         }
     }
 }
@@ -28641,9 +28645,9 @@ impl Worker {
     /// Each worker reads only the queues whose sweep lease it holds
     /// (issue #1429). Every worker still emits the throttle metrics below.
     /// A sweep that fails on Postgres gives its leases up, so a peer sweeps
-    /// next. After a successful sweep the holder saves its cursors with the
-    /// channel. A new holder resumes from them, so a hand-over does not
-    /// restart the walk.
+    /// next. A sweep whose lease renewal fails publishes nothing. After a
+    /// successful sweep the holder saves its cursors with the channel. A new
+    /// holder resumes from them, so a hand-over does not restart the walk.
     ///
     /// Returns `false` when a channel call failed, so the caller can enter
     /// degraded mode. A database failure returns `true`: the database is not
@@ -28674,8 +28678,8 @@ impl Worker {
 
         let batch = installed.settings.reconcile_batch;
         let mut hints = Vec::new();
-        // The cursors are applied after every queue is read, so a read failure
-        // part way through leaves the walk where it was.
+        // The cursors are applied after every queue is read and the leases are
+        // renewed. A failed read or renewal leaves the walk where it was.
         let mut walked: Vec<(String, Option<crate::queue::DispatchCursor>)> = Vec::new();
         for queue in &leased {
             let after = state.reconcile_cursors.get(queue).cloned();
@@ -28698,20 +28702,35 @@ impl Worker {
             ));
             hints.extend(page.hints);
         }
+        // Slow page reads can outlast a lease. A renewal keeps a peer from
+        // sweeping the same queues while this sweep publishes. A queue a peer
+        // took meanwhile is the peer's to publish.
+        if lease_held && held_at.elapsed() >= reconcile_lease_period(&installed.settings) {
+            match self.hold_reconcile_leases(installed, &leased).await {
+                Ok(renewed) => retain_renewed(&mut leased, &mut hints, &renewed),
+                Err(error) => {
+                    // A failed renewal can hide a lost lease, so this sweep
+                    // publishes nothing. The Postgres claim path keeps the
+                    // floor until the cooldown ends.
+                    drop(conn);
+                    self.enter_degraded(
+                        state,
+                        &error,
+                        DispatchFallback::Lease,
+                        &installed.settings,
+                    );
+                    return false;
+                }
+            }
+        }
         for (queue, cursor) in walked {
+            if !leased.contains(&queue) {
+                continue;
+            }
             match cursor {
                 Some(cursor) => state.reconcile_cursors.insert(queue, cursor),
                 None => state.reconcile_cursors.remove(&queue),
             };
-        }
-        // Slow page reads can outlast a lease. A renewal keeps a peer from
-        // sweeping the same queues while this sweep publishes. A queue a peer
-        // took meanwhile is the peer's to publish.
-        if lease_held
-            && held_at.elapsed() >= reconcile_lease_period(&installed.settings)
-            && let Ok(renewed) = self.hold_reconcile_leases(installed, &leased).await
-        {
-            retain_renewed(&mut leased, &mut hints, &renewed);
         }
 
         // The throttle metrics ride on this sweep. The Postgres poll path

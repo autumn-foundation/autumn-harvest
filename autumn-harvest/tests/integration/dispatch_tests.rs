@@ -2151,6 +2151,9 @@ struct LeaseSwitchDispatch {
     inner: MemoryDispatch,
     grant: std::sync::atomic::AtomicBool,
     fail_lease: std::sync::atomic::AtomicBool,
+    /// The lease call that fails, counted from 1. Zero fails none.
+    fail_hold_call: AtomicUsize,
+    hold_calls: AtomicUsize,
     releases: AtomicUsize,
     cursors: std::sync::Mutex<std::collections::HashMap<String, String>>,
     saves: std::sync::Mutex<Vec<(String, Option<String>)>>,
@@ -2211,7 +2214,10 @@ impl TaskDispatch for LeaseSwitchDispatch {
         consumer: &str,
         _ttl: Duration,
     ) -> autumn_harvest::HarvestResult<Vec<autumn_harvest::dispatch::ReconcileLease>> {
-        if std::sync::atomic::AtomicBool::load(&self.fail_lease, Ordering::SeqCst) {
+        let call = self.hold_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if std::sync::atomic::AtomicBool::load(&self.fail_lease, Ordering::SeqCst)
+            || AtomicUsize::load(&self.fail_hold_call, Ordering::SeqCst) == call
+        {
             return Err(autumn_harvest::HarvestError::Dispatch(
                 "injected lease failure".to_string(),
             ));
@@ -2396,6 +2402,54 @@ async fn a_failed_lease_call_sweeps_every_queue() {
     .await;
 
     assert!(channel.inner.published_ids().contains(&task_id));
+}
+
+/// A sweep whose lease renewal fails treats its leases as lost. It publishes
+/// nothing, and the worker claims through Postgres (issue #1429).
+///
+/// Zero intervals make every sweep renew. The second lease call is the
+/// renewal of the first sweep, and it fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_renewal_publishes_nothing() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let (exec_id, task_id) = start_unpublished(&url).await;
+
+    let channel = Arc::new(LeaseSwitchDispatch::default());
+    channel.grant.store(true, Ordering::SeqCst);
+    channel.fail_hold_call.store(2, Ordering::SeqCst);
+    autumn_harvest::dispatch::install(
+        Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+        DispatchSettings {
+            poll_interval: Duration::ZERO,
+            reconcile_interval: Duration::ZERO,
+            ..dispatch_settings()
+        },
+    );
+    let _guard = InstalledGuard;
+
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker_with(
+        worker_config(LEASE_QUEUE, vec![ShardId::new(0)]),
+        vec![wf_info("dispatch_trivial", trivial_workflow)],
+        vec![],
+        empty_shared_state(),
+    ));
+
+    let mut check = connect(&url).await;
+    with_worker(worker, pool, async {
+        wait_for_state(&mut check, exec_id, &["COMPLETED"], Duration::from_secs(30)).await;
+    })
+    .await;
+
+    assert!(
+        AtomicUsize::load(&channel.hold_calls, Ordering::SeqCst) >= 2,
+        "the first sweep must renew"
+    );
+    assert!(
+        !channel.inner.published_ids().contains(&task_id),
+        "a sweep whose renewal failed must not publish"
+    );
 }
 
 /// A new lease holder resumes the walk from the cursor the last holder saved

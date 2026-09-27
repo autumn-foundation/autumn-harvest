@@ -415,7 +415,7 @@ metric is emitted in the source code.
 | `harvest.audit.export_observed` | `shard` |
 | `harvest.audit.exported` | `shard` |
 | `harvest.dispatch.hints_dropped` | _(none)_ |
-| `harvest.dispatch.fallbacks` | `reason` (`maintain\|read\|read_timeout\|publish` — the channel call that failed) |
+| `harvest.dispatch.fallbacks` | `reason` (`maintain\|read\|read_timeout\|publish\|lease` — the channel call that failed) |
 | `harvest.dispatch.recovered` | _(none)_ |
 | `harvest.task.capability_miss` | `queue`, `task_type` (`workflow\|activity`), `outcome` (`released\|escalated\|escalated_never_offered`) |
 | `harvest.queue.paused` | `queue` |

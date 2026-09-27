@@ -1464,7 +1464,7 @@
     {
       "id": "harvest_dispatch_fallback",
       "status": "enforceable",
-      "signal_source": "harvest.dispatch.fallbacks{reason} - one per failed Redis channel call that sends a worker to the Postgres claim path for a cooldown (issue #1429). reason is maintain, read, read_timeout or publish.",
+      "signal_source": "harvest.dispatch.fallbacks{reason} - one per failed Redis channel call that sends a worker to the Postgres claim path for a cooldown (issue #1429). reason is maintain, read, read_timeout, publish or lease.",
       "default_threshold": "Ticket when fallbacks occur in every 5-minute window for 10 minutes. One transient failure does not fire.",
       "severity": "ticket",
       "owner_persona": "platform on-call",

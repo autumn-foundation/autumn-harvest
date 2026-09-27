@@ -429,7 +429,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
         &["shard"],
     ),
     // Issue #1429 — Redis dispatch channel health. `reason` is a closed set:
-    // `maintain`, `read`, `read_timeout` or `publish`.
+    // `maintain`, `read`, `read_timeout`, `publish` or `lease`.
     ("harvest_dispatch_hints_dropped", &[]),
     ("harvest_dispatch_fallbacks", &["reason"]),
     ("harvest_dispatch_recovered", &[]),

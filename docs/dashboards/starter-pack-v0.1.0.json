@@ -6690,7 +6690,7 @@
           }
         }
       ],
-      "description": "Alert: harvest_dispatch_fallback (docs/runbooks/harvest-alerts.md#harvest_dispatch_fallback) Failed Redis channel calls, by the call that failed (maintain, read, read_timeout, publish). Each failure sends a worker to the Postgres claim path for a cooldown. Work continues, at the Postgres claim-path throughput. The cooldown starts at the poll interval, doubles per consecutive channel failure and stops at 30 s."
+      "description": "Alert: harvest_dispatch_fallback (docs/runbooks/harvest-alerts.md#harvest_dispatch_fallback) Failed Redis channel calls, by the call that failed (maintain, read, read_timeout, publish, lease). Each failure sends a worker to the Postgres claim path for a cooldown. Work continues, at the Postgres claim-path throughput. The cooldown starts at the poll interval, doubles per consecutive channel failure and stops at 30 s."
     },
     {
       "id": 629907,
