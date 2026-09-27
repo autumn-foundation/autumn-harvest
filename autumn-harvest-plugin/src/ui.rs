@@ -345,6 +345,44 @@ struct WorkflowTriggerUpdateForm {
     payload: Option<String>,
 }
 
+/// The operator's submitted values and an error, echoed back into the
+/// workflow detail page's Send signal / Reset to event N / Trigger update
+/// panels on a genuine failure, instead of being lost on a redirect (issue
+/// #1737 — the same mechanism issue #1723 used for the DAG retry confirm
+/// form). Every field is `None` on the plain `GET`: nothing has failed, so
+/// each panel stays collapsed and empty. The failing handler fills its own
+/// slot and renders the detail page directly rather than redirecting,
+/// because a redirect can only carry a flash string, with no slot for a
+/// signal payload, an event number, or an update payload the operator
+/// already typed.
+#[derive(Debug, Default)]
+struct WorkflowFormEcho {
+    signal: Option<WorkflowSignalEcho>,
+    reset: Option<WorkflowResetEcho>,
+    trigger_update: Option<WorkflowTriggerUpdateEcho>,
+}
+
+#[derive(Debug)]
+struct WorkflowSignalEcho {
+    signal_name: String,
+    payload: String,
+    error: String,
+}
+
+#[derive(Debug)]
+struct WorkflowResetEcho {
+    reset_to_event_id: String,
+    reason: String,
+    error: String,
+}
+
+#[derive(Debug)]
+struct WorkflowTriggerUpdateEcho {
+    update_name: String,
+    payload: String,
+    error: String,
+}
+
 // ---------------------------------------------------------------------------
 // Blocked-on panel data
 // ---------------------------------------------------------------------------
@@ -1587,13 +1625,39 @@ fn resolve_workflow_detail_event_page(
     (event_page, event_page_error, jump_event_error)
 }
 
-#[allow(clippy::too_many_lines)]
 async fn workflow_detail_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     Query(params): Query<WorkflowDetailParams>,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
+) -> Result<Markup, AutumnError> {
+    render_workflow_detail_page(
+        api_state,
+        id,
+        params,
+        headers,
+        maybe_session,
+        WorkflowFormEcho::default(),
+    )
+    .await
+}
+
+/// Loads and renders the workflow detail page. Shared by the plain `GET`
+/// (`workflow_detail_ui`, `form_echo` always empty) and, on a genuine
+/// mutation failure, by `signal_workflow_ui` / `reset_workflow_ui` /
+/// `trigger_update_ui` (issue #1737): rendering this page directly, with
+/// the failed form's submitted values in `form_echo`, replaces a redirect
+/// that could only carry a flash string with no slot for them. Same
+/// mechanism as `render_dag_retry_confirm_page` (issue #1723).
+#[allow(clippy::too_many_lines)]
+async fn render_workflow_detail_page(
+    api_state: HarvestApiState,
+    id: String,
+    params: WorkflowDetailParams,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
+    form_echo: WorkflowFormEcho,
 ) -> Result<Markup, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
     let exec_uuid = exec_id.as_uuid();
@@ -1850,6 +1914,7 @@ async fn workflow_detail_ui(
             truncated: log_truncated,
             read_failed: log_read_failed,
         },
+        &form_echo,
     ))
 }
 
@@ -2301,6 +2366,7 @@ async fn resume_workflow_ui(
 async fn signal_workflow_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
     Path(id): Path<String>,
     Form(form): Form<WorkflowSignalForm>,
 ) -> Result<axum::response::Response, AutumnError> {
@@ -2365,6 +2431,32 @@ async fn signal_workflow_ui(
     )
     .await;
 
+    // A genuine failure renders the detail page directly, with the
+    // submitted signal name and payload echoed back into the still-open
+    // panel, instead of redirecting through a flash string that has no
+    // slot for them (issue #1737 -- same mechanism as #1723's DAG retry
+    // fix).
+    if let Some(error) = error_summary {
+        let echo = WorkflowFormEcho {
+            signal: Some(WorkflowSignalEcho {
+                signal_name: form.signal_name.clone(),
+                payload: form.payload.clone().unwrap_or_default(),
+                error,
+            }),
+            ..Default::default()
+        };
+        let markup = render_workflow_detail_page(
+            api_state,
+            id,
+            WorkflowDetailParams::default(),
+            headers,
+            maybe_session,
+            echo,
+        )
+        .await?;
+        return Ok(markup.into_response());
+    }
+
     let redirect_url = format!("../../workflows/{id}?flash={flash}");
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
@@ -2403,6 +2495,7 @@ fn parse_reset_to_event_id(raw: &str) -> Result<i64, String> {
 async fn reset_workflow_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
     Path(id): Path<String>,
     Form(form): Form<WorkflowResetForm>,
 ) -> Result<axum::response::Response, AutumnError> {
@@ -2475,13 +2568,43 @@ async fn reset_workflow_ui(
     )
     .await;
 
+    // A genuine failure renders the detail page directly, with the
+    // submitted event number and reason echoed back into the still-open
+    // panel, instead of redirecting through a flash string that has no
+    // slot for them (issue #1737 -- same mechanism as #1723's DAG retry
+    // fix). This is the page's one destructive-recovery action
+    // (`docs/vantage-ui.md` scenarios 3-4), the moment an operator is
+    // least willing to retype their input.
+    if let Some(error) = error_summary {
+        let echo = WorkflowFormEcho {
+            reset: Some(WorkflowResetEcho {
+                reset_to_event_id: form.reset_to_event_id.clone(),
+                reason: form.reason.clone().unwrap_or_default(),
+                error,
+            }),
+            ..Default::default()
+        };
+        let markup = render_workflow_detail_page(
+            api_state,
+            id,
+            WorkflowDetailParams::default(),
+            headers,
+            maybe_session,
+            echo,
+        )
+        .await?;
+        return Ok(markup.into_response());
+    }
+
     let redirect_url = format!("../../workflows/{id}?flash={flash}");
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn trigger_update_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
     Path(id): Path<String>,
     Form(form): Form<WorkflowTriggerUpdateForm>,
 ) -> Result<axum::response::Response, AutumnError> {
@@ -2515,9 +2638,28 @@ async fn trigger_update_ui(
                     },
                 )
                 .await;
-                let flash = url_encode(&err_msg);
-                let redirect_url = format!("../../workflows/{id}?flash={flash}");
-                return Ok(axum::response::Redirect::to(&redirect_url).into_response());
+                // Same in-place re-render as the two failure branches below
+                // (issue #1737): the operator's update name and payload
+                // survive a bad JSON payload, not just a downstream
+                // rejection.
+                let echo = WorkflowFormEcho {
+                    trigger_update: Some(WorkflowTriggerUpdateEcho {
+                        update_name: form.update_name.clone(),
+                        payload: form.payload.clone().unwrap_or_default(),
+                        error: err_msg,
+                    }),
+                    ..Default::default()
+                };
+                let markup = render_workflow_detail_page(
+                    api_state,
+                    id,
+                    WorkflowDetailParams::default(),
+                    headers,
+                    maybe_session,
+                    echo,
+                )
+                .await?;
+                return Ok(markup.into_response());
             }
         }
     };
@@ -2584,6 +2726,32 @@ async fn trigger_update_ui(
         },
     )
     .await;
+
+    // A genuine failure renders the detail page directly, with the
+    // submitted update name and payload echoed back into the still-open
+    // panel, instead of redirecting through a flash string that has no
+    // slot for them (issue #1737 -- same mechanism as #1723's DAG retry
+    // fix).
+    if let Some(error) = error_summary {
+        let echo = WorkflowFormEcho {
+            trigger_update: Some(WorkflowTriggerUpdateEcho {
+                update_name: form.update_name.clone(),
+                payload: form.payload.clone().unwrap_or_default(),
+                error,
+            }),
+            ..Default::default()
+        };
+        let markup = render_workflow_detail_page(
+            api_state,
+            id,
+            WorkflowDetailParams::default(),
+            headers,
+            maybe_session,
+            echo,
+        )
+        .await?;
+        return Ok(markup.into_response());
+    }
 
     let redirect_url = format!("../../workflows/{id}?flash={flash}");
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
@@ -5557,6 +5725,7 @@ fn render_workflow_detail(
     jump_event_error: Option<&str>,
     continue_as_new_threshold: Option<u64>,
     logs: &WorkflowLogsPanelData<'_>,
+    form_echo: &WorkflowFormEcho,
 ) -> Markup {
     let exec_id_str = execution.id.to_string();
     let title = format!("{} · Vantage", execution.workflow_name);
@@ -5661,44 +5830,70 @@ fn render_workflow_detail(
                 button.danger type="submit" disabled[terminal]
                     title=[terminal.then_some("Workflow is terminal")] { "Terminate" }
             }
-            details style="display:inline-block" {
+            // The `open[...]` and `value=[...]`/echoed-content wiring below
+            // re-populates a panel from `form_echo` after a genuine failure
+            // instead of losing what the operator typed (issue #1737). The
+            // plain `GET` always passes an empty `WorkflowFormEcho`, so every
+            // panel here stays collapsed and empty exactly as before.
+            details style="display:inline-block" open[form_echo.signal.is_some()] {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Send signal" }
                 form method="post" action={ (exec_id_str) "/signal" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Signal name"
-                        input type="text" name="signal_name" required placeholder="e.g. approve" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        input type="text" name="signal_name" required placeholder="e.g. approve"
+                            value=[form_echo.signal.as_ref().map(|e| e.signal_name.as_str())]
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Payload (JSON)"
-                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {}
+                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {
+                            (form_echo.signal.as_ref().map_or("", |e| e.payload.as_str()))
+                        }
+                    }
+                    @if let Some(echo) = &form_echo.signal {
+                        span.field-error role="alert" { "Signal failed: " (echo.error) }
                     }
                     button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Send" }
                 }
             }
-            details style="display:inline-block" {
+            details style="display:inline-block" open[form_echo.reset.is_some()] {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Reset to event N" }
                 form method="post" action={ (exec_id_str) "/reset" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Event # (1-based, as shown in timeline)"
-                        input type="number" name="reset_to_event_id" min="1" required placeholder="1" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        input type="number" name="reset_to_event_id" min="1" required placeholder="1"
+                            value=[form_echo.reset.as_ref().map(|e| e.reset_to_event_id.as_str())]
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Reason"
-                        input type="text" name="reason" placeholder="rollback" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        input type="text" name="reason" placeholder="rollback"
+                            value=[form_echo.reset.as_ref().map(|e| e.reason.as_str())]
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                    }
+                    @if let Some(echo) = &form_echo.reset {
+                        span.field-error role="alert" { "Reset failed: " (echo.error) }
                     }
                     button type="submit" style="background:#92400e;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" onclick="return confirm('Reset this workflow execution? This is destructive.')" { "Reset" }
                 }
             }
-            details style="display:inline-block" {
+            details style="display:inline-block" open[form_echo.trigger_update.is_some()] {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Trigger update" }
                 form method="post" action={ (exec_id_str) "/trigger-update" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Update name"
-                        input type="text" name="update_name" required placeholder="e.g. set_priority" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        input type="text" name="update_name" required placeholder="e.g. set_priority"
+                            value=[form_echo.trigger_update.as_ref().map(|e| e.update_name.as_str())]
+                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Payload (JSON)"
-                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {}
+                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {
+                            (form_echo.trigger_update.as_ref().map_or("", |e| e.payload.as_str()))
+                        }
+                    }
+                    @if let Some(echo) = &form_echo.trigger_update {
+                        span.field-error role="alert" { "Update failed: " (echo.error) }
                     }
                     button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Submit" }
                 }
@@ -14932,6 +15127,7 @@ mod tests {
             None,
             Some(10_000),
             &WorkflowLogsPanelData::default(),
+            &WorkflowFormEcho::default(),
         )
         .into_string();
 
@@ -14968,6 +15164,7 @@ mod tests {
             None,
             None,
             &WorkflowLogsPanelData::default(),
+            &WorkflowFormEcho::default(),
         )
         .into_string();
 
@@ -15000,6 +15197,7 @@ mod tests {
             None,
             Some(500),
             &WorkflowLogsPanelData::default(),
+            &WorkflowFormEcho::default(),
         )
         .into_string();
 
@@ -15007,6 +15205,139 @@ mod tests {
         assert!(
             html.contains("500"),
             "custom threshold 500 must appear in HTML"
+        );
+    }
+
+    // ── Workflow-detail form echo (issue #1737) ─────────────────────────────
+
+    fn render_detail_with_echo(echo: &WorkflowFormEcho) -> String {
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        render_workflow_detail(
+            &execution,
+            0,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            None,
+            None,
+            None,
+            &WorkflowLogsPanelData::default(),
+            echo,
+        )
+        .into_string()
+    }
+
+    #[test]
+    fn render_detail_form_panels_collapsed_and_empty_by_default() {
+        let html = render_detail_with_echo(&WorkflowFormEcho::default());
+        assert!(
+            !html.contains("<details style=\"display:inline-block\" open"),
+            "no panel should be forced open on a plain GET: {html}"
+        );
+        assert!(
+            !html.contains("<span class=\"field-error\""),
+            "no inline form error should render on a plain GET: {html}"
+        );
+    }
+
+    #[test]
+    fn signal_form_echoes_submitted_values_and_error_on_failure() {
+        let echo = WorkflowFormEcho {
+            signal: Some(WorkflowSignalEcho {
+                signal_name: "approve-refund".to_string(),
+                payload: "{\"amount\": 500".to_string(),
+                error: "Invalid JSON payload: EOF while parsing an object".to_string(),
+            }),
+            ..Default::default()
+        };
+        let html = render_detail_with_echo(&echo);
+        assert!(
+            html.contains("value=\"approve-refund\""),
+            "the submitted signal name must survive the failed submission: {html}"
+        );
+        assert!(
+            html.contains("{&quot;amount&quot;: 500"),
+            "the submitted (malformed) payload must survive the failed submission: {html}"
+        );
+        assert!(
+            html.contains("<span class=\"field-error\"") && html.contains("Signal failed:"),
+            "the failure must render inline, next to the field: {html}"
+        );
+    }
+
+    #[test]
+    fn reset_form_echoes_submitted_values_and_error_on_failure() {
+        let echo = WorkflowFormEcho {
+            reset: Some(WorkflowResetEcho {
+                reset_to_event_id: "not-a-number".to_string(),
+                reason: "rolling back the bad deploy".to_string(),
+                error: "invalid event number 'not-a-number'; expected a whole number".to_string(),
+            }),
+            ..Default::default()
+        };
+        let html = render_detail_with_echo(&echo);
+        assert!(
+            html.contains("value=\"not-a-number\""),
+            "the submitted event number must survive the failed submission: {html}"
+        );
+        assert!(
+            html.contains("value=\"rolling back the bad deploy\""),
+            "the submitted reason must survive the failed submission: {html}"
+        );
+        assert!(
+            html.contains("<span class=\"field-error\"") && html.contains("Reset failed:"),
+            "the failure must render inline, next to the field: {html}"
+        );
+    }
+
+    #[test]
+    fn trigger_update_form_echoes_submitted_values_and_error_on_failure() {
+        let echo = WorkflowFormEcho {
+            trigger_update: Some(WorkflowTriggerUpdateEcho {
+                update_name: "set_priority".to_string(),
+                payload: "{\"priority\": ".to_string(),
+                error: "Invalid JSON payload: EOF while parsing a value".to_string(),
+            }),
+            ..Default::default()
+        };
+        let html = render_detail_with_echo(&echo);
+        assert!(
+            html.contains("value=\"set_priority\""),
+            "the submitted update name must survive the failed submission: {html}"
+        );
+        assert!(
+            html.contains("{&quot;priority&quot;: "),
+            "the submitted (malformed) payload must survive the failed submission: {html}"
+        );
+        assert!(
+            html.contains("<span class=\"field-error\"") && html.contains("Update failed:"),
+            "the failure must render inline, next to the field: {html}"
+        );
+    }
+
+    #[test]
+    fn echoed_panel_is_reopened_and_others_stay_collapsed() {
+        let echo = WorkflowFormEcho {
+            reset: Some(WorkflowResetEcho {
+                reset_to_event_id: "3".to_string(),
+                reason: String::new(),
+                error: "event 3 has already completed".to_string(),
+            }),
+            ..Default::default()
+        };
+        let html = render_detail_with_echo(&echo);
+        let open_count = html
+            .matches("<details style=\"display:inline-block\" open")
+            .count();
+        assert_eq!(
+            open_count, 1,
+            "only the failing form's panel should reopen, not the other two: {html}"
         );
     }
 
@@ -16901,6 +17232,7 @@ mod tests {
             None,
             None,
             logs,
+            &WorkflowFormEcho::default(),
         )
         .into_string()
     }
@@ -17024,6 +17356,7 @@ mod tests {
                 admin: true,
                 ..Default::default()
             },
+            &WorkflowFormEcho::default(),
         )
         .into_string();
         // maud escapes `&` inside an attribute value, which is the correct
@@ -17064,6 +17397,7 @@ mod tests {
                 admin: true,
                 ..Default::default()
             },
+            &WorkflowFormEcho::default(),
         )
         .into_string();
 
@@ -17110,6 +17444,7 @@ mod tests {
             Some("Invalid jump_event 'zap'; expected a whole number. Jump ignored."),
             None,
             &WorkflowLogsPanelData::default(),
+            &WorkflowFormEcho::default(),
         )
         .into_string();
         assert!(
